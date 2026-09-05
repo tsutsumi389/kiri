@@ -95,5 +95,5 @@ GitHub Actions で以下を実行する。
 - [x] Phase 2: `kiri resize`
 - [x] Phase 3: 切り抜きコア
 - [x] Phase 4: EC整形
-- [ ] Phase 5: バッチ
+- [x] Phase 5: バッチ
 - [ ] Phase 6: 仕上げ

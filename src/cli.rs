@@ -39,6 +39,8 @@ pub enum Command {
     Resize(ResizeArgs),
     /// 背景を透過して商品を切り抜く
     Cutout(CutoutArgs),
+    /// 仕様ファイルに従って複数の画像を一括処理する
+    Batch(BatchArgs),
 }
 
 #[derive(Args, Debug)]
@@ -176,6 +178,25 @@ pub struct CutoutArgs {
 
     #[command(flatten)]
     pub out: OutputOpts,
+}
+
+#[derive(Args, Debug)]
+pub struct BatchArgs {
+    /// 処理内容を記した JSON ファイル
+    pub spec: PathBuf,
+
+    /// 仕様ファイル中の相対パスを解決する基準ディレクトリ。
+    /// 既定では仕様ファイルのある場所
+    #[arg(long, value_name = "DIR")]
+    pub base_dir: Option<PathBuf>,
+
+    /// 並列実行数。0 で CPU 数に合わせる
+    #[arg(long, default_value_t = 0)]
+    pub jobs: usize,
+
+    /// 出力先が既に存在する場合に上書きする
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// `1000x1000` または `1000`（正方形）を受け付ける。

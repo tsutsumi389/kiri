@@ -4,8 +4,8 @@ AIエージェントから使われることを前提とした、EC商品画像�
 
 単色背景の商品写真を対象に、背景透過の切り抜き・リサイズ・キャンバス配置・Web配信形式への変換を1コマンドで行う。
 
-> **開発中です。** 現在 `info` / `convert` / `resize` / `cutout` が動作します。
-> 残るはバッチ処理（`kiri batch`）です。
+> **開発中です。** 主要なコマンドは一通り動作します（`info` / `convert` / `resize` / `cutout` / `batch`）。
+> 残るは README の整備、実素材での既定値の再調整、リリース用 CI です。
 > 進捗は [docs/implementation-plan.md](docs/implementation-plan.md) を参照してください。
 
 ## 特徴
@@ -191,6 +191,77 @@ $ kiri cutout product.jpg -o product.jpg --canvas 1000 --flatten --background "#
 - `foreground_ratio` が極端（0.01未満 / 0.99超）なら警告が出る
 - `touches_edge` が `true` なら商品が見切れている
 - `uniformity` が低ければ単色背景ではない
+
+### kiri batch
+
+仕様ファイルに従って複数の画像を一括処理する。**AI エージェントから使う際の本命はこれ。**
+
+```
+$ kiri batch spec.json
+  out/p1.avif  1000x1000  4.0 KB
+! out/p2.avif  1000x1000  4.9 KB
+  out/p3.avif  1000x1000  4.2 KB
+x broken.jpg  失敗
+
+4 件中 3 件成功、1 件失敗、1 件に警告  (387 ms)
+```
+
+```json
+{
+  "defaults": {
+    "canvas": "1000x1000",
+    "fill_ratio": 0.85,
+    "format": "avif",
+    "tolerance": 12
+  },
+  "items": [
+    { "input": "p1.jpg", "output": "out/p1.avif" },
+    { "input": "p2.jpg", "output": "out/p2.avif", "tolerance": 6 },
+    { "input": "p3.jpg", "output": "out/p3.avif", "bbox": [200, 150, 1100, 1600] }
+  ]
+}
+```
+
+`defaults` は全項目に適用され、項目側の指定が優先される。指定できるキーは `cutout` の
+オプションと対応する（`bbox` / `normalized` / `fg_seeds` / `tolerance` / `border` /
+`cleanup` / `feather` / `despill` / `edge_threshold` / `canvas` / `fill_ratio` /
+`format` / `quality` / `effort` / `background` / `flatten`）。
+
+| オプション | 既定値 | 説明 |
+|---|---|---|
+| `--base-dir DIR` | 仕様ファイルの場所 | 相対パスの基準ディレクトリ |
+| `--jobs N` | CPU数 | 並列実行数 |
+| `--force` | | 全項目で上書きを許可する |
+
+**1件の失敗で全体を止めない。** 数百点を回すバッチでは、失敗を報告しつつ残りを処理し
+切るほうが有用なため。失敗があった場合は終了コード 4 で知らせ、詳細は `results[]` に入る。
+結果の並びは仕様ファイルの順序を保つ（並列実行でも）。
+
+**仕様の誤りは黙って無視しない。** 綴り違いのキーがあればエラーにして候補を示す。
+無視すると「指定したはずの設定が効いていない」という最も気づきにくい失敗を生むため。
+
+```
+$ kiri batch spec.json --json
+{
+  "error": {
+    "code": "SPEC_UNKNOWN_FIELD",
+    "message": "items[0] に未知のキー 'tolerence' があります",
+    "hint": "'tolerance' の綴り違いではありませんか"
+  }
+}
+```
+
+#### AIエージェントからの使い方
+
+想定している流れはこう。
+
+1. AI が対象画像を `kiri info` で確認し、仕様 JSON を書き出す
+2. `kiri batch spec.json --json` で一括処理する
+3. 結果の `failed` / `with_warnings` と各項目の `mask.foreground_ratio` を検証する
+4. 失敗した項目だけ `tolerance` や `bbox` を調整して再実行する
+
+全件の座標を AI が出す必要はない。単色背景では自動判定が成立するため、AI の仕事は
+「結果を見て、うまくいかなかった数枚を救済する」ことに絞られる。
 
 ## 対応形式
 

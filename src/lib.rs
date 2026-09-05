@@ -3,6 +3,7 @@
 //! CLI 本体は `main.rs` にあるが、統合テストから触れるようライブラリとして
 //! 公開している。
 
+pub mod batch;
 pub mod cli;
 pub mod color;
 pub mod commands;

@@ -20,6 +20,16 @@ pub struct ErrorBody {
     pub hint: Option<String>,
 }
 
+impl From<&Error> for ErrorBody {
+    fn from(e: &Error) -> Self {
+        ErrorBody {
+            code: e.code,
+            message: e.message.clone(),
+            hint: e.hint.clone(),
+        }
+    }
+}
+
 impl From<&Error> for ErrorReport {
     fn from(e: &Error) -> Self {
         ErrorReport {
@@ -122,4 +132,28 @@ pub struct CutoutReport {
     pub canvas: Option<CanvasReport>,
     pub elapsed_ms: u128,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchItemReport {
+    pub input: String,
+    pub output: String,
+    /// "ok" または "error"
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<CutoutReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorBody>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchReport {
+    pub spec: String,
+    pub total: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    /// 成功したが警告が付いた項目の数。目視確認の対象になる
+    pub with_warnings: usize,
+    pub elapsed_ms: u128,
+    pub results: Vec<BatchItemReport>,
 }

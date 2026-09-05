@@ -5,7 +5,7 @@
 
 mod common;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 use common::{ProductSpec, product_image, transparent_product, write_jpeg, write_png};
@@ -1507,4 +1507,325 @@ fn cutout_without_a_canvas_reports_no_canvas_field() {
         "キャンバス未指定なのに canvas が出ている"
     );
     assert_eq!(v["outputs"][0]["width"], 120, "寸法は元のままであるべき");
+}
+
+// --- batch (Phase 5) ---
+
+/// 商品画像を n 枚と spec.json を用意する。
+fn batch_fixture(dir: &Path, count: usize) -> Vec<String> {
+    let mut names = Vec::new();
+    for i in 0..count {
+        let name = format!("p{i}.png");
+        let img = product_image(&ProductSpec {
+            width: 120 + (i as u32) * 20,
+            height: 120 + (i as u32) * 10,
+            ..Default::default()
+        });
+        write_png(dir, &name, &img);
+        names.push(name);
+    }
+    names
+}
+
+fn write_spec(dir: &Path, json: &str) -> PathBuf {
+    let path = dir.join("spec.json");
+    std::fs::write(&path, json).unwrap();
+    path
+}
+
+fn run_batch(spec: &Path, extra: &[&str]) -> std::process::Output {
+    let mut args = vec!["batch", spec.to_str().unwrap(), "--json"];
+    args.extend_from_slice(extra);
+    kiri().args(&args).output().unwrap()
+}
+
+#[test]
+fn batch_processes_every_item() {
+    let dir = fixture_dir();
+    batch_fixture(dir.path(), 3);
+    let spec = write_spec(
+        dir.path(),
+        r#"{"defaults":{"canvas":"400x400","format":"png"},
+            "items":[{"input":"p0.png","output":"out/a.png"},
+                     {"input":"p1.png","output":"out/b.png"},
+                     {"input":"p2.png","output":"out/c.png"}]}"#,
+    );
+
+    let out = run_batch(&spec, &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let v = json_stdout(&out);
+    assert_eq!(v["total"], 3);
+    assert_eq!(v["succeeded"], 3);
+    assert_eq!(v["failed"], 0);
+
+    for name in ["a", "b", "c"] {
+        assert!(
+            dir.path().join(format!("out/{name}.png")).exists(),
+            "{name} が無い"
+        );
+    }
+}
+
+#[test]
+fn batch_applies_defaults_and_lets_items_override_them() {
+    let dir = fixture_dir();
+    batch_fixture(dir.path(), 2);
+    let spec = write_spec(
+        dir.path(),
+        r#"{"defaults":{"canvas":"400x400","fill_ratio":0.5,"format":"png"},
+            "items":[{"input":"p0.png","output":"a.png"},
+                     {"input":"p1.png","output":"b.png","fill_ratio":0.9}]}"#,
+    );
+
+    let v = json_stdout(&run_batch(&spec, &[]));
+    let long = |i: usize| -> u64 {
+        let c = v["results"][i]["result"]["canvas"]["content"]
+            .as_array()
+            .unwrap();
+        c[0].as_u64().unwrap().max(c[1].as_u64().unwrap())
+    };
+    assert_eq!(long(0), 200, "既定の占有率 0.5 が効いていない");
+    assert_eq!(long(1), 360, "項目側の 0.9 が優先されていない");
+}
+
+/// 数百点を回す前提では、1 件の失敗で全体が止まっては困る。
+#[test]
+fn one_failing_item_does_not_stop_the_rest() {
+    let dir = fixture_dir();
+    batch_fixture(dir.path(), 2);
+    std::fs::write(dir.path().join("broken.jpg"), b"not an image").unwrap();
+    let spec = write_spec(
+        dir.path(),
+        r#"{"defaults":{"format":"png"},
+            "items":[{"input":"p0.png","output":"a.png"},
+                     {"input":"broken.jpg","output":"bad.png"},
+                     {"input":"p1.png","output":"c.png"}]}"#,
+    );
+
+    let out = run_batch(&spec, &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "失敗があれば exit 4 で知らせるべき"
+    );
+
+    let v = json_stdout(&out);
+    assert_eq!(v["total"], 3);
+    assert_eq!(v["succeeded"], 2);
+    assert_eq!(v["failed"], 1);
+
+    assert_eq!(v["results"][1]["status"], "error");
+    assert!(
+        v["results"][1]["error"]["code"]
+            .as_str()
+            .unwrap()
+            .starts_with("UNSUPPORTED")
+    );
+
+    // 失敗の前後にある項目はどちらも処理されていること
+    assert!(dir.path().join("a.png").exists());
+    assert!(dir.path().join("c.png").exists());
+}
+
+#[test]
+fn batch_results_follow_the_spec_order() {
+    let dir = fixture_dir();
+    batch_fixture(dir.path(), 4);
+    let spec = write_spec(
+        dir.path(),
+        r#"{"defaults":{"format":"png"},
+            "items":[{"input":"p3.png","output":"d.png"},
+                     {"input":"p0.png","output":"a.png"},
+                     {"input":"p2.png","output":"c.png"},
+                     {"input":"p1.png","output":"b.png"}]}"#,
+    );
+
+    let v = json_stdout(&run_batch(&spec, &[]));
+    let inputs: Vec<String> = v["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            r["input"]
+                .as_str()
+                .unwrap()
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        inputs,
+        ["p3.png", "p0.png", "p2.png", "p1.png"],
+        "並列でも順序が保たれるべき"
+    );
+}
+
+#[test]
+fn serial_and_parallel_runs_agree() {
+    let dir = fixture_dir();
+    batch_fixture(dir.path(), 3);
+    let spec = write_spec(
+        dir.path(),
+        r#"{"defaults":{"canvas":"300","format":"png"},
+            "items":[{"input":"p0.png","output":"s/a.png"},
+                     {"input":"p1.png","output":"s/b.png"},
+                     {"input":"p2.png","output":"s/c.png"}]}"#,
+    );
+
+    let ratios = |extra: &[&str]| -> Vec<f64> {
+        let v = json_stdout(&run_batch(&spec, extra));
+        v["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["result"]["mask"]["foreground_ratio"].as_f64().unwrap())
+            .collect()
+    };
+    let parallel = ratios(&["--force"]);
+    let serial = ratios(&["--jobs", "1", "--force"]);
+    assert_eq!(parallel, serial, "並列と直列で結果が食い違っている");
+}
+
+/// AI が生成した仕様の綴り違いを黙って無視しない。
+#[test]
+fn a_misspelled_key_in_the_spec_is_reported_with_a_suggestion() {
+    let dir = fixture_dir();
+    batch_fixture(dir.path(), 1);
+    let spec = write_spec(
+        dir.path(),
+        r#"{"items":[{"input":"p0.png","output":"a.png","tolerence":5}]}"#,
+    );
+
+    let out = run_batch(&spec, &[]);
+    assert_eq!(out.status.code(), Some(3));
+    let v = json_stdout(&out);
+    assert_eq!(v["error"]["code"], "SPEC_UNKNOWN_FIELD");
+    assert!(v["error"]["hint"].as_str().unwrap().contains("tolerance"));
+}
+
+#[test]
+fn a_malformed_spec_is_rejected() {
+    let dir = fixture_dir();
+    let spec = write_spec(dir.path(), "{ this is not json");
+    let out = run_batch(&spec, &[]);
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(json_stdout(&out)["error"]["code"], "SPEC_INVALID_JSON");
+}
+
+#[test]
+fn an_empty_item_list_is_an_argument_error() {
+    let dir = fixture_dir();
+    let spec = write_spec(dir.path(), r#"{"items":[]}"#);
+    let out = run_batch(&spec, &[]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(json_stdout(&out)["error"]["code"], "SPEC_EMPTY");
+}
+
+#[test]
+fn a_missing_spec_file_is_an_input_error() {
+    let out = run_batch(Path::new("/nonexistent/spec.json"), &[]);
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(json_stdout(&out)["error"]["code"], "SPEC_UNREADABLE");
+}
+
+#[test]
+fn relative_paths_resolve_against_the_spec_file() {
+    let dir = fixture_dir();
+    let images = dir.path().join("images");
+    std::fs::create_dir_all(&images).unwrap();
+    batch_fixture(&images, 1);
+
+    // 仕様ファイルを画像と同じ場所に置き、カレントディレクトリとは無関係に動くこと
+    let spec = write_spec(
+        &images,
+        r#"{"items":[{"input":"p0.png","output":"a.png"}]}"#,
+    );
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--json"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        images.join("a.png").exists(),
+        "仕様ファイルの隣に出力されるべき"
+    );
+}
+
+#[test]
+fn base_dir_overrides_where_relative_paths_point() {
+    let dir = fixture_dir();
+    let images = dir.path().join("images");
+    std::fs::create_dir_all(&images).unwrap();
+    batch_fixture(&images, 1);
+
+    // 仕様ファイルは別の場所に置く
+    let spec = write_spec(
+        dir.path(),
+        r#"{"items":[{"input":"p0.png","output":"out.png"}]}"#,
+    );
+    let out = run_batch(&spec, &["--base-dir", images.to_str().unwrap()]);
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(images.join("out.png").exists());
+}
+
+#[test]
+fn batch_respects_the_overwrite_guard() {
+    let dir = fixture_dir();
+    batch_fixture(dir.path(), 1);
+    std::fs::write(dir.path().join("a.png"), b"existing").unwrap();
+    let spec = write_spec(
+        dir.path(),
+        r#"{"defaults":{"format":"png"},"items":[{"input":"p0.png","output":"a.png"}]}"#,
+    );
+
+    let out = run_batch(&spec, &[]);
+    assert_eq!(out.status.code(), Some(4), "全項目が失敗しても exit 4");
+    let v = json_stdout(&out);
+    assert_eq!(v["results"][0]["error"]["code"], "OUTPUT_EXISTS");
+    assert_eq!(
+        std::fs::read(dir.path().join("a.png")).unwrap(),
+        b"existing"
+    );
+
+    // --force なら通る
+    let out = run_batch(&spec, &["--force"]);
+    assert!(out.status.success());
+    assert_ne!(
+        std::fs::read(dir.path().join("a.png")).unwrap(),
+        b"existing"
+    );
+}
+
+#[test]
+fn batch_counts_items_that_need_review() {
+    let dir = fixture_dir();
+    batch_fixture(dir.path(), 2);
+    let spec = write_spec(
+        dir.path(),
+        r#"{"defaults":{"format":"png"},
+            "items":[{"input":"p0.png","output":"a.png"},
+                     {"input":"p1.png","output":"b.png","tolerance":0}]}"#,
+    );
+
+    let v = json_stdout(&run_batch(&spec, &[]));
+    assert_eq!(v["succeeded"], 2);
+    assert_eq!(v["with_warnings"], 1, "tolerance 0 の項目に警告が付くはず");
 }

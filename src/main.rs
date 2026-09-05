@@ -11,13 +11,13 @@ use serde::Serialize;
 
 use kiri::cli::{Cli, Command};
 use kiri::commands;
-use kiri::error::{Error, Result};
-use kiri::report::{CutoutReport, ErrorReport, InfoReport, ProcessReport};
+use kiri::error::{Error, ErrorKind, Result};
+use kiri::report::{BatchReport, CutoutReport, ErrorReport, InfoReport, ProcessReport};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match dispatch(&cli) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
             emit_error(&e, cli.json);
             ExitCode::from(e.exit_code() as u8)
@@ -25,7 +25,9 @@ fn main() -> ExitCode {
     }
 }
 
-fn dispatch(cli: &Cli) -> Result<()> {
+/// 成功時も終了コードを返す。バッチは一部の項目が失敗しても処理を続けるため、
+/// 「全体としては動いたが失敗がある」を表現する必要がある。
+fn dispatch(cli: &Cli) -> Result<i32> {
     match &cli.command {
         Command::Info(args) => {
             let report = commands::info::run(args)?;
@@ -59,8 +61,20 @@ fn dispatch(cli: &Cli) -> Result<()> {
                 print_cutout(&report);
             }
         }
+        Command::Batch(args) => {
+            let report = commands::batch::run(args)?;
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                print_batch(&report);
+            }
+            // 失敗した項目があれば処理失敗として知らせる。詳細は results[] にある
+            if report.failed > 0 {
+                return Ok(ErrorKind::Processing.exit_code());
+            }
+        }
     }
-    Ok(())
+    Ok(0)
 }
 
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
@@ -173,6 +187,36 @@ fn print_cutout(report: &CutoutReport) {
         println!("  マスク    {path}");
     }
     print_warnings(&report.warnings);
+}
+
+fn print_batch(report: &BatchReport) {
+    for item in &report.results {
+        match (&item.result, &item.error) {
+            (Some(r), _) => {
+                let out = &r.outputs[0];
+                let mark = if r.warnings.is_empty() { " " } else { "!" };
+                println!(
+                    "{mark} {}  {}x{}  {}",
+                    item.output,
+                    out.width,
+                    out.height,
+                    human_bytes(out.bytes)
+                );
+                for w in &r.warnings {
+                    eprintln!("  警告 [{}]: {w}", item.input);
+                }
+            }
+            (_, Some(e)) => {
+                println!("x {}  失敗", item.input);
+                eprintln!("  エラー [{}]: {}: {}", item.input, e.code, e.message);
+            }
+            _ => {}
+        }
+    }
+    println!(
+        "\n{} 件中 {} 件成功、{} 件失敗、{} 件に警告  ({} ms)",
+        report.total, report.succeeded, report.failed, report.with_warnings, report.elapsed_ms
+    );
 }
 
 fn print_warnings(warnings: &[String]) {

@@ -31,6 +31,16 @@ impl OutputFormat {
         !matches!(self, OutputFormat::Jpeg)
     }
 
+    /// 名前から出力形式を得る。仕様ファイルの "format" 用。
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "avif" => Some(OutputFormat::Avif),
+            "png" => Some(OutputFormat::Png),
+            "jpeg" | "jpg" => Some(OutputFormat::Jpeg),
+            _ => None,
+        }
+    }
+
     /// 拡張子から出力形式を推論する。
     pub fn from_path(path: &Path) -> Option<Self> {
         let ext = path.extension()?.to_str()?.to_ascii_lowercase();
@@ -233,6 +243,14 @@ mod tests {
         );
         assert_eq!(OutputFormat::from_path(Path::new("a.webp")), None);
         assert_eq!(OutputFormat::from_path(Path::new("noext")), None);
+    }
+
+    #[test]
+    fn format_names_are_parsed_case_insensitively() {
+        assert_eq!(OutputFormat::from_name("avif"), Some(OutputFormat::Avif));
+        assert_eq!(OutputFormat::from_name("JPEG"), Some(OutputFormat::Jpeg));
+        assert_eq!(OutputFormat::from_name("jpg"), Some(OutputFormat::Jpeg));
+        assert_eq!(OutputFormat::from_name("webp"), None);
     }
 
     #[test]

@@ -12,7 +12,7 @@ use serde::Serialize;
 use kiri::cli::{Cli, Command};
 use kiri::commands;
 use kiri::error::{Error, Result};
-use kiri::report::{ConvertReport, ErrorReport, InfoReport};
+use kiri::report::{ErrorReport, InfoReport, ProcessReport};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -40,7 +40,15 @@ fn dispatch(cli: &Cli) -> Result<()> {
             if cli.json {
                 print_json(&report)?;
             } else {
-                print_convert(&report);
+                print_process(&report);
+            }
+        }
+        Command::Resize(args) => {
+            let report = commands::resize::run(args)?;
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                print_process(&report);
             }
         }
     }
@@ -100,7 +108,7 @@ fn print_info(report: &InfoReport) {
     print_warnings(&report.warnings);
 }
 
-fn print_convert(report: &ConvertReport) {
+fn print_process(report: &ProcessReport) {
     for out in &report.outputs {
         println!(
             "{}  {}x{}  {}  {}  ({} ms)",

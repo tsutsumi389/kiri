@@ -71,7 +71,7 @@ pub struct Dimensions {
 }
 
 #[derive(Debug, Serialize)]
-pub struct ConvertReport {
+pub struct ProcessReport {
     pub input: String,
     pub source: Dimensions,
     pub outputs: Vec<OutputReport>,

@@ -9,6 +9,7 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::cutout::background::DEFAULT_BORDER;
 use crate::image_io::OutputFormat;
+use crate::transform::FitMode;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -34,6 +35,8 @@ pub enum Command {
     Info(InfoArgs),
     /// 画像形式を変換する
     Convert(ConvertArgs),
+    /// 画像をリサイズする
+    Resize(ResizeArgs),
 }
 
 #[derive(Args, Debug)]
@@ -46,11 +49,9 @@ pub struct InfoArgs {
     pub border: u32,
 }
 
+/// 出力に関する共通オプション。convert と resize で同じものを使う。
 #[derive(Args, Debug)]
-pub struct ConvertArgs {
-    /// 入力画像（JPEG または PNG）
-    pub input: PathBuf,
-
+pub struct OutputOpts {
     /// 出力先。拡張子から形式を推論する
     #[arg(short, long)]
     pub output: PathBuf,
@@ -74,6 +75,40 @@ pub struct ConvertArgs {
     /// 出力先が既に存在する場合に上書きする
     #[arg(long)]
     pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ConvertArgs {
+    /// 入力画像（JPEG または PNG）
+    pub input: PathBuf,
+
+    #[command(flatten)]
+    pub out: OutputOpts,
+}
+
+#[derive(Args, Debug)]
+pub struct ResizeArgs {
+    /// 入力画像（JPEG または PNG）
+    pub input: PathBuf,
+
+    /// 出力の幅(px)。height と併せて枠を指定する
+    #[arg(long)]
+    pub width: Option<u32>,
+
+    /// 出力の高さ(px)。width と併せて枠を指定する
+    #[arg(long)]
+    pub height: Option<u32>,
+
+    /// 枠への当てはめ方。width か height の一方だけを指定した場合は無視される
+    #[arg(long, value_enum, default_value_t = FitMode::Contain)]
+    pub fit: FitMode,
+
+    /// 元画像より大きくすることを許す（画質は劣化する）
+    #[arg(long)]
+    pub allow_upscale: bool,
+
+    #[command(flatten)]
+    pub out: OutputOpts,
 }
 
 /// `#RRGGBB` / `RRGGBB` / `#RGB` を受け付ける。

@@ -4,7 +4,7 @@ AIエージェントから使われることを前提とした、EC商品画像�
 
 単色背景の商品写真を対象に、背景透過の切り抜き・リサイズ・キャンバス配置・Web配信形式への変換を1コマンドで行う。
 
-> **開発中です。** 現在 `info` と `convert` が動作します。主機能である `cutout` は実装中です。
+> **開発中です。** 現在 `info` / `convert` / `resize` が動作します。主機能である `cutout` は実装中です。
 > 進捗は [docs/implementation-plan.md](docs/implementation-plan.md) を参照してください。
 
 ## 特徴
@@ -71,6 +71,38 @@ $ kiri convert product.jpg -o product.avif --json
 | `--effort` | 6 | AVIFのエンコード速度 1-10。小さいほど高品質・低速 |
 | `--background` | `#FFFFFF` | 透過を保持できない形式へ出力する際の合成色 |
 | `--force` | | 出力先が既に存在する場合に上書きする |
+
+### kiri resize
+
+`--width` と `--height` の一方だけを指定すればアスペクト比を保って拡縮する。
+両方指定した場合は `--fit` が枠への当てはめ方を決める。
+
+```
+$ kiri resize product.jpg -o product.avif --width 1000
+product.avif  1000x1250  avif  4.0 KB  (108 ms)
+```
+
+| `--fit` | 挙動 | 1600×2000 を 1000×1000 の枠へ |
+|---|---|---|
+| `contain`（既定） | 枠に収まるよう縮小。アスペクト比を保つ | 800×1000 |
+| `cover` | 枠を覆うよう縮小し、はみ出しを中央で切る | 1000×1000 |
+| `exact` | アスペクト比を無視して枠ちょうどに変形 | 1000×1000 |
+
+**拡大は既定で拒否する。** 要求サイズが元画像より大きい場合はエラーになる。
+黙って縮めると出力が要求と食い違い、バッチ処理で気づけないため。
+
+```
+$ kiri resize small.jpg -o out.avif --width 3000 --json
+{
+  "error": {
+    "code": "UPSCALE_NOT_ALLOWED",
+    "message": "1600x2000 から 3000x3750 への拡大が必要です",
+    "hint": "--allow-upscale を付けると拡大しますが、画質は劣化します"
+  }
+}
+```
+
+補間は Lanczos3。透過画像は事前乗算つきで補間するため、境界に背景色がにじまない。
 
 ## 対応形式
 

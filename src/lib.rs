@@ -10,5 +10,6 @@ pub mod cutout;
 pub mod error;
 pub mod image_io;
 pub mod report;
+pub mod transform;
 
 pub use error::{Error, ErrorKind, Result};

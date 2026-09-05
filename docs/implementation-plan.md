@@ -91,7 +91,7 @@ GitHub Actions で以下を実行する。
 
 - [x] Phase 0: 土台
 - [x] Phase 1: I/O と `kiri info` / `kiri convert`
-- [ ] Phase 2: `kiri resize`
+- [x] Phase 2: `kiri resize`
 - [ ] Phase 3: 切り抜きコア
 - [ ] Phase 4: EC整形
 - [ ] Phase 5: バッチ

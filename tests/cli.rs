@@ -483,3 +483,266 @@ fn the_output_path_parent_is_created_if_missing() {
     );
     assert!(Path::new(&output).exists());
 }
+
+// --- resize ---
+
+#[test]
+fn resize_by_width_preserves_the_aspect_ratio() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 400,
+        height: 500,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    let out = kiri()
+        .args([
+            "resize",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--width",
+            "200",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    assert_eq!(v["source"]["width"], 400);
+    assert_eq!(v["outputs"][0]["width"], 200);
+    assert_eq!(v["outputs"][0]["height"], 250);
+}
+
+#[test]
+fn resize_fit_modes_produce_the_documented_shapes() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 400,
+        height: 500,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    // 400x500 を 200x200 の枠へ
+    let cases = [
+        ("contain", 160, 200), // 枠に収まる
+        ("cover", 200, 200),   // 枠ちょうど（はみ出しは切る）
+        ("exact", 200, 200),   // 枠ちょうど（比率無視）
+    ];
+    for (fit, w, h) in cases {
+        let output = dir.path().join(format!("{fit}.png"));
+        let out = kiri()
+            .args([
+                "resize",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--width",
+                "200",
+                "--height",
+                "200",
+                "--fit",
+                fit,
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{fit}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let v = json_stdout(&out);
+        assert_eq!(v["outputs"][0]["width"], w, "fit={fit}");
+        assert_eq!(v["outputs"][0]["height"], h, "fit={fit}");
+    }
+}
+
+#[test]
+fn resize_rejects_upscaling_by_default() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    let out = kiri()
+        .args([
+            "resize",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--width",
+            "800",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(2));
+    let v = json_stdout(&out);
+    assert_eq!(v["error"]["code"], "UPSCALE_NOT_ALLOWED");
+    assert!(!output.exists(), "拒否したのにファイルを作っている");
+}
+
+#[test]
+fn resize_upscales_with_an_explicit_flag_and_warns() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    let out = kiri()
+        .args([
+            "resize",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--width",
+            "400",
+            "--allow-upscale",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let v = json_stdout(&out);
+    assert_eq!(v["outputs"][0]["width"], 400);
+    let warnings = v["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("拡大しました")),
+        "拡大した旨の警告がない: {warnings:?}"
+    );
+}
+
+#[test]
+fn resize_without_any_dimension_is_an_argument_error() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 100,
+        height: 100,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    let out = kiri()
+        .args([
+            "resize",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(json_stdout(&out)["error"]["code"], "MISSING_DIMENSION");
+}
+
+#[test]
+fn resize_can_change_the_format_at_the_same_time() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 400,
+        height: 400,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.avif");
+
+    let out = kiri()
+        .args([
+            "resize",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--width",
+            "200",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let v = json_stdout(&out);
+    assert_eq!(v["outputs"][0]["format"], "avif");
+    assert_eq!(v["outputs"][0]["width"], 200);
+}
+
+#[test]
+fn resize_preserves_transparency() {
+    let dir = fixture_dir();
+    let input = write_png(dir.path(), "cut.png", &transparent_product(200, 200));
+    let output = dir.path().join("small.png");
+
+    let out = kiri()
+        .args([
+            "resize",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--width",
+            "100",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // 出力を読み直して、透過が残っていることを確かめる
+    let check = kiri()
+        .args(["info", output.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(json_stdout(&check)["has_alpha"], true);
+}
+
+#[test]
+fn resize_respects_the_overwrite_guard() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 100,
+        height: 100,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+    std::fs::write(&output, b"existing").unwrap();
+
+    let out = kiri()
+        .args([
+            "resize",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--width",
+            "50",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(json_stdout(&out)["error"]["code"], "OUTPUT_EXISTS");
+    assert_eq!(std::fs::read(&output).unwrap(), b"existing");
+}

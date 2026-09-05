@@ -37,6 +37,8 @@ pub enum Command {
     Convert(ConvertArgs),
     /// 画像をリサイズする
     Resize(ResizeArgs),
+    /// 背景を透過して商品を切り抜く
+    Cutout(CutoutArgs),
 }
 
 #[derive(Args, Debug)]
@@ -111,6 +113,96 @@ pub struct ResizeArgs {
     pub out: OutputOpts,
 }
 
+#[derive(Args, Debug)]
+pub struct CutoutArgs {
+    /// 入力画像（JPEG または PNG）
+    pub input: PathBuf,
+
+    /// 切り抜く範囲 x1,y1,x2,y2（左上原点）。この外側は無条件に背景とする。
+    /// 未指定なら全自動で判定する
+    #[arg(long, value_parser = parse_bbox, allow_hyphen_values = false)]
+    pub bbox: Option<[f64; 4]>,
+
+    /// --bbox と --fg-seed の座標を 0.0-1.0 の正規化座標として解釈する
+    #[arg(long)]
+    pub normalized: bool,
+
+    /// 「ここは必ず前景」と指定する座標 x,y。複数回指定できる
+    #[arg(long = "fg-seed", value_parser = parse_point)]
+    pub fg_seed: Vec<[f64; 2]>,
+
+    /// 背景色との色差(ΔE)の許容量。大きいほど広く背景として飲み込む
+    #[arg(long, default_value_t = 12.0)]
+    pub tolerance: f64,
+
+    /// 背景色推定に使う外周の幅(px)
+    #[arg(long, default_value_t = DEFAULT_BORDER)]
+    pub border: u32,
+
+    /// 孤立ノイズの除去と小さな穴埋めの半径(px)。0 で無効
+    #[arg(long, default_value_t = 2)]
+    pub cleanup: u32,
+
+    /// 境界フェザリングの半径(px)。0 で無効
+    #[arg(long, default_value_t = 1)]
+    pub feather: u32,
+
+    /// 1px あたりの輝度変化がこの値を超える輪郭でフィルを止める。0 で無効。
+    /// 淡い色の商品が背景ごと消えるのを防ぐ
+    #[arg(long, default_value_t = 8.0)]
+    pub edge_threshold: f64,
+
+    /// 境界の色かぶり除去を行わない
+    #[arg(long)]
+    pub no_despill: bool,
+
+    /// 生成したマスクを PNG として書き出す（目視確認用）
+    #[arg(long, value_name = "PATH")]
+    pub debug_mask: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub out: OutputOpts,
+}
+
+/// `x1,y1,x2,y2` を受け付ける。
+pub fn parse_bbox(s: &str) -> Result<[f64; 4], String> {
+    let v = parse_numbers(s, 4)?;
+    let bbox = [v[0], v[1], v[2], v[3]];
+    if bbox[0] >= bbox[2] || bbox[1] >= bbox[3] {
+        return Err(format!("'{s}' は x1<x2, y1<y2 を満たしていません"));
+    }
+    Ok(bbox)
+}
+
+/// `x,y` を受け付ける。
+pub fn parse_point(s: &str) -> Result<[f64; 2], String> {
+    let v = parse_numbers(s, 2)?;
+    Ok([v[0], v[1]])
+}
+
+fn parse_numbers(s: &str, expected: usize) -> Result<Vec<f64>, String> {
+    let parts: Vec<&str> = s.split(',').map(str::trim).collect();
+    if parts.len() != expected {
+        return Err(format!(
+            "'{s}' はカンマ区切りの数値 {expected} 個である必要があります"
+        ));
+    }
+    parts
+        .iter()
+        .map(|p| {
+            p.parse::<f64>()
+                .map_err(|_| format!("'{p}' を数値として解釈できません"))
+        })
+        .collect::<Result<Vec<f64>, String>>()
+        .and_then(|v| {
+            if v.iter().any(|x| !x.is_finite() || *x < 0.0) {
+                Err(format!("'{s}' に負数または不正な値が含まれています"))
+            } else {
+                Ok(v)
+            }
+        })
+}
+
 /// `#RRGGBB` / `RRGGBB` / `#RGB` を受け付ける。
 pub fn parse_hex_color(s: &str) -> Result<[u8; 3], String> {
     let hex = s.strip_prefix('#').unwrap_or(s);
@@ -167,6 +259,35 @@ mod tests {
         assert!(parse_hex_color("#12345").is_err());
         assert!(parse_hex_color("white").is_err());
         assert!(parse_hex_color("").is_err());
+    }
+
+    #[test]
+    fn parses_a_bbox() {
+        assert_eq!(parse_bbox("10,20,300,400"), Ok([10.0, 20.0, 300.0, 400.0]));
+        assert_eq!(parse_bbox("0.1, 0.2, 0.8, 0.9"), Ok([0.1, 0.2, 0.8, 0.9]));
+    }
+
+    #[test]
+    fn rejects_an_inverted_or_malformed_bbox() {
+        assert!(
+            parse_bbox("300,20,10,400").is_err(),
+            "x1>x2 を許してはいけない"
+        );
+        assert!(
+            parse_bbox("10,400,300,20").is_err(),
+            "y1>y2 を許してはいけない"
+        );
+        assert!(parse_bbox("10,10,10,20").is_err(), "幅0を許してはいけない");
+        assert!(parse_bbox("10,20,30").is_err());
+        assert!(parse_bbox("a,b,c,d").is_err());
+        assert!(parse_bbox("-1,0,10,10").is_err(), "負数を許してはいけない");
+    }
+
+    #[test]
+    fn parses_a_point() {
+        assert_eq!(parse_point("120,80"), Ok([120.0, 80.0]));
+        assert_eq!(parse_point("0.5,0.5"), Ok([0.5, 0.5]));
+        assert!(parse_point("1,2,3").is_err());
     }
 
     #[test]

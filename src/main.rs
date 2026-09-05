@@ -12,7 +12,7 @@ use serde::Serialize;
 use kiri::cli::{Cli, Command};
 use kiri::commands;
 use kiri::error::{Error, Result};
-use kiri::report::{ErrorReport, InfoReport, ProcessReport};
+use kiri::report::{CutoutReport, ErrorReport, InfoReport, ProcessReport};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -49,6 +49,14 @@ fn dispatch(cli: &Cli) -> Result<()> {
                 print_json(&report)?;
             } else {
                 print_process(&report);
+            }
+        }
+        Command::Cutout(args) => {
+            let report = commands::cutout::run(args)?;
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                print_cutout(&report);
             }
         }
     }
@@ -119,6 +127,37 @@ fn print_process(report: &ProcessReport) {
             human_bytes(out.bytes),
             report.elapsed_ms
         );
+    }
+    print_warnings(&report.warnings);
+}
+
+fn print_cutout(report: &CutoutReport) {
+    let [r, g, b] = report.background.rgb;
+    for out in &report.outputs {
+        println!(
+            "{}  {}x{}  {}  {}  ({} ms)",
+            out.path,
+            out.width,
+            out.height,
+            out.format,
+            human_bytes(out.bytes),
+            report.elapsed_ms
+        );
+    }
+    println!(
+        "  背景色    #{r:02X}{g:02X}{b:02X}  (均一度 {:.2}, tolerance {})",
+        report.background.uniformity, report.tolerance
+    );
+    println!("  前景比率  {:.1}%", report.mask.foreground_ratio * 100.0);
+    match report.mask.bbox {
+        Some([x1, y1, x2, y2]) => println!("  前景範囲  {x1},{y1} - {x2},{y2}"),
+        None => println!("  前景範囲  なし"),
+    }
+    if report.mask.touches_edge {
+        println!("  外周接触  あり");
+    }
+    if let Some(path) = &report.mask.debug_mask {
+        println!("  マスク    {path}");
     }
     print_warnings(&report.warnings);
 }

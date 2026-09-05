@@ -38,6 +38,31 @@ pub fn ensure_writable(opts: &OutputOpts) -> Result<()> {
     Ok(())
 }
 
+/// 画像を書き出し、出力レポートと警告を返す。
+pub fn write_image(
+    image: &RgbaImage,
+    opts: &OutputOpts,
+    format: OutputFormat,
+) -> Result<(OutputReport, Vec<String>)> {
+    let save_opts = SaveOptions {
+        format,
+        quality: opts.quality,
+        effort: opts.effort,
+        background: opts.background,
+    };
+    let outcome = save(&opts.output, image, &save_opts)?;
+    Ok((
+        OutputReport {
+            path: opts.output.display().to_string(),
+            format: format.as_str().to_string(),
+            width: image.width(),
+            height: image.height(),
+            bytes: outcome.bytes,
+        },
+        outcome.warnings,
+    ))
+}
+
 /// 書き出して結果レポートを組み立てる。
 pub fn finish(
     input: &Path,

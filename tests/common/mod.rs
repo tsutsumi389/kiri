@@ -145,3 +145,26 @@ pub fn write_jpeg(dir: &Path, name: &str, img: &RgbaImage) -> PathBuf {
         .unwrap();
     path
 }
+
+/// 白背景に「ほぼ白い商品」を置いた、切り抜きの最難ケース。
+///
+/// 商品本体と背景の色差はごくわずかで、両者を分ける手がかりは商品の輪郭に
+/// 生じるわずかな陰影だけになる。実写のライティングでは必ず生じるもの。
+pub fn light_product_image(width: u32, height: u32) -> RgbaImage {
+    let mut img = RgbaImage::from_pixel(width, height, Rgba([250, 250, 249, 255]));
+    let (x1, y1) = (width / 4, height / 4);
+    let (x2, y2) = (width * 3 / 4, height * 3 / 4);
+
+    for y in y1..y2 {
+        for x in x1..x2 {
+            // 縁 2px だけ陰影を入れる。ここが唯一の手がかりになる。
+            // 236 は背景(250)との色差が ΔE 5 程度しかなく、既定の許容量 12 では
+            // 色だけでは止まらない。1px あたり 14 の急峻な変化があることだけが
+            // 商品の輪郭である証拠になる
+            let on_edge = x < x1 + 2 || y < y1 + 2 || x >= x2 - 2 || y >= y2 - 2;
+            let c = if on_edge { 236 } else { 242 };
+            img.put_pixel(x, y, Rgba([c, c, c - 2, 255]));
+        }
+    }
+    img
+}

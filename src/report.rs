@@ -78,3 +78,33 @@ pub struct ProcessReport {
     pub elapsed_ms: u128,
     pub warnings: Vec<String>,
 }
+
+#[derive(Debug, Serialize)]
+pub struct MaskReport {
+    /// 前景が画像全体に占める割合。極端な値は失敗の兆候
+    pub foreground_ratio: f64,
+    /// 前景の外接矩形 [x1, y1, x2, y2]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bbox: Option<[u32; 4]>,
+    /// 前景が画像の外周に接しているか（商品の見切れ）
+    pub touches_edge: bool,
+    /// --debug-mask で書き出したマスク画像のパス
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debug_mask: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CutoutReport {
+    pub input: String,
+    pub source: Dimensions,
+    pub outputs: Vec<OutputReport>,
+    pub background: BackgroundReport,
+    /// 実際に適用された色差の許容量
+    pub tolerance: f64,
+    /// 実際に適用された bbox（未指定なら None）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_bbox: Option<[u32; 4]>,
+    pub mask: MaskReport,
+    pub elapsed_ms: u128,
+    pub warnings: Vec<String>,
+}

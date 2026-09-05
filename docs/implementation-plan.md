@@ -24,6 +24,7 @@ src/
     background.rs      背景色推定、uniformity 算出
     floodfill.rs       外周シードの連結フラッドフィル
     morphology.rs      オープニング / クロージング
+    edges.rs           Sobel による輪郭強度（フラッドフィルの堤防）
     feather.rs         境界フェザリング
     despill.rs         色かぶり除去
     mask.rs            マスク型と統計（foreground_ratio, bbox, touches_edge）
@@ -92,7 +93,7 @@ GitHub Actions で以下を実行する。
 - [x] Phase 0: 土台
 - [x] Phase 1: I/O と `kiri info` / `kiri convert`
 - [x] Phase 2: `kiri resize`
-- [ ] Phase 3: 切り抜きコア
+- [x] Phase 3: 切り抜きコア
 - [ ] Phase 4: EC整形
 - [ ] Phase 5: バッチ
 - [ ] Phase 6: 仕上げ

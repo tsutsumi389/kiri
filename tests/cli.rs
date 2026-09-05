@@ -746,3 +746,404 @@ fn resize_respects_the_overwrite_guard() {
     assert_eq!(json_stdout(&out)["error"]["code"], "OUTPUT_EXISTS");
     assert_eq!(std::fs::read(&output).unwrap(), b"existing");
 }
+
+// --- cutout ---
+
+use common::light_product_image;
+
+#[test]
+fn cutout_makes_the_background_transparent() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_jpeg(dir.path(), "in.jpg", &img);
+    let output = dir.path().join("cut.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let v = json_stdout(&out);
+    let ratio = v["mask"]["foreground_ratio"].as_f64().unwrap();
+    assert!((0.05..0.6).contains(&ratio), "前景比率が不自然: {ratio}");
+    assert_eq!(v["mask"]["touches_edge"], false);
+    assert!(v["mask"]["bbox"].is_array());
+
+    // 出力を読み直して透過が生まれていることを確認
+    let check = kiri()
+        .args(["info", output.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(json_stdout(&check)["has_alpha"], true);
+}
+
+#[test]
+fn cutout_reports_the_background_it_used() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 150,
+        height: 150,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("cut.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--tolerance",
+            "9",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    let v = json_stdout(&out);
+    assert_eq!(v["tolerance"], 9.0);
+    let rgb: Vec<u64> = v["background"]["rgb"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_u64().unwrap())
+        .collect();
+    for c in rgb {
+        assert!((240..=255).contains(&c), "背景色が白付近でない: {c}");
+    }
+}
+
+/// 設計の核心。淡い商品が背景ごと消えないのはエッジ堤防が効いているため。
+#[test]
+fn the_edge_dam_saves_a_light_product_on_a_light_background() {
+    let dir = fixture_dir();
+    let input = write_png(dir.path(), "light.png", &light_product_image(200, 200));
+
+    let ratio = |extra: &[&str]| -> f64 {
+        let output = dir.path().join(format!("out{}.png", extra.join("")));
+        let mut args = vec![
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        let out = kiri().args(&args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        json_stdout(&out)["mask"]["foreground_ratio"]
+            .as_f64()
+            .unwrap()
+    };
+
+    // 商品は画像の 1/4 〜 3/4 を占めるので、前景比率は 0.25 前後になるはず
+    let with_dam = ratio(&[]);
+    assert!(
+        (0.20..0.32).contains(&with_dam),
+        "堤防が効いていれば商品全体が残るはず: {with_dam}"
+    );
+
+    let without_dam = ratio(&["--edge-threshold", "0"]);
+    assert!(
+        without_dam < with_dam / 2.0,
+        "堤防を切っても結果が変わらない（堤防が効いていない）: {without_dam} vs {with_dam}"
+    );
+}
+
+#[test]
+fn cutout_restricts_the_result_to_the_given_bbox() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("cut.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--bbox",
+            "60,60,120,120",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    assert_eq!(v["applied_bbox"], serde_json::json!([60, 60, 120, 120]));
+
+    let bbox: Vec<u64> = v["mask"]["bbox"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_u64().unwrap())
+        .collect();
+    assert!(
+        bbox[0] >= 60 && bbox[1] >= 60,
+        "bbox の外が残っている: {bbox:?}"
+    );
+    assert!(
+        bbox[2] <= 120 && bbox[3] <= 120,
+        "bbox の外が残っている: {bbox:?}"
+    );
+}
+
+#[test]
+fn cutout_accepts_normalized_coordinates() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 400,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("cut.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--bbox",
+            "0.25,0.25,0.75,0.75",
+            "--normalized",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    assert_eq!(
+        json_stdout(&out)["applied_bbox"],
+        serde_json::json!([50, 100, 150, 300])
+    );
+}
+
+#[test]
+fn pixel_coordinates_passed_as_normalized_are_rejected() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("cut.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--bbox",
+            "20,20,180,180",
+            "--normalized",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(json_stdout(&out)["error"]["code"], "INVALID_BBOX");
+}
+
+#[test]
+fn debug_mask_is_written_and_reported() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 150,
+        height: 150,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("cut.png");
+    let mask = dir.path().join("mask.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--debug-mask",
+            mask.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    assert!(mask.exists(), "マスクが書き出されていない");
+    assert_eq!(
+        json_stdout(&out)["mask"]["debug_mask"],
+        mask.to_str().unwrap()
+    );
+}
+
+#[test]
+fn cutout_warns_when_almost_nothing_is_removed() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 150,
+        height: 150,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("cut.png");
+
+    // 許容量 0 なら背景がほぼ残る。AI がこれを検出できること
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--tolerance",
+            "0",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let v = json_stdout(&out);
+    let warnings = v["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|w| w
+            .as_str()
+            .unwrap()
+            .contains("背景がほとんど除去されていません")),
+        "失敗が検出できていない: {warnings:?}"
+    );
+}
+
+#[test]
+fn cutout_flags_a_product_running_off_the_frame() {
+    let dir = fixture_dir();
+    // 商品が下端まで伸びて見切れている状態を作る。
+    // 全面を商品にすると外周サンプルまで商品色になり、背景推定自体が成立しない
+    let mut img = image::RgbaImage::from_pixel(120, 120, image::Rgba([250, 250, 249, 255]));
+    for y in 70..120 {
+        for x in 40..80 {
+            img.put_pixel(x, y, image::Rgba([40, 40, 40, 255]));
+        }
+    }
+    let input = write_png(dir.path(), "cropped.png", &img);
+    let output = dir.path().join("cut.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let v = json_stdout(&out);
+    assert_eq!(v["mask"]["touches_edge"], true);
+    let warnings = v["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("見切れ"))
+    );
+}
+
+#[test]
+fn cutout_respects_the_overwrite_guard() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 100,
+        height: 100,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("cut.png");
+    std::fs::write(&output, b"existing").unwrap();
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(json_stdout(&out)["error"]["code"], "OUTPUT_EXISTS");
+}
+
+#[test]
+fn cutout_to_jpeg_composites_onto_the_given_background() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("flat.jpg");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--background",
+            "#FFFFFF",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let v = json_stdout(&out);
+    assert_eq!(v["outputs"][0]["format"], "jpeg");
+    assert!(
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("透過を保持できない"))
+    );
+}

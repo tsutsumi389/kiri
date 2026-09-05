@@ -1,0 +1,41 @@
+[package]
+name = "kiri"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "AI-friendly image cutout CLI for e-commerce product photos"
+repository = "https://github.com/tsutsumi389/kiri"
+readme = "README.md"
+keywords = ["image", "cutout", "avif", "cli", "ecommerce"]
+categories = ["command-line-utilities", "multimedia::images"]
+
+# パッケージ名を後から変更してもコマンド名が揺れないよう明示する
+[[bin]]
+name = "kiri"
+path = "src/main.rs"
+
+[lib]
+name = "kiri"
+path = "src/lib.rs"
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+ravif = "0.13"
+rgb = "0.8"
+imgref = "1.10"
+kamadak-exif = "0.6"
+clap = { version = "4.6", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3.27.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

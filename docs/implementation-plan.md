@@ -89,8 +89,8 @@ GitHub Actions で以下を実行する。
 
 ## 5. 進捗
 
-- [ ] Phase 0: 土台
-- [ ] Phase 1: I/O と `kiri info` / `kiri convert`
+- [x] Phase 0: 土台
+- [x] Phase 1: I/O と `kiri info` / `kiri convert`
 - [ ] Phase 2: `kiri resize`
 - [ ] Phase 3: 切り抜きコア
 - [ ] Phase 4: EC整形

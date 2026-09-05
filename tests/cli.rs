@@ -1147,3 +1147,364 @@ fn cutout_to_jpeg_composites_onto_the_given_background() {
             .any(|w| w.as_str().unwrap().contains("透過を保持できない"))
     );
 }
+
+// --- キャンバス配置 (Phase 4) ---
+
+/// 指定サイズ・占有率で切り抜き結果を配置し、JSON から配置情報を取り出す。
+fn cutout_on_canvas(dir: &Path, input: &Path, name: &str, extra: &[&str]) -> Value {
+    let output = dir.join(name);
+    let mut args = vec![
+        "cutout",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--json",
+    ];
+    args.extend_from_slice(extra);
+    let out = kiri().args(&args).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{name}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    json_stdout(&out)
+}
+
+#[test]
+fn canvas_produces_exactly_the_requested_size() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 300,
+        height: 400,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let v = cutout_on_canvas(dir.path(), &input, "out.png", &["--canvas", "500x500"]);
+    assert_eq!(v["outputs"][0]["width"], 500);
+    assert_eq!(v["outputs"][0]["height"], 500);
+    assert_eq!(v["canvas"]["width"], 500);
+    assert_eq!(v["canvas"]["height"], 500);
+}
+
+#[test]
+fn a_single_number_canvas_means_square() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let v = cutout_on_canvas(dir.path(), &input, "out.png", &["--canvas", "600"]);
+    assert_eq!(v["outputs"][0]["width"], 600);
+    assert_eq!(v["outputs"][0]["height"], 600);
+}
+
+#[test]
+fn fill_ratio_controls_how_much_of_the_canvas_the_product_takes() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 300,
+        height: 300,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let long_side = |v: &Value| -> u64 {
+        let c = v["canvas"]["content"].as_array().unwrap();
+        c[0].as_u64().unwrap().max(c[1].as_u64().unwrap())
+    };
+
+    let tight = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "a.png",
+        &["--canvas", "1000", "--fill-ratio", "0.5"],
+    );
+    let loose = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "b.png",
+        &["--canvas", "1000", "--fill-ratio", "0.9"],
+    );
+
+    assert_eq!(
+        long_side(&tight),
+        500,
+        "占有率 0.5 なら長辺は 500 になるはず"
+    );
+    assert_eq!(
+        long_side(&loose),
+        900,
+        "占有率 0.9 なら長辺は 900 になるはず"
+    );
+}
+
+/// --fill-ratio の目的。構図の異なる商品でも並べたときの見た目が揃うこと。
+#[test]
+fn products_of_different_sizes_end_up_the_same_size_on_the_canvas() {
+    let dir = fixture_dir();
+    // 同じ縦横比で、画像内での占有面積だけが違う2枚を作る
+    let small = product_image(&ProductSpec {
+        width: 400,
+        height: 400,
+        ..Default::default()
+    });
+    let large = product_image(&ProductSpec {
+        width: 800,
+        height: 800,
+        ..Default::default()
+    });
+    let a = write_png(dir.path(), "small.png", &small);
+    let b = write_png(dir.path(), "large.png", &large);
+
+    let opts = ["--canvas", "1000", "--fill-ratio", "0.8"];
+    let va = cutout_on_canvas(dir.path(), &a, "a.png", &opts);
+    let vb = cutout_on_canvas(dir.path(), &b, "b.png", &opts);
+
+    let content = |v: &Value| -> (u64, u64) {
+        let c = v["canvas"]["content"].as_array().unwrap();
+        (c[0].as_u64().unwrap(), c[1].as_u64().unwrap())
+    };
+    let (aw, ah) = content(&va);
+    let (bw, bh) = content(&vb);
+    assert!(
+        aw.abs_diff(bw) <= 2 && ah.abs_diff(bh) <= 2,
+        "元の解像度が違っても同じ大きさに揃うべき: {aw}x{ah} と {bw}x{bh}"
+    );
+
+    // 中央に置かれていること
+    let offset = |v: &Value| -> (u64, u64) {
+        let o = v["canvas"]["offset"].as_array().unwrap();
+        (o[0].as_u64().unwrap(), o[1].as_u64().unwrap())
+    };
+    let placed = offset(&va).0 * 2 + aw;
+    assert!(
+        placed.abs_diff(1000) <= 1,
+        "左右の余白が均等でない: {placed} (キャンバス 1000)"
+    );
+}
+
+#[test]
+fn canvas_margins_are_transparent_by_default() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--canvas",
+            "400",
+            "--fill-ratio",
+            "0.5",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let check = kiri()
+        .args(["info", output.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        json_stdout(&check)["has_alpha"],
+        true,
+        "余白が透明になっていない"
+    );
+}
+
+#[test]
+fn flatten_removes_transparency_even_for_png() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--canvas",
+            "400",
+            "--flatten",
+            "--background",
+            "#FFFFFF",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let check = kiri()
+        .args(["info", output.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let v = json_stdout(&check);
+    assert_eq!(
+        v["has_alpha"], false,
+        "--flatten を指定したのに透過が残っている"
+    );
+    // 塗り潰し色が背景として検出される
+    assert_eq!(v["background"]["rgb"], serde_json::json!([255, 255, 255]));
+}
+
+#[test]
+fn flatten_works_without_a_canvas_too() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 150,
+        height: 150,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--flatten",
+            "--background",
+            "#00FF00",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let check = kiri()
+        .args(["info", output.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let v = json_stdout(&check);
+    assert_eq!(v["has_alpha"], false);
+    assert_eq!(v["background"]["rgb"], serde_json::json!([0, 255, 0]));
+}
+
+#[test]
+fn scaling_up_onto_a_canvas_is_reported_and_warned() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 100,
+        height: 100,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let v = cutout_on_canvas(dir.path(), &input, "out.png", &["--canvas", "1000"]);
+    let scale = v["canvas"]["scale"].as_f64().unwrap();
+    assert!(scale > 1.0, "拡大しているのに倍率が 1 以下: {scale}");
+    assert!(
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("拡大して配置")),
+        "拡大の警告がない"
+    );
+}
+
+#[test]
+fn an_invalid_fill_ratio_is_an_argument_error() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 100,
+        height: 100,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    for bad in ["0", "1.5"] {
+        let out = kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--canvas",
+                "500",
+                "--fill-ratio",
+                bad,
+                "--json",
+                "--force",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "fill-ratio={bad} が通ってしまった"
+        );
+        assert_eq!(json_stdout(&out)["error"]["code"], "INVALID_FILL_RATIO");
+    }
+}
+
+#[test]
+fn a_canvas_without_any_foreground_is_a_processing_error() {
+    let dir = fixture_dir();
+    // 全面が単色。前景が検出できないので配置しようがない
+    let img = image::RgbaImage::from_pixel(120, 120, image::Rgba([250, 250, 249, 255]));
+    let input = write_png(dir.path(), "flat.png", &img);
+    let output = dir.path().join("out.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--canvas",
+            "500",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(4), "処理失敗は exit 4 であるべき");
+    let v = json_stdout(&out);
+    assert_eq!(v["error"]["code"], "NO_FOREGROUND");
+    assert!(v["error"]["hint"].as_str().unwrap().contains("--tolerance"));
+}
+
+#[test]
+fn cutout_without_a_canvas_reports_no_canvas_field() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let v = cutout_on_canvas(dir.path(), &input, "out.png", &[]);
+    assert!(
+        v.get("canvas").is_none(),
+        "キャンバス未指定なのに canvas が出ている"
+    );
+    assert_eq!(v["outputs"][0]["width"], 120, "寸法は元のままであるべき");
+}

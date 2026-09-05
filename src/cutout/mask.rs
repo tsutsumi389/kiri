@@ -76,6 +76,29 @@ impl Mask {
         }
     }
 
+    /// 指定した値を超える画素の外接矩形を返す。
+    ///
+    /// `stats` の bbox は前景判定(128以上)に基づくが、キャンバス配置では
+    /// フェザリングされた薄い縁まで含めたいので閾値を分けられるようにしている。
+    pub fn bbox_above(&self, threshold: u8) -> Option<(u32, u32, u32, u32)> {
+        let mut min = (u32::MAX, u32::MAX);
+        let mut max = (0u32, 0u32);
+        let mut found = false;
+        for y in 0..self.height {
+            for x in 0..self.width {
+                if self.get(x, y) <= threshold {
+                    continue;
+                }
+                found = true;
+                min.0 = min.0.min(x);
+                min.1 = min.1.min(y);
+                max.0 = max.0.max(x);
+                max.1 = max.1.max(y);
+            }
+        }
+        found.then_some((min.0, min.1, max.0, max.1))
+    }
+
     pub fn stats(&self) -> MaskStats {
         let mut count = 0usize;
         let mut min = (u32::MAX, u32::MAX);
@@ -163,6 +186,22 @@ mod tests {
                 "({x},{y}) が外周として検出されない"
             );
         }
+    }
+
+    #[test]
+    fn bbox_above_includes_faint_edges() {
+        let mut mask = Mask::new(10, 10, 0);
+        mask.set(5, 5, 255);
+        // 薄い縁。前景judgeでは拾われないが、キャンバス配置では含めたい
+        mask.set(3, 3, 20);
+        assert_eq!(mask.stats().bbox, Some((5, 5, 5, 5)));
+        assert_eq!(mask.bbox_above(0), Some((3, 3, 5, 5)));
+        assert_eq!(mask.bbox_above(64), Some((5, 5, 5, 5)));
+    }
+
+    #[test]
+    fn bbox_above_is_none_for_an_empty_mask() {
+        assert_eq!(Mask::new(4, 4, 0).bbox_above(0), None);
     }
 
     #[test]

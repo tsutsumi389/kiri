@@ -94,6 +94,19 @@ pub struct MaskReport {
 }
 
 #[derive(Debug, Serialize)]
+pub struct CanvasReport {
+    pub width: u32,
+    pub height: u32,
+    pub fill_ratio: f64,
+    /// キャンバス上に配置された商品の寸法
+    pub content: [u32; 2],
+    /// キャンバス左上からの配置位置
+    pub offset: [u32; 2],
+    /// 元の商品寸法に対する倍率。1.0 を超えていれば拡大している
+    pub scale: f64,
+}
+
+#[derive(Debug, Serialize)]
 pub struct CutoutReport {
     pub input: String,
     pub source: Dimensions,
@@ -105,6 +118,8 @@ pub struct CutoutReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub applied_bbox: Option<[u32; 4]>,
     pub mask: MaskReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canvas: Option<CanvasReport>,
     pub elapsed_ms: u128,
     pub warnings: Vec<String>,
 }

@@ -74,6 +74,10 @@ pub struct OutputOpts {
     #[arg(long, value_parser = parse_hex_color, default_value = "#FFFFFF")]
     pub background: [u8; 3],
 
+    /// 透過を残さず --background の色で塗り潰す
+    #[arg(long)]
+    pub flatten: bool,
+
     /// 出力先が既に存在する場合に上書きする
     #[arg(long)]
     pub force: bool,
@@ -156,12 +160,45 @@ pub struct CutoutArgs {
     #[arg(long)]
     pub no_despill: bool,
 
+    /// 切り抜いた商品を指定サイズのキャンバス中央に配置する。
+    /// 1000x1000 または 1000（正方形）の形式
+    #[arg(long, value_parser = parse_size)]
+    pub canvas: Option<(u32, u32)>,
+
+    /// 商品がキャンバスの何割を占めるか (0.0-1.0)。--canvas 指定時のみ有効。
+    /// 既定の 0.85 は EC プラットフォームで広く求められる占有率に合わせている
+    #[arg(long, default_value_t = 0.85)]
+    pub fill_ratio: f64,
+
     /// 生成したマスクを PNG として書き出す（目視確認用）
     #[arg(long, value_name = "PATH")]
     pub debug_mask: Option<PathBuf>,
 
     #[command(flatten)]
     pub out: OutputOpts,
+}
+
+/// `1000x1000` または `1000`（正方形）を受け付ける。
+pub fn parse_size(s: &str) -> Result<(u32, u32), String> {
+    let parse = |v: &str| -> Result<u32, String> {
+        v.trim()
+            .parse::<u32>()
+            .map_err(|_| format!("'{v}' を寸法として解釈できません"))
+            .and_then(|n| {
+                if n == 0 {
+                    Err("寸法に 0 は指定できません".into())
+                } else {
+                    Ok(n)
+                }
+            })
+    };
+    match s.split_once(['x', 'X']) {
+        Some((w, h)) => Ok((parse(w)?, parse(h)?)),
+        None => {
+            let n = parse(s)?;
+            Ok((n, n))
+        }
+    }
 }
 
 /// `x1,y1,x2,y2` を受け付ける。
@@ -259,6 +296,26 @@ mod tests {
         assert!(parse_hex_color("#12345").is_err());
         assert!(parse_hex_color("white").is_err());
         assert!(parse_hex_color("").is_err());
+    }
+
+    #[test]
+    fn parses_a_canvas_size() {
+        assert_eq!(parse_size("1000x1000"), Ok((1000, 1000)));
+        assert_eq!(parse_size("800X1200"), Ok((800, 1200)));
+        assert_eq!(
+            parse_size("1000"),
+            Ok((1000, 1000)),
+            "単一の数値は正方形として扱う"
+        );
+    }
+
+    #[test]
+    fn rejects_a_malformed_canvas_size() {
+        assert!(parse_size("0x100").is_err());
+        assert!(parse_size("100x0").is_err());
+        assert!(parse_size("axb").is_err());
+        assert!(parse_size("").is_err());
+        assert!(parse_size("-100").is_err());
     }
 
     #[test]

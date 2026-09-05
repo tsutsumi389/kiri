@@ -49,6 +49,7 @@ pub fn write_image(
         quality: opts.quality,
         effort: opts.effort,
         background: opts.background,
+        flatten: opts.flatten,
     };
     let outcome = save(&opts.output, image, &save_opts)?;
     Ok((
@@ -73,14 +74,8 @@ pub fn finish(
     started: Instant,
     mut warnings: Vec<String>,
 ) -> Result<ProcessReport> {
-    let save_opts = SaveOptions {
-        format,
-        quality: opts.quality,
-        effort: opts.effort,
-        background: opts.background,
-    };
-    let outcome = save(&opts.output, image, &save_opts)?;
-    warnings.extend(outcome.warnings);
+    let (output, save_warnings) = write_image(image, opts, format)?;
+    warnings.extend(save_warnings);
 
     Ok(ProcessReport {
         input: input.display().to_string(),
@@ -88,13 +83,7 @@ pub fn finish(
             width: source.0,
             height: source.1,
         },
-        outputs: vec![OutputReport {
-            path: opts.output.display().to_string(),
-            format: format.as_str().to_string(),
-            width: image.width(),
-            height: image.height(),
-            bytes: outcome.bytes,
-        }],
+        outputs: vec![output],
         elapsed_ms: started.elapsed().as_millis(),
         warnings,
     })

@@ -156,6 +156,19 @@ fn print_cutout(report: &CutoutReport) {
     if report.mask.touches_edge {
         println!("  外周接触  あり");
     }
+    if let Some(c) = &report.canvas {
+        println!(
+            "  キャンバス {}x{}  占有率 {:.0}%  配置 {}x{} @ {},{}  (倍率 {:.2})",
+            c.width,
+            c.height,
+            c.fill_ratio * 100.0,
+            c.content[0],
+            c.content[1],
+            c.offset[0],
+            c.offset[1],
+            c.scale
+        );
+    }
     if let Some(path) = &report.mask.debug_mask {
         println!("  マスク    {path}");
     }

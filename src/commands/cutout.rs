@@ -12,7 +12,8 @@ use crate::commands::output;
 use crate::cutout::{CutoutOptions, cutout};
 use crate::error::{Error, Result};
 use crate::image_io::load;
-use crate::report::{BackgroundReport, CutoutReport, Dimensions, MaskReport};
+use crate::report::{BackgroundReport, CanvasReport, CutoutReport, Dimensions, MaskReport};
+use crate::transform::canvas::{CanvasSpec, apply as canvas_apply, plan as canvas_plan};
 
 pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     let started = Instant::now();
@@ -46,10 +47,18 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
 
     let debug_mask = write_debug_mask(args.debug_mask.as_ref(), &result.mask)?;
 
-    let (output_report, save_warnings) = output::write_image(&result.image, &args.out, format)?;
-
     let mut warnings = loaded.warnings();
-    warnings.extend(result.warnings);
+    warnings.extend(result.warnings.clone());
+
+    let (final_image, canvas) = match args.canvas {
+        Some((cw, ch)) => {
+            let (image, report) = place_on_canvas(&result, cw, ch, args, &mut warnings)?;
+            (image, Some(report))
+        }
+        None => (result.image.clone(), None),
+    };
+
+    let (output_report, save_warnings) = output::write_image(&final_image, &args.out, format)?;
     warnings.extend(save_warnings);
 
     Ok(CutoutReport {
@@ -71,9 +80,61 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             touches_edge: result.stats.touches_edge,
             debug_mask,
         },
+        canvas,
         elapsed_ms: started.elapsed().as_millis(),
         warnings,
     })
+}
+
+/// 切り抜いた商品を余白ごと切り詰め、指定サイズのキャンバス中央へ配置する。
+fn place_on_canvas(
+    result: &crate::cutout::CutoutResult,
+    width: u32,
+    height: u32,
+    args: &CutoutArgs,
+    warnings: &mut Vec<String>,
+) -> Result<(image::RgbaImage, CanvasReport)> {
+    // フェザリングされた薄い縁まで含めて切り詰める。前景判定(128以上)で切ると
+    // 輪郭の階調が落ちてギザギザに戻ってしまう
+    let (x1, y1, x2, y2) = result.mask.bbox_above(0).ok_or_else(|| {
+        Error::processing(
+            "NO_FOREGROUND",
+            "前景が検出されなかったためキャンバスに配置できません",
+        )
+        .with_hint("--tolerance を下げるか --bbox で対象範囲を指定してください")
+    })?;
+
+    let trimmed =
+        image::imageops::crop_imm(&result.image, x1, y1, x2 - x1 + 1, y2 - y1 + 1).to_image();
+
+    let spec = CanvasSpec {
+        width,
+        height,
+        fill_ratio: args.fill_ratio,
+        // --flatten が指定されていれば下地を塗る。既定は透明のまま
+        background: args.out.flatten.then_some(args.out.background),
+    };
+    let plan = canvas_plan((trimmed.width(), trimmed.height()), &spec)?;
+    let placed = canvas_apply(&trimmed, &spec)?;
+
+    if plan.scale > 1.0 {
+        warnings.push(format!(
+            "商品を {:.2} 倍に拡大して配置しました。元素材以上の解像度にはなりません",
+            plan.scale
+        ));
+    }
+
+    Ok((
+        placed,
+        CanvasReport {
+            width,
+            height,
+            fill_ratio: args.fill_ratio,
+            content: [plan.content.0, plan.content.1],
+            offset: [plan.offset.0, plan.offset.1],
+            scale: round4(plan.scale),
+        },
+    ))
 }
 
 fn write_debug_mask(path: Option<&PathBuf>, mask: &crate::cutout::Mask) -> Result<Option<String>> {

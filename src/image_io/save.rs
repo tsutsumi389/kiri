@@ -53,6 +53,8 @@ pub struct SaveOptions {
     pub effort: u8,
     /// アルファを保持できない形式へ出力する際の合成色
     pub background: [u8; 3],
+    /// 形式が透過を保持できる場合でも、背景色で塗り潰して不透明にする
+    pub flatten: bool,
 }
 
 impl Default for SaveOptions {
@@ -62,6 +64,7 @@ impl Default for SaveOptions {
             quality: 75.0,
             effort: 6,
             background: [255, 255, 255],
+            flatten: false,
         }
     }
 }
@@ -88,6 +91,8 @@ pub fn save(path: &Path, image: &RgbaImage, opts: &SaveOptions) -> Result<SaveOu
     }
 
     let has_alpha = image.pixels().any(|p| p[3] != 255);
+    // 形式が透過を扱えない場合は否応なく、--flatten 指定時は要求として塗り潰す
+    let must_flatten = has_alpha && (opts.flatten || !opts.format.supports_alpha());
     if has_alpha && !opts.format.supports_alpha() {
         let [r, g, b] = opts.background;
         warnings.push(format!(
@@ -96,10 +101,18 @@ pub fn save(path: &Path, image: &RgbaImage, opts: &SaveOptions) -> Result<SaveOu
         ));
     }
 
+    let flattened;
+    let target = if must_flatten {
+        flattened = flatten_image(image, opts.background);
+        &flattened
+    } else {
+        image
+    };
+
     let encoded = match opts.format {
-        OutputFormat::Avif => encode_avif(image, opts)?,
-        OutputFormat::Png => encode_png(image)?,
-        OutputFormat::Jpeg => encode_jpeg(image, opts)?,
+        OutputFormat::Avif => encode_avif(target, opts)?,
+        OutputFormat::Png => encode_png(target)?,
+        OutputFormat::Jpeg => encode_jpeg(target, opts)?,
     };
 
     if let Some(parent) = path.parent()
@@ -171,6 +184,16 @@ fn encode_jpeg(image: &RgbaImage, opts: &SaveOptions) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// アルファを指定色の上に合成し、不透明な RGBA を返す。
+fn flatten_image(image: &RgbaImage, background: [u8; 3]) -> RgbaImage {
+    let rgb = flatten_onto(image, background);
+    let mut out = RgbaImage::new(image.width(), image.height());
+    for (i, pixel) in out.pixels_mut().enumerate() {
+        *pixel = image::Rgba([rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2], 255]);
+    }
+    out
+}
+
 /// アルファを指定色の上に合成して RGB に落とす。
 fn flatten_onto(image: &RgbaImage, background: [u8; 3]) -> Vec<u8> {
     let mut out = Vec::with_capacity(image.width() as usize * image.height() as usize * 3);
@@ -217,6 +240,16 @@ mod tests {
         assert!(OutputFormat::Avif.supports_alpha());
         assert!(OutputFormat::Png.supports_alpha());
         assert!(!OutputFormat::Jpeg.supports_alpha());
+    }
+
+    #[test]
+    fn flatten_image_removes_all_transparency() {
+        let mut img = RgbaImage::new(2, 1);
+        img.put_pixel(0, 0, image::Rgba([10, 20, 30, 0]));
+        img.put_pixel(1, 0, image::Rgba([10, 20, 30, 255]));
+        let out = flatten_image(&img, [255, 255, 255]);
+        assert_eq!(out.get_pixel(0, 0).0, [255, 255, 255, 255]);
+        assert_eq!(out.get_pixel(1, 0).0, [10, 20, 30, 255]);
     }
 
     #[test]

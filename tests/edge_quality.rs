@@ -558,3 +558,59 @@ fn print_the_metrics_table() {
         println!();
     }
 }
+
+/// 櫛状の素材で、正当な隙間が最終アルファまで抜けること。
+///
+/// `--seal` は「幅 2N px 以下の隙間だけを塞ぐ」と約束している。堤防が隙間の
+/// 両側を背景候補から外すぶん、素直に組み合わせると 3px の通路まで塞がって
+/// いた（実測 7.9% しか抜けない）。メッシュ・レース・ワイヤーラックのように
+/// 隙間が意味を持つ素材では、これは目に見える欠陥になる。
+///
+/// 単体テストは背景マスクを見るが、こちらは最終的なアルファで測る。
+/// 帯の再推定が縁を透明へ戻すので、利用者が受け取る結果はここに出る。
+#[test]
+fn the_gaps_of_a_comb_are_transparent_in_the_result() {
+    for (gap, open_ratio) in [(1u32, false), (2, false), (3, true), (5, true)] {
+        let (w, h) = (240u32, 240u32);
+        let mut img = RgbaImage::from_pixel(w, h, Rgba([248, 248, 247, 255]));
+        let period = 5 + gap;
+        let (x0, x1) = (w / 5, w * 4 / 5);
+        let (y0, y1) = (h / 5, h * 4 / 5);
+        // 歯を 1 つの連結成分にまとめる背骨。面積フィルタで歯だけが消えるのを防ぐ
+        let spine = h * 3 / 4;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if y >= spine || (x - x0) % period < 5 {
+                    img.put_pixel(x, y, Rgba([190, 70, 55, 255]));
+                }
+            }
+        }
+
+        let out = cutout(&img, &CutoutOptions::default());
+        let (mut total, mut clear) = (0u32, 0u32);
+        for y in (y0 + 2)..(spine - 2) {
+            for x in x0..x1 {
+                if (x - x0) % period >= 5 {
+                    total += 1;
+                    if out.image.get_pixel(x, y)[3] < 128 {
+                        clear += 1;
+                    }
+                }
+            }
+        }
+        let ratio = f64::from(clear) / f64::from(total.max(1));
+        if open_ratio {
+            assert!(
+                ratio > 0.90,
+                "幅 {gap}px の隙間が抜けていない: {:.1}%",
+                ratio * 100.0
+            );
+        } else {
+            assert!(
+                ratio < 0.10,
+                "幅 {gap}px の破れが塞がっていない: {:.1}%",
+                ratio * 100.0
+            );
+        }
+    }
+}

@@ -94,14 +94,23 @@ fn a_soft_edge_is_followed_instead_of_being_cut_at_the_dam() {
     // マスクの形からアルファを作ると遷移全体がほぼ不透明のまま残ってしまう
     let truth = find("S4");
     let m = run(&truth, &CutoutOptions::default());
+    // 実測 0.139。8px かけて溶ける輪郭では、帯の上限(10px)まで広げても
+    // 遷移の外側で背景と区別が付かなくなる分が残る。0.15 はその実測に
+    // 1 割弱の余裕を足した値
     assert!(
         m.alpha_mae < 0.15,
         "柔らかい輪郭のアルファ誤差が大きい: {:.3}\n{m:?}",
         m.alpha_mae
     );
+    // ずれは 0 ではなく +1.0px が基準値。エッジ堤防は Sobel の勾配が輪郭の
+    // 両側に立つため、フィルの停止位置が真の輪郭より 1px 外側になる
+    // （docs/design.md「堤防の副作用」）。アルファの再推定はその縁を透明へ
+    // 戻すが、停止位置そのものは動かさないので、この 1px は残る。
+    // 0 を要求すると堤防の頑健化まで巻き込むので、基準値からの幅で見る
+    let drift = m.offset - 1.0;
     assert!(
-        m.offset.abs() <= 1.0,
-        "境界位置が {:+.2}px ずれている\n{m:?}",
+        drift.abs() <= 0.5,
+        "境界位置が基準の +1.00px から {drift:+.2}px 動いている (実測 {:+.2}px)\n{m:?}",
         m.offset
     );
 }
@@ -227,40 +236,108 @@ fn the_edge_width_diagnostic_tracks_the_softness_of_the_contour() {
     );
 }
 
-/// 大きな素材での所要時間。`--ignored` を付けたときだけ走る。
+/// 櫛状の商品画像。周期 `period` px（歯と隙間が半分ずつ）の細かい構造を作る。
 ///
-/// 境界帯の推定は帯の画素だけを走査するので、面積ではなく周長にほぼ比例する。
-/// それでも実素材の 12MP で数百 ms に収まっているかは確かめておく必要がある。
+/// メッシュ・レース・ニット・ワイヤーラック・文字のように、境界帯が構造そのもの
+/// より太くなる素材を模す。滑らかなシルエットでは帯は周長ぶんしか立たないが、
+/// この形では帯が面ごと埋まり、窓の走査量が帯の面積に比例して効いてくる。
+fn comb_image(width: u32, height: u32, period: u32) -> RgbaImage {
+    let mut img = RgbaImage::from_pixel(width, height, Rgba([248, 248, 247, 255]));
+    let product = Rgba([190u8, 70, 55, 255]);
+    let (x0, x1) = (width / 5, width * 4 / 5);
+    let (y0, y1) = (height / 5, height * 4 / 5);
+    // 歯を1つの連結成分にまとめる背骨。面積フィルタで歯だけが消えるのを防ぐ
+    let spine = height * 3 / 4;
+    let tooth = (period / 2).max(1);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            if y >= spine || (x - x0) % period < tooth {
+                img.put_pixel(x, y, product);
+            }
+        }
+    }
+    img
+}
+
+/// 同じ画像を切り抜くのにかかる最短時間(ms)。
+///
+/// 最短を採るのは、他プロセスに邪魔された回を混ぜないため。
+fn fastest(image: &RgbaImage, refine: bool) -> f64 {
+    let opts = CutoutOptions {
+        refine,
+        ..Default::default()
+    };
+    let mut best = f64::MAX;
+    for _ in 0..2 {
+        let started = std::time::Instant::now();
+        let result = cutout(image, &opts);
+        std::hint::black_box(result.stats.foreground_ratio);
+        best = best.min(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    best
+}
+
+/// 境界帯の推定が窓の面積ぶんだけ膨らんでいないこと。
+///
+/// 帯画素ごとに窓を全走査していた頃は、構造が帯より細い素材で計算量が
+/// 「帯の面積 × 窓²」になった。12MP・周期 12px の櫛で refine の追加コストが
+/// +9.4 秒に達していたが、これは「帯は周長ぶんしか立たない」という前提が
+/// 崩れた形でしか現れず、滑らかなシルエットの計測では一切見えない。
+///
+/// 絶対時間は機械によって何倍も違うので、同じ画像を refine 抜きで回した時間との
+/// 比で見る。実測はこの実装で release 0.44 / debug 0.72、崩れていた頃は
+/// release 5.9 / debug 14.9 だった。3.0 はその間に置いた緩い上限である。
 #[test]
-#[ignore = "計測用。判定はせず所要時間を出すだけ"]
-fn print_the_timing() {
-    for (w, h) in [(1000u32, 1000u32), (3000, 4000)] {
-        let truth = edge_scene(&EdgeScene {
+fn refine_does_not_scale_with_the_area_of_the_window() {
+    let image = comb_image(320, 320, 12);
+    let with = fastest(&image, true);
+    let without = fastest(&image, false);
+    let ratio = (with - without) / without;
+    assert!(
+        ratio < 3.0,
+        "refine の追加コストが膨らんでいる: {with:.1} ms vs {without:.1} ms (比 {ratio:.2})"
+    );
+}
+
+/// 12MP での refine の追加コスト。`--ignored` を付けたときだけ走る。
+///
+/// 所要時間は帯の周長と帯幅で決まる。角丸矩形のような滑らかなシルエットでは
+/// ほぼ無視できるが、構造が帯より細い素材では帯が面ごと埋まって桁が変わるので、
+/// 両方を測る。判定値は「桁が変わったら落ちる」ための緩いもので、
+/// 実際の値は出力を読むこと。
+///
+/// ```text
+/// cargo test --release --test edge_quality -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "計測用。12MP を数枚回すので十数秒かかる"]
+fn print_the_refine_cost_on_large_inputs() {
+    let (w, h) = (3000u32, 4000u32);
+    let mut cases: Vec<(String, RgbaImage)> = vec![(
+        "角丸矩形".to_string(),
+        edge_scene(&EdgeScene {
             name: "計測",
             width: w,
             height: h,
             ..Default::default()
-        });
-        for (label, opts) in [
-            ("refine", CutoutOptions::default()),
-            (
-                "no-refine",
-                CutoutOptions {
-                    refine: false,
-                    ..Default::default()
-                },
-            ),
-        ] {
-            let started = std::time::Instant::now();
-            let result = cutout(&truth.image, &opts);
-            let elapsed = started.elapsed();
-            println!(
-                "{w}x{h} ({:.1} MP) {label:<10} {:>7.1} ms  前景比率 {:.3}",
-                (w as f64) * (h as f64) / 1e6,
-                elapsed.as_secs_f64() * 1000.0,
-                result.stats.foreground_ratio,
-            );
-        }
+        })
+        .image,
+    )];
+    for period in [24u32, 12, 6] {
+        cases.push((format!("櫛 {period}px 周期"), comb_image(w, h, period)));
+    }
+
+    for (name, image) in cases {
+        let with = fastest(&image, true);
+        let without = fastest(&image, false);
+        let overhead = with - without;
+        println!(
+            "{name:<14} refine {with:>7.0} ms / refine なし {without:>7.0} ms / 追加 {overhead:>+7.0} ms"
+        );
+        assert!(
+            overhead < 2000.0,
+            "{name} で refine の追加コストが膨らんでいる: {overhead:+.0} ms"
+        );
     }
 }
 

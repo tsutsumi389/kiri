@@ -2258,3 +2258,35 @@ fn a_misspelled_refine_key_suggests_the_right_one() {
         json["error"]["hint"]
     );
 }
+
+// --- 既定値の重複 ---
+
+/// CLI の既定値とライブラリの既定値が食い違っていないこと。
+///
+/// 同じ数字が clap の `default_value_t`、`CutoutOptions::default()`、そして
+/// batch の `unwrap_or` の 3 箇所に書かれている。片方だけ動かしても
+/// コンパイルは通り、テストも「その値でたまたま通る」ので誰も気づかない。
+/// batch 側は構築関数が非公開なので、ここでは CLI とライブラリを突き合わせる。
+#[test]
+fn the_cli_defaults_match_the_library_defaults() {
+    use clap::Parser;
+    use kiri::cli::{Cli, Command as CliCommand};
+    use kiri::cutout::CutoutOptions;
+
+    let cli = Cli::parse_from(["kiri", "cutout", "in.png", "-o", "out.png"]);
+    let CliCommand::Cutout(args) = cli.command else {
+        panic!("cutout として解釈されていない");
+    };
+    let defaults = CutoutOptions::default();
+
+    assert_eq!(args.tolerance, defaults.tolerance, "--tolerance の既定値");
+    assert_eq!(args.border, defaults.border, "--border の既定値");
+    assert_eq!(args.cleanup, defaults.cleanup, "--cleanup の既定値");
+    assert_eq!(args.feather, defaults.feather, "--feather の既定値");
+    assert_eq!(
+        args.edge_threshold, defaults.edge_threshold,
+        "--edge-threshold の既定値"
+    );
+    assert_eq!(!args.no_despill, defaults.despill, "デスピルの既定");
+    assert_eq!(!args.no_refine, defaults.refine, "アルファ再推定の既定");
+}

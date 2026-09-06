@@ -149,14 +149,42 @@ pub struct CanvasReport {
     pub scale: f64,
 }
 
+/// 実際に効いた設定。
+///
+/// 結果が期待と違ったとき、エージェントが最初に確かめたいのは「自分の指定が
+/// 効いたのか、既定のまま走ったのか」である。切り抜きの挙動を決める値は
+/// `--json` だけで分かるようにしておく。バッチでは spec の継承（defaults →
+/// item）が絡むので、なおさら結果側に答えが要る。
+#[derive(Debug, Serialize)]
+pub struct SettingsReport {
+    /// 背景色との色差(ΔE)の許容量
+    pub tolerance: f64,
+    /// 1px あたりの輝度変化がこの値を超える輪郭でフィルを止める。0 で無効
+    pub edge_threshold: f64,
+    /// 背景を広げる際に 1px あたりに許した色差(ΔE)。0 で 2 段階フィルは無効
+    pub step_tolerance: f64,
+    /// 落ち影として消した明度(L*)の落ち込みの上限。0 で影を残す
+    pub shadow_tolerance: f64,
+    /// 測地的オープニングの半径(px)。0 で無効
+    pub seal: u32,
+    /// 孤立ノイズ除去の半径(px)
+    pub cleanup: u32,
+    /// フェザリング半径(px)
+    pub feather: u32,
+    /// 境界の色かぶり除去を行ったか
+    pub despill: bool,
+    /// 境界帯のアルファを色から推定し直したか
+    pub refine: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CutoutReport {
     pub input: String,
     pub source: Dimensions,
     pub outputs: Vec<OutputReport>,
     pub background: BackgroundReport,
-    /// 実際に適用された色差の許容量
-    pub tolerance: f64,
+    /// 実際に効いた切り抜きの設定
+    pub settings: SettingsReport,
     /// 実際に適用された bbox（未指定なら None）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub applied_bbox: Option<[u32; 4]>,

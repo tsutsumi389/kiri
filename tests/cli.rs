@@ -817,7 +817,7 @@ fn cutout_reports_the_background_it_used() {
         .unwrap();
 
     let v = json_stdout(&out);
-    assert_eq!(v["tolerance"], 9.0);
+    assert_eq!(v["settings"]["tolerance"], 9.0);
     let rgb: Vec<u64> = v["background"]["rgb"]
         .as_array()
         .unwrap()
@@ -2432,6 +2432,67 @@ fn a_misspelled_shadow_tolerance_key_suggests_the_right_one() {
         "候補に shadow_tolerance が出ていない: {}",
         json["error"]["hint"]
     );
+}
+
+/// 効いた設定が結果の JSON に載ること。
+///
+/// 結果が期待と違ったとき、エージェントがまず知りたいのは「自分の指定が
+/// 効いたのか、既定のまま走ったのか」である。画像を開いても分からないし、
+/// バッチでは defaults と item の継承が絡むので、結果側に答えが要る。
+#[test]
+fn the_report_states_the_settings_that_took_effect() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 80,
+        height: 80,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    let settings = |extra: &[&str]| -> Value {
+        let mut args = vec![
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--force",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        let out = kiri().args(&args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        json_stdout(&out)["settings"].clone()
+    };
+
+    let defaults = settings(&[]);
+    assert_eq!(defaults["tolerance"], 12.0);
+    assert_eq!(defaults["edge_threshold"], 8.0);
+    assert_eq!(defaults["step_tolerance"], 2.2);
+    assert_eq!(defaults["shadow_tolerance"], 35.0);
+    assert_eq!(defaults["seal"], 1);
+    assert_eq!(defaults["cleanup"], 2);
+    assert_eq!(defaults["feather"], 1);
+    assert_eq!(defaults["despill"], true);
+    assert_eq!(defaults["refine"], true);
+
+    let tuned = settings(&[
+        "--step-tolerance",
+        "3.5",
+        "--shadow-tolerance",
+        "0",
+        "--seal",
+        "2",
+        "--no-refine",
+    ]);
+    assert_eq!(tuned["step_tolerance"], 3.5);
+    assert_eq!(tuned["shadow_tolerance"], 0.0);
+    assert_eq!(tuned["seal"], 2);
+    assert_eq!(tuned["refine"], false);
 }
 
 /// 範囲外の数値は受け取る前に断ること。

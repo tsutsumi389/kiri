@@ -15,6 +15,7 @@ use crate::image_io::{OutputFormat, SaveOptions, load, save};
 use crate::preview::{PreviewSpec, contact_sheet};
 use crate::report::{
     BackgroundReport, CanvasReport, CutoutReport, Dimensions, MaskReport, PerimeterDeltaE,
+    SettingsReport,
 };
 use crate::transform::canvas::{CanvasSpec, apply as canvas_apply, plan as canvas_plan};
 
@@ -97,7 +98,17 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
                 max: round4(result.background.delta_e.max),
             },
         },
-        tolerance: args.tolerance,
+        settings: SettingsReport {
+            tolerance: opts.tolerance,
+            edge_threshold: opts.edge_threshold,
+            step_tolerance: opts.step_tolerance,
+            shadow_tolerance: opts.shadow_tolerance,
+            seal: opts.seal,
+            cleanup: opts.cleanup,
+            feather: opts.feather,
+            despill: opts.despill,
+            refine: opts.refine,
+        },
         applied_bbox: bbox.map(|(x1, y1, x2, y2)| [x1, y1, x2, y2]),
         mask: MaskReport {
             foreground_ratio: round4(result.stats.foreground_ratio),

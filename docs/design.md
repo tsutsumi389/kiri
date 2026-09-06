@@ -499,7 +499,12 @@ AI エージェントが `--allow-upscale` を付けるか元素材を見直す�
     "touches_edge": false,
     "holes_filled": 3
   },
-  "background": { "rgb": [248, 248, 247], "tolerance": 12 },
+  "background": { "rgb": [248, 248, 247] },
+  "settings": {
+    "tolerance": 12, "edge_threshold": 8,
+    "step_tolerance": 2.2, "shadow_tolerance": 35, "seal": 1,
+    "cleanup": 2, "feather": 1, "despill": true, "refine": true
+  },
   "elapsed_ms": 142,
   "warnings": []
 }
@@ -508,6 +513,8 @@ AI エージェントが `--allow-upscale` を付けるか元素材を見直す�
 `foreground_ratio` が極端な値（0.02 や 0.98）であれば失敗を検知でき、`touches_edge` は商品の見切れを示す。
 
 ただし `foreground_ratio` は「どれだけ残ったか」しか言わず、その輪郭が妥当かを語らない。そこで `mask.separability`（切り抜き境界の内側で測った商品と背景の色差）と `background.perimeter_delta_e`（外周の色差の分布）を併せて返す。
+
+`settings` には**実際に効いた**設定を並べる。結果が期待と違ったとき、指定が効いたのか既定のまま走ったのかは画像を見ても分からない。バッチでは `defaults` と項目の継承が絡むぶん、なおさら結果側に答えが要る。
 
 `separability` は境界の**内側**を測るため、前景の外側に張り付いた背景色の縁を検出できない。そこで縁そのものを測る `mask.halo_ratio`（境界近傍で不透明なのに、元画素の色が局所背景と ΔE≤3 の画素の割合）と、境界の階調を測る `mask.edge_width`（アルファが 0.9 から 0.1 へ落ちるまでの幅の中央値 px）を加える。
 

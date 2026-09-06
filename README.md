@@ -297,7 +297,11 @@ $ kiri cutout product.jpg -o product.jpg --canvas 1000 --flatten --background "#
     "rgb": [249, 249, 247], "uniformity": 1.0,
     "perimeter_delta_e": { "p50": 0.4, "p90": 1.2, "max": 2.8 }
   },
-  "tolerance": 12.0,
+  "settings": {
+    "tolerance": 12.0, "edge_threshold": 8.0,
+    "step_tolerance": 2.2, "shadow_tolerance": 35.0, "seal": 1,
+    "cleanup": 2, "feather": 1, "despill": true, "refine": true
+  },
   "mask": {
     "foreground_ratio": 0.2164,
     "bbox": [528, 200, 1073, 1601],
@@ -321,6 +325,9 @@ $ kiri cutout product.jpg -o product.jpg --canvas 1000 --flatten --background "#
 - `halo_ratio` が 0.10 を超えれば境界に背景色が残っている（警告が出る）
 - `edge_width` は鮮鋭な輪郭なら 1〜3。素材の遷移が広ければ 6 前後まで伸びるのが正常で、鮮鋭なはずの輪郭で 6 を超えたらぼやけている
 - `separability` / `halo_ratio` / `edge_width` は測れなければ `null`。0 ではない
+- `settings` は**実際に効いた**設定。結果が期待と違ったとき、指定が効いたのか
+  既定のまま走ったのかを画像を開かずに切り分けられる。`batch` は `defaults` と
+  項目の継承が絡むので、項目ごとの結果にも同じものが入る
 
 `separability` は切り抜き境界の内側で測った商品と背景の色差。**`foreground_ratio` は
 「どれだけ残ったか」しか言わず、その輪郭が妥当かを何も語らない。**`separability` は

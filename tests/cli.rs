@@ -817,7 +817,7 @@ fn cutout_reports_the_background_it_used() {
         .unwrap();
 
     let v = json_stdout(&out);
-    assert_eq!(v["tolerance"], 9.0);
+    assert_eq!(v["settings"]["tolerance"], 9.0);
     let rgb: Vec<u64> = v["background"]["rgb"]
         .as_array()
         .unwrap()
@@ -829,9 +829,16 @@ fn cutout_reports_the_background_it_used() {
     }
 }
 
-/// 設計の核心。淡い商品が背景ごと消えないのはエッジ堤防が効いているため。
+/// 設計の核心。淡い商品が背景ごと消えないこと。
+///
+/// かつては勾配の堤防だけがこれを支えており、`--edge-threshold 0` にすると
+/// 商品が消えることをこのテストで固定していた。段差の検査（第2段のフィル）が
+/// 入ってからは、堤防を切っても輪郭で止まる。輪郭のコントラストは ΔE 4.9 あり、
+/// 1px あたりの色差 2.2 という基準を超えているためである。
+/// 「堤防が無いと壊れる」という期待は、堤防以外に守りが無かった時代の仕様なので
+/// もう固定しない。代わりに「どちらの設定でも商品が残る」ことを固定する。
 #[test]
-fn the_edge_dam_saves_a_light_product_on_a_light_background() {
+fn a_light_product_on_a_light_background_survives() {
     let dir = fixture_dir();
     let input = write_png(dir.path(), "light.png", &light_product_image(200, 200));
 
@@ -860,13 +867,78 @@ fn the_edge_dam_saves_a_light_product_on_a_light_background() {
     let with_dam = ratio(&[]);
     assert!(
         (0.20..0.32).contains(&with_dam),
-        "堤防が効いていれば商品全体が残るはず: {with_dam}"
+        "淡い商品が背景ごと消えている: {with_dam}"
     );
 
     let without_dam = ratio(&["--edge-threshold", "0"]);
     assert!(
-        without_dam < with_dam / 2.0,
-        "堤防を切っても結果が変わらない（堤防が効いていない）: {without_dam} vs {with_dam}"
+        (0.20..0.32).contains(&without_dam),
+        "堤防を切ると段差の検査だけになるが、それでも商品は残るべき: {without_dam}"
+    );
+
+    // 段差の検査まで切ると、淡い商品は色だけで判定されて消える。
+    // 「連結性と色だけでは解けない」という前提そのものの確認
+    let bare = ratio(&["--edge-threshold", "0", "--step-tolerance", "0"]);
+    assert!(
+        bare < with_dam / 2.0,
+        "守りを全部外しても商品が残る＝この画像は難しくない: {bare} vs {with_dam}"
+    );
+}
+
+/// 堤防が実際に効いていることを CLI から固定する。
+///
+/// 上のテストは「堤防を切っても結果が変わらない」ことを固定しているので、
+/// `edge_ridges` が全ゼロを返すようになっても気づけない。堤防だけが
+/// 結論を変える場面を 1 つ押さえておく。
+///
+/// 幅 1px のスリットがそれにあたる。色も連結性も「外周から届く背景」と
+/// 言うが、堤防は 1px の通路の入口で止める。`--seal` は同じ隙間を別の
+/// 理由（細すぎる通路）で塞ぐので、堤防だけを見るために切ってある。
+#[test]
+fn the_edge_dam_alone_stops_a_one_pixel_slit() {
+    let dir = fixture_dir();
+    // 32x32 の白地に濃色のブロック。上辺から幅 1px のスリットを彫る
+    let mut img = image::RgbaImage::from_pixel(32, 32, image::Rgba([250, 250, 250, 255]));
+    for y in 8..24 {
+        for x in 8..24 {
+            img.put_pixel(x, y, image::Rgba([40, 40, 40, 255]));
+        }
+    }
+    for y in 8..20 {
+        img.put_pixel(16, y, image::Rgba([250, 250, 250, 255]));
+    }
+    let input = write_png(dir.path(), "slit.png", &img);
+
+    let slit_is_background = |extra: &[&str]| -> bool {
+        let output = dir.path().join(format!("out{}.png", extra.join("")));
+        let mask = dir.path().join(format!("mask{}.png", extra.join("")));
+        let mut args = vec![
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--debug-mask",
+            mask.to_str().unwrap(),
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        let out = kiri().args(&args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let written = image::open(&mask).unwrap().to_luma8();
+        written.get_pixel(16, 14)[0] < 128
+    };
+
+    assert!(
+        slit_is_background(&["--edge-threshold", "0", "--seal", "0"]),
+        "守りを外しても 1px のスリットが背景として抜けない＝前提が崩れている"
+    );
+    assert!(
+        !slit_is_background(&["--seal", "0"]),
+        "堤防が効いていない: 1px のスリットが素通りしている"
     );
 }
 
@@ -2201,8 +2273,13 @@ fn no_refine_falls_back_to_the_old_boundary_handling() {
 
     let refined = halo(&[]);
     let legacy = halo(&["--no-refine"]);
+    // 差の下限が 0.02 なのは、旧経路が残す縁そのものが薄くなったため。
+    // 稜線の細線化で堤防が 1px になり、測地的オープニングも堤防の分を
+    // 補うようになったので、背景色のまま不透明で残る画素は実測 3.0% しかない
+    // （どちらも入る前は 33.9% だった）。それでも 0 ではない点が肝で、
+    // 色から決め直す経路だけが 0 にできる
     assert!(
-        legacy > refined + 0.05,
+        legacy > refined + 0.02,
         "--no-refine で旧挙動に戻っていない: {legacy} vs {refined}"
     );
 }
@@ -2288,6 +2365,260 @@ fn the_cli_defaults_match_the_library_defaults() {
         args.edge_threshold, defaults.edge_threshold,
         "--edge-threshold の既定値"
     );
+    assert_eq!(
+        args.step_tolerance, defaults.step_tolerance,
+        "--step-tolerance の既定値"
+    );
+    assert_eq!(
+        args.shadow_tolerance, defaults.shadow_tolerance,
+        "--shadow-tolerance の既定値"
+    );
+    assert_eq!(args.seal, defaults.seal, "--seal の既定値");
     assert_eq!(!args.no_despill, defaults.despill, "デスピルの既定");
     assert_eq!(!args.no_refine, defaults.refine, "アルファ再推定の既定");
+}
+
+#[test]
+fn batch_accepts_the_new_fill_keys() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        shadow: true,
+        ..Default::default()
+    });
+    write_png(dir.path(), "a.png", &img);
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        r#"{"defaults":{"step_tolerance":3.0,"shadow_tolerance":20.0,"seal":2},
+             "items":[{"input":"a.png","output":"out.png"}]}"#,
+    )
+    .unwrap();
+
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(json_stdout(&out)["succeeded"], 1);
+}
+
+#[test]
+fn a_misspelled_shadow_tolerance_key_suggests_the_right_one() {
+    let dir = fixture_dir();
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        r#"{"items":[{"input":"a.png","output":"b.png","shadow_tolerence":20}]}"#,
+    )
+    .unwrap();
+
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let json = json_stdout(&out);
+    assert_eq!(json["error"]["code"], "SPEC_UNKNOWN_FIELD");
+    assert!(
+        json["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("shadow_tolerance"),
+        "候補に shadow_tolerance が出ていない: {}",
+        json["error"]["hint"]
+    );
+}
+
+/// 効いた設定が結果の JSON に載ること。
+///
+/// 結果が期待と違ったとき、エージェントがまず知りたいのは「自分の指定が
+/// 効いたのか、既定のまま走ったのか」である。画像を開いても分からないし、
+/// バッチでは defaults と item の継承が絡むので、結果側に答えが要る。
+#[test]
+fn the_report_states_the_settings_that_took_effect() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 80,
+        height: 80,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    let settings = |extra: &[&str]| -> Value {
+        let mut args = vec![
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--force",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        let out = kiri().args(&args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        json_stdout(&out)["settings"].clone()
+    };
+
+    let defaults = settings(&[]);
+    assert_eq!(defaults["tolerance"], 12.0);
+    assert_eq!(defaults["edge_threshold"], 8.0);
+    assert_eq!(defaults["step_tolerance"], 2.2);
+    assert_eq!(defaults["shadow_tolerance"], 35.0);
+    assert_eq!(defaults["seal"], 1);
+    assert_eq!(defaults["cleanup"], 2);
+    assert_eq!(defaults["feather"], 1);
+    assert_eq!(defaults["despill"], true);
+    assert_eq!(defaults["refine"], true);
+
+    let tuned = settings(&[
+        "--step-tolerance",
+        "3.5",
+        "--shadow-tolerance",
+        "0",
+        "--seal",
+        "2",
+        "--no-refine",
+    ]);
+    assert_eq!(tuned["step_tolerance"], 3.5);
+    assert_eq!(tuned["shadow_tolerance"], 0.0);
+    assert_eq!(tuned["seal"], 2);
+    assert_eq!(tuned["refine"], false);
+}
+
+/// 範囲外の数値は受け取る前に断ること。
+///
+/// 負値や nan は比較が常に偽になるだけなので、通してしまうと「指定したのに
+/// 効かない」という形で黙って無視される。エージェントは結果の JSON を見て
+/// 判断するので、無視されたことに気づく手がかりが無い。
+#[test]
+fn out_of_range_numeric_options_are_rejected() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 60,
+        height: 60,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    for bad in [
+        "--tolerance=-1",
+        "--step-tolerance=-0.5",
+        "--shadow-tolerance=nan",
+        "--edge-threshold=inf",
+        // 半径に比例して走査量が増えるので、二桁の指定は事故しかない
+        "--seal=400",
+    ] {
+        let out = kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                dir.path().join("out.png").to_str().unwrap(),
+                "--force",
+                bad,
+            ])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{bad} が受け付けられてしまった");
+    }
+}
+
+/// バッチの spec も同じ約束で弾くこと。clap を通らない経路なので別立てで見る。
+#[test]
+fn a_negative_setting_in_a_batch_spec_is_rejected() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 60,
+        height: 60,
+        ..Default::default()
+    });
+    write_png(dir.path(), "a.png", &img);
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        r#"{"defaults":{"step_tolerance":-1.0},
+             "items":[{"input":"a.png","output":"out.png"}]}"#,
+    )
+    .unwrap();
+
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let json = json_stdout(&out);
+    assert_eq!(
+        json["results"][0]["error"]["code"], "INVALID_SETTING",
+        "spec の負値が弾かれていない: {json}"
+    );
+}
+
+/// 落ち影が既定で消えること。CLI から通しで確かめる。
+#[test]
+fn cutout_removes_a_cast_shadow_by_default() {
+    let dir = fixture_dir();
+    // 落ち影の裾は商品の大きさに比例するので、小さすぎる画像では
+    // 消えても消えなくても前景比率がほとんど動かない
+    let img = product_image(&ProductSpec {
+        width: 600,
+        height: 600,
+        shadow: true,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "shadow.png", &img);
+    let plain = write_png(
+        dir.path(),
+        "plain.png",
+        &product_image(&ProductSpec {
+            width: 600,
+            height: 600,
+            ..Default::default()
+        }),
+    );
+
+    let ratio = |src: &Path, extra: &[&str]| -> f64 {
+        let output = dir.path().join(format!(
+            "out-{}{}.png",
+            src.file_stem().unwrap().to_str().unwrap(),
+            extra.join("")
+        ));
+        let mut args = vec![
+            "cutout",
+            src.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        let out = kiri().args(&args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        json_stdout(&out)["mask"]["foreground_ratio"]
+            .as_f64()
+            .unwrap()
+    };
+
+    // 影が残ると前景比率がその分だけ膨らむ。判定は絶対値の差ではなく
+    // 「影を置かなかった場合」との距離で見る。600px では影の裾が前景比率を
+    // 0.005 しか動かさないので、固定のマージンでは実測との差が薄すぎて、
+    // 影の消え方が少し変わっただけで落ちたり通ったりしてしまう
+    let removed = ratio(&input, &[]);
+    let kept = ratio(&input, &["--shadow-tolerance", "0"]);
+    let none = ratio(&plain, &[]);
+    assert!(
+        (removed - none).abs() < (kept - none) * 0.5,
+        "既定で影が消えていない: 影あり {removed} / 影判定なし {kept} / 影なし {none}"
+    );
 }

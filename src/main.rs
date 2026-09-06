@@ -163,13 +163,16 @@ fn print_cutout(report: &CutoutReport) {
     }
     println!(
         "  背景色    #{r:02X}{g:02X}{b:02X}  (均一度 {:.2}, tolerance {})",
-        report.background.uniformity, report.tolerance
+        report.background.uniformity, report.settings.tolerance
     );
     print_perimeter(&report.background);
     println!("  前景比率  {:.1}%", report.mask.foreground_ratio * 100.0);
     if let Some(sep) = report.mask.separability {
         // tolerance と並べて出す。両者の大小そのものが判断材料であるため
-        println!("  境界色差  ΔE {sep:.1}  (tolerance {})", report.tolerance);
+        println!(
+            "  境界色差  ΔE {sep:.1}  (tolerance {})",
+            report.settings.tolerance
+        );
     }
     match report.mask.bbox {
         Some([x1, y1, x2, y2]) => println!("  前景範囲  {x1},{y1} - {x2},{y2}"),

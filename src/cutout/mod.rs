@@ -49,6 +49,12 @@ pub struct CutoutOptions {
     pub despill: bool,
     /// 1px あたりの輝度変化がこの値を超える画素にはフィルを侵入させない。0 で無効
     pub edge_threshold: f64,
+    /// 背景を広げる際に 1px あたりに許す色差(ΔE)。0 で 2 段階フィルを無効化する
+    pub step_tolerance: f64,
+    /// 落ち影として吸収する明度差(L*)の上限。0 で無効
+    pub shadow_tolerance: f64,
+    /// 測地的オープニングの半径(px)。幅 2k 以下の隙間からの浸水を前景へ戻す。0 で無効
+    pub seal: u32,
     /// 境界帯のアルファを画像の色から推定し直すか。false で旧来の
     /// 幾何的フェザリング + 大域背景色でのデスピルに戻す
     pub refine: bool,
@@ -57,8 +63,9 @@ pub struct CutoutOptions {
 impl Default for CutoutOptions {
     fn default() -> Self {
         Self {
-            // 落ち影まで背景として飲み込める程度に広く取る。
-            // 単色背景では商品の縁を削るリスクより、影が残る見苦しさのほうが大きい
+            // 背景色そのもののばらつきと、圧縮由来の滲みを跨げる幅。
+            // 落ち影は shadow_tolerance が別に受け持つので、ここを影のために
+            // 広げる必要はない
             tolerance: 12.0,
             border: DEFAULT_BORDER,
             bbox: None,
@@ -69,6 +76,17 @@ impl Default for CutoutOptions {
             // 商品の輪郭(1px で十数以上の変化)は超え、落ち影(1px で 1-2 程度)は
             // 超えない値。実測に基づく
             edge_threshold: 8.0,
+            // 落ち影の裾（合成シーンの実測で最大 1.9 ΔE/px）は越えられ、
+            // ΔE 3 程度しかない淡い商品の輪郭（同 2.5 ΔE/px）は越えられない値。
+            // 背景そのものの揺らぎは core_tolerance の免除で通るので、
+            // これを小さく取っても背景が残ることはない
+            step_tolerance: 2.2,
+            // 白背景(L* 97)に落ちる実用的な影の最大の落ち込み。
+            // これ以上暗い無彩色は影ではなく黒い商品とみなす
+            shadow_tolerance: 35.0,
+            // 1-2px の破れからの浸水を止め、取っ手の内側のような
+            // 正当な隙間は塞がない幅
+            seal: 1,
             refine: true,
         }
     }
@@ -95,6 +113,13 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
         bbox: opts.bbox,
         fg_seeds: opts.fg_seeds.clone(),
         edge_threshold: opts.edge_threshold,
+        // 芯の許容量は利用者に決めさせず、背景自身のばらつきから導く。
+        // 「どこまでを背景と言い切れるか」は画像ごとに違い、外周の ΔE 分布が
+        // その答えを持っているためである
+        core_tolerance: floodfill::core_tolerance(opts.tolerance, background.delta_e.p90),
+        step_tolerance: opts.step_tolerance,
+        shadow_tolerance: opts.shadow_tolerance,
+        seal: opts.seal,
     };
     let mut mask = foreground_mask(image, background.rgb, &flood);
 

@@ -2266,7 +2266,8 @@ fn a_misspelled_refine_key_suggests_the_right_one() {
 /// 同じ数字が clap の `default_value_t`、`CutoutOptions::default()`、そして
 /// batch の `unwrap_or` の 3 箇所に書かれている。片方だけ動かしても
 /// コンパイルは通り、テストも「その値でたまたま通る」ので誰も気づかない。
-/// batch 側は構築関数が非公開なので、ここでは CLI とライブラリを突き合わせる。
+/// ここでは CLI とライブラリを突き合わせる。batch の `to_cutout_args` は非公開で
+/// ここからは触れないので、同じモジュール内のユニットテストで押さえている。
 #[test]
 fn the_cli_defaults_match_the_library_defaults() {
     use clap::Parser;

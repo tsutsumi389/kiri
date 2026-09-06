@@ -285,11 +285,15 @@ fn fastest(image: &RgbaImage, refine: bool) -> f64 {
 /// 崩れた形でしか現れず、滑らかなシルエットの計測では一切見えない。
 ///
 /// 絶対時間は機械によって何倍も違うので、同じ画像を refine 抜きで回した時間との
-/// 比で見る。実測はこの実装で release 0.44 / debug 0.72、崩れていた頃は
-/// release 5.9 / debug 14.9 だった。3.0 はその間に置いた緩い上限である。
+/// 比で見る。実測はこの実装で release 0.5 / debug 0.9、崩れていた頃は同じ形の
+/// 320x320 で release 5.9 / debug 14.9 だった。3.0 はその間に置いた緩い上限である。
+///
+/// 画像を 640x640 にしてあるのは、320x320 だと release の計測対象が 10ms しか
+/// 残らず、暖機を含む最短 2 回の比が 0.5 と 0.8 の間で振れたためである。
+/// 1 回あたりの時間を稼いだほうが、試行回数を増やすより安い。
 #[test]
 fn refine_does_not_scale_with_the_area_of_the_window() {
-    let image = comb_image(320, 320, 12);
+    let image = comb_image(640, 640, 12);
     let with = fastest(&image, true);
     let without = fastest(&image, false);
     let ratio = (with - without) / without;

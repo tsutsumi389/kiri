@@ -8,7 +8,9 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
-use common::{ProductSpec, product_image, transparent_product, write_jpeg, write_png};
+use common::{
+    ProductSpec, product_image, transparent_product, woven_background_image, write_jpeg, write_png,
+};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -939,6 +941,118 @@ fn the_edge_dam_alone_stops_a_one_pixel_slit() {
     assert!(
         !slit_is_background(&["--seal", "0"]),
         "堤防が効いていない: 1px のスリットが素通りしている"
+    );
+}
+
+/// 織り目のある背景では堤防を自動で引き上げ、その旨を結果に書くこと。
+///
+/// 布・段ボールのような素材は、背景そのものが 1px あたり十数の変化を持つ。
+/// 既定の堤防（8）はそれに反応して**背景の中で**壁になり、フィルが商品まで
+/// 届かない。`--edge-threshold 0` を知っていれば救えるが、知識を前提にした
+/// 道具は AI エージェントには使えない。
+///
+/// 黙って値を変えるのはもっと悪い。効いた値は `settings` に、変えた理由は
+/// `warnings` に出す。
+#[test]
+fn a_woven_background_raises_the_dam_and_the_report_says_so() {
+    let dir = fixture_dir();
+    let input = write_png(dir.path(), "woven.png", &woven_background_image(240, 240));
+
+    let run = |name: &str, extra: &[&str]| -> Value {
+        let output = dir.path().join(format!("{name}.png"));
+        let mut args = vec![
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        let out = kiri().args(&args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        json_stdout(&out)
+    };
+    let adjusted = |v: &Value| -> bool {
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("テクスチャ"))
+    };
+
+    let auto = run("auto", &[]);
+    // 商品は画像の 1/4 〜 3/4 を占めるので、前景比率は 0.25 前後になるはず
+    let ratio = auto["mask"]["foreground_ratio"].as_f64().unwrap();
+    assert!(
+        (0.20..0.32).contains(&ratio),
+        "織り目が堤防を発火させて背景が残っている: {ratio}"
+    );
+    let raised = auto["settings"]["edge_threshold"].as_f64().unwrap();
+    assert!(raised > 8.0, "堤防が引き上げられていない: {raised}");
+    assert!(
+        adjusted(&auto),
+        "黙って設定を変えている: {}",
+        auto["warnings"]
+    );
+    // 判断の根拠も返す。エージェントが自分で確かめられなければ意味がない
+    let p90 = auto["background"]["texture"]["p90"].as_f64().unwrap();
+    assert!(p90 > 8.0, "外周の勾配が報告されていない: {p90}");
+
+    // 明示指定には従う。従わないと「指定したのに効かない」になる
+    let pinned = run("pinned", &["--edge-threshold", "8"]);
+    assert_eq!(pinned["settings"]["edge_threshold"], 8.0);
+    assert!(!adjusted(&pinned), "明示指定に割り込んでいる");
+    let pinned_ratio = pinned["mask"]["foreground_ratio"].as_f64().unwrap();
+    assert!(
+        pinned_ratio > ratio + 0.1,
+        "対照が成立していない（堤防を明示しても背景が消える）: {pinned_ratio} vs {ratio}"
+    );
+}
+
+/// `kiri info` でも同じ値を返すこと。
+///
+/// 切り抜く前に「この背景は堤防を張れる素材か」を知るための値なので、
+/// cutout でしか出ないのでは遅い。
+#[test]
+fn info_reports_the_texture_of_the_border() {
+    let dir = fixture_dir();
+    let texture = |name: &str, img: &image::RgbaImage| -> (f64, f64) {
+        let input = write_png(dir.path(), name, img);
+        let out = kiri()
+            .args(["info", input.to_str().unwrap(), "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let t = json_stdout(&out)["background"]["texture"].clone();
+        (
+            t["p50"].as_f64().expect("p50 が無い"),
+            t["p90"].as_f64().expect("p90 が無い"),
+        )
+    };
+
+    let studio = product_image(&ProductSpec {
+        width: 240,
+        height: 240,
+        ..Default::default()
+    });
+    let (_, studio_p90) = texture("studio.png", &studio);
+    assert!(
+        studio_p90 < 5.0,
+        "スタジオ背景でテクスチャが立っている: {studio_p90}"
+    );
+
+    let (_, woven_p90) = texture("woven_info.png", &woven_background_image(240, 240));
+    assert!(
+        woven_p90 > 8.0,
+        "織り目を検出できていない: {woven_p90}（スタジオ背景は {studio_p90}）"
     );
 }
 
@@ -2493,6 +2607,45 @@ fn the_report_states_the_settings_that_took_effect() {
     assert_eq!(tuned["shadow_tolerance"], 0.0);
     assert_eq!(tuned["seal"], 2);
     assert_eq!(tuned["refine"], false);
+}
+
+/// バッチの spec でも「未指定」と「8 を明示」が区別されること。
+///
+/// spec は clap を通らない経路なので、既定値で埋める実装が残っていると
+/// 自動調整が働かない。数百点を回した後で気づくのでは遅い。
+#[test]
+fn a_batch_spec_distinguishes_an_unset_dam_from_an_explicit_one() {
+    let dir = fixture_dir();
+    write_png(dir.path(), "a.png", &woven_background_image(240, 240));
+    let spec = dir.path().join("spec.json");
+
+    let run = |body: &str| -> Value {
+        std::fs::write(&spec, body).unwrap();
+        let out = kiri()
+            .args(["batch", spec.to_str().unwrap(), "--json", "--force"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        json_stdout(&out)["results"][0]["result"].clone()
+    };
+
+    let auto = run(r#"{"items":[{"input":"a.png","output":"auto.png"}]}"#);
+    assert!(
+        auto["settings"]["edge_threshold"].as_f64().unwrap() > 8.0,
+        "spec で未指定なのに自動調整が働いていない: {}",
+        auto["settings"]
+    );
+
+    let pinned =
+        run(r#"{"defaults":{"edge_threshold":8.0},"items":[{"input":"a.png","output":"p.png"}]}"#);
+    assert_eq!(
+        pinned["settings"]["edge_threshold"], 8.0,
+        "spec の明示指定に割り込んでいる"
+    );
 }
 
 /// 範囲外の数値は受け取る前に断ること。

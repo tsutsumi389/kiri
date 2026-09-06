@@ -173,6 +173,13 @@ pub struct EdgeScene {
     pub jpeg: Option<u8>,
     /// 背景に乗せるセンサーノイズの振幅
     pub noise: f32,
+    /// 背景に乗せる織り目状のテクスチャ。(振幅, 周期px)。
+    ///
+    /// 不織布・キャンバス地・段ボールのような素材を模す。センサーノイズと違い、
+    /// **1px あたりの変化が大きい**のが要点で、勾配の堤防はこれに反応する。
+    /// 縦横の正弦の積にするのは、実素材の織り目が線ではなく点として現れ、
+    /// 面積フィルタの対象になるためである
+    pub weave: Option<(f32, f32)>,
 }
 
 impl Default for EdgeScene {
@@ -190,6 +197,7 @@ impl Default for EdgeScene {
             strap: None,
             jpeg: Some(90),
             noise: 1.5,
+            weave: None,
         }
     }
 }
@@ -261,7 +269,15 @@ pub fn edge_scene(scene: &EdgeScene) -> EdgeTruth {
                 }
             }
             let c = (0.5 - d / scene.softness).clamp(0.0, 1.0);
-            let nz = rng.jitter(scene.noise);
+            let mut nz = rng.jitter(scene.noise);
+            // 織り目は商品の下には回り込まない。布の上に商品が載っている状況を
+            // 模すので、被覆率が 0 の画素にだけ乗せる
+            if let Some((amp, period)) = scene.weave {
+                if c <= 0.0 {
+                    let k = std::f32::consts::TAU / period;
+                    nz += amp * (fx * k).sin() * (fy * k).sin();
+                }
+            }
             let mut rgb = [
                 scene.background[0] as f32 + nz,
                 scene.background[1] as f32 + nz,
@@ -349,6 +365,11 @@ pub struct EdgeMetrics {
     pub strap_kept: f32,
     /// 落ち影のうち前景として残った割合(0.0-1.0)。シーンに無ければ NaN
     pub shadow_kept: f32,
+    /// 輪郭から 8px 以上離れた背景のうち前景として残った割合(0.0-1.0)。
+    ///
+    /// `rim` は輪郭の近傍しか見ないので、背景一面に散った織り目のゴミを
+    /// 捉えられない。面積フィルタが解像度に追従しているかはここに出る
+    pub speckles: f32,
 }
 
 fn luma(p: [u8; 4]) -> f32 {
@@ -387,6 +408,7 @@ pub fn measure_edges(
     let (mut white, mut white_n) = (0f32, 0u32);
     let (mut strap_kept, mut strap_n) = (0u32, 0u32);
     let (mut shadow_kept, mut shadow_n) = (0u32, 0u32);
+    let (mut speckles, mut speckles_n) = (0u32, 0u32);
 
     for y in 0..h {
         for x in 0..w {
@@ -438,6 +460,12 @@ pub fn measure_edges(
                     shadow_kept += 1;
                 }
             }
+            if c == 0.0 && d > 8.0 && lit {
+                speckles_n += 1;
+                if fg {
+                    speckles += 1;
+                }
+            }
         }
     }
 
@@ -457,7 +485,34 @@ pub fn measure_edges(
         white_error: white / white_n.max(1) as f32,
         strap_kept: ratio(strap_kept, strap_n),
         shadow_kept: ratio(shadow_kept, shadow_n),
+        speckles: ratio(speckles, speckles_n),
     }
+}
+
+/// 織り目のある布の上に濃色の商品を置いた画像。
+///
+/// 不織布・キャンバス地のように、**背景そのものが 1px あたり十数の変化を持つ**
+/// 素材を模す。勾配の堤防はこの織り目に反応して背景の中で壁になる。
+/// 周期 6px は実写（不織布）で堤防が壁として立った密度に合わせてある。
+pub fn woven_background_image(width: u32, height: u32) -> RgbaImage {
+    let mut img = RgbaImage::new(width, height);
+    let k = std::f32::consts::TAU / 6.0;
+    let (x1, y1) = (width / 4, height / 4);
+    let (x2, y2) = (width * 3 / 4, height * 3 / 4);
+    for y in 0..height {
+        for x in 0..width {
+            let inside = (x1..x2).contains(&x) && (y1..y2).contains(&y);
+            let p = if inside {
+                Rgba([35, 35, 38, 255])
+            } else {
+                let t = 12.0 * (x as f32 * k).sin() * (y as f32 * k).sin();
+                let v = |c: f32| (c + t).clamp(0.0, 255.0) as u8;
+                Rgba([v(177.0), v(174.0), v(168.0), 255])
+            };
+            img.put_pixel(x, y, p);
+        }
+    }
+    img
 }
 
 /// 白背景に「ほぼ白い商品」を置いた、切り抜きの最難ケース。

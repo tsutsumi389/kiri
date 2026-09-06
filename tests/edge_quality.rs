@@ -97,6 +97,24 @@ fn scenes() -> Vec<EdgeScene> {
             noise: 1.0,
             ..Default::default()
         },
+        // S11 の織り目の上に**淡色**の商品を置く。テクスチャ検知が「無効化」では
+        // なく「引き上げ」でなければならない理由がここに出る。S11 は濃色商品
+        // なので堤防を切っても崩れず、引き上げ幅が何倍でも同じ結果になってしまう。
+        //
+        // 商品の輪郭は 1px あたり 28 の段差を持ち、織り目（p90 14.0）より大きい。
+        // 堤防を 21 に置けば織り目は越えられて輪郭では止まる、という
+        // 「引き上げ」の狙いがそのまま成立する唯一のシーンである
+        EdgeScene {
+            name: "S12 織り目のある背景 + 淡色商品",
+            width: 1200,
+            height: 1200,
+            background: [177, 174, 168],
+            product: [205, 202, 196],
+            shading: (1.0, 1.0),
+            weave: Some((12.0, 6.0)),
+            noise: 1.0,
+            ..Default::default()
+        },
         // 解けないケース。商品の明度が上から下へ変化する途中で背景色を
         // **横切る**ため、輪郭のコントラストが 0 になる行が存在する。そこでは
         // 色による分離が原理的に不可能で、いったん入られると商品の内部は
@@ -368,6 +386,65 @@ fn pinning_the_dam_by_hand_leaves_the_woven_background_behind() {
     );
 }
 
+/// テクスチャ検知は堤防を**無効化するのではなく引き上げる**こと。
+///
+/// S11 は濃色商品なので、堤防が 21 でも 0 でも同じ結果になる。つまり
+/// `TEXTURE_DAM_HEADROOM` を 10 倍にしても S11 は通ってしまい、
+/// 「引き上げ」という設計の核心は何にも固定されていなかった。
+///
+/// S12 は織り目（p90 14.0）の上に、輪郭の段差が 1px あたり 28 の淡色商品を
+/// 置く。堤防を切ると商品はまるごと背景として飲まれ、既定の 8 に置くと
+/// 織り目が壁になって背景が残る。**その間にしか正解が無い。** 実測では
+/// 12〜24 の窓で両立し、既定の 1.5 倍（21）はその中にある。
+#[test]
+fn the_raised_dam_still_protects_a_light_product_on_a_woven_background() {
+    let truth = find("S12");
+    let auto = cutout(&truth.image, &CutoutOptions::default());
+    assert!(
+        auto.edge_threshold > kiri::cutout::DEFAULT_EDGE_THRESHOLD,
+        "テクスチャ検知が発火していない: {:.1}",
+        auto.edge_threshold
+    );
+    let m = measure_edges(&truth, &auto.image, &auto.mask);
+    assert!(
+        m.eaten < 0.02,
+        "引き上げた堤防が淡色商品を守れていない: {:.1}%\n{m:?}",
+        m.eaten * 100.0
+    );
+    assert!(
+        m.rim < 0.02,
+        "引き上げた堤防が織り目を残している: {:.1}%\n{m:?}",
+        m.rim * 100.0
+    );
+
+    // 両端の対照。どちらか一方でも成立していなければ、上の合格は
+    // 「もともと両立していただけ」で引き上げ幅を何も語らない
+    let off = run(
+        &truth,
+        &CutoutOptions {
+            edge_threshold: Some(0.0),
+            ..Default::default()
+        },
+    );
+    assert!(
+        off.eaten > 0.50,
+        "対照が成立していない（堤防を切っても淡色商品が残る）: {:.1}%\n{off:?}",
+        off.eaten * 100.0
+    );
+    let pinned = run(
+        &truth,
+        &CutoutOptions {
+            edge_threshold: Some(kiri::cutout::DEFAULT_EDGE_THRESHOLD),
+            ..Default::default()
+        },
+    );
+    assert!(
+        pinned.rim > 0.50,
+        "対照が成立していない（既定の堤防でも織り目が残らない）: {:.1}%\n{pinned:?}",
+        pinned.rim * 100.0
+    );
+}
+
 #[test]
 fn an_isolated_speck_is_removed_but_a_thin_line_is_not() {
     // 面積フィルタの二面性を1つのシーンで見る。孤立した 3x3 のゴミは消え、
@@ -429,7 +506,11 @@ fn a_speck_scales_with_the_resolution_but_small_images_are_untouched() {
             }
         }
         // 7x7 = 49px²。長辺 1000px までは下限 25px² を超えるので残り、
-        // 長辺 1500px では下限が 56px² になるので消える
+        // 長辺 2000px では下限が 100px² になるので消える。
+        //
+        // 崖に寄せない。長辺 1500px の下限は 56px² で 49px² との差が 12% しか
+        // なく、丸めや境界帯の 1px の増減で符号が変わる。「消えるか残るか」を
+        // 見たいのであって、丸めの向きを見たいのではない
         let (sx, sy) = (size / 10, size / 10);
         for y in sy..sy + 7 {
             for x in sx..sx + 7 {
@@ -441,8 +522,9 @@ fn a_speck_scales_with_the_resolution_but_small_images_are_untouched() {
     };
 
     assert!(speck_survives(400), "小さい画像で 7x7 の細部まで消えている");
+    assert!(speck_survives(1000), "長辺ちょうど 1000px で消えている");
     assert!(
-        !speck_survives(1500),
+        !speck_survives(2000),
         "高解像度で 7x7 相当のゴミが残っている"
     );
 }

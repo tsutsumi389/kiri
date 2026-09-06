@@ -26,11 +26,13 @@ pub fn detect(bytes: &[u8]) -> Option<Family> {
         return None;
     }
     let size = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-    // メジャーブランド + マイナーバージョン + 互換ブランドの並び。
+    // 並びは メジャーブランド(8..12) + マイナーバージョン(12..16) + 互換ブランド(16..)。
+    // マイナーバージョンはブランドではないので照合に含めない。含めると、たまたま
+    // `avif` 等と同じ 4 バイトになった版数を持つ無関係な MP4 を弾いてしまう。
     // 長さはヘッダの値を信じず、実バイト数と上限で押さえる
     let end = size.clamp(16, bytes.len().min(256));
     let mut family = None;
-    for brand in bytes[8..end].chunks_exact(4) {
+    for brand in std::iter::once(&bytes[8..12]).chain(bytes[16..end].chunks_exact(4)) {
         match brand {
             b"avif" | b"avis" => return Some(Family::Avif),
             b"heic" | b"heix" | b"hevc" | b"hevx" | b"heim" | b"heis" | b"mif1" | b"msf1" => {
@@ -44,18 +46,20 @@ pub fn detect(bytes: &[u8]) -> Option<Family> {
 
 /// 非対応であることと、その場で打てる手を返す。
 pub fn unsupported(family: Family) -> Error {
-    let what = match family {
-        Family::Heif => "HEIC/HEIF",
-        Family::Avif => "AVIF",
+    // 拡張子とデコーダは形式ごとに違う。AVIF なのに `in.HEIC` を打たせると、
+    // エージェントは失敗した理由が形式なのかパスなのか切り分けられない
+    let (what, ext, fallback) = match family {
+        Family::Heif => ("HEIC/HEIF", "heic", "libheif の heif-convert"),
+        Family::Avif => ("AVIF", "avif", "libavif の avifdec"),
     };
     Error::input(
         "UNSUPPORTED_FORMAT",
         format!("{what} は入力として未対応です（pure Rust の HEVC/AV1 デコーダが無いため）"),
     )
-    .with_hint(
-        "macOS: sips -s format jpeg -s formatOptions 95 in.HEIC --out in.jpg / \
-         その他: magick in.heic -quality 95 in.jpg（または libheif の heif-convert）",
-    )
+    .with_hint(format!(
+        "macOS: sips -s format jpeg -s formatOptions 95 in.{ext} --out in.jpg / \
+         その他: magick in.{ext} -quality 95 in.jpg（または{fallback}）"
+    ))
 }
 
 #[cfg(test)]
@@ -102,13 +106,40 @@ mod tests {
         assert_eq!(detect(&[]), None);
     }
 
+    /// マイナーバージョンはブランドではない。
+    ///
+    /// 12..16 を照合に含めると、版数がたまたま `avif` と同じバイト列になった
+    /// 無関係なファイルを HEIF 系として弾いてしまう。
+    #[test]
+    fn the_minor_version_is_not_matched_as_a_brand() {
+        let mut out = 16u32.to_be_bytes().to_vec();
+        out.extend_from_slice(b"ftyp");
+        out.extend_from_slice(b"isom"); // メジャーブランド
+        out.extend_from_slice(b"avif"); // マイナーバージョン（ブランドではない）
+        assert_eq!(detect(&out), None);
+    }
+
     #[test]
     fn the_error_points_at_a_conversion_command() {
-        let err = unsupported(Family::Heif);
-        assert_eq!(err.code, "UNSUPPORTED_FORMAT");
-        assert_eq!(err.exit_code(), 3, "入力ファイル異常として扱う");
-        let hint = err.hint.unwrap();
-        assert!(hint.contains("sips"), "macOS 向けの手順が要る: {hint}");
-        assert!(hint.contains("magick"), "macOS 以外の手順が要る: {hint}");
+        for (family, ext, other) in [
+            (Family::Heif, "heic", "avif"),
+            (Family::Avif, "avif", "heic"),
+        ] {
+            let err = unsupported(family);
+            assert_eq!(err.code, "UNSUPPORTED_FORMAT");
+            assert_eq!(err.exit_code(), 3, "入力ファイル異常として扱う");
+            let hint = err.hint.unwrap();
+            assert!(hint.contains("sips"), "macOS 向けの手順が要る: {hint}");
+            assert!(hint.contains("magick"), "macOS 以外の手順が要る: {hint}");
+            // 入力の形式と違う拡張子・違うデコーダを打たせない
+            assert!(
+                hint.contains(&format!("in.{ext}")),
+                "{family:?} なのに in.{ext} が出ていない: {hint}"
+            );
+            assert!(
+                !hint.to_ascii_lowercase().contains(other),
+                "{family:?} のヒントに {other} が混ざっている: {hint}"
+            );
+        }
     }
 }

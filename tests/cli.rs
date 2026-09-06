@@ -2689,6 +2689,13 @@ fn the_cli_defaults_match_the_library_defaults() {
     assert_eq!(args.seal, defaults.seal, "--seal の既定値");
     assert_eq!(!args.no_despill, defaults.despill, "デスピルの既定");
     assert_eq!(!args.no_refine, defaults.refine, "アルファ再推定の既定");
+    // 色変換だけ既定値の持ち主が CutoutOptions ではなく LoadOptions になる。
+    // 読み込み側の設定なので、切り抜きの設定に混ぜるとかえって追えない
+    assert_eq!(
+        !args.color.no_color_convert,
+        kiri::image_io::LoadOptions::default().convert_color,
+        "--no-color-convert の既定値"
+    );
 }
 
 /// `--help` が語る既定値が `DEFAULT_EDGE_THRESHOLD` と食い違っていないこと。

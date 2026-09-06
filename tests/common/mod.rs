@@ -160,6 +160,11 @@ pub struct EdgeScene {
     pub product: [u8; 3],
     /// 輪郭が背景へ溶けるまでの距離(px)。1.0 で「くっきり」、8.0 で「柔らかい」
     pub softness: f32,
+    /// 商品にかかる照明の傾き。(画像上端での明度係数, 下端での明度係数)。
+    /// 上を明るく下を暗くすることで、実写のライティングを模す。
+    /// 商品と背景の色差はこの係数で決まるため、淡色商品のシーンはここを調整して
+    /// 「輪郭のコントラストが何 ΔE まで落ちるか」を作り込む
+    pub shading: (f32, f32),
     /// 商品の真下に落ち影を置く
     pub shadow: bool,
     /// 商品の上に伸びる細いストラップの幅(px)
@@ -179,6 +184,8 @@ impl Default for EdgeScene {
             background: [248, 248, 247],
             product: [190, 70, 55],
             softness: 1.0,
+            // 既定は従来どおり 1.15 - 0.35t。S1/S4/S5/S6 の画素を変えないため
+            shading: (1.15, 0.80),
             shadow: false,
             strap: None,
             jpeg: Some(90),
@@ -274,8 +281,10 @@ pub fn edge_scene(scene: &EdgeScene) -> EdgeTruth {
             }
             if c > 0.0 {
                 let t = fy / fh;
+                let (top, bottom) = scene.shading;
+                let shade = top + (bottom - top) * t;
                 for (k, slot) in rgb.iter_mut().enumerate() {
-                    let base = scene.product[k] as f32 * (1.15 - 0.35 * t);
+                    let base = scene.product[k] as f32 * shade;
                     *slot = *slot * (1.0 - c) + base.clamp(0.0, 255.0) * c;
                 }
             }

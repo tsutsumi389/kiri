@@ -122,10 +122,15 @@ pub struct MaskReport {
     /// `separability` は境界の内側を測るため、前景の外側に張り付いた背景色の縁を
     /// 検出できない。この値が大きいときは、白背景では見えなくても黒や色付きの
     /// 下地に載せた瞬間に輪郭が光る。
-    pub halo_ratio: f64,
+    ///
+    /// 測る対象の境界が無ければ null。`separability` と同じく、キー自体は
+    /// 常に出す。0 と報告すると「縁が残っていない」に見えてしまうが、
+    /// それと「そもそも測れていない」はまったく別の状態である。
+    pub halo_ratio: Option<f64>,
     /// 境界法線方向にアルファが 0.9 から 0.1 へ落ちるまでの幅(px)の中央値。
-    /// 0 に近ければ階調が無くギザギザ、大きすぎれば輪郭がぼやけている
-    pub edge_width: f64,
+    /// 鮮鋭な輪郭では 1 前後、6 以上なら輪郭がぼやけている。
+    /// 遷移を1本も追えなければ null
+    pub edge_width: Option<f64>,
     /// --debug-mask で書き出したマスク画像のパス
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug_mask: Option<String>,

@@ -30,11 +30,18 @@ pub const HALO_WARN: f64 = 0.10;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Diagnostics {
     /// 境界近傍で不透明なのに、元画素の色が局所背景と見分けがつかない画素の割合。
-    /// 大きいほど、切り抜きの縁に背景色が残って光輪になる
-    pub halo_ratio: f64,
+    /// 大きいほど、切り抜きの縁に背景色が残って光輪になる。
+    ///
+    /// 境界近傍の前景画素が1つも無ければ None。`separability` と同じ理由で
+    /// 0.0 とは区別する。「縁が残っていない」と「そもそも測れていない」は
+    /// まったく別の状態であり、0 と報告すると前者に見えてしまう
+    pub halo_ratio: Option<f64>,
     /// 境界法線方向にアルファが 0.9 から 0.1 へ落ちるまでの幅(px)の中央値。
-    /// 0 に近ければ階調が無くギザギザ、大きすぎれば輪郭がぼやけている
-    pub edge_width: f64,
+    /// 小さいほど輪郭が鮮鋭で、大きすぎればぼやけている。
+    ///
+    /// 遷移を1本も追えなければ None。前景が無い場合と、見切れて輪郭が
+    /// 画像の中に存在しない場合がこれに当たる
+    pub edge_width: Option<f64>,
 }
 
 /// 元画像とマスクから診断値を求める。
@@ -49,11 +56,11 @@ pub fn diagnose(image: &RgbaImage, mask: &Mask, background: [u8; 3]) -> Diagnost
     }
 }
 
-/// 境界近傍で「背景色のままなのに不透明」な画素の割合。
-pub fn halo_ratio(image: &RgbaImage, mask: &Mask, background: [u8; 3]) -> f64 {
+/// 境界近傍で「背景色のままなのに不透明」な画素の割合。測る対象が無ければ None。
+pub fn halo_ratio(image: &RgbaImage, mask: &Mask, background: [u8; 3]) -> Option<f64> {
     let (w, h) = (mask.width(), mask.height());
     if image.width() != w || image.height() != h {
-        return 0.0;
+        return None;
     }
     let fallback = srgb_to_lab(background);
     let (mut halo, mut total) = (0u64, 0u64);
@@ -72,11 +79,7 @@ pub fn halo_ratio(image: &RgbaImage, mask: &Mask, background: [u8; 3]) -> f64 {
             }
         }
     }
-    if total == 0 {
-        0.0
-    } else {
-        halo as f64 / total as f64
-    }
+    (total > 0).then(|| halo as f64 / total as f64)
 }
 
 fn near_boundary(mask: &Mask, x: u32, y: u32) -> bool {
@@ -123,7 +126,8 @@ fn local_background(image: &RgbaImage, mask: &Mask, x: u32, y: u32) -> Option<[u
 }
 
 /// 境界法線方向にアルファが 0.9 から 0.1 へ落ちるまでの幅(px)の中央値。
-pub fn edge_width(mask: &Mask) -> f64 {
+/// 遷移を1本も追えなければ None。
+pub fn edge_width(mask: &Mask) -> Option<f64> {
     let (w, h) = (mask.width(), mask.height());
     let mut widths: Vec<f32> = Vec::new();
 
@@ -142,10 +146,10 @@ pub fn edge_width(mask: &Mask) -> f64 {
     }
 
     if widths.is_empty() {
-        return 0.0;
+        return None;
     }
     widths.sort_by(f32::total_cmp);
-    f64::from(widths[widths.len() / 2])
+    Some(f64::from(widths[widths.len() / 2]))
 }
 
 /// 法線に沿ってアルファを追い、0.9 を最後に上回った位置から 0.1 を最初に
@@ -206,14 +210,14 @@ mod tests {
     #[test]
     fn a_clean_edge_has_no_halo() {
         let (image, mask) = scene(0, 2);
-        let r = halo_ratio(&image, &mask, [250, 250, 249]);
+        let r = halo_ratio(&image, &mask, [250, 250, 249]).expect("境界があるので測れる");
         assert!(r < 0.05, "縁が無いのに halo_ratio が高い: {r:.3}");
     }
 
     #[test]
     fn a_background_coloured_rim_is_detected() {
         let (image, mask) = scene(3, 2);
-        let r = halo_ratio(&image, &mask, [250, 250, 249]);
+        let r = halo_ratio(&image, &mask, [250, 250, 249]).expect("境界があるので測れる");
         assert!(r > 0.5, "背景色の縁を検出できていない: {r:.3}");
     }
 
@@ -221,11 +225,11 @@ mod tests {
     fn a_wider_rim_scores_higher() {
         let narrow = {
             let (i, m) = scene(1, 2);
-            halo_ratio(&i, &m, [250, 250, 249])
+            halo_ratio(&i, &m, [250, 250, 249]).unwrap()
         };
         let wide = {
             let (i, m) = scene(3, 2);
-            halo_ratio(&i, &m, [250, 250, 249])
+            halo_ratio(&i, &m, [250, 250, 249]).unwrap()
         };
         assert!(
             wide > narrow,
@@ -237,8 +241,8 @@ mod tests {
     fn edge_width_grows_with_the_ramp() {
         let (_, sharp) = scene(0, 1);
         let (_, soft) = scene(0, 8);
-        let a = edge_width(&sharp);
-        let b = edge_width(&soft);
+        let a = edge_width(&sharp).unwrap();
+        let b = edge_width(&soft).unwrap();
         assert!(a < b, "遷移幅が階調の広さに追従していない: {a} >= {b}");
         assert!(b > 3.0, "8px の階調が幅として出ていない: {b}");
     }
@@ -246,7 +250,7 @@ mod tests {
     #[test]
     fn a_binary_edge_is_narrow() {
         let (_, mask) = scene(0, 0);
-        let width = edge_width(&mask);
+        let width = edge_width(&mask).unwrap();
         assert!(width <= 1.5, "二値の境界が広く測られている: {width}");
     }
 
@@ -255,8 +259,9 @@ mod tests {
         let image = RgbaImage::from_pixel(8, 8, Rgba([250, 250, 249, 255]));
         let mask = Mask::new(8, 8, 0);
         let d = diagnose(&image, &mask, [250, 250, 249]);
-        assert_eq!(d.halo_ratio, 0.0);
-        assert_eq!(d.edge_width, 0.0);
+        // 「縁が無い」ではなく「測れなかった」。0 と報告すると良い結果に見える
+        assert_eq!(d.halo_ratio, None);
+        assert_eq!(d.edge_width, None);
     }
 
     #[test]
@@ -264,6 +269,6 @@ mod tests {
         let image = RgbaImage::from_pixel(8, 8, Rgba([0, 0, 0, 255]));
         let mut mask = Mask::new(10, 10, 0);
         mask.set(5, 5, 255);
-        assert_eq!(halo_ratio(&image, &mask, [0; 3]), 0.0);
+        assert_eq!(halo_ratio(&image, &mask, [0; 3]), None);
     }
 }

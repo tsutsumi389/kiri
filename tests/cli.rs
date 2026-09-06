@@ -2121,13 +2121,13 @@ fn separability_is_reported_as_null_rather_than_omitted() {
         .unwrap();
 
     let json = json_stdout(&out);
-    assert!(
-        json["mask"]
-            .as_object()
-            .unwrap()
-            .contains_key("separability"),
-        "キーは常に存在すべき"
-    );
+    let mask = json["mask"].as_object().unwrap();
+    // 同じ理由で halo_ratio と edge_width もキーを消さない。0 と報告すると
+    // 「縁が残っていない」「輪郭がギザギザ」に見えてしまい、
+    // 「そもそも測れていない」と区別できなくなる
+    for key in ["separability", "halo_ratio", "edge_width"] {
+        assert!(mask.contains_key(key), "{key} のキーは常に存在すべき");
+    }
 }
 
 #[test]

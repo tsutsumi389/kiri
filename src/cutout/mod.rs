@@ -292,13 +292,14 @@ fn collect_warnings(
     // 前景の外側に背景色のままの縁が張り付いていても値が悪化しない。
     // この縁は白背景では見えず、黒や色付きの下地に載せて初めて光輪として現れる。
     // 納品先の背景が分からない以上、書き出しの時点で知らせる必要がある
-    if diagnostics.halo_ratio > diagnostics::HALO_WARN {
-        warnings.push(format!(
-            "境界の {:.0}% が背景色のまま不透明で残っています (halo_ratio={:.2})。\
-             白以外の下地に載せると輪郭が光ります",
-            diagnostics.halo_ratio * 100.0,
-            diagnostics.halo_ratio
-        ));
+    if let Some(halo) = diagnostics.halo_ratio {
+        if halo > diagnostics::HALO_WARN {
+            warnings.push(format!(
+                "境界の {:.0}% が背景色のまま不透明で残っています (halo_ratio={halo:.2})。\
+                 白以外の下地に載せると輪郭が光ります",
+                halo * 100.0,
+            ));
+        }
     }
 
     // 商品と背景の色差が、背景自身のばらつきより小さい場合、背景を飲み込める
@@ -367,8 +368,8 @@ mod tests {
     /// 縁が残っていない状態の診断値。ハロー警告と混ざらないようにするため。
     fn clean() -> Diagnostics {
         Diagnostics {
-            halo_ratio: 0.0,
-            edge_width: 1.5,
+            halo_ratio: Some(0.0),
+            edge_width: Some(1.5),
         }
     }
 

@@ -203,11 +203,13 @@ fn the_halo_diagnostic_notices_a_background_coloured_rim() {
             ..Default::default()
         },
     );
+    let (rimmed, clean) = (
+        rimmed.diagnostics.halo_ratio.expect("境界があるので測れる"),
+        clean.diagnostics.halo_ratio.expect("境界があるので測れる"),
+    );
     assert!(
-        rimmed.diagnostics.halo_ratio > clean.diagnostics.halo_ratio + 0.05,
-        "縁を残した結果のほうが halo_ratio が高くあるべき: {:.3} vs {:.3}",
-        rimmed.diagnostics.halo_ratio,
-        clean.diagnostics.halo_ratio
+        rimmed > clean + 0.05,
+        "縁を残した結果のほうが halo_ratio が高くあるべき: {rimmed:.3} vs {clean:.3}"
     );
 }
 
@@ -215,11 +217,13 @@ fn the_halo_diagnostic_notices_a_background_coloured_rim() {
 fn the_edge_width_diagnostic_tracks_the_softness_of_the_contour() {
     let hard = cutout(&find("S1").image, &CutoutOptions::default());
     let soft = cutout(&find("S4").image, &CutoutOptions::default());
+    let (soft, hard) = (
+        soft.diagnostics.edge_width.expect("輪郭があるので測れる"),
+        hard.diagnostics.edge_width.expect("輪郭があるので測れる"),
+    );
     assert!(
-        soft.diagnostics.edge_width > hard.diagnostics.edge_width,
-        "柔らかい輪郭のほうが遷移幅が広くあるべき: {:.2} vs {:.2}",
-        soft.diagnostics.edge_width,
-        hard.diagnostics.edge_width
+        soft > hard,
+        "柔らかい輪郭のほうが遷移幅が広くあるべき: {soft:.2} vs {hard:.2}"
     );
 }
 
@@ -308,12 +312,16 @@ fn print_the_metrics_table() {
                 m.strap_kept * 100.0,
                 m.shadow_kept * 100.0,
             );
+            let round1 = |v: f64| (v * 10.0).round() / 10.0;
             println!(
-                "{:<49} halo_ratio={:.3} edge_width={:.2} separability={:?}",
+                "{:<49} halo_ratio={:?} edge_width={:?} separability={:?}",
                 "",
-                result.diagnostics.halo_ratio,
-                result.diagnostics.edge_width,
-                result.separability.map(|v| (v * 10.0).round() / 10.0),
+                result
+                    .diagnostics
+                    .halo_ratio
+                    .map(|v| (v * 1000.0).round() / 1000.0),
+                result.diagnostics.edge_width.map(round1),
+                result.separability.map(round1),
             );
         }
         println!();

@@ -4,12 +4,14 @@
 //! 数値は macOS の ColorSync が配っている実プロファイルから採ったもので、
 //! s15Fixed16 に丸めた値そのままである。
 
-/// TRC の与え方。ICC の 3 つの型を書き分けられるようにしてある。
+/// TRC の与え方。ICC の型を書き分けられるようにしてある。
 pub(crate) enum Trc {
     /// `curv` 1 点（AdobeRGB がこの形）
     Gamma(f64),
     /// `curv` N 点（v2 の sRGB がこの形）
     Table(Vec<f64>),
+    /// `para` タイプ 0（DCI(P3) がこの形）: 単純なガンマ
+    Parametric0(f64),
     /// `para` タイプ 3（Display P3 がこの形）: [g, a, b, c, d]
     Parametric3([f64; 5]),
 }
@@ -27,6 +29,9 @@ pub(crate) struct ProfileSpec {
     pub chad: Option<[f64; 9]>,
     /// false にすると rXYZ/gXYZ/bXYZ を落とし、LUT 型のプロファイルを模す
     pub include_matrix: bool,
+    /// 中身が同じタグを 1 つの実体に束ねる。実プロファイルは rTRC/gTRC/bTRC が
+    /// 同じオフセットを指しているのが普通で、その並びを再現する
+    pub share_identical_tags: bool,
 }
 
 /// Apple の Display P3（v4、`para` タイプ 3、`chad` あり）。
@@ -60,6 +65,62 @@ pub(crate) fn display_p3() -> ProfileSpec {
             0.015_075_683,
             0.751_678_466,
         ]),
+        share_identical_tags: false,
+        include_matrix: true,
+    }
+}
+
+/// ROMM RGB / ProPhoto（v4、`para` タイプ 3、媒体白色点が D50）。
+///
+/// 媒体白色点が D50 なので `chad` は恒等になる。相対比色で `chad` の逆を
+/// 白色順応の代わりに使うと、ここで D50→D65 の順応が丸ごと抜け落ちる。
+pub(crate) fn romm_rgb() -> ProfileSpec {
+    ProfileSpec {
+        version: 0x0400_0000,
+        desc: "ROMM RGB: ISO 22028-2:2013".into(),
+        desc_is_mluc: true,
+        colour_space: *b"RGB ",
+        pcs: *b"XYZ ",
+        primaries: [
+            [0.797_668_457, 0.288_040_161, 0.0],
+            [0.135_192_871, 0.711_883_544, 0.0],
+            [0.031_356_811, 0.000_091_552, 0.825_195_312],
+        ],
+        trc: Trc::Parametric3([1.800_003_051, 1.0, 0.0, 0.0625, 0.001_953_125]),
+        chad: Some([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
+        share_identical_tags: true,
+        include_matrix: true,
+    }
+}
+
+/// SMPTE RP 431-2 DCI (P3)（v4、`para` タイプ 0、媒体白色点が DCI 白）。
+///
+/// `chad` は非恒等だが D65 由来でもない。`chad` の逆を使うと白が緑に転ぶ。
+pub(crate) fn dci_p3() -> ProfileSpec {
+    ProfileSpec {
+        version: 0x0400_0000,
+        desc: "SMPTE RP 431-2-2007 DCI (P3)".into(),
+        desc_is_mluc: true,
+        colour_space: *b"RGB ",
+        pcs: *b"XYZ ",
+        primaries: [
+            [0.486_160_278, 0.226_684_570, -0.000_808_715],
+            [0.323_852_539, 0.710_327_148, 0.043_228_149],
+            [0.154_190_063, 0.062_988_281, 0.782_470_703],
+        ],
+        trc: Trc::Parametric0(2.600_006_103),
+        chad: Some([
+            1.073_822_021,
+            0.038_803_100,
+            -0.036_895_751,
+            0.055_572_509,
+            0.963_989_257,
+            -0.014_343_261,
+            -0.004_272_460,
+            0.005_294_799,
+            0.862_777_709,
+        ]),
+        share_identical_tags: true,
         include_matrix: true,
     }
 }
@@ -91,6 +152,7 @@ pub(crate) fn srgb_v2() -> ProfileSpec {
                 .collect(),
         ),
         chad: None,
+        share_identical_tags: false,
         include_matrix: true,
     }
 }
@@ -110,6 +172,7 @@ pub(crate) fn adobe_rgb() -> ProfileSpec {
         ],
         trc: Trc::Gamma(2.199_218_75),
         chad: None,
+        share_identical_tags: false,
         include_matrix: true,
     }
 }
@@ -142,29 +205,40 @@ fn trc_tag(trc: &Trc) -> Vec<u8> {
             }
             out
         }
-        Trc::Parametric3(p) => {
-            let mut out = b"para\0\0\0\0".to_vec();
-            out.extend_from_slice(&3u16.to_be_bytes());
-            out.extend_from_slice(&0u16.to_be_bytes());
-            for v in p {
-                out.extend_from_slice(&s15(*v));
-            }
-            out
-        }
+        Trc::Parametric0(g) => parametric_tag(0, &[*g]),
+        Trc::Parametric3(p) => parametric_tag(3, p),
     }
 }
 
-fn desc_tag(text: &str, mluc: bool) -> Vec<u8> {
-    if mluc {
-        let units: Vec<u16> = text.encode_utf16().collect();
-        let bytes: Vec<u8> = units.iter().flat_map(|u| u.to_be_bytes()).collect();
+fn parametric_tag(kind: u16, params: &[f64]) -> Vec<u8> {
+    let mut out = b"para\0\0\0\0".to_vec();
+    out.extend_from_slice(&kind.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    for v in params {
+        out.extend_from_slice(&s15(*v));
+    }
+    out
+}
+
+fn desc_tag(spec: &ProfileSpec) -> Vec<u8> {
+    let text = &spec.desc;
+    if spec.desc_is_mluc {
+        let records: Vec<([u8; 4], &str)> = vec![(*b"enUS", text.as_str())];
+
         let mut out = b"mluc\0\0\0\0".to_vec();
-        out.extend_from_slice(&1u32.to_be_bytes()); // レコード数
+        out.extend_from_slice(&(records.len() as u32).to_be_bytes()); // レコード数
         out.extend_from_slice(&12u32.to_be_bytes()); // レコード長
-        out.extend_from_slice(b"enUS");
-        out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-        out.extend_from_slice(&28u32.to_be_bytes()); // タグ先頭からの位置
-        out.extend_from_slice(&bytes);
+        // 文字列の実体はレコード表の後ろにまとめて置く
+        let mut strings = Vec::new();
+        let base = 16 + records.len() * 12;
+        for (code, name) in &records {
+            let bytes: Vec<u8> = name.encode_utf16().flat_map(|u| u.to_be_bytes()).collect();
+            out.extend_from_slice(code);
+            out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            out.extend_from_slice(&((base + strings.len()) as u32).to_be_bytes());
+            strings.extend_from_slice(&bytes);
+        }
+        out.extend_from_slice(&strings);
         out
     } else {
         let ascii = text.as_bytes();
@@ -184,8 +258,7 @@ fn desc_tag(text: &str, mluc: bool) -> Vec<u8> {
 
 /// 仕様から ICC のバイト列を組み立てる。
 pub(crate) fn build(spec: &ProfileSpec) -> Vec<u8> {
-    let mut tags: Vec<([u8; 4], Vec<u8>)> =
-        vec![(*b"desc", desc_tag(&spec.desc, spec.desc_is_mluc))];
+    let mut tags: Vec<([u8; 4], Vec<u8>)> = vec![(*b"desc", desc_tag(spec))];
     if spec.include_matrix {
         tags.push((*b"rXYZ", xyz_tag(spec.primaries[0])));
         tags.push((*b"gXYZ", xyz_tag(spec.primaries[1])));
@@ -206,16 +279,25 @@ pub(crate) fn build(spec: &ProfileSpec) -> Vec<u8> {
     let table_len = 4 + tags.len() * 12;
     let mut body = Vec::new();
     let mut table = Vec::new();
+    let mut placed: Vec<(&[u8], usize)> = Vec::new();
     table.extend_from_slice(&(tags.len() as u32).to_be_bytes());
     for (sig, data) in &tags {
-        let offset = 128 + table_len + body.len();
+        let shared = spec
+            .share_identical_tags
+            .then(|| placed.iter().find(|(d, _)| *d == data.as_slice()))
+            .flatten()
+            .map(|(_, offset)| *offset);
+        let offset = shared.unwrap_or(128 + table_len + body.len());
         table.extend_from_slice(sig);
         table.extend_from_slice(&(offset as u32).to_be_bytes());
         table.extend_from_slice(&(data.len() as u32).to_be_bytes());
-        body.extend_from_slice(data);
-        // タグは 4 バイト境界に揃える
-        while body.len() % 4 != 0 {
-            body.push(0);
+        if shared.is_none() {
+            placed.push((data.as_slice(), offset));
+            body.extend_from_slice(data);
+            // タグは 4 バイト境界に揃える
+            while body.len() % 4 != 0 {
+                body.push(0);
+            }
         }
     }
 

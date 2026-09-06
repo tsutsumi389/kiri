@@ -19,7 +19,11 @@ use rayon::prelude::*;
 
 /// ICC を解釈した結果。
 pub struct Icc {
-    /// プロファイルの表示名（`desc` / `mluc`）。sRGB 相当なら "sRGB" に正規化する
+    /// プロファイル自身の名乗り（`desc` / `mluc`）。
+    ///
+    /// sRGB 相当と判定しても書き換えない。報告する色空間名は呼び出し側が
+    /// `interpretation` から決める。ここまで "sRGB" に潰すと、どのプロファイルが
+    /// 素通しされたのかが結果から消え、色を疑ったときに追えなくなる
     pub name: Option<String>,
     pub interpretation: Interpretation,
 }
@@ -99,15 +103,13 @@ impl Transform {
 
     /// sRGB と実質同じプロファイルか。
     ///
-    /// 原色が一致していることを必須にした上で、TRC も一致するか、名前が sRGB を
-    /// 名乗っているかを見る。名乗りだけで通さないのは、「sRGB」を含む名前の
-    /// 別物（sRGB 原色にガンマ 1.8 を載せた類）を素通しさせないため。
-    fn looks_like_srgb(&self, name: Option<&str>) -> bool {
-        if !self.matrix_is_identity(0.003) {
-            return false;
-        }
-        let named_srgb = name.is_some_and(|n| n.to_ascii_lowercase().contains("srgb"));
-        named_srgb || self.trc_matches_srgb(0.002)
+    /// 原色と TRC の両方が一致することを要求し、名前は見ない。「sRGB」を含む
+    /// 名前で中身が別物のプロファイル（sRGB 原色にガンマ 1.0 や 1.8 を載せた類）は
+    /// 実在し、名乗りを信じると 8bit で数十段ずれた画像をそのまま素通しさせる。
+    /// 実プロファイルの側に名乗りへ頼る理由も無い。macOS の `sRGB Profile.icc` の
+    /// `curv[1024]` は解析式との差が 7.6e-6 で、TRC の一致だけで十分に通る。
+    fn looks_like_srgb(&self) -> bool {
+        self.matrix_is_identity(0.003) && self.trc_matches_srgb(0.002)
     }
 
     fn matrix_is_identity(&self, tolerance: f32) -> bool {
@@ -144,25 +146,14 @@ fn encode(table: &[f32; ENCODE_STEPS + 1], v: f32) -> u8 {
 ///
 /// 画像そのものは読めているのに、付随するメタデータのせいで処理を断るのは筋が悪い。
 pub fn interpret(bytes: &[u8]) -> Icc {
-    let name = profile_name(bytes);
-    match parse_transform(bytes) {
-        Some(transform) => {
-            if transform.looks_like_srgb(name.as_deref()) {
-                Icc {
-                    name: Some("sRGB".to_string()),
-                    interpretation: Interpretation::Srgb,
-                }
-            } else {
-                Icc {
-                    name,
-                    interpretation: Interpretation::Convertible(Box::new(transform)),
-                }
-            }
-        }
-        None => Icc {
-            name,
-            interpretation: Interpretation::Unsupported,
-        },
+    let interpretation = match parse_transform(bytes) {
+        Some(t) if t.looks_like_srgb() => Interpretation::Srgb,
+        Some(t) => Interpretation::Convertible(Box::new(t)),
+        None => Interpretation::Unsupported,
+    };
+    Icc {
+        name: profile_name(bytes),
+        interpretation,
     }
 }
 
@@ -388,20 +379,6 @@ fn parse_xyz(data: &[u8]) -> Option<[f64; 3]> {
     Some([s15(data, 8)?, s15(data, 12)?, s15(data, 16)?])
 }
 
-/// s15Fixed16ArrayType（`chad` が使う）から 3x3 を読む。
-fn parse_sf32_matrix(data: &[u8]) -> Option<[[f64; 3]; 3]> {
-    if signature(data, 0)? != *b"sf32" {
-        return None;
-    }
-    let mut m = [[0.0; 3]; 3];
-    for (i, row) in m.iter_mut().enumerate() {
-        for (j, v) in row.iter_mut().enumerate() {
-            *v = s15(data, 8 + (i * 3 + j) * 4)?;
-        }
-    }
-    Some(m)
-}
-
 /// 行列 + TRC 型として解釈し、sRGB への変換を組み立てる。
 /// LUT 型や CMYK / Gray はここで None になる。
 fn parse_transform(bytes: &[u8]) -> Option<Transform> {
@@ -436,15 +413,14 @@ fn parse_transform(bytes: &[u8]) -> Option<Transform> {
     }
 
     // PCS は必ず D50。sRGB は D65 なので白色順応を挟む。
-    // v4 は実際の白色点から D50 への行列（chad）を持つので、その逆が答えになる。
-    // v2 のディスプレイプロファイルは chad を持たず、原色が Bradford で D50 へ
-    // 寄せられているだけなので、標準の Bradford で戻す。
-    let to_d65 = match tag(bytes, b"chad").and_then(parse_sf32_matrix) {
-        Some(chad) if invertible(&chad) => invert(&chad),
-        _ => bradford(D50, D65),
-    };
-
-    let matrix64 = mul(&XYZ_D65_TO_SRGB, &mul(&to_d65, &to_pcs));
+    //
+    // ここで `chad` を使ってはいけない。相対比色では PCS の値は媒体相対
+    // （媒体の白 = PCS の白 = D50）で表され、`rXYZ`/`gXYZ`/`bXYZ` も既に D50 へ
+    // 順応済みの値が入っている。`chad`（実測白色点 → D50）の逆を掛けると媒体の
+    // 実測白へ引き戻してしまい、白色点が D65 でないプロファイル（D50 の ROMM、
+    // DCI 白の DCI-P3、D60 の ACES）で白が白でなくなる。`chad` が要るのは
+    // 絶対比色のときだけで、kiri は相対比色しか扱わない。
+    let matrix64 = mul(&XYZ_D65_TO_SRGB, &mul(&bradford(D50, D65), &to_pcs));
     let mut matrix = [[0.0f32; 3]; 3];
     for (i, row) in matrix.iter_mut().enumerate() {
         for (j, v) in row.iter_mut().enumerate() {
@@ -607,39 +583,96 @@ mod tests {
         }
     }
 
-    /// sRGB 相当のプロファイルでは変換しない。
+    /// sRGB 相当のプロファイルでは変換しない。名乗りは潰さずに残す。
     #[test]
     fn an_srgb_profile_is_detected_and_left_alone() {
         let icc = interpret(&build(&srgb_v2()));
-        assert_eq!(icc.name.as_deref(), Some("sRGB"));
         assert!(
             matches!(icc.interpretation, Interpretation::Srgb),
             "sRGB 相当は変換対象にしてはいけない"
         );
+        assert_eq!(
+            icc.name.as_deref(),
+            Some("sRGB IEC61966-2.1"),
+            "どのプロファイルが素通しされたのかは残すべき"
+        );
     }
 
-    /// 仮に変換したとしても恒等でなければならない。
-    /// 恒等でない実装は、sRGB を素通しにする判定が外れた瞬間に色を壊す。
+    /// 媒体白色点が D65 でないプロファイルでも中性グレーが中性のまま出ること。
+    ///
+    /// 相対比色では PCS の値は媒体相対（媒体の白 = PCS の白 = D50）で表され、
+    /// 原色の XYZ も既に D50 へ順応済みである。`chad`（実測白色点 → D50）の逆を
+    /// 白色順応の代わりに使うと媒体の実測白へ引き戻してしまい、白が D65 でない
+    /// プロファイルで白が白でなくなる。ROMM は媒体白が D50 で `chad` が恒等な
+    /// ため順応が丸ごと抜け、白が 255,252,221 に転ぶ。
     #[test]
-    fn the_srgb_transform_is_the_identity() {
-        let t = transform_of(&build(&srgb_v2()));
-        for i in 0..=255u8 {
-            let out = t.convert_pixel([i, i, i]);
-            for c in out {
-                assert!(
-                    u32::from(i).abs_diff(u32::from(c)) <= 1,
-                    "{i} が {out:?} に動いた"
-                );
+    fn a_media_white_that_is_not_d65_still_maps_white_to_white() {
+        use crate::color::synthetic::{dci_p3, romm_rgb};
+        for spec in [romm_rgb(), dci_p3()] {
+            let name = spec.desc.clone();
+            let t = transform_of(&build(&spec));
+            for level in [64u8, 128, 192, 255] {
+                let out = t.convert_pixel([level, level, level]);
+                let spread = u32::from(out.iter().copied().max().unwrap())
+                    - u32::from(out.iter().copied().min().unwrap());
+                assert!(spread <= 1, "{name} の {level} が中性でなくなった: {out:?}");
             }
         }
-        for rgb in [[190u8, 70, 55], [12, 200, 240], [248, 248, 247]] {
-            let out = t.convert_pixel(rgb);
-            for (a, b) in rgb.iter().zip(out.iter()) {
-                assert!(
-                    u32::from(*a).abs_diff(u32::from(*b)) <= 1,
-                    "{rgb:?} が {out:?} に動いた"
-                );
+    }
+
+    /// グレー階調が ColorSync / littleCMS の相対比色と一致すること。
+    ///
+    /// 中性であるだけでは足りない。白色順応を丸ごと落としても「灰色のまま
+    /// 明るさだけずれる」ことはあり得るので、絶対値を外部の実装で押さえる。
+    /// 参照値は macOS の `sips --matchTo "sRGB Profile.icc"` と littleCMS 2.17
+    /// （intent 1）が同じ値を返したもの。
+    #[test]
+    fn grays_agree_with_colorsync_and_littlecms() {
+        use crate::color::synthetic::{dci_p3, romm_rgb};
+        // 入力 64 / 128 / 192 / 255 に対する sRGB 側の期待値
+        let cases = [
+            (display_p3(), [64u8, 128, 192, 255]),
+            (crate::color::synthetic::adobe_rgb(), [62, 129, 193, 255]),
+            (romm_rgb(), [81, 146, 203, 255]),
+            (dci_p3(), [46, 113, 184, 255]),
+        ];
+        for (spec, expected) in cases {
+            let name = spec.desc.clone();
+            let t = transform_of(&build(&spec));
+            for (level, want) in [64u8, 128, 192, 255].into_iter().zip(expected) {
+                let out = t.convert_pixel([level, level, level]);
+                for c in out {
+                    assert!(
+                        u32::from(c).abs_diff(u32::from(want)) <= 1,
+                        "{name} の {level}: 期待 {want} に対して {out:?}"
+                    );
+                }
             }
+        }
+    }
+
+    /// 名前が sRGB を名乗っていても、TRC が違えば素通しにしてはいけない。
+    ///
+    /// sRGB 原色にガンマ 1.0 や 1.8 を載せたプロファイルは実在する。名乗りだけで
+    /// 通すと、8bit で数十段ずれた画像がそのまま納品される。
+    #[test]
+    fn a_profile_that_merely_calls_itself_srgb_is_still_converted() {
+        for (desc, trc) in [
+            ("sRGB Linear", Trc::Gamma(1.0)),
+            ("sRGB with gamma 1.8", Trc::Gamma(1.8)),
+        ] {
+            let mut spec = srgb_v2();
+            spec.desc = desc.into();
+            spec.trc = trc;
+            let icc = interpret(&build(&spec));
+            let Interpretation::Convertible(t) = icc.interpretation else {
+                panic!("{desc} は sRGB ではないので変換対象であるべき");
+            };
+            let out = t.convert_pixel([128, 128, 128]);
+            assert!(
+                u32::from(out[0]).abs_diff(128) >= 10,
+                "{desc} は 128 が大きく動くはずなのに {out:?}"
+            );
         }
     }
 

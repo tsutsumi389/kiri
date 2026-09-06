@@ -146,11 +146,11 @@ pub struct CutoutArgs {
     #[arg(long, default_value_t = DEFAULT_BORDER)]
     pub border: u32,
 
-    /// 孤立ノイズの除去と小さな穴埋めの半径(px)。0 で無効
+    /// 孤立ノイズ除去の半径(px)。面積 (2n+1)² 未満の連結成分を消す。0 で無効
     #[arg(long, default_value_t = 2)]
     pub cleanup: u32,
 
-    /// 境界フェザリングの半径(px)。0 で無効
+    /// 境界の階調を色から決められなかった箇所で使うフェザリング半径(px)。0 で無効
     #[arg(long, default_value_t = 1)]
     pub feather: u32,
 

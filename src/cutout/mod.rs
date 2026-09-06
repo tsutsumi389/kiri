@@ -4,24 +4,31 @@
 //! 1. 外周から背景色を推定する
 //! 2. 外周を起点に、背景色に近い画素を連結でたどって背景マスクを作る
 //! 3. bbox 指定があれば、その外側を背景として確定させる
-//! 4. オープニングで孤立ノイズを、クロージングで小さな穴を消す
-//! 5. 境界をフェザリングして階調を持たせる
-//! 6. 境界画素から背景色の寄与を取り除く
-//! 7. マスクをアルファとして適用する
+//! 4. 面積フィルタで孤立ノイズを消す
+//! 5. 境界帯のアルファを画像の色から推定し直し、同じ推定から色も復元する
+//! 6. マスクをアルファとして適用する
+//!
+//! 5 は `--no-refine` で旧経路（幾何的フェザリング + 大域背景色でのデスピル）へ
+//! 戻せる。旧経路は refine が「色では決められない」と判断した画素の受け皿でも
+//! あるため、コードとしても残っている。
 
 pub mod background;
 pub mod despill;
+pub mod diagnostics;
 pub mod edges;
 pub mod feather;
 pub mod floodfill;
 pub mod mask;
 pub mod morphology;
+pub mod refine;
 
 use image::RgbaImage;
 
 pub use background::{BackgroundEstimate, DEFAULT_BORDER, DeltaEQuantiles, estimate_background};
+pub use diagnostics::Diagnostics;
 pub use floodfill::{FG_SEED_RADIUS, FloodOptions, foreground_mask};
 pub use mask::{Mask, MaskStats};
+pub use refine::RefineOptions;
 
 #[derive(Debug, Clone)]
 pub struct CutoutOptions {
@@ -33,14 +40,18 @@ pub struct CutoutOptions {
     pub bbox: Option<(u32, u32, u32, u32)>,
     /// 「ここは必ず前景」と指定された座標
     pub fg_seeds: Vec<(u32, u32)>,
-    /// 形態素処理の半径。孤立ノイズと小さな穴の除去に使う
+    /// 孤立ノイズ除去の半径。面積 `(2*cleanup+1)^2` 未満の連結成分を消す
     pub cleanup: u32,
-    /// 境界フェザリングの半径
+    /// 境界フェザリングの半径。`refine` が色で決められなかった画素と、
+    /// `refine` を切ったときの境界処理に使う
     pub feather: u32,
     /// 境界の色かぶりを除去するか
     pub despill: bool,
     /// 1px あたりの輝度変化がこの値を超える画素にはフィルを侵入させない。0 で無効
     pub edge_threshold: f64,
+    /// 境界帯のアルファを画像の色から推定し直すか。false で旧来の
+    /// 幾何的フェザリング + 大域背景色でのデスピルに戻す
+    pub refine: bool,
 }
 
 impl Default for CutoutOptions {
@@ -58,6 +69,7 @@ impl Default for CutoutOptions {
             // 商品の輪郭(1px で十数以上の変化)は超え、落ち影(1px で 1-2 程度)は
             // 超えない値。実測に基づく
             edge_threshold: 8.0,
+            refine: true,
         }
     }
 }
@@ -70,6 +82,8 @@ pub struct CutoutResult {
     pub stats: MaskStats,
     /// 切り抜き境界での商品と背景の色差(ΔE)の中央値。前景が無ければ None
     pub separability: Option<f64>,
+    /// 境界の縁と階調の診断値
+    pub diagnostics: Diagnostics,
     pub warnings: Vec<String>,
 }
 
@@ -84,16 +98,40 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
     };
     let mut mask = foreground_mask(image, background.rgb, &flood);
 
-    // 順序に意味がある。先に孤立ノイズを消してから穴を埋めないと、
-    // ノイズの周りが埋まって塊になってしまう
-    mask = morphology::open(&mask, opts.cleanup);
-    mask = morphology::close(&mask, opts.cleanup);
-    mask = feather::feather(&mask, opts.feather);
+    // 孤立ノイズは面積で落とす。オープニングは幅で落とすため、ストラップや
+    // ケーブルのような細い商品の一部まで巻き添えにしていた。
+    // クロージングは掛けない（morphology::close のコメントを参照）。
+    //
+    // ここで一度掛けるのは、境界帯の推定をノイズの一つ一つに走らせないため
+    mask = morphology::remove_specks(&mask, opts.cleanup);
 
-    let mut out = image.clone();
-    if opts.despill {
-        despill::despill(&mut out, &mask, background.rgb);
-    }
+    let mut out = if opts.refine {
+        let refined = refine::refine(
+            image,
+            &mask,
+            background.rgb,
+            &RefineOptions {
+                feather: opts.feather,
+                despill: opts.despill,
+                ..Default::default()
+            },
+        );
+        mask = refined.mask;
+        refined.image
+    } else {
+        mask = feather::feather(&mask, opts.feather);
+        let mut out = image.clone();
+        if opts.despill {
+            despill::despill(&mut out, &mask, background.rgb);
+        }
+        out
+    };
+
+    // もう一度掛ける。エッジ堤防は勾配が立つ画素を軒並み前景側へ残すので、
+    // ゴミは実寸より 1px ほど太って見える。3x3 のゴミが 5x5 に見えると、
+    // 面積 25 の下限をちょうど超えて生き残ってしまう。帯の推定で縁が透明へ
+    // 戻った後こそが、成分の大きさを正しく測れる唯一のタイミングである
+    mask = morphology::remove_specks(&mask, opts.cleanup);
     apply_alpha(&mut out, &mask);
 
     let stats = mask.stats();
@@ -103,7 +141,8 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
     // 輪郭検出(1px程度)・形態素処理・フェザリングの合計で決まる
     let inset = opts.cleanup + opts.feather + 4;
     let separability = boundary_separability(image, &mask, background.rgb, inset, opts.bbox);
-    let warnings = collect_warnings(&background, &stats, separability);
+    let diagnostics = diagnostics::diagnose(image, &mask, background.rgb);
+    let warnings = collect_warnings(&background, &stats, separability, &diagnostics);
 
     CutoutResult {
         image: out,
@@ -111,6 +150,7 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
         background,
         stats,
         separability,
+        diagnostics,
         warnings,
     }
 }
@@ -220,6 +260,7 @@ fn collect_warnings(
     background: &BackgroundEstimate,
     stats: &MaskStats,
     separability: Option<f64>,
+    diagnostics: &Diagnostics,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
 
@@ -245,6 +286,20 @@ fn collect_warnings(
     }
     if stats.touches_edge {
         warnings.push("前景が画像の外周に接しています。商品が見切れている可能性があります".into());
+    }
+
+    // 縁の残りは separability では検出できない。あちらは境界の内側を測るため、
+    // 前景の外側に背景色のままの縁が張り付いていても値が悪化しない。
+    // この縁は白背景では見えず、黒や色付きの下地に載せて初めて光輪として現れる。
+    // 納品先の背景が分からない以上、書き出しの時点で知らせる必要がある
+    if let Some(halo) = diagnostics.halo_ratio {
+        if halo > diagnostics::HALO_WARN {
+            warnings.push(format!(
+                "境界の {:.0}% が背景色のまま不透明で残っています (halo_ratio={halo:.2})。\
+                 白以外の下地に載せると輪郭が光ります",
+                halo * 100.0,
+            ));
+        }
     }
 
     // 商品と背景の色差が、背景自身のばらつきより小さい場合、背景を飲み込める
@@ -307,6 +362,14 @@ mod tests {
             foreground_ratio: 0.3,
             bbox: Some((0, 0, 10, 10)),
             touches_edge: false,
+        }
+    }
+
+    /// 縁が残っていない状態の診断値。ハロー警告と混ざらないようにするため。
+    fn clean() -> Diagnostics {
+        Diagnostics {
+            halo_ratio: Some(0.0),
+            edge_width: Some(1.5),
         }
     }
 
@@ -413,7 +476,7 @@ mod tests {
     #[test]
     fn a_hopeless_image_is_called_out() {
         // 実写のキーボードがこれ。商品が、背景が背景自身と違う量より背景に近い
-        let warnings = collect_warnings(&estimate(0.16, 20.0), &stats(), Some(12.1));
+        let warnings = collect_warnings(&estimate(0.16, 20.0), &stats(), Some(12.1), &clean());
         assert!(
             hopeless(&warnings),
             "色差がばらつきを下回るなら警告する: {warnings:?}"
@@ -430,7 +493,7 @@ mod tests {
             bbox: Some((0, 0, 10, 10)),
             touches_edge: true,
         };
-        let warnings = collect_warnings(&estimate(0.21, 11.9), &stats, Some(11.5));
+        let warnings = collect_warnings(&estimate(0.21, 11.9), &stats, Some(11.5), &clean());
         assert!(
             !hopeless(&warnings),
             "切り抜きが成立していない段階で断定してはいけない: {warnings:?}"
@@ -441,7 +504,7 @@ mod tests {
     fn a_white_product_on_a_uniform_white_background_is_not_called_out() {
         // README の看板ケース。均一な背景では輪郭検出で正しく解けるため、
         // 境界の色差が小さくても失敗ではない
-        let warnings = collect_warnings(&estimate(1.0, 0.8), &stats(), Some(3.0));
+        let warnings = collect_warnings(&estimate(1.0, 0.8), &stats(), Some(3.0), &clean());
         assert!(
             !hopeless(&warnings),
             "均一背景では警告してはいけない: {warnings:?}"
@@ -451,7 +514,7 @@ mod tests {
     #[test]
     fn a_patchy_background_with_a_distinct_product_is_not_called_out() {
         // 背景が汚れていても商品がはっきり違うなら、tolerance を上げれば解ける
-        let warnings = collect_warnings(&estimate(0.5, 15.0), &stats(), Some(60.0));
+        let warnings = collect_warnings(&estimate(0.5, 15.0), &stats(), Some(60.0), &clean());
         assert!(
             !hopeless(&warnings),
             "色差が十分ならばらつきがあっても警告しない: {warnings:?}"

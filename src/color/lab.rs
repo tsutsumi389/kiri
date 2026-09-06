@@ -9,13 +9,24 @@ const XN: f64 = 0.950_47;
 const YN: f64 = 1.0;
 const ZN: f64 = 1.088_83;
 
+/// sRGB 8bit → 線形値の変換表。
+///
+/// `powf` は 1 回でも数十 ns かかる。境界帯の推定は境界画素ごとに何度も Lab へ
+/// 変換するため、12MP のメッシュ状の素材では変換だけで数百 ms を占めていた。
+/// 入力が 8bit しか取り得ない以上、表を引けば結果は完全に同じで済む。
+static LINEAR: std::sync::LazyLock<[f64; 256]> = std::sync::LazyLock::new(|| {
+    std::array::from_fn(|i| {
+        let c = i as f64 / 255.0;
+        if c <= 0.040_45 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    })
+});
+
 fn srgb_to_linear(c: u8) -> f64 {
-    let c = c as f64 / 255.0;
-    if c <= 0.040_45 {
-        c / 12.92
-    } else {
-        ((c + 0.055) / 1.055).powf(2.4)
-    }
+    LINEAR[c as usize]
 }
 
 fn pivot(t: f64) -> f64 {

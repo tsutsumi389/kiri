@@ -121,6 +121,7 @@ fn to_cutout_args(
         cleanup: settings.cleanup.unwrap_or(2),
         feather: settings.feather.unwrap_or(1),
         no_despill: !settings.despill.unwrap_or(true),
+        no_refine: !settings.refine.unwrap_or(true),
         edge_threshold: settings.edge_threshold.unwrap_or(8.0),
         canvas,
         fill_ratio: settings.fill_ratio.unwrap_or(0.85),
@@ -139,4 +140,36 @@ fn to_cutout_args(
             force,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cutout::CutoutOptions;
+
+    /// 何も書かれていない仕様項目の既定値が、ライブラリの既定値と食い違わないこと。
+    ///
+    /// 同じ数字が clap の `default_value_t`、`CutoutOptions::default()`、そして
+    /// ここの `unwrap_or` の 3 箇所に書かれている。片方だけ動かしてもコンパイルは
+    /// 通り、テストも「その値でたまたま通る」ので誰も気づかない。CLI と
+    /// ライブラリの突き合わせは tests/cli.rs にあるが、`to_cutout_args` は
+    /// 非公開なのでそちらからは触れない。同じモジュール内なら呼べる。
+    #[test]
+    fn the_batch_defaults_match_the_library_defaults() {
+        let settings = ItemSettings::default();
+        let args = to_cutout_args(Path::new("in.png"), Path::new("out.png"), &settings, false)
+            .expect("既定値だけの項目は解釈できるはず");
+        let defaults = CutoutOptions::default();
+
+        assert_eq!(args.tolerance, defaults.tolerance, "tolerance の既定値");
+        assert_eq!(args.border, defaults.border, "border の既定値");
+        assert_eq!(args.cleanup, defaults.cleanup, "cleanup の既定値");
+        assert_eq!(args.feather, defaults.feather, "feather の既定値");
+        assert_eq!(
+            args.edge_threshold, defaults.edge_threshold,
+            "edge_threshold の既定値"
+        );
+        assert_eq!(!args.no_despill, defaults.despill, "デスピルの既定");
+        assert_eq!(!args.no_refine, defaults.refine, "アルファ再推定の既定");
+    }
 }

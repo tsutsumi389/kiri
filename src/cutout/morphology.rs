@@ -1,10 +1,105 @@
 //! マスクの形態素処理。
 //!
 //! フラッドフィルの結果には、背景に散った孤立点（センサーノイズが背景色から
-//! 外れたもの）と、商品内部の小さな穴（ハイライトが背景色に一致したもの）が残る。
-//! オープニングで前者を、クロージングで後者を消す。
+//! 外れたもの）が残る。これを消すのが `remove_specks` の役目である。
+//!
+//! かつてはオープニング（収縮 → 膨張）で消していたが、オープニングは
+//! **構造要素より細いものをすべて消す**。半径 2 のオープニングは幅 5px 未満の
+//! 構造を無条件に落とすため、ストラップ・持ち手・ケーブルといった商品の一部まで
+//! 巻き添えにしていた。孤立点と細い構造を分けるのは太さではなく面積なので、
+//! 連結成分の面積で選ぶ。
+//!
+//! `erode` / `dilate` / `open` / `close` は境界帯の生成や比較のために残している。
+//! ただしパイプラインからは外した。理由は `remove_specks` と `close` の項を参照。
+
+use std::collections::VecDeque;
 
 use crate::cutout::mask::Mask;
+
+/// 孤立ノイズの除去。連結成分のうち、不透明な芯の面積が `(2*radius+1)^2` に
+/// 満たないものを消す。`radius` 0 で無効。
+///
+/// 「半径 r のオープニングが消すのは、r の構造要素が入らないもの」という直感を
+/// 面積で置き換えている。同じ `--cleanup` の値で、消える孤立点の大きさは
+/// おおむね従来どおりのまま、細い構造だけが生き残る。
+///
+/// 連結は 8 近傍で、**アルファが 0 より大きい画素**をたどる。面積は
+/// **前景判定(128以上)の画素だけ**で数える。半透明の裾ごと消さないと、
+/// 芯を消した跡に薄い輪だけが残るためである。二値マスクではどちらも同じになる。
+///
+/// 連結を 8 近傍にするのは、4 近傍だと斜めに走る 1px の構造が細切れになり、
+/// 面積で判定した途端にすべて消えてしまうためである。
+pub fn remove_specks(mask: &Mask, radius: u32) -> Mask {
+    if radius == 0 {
+        return mask.clone();
+    }
+    let side = 2 * radius + 1;
+    let min_area = (side as usize) * (side as usize);
+    let (w, h) = (mask.width(), mask.height());
+    let stride = w as usize;
+
+    let mut out = mask.clone();
+    let mut visited = vec![false; stride * (h as usize)];
+    let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
+
+    for y in 0..h {
+        for x in 0..w {
+            let start = (y as usize) * stride + (x as usize);
+            if visited[start] || mask.get(x, y) == 0 {
+                continue;
+            }
+
+            // 1 周目は面積を数えるだけにする。成分の座標を Vec に実体化すると、
+            // 前景がほぼ全面の 12MP で 1 成分が 1200 万画素になり、それだけで
+            // 96MB を余計に抱える。パイプラインは 2 回呼ぶので、ピーク RSS が
+            // 207MB から 400MB へ跳ねていた
+            visited[start] = true;
+            queue.clear();
+            queue.push_back((x, y));
+            let mut core = 0usize;
+            while let Some((cx, cy)) = queue.pop_front() {
+                if mask.is_foreground(cx, cy) {
+                    core += 1;
+                }
+                let (x0, x1) = (cx.saturating_sub(1), (cx + 1).min(w - 1));
+                let (y0, y1) = (cy.saturating_sub(1), (cy + 1).min(h - 1));
+                for ny in y0..=y1 {
+                    for nx in x0..=x1 {
+                        let i = (ny as usize) * stride + (nx as usize);
+                        if visited[i] || mask.get(nx, ny) == 0 {
+                            continue;
+                        }
+                        visited[i] = true;
+                        queue.push_back((nx, ny));
+                    }
+                }
+            }
+            if core >= min_area {
+                continue;
+            }
+
+            // 2 周目で 0 を書きながら同じ成分をたどる。書き込んだ 0 がそのまま
+            // 訪問済みの印になるので、座標を覚えておく必要がない
+            queue.clear();
+            out.set(x, y, 0);
+            queue.push_back((x, y));
+            while let Some((cx, cy)) = queue.pop_front() {
+                let (x0, x1) = (cx.saturating_sub(1), (cx + 1).min(w - 1));
+                let (y0, y1) = (cy.saturating_sub(1), (cy + 1).min(h - 1));
+                for ny in y0..=y1 {
+                    for nx in x0..=x1 {
+                        if out.get(nx, ny) == 0 {
+                            continue;
+                        }
+                        out.set(nx, ny, 0);
+                        queue.push_back((nx, ny));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
 
 /// 収縮。前景を `radius` px 削る。
 pub fn erode(mask: &Mask, radius: u32) -> Mask {
@@ -25,6 +120,12 @@ pub fn open(mask: &Mask, radius: u32) -> Mask {
 }
 
 /// クロージング（膨張 → 収縮）。前景の小さな穴を埋める。
+///
+/// **切り抜きのパイプラインでは使っていない。** 前景は「外周から到達できなかった
+/// 領域」として定義されるため、到達できない穴はそもそも前景になっている。
+/// 残るのは細い隙間を通って外周とつながった領域だけで、それを埋めるのは
+/// 形の改変にあたる。穴を埋める効果より、商品の隙間（取っ手の内側など）を
+/// 塞いでしまう害のほうが大きい。
 pub fn close(mask: &Mask, radius: u32) -> Mask {
     if radius == 0 {
         return mask.clone();
@@ -177,6 +278,99 @@ mod tests {
         let mask = from_ascii(&[".......", "..###..", "..###..", "..###..", "......."]);
         assert_eq!(erode(&mask, 1).stats().bbox, Some((3, 2, 3, 2)));
         assert_eq!(dilate(&mask, 1).stats().bbox, Some((1, 0, 5, 4)));
+    }
+
+    #[test]
+    fn an_area_filter_removes_a_speck() {
+        let mask = from_ascii(&[
+            ".........",
+            "..#####..",
+            "..#####..",
+            "..#####..",
+            ".........",
+            ".......#.",
+        ]);
+        let out = remove_specks(&mask, 1);
+        assert!(
+            !out.is_foreground(7, 5),
+            "孤立点が残っている\n{}",
+            render(&out)
+        );
+        assert!(
+            out.is_foreground(4, 2),
+            "本体まで消えている\n{}",
+            render(&out)
+        );
+    }
+
+    /// オープニングとの決定的な違い。細い構造を消さない。
+    #[test]
+    fn an_area_filter_keeps_a_thin_limb_that_opening_would_erase() {
+        let mask = from_ascii(&[
+            "...#......",
+            "...#......",
+            "...#......",
+            ".######...",
+            ".######...",
+            ".######...",
+            ".######...",
+            "..........",
+        ]);
+        let opened = open(&mask, 1);
+        assert!(
+            !opened.is_foreground(3, 0),
+            "前提が崩れている: オープニングは幅 1px の腕を消すはず\n{}",
+            render(&opened)
+        );
+        let filtered = remove_specks(&mask, 1);
+        assert!(
+            filtered.is_foreground(3, 0),
+            "面積フィルタが細い腕を消している\n{}",
+            render(&filtered)
+        );
+    }
+
+    #[test]
+    fn an_area_filter_measures_area_not_thickness() {
+        // 幅 1px でも、面積が下限を超えていれば残る
+        let mask = from_ascii(&[
+            "..........",
+            ".#########",
+            "..........",
+            "..#.......",
+            "..........",
+        ]);
+        let out = remove_specks(&mask, 1);
+        assert!(out.is_foreground(5, 1), "面積 9 の線が消えている");
+        assert!(!out.is_foreground(2, 3), "面積 1 の点が残っている");
+    }
+
+    #[test]
+    fn an_area_filter_follows_diagonal_connections() {
+        // 4 近傍で見ると斜めの線が細切れになり、面積判定で全部消えてしまう
+        let mask = from_ascii(&[
+            "#.........",
+            ".#........",
+            "..#.......",
+            "...#......",
+            "....#.....",
+            ".....#....",
+            "......#...",
+            ".......#..",
+            "........#.",
+        ]);
+        let out = remove_specks(&mask, 1);
+        assert!(
+            out.is_foreground(4, 4),
+            "斜めの線が消えている\n{}",
+            render(&out)
+        );
+    }
+
+    #[test]
+    fn an_area_filter_with_radius_zero_is_the_identity() {
+        let mask = from_ascii(&["..#..", ".###.", "..#.."]);
+        assert_eq!(remove_specks(&mask, 0), mask);
     }
 
     #[test]

@@ -67,6 +67,64 @@ impl Mask {
         self.get(x, y) >= FOREGROUND_THRESHOLD
     }
 
+    /// 4 近傍に背景があるか。前景かどうかは見ないので、境界の前景側だけを
+    /// 拾いたい呼び出し側は `is_foreground` と併せて使う。
+    ///
+    /// 画像の外は背景として数えない。見切れている商品の縁を境界と見なすと、
+    /// そこに存在しない輪郭を測ることになる。
+    pub fn touches_background(&self, x: u32, y: u32) -> bool {
+        (x > 0 && !self.is_foreground(x - 1, y))
+            || (y > 0 && !self.is_foreground(x, y - 1))
+            || (x + 1 < self.width && !self.is_foreground(x + 1, y))
+            || (y + 1 < self.height && !self.is_foreground(x, y + 1))
+    }
+
+    /// 前景から背景へ向かう単位法線。5x5 の窓で背景側の重心方向を採る。
+    ///
+    /// 画像の外は背景として数えない。見切れている商品の縁を輪郭と見なすと、
+    /// 存在しない遷移をそこで測ることになる。
+    pub fn outward_normal(&self, x: u32, y: u32) -> Option<[f32; 2]> {
+        let (mut vx, mut vy) = (0f32, 0f32);
+        for dy in -2i64..=2 {
+            for dx in -2i64..=2 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let (nx, ny) = (x as i64 + dx, y as i64 + dy);
+                if nx < 0
+                    || ny < 0
+                    || nx >= i64::from(self.width)
+                    || ny >= i64::from(self.height)
+                    || self.is_foreground(nx as u32, ny as u32)
+                {
+                    continue;
+                }
+                let len = ((dx * dx + dy * dy) as f32).sqrt();
+                vx += dx as f32 / len;
+                vy += dy as f32 / len;
+            }
+        }
+        let len = (vx * vx + vy * vy).sqrt();
+        (len > 1e-3).then(|| [vx / len, vy / len])
+    }
+
+    /// マスクを 0.0-1.0 の実数として双線形にサンプルする。範囲外は 0 とみなす。
+    pub fn sample(&self, fx: f32, fy: f32) -> f32 {
+        let (w, h) = (i64::from(self.width), i64::from(self.height));
+        let (bx, by) = (fx.floor(), fy.floor());
+        let (tx, ty) = (fx - bx, fy - by);
+        let at = |ix: i64, iy: i64| -> f32 {
+            if ix < 0 || iy < 0 || ix >= w || iy >= h {
+                return 0.0;
+            }
+            f32::from(self.get(ix as u32, iy as u32)) / 255.0
+        };
+        let (bx, by) = (bx as i64, by as i64);
+        let top = at(bx, by) * (1.0 - tx) + at(bx + 1, by) * tx;
+        let bottom = at(bx, by + 1) * (1.0 - tx) + at(bx + 1, by + 1) * tx;
+        top * (1.0 - ty) + bottom * ty
+    }
+
     /// 真偽値の並びからマスクを作る（true = 前景）。
     pub fn from_bools(width: u32, height: u32, values: &[bool]) -> Self {
         Self {
@@ -202,6 +260,55 @@ mod tests {
     #[test]
     fn bbox_above_is_none_for_an_empty_mask() {
         assert_eq!(Mask::new(4, 4, 0).bbox_above(0), None);
+    }
+
+    #[test]
+    fn the_boundary_is_the_foreground_side_of_the_edge() {
+        let mut mask = Mask::new(5, 5, 0);
+        for y in 1..4 {
+            for x in 1..4 {
+                mask.set(x, y, 255);
+            }
+        }
+        assert!(mask.touches_background(1, 1), "縁が境界とみなされていない");
+        assert!(!mask.touches_background(2, 2), "中心が境界とみなされている");
+        // 前景かどうかは見ない契約。呼び出し側が is_foreground と併せて使う
+        assert!(
+            mask.touches_background(0, 1),
+            "背景側からも境界に見えるはず"
+        );
+    }
+
+    #[test]
+    fn a_product_filling_the_frame_has_no_boundary() {
+        // 画像の外を背景として数えると、見切れた商品の縁が輪郭になってしまう
+        let mask = Mask::new(5, 5, 255);
+        assert!(!mask.touches_background(0, 0));
+        assert_eq!(mask.outward_normal(0, 0), None);
+    }
+
+    #[test]
+    fn the_normal_points_away_from_the_foreground() {
+        // 左半分が前景。境界の法線は右（背景側）を向く
+        let mut mask = Mask::new(10, 10, 0);
+        for y in 0..10 {
+            for x in 0..5 {
+                mask.set(x, y, 255);
+            }
+        }
+        let n = mask.outward_normal(4, 5).unwrap();
+        assert!(n[0] > 0.9, "法線が背景側を向いていない: {n:?}");
+        assert!(n[1].abs() < 0.1, "法線が境界に沿って傾いている: {n:?}");
+    }
+
+    #[test]
+    fn sampling_interpolates_between_neighbours() {
+        let mut mask = Mask::new(2, 1, 0);
+        mask.set(0, 0, 255);
+        assert_eq!(mask.sample(0.0, 0.0), 1.0);
+        assert_eq!(mask.sample(1.0, 0.0), 0.0);
+        assert!((mask.sample(0.5, 0.0) - 0.5).abs() < 0.01);
+        assert_eq!(mask.sample(-5.0, 0.0), 0.0, "範囲外は 0");
     }
 
     #[test]

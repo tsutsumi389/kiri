@@ -146,11 +146,11 @@ pub struct CutoutArgs {
     #[arg(long, default_value_t = DEFAULT_BORDER)]
     pub border: u32,
 
-    /// 孤立ノイズの除去と小さな穴埋めの半径(px)。0 で無効
+    /// 孤立ノイズ除去の半径(px)。面積 (2n+1)² 未満の連結成分を消す。0 で無効
     #[arg(long, default_value_t = 2)]
     pub cleanup: u32,
 
-    /// 境界フェザリングの半径(px)。0 で無効
+    /// 境界の階調を色から決められなかった箇所で使うフェザリング半径(px)。0 で無効（--no-refine では境界全体に掛かる）
     #[arg(long, default_value_t = 1)]
     pub feather: u32,
 
@@ -162,6 +162,11 @@ pub struct CutoutArgs {
     /// 境界の色かぶり除去を行わない
     #[arg(long)]
     pub no_despill: bool,
+
+    /// 境界帯のアルファを画像の色から推定し直さず、マスクの形から作る旧方式に戻す。
+    /// 淡い色の商品で新方式が不安定なときの逃げ道
+    #[arg(long)]
+    pub no_refine: bool,
 
     /// 切り抜いた商品を指定サイズのキャンバス中央に配置する。
     /// 1000x1000 または 1000（正方形）の形式

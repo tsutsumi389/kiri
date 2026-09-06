@@ -113,10 +113,15 @@ fn print_info(report: &InfoReport) {
         }
     );
     println!(
-        "  色空間    {}{}",
+        "  色空間    {}{}{}",
         report.color_space,
         if report.icc_profile {
             " (ICCあり)"
+        } else {
+            ""
+        },
+        if report.color_converted {
+            " → sRGB に変換"
         } else {
             ""
         }
@@ -145,7 +150,15 @@ fn print_process(report: &ProcessReport) {
             report.elapsed_ms
         );
     }
+    print_color(&report.color_space, report.color_converted);
     print_warnings(&report.warnings);
+}
+
+/// 色を触ったときだけ知らせる。sRGB の素材で毎回 1 行増えても意味がない。
+fn print_color(space: &str, converted: bool) {
+    if converted {
+        println!("  色空間    {space} → sRGB に変換");
+    }
 }
 
 fn print_cutout(report: &CutoutReport) {
@@ -161,6 +174,7 @@ fn print_cutout(report: &CutoutReport) {
             report.elapsed_ms
         );
     }
+    print_color(&report.color_space, report.color_converted);
     println!(
         "  背景色    #{r:02X}{g:02X}{b:02X}  (均一度 {:.2}, tolerance {})",
         report.background.uniformity, report.settings.tolerance

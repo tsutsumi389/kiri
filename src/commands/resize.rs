@@ -17,7 +17,7 @@ pub fn run(args: &ResizeArgs) -> Result<ProcessReport> {
     let format = output::resolve_format(&args.out)?;
     output::ensure_writable(&args.out)?;
 
-    let loaded = load::load(&args.input)?;
+    let loaded = load::load_with(&args.input, &args.color.to_load_options())?;
     let source = (loaded.width(), loaded.height());
 
     let spec = ResizeSpec {
@@ -39,7 +39,7 @@ pub fn run(args: &ResizeArgs) -> Result<ProcessReport> {
 
     output::finish(
         &args.input,
-        source,
+        &loaded,
         &resized,
         &args.out,
         format,

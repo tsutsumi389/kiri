@@ -8,31 +8,28 @@ use std::path::Path;
 use exif::{In, Tag};
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, RgbaImage};
 
+use crate::color::icc::{self, Interpretation};
 use crate::error::{Error, Result};
 
-/// 入力画像の色空間。sRGB 以外は色がくすむ可能性があるため警告の対象にする。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ColorSpace {
-    /// EXIF が sRGB を明示している、または情報がなく sRGB とみなせる
-    Srgb,
-    /// EXIF が uncalibrated（AdobeRGB 等の可能性が高い）
-    Uncalibrated,
-    /// ICC プロファイルはあるが sRGB かどうか判別できない
-    Unknown,
+/// 読み込み時の振る舞い。
+#[derive(Debug, Clone, Copy)]
+pub struct LoadOptions {
+    /// 埋め込み ICC を解釈して sRGB へ変換する
+    pub convert_color: bool,
 }
 
-impl ColorSpace {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ColorSpace::Srgb => "sRGB",
-            ColorSpace::Uncalibrated => "uncalibrated",
-            ColorSpace::Unknown => "unknown",
+impl Default for LoadOptions {
+    /// 既定で変換する。iPhone の素材は Display P3 で入ってくるのが普通で、
+    /// 素通しすると彩度が誇張されたまま納品されるため。
+    fn default() -> Self {
+        Self {
+            convert_color: true,
         }
     }
 }
 
 pub struct LoadedImage {
-    /// EXIF Orientation 適用済みの RGBA 画像
+    /// EXIF Orientation 適用済み・必要なら sRGB へ変換済みの RGBA 画像
     pub image: RgbaImage,
     pub format: ImageFormat,
     /// 元ファイルの EXIF Orientation 値（1 = 回転なし）
@@ -40,9 +37,14 @@ pub struct LoadedImage {
     /// 実際に回転・反転を適用したか
     pub orientation_applied: bool,
     pub icc_profile: bool,
-    pub color_space: ColorSpace,
+    /// 検出した色空間の名前（"sRGB" / "Display P3" / "uncalibrated" など）
+    pub color_space: String,
+    /// 実際に sRGB へ変換したか
+    pub color_converted: bool,
     /// 実際に不透明でないピクセルが存在するか
     pub has_alpha: bool,
+    /// 色空間に起因する警告
+    color_warnings: Vec<String>,
 }
 
 impl LoadedImage {
@@ -55,26 +57,19 @@ impl LoadedImage {
     }
 
     /// 色空間に起因する警告を返す。
+    ///
+    /// 変換できたときは黙る。何が起きたかは `color_space` と `color_converted`
+    /// が答えており、成功を警告として流すとエージェントが本当の警告を見落とす。
     pub fn warnings(&self) -> Vec<String> {
-        let mut w = Vec::new();
-        match self.color_space {
-            ColorSpace::Uncalibrated => w.push(
-                "入力の色空間が uncalibrated です（AdobeRGB の可能性）。sRGB として\
-                 扱うため色がくすむ場合があります"
-                    .into(),
-            ),
-            ColorSpace::Unknown => w.push(
-                "ICC プロファイルが埋め込まれていますが sRGB か判別できません。\
-                 sRGB として扱います"
-                    .into(),
-            ),
-            ColorSpace::Srgb => {}
-        }
-        w
+        self.color_warnings.clone()
     }
 }
 
 pub fn load(path: &Path) -> Result<LoadedImage> {
+    load_with(path, &LoadOptions::default())
+}
+
+pub fn load_with(path: &Path, opts: &LoadOptions) -> Result<LoadedImage> {
     let bytes = std::fs::read(path).map_err(|e| {
         Error::input(
             "INPUT_UNREADABLE",
@@ -107,11 +102,12 @@ pub fn load(path: &Path) -> Result<LoadedImage> {
         .into_decoder()
         .map_err(|e| Error::input("INPUT_DECODE_FAILED", e.to_string()))?;
 
-    let icc_profile = decoder
+    let icc = decoder
         .icc_profile()
         .ok()
         .flatten()
-        .is_some_and(|p| !p.is_empty());
+        .filter(|p| !p.is_empty());
+    let icc_profile = icc.is_some();
 
     let dynamic = DynamicImage::from_decoder(decoder)
         .map_err(|e| Error::input("INPUT_DECODE_FAILED", e.to_string()))?;
@@ -119,14 +115,8 @@ pub fn load(path: &Path) -> Result<LoadedImage> {
     let (exif_orientation, exif_color_space) = read_exif(&bytes);
     let (image, orientation_applied) = apply_orientation(dynamic, exif_orientation);
 
-    let color_space = match exif_color_space {
-        Some(1) => ColorSpace::Srgb,
-        Some(0xFFFF) => ColorSpace::Uncalibrated,
-        _ if icc_profile => ColorSpace::Unknown,
-        _ => ColorSpace::Srgb,
-    };
-
-    let image = image.to_rgba8();
+    let mut image = image.to_rgba8();
+    let color = normalize_color(&mut image, icc.as_deref(), exif_color_space, opts);
     let has_alpha = image.pixels().any(|p| p[3] != 255);
 
     Ok(LoadedImage {
@@ -135,9 +125,95 @@ pub fn load(path: &Path) -> Result<LoadedImage> {
         exif_orientation,
         orientation_applied,
         icc_profile,
-        color_space,
+        color_space: color.name,
+        color_converted: color.converted,
         has_alpha,
+        color_warnings: color.warnings,
     })
+}
+
+/// 色空間の判定と変換の結果。
+struct ColorOutcome {
+    name: String,
+    converted: bool,
+    warnings: Vec<String>,
+}
+
+/// 埋め込み ICC があれば sRGB へ寄せ、無ければ EXIF の申告をそのまま報告する。
+///
+/// ICC を EXIF より優先するのは、iPhone の JPEG が EXIF では uncalibrated と
+/// 名乗りつつ ICC で Display P3 だと明かすため。曖昧な申告より実体を採る。
+fn normalize_color(
+    image: &mut RgbaImage,
+    icc: Option<&[u8]>,
+    exif_color_space: Option<u16>,
+    opts: &LoadOptions,
+) -> ColorOutcome {
+    let Some(bytes) = icc else {
+        return match exif_color_space {
+            Some(0xFFFF) => ColorOutcome {
+                name: "uncalibrated".into(),
+                converted: false,
+                warnings: vec![
+                    "入力の色空間が uncalibrated です（AdobeRGB の可能性）。ICC も\
+                     埋め込まれていないため sRGB として扱います"
+                        .into(),
+                ],
+            },
+            _ => ColorOutcome {
+                name: "sRGB".into(),
+                converted: false,
+                warnings: Vec::new(),
+            },
+        };
+    };
+
+    let profile = icc::interpret(bytes);
+    let label = || match &profile.name {
+        Some(n) => format!("'{n}'"),
+        None => "（名前なし）".to_string(),
+    };
+
+    match profile.interpretation {
+        Interpretation::Srgb => ColorOutcome {
+            name: "sRGB".into(),
+            converted: false,
+            warnings: Vec::new(),
+        },
+        Interpretation::Convertible(transform) => {
+            let name = profile.name.clone().unwrap_or_else(|| "unknown".into());
+            if opts.convert_color {
+                transform.apply(image);
+                ColorOutcome {
+                    name,
+                    converted: true,
+                    warnings: Vec::new(),
+                }
+            } else {
+                let warning = format!(
+                    "ICC プロファイル {} を検出しましたが --no-color-convert のため\
+                     sRGB へ変換していません",
+                    label()
+                );
+                ColorOutcome {
+                    name,
+                    converted: false,
+                    warnings: vec![warning],
+                }
+            }
+        }
+        Interpretation::Unsupported => {
+            let warning = format!(
+                "ICC プロファイル {} は変換に対応していないため sRGB として扱います",
+                label()
+            );
+            ColorOutcome {
+                name: profile.name.unwrap_or_else(|| "unknown".into()),
+                converted: false,
+                warnings: vec![warning],
+            }
+        }
+    }
 }
 
 /// EXIF から Orientation と ColorSpace を読む。EXIF がなければ既定値を返す。
@@ -255,5 +331,105 @@ mod tests {
             assert!(!applied, "orientation {value} を適用してはいけない");
             assert_eq!((img.width(), img.height()), (2, 3));
         }
+    }
+
+    /// ICC 付きの実ファイルを通した経路。単体の変換が正しくても、
+    /// デコーダから ICC を取り出せていなければ何も起きない。
+    fn jpeg_with_profile(dir: &Path, name: &str, rgb: [u8; 3], icc: &[u8]) -> std::path::PathBuf {
+        let img = image::RgbImage::from_pixel(24, 24, image::Rgb(rgb));
+        let mut raw = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut raw, 100)
+            .encode_image(&img)
+            .unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, crate::color::synthetic::embed_in_jpeg(&raw, icc)).unwrap();
+        path
+    }
+
+    #[test]
+    fn an_embedded_display_p3_profile_is_converted_to_srgb() {
+        use crate::color::synthetic::{build, display_p3};
+        let dir = tempfile::tempdir().unwrap();
+        // P3 の飽和した赤。sRGB では色域外なので 255 に張り付く
+        let path = jpeg_with_profile(dir.path(), "p3.jpg", [255, 0, 0], &build(&display_p3()));
+
+        let loaded = load(&path).unwrap();
+        assert!(loaded.icc_profile);
+        assert_eq!(loaded.color_space, "Display P3");
+        assert!(loaded.color_converted);
+        assert!(loaded.warnings().is_empty(), "変換できたら黙るべき");
+
+        let px = loaded.image.get_pixel(12, 12);
+        assert!(px[0] > 250 && px[1] < 8 && px[2] < 8, "{px:?}");
+    }
+
+    #[test]
+    fn no_color_convert_leaves_the_pixels_untouched_and_says_so() {
+        use crate::color::synthetic::{build, display_p3};
+        let dir = tempfile::tempdir().unwrap();
+        let path = jpeg_with_profile(dir.path(), "p3.jpg", [200, 60, 40], &build(&display_p3()));
+
+        let converted = load(&path).unwrap();
+        let raw = load_with(
+            &path,
+            &LoadOptions {
+                convert_color: false,
+            },
+        )
+        .unwrap();
+
+        assert!(!raw.color_converted);
+        assert_eq!(raw.color_space, "Display P3");
+        assert_eq!(raw.warnings().len(), 1, "変換していないことは伝えるべき");
+        assert_ne!(
+            raw.image.get_pixel(12, 12),
+            converted.image.get_pixel(12, 12),
+            "変換の有無で結果が変わらないのはおかしい"
+        );
+    }
+
+    #[test]
+    fn an_embedded_srgb_profile_is_reported_but_not_converted() {
+        use crate::color::synthetic::{build, srgb_v2};
+        let dir = tempfile::tempdir().unwrap();
+        let path = jpeg_with_profile(dir.path(), "srgb.jpg", [190, 70, 55], &build(&srgb_v2()));
+
+        let loaded = load(&path).unwrap();
+        assert!(loaded.icc_profile);
+        assert_eq!(loaded.color_space, "sRGB");
+        assert!(!loaded.color_converted, "sRGB を変換してはいけない");
+        assert!(loaded.warnings().is_empty());
+    }
+
+    #[test]
+    fn an_unsupported_profile_warns_instead_of_converting() {
+        use crate::color::synthetic::{build, display_p3};
+        let dir = tempfile::tempdir().unwrap();
+        let mut spec = display_p3();
+        spec.include_matrix = false;
+        let path = jpeg_with_profile(dir.path(), "lut.jpg", [190, 70, 55], &build(&spec));
+
+        let loaded = load(&path).unwrap();
+        assert!(!loaded.color_converted);
+        assert_eq!(loaded.color_space, "Display P3");
+        let warnings = loaded.warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("変換に対応していない"), "{warnings:?}");
+    }
+
+    /// ICC が無い画像は今までどおり触らない。
+    #[test]
+    fn an_image_without_a_profile_is_passed_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = image::RgbImage::from_pixel(8, 8, image::Rgb([190, 70, 55]));
+        let path = dir.path().join("plain.png");
+        img.save(&path).unwrap();
+
+        let loaded = load(&path).unwrap();
+        assert!(!loaded.icc_profile);
+        assert_eq!(loaded.color_space, "sRGB");
+        assert!(!loaded.color_converted);
+        let px = loaded.image.get_pixel(4, 4);
+        assert_eq!([px[0], px[1], px[2]], [190, 70, 55]);
     }
 }

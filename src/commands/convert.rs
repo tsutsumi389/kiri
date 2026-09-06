@@ -15,12 +15,11 @@ pub fn run(args: &ConvertArgs) -> Result<ProcessReport> {
     let format = output::resolve_format(&args.out)?;
     output::ensure_writable(&args.out)?;
 
-    let loaded = load::load(&args.input)?;
-    let source = (loaded.width(), loaded.height());
+    let loaded = load::load_with(&args.input, &args.color.to_load_options())?;
 
     output::finish(
         &args.input,
-        source,
+        &loaded,
         &loaded.image,
         &args.out,
         format,

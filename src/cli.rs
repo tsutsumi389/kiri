@@ -53,6 +53,26 @@ pub struct InfoArgs {
     /// 背景色推定に使う外周の幅(px)
     #[arg(long, default_value_t = DEFAULT_BORDER)]
     pub border: u32,
+
+    #[command(flatten)]
+    pub color: ColorOpts,
+}
+
+/// 入力の色の扱い。読み込みを伴うコマンドすべてで同じものを使う。
+#[derive(Args, Debug, Default)]
+pub struct ColorOpts {
+    /// 埋め込み ICC を解釈せず、画素の値をそのまま使う。
+    /// 既定では Display P3 や AdobeRGB を sRGB へ変換する
+    #[arg(long)]
+    pub no_color_convert: bool,
+}
+
+impl ColorOpts {
+    pub fn to_load_options(&self) -> crate::image_io::LoadOptions {
+        crate::image_io::LoadOptions {
+            convert_color: !self.no_color_convert,
+        }
+    }
 }
 
 /// 出力に関する共通オプション。convert と resize で同じものを使う。
@@ -93,6 +113,9 @@ pub struct ConvertArgs {
     pub input: PathBuf,
 
     #[command(flatten)]
+    pub color: ColorOpts,
+
+    #[command(flatten)]
     pub out: OutputOpts,
 }
 
@@ -116,6 +139,9 @@ pub struct ResizeArgs {
     /// 元画像より大きくすることを許す（画質は劣化する）
     #[arg(long)]
     pub allow_upscale: bool,
+
+    #[command(flatten)]
+    pub color: ColorOpts,
 
     #[command(flatten)]
     pub out: OutputOpts,
@@ -275,6 +301,9 @@ pub struct CutoutArgs {
     /// グリッドは --bbox --normalized の値を読み取るためにある
     #[arg(long)]
     pub no_preview_grid: bool,
+
+    #[command(flatten)]
+    pub color: ColorOpts,
 
     #[command(flatten)]
     pub out: OutputOpts,

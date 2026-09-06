@@ -8,7 +8,7 @@ use image::RgbaImage;
 use crate::cli::OutputOpts;
 use crate::cutout::BackgroundEstimate;
 use crate::error::{Error, Result};
-use crate::image_io::{OutputFormat, SaveOptions, save};
+use crate::image_io::{LoadedImage, OutputFormat, SaveOptions, save};
 use crate::report::{
     BackgroundReport, Dimensions, OutputReport, PerimeterDeltaE, PerimeterTexture, ProcessReport,
 };
@@ -102,9 +102,12 @@ pub fn write_image(
 }
 
 /// 書き出して結果レポートを組み立てる。
+///
+/// 元寸法と色空間はどちらも読み込み結果が持っているので、ばらして渡さず
+/// `LoadedImage` のまま受ける。書き出す画像だけは加工後のものが来る。
 pub fn finish(
     input: &Path,
-    source: (u32, u32),
+    loaded: &LoadedImage,
     image: &RgbaImage,
     opts: &OutputOpts,
     format: OutputFormat,
@@ -117,10 +120,12 @@ pub fn finish(
     Ok(ProcessReport {
         input: input.display().to_string(),
         source: Dimensions {
-            width: source.0,
-            height: source.1,
+            width: loaded.width(),
+            height: loaded.height(),
         },
         outputs: vec![output],
+        color_space: loaded.color_space.clone(),
+        color_converted: loaded.color_converted,
         elapsed_ms: started.elapsed().as_millis(),
         warnings,
     })

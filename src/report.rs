@@ -86,6 +86,8 @@ pub struct InfoReport {
     pub exif_orientation: u16,
     pub orientation_applied: bool,
     pub color_space: String,
+    /// 埋め込み ICC から sRGB へ実際に変換したか
+    pub color_converted: bool,
     pub icc_profile: bool,
     pub has_alpha: bool,
     pub background: BackgroundReport,
@@ -112,6 +114,10 @@ pub struct ProcessReport {
     pub input: String,
     pub source: Dimensions,
     pub outputs: Vec<OutputReport>,
+    /// 入力で検出した色空間の名前
+    pub color_space: String,
+    /// sRGB へ変換したか
+    pub color_converted: bool,
     pub elapsed_ms: u128,
     pub warnings: Vec<String>,
 }
@@ -199,6 +205,10 @@ pub struct CutoutReport {
     pub input: String,
     pub source: Dimensions,
     pub outputs: Vec<OutputReport>,
+    /// 入力で検出した色空間の名前
+    pub color_space: String,
+    /// sRGB へ変換したか
+    pub color_converted: bool,
     pub background: BackgroundReport,
     /// 実際に効いた切り抜きの設定
     pub settings: SettingsReport,

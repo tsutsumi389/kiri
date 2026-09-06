@@ -252,9 +252,14 @@ fn collect_warnings(
     // 続けても無駄である。しきい値を定数で置かず背景自身のばらつきと比べるのは、
     // 「どこまで許容すべきか」が画像ごとに違うためである。
     // 均一な背景では p50 がほぼ 0 になるので、白背景×白商品では発火しない。
+    // 前景比率が極端なときは判定しない。ほとんど切れていない（あるいは
+    // 全部消えた）状態では「境界」が切り抜きの輪郭を表しておらず、測っても
+    // 意味がないためである。実際、布の上のリモコンで tolerance が低すぎた際に
+    // 「tolerance を上げてください」と「調整では改善しません」が同時に出た。
+    let cut_happened = stats.foreground_ratio > 0.01 && stats.foreground_ratio < 0.99;
     if let Some(sep) = separability {
         let spread = background.delta_e.p50;
-        if sep < spread {
+        if cut_happened && sep < spread {
             warnings.push(format!(
                 "商品と背景の色差 (ΔE {sep:.1}) が背景自身のばらつき (ΔE {spread:.1}) を\
                  下回っています。背景を消せる tolerance では商品も消えるため、\
@@ -412,6 +417,23 @@ mod tests {
         assert!(
             hopeless(&warnings),
             "色差がばらつきを下回るなら警告する: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn nothing_is_called_out_before_the_cut_has_happened() {
+        // 背景がほとんど除去されていない状態では、境界は輪郭を表していない。
+        // ここで「調整では改善しません」と言うと、同時に出ている
+        // 「tolerance を上げてください」と矛盾する
+        let stats = MaskStats {
+            foreground_ratio: 0.998,
+            bbox: Some((0, 0, 10, 10)),
+            touches_edge: true,
+        };
+        let warnings = collect_warnings(&estimate(0.21, 11.9), &stats, Some(11.5));
+        assert!(
+            !hopeless(&warnings),
+            "切り抜きが成立していない段階で断定してはいけない: {warnings:?}"
         );
     }
 

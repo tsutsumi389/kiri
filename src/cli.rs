@@ -159,6 +159,21 @@ pub struct CutoutArgs {
     #[arg(long, default_value_t = 8.0)]
     pub edge_threshold: f64,
 
+    /// 背景を広げる際に 1px あたりに許す色差(ΔE)。0 で無効。
+    /// なだらかな落ち影は越え、淡い商品の輪郭の段差では止まる
+    #[arg(long, default_value_t = 2.2)]
+    pub step_tolerance: f64,
+
+    /// 落ち影として消す明度(L*)の落ち込みの上限。0 で無効。
+    /// 彩度が背景とほぼ同じで暗いだけの画素に限って適用される
+    #[arg(long, default_value_t = 35.0)]
+    pub shadow_tolerance: f64,
+
+    /// 幅 2N px 以下の隙間を通ってしか外周につながらない背景を前景へ戻す。
+    /// 0 で無効。輪郭の小さな破れからの浸水を止める
+    #[arg(long, default_value_t = 1)]
+    pub seal: u32,
+
     /// 境界の色かぶり除去を行わない
     #[arg(long)]
     pub no_despill: bool,

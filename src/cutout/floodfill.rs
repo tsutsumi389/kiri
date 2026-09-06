@@ -5,17 +5,48 @@
 //!
 //! これが白背景に白い商品を置いた場合（EC で最頻出かつ最難の状況）の答えになる。
 //! 商品内部の白は外周から到達できないため、色が背景と同じでも生き残る。
+//!
+//! # フィルを 2 段に分ける理由
+//!
+//! 連結性と勾配の堤防（`edges`）だけでは、淡い色の商品が守れない。堤防は
+//! 「1px あたりの輝度変化がしきい値を超える画素には入らない」という規則なので、
+//! 局所的にコントラストが足りない場所が **1 箇所でもあれば** そこから商品の
+//! 内部へフィルが流れ込む。内部は一様なので、いったん入られると許容量いっぱいまで
+//! 削られる。実測では境界近傍の商品の 6 割が消えた。
+//!
+//! そこで色の判定をヒステリシスにする。
+//!
+//! 1. **芯**: 背景と言い切れる厳しい許容量 `core_tolerance` の画素だけを外周から
+//!    連結フィルし、確定背景の芯を作る
+//! 2. **拡張**: 芯から、緩い許容量 `tolerance` の画素へ広げる。ただし
+//!    **1px あたりの色差が `step_tolerance` 以下の滑らかな経路でしか進めない**
+//!
+//! 落ち影や周辺減光は滑らかな傾斜なので 2 で吸収される。商品の縁は
+//! （勾配が堤防のしきい値を下回るほど淡くても）段差なので越えられない。
+//! この 2 段構えにより、堤防のしきい値 8 では止められなかった ΔE 2-3 程度の
+//! 輪郭でもフィルを止められる。
+//!
+//! 芯に入れる画素は段差の検査を免除する。背景と言い切れる色である以上、
+//! JPEG のブロックノイズで隣と段差があっても背景であることに変わりはない。
+//! これがあるおかげで `step_tolerance` を小さく取っても背景が残らない。
 
 use std::collections::VecDeque;
 
 use image::RgbaImage;
 
-use crate::color::lab::delta_e_rgb;
-use crate::cutout::edges::gradient_magnitude;
+use crate::color::lab::{delta_e76_f32, linear_to_lab, srgb_linear_lut};
+use crate::cutout::edges::edge_ridges;
 use crate::cutout::mask::Mask;
 
 /// `--fg-seed` が保護する円の半径(px)。
 pub const FG_SEED_RADIUS: u32 = 5;
+
+/// 影候補とみなす彩度差（Lab の a*b* 平面での距離）の上限。
+///
+/// 無彩色の面に落ちた影は光量だけが減るので、a*/b* はほとんど動かない。
+/// 4 は JPEG の色ノイズを飲み込みつつ、色の付いた商品（茶色い革、紺の布）を
+/// 影と取り違えない値。
+pub const SHADOW_CHROMA: f32 = 4.0;
 
 #[derive(Debug, Clone, Default)]
 pub struct FloodOptions {
@@ -28,6 +59,50 @@ pub struct FloodOptions {
     /// 1px あたりの輝度変化がこの値を超える画素にはフィルを侵入させない。
     /// 0 で無効。商品の輪郭は急峻、落ち影はなだらかという差を使って両者を分ける
     pub edge_threshold: f64,
+    /// 第1段（確定背景の芯）の許容量(ΔE)。`core_tolerance()` で決める。
+    /// 0 なら 2 段階フィルを行わず、従来の 1 段フィルになる
+    pub core_tolerance: f64,
+    /// 第2段で 1px あたりに許す色差(ΔE)。0 で 2 段階フィルを無効化する
+    pub step_tolerance: f64,
+    /// 落ち影として吸収する明度差(L*)の上限。0 で無効
+    pub shadow_tolerance: f64,
+    /// 測地的オープニングの半径(px)。幅 2k 以下の隙間を通ってしか外周に
+    /// つながらない背景を前景へ戻す。0 で無効
+    pub seal: u32,
+}
+
+/// 第1段の許容量（芯に入れてよい ΔE）を決める。
+///
+/// 背景自身のばらつき（外周 ΔE の p90）の 2 倍を基準にする。芯は「背景と
+/// 言い切れる画素」でなければならないのでばらつきを跨げる幅は要るが、それ以上
+/// 広げると淡い商品が芯に入り込み、そこから第2段が商品の内部へ流れ出してしまう。
+///
+/// 上限を tolerance の 1/3 に置くのは、芯が緩い許容量に近づくと 2 段に分けた
+/// 意味が消えるため。下限 1.0 は、ノイズの無い合成画像（p90 が 0）で芯が
+/// 1 画素も取れなくなるのを防ぐ。
+///
+/// ただし芯は緩い許容量を決して超えない。超えると `--tolerance 0`（何も消すな）
+/// のような指定を芯が勝手に破り、利用者の指示と食い違う。0 を返した場合は
+/// 2 段階フィルそのものが無効になる。
+pub fn core_tolerance(tolerance: f64, perimeter_p90: f64) -> f64 {
+    let ceiling = (tolerance / 3.0).max(1.0).min(tolerance);
+    if ceiling <= 0.0 {
+        return 0.0;
+    }
+    (perimeter_p90 * 2.0).clamp(ceiling.min(1.0), ceiling)
+}
+
+/// 影の吸収が第2段の背景から進んでよい距離(px)。
+///
+/// 落ち影は物理的に「背景の上の暗がり」であって、数十 px も進めば背景色へ戻る。
+/// 一方、輪郭の破れから商品の内部へ漏れた浸水は、商品が続く限りどこまでも進む。
+/// 距離を切ることで、影の判定が失敗したときの被害を輪郭沿いの数十 px に閉じ込める。
+///
+/// 画素数ではなく画像の短辺に対する割合で決める。同じ被写体を 2 倍の解像度で
+/// 撮れば影の裾も 2 倍の画素数になるため、固定値では解像度によって挙動が変わる。
+/// 下限 16px は、小さなサムネイルで影が消せなくなるのを防ぐ。
+fn shadow_reach(width: u32, height: u32) -> u32 {
+    (width.min(height) / 24).max(16)
 }
 
 /// 前景マスクを生成する。255 = 前景、0 = 背景。
@@ -37,12 +112,60 @@ pub fn foreground_mask(image: &RgbaImage, background: [u8; 3], opts: &FloodOptio
         return Mask::new(w, h, 0);
     }
 
+    let two_stage = opts.step_tolerance > 0.0 && opts.core_tolerance > 0.0;
     let protected = protected_pixels(w, h, &opts.fg_seeds);
-    let candidate = background_candidates(image, background, opts, &protected);
-    let mut is_background = fill_from_border(w, h, &candidate, opts.bbox);
+    let lut = srgb_linear_lut();
+    let lab = lab_map(image, &lut);
+    let bg_lab = linear_to_lab([
+        lut[background[0] as usize],
+        lut[background[1] as usize],
+        lut[background[2] as usize],
+    ]);
+    let candidates = classify(image, &lab, bg_lab, opts, &protected, two_stage);
+    let step = opts.step_tolerance as f32;
+
+    let mut is_background = if two_stage {
+        let core = fill_from_border(w, h, &candidates.strict, opts.bbox);
+        if core.iter().any(|&b| b) {
+            let stage = Expansion {
+                candidates: &candidates,
+                lab: &lab,
+                step_tolerance: step,
+                with_shadow: false,
+                reach: None,
+            };
+            // 第2段。商品を守るフィルはここまでで完結している
+            let plain = expand(w, h, core, &stage);
+            if candidates.shadow.iter().any(|&s| s) {
+                // 第3段。影候補へさらに広げる。ここだけは堤防を無視するので、
+                // 第2段の背景から `shadow_reach` px 以内に閉じ込める
+                expand(
+                    w,
+                    h,
+                    plain,
+                    &Expansion {
+                        with_shadow: true,
+                        reach: Some(shadow_reach(w, h)),
+                        ..stage
+                    },
+                )
+            } else {
+                plain
+            }
+        } else {
+            // 芯が 1 画素も取れなかった＝外周が推定背景色から離れている。
+            // ここで諦めると全面が前景になってしまうので、従来の 1 段フィルへ落とす
+            fill_from_border(w, h, &candidates.loose, opts.bbox)
+        }
+    } else {
+        fill_from_border(w, h, &candidates.loose, opts.bbox)
+    };
 
     // bbox の外側は、色に関わらず背景として扱う。
     // AI が「商品はここにある」と判断した結果をここで効かせる。
+    //
+    // 測地的オープニングより先に効かせる。bbox の外側は「外周につながった
+    // 確実な背景」なので、隙間の判定でも背景として数えるのが正しい。
     if let Some((x1, y1, x2, y2)) = opts.bbox {
         for y in 0..h {
             for x in 0..w {
@@ -51,6 +174,10 @@ pub fn foreground_mask(image: &RgbaImage, background: [u8; 3], opts: &FloodOptio
                 }
             }
         }
+    }
+
+    if opts.seal > 0 {
+        is_background = seal_narrow_gaps(w, h, &is_background, opts.seal);
     }
 
     // 保護された画素は最後に前景へ戻す（bbox 指定より優先する）
@@ -63,38 +190,333 @@ pub fn foreground_mask(image: &RgbaImage, background: [u8; 3], opts: &FloodOptio
     Mask::from_bools(w, h, &foreground)
 }
 
-/// 背景色に十分近い画素に印を付ける。既に透明な画素も背景として扱う。
+/// 画素ごとの Lab。
+///
+/// 段差の判定には隣接画素同士の色差が要るので、フィルの最中に都度変換すると
+/// 同じ画素を何度も変換することになる。一度だけ作って引く。
+fn lab_map(image: &RgbaImage, lut: &[f32; 256]) -> Vec<[f32; 3]> {
+    image
+        .pixels()
+        .map(|p| linear_to_lab([lut[p[0] as usize], lut[p[1] as usize], lut[p[2] as usize]]))
+        .collect()
+}
+
+/// 画素の素性。3 つの段すべてがここを参照する。
+struct Candidates {
+    /// 芯に入れてよい画素（背景と言い切れる）。第2段以降は段差の検査を免除する
+    strict: Vec<bool>,
+    /// 第2段で吸収してよい画素。堤防を織り込んである
+    loose: Vec<bool>,
+    /// 第3段で吸収してよい影の候補。堤防は織り込まない
+    shadow: Vec<bool>,
+}
+
+/// 各画素が背景候補かどうかを判定する。既に透明な画素は無条件に背景とする。
 ///
 /// `edge_threshold` が有効なとき、輪郭上の画素は色が背景に近くても候補から外す。
 /// これがなければ、淡い色の商品は落ち影を消せる許容量の下で必ず飲み込まれてしまう。
-fn background_candidates(
+fn classify(
     image: &RgbaImage,
-    background: [u8; 3],
+    lab: &[[f32; 3]],
+    bg_lab: [f32; 3],
     opts: &FloodOptions,
     protected: &[bool],
-) -> Vec<bool> {
-    let gradient = (opts.edge_threshold > 0.0).then(|| gradient_magnitude(image));
+    two_stage: bool,
+) -> Candidates {
+    let gradient = (opts.edge_threshold > 0.0).then(|| edge_ridges(image));
+    let tolerance = opts.tolerance as f32;
+    let core = opts.core_tolerance as f32;
+    // 影の専用判定は第2段の段差の検査とセットで初めて安全になる。
+    // 1 段フィルで有効にすると、中間グレーの商品が「背景より暗い無彩色」として
+    // まるごと影に見えてしまう
+    let shadow = if two_stage {
+        opts.shadow_tolerance as f32
+    } else {
+        0.0
+    };
 
-    image
-        .pixels()
-        .enumerate()
-        .zip(protected.iter())
-        .map(|((i, p), &prot)| {
-            if prot {
-                return false;
+    let n = lab.len();
+    let mut strict = vec![false; n];
+    let mut loose = vec![false; n];
+    let mut shadowy = vec![false; n];
+
+    for (i, p) in image.pixels().enumerate() {
+        if protected[i] {
+            continue;
+        }
+        if p[3] == 0 {
+            strict[i] = true;
+            loose[i] = true;
+            continue;
+        }
+        // 影候補には堤防を適用しない。
+        //
+        // 堤防は輝度の勾配で測るが、Sobel は一定の傾斜に対して 1px あたりの
+        // 変化量の **2 倍** を返す（中央差分を 2px の間隔で取るため）。落ち影の
+        // 裾は 8bit へ量子化されると 1px あたり 5-6 の階段になり、勾配としては
+        // 10 前後と報告されてしまう。既定のしきい値 8 では商品の輪郭と区別が
+        // つかず、実測で影の 29% が商品直下に取り残された。
+        //
+        // 代わりに、影の吸収は第2段の背景から `shadow_reach` px 以内に
+        // 閉じ込める。堤防を外した分の危険は距離で抑える
+        shadowy[i] = is_shadow(lab[i], bg_lab, shadow);
+
+        // let-chain は Rust 1.88 以降。MSRV 1.85 を保つためネストで書く
+        if let Some(g) = &gradient {
+            if f64::from(g[i]) > opts.edge_threshold {
+                continue;
             }
-            if p[3] == 0 {
-                return true;
+        }
+        let d = delta_e76_f32(lab[i], bg_lab);
+        strict[i] = d <= core;
+        loose[i] = d <= tolerance;
+    }
+
+    Candidates {
+        strict,
+        loose,
+        shadow: shadowy,
+    }
+}
+
+/// 落ち影らしさ。彩度はほぼ動かさず明度だけを下げる画素を影候補とする。
+///
+/// 背景より**明るい**画素は対象外にする。グレー背景での映り込みや光沢は
+/// 明度が上がる方向に出るが、それを影と同じ規則で飲み込むと、白背景に置いた
+/// 白い商品のハイライトを消してしまう。
+fn is_shadow(lab: [f32; 3], bg_lab: [f32; 3], shadow_tolerance: f32) -> bool {
+    if shadow_tolerance <= 0.0 {
+        return false;
+    }
+    let drop = bg_lab[0] - lab[0];
+    if drop <= 0.0 || drop > shadow_tolerance {
+        return false;
+    }
+    let da = lab[1] - bg_lab[1];
+    let db = lab[2] - bg_lab[2];
+    da.hypot(db) <= SHADOW_CHROMA
+}
+
+/// 先が平坦な段差に許す色差を、`step_tolerance` のこの割合まで絞る。
+///
+/// 傾斜と段差は 1px だけ見ても区別できない。落ち影の裾は最も急なところで
+/// 1px あたり ΔE 1.9 変化し、淡色商品の輪郭（総コントラスト ΔE 3.6）は
+/// アンチエイリアスで 2px に広がって 1px あたり ΔE 1.8 になる。数値が同じ以上、
+/// 一方を通して他方を止めるしきい値は存在しない。
+const RIDGE_FLOOR: f32 = 0.36;
+
+/// 「この先も同じだけ変化し続けているか」を測る係数。
+///
+/// 進行方向の先の変化量の何倍までを「傾斜の続き」とみなすか。実測では、
+/// 落ち影の裾で手前と先の変化量の比が最大 1.7 だったので、2.0 で余裕を取る。
+const RIDGE_RATIO: f32 = 2.0;
+
+/// 1 段ぶんの拡張の設定。
+#[derive(Clone, Copy)]
+struct Expansion<'a> {
+    candidates: &'a Candidates,
+    lab: &'a [[f32; 3]],
+    /// 1px あたりに許す色差(ΔE)
+    step_tolerance: f32,
+    /// 影候補も吸収するか
+    with_shadow: bool,
+    /// 起点から進んでよい測地距離(px)。None で無制限
+    reach: Option<u32>,
+}
+
+/// 芯（あるいは前段の結果）から、滑らかな経路でたどれる範囲へ背景を広げる。
+///
+/// 判定は 2 つの条件の積になる。
+///
+/// 1. 進入元との色差が `step_tolerance` 以下であること
+/// 2. その色差が、**進行方向の先で続く変化量**に見合っていること
+///
+/// 2 が要る理由は上の `RIDGE_FLOOR` に書いたとおりで、傾斜と段差は 1px の
+/// 変化量だけでは分けられないためである。分けているのは「その先が平らかどうか」で、
+/// 落ち影は裾から芯まで変化し続けるのに対し、商品の輪郭は 1-2px で終わって
+/// 一様な商品面に入る。進行方向に 1px 先・2px 先を覗き、そこで続いている変化量と
+/// 比べることで、輪郭の最後の 1 段だけを弾ける。
+/// フィルは被覆率 0.5 付近の中間色の画素までは入り、商品面には入らない。
+///
+/// `with_shadow` を立てると影候補も吸収する。そのときは `reach` を必ず与えて、
+/// 起点からの測地距離で進める範囲を切る。影の判定は堤防を無視するぶん危うく、
+/// 輪郭に 1 箇所でも通り道ができると商品の内部へ届いてしまうためである。
+fn expand(w: u32, h: u32, seed: Vec<bool>, stage: &Expansion) -> Vec<bool> {
+    let Expansion {
+        candidates,
+        lab,
+        step_tolerance,
+        with_shadow,
+        reach,
+    } = *stage;
+
+    let mut filled = seed;
+    let stride = w as usize;
+    let idx = |x: u32, y: u32| (y as usize) * stride + (x as usize);
+    let floor = step_tolerance * RIDGE_FLOOR;
+    // 起点からの測地距離。起点そのものは 0、そこから 1px 進むごとに 1 増える
+    let limit = reach.unwrap_or(u32::MAX);
+    let mut distance = vec![0u32; filled.len()];
+
+    let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
+    for y in 0..h {
+        for x in 0..w {
+            if filled[idx(x, y)] {
+                queue.push_back((x, y));
             }
-            // let-chain は Rust 1.88 以降。MSRV 1.85 を保つためネストで書く
-            if let Some(g) = &gradient {
-                if f64::from(g[i]) > opts.edge_threshold {
-                    return false;
+        }
+    }
+
+    // 進行方向の先で続いている変化量。画像の外へ出る向きでは測れないので、
+    // その場合は「いくらでも続いている」とみなして段差の検査を見送る。
+    // 端で止めると見切れた商品の周りに背景が残るほうが害が大きい
+    let ahead_change = |nx: u32, ny: u32, dx: i64, dy: i64| -> f32 {
+        let here = lab[idx(nx, ny)];
+        let mut change = f32::INFINITY;
+        for step in 1..=2i64 {
+            let (ax, ay) = (i64::from(nx) + dx * step, i64::from(ny) + dy * step);
+            if ax < 0 || ay < 0 || ax >= i64::from(w) || ay >= i64::from(h) {
+                return f32::INFINITY;
+            }
+            let d = delta_e76_f32(lab[idx(ax as u32, ay as u32)], here) / step as f32;
+            change = if step == 1 { d } else { change.max(d) };
+        }
+        change
+    };
+
+    while let Some((x, y)) = queue.pop_front() {
+        let from = lab[idx(x, y)];
+        let travelled = distance[idx(x, y)];
+        if travelled >= limit {
+            continue;
+        }
+        let mut visit = |nx: u32, ny: u32, dx: i64, dy: i64, q: &mut VecDeque<(u32, u32)>| {
+            let i = idx(nx, ny);
+            if filled[i] {
+                return;
+            }
+            if !candidates.loose[i] && !(with_shadow && candidates.shadow[i]) {
+                return;
+            }
+            // 芯に入れてよい色なら段差は問わない。背景と言い切れる画素を
+            // 段差で弾くと、圧縮ノイズの多い背景に穴が残る
+            if !candidates.strict[i] {
+                let step = delta_e76_f32(lab[i], from);
+                let allowance =
+                    step_tolerance.min(RIDGE_RATIO * ahead_change(nx, ny, dx, dy) + floor);
+                if step > allowance {
+                    return;
                 }
             }
-            delta_e_rgb([p[0], p[1], p[2]], background) <= opts.tolerance
-        })
+            filled[i] = true;
+            distance[i] = travelled + 1;
+            q.push_back((nx, ny));
+        };
+        if x > 0 {
+            visit(x - 1, y, -1, 0, &mut queue);
+        }
+        if y > 0 {
+            visit(x, y - 1, 0, -1, &mut queue);
+        }
+        if x + 1 < w {
+            visit(x + 1, y, 1, 0, &mut queue);
+        }
+        if y + 1 < h {
+            visit(x, y + 1, 0, 1, &mut queue);
+        }
+    }
+
+    filled
+}
+
+/// 幅 2k 以下の隙間を通ってしか外周に届かない背景を前景へ戻す（測地的オープニング）。
+///
+/// 堤防も段差の判定も、1 画素でも破れればそこから商品の内部へフィルが流れ込む。
+/// 破れをゼロにするより「細い通路を通ってきた浸水を後から見分けて戻す」ほうが
+/// 確実である。破れは圧縮ノイズや微細な傷で生じるので通路は必ず細い。
+///
+/// 背景マスクを k px 収縮し、外周に連結する成分だけを残して k px 膨張させ、
+/// 元の背景マスクと交差させる。既定の k=1 は、1-2px の破れからの浸水を止めつつ、
+/// 取っ手の内側のような正当な隙間を塞がない幅である。
+///
+/// 収縮の芯が取れなくても外周に接している背景は残す。商品が画面いっぱいに写り、
+/// 背景が 1px の縁しかない場合に、その縁まで前景へ塗り替えてしまわないため。
+/// 外周に接する背景は定義上フィルの起点であり、隙間を通って入ってきたものでは
+/// ありえない。
+fn seal_narrow_gaps(w: u32, h: u32, background: &[bool], radius: u32) -> Vec<bool> {
+    let stride = w as usize;
+    let idx = |x: u32, y: u32| (y as usize) * stride + (x as usize);
+    let eroded = erode_bools(w, h, background, radius);
+
+    // 外周に接する背景も起点として信用する（上のコメントを参照）
+    let mut trusted = eroded;
+    for x in 0..w {
+        for y in [0, h - 1] {
+            let i = idx(x, y);
+            trusted[i] |= background[i];
+        }
+    }
+    for y in 0..h {
+        for x in [0, w - 1] {
+            let i = idx(x, y);
+            trusted[i] |= background[i];
+        }
+    }
+
+    // 外周から届く芯だけを残す
+    let reachable = fill_from_border(w, h, &trusted, None);
+    let grown = dilate_bools(w, h, &reachable, radius);
+
+    grown
+        .iter()
+        .zip(background.iter())
+        .map(|(&g, &b)| g && b)
         .collect()
+}
+
+/// 正方形の構造要素による収縮／膨張。横と縦に分けて O(n * radius) に収める。
+///
+/// 画像の外は「窓に含めない」扱いにする。外を前景とみなすと、画面の端で
+/// 切れている背景まで削れてしまう。
+fn erode_bools(w: u32, h: u32, src: &[bool], radius: u32) -> Vec<bool> {
+    separable(w, h, src, radius, false)
+}
+
+fn dilate_bools(w: u32, h: u32, src: &[bool], radius: u32) -> Vec<bool> {
+    separable(w, h, src, radius, true)
+}
+
+fn separable(w: u32, h: u32, src: &[bool], radius: u32, take_max: bool) -> Vec<bool> {
+    let stride = w as usize;
+    let r = radius as i64;
+    let combine = |acc: bool, v: bool| if take_max { acc || v } else { acc && v };
+
+    let mut horizontal = vec![false; src.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let from = (i64::from(x) - r).max(0) as u32;
+            let to = ((i64::from(x) + r) as u32).min(w - 1);
+            let mut acc = !take_max;
+            for k in from..=to {
+                acc = combine(acc, src[(y as usize) * stride + (k as usize)]);
+            }
+            horizontal[(y as usize) * stride + (x as usize)] = acc;
+        }
+    }
+
+    let mut out = vec![false; src.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let from = (i64::from(y) - r).max(0) as u32;
+            let to = ((i64::from(y) + r) as u32).min(h - 1);
+            let mut acc = !take_max;
+            for k in from..=to {
+                acc = combine(acc, horizontal[(k as usize) * stride + (x as usize)]);
+            }
+            out[(y as usize) * stride + (x as usize)] = acc;
+        }
+    }
+    out
 }
 
 /// 外周を起点に 4 近傍で塗り広げる。
@@ -476,5 +898,285 @@ mod tests {
         o.fg_seeds = vec![(100, 100)];
         let mask = foreground_mask(&img, BG, &o);
         assert_eq!(mask.stats().foreground_ratio, 0.0);
+    }
+
+    // ---- 2 段階フィル ----
+
+    /// 灰色の値を並べて 1 行の画像を作る。段差と傾斜を作り分けるため。
+    fn gray_rows(rows: &[Vec<u8>]) -> RgbaImage {
+        let h = rows.len() as u32;
+        let w = rows[0].len() as u32;
+        let mut img = RgbaImage::new(w, h);
+        for (y, row) in rows.iter().enumerate() {
+            for (x, &v) in row.iter().enumerate() {
+                img.put_pixel(x as u32, y as u32, Rgba([v, v, v, 255]));
+            }
+        }
+        img
+    }
+
+    fn two_stage(tolerance: f64) -> FloodOptions {
+        FloodOptions {
+            tolerance,
+            core_tolerance: core_tolerance(tolerance, 0.0),
+            step_tolerance: 2.2,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_core_tolerance_never_exceeds_the_loose_one() {
+        // `--tolerance 0`（何も消すな）を芯が勝手に破ってはいけない
+        assert_eq!(core_tolerance(0.0, 0.5), 0.0);
+        assert!(core_tolerance(0.6, 5.0) <= 0.6);
+        // 通常の設定では「背景のばらつきの2倍」だが、tolerance の 1/3 で頭打ち
+        assert_eq!(core_tolerance(12.0, 0.35), 1.0, "下限は 1.0");
+        assert_eq!(core_tolerance(12.0, 1.5), 3.0, "ばらつきの 2 倍");
+        assert_eq!(core_tolerance(12.0, 9.0), 4.0, "上限は tolerance の 1/3");
+    }
+
+    /// 案Bの核心。同じ「1px あたり ΔE 1 前後」でも、傾斜は越えられて段差は越えられない。
+    #[test]
+    fn a_gentle_ramp_is_crossed_but_a_step_of_the_same_slope_is_not() {
+        // 250 から 20px かけて 190 まで落ちる傾斜。落ち影の裾に相当する
+        let ramp: Vec<u8> = (0..40u8).map(|x| 250u8.saturating_sub(x * 3)).collect();
+        let img = gray_rows(&vec![ramp; 5]);
+        let mut o = two_stage(40.0);
+        o.edge_threshold = 0.0;
+        let mask = foreground_mask(&img, BG, &o);
+        assert!(
+            !mask.is_foreground(30, 2),
+            "なだらかな傾斜を渡れていない\n{}",
+            render(&mask)
+        );
+
+        // 同じ幅で同じ量を落とすが、途中に 1px の段差を挟む
+        let mut stepped: Vec<u8> = vec![250; 40];
+        for (x, v) in stepped.iter_mut().enumerate() {
+            *v = if x < 20 { 250 } else { 190 };
+        }
+        let img = gray_rows(&vec![stepped; 5]);
+        let mask = foreground_mask(&img, BG, &o);
+        assert!(
+            mask.is_foreground(30, 2),
+            "段差を越えてしまっている\n{}",
+            render(&mask)
+        );
+    }
+
+    /// 芯に入る色は段差を問わない。圧縮ノイズの多い背景に穴を残さないため。
+    #[test]
+    fn a_pixel_that_is_plainly_background_is_taken_regardless_of_the_step() {
+        // 背景のただ中に、背景に十分近いが隣とは段差のある画素を置く
+        let mut row: Vec<u8> = vec![250; 20];
+        row[10] = 249;
+        let img = gray_rows(&vec![row; 5]);
+        let mut o = two_stage(12.0);
+        o.core_tolerance = 1.0;
+        o.step_tolerance = 0.05;
+        o.edge_threshold = 0.0;
+        let mask = foreground_mask(&img, BG, &o);
+        assert_eq!(
+            mask.stats().foreground_ratio,
+            0.0,
+            "背景が残っている\n{}",
+            render(&mask)
+        );
+    }
+
+    /// 芯が取れないときは従来の 1 段フィルへ落ちる。全面前景にしてはいけない。
+    #[test]
+    fn a_border_far_from_the_estimated_background_falls_back_to_a_single_pass() {
+        // 推定背景色 250 に対して、画像全体が 240（芯の許容量の外）
+        let img = gray_rows(&vec![vec![240u8; 20]; 8]);
+        let mut o = two_stage(30.0);
+        o.edge_threshold = 0.0;
+        let mask = foreground_mask(&img, BG, &o);
+        assert_eq!(
+            mask.stats().foreground_ratio,
+            0.0,
+            "芯が取れないだけで全面が前景になっている\n{}",
+            render(&mask)
+        );
+    }
+
+    // ---- 影の専用判定 ----
+
+    fn with_shadow(tolerance: f64) -> FloodOptions {
+        FloodOptions {
+            shadow_tolerance: 35.0,
+            ..two_stage(tolerance)
+        }
+    }
+
+    #[test]
+    fn a_neutral_gradient_darker_than_the_background_is_absorbed_as_a_shadow() {
+        // tolerance 12 では届かない ΔE 25 相当まで落ちる無彩色の傾斜。
+        // 色だけで判定する第2段は ΔE 12 のあたり（x=10 前後）で止まる
+        let ramp: Vec<u8> = (0..40u8).map(|x| 250u8.saturating_sub(x * 3)).collect();
+        let img = gray_rows(&vec![ramp; 5]);
+        let mut o = with_shadow(12.0);
+        o.edge_threshold = 0.0;
+        let mask = foreground_mask(&img, BG, &o);
+        assert!(
+            !mask.is_foreground(24, 2),
+            "影として吸収できていない\n{}",
+            render(&mask)
+        );
+
+        // 影の判定を切れば、tolerance の外なので前景として残るはず
+        o.shadow_tolerance = 0.0;
+        let mask = foreground_mask(&img, BG, &o);
+        assert!(
+            mask.is_foreground(24, 2),
+            "対照が成立していない（影判定なしでも消えている）\n{}",
+            render(&mask)
+        );
+    }
+
+    /// 影の吸収は無制限には進まない。堤防を外している分、
+    /// 判定を誤ったときの被害を距離で閉じ込める。
+    #[test]
+    fn the_shadow_pass_stops_after_a_bounded_distance() {
+        let ramp: Vec<u8> = (0..40u8).map(|x| 250u8.saturating_sub(x * 3)).collect();
+        let img = gray_rows(&vec![ramp; 5]);
+        let mut o = with_shadow(12.0);
+        o.edge_threshold = 0.0;
+        let mask = foreground_mask(&img, BG, &o);
+        // 短辺 5px の画像なので進める距離は下限の 16px。色だけで届く範囲
+        // （x=10 前後）から 16px 先まででフィルは止まる
+        assert!(
+            mask.is_foreground(38, 2),
+            "距離の上限が効いていない\n{}",
+            render(&mask)
+        );
+    }
+
+    #[test]
+    fn a_coloured_gradient_is_not_mistaken_for_a_shadow() {
+        // 明度は影と同じだけ落ちるが、彩度が動く（茶色い革のような面）
+        let mut img = RgbaImage::new(40, 5);
+        for y in 0..5 {
+            for x in 0..40 {
+                let drop = (x as u16 * 3).min(120) as u8;
+                img.put_pixel(
+                    x,
+                    y,
+                    Rgba([
+                        250,
+                        250u8.saturating_sub(drop),
+                        250u8.saturating_sub(drop),
+                        255,
+                    ]),
+                );
+            }
+        }
+        let mut o = with_shadow(12.0);
+        o.edge_threshold = 0.0;
+        let mask = foreground_mask(&img, BG, &o);
+        assert!(
+            mask.is_foreground(38, 2),
+            "彩度が動く傾斜まで影として飲み込んでいる\n{}",
+            render(&mask)
+        );
+    }
+
+    #[test]
+    fn a_reflection_brighter_than_the_background_is_left_alone() {
+        // グレー背景に置いた光沢の映り込み。影とは逆に明度が上がる
+        let bg = [180u8, 180, 180];
+        let ramp: Vec<u8> = (0..40u8).map(|x| 180u8.saturating_add(x * 2)).collect();
+        let img = gray_rows(&vec![ramp; 5]);
+        let mut o = with_shadow(12.0);
+        o.edge_threshold = 0.0;
+        let mask = foreground_mask(&img, bg, &o);
+        assert!(
+            mask.is_foreground(38, 2),
+            "背景より明るい映り込みを影として消している\n{}",
+            render(&mask)
+        );
+    }
+
+    // ---- 測地的オープニング ----
+
+    #[test]
+    fn a_pinhole_in_the_outline_does_not_flood_the_interior() {
+        // 濃い商品の輪郭に 1px の穴を開ける。穴からの浸水を塞ぐこと
+        let mut img = RgbaImage::from_pixel(24, 24, Rgba([250, 250, 250, 255]));
+        for y in 6..18 {
+            for x in 6..18 {
+                // 内部は背景と同じ色。輪郭だけが商品を商品たらしめている
+                let outline = x == 6 || x == 17 || y == 6 || y == 17;
+                let v = if outline { 40 } else { 250 };
+                img.put_pixel(x, y, Rgba([v, v, v, 255]));
+            }
+        }
+        // 上辺に 1px の穴
+        img.put_pixel(11, 6, Rgba([250, 250, 250, 255]));
+
+        let mut o = two_stage(12.0);
+        o.seal = 0;
+        let leaked = foreground_mask(&img, BG, &o);
+        assert!(
+            !leaked.is_foreground(11, 12),
+            "前提が崩れている: 穴から浸水するはず\n{}",
+            render(&leaked)
+        );
+
+        o.seal = 1;
+        let sealed = foreground_mask(&img, BG, &o);
+        assert!(
+            sealed.is_foreground(11, 12),
+            "1px の穴からの浸水を塞げていない\n{}",
+            render(&sealed)
+        );
+        assert!(
+            !sealed.is_foreground(1, 1),
+            "外側の背景まで前景に戻している"
+        );
+    }
+
+    #[test]
+    fn a_wide_opening_is_left_as_background() {
+        // 幅 6px の切り欠き。取っ手の内側のような正当な隙間は塞がない
+        let mut img = RgbaImage::from_pixel(24, 24, Rgba([250, 250, 250, 255]));
+        for y in 6..18 {
+            for x in 6..18 {
+                let outline = x == 6 || x == 17 || y == 6 || y == 17;
+                let v = if outline { 40 } else { 250 };
+                img.put_pixel(x, y, Rgba([v, v, v, 255]));
+            }
+        }
+        for x in 9..15 {
+            img.put_pixel(x, 6, Rgba([250, 250, 250, 255]));
+        }
+        let mut o = two_stage(12.0);
+        o.seal = 1;
+        let mask = foreground_mask(&img, BG, &o);
+        assert!(
+            !mask.is_foreground(11, 12),
+            "幅 6px の隙間まで塞いでいる\n{}",
+            render(&mask)
+        );
+    }
+
+    #[test]
+    fn a_one_pixel_margin_of_background_is_not_swallowed_by_the_seal() {
+        // 商品が画面いっぱいに写り、背景が 1px の縁しかない場合。
+        // 収縮で芯が消えても、外周に接する背景は背景のまま残さなければならない
+        let mut img = RgbaImage::from_pixel(20, 20, Rgba([250, 250, 250, 255]));
+        for y in 1..19 {
+            for x in 1..19 {
+                img.put_pixel(x, y, Rgba([40, 40, 40, 255]));
+            }
+        }
+        let mut o = two_stage(12.0);
+        o.seal = 1;
+        let mask = foreground_mask(&img, BG, &o);
+        assert!(
+            !mask.is_foreground(0, 10),
+            "1px の背景の縁まで前景にしている\n{}",
+            render(&mask)
+        );
     }
 }

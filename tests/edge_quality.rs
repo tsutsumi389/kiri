@@ -22,6 +22,16 @@ fn scenes() -> Vec<EdgeScene> {
             jpeg: None,
             ..Default::default()
         },
+        // 白背景に置いた淡色商品。上端のハイライトで商品は 221 まで明るくなり、
+        // 背景 248 との輪郭のコントラストは ΔE 9.5 まで落ちる。既定の
+        // tolerance 12 より小さいので、**色だけを見れば商品はまるごと背景**
+        // である。連結性と段差の検査だけがこれを商品として残している
+        EdgeScene {
+            name: "S3 淡色商品(輪郭 ΔE 9.5)",
+            product: [232, 232, 230],
+            shading: (0.98, 0.80),
+            ..Default::default()
+        },
         EdgeScene {
             name: "S4 柔らかい輪郭(8px)",
             softness: 8.0,
@@ -40,6 +50,27 @@ fn scenes() -> Vec<EdgeScene> {
         EdgeScene {
             name: "S6 落ち影あり",
             shadow: true,
+            ..Default::default()
+        },
+        EdgeScene {
+            name: "S7 中間グレー商品+影",
+            product: [150, 150, 150],
+            shadow: true,
+            ..Default::default()
+        },
+        EdgeScene {
+            name: "S8 黒商品+影",
+            product: [20, 20, 20],
+            shadow: true,
+            ..Default::default()
+        },
+        // 解けないケース。商品の明度が上から下へ変化する途中で背景色を
+        // **横切る**ため、輪郭のコントラストが 0 になる行が存在する。そこでは
+        // 色による分離が原理的に不可能で、いったん入られると商品の内部は
+        // 一様なのでフィルが広がる。判定はせず、表に出して限界を可視化する
+        EdgeScene {
+            name: "S9 淡色商品(明度が背景を横切る)",
+            product: [232, 232, 230],
             ..Default::default()
         },
     ]
@@ -146,6 +177,81 @@ fn a_three_pixel_strap_does_not_leave_a_halo() {
         m.halo < 5.0,
         "細部の周りにハローが残っている: {:.1}\n{m:?}",
         m.halo
+    );
+}
+
+#[test]
+fn a_light_product_is_not_flooded_through_its_faint_outline() {
+    // 商品の上端は 221、背景は 248。輪郭のコントラストは ΔE 9.5 しかなく、
+    // 既定の tolerance 12 より小さい。つまり **色だけを見れば商品はまるごと
+    // 背景**である。勾配の堤防（1px あたり輝度 8）も、JPEG で滲んだ角では
+    // 反応しない。段差の検査が入る前は、境界近傍の商品の 6 割が削れていた
+    let truth = find("S3");
+    let m = run(&truth, &CutoutOptions::default());
+    assert!(
+        m.eaten < 0.05,
+        "淡色商品が削られている: {:.1}%\n{m:?}",
+        m.eaten * 100.0
+    );
+    assert!(
+        m.rim < 0.01,
+        "背景色のままの画素が不透明で残っている: {:.1}%\n{m:?}",
+        m.rim * 100.0
+    );
+}
+
+#[test]
+fn a_cast_shadow_is_removed() {
+    // tolerance 12 では影の濃い部分（ΔE 20-30）に届かない。影の専用判定が
+    // 入る前は 56% が商品の直下に残っていた
+    let truth = find("S6");
+    let m = run(&truth, &CutoutOptions::default());
+    assert!(
+        m.shadow_kept < 0.05,
+        "落ち影が残っている: {:.1}%\n{m:?}",
+        m.shadow_kept * 100.0
+    );
+    assert!(
+        m.eaten < 0.01,
+        "影を消すために商品まで削っている: {:.1}%\n{m:?}",
+        m.eaten * 100.0
+    );
+}
+
+/// 影の判定が商品を巻き込まないこと。
+///
+/// 「背景より暗い無彩色」という条件だけを見れば、中間グレーや黒の商品も
+/// 影候補になる。それでも消えないのは、輪郭の段差でフィルが止まるからである。
+/// 影の判定を入れたときに最も壊れやすいのがここなので、別立てで固定する。
+#[test]
+fn the_shadow_rule_does_not_eat_a_neutral_product() {
+    for (name, limit) in [("S7", 0.01f32), ("S8", 0.0)] {
+        let truth = find(name);
+        let m = run(&truth, &CutoutOptions::default());
+        assert!(
+            m.eaten <= limit,
+            "{name}: 無彩色の商品が影として消されている: {:.2}%\n{m:?}",
+            m.eaten * 100.0
+        );
+    }
+}
+
+/// 影の判定を切れば影が残ることを確かめる対照実験。
+/// 「もともと残っていなかっただけ」で上のテストが通るのを防ぐ。
+#[test]
+fn turning_off_the_shadow_rule_leaves_the_shadow_behind() {
+    let truth = find("S6");
+    let m = run(
+        &truth,
+        &CutoutOptions {
+            shadow_tolerance: 0.0,
+            ..Default::default()
+        },
+    );
+    assert!(
+        m.shadow_kept > 0.20,
+        "対照が成立していない（影判定なしでも影が消えている）: {:.1}%",
+        m.shadow_kept * 100.0
     );
 }
 

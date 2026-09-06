@@ -46,6 +46,9 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         feather: args.feather,
         despill: !args.no_despill,
         edge_threshold: args.edge_threshold,
+        step_tolerance: args.step_tolerance,
+        shadow_tolerance: args.shadow_tolerance,
+        seal: args.seal,
         refine: !args.no_refine,
     };
     let result = cutout(&loaded.image, &opts);

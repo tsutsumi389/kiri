@@ -2670,6 +2670,10 @@ fn out_of_range_numeric_options_are_rejected() {
         "--edge-threshold=inf",
         // 半径に比例して走査量が増えるので、二桁の指定は事故しかない
         "--seal=400",
+        // 長辺 1000px 換算の半径。上限を超えると商品そのものが
+        // 「孤立ノイズ」になり、消す道具ではなく全消しの道具になる
+        "--cleanup=65",
+        "--cleanup=4294967295",
     ] {
         let out = kiri()
             .args([
@@ -2688,7 +2692,7 @@ fn out_of_range_numeric_options_are_rejected() {
 
 /// バッチの spec も同じ約束で弾くこと。clap を通らない経路なので別立てで見る。
 #[test]
-fn a_negative_setting_in_a_batch_spec_is_rejected() {
+fn an_out_of_range_setting_in_a_batch_spec_is_rejected() {
     let dir = fixture_dir();
     let img = product_image(&ProductSpec {
         width: 60,
@@ -2696,23 +2700,32 @@ fn a_negative_setting_in_a_batch_spec_is_rejected() {
         ..Default::default()
     });
     write_png(dir.path(), "a.png", &img);
-    let spec = dir.path().join("spec.json");
-    std::fs::write(
-        &spec,
-        r#"{"defaults":{"step_tolerance":-1.0},
-             "items":[{"input":"a.png","output":"out.png"}]}"#,
-    )
-    .unwrap();
-
-    let out = kiri()
-        .args(["batch", spec.to_str().unwrap(), "--json"])
-        .output()
+    for defaults in [
+        r#"{"step_tolerance":-1.0}"#,
+        r#"{"seal":400}"#,
+        // 上限を超えた cleanup。clap 側と同じ関門を spec にも掛ける
+        r#"{"cleanup":65}"#,
+        r#"{"cleanup":4294967295}"#,
+    ] {
+        let spec = dir.path().join("spec.json");
+        std::fs::write(
+            &spec,
+            format!(
+                r#"{{"defaults":{defaults},"items":[{{"input":"a.png","output":"out.png"}}]}}"#
+            ),
+        )
         .unwrap();
-    let json = json_stdout(&out);
-    assert_eq!(
-        json["results"][0]["error"]["code"], "INVALID_SETTING",
-        "spec の負値が弾かれていない: {json}"
-    );
+
+        let out = kiri()
+            .args(["batch", spec.to_str().unwrap(), "--json", "--force"])
+            .output()
+            .unwrap();
+        let json = json_stdout(&out);
+        assert_eq!(
+            json["results"][0]["error"]["code"], "INVALID_SETTING",
+            "spec の {defaults} が弾かれていない: {json}"
+        );
+    }
 }
 
 /// 落ち影が既定で消えること。CLI から通しで確かめる。

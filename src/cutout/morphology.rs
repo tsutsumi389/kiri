@@ -29,13 +29,34 @@ use crate::cutout::mask::Mask;
 ///
 /// 半径 0 は「無効」の意味なので 0 を返す。比例させると面積 1 以上、つまり
 /// 「1 画素の成分は消す」という別の意味になってしまう。
+///
+/// `2 * radius` を整数で組まないのは、公開 API に `u32::MAX` を渡されても
+/// debug ビルドで溢れさせないためである。CLI と batch は `MAX_CLEANUP` で
+/// 上限を掛けるが、ライブラリとして呼ばれる経路にはその関門が無い。
 pub fn speck_min_area(radius: u32, width: u32, height: u32) -> usize {
     if radius == 0 {
         return 0;
     }
-    let side = f64::from(2 * radius + 1);
-    let scale = (f64::from(width.max(height)) / 1000.0).max(1.0);
-    (side * scale).powi(2).round() as usize
+    let side = 2.0 * f64::from(radius) + 1.0;
+    (side * speck_scale(width, height)).powi(2).round() as usize
+}
+
+/// 実際の画素数での半径。`speck_min_area` と同じ大きさの正方形の半径にあたる。
+///
+/// `--cleanup` は長辺 1000px 換算の値なので、そのままでは「実寸で何 px か」を
+/// 語らない。境界の探索深さのように**実寸の距離**が要る場所では、面積の下限から
+/// 逆算したこちらを使う。
+pub fn speck_radius(radius: u32, width: u32, height: u32) -> u32 {
+    if radius == 0 {
+        return 0;
+    }
+    let side = (2.0 * f64::from(radius) + 1.0) * speck_scale(width, height);
+    ((side - 1.0) / 2.0).round() as u32
+}
+
+/// 面積と半径に掛ける解像度の倍率。長辺 1000px 以下では 1 に留める。
+fn speck_scale(width: u32, height: u32) -> f64 {
+    (f64::from(width.max(height)) / 1000.0).max(1.0)
 }
 
 /// 孤立ノイズの除去。連結成分のうち、不透明な芯の面積が
@@ -411,6 +432,37 @@ mod tests {
             "20MP で織り目(150px²)を超えていない: {}",
             speck_min_area(2, 4284, 5712)
         );
+    }
+
+    /// 実効半径は面積の下限と同じ大きさを指すこと。
+    ///
+    /// 境界の探索深さがこれを使うので、面積の式とずれると
+    /// 「高解像度でだけ縁を跨げない」という形で静かに壊れる。
+    #[test]
+    fn the_effective_radius_matches_the_area_threshold() {
+        for (r, w, h) in [(2u32, 600u32, 600u32), (2, 3000, 4000), (2, 4284, 5712)] {
+            // 半径は整数なので一辺は必ず奇数になる。ずれは丸めのぶんの 1px まで
+            let from_radius = f64::from(2 * speck_radius(r, w, h) + 1);
+            let from_area = (speck_min_area(r, w, h) as f64).sqrt();
+            assert!(
+                (from_radius - from_area).abs() <= 1.0,
+                "{w}x{h} 半径 {r}: 実効半径からの一辺 {from_radius} と面積からの一辺 {from_area} が食い違う"
+            );
+        }
+        assert_eq!(
+            speck_radius(2, 600, 600),
+            2,
+            "長辺 1000px 以下では換算しない"
+        );
+        assert_eq!(speck_radius(0, 4000, 4000), 0, "半径 0 は無効");
+    }
+
+    /// 半径に極端な値が来ても溢れないこと。CLI と batch は上限で断るが、
+    /// ライブラリとして呼ばれる経路にはその関門が無い。
+    #[test]
+    fn an_absurd_radius_does_not_overflow() {
+        assert!(speck_min_area(u32::MAX, 4000, 4000) > 0);
+        assert!(speck_radius(u32::MAX, 4000, 4000) > 0);
     }
 
     /// 大きな画像では、小さな画像なら残る大きさのゴミが消えること。

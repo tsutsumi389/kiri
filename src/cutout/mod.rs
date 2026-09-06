@@ -269,8 +269,13 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
     // despill 前の元画像で測る。境界の色を書き換えた後では、
     // 「元々どれだけ違ったか」が分からなくなるため。
     // 探る深さは、前景の外側に残る背景色の縁を跨げるだけ取る。縁の厚さは
-    // 輪郭検出(1px程度)・形態素処理・フェザリングの合計で決まる
-    let inset = opts.cleanup + opts.feather + 4;
+    // 輪郭検出(1px程度)・形態素処理・フェザリングの合計で決まる。
+    //
+    // `--cleanup` は長辺 1000px 換算の値なので、そのまま足すと実寸を語らない。
+    // 20MP では換算値 2 が実寸 13px 相当になり、換算値のまま足していた頃は
+    // 高解像度ほど縁を跨げなくなっていた。面積の下限から実効半径を逆算する
+    let inset =
+        morphology::speck_radius(opts.cleanup, image.width(), image.height()) + opts.feather + 4;
     let separability = boundary_separability(image, &mask, background.rgb, inset, opts.bbox);
     let diagnostics = diagnostics::diagnose(image, &mask, background.rgb);
     // 設定の調整はいちばん先に伝える。結果への警告は、その設定で走った結果に

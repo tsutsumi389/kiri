@@ -111,16 +111,8 @@ fn to_cutout_args(
         .transpose()?
         .unwrap_or([255, 255, 255]);
 
-    let seal = settings.seal.unwrap_or(1);
-    if seal > crate::cli::MAX_SEAL {
-        return Err(Error::argument(
-            "INVALID_SETTING",
-            format!(
-                "seal は 0 から {} の範囲で指定してください（{seal} が指定されました）",
-                crate::cli::MAX_SEAL
-            ),
-        ));
-    }
+    let seal = capped(settings.seal, 1, crate::cli::MAX_SEAL, "seal")?;
+    let cleanup = capped(settings.cleanup, 2, crate::cli::MAX_CLEANUP, "cleanup")?;
 
     Ok(CutoutArgs {
         input: input.to_path_buf(),
@@ -129,14 +121,12 @@ fn to_cutout_args(
         fg_seed: settings.fg_seeds.clone().unwrap_or_default(),
         tolerance: checked(settings.tolerance, 12.0, "tolerance")?,
         border: settings.border.unwrap_or(DEFAULT_BORDER),
-        cleanup: settings.cleanup.unwrap_or(2),
+        cleanup,
         feather: settings.feather.unwrap_or(1),
         no_despill: !settings.despill.unwrap_or(true),
         no_refine: !settings.refine.unwrap_or(true),
         // 未指定は未指定のまま渡す。既定値で埋めてしまうと、テクスチャに応じた
         // 自動調整が spec を書いた人の「8 を指定した」と区別できなくなる
-        // 未指定は未指定のまま渡す。既定値で埋めてしまうと、テクスチャに応じた
-        // 自動調整が「spec に 8 と書いた」と区別できなくなる
         edge_threshold: checked_opt(settings.edge_threshold, "edge_threshold")?,
         step_tolerance: checked(settings.step_tolerance, 2.2, "step_tolerance")?,
         shadow_tolerance: checked(settings.shadow_tolerance, 35.0, "shadow_tolerance")?,
@@ -167,6 +157,22 @@ fn to_cutout_args(
 /// 結果の JSON にも異常が出ない。気づけるのは仕上がりを目で見たときになる。
 fn checked(value: Option<f64>, default: f64, key: &str) -> Result<f64> {
     validate(value.unwrap_or(default), key)
+}
+
+/// 上限のある整数の設定に CLI と同じ関門を掛ける。
+///
+/// clap の `value_parser` に相当するものが spec には無い。上限を超えた値を
+/// 通すと、`--seal` なら 1MP で秒単位、`--cleanup` なら商品ごと全消しという
+/// 形で表れるが、どちらも「数百点を回し終えてから気づく」種類の失敗になる。
+fn capped(value: Option<u32>, default: u32, max: u32, key: &str) -> Result<u32> {
+    let value = value.unwrap_or(default);
+    if value > max {
+        return Err(Error::argument(
+            "INVALID_SETTING",
+            format!("{key} は 0 から {max} の範囲で指定してください（{value} が指定されました）"),
+        ));
+    }
+    Ok(value)
 }
 
 /// 既定値を持たない設定用。未指定は未指定のまま返す。

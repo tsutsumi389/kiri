@@ -37,6 +37,50 @@ fn pivot(t: f64) -> f64 {
     }
 }
 
+/// sRGB 8bit → 線形 RGB の変換表。
+///
+/// 画像全体を走査する処理（フラッドフィルの Lab 化、境界帯の色復元）では、
+/// 画素ごとに `powf` を呼ぶと変換だけで数百 ms かかる。256 通りしか入力が
+/// 無いので表を引く。
+pub fn srgb_linear_lut() -> [f32; 256] {
+    let mut lut = [0f32; 256];
+    for (i, slot) in lut.iter_mut().enumerate() {
+        *slot = srgb_to_linear(i as u8) as f32;
+    }
+    lut
+}
+
+/// 線形 RGB (0.0-1.0) を CIE Lab に変換する。`srgb_linear_lut` と組で使う。
+pub fn linear_to_lab(rgb: [f32; 3]) -> [f32; 3] {
+    let pivot32 = |t: f32| -> f32 {
+        if t > 0.008_856 {
+            t.cbrt()
+        } else {
+            7.787 * t + 16.0 / 116.0
+        }
+    };
+    let (r, g, b) = (rgb[0], rgb[1], rgb[2]);
+
+    let x = 0.412_456_4 * r + 0.357_576_1 * g + 0.180_437_5 * b;
+    let y = 0.212_672_9 * r + 0.715_152_2 * g + 0.072_175_0 * b;
+    // 0.119_192_0 と書くと f32 では表現できない桁だと clippy に叱られる
+    let z = 0.019_333_9 * r + 0.119_192 * g + 0.950_304_1 * b;
+
+    let fx = pivot32(x / XN as f32);
+    let fy = pivot32(y / YN as f32);
+    let fz = pivot32(z / ZN as f32);
+
+    [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
+}
+
+/// CIE76 の色差（f32 版）。
+pub fn delta_e76_f32(a: [f32; 3], b: [f32; 3]) -> f32 {
+    let dl = a[0] - b[0];
+    let da = a[1] - b[1];
+    let db = a[2] - b[2];
+    (dl * dl + da * da + db * db).sqrt()
+}
+
 /// sRGB (0-255) を CIE Lab に変換する。
 pub fn srgb_to_lab(rgb: [u8; 3]) -> [f64; 3] {
     let r = srgb_to_linear(rgb[0]);
@@ -111,5 +155,37 @@ mod tests {
     #[test]
     fn white_and_black_are_far_apart() {
         assert!(delta_e_rgb([255, 255, 255], [0, 0, 0]) > 99.0);
+    }
+
+    /// f32 経路は f64 経路と実質同じ値を返さなければならない。
+    /// 段差の判定は ΔE 1 前後の差で結論が変わるため、ここがずれると
+    /// フラッドフィルの停止位置が変わってしまう。
+    #[test]
+    fn the_f32_path_agrees_with_the_f64_path() {
+        let lut = srgb_linear_lut();
+        for rgb in [
+            [0u8, 0, 0],
+            [255, 255, 255],
+            [248, 248, 247],
+            [232, 232, 230],
+            [190, 70, 55],
+            [40, 40, 45],
+            [7, 3, 1],
+        ] {
+            let a = srgb_to_lab(rgb);
+            let b = linear_to_lab([
+                lut[rgb[0] as usize],
+                lut[rgb[1] as usize],
+                lut[rgb[2] as usize],
+            ]);
+            for k in 0..3 {
+                assert!(
+                    (a[k] - f64::from(b[k])).abs() < 0.01,
+                    "{rgb:?} の成分 {k} がずれている: {} vs {}",
+                    a[k],
+                    b[k]
+                );
+            }
+        }
     }
 }

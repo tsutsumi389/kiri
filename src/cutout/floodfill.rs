@@ -687,7 +687,14 @@ fn fill_from_border(
     // 途中に背景色から外れた領域（照明ムラや別の物体）があるだけでフィルが
     // 遮られ、bbox の内側に一切届かなくなる。それでは bbox が「商品はここに
     // ある」という指示ではなく、単なる切り取り枠に留まってしまう。
+    //
+    // 画像の外へはみ出した矩形は縁へ寄せる。`foreground_mask` はライブラリの
+    // 公開関数なので、CLI の `resolve_bbox` を通さずに呼ばれれば範囲外の bbox が
+    // 届きうる。添字が破裂して panic するより、指示を画像の中へ丸めるほうが
+    // 親切である。左右・上下が反転している指定もここで正す
     let (sx1, sy1, sx2, sy2) = bbox.unwrap_or((0, 0, w - 1, h - 1));
+    let (sx1, sx2) = (sx1.min(sx2).min(w - 1), sx2.max(sx1).min(w - 1));
+    let (sy1, sy2) = (sy1.min(sy2).min(h - 1), sy2.max(sy1).min(h - 1));
     for x in sx1..=sx2 {
         seed(x, sy1, &mut filled, &mut queue);
         seed(x, sy2, &mut filled, &mut queue);
@@ -977,6 +984,29 @@ mod tests {
             "bbox の内側の背景色は消える（外周からは到達できない位置）"
         );
         assert!(!mask.is_foreground(2, 2), "bbox の外は背景");
+    }
+
+    /// 画像の外へはみ出した bbox で落ちないこと。
+    ///
+    /// CLI は `resolve_bbox` で画像内へ丸めるが、`foreground_mask` は
+    /// ライブラリの公開関数なので、丸めていない座標がそのまま届きうる。
+    /// 添字が範囲外になって panic するのは、指示が乱暴だっただけの利用者に
+    /// 対して重すぎる反応である。
+    #[test]
+    fn a_bbox_outside_the_image_is_clamped_instead_of_panicking() {
+        let img = RgbaImage::from_pixel(30, 30, Rgba([250, 250, 250, 255]));
+        for bbox in [
+            Some((5, 5, 40, 40)),
+            Some((40, 40, 50, 50)),
+            // 左右・上下が反転した指定
+            Some((20, 20, 5, 5)),
+        ] {
+            let mut o = opts(5.0);
+            o.bbox = bbox;
+            let mask = foreground_mask(&img, BG, &o);
+            assert_eq!(mask.width(), 30);
+            assert_eq!(mask.height(), 30);
+        }
     }
 
     #[test]

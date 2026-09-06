@@ -53,6 +53,19 @@ pub struct PerimeterDeltaE {
     pub max: f64,
 }
 
+/// 外周の帯で測った勾配強度（1px あたりの輝度変化量）の分布。
+///
+/// `perimeter_delta_e` は「背景色からどれだけ離れているか」しか言わないので、
+/// なだらかな照明ムラと、ざらついた織り目を区別できない。前者は tolerance で
+/// 吸収できるが、後者は輪郭の堤防を誤発火させ、フィルが商品まで届かなくなる。
+/// `p90` が `settings.edge_threshold` の水準に達していれば、その背景は
+/// 「堤防を張れない素材」である。
+#[derive(Debug, Serialize)]
+pub struct PerimeterTexture {
+    pub p50: f64,
+    pub p90: f64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct BackgroundReport {
     pub rgb: [u8; 3],
@@ -60,6 +73,7 @@ pub struct BackgroundReport {
     /// 1.0 に近いほど単色背景で、切り抜きの成功率が高い。
     pub uniformity: f64,
     pub perimeter_delta_e: PerimeterDeltaE,
+    pub texture: PerimeterTexture,
 }
 
 #[derive(Debug, Serialize)]
@@ -159,7 +173,9 @@ pub struct CanvasReport {
 pub struct SettingsReport {
     /// 背景色との色差(ΔE)の許容量
     pub tolerance: f64,
-    /// 1px あたりの輝度変化がこの値を超える輪郭でフィルを止める。0 で無効
+    /// 1px あたりの輝度変化がこの値を超える輪郭でフィルを止める。0 で無効。
+    /// 未指定のまま背景のテクスチャで自動調整された場合は、調整後の値が入り、
+    /// `warnings` にその旨が 1 行出る
     pub edge_threshold: f64,
     /// 背景を広げる際に 1px あたりに許した色差(ΔE)。0 で 2 段階フィルは無効
     pub step_tolerance: f64,

@@ -1,10 +1,11 @@
 //! 背景透過の切り抜き。
 //!
 //! 処理の流れ:
-//! 1. 外周から背景色を推定する
+//! 1. 外周から背景色とテクスチャ（勾配の分布）を推定する。テクスチャが強ければ
+//!    堤防のしきい値を引き上げる（`resolve_edge_threshold`）
 //! 2. 外周を起点に、背景色に近い画素を連結でたどって背景マスクを作る
 //! 3. bbox 指定があれば、その外側を背景として確定させる
-//! 4. 面積フィルタで孤立ノイズを消す
+//! 4. 面積フィルタで孤立ノイズを消す（下限は解像度に比例させる）
 //! 5. 境界帯のアルファを画像の色から推定し直し、同じ推定から色も復元する
 //! 6. マスクをアルファとして適用する
 //!
@@ -26,9 +27,29 @@ use image::RgbaImage;
 
 pub use background::{BackgroundEstimate, DEFAULT_BORDER, DeltaEQuantiles, estimate_background};
 pub use diagnostics::Diagnostics;
+pub use edges::GradientQuantiles;
 pub use floodfill::{FG_SEED_RADIUS, FloodOptions, foreground_mask};
 pub use mask::{Mask, MaskStats};
 pub use refine::RefineOptions;
+
+/// 堤防の既定のしきい値。1px あたりの輝度変化量。
+///
+/// 商品の輪郭（1px で十数以上の変化）は超え、落ち影（1px で 1-2 程度）は
+/// 超えない値。実測に基づく。
+pub const DEFAULT_EDGE_THRESHOLD: f64 = 8.0;
+
+/// 背景のテクスチャに対して堤防を何倍のところへ置くか。
+///
+/// p90 は「帯の 1 割がこれを超える」という水準なので、そのままを堤防にすると
+/// 背景の 1 割が侵入禁止になり、4 近傍のフィルには壁として立ちはだかる。
+/// 1.5 倍まで上げると残る侵入禁止の画素は数 % に落ち、点在するだけで
+/// 経路を塞がなくなる。実写（外周勾配 p90 27.9 の不織布）での実測では、
+/// 1.0 倍で halo_ratio 0.0073、1.5 倍で 0.0059、堤防を切った場合が 0.0058 で、
+/// 1.5 倍は「切ったのと同じ結果」に達している。
+///
+/// 切らずに引き上げるのは、堤防の役目（淡い商品を守る）を残すためである。
+/// 織り目の上に載った白い商品は、輪郭の勾配が織り目より大きい限り守られる。
+const TEXTURE_DAM_HEADROOM: f64 = 1.5;
 
 #[derive(Debug, Clone)]
 pub struct CutoutOptions {
@@ -40,15 +61,20 @@ pub struct CutoutOptions {
     pub bbox: Option<(u32, u32, u32, u32)>,
     /// 「ここは必ず前景」と指定された座標
     pub fg_seeds: Vec<(u32, u32)>,
-    /// 孤立ノイズ除去の半径。面積 `(2*cleanup+1)^2` 未満の連結成分を消す
+    /// 孤立ノイズ除去の半径。**長辺 1000px 換算**で指定し、面積
+    /// `(2*cleanup+1)^2 * (長辺/1000)^2` 未満の連結成分を消す
     pub cleanup: u32,
     /// 境界フェザリングの半径。`refine` が色で決められなかった画素と、
     /// `refine` を切ったときの境界処理に使う
     pub feather: u32,
     /// 境界の色かぶりを除去するか
     pub despill: bool,
-    /// 1px あたりの輝度変化がこの値を超える画素にはフィルを侵入させない。0 で無効
-    pub edge_threshold: f64,
+    /// 1px あたりの輝度変化がこの値を超える画素にはフィルを侵入させない。0 で無効。
+    ///
+    /// `None` は「利用者は指定していない」の意味で、既定値
+    /// `DEFAULT_EDGE_THRESHOLD` を起点に背景のテクスチャで自動調整する
+    /// （`resolve_edge_threshold`）。`Some` なら指定どおりに使う
+    pub edge_threshold: Option<f64>,
     /// 背景を広げる際に 1px あたりに許す色差(ΔE)。0 で 2 段階フィルを無効化する
     pub step_tolerance: f64,
     /// 落ち影として吸収する明度差(L*)の上限。0 で無効
@@ -73,9 +99,8 @@ impl Default for CutoutOptions {
             cleanup: 2,
             feather: 1,
             despill: true,
-            // 商品の輪郭(1px で十数以上の変化)は超え、落ち影(1px で 1-2 程度)は
-            // 超えない値。実測に基づく
-            edge_threshold: 8.0,
+            // 指定なし = 背景のテクスチャに応じて自動調整する
+            edge_threshold: None,
             // 落ち影の裾（合成シーンの実測で最大 1.9 ΔE/px）は越えられ、
             // ΔE 3 程度しかない淡い商品の輪郭（同 2.5 ΔE/px）は越えられない値。
             // 背景そのものの揺らぎは core_tolerance の免除で通るので、
@@ -97,6 +122,9 @@ pub struct CutoutResult {
     pub image: RgbaImage,
     pub mask: Mask,
     pub background: BackgroundEstimate,
+    /// 実際に効いた堤防のしきい値。自動調整が入ると指定値と食い違うため、
+    /// 呼び出し側が「何が効いたか」を報告できるように返す
+    pub edge_threshold: f64,
     pub stats: MaskStats,
     /// 切り抜き境界での商品と背景の色差(ΔE)の中央値。前景が無ければ None
     pub separability: Option<f64>,
@@ -105,14 +133,53 @@ pub struct CutoutResult {
     pub warnings: Vec<String>,
 }
 
+/// 実際に使う堤防のしきい値と、自動調整したことを知らせる警告を決める。
+///
+/// **背景そのものが 1px あたり十数の変化を持つ素材がある。** 不織布・キャンバス地・
+/// 段ボールがそれで、既定の堤防（8）はその織り目に反応して**背景の中で**壁になる。
+/// フィルは外周から数 px も進めず、商品はまるごと前景として残る（実写での
+/// 前景比率 0.94）。堤防は「輪郭を守る」ために置いたものなので、背景を守って
+/// しまっては本末転倒である。
+///
+/// 逃げ道は `--edge-threshold 0` だが、それを知らなければ救えない。kiri は
+/// AI エージェントが使う道具であり、**知識ではなく既定値で解けること**を優先する。
+/// そこで、外周の勾配 p90 から「堤防を張れる高さ」を求めて自動で引き上げる。
+///
+/// 明示指定には手を出さない。0 を指定した利用者は無効化を、8 を指定した利用者は
+/// 8 を望んでいる。自動調整が割り込むと「指定したのに効かない」になる。
+fn resolve_edge_threshold(
+    requested: Option<f64>,
+    texture: &GradientQuantiles,
+) -> (f64, Option<String>) {
+    if let Some(value) = requested {
+        return (value, None);
+    }
+    // 小数第 1 位で丸める。しきい値は「1px あたりの輝度変化」なので、それより
+    // 細かい分解能に意味は無い。警告に出す値と `settings` に出す値が桁まで
+    // 一致していないと、エージェントは「別の値が効いたのか」と疑う
+    let raised = (texture.p90 * TEXTURE_DAM_HEADROOM * 10.0).round() / 10.0;
+    if raised <= DEFAULT_EDGE_THRESHOLD {
+        return (DEFAULT_EDGE_THRESHOLD, None);
+    }
+    let warning = format!(
+        "背景のテクスチャ（外周の勾配 p90 = {:.1}）が堤防を発火させるため、\
+         edge_threshold を {DEFAULT_EDGE_THRESHOLD:.0} から {raised:.1} へ調整しました。\
+         明示指定すれば従います",
+        texture.p90
+    );
+    (raised, Some(warning))
+}
+
 pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
     let background = estimate_background(image, opts.border);
+    let (edge_threshold, texture_warning) =
+        resolve_edge_threshold(opts.edge_threshold, &background.texture);
 
     let flood = FloodOptions {
         tolerance: opts.tolerance,
         bbox: opts.bbox,
         fg_seeds: opts.fg_seeds.clone(),
-        edge_threshold: opts.edge_threshold,
+        edge_threshold,
         // 芯の許容量は利用者に決めさせず、背景自身のばらつきから導く。
         // 「どこまでを背景と言い切れるか」は画像ごとに違い、外周の ΔE 分布が
         // その答えを持っているためである
@@ -154,7 +221,7 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
 
     // もう一度掛ける。エッジ堤防は勾配が立つ画素を軒並み前景側へ残すので、
     // ゴミは実寸より 1px ほど太って見える。3x3 のゴミが 5x5 に見えると、
-    // 面積 25 の下限をちょうど超えて生き残ってしまう。帯の推定で縁が透明へ
+    // 面積の下限をちょうど超えて生き残ってしまう。帯の推定で縁が透明へ
     // 戻った後こそが、成分の大きさを正しく測れる唯一のタイミングである
     mask = morphology::remove_specks(&mask, opts.cleanup);
     apply_alpha(&mut out, &mask);
@@ -167,12 +234,21 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
     let inset = opts.cleanup + opts.feather + 4;
     let separability = boundary_separability(image, &mask, background.rgb, inset, opts.bbox);
     let diagnostics = diagnostics::diagnose(image, &mask, background.rgb);
-    let warnings = collect_warnings(&background, &stats, separability, &diagnostics);
+    // 設定の調整はいちばん先に伝える。結果への警告は、その設定で走った結果に
+    // ついてのものなので、順序が逆だと読み手が原因を後から知ることになる
+    let mut warnings = Vec::from_iter(texture_warning);
+    warnings.extend(collect_warnings(
+        &background,
+        &stats,
+        separability,
+        &diagnostics,
+    ));
 
     CutoutResult {
         image: out,
         mask,
         background,
+        edge_threshold,
         stats,
         separability,
         diagnostics,
@@ -379,6 +455,7 @@ mod tests {
                 p90: spread * 2.0,
                 max: spread * 3.0,
             },
+            texture: GradientQuantiles::default(),
         }
     }
 
@@ -496,6 +573,47 @@ mod tests {
             boundary_separability(&image, &mask, [255, 255, 255], 7, None),
             None
         );
+    }
+
+    fn texture(p90: f64) -> GradientQuantiles {
+        GradientQuantiles {
+            p50: p90 / 2.0,
+            p90,
+        }
+    }
+
+    #[test]
+    fn a_smooth_background_keeps_the_default_dam() {
+        // スタジオ背景（勾配 p90 が 1 前後）では挙動が一切変わってはいけない
+        for p90 in [0.0, 1.0, 3.9, 5.3] {
+            let (value, warning) = resolve_edge_threshold(None, &texture(p90));
+            assert_eq!(value, DEFAULT_EDGE_THRESHOLD, "p90={p90} で堤防が動いた");
+            assert!(warning.is_none(), "p90={p90} で余計な警告が出た");
+        }
+    }
+
+    #[test]
+    fn a_woven_background_raises_the_dam_and_says_so() {
+        // 実写の不織布（外周の勾配 p90 27.9）
+        let (value, warning) = resolve_edge_threshold(None, &texture(27.9));
+        assert_eq!(value, 41.8, "p90 の 1.5 倍（小数第1位まで）になっていない");
+        let warning = warning.expect("黙って設定を変えてはいけない");
+        assert!(warning.contains("テクスチャ"), "{warning}");
+        assert!(warning.contains("27.9"), "根拠の数値が無い: {warning}");
+        assert!(
+            warning.contains("41.8"),
+            "警告と実際に効く値が食い違っている: {warning}"
+        );
+    }
+
+    /// 明示指定には手を出さない。0 を指定した利用者は無効化を望んでいる。
+    #[test]
+    fn an_explicit_dam_is_left_alone() {
+        for requested in [0.0, DEFAULT_EDGE_THRESHOLD, 100.0] {
+            let (value, warning) = resolve_edge_threshold(Some(requested), &texture(27.9));
+            assert_eq!(value, requested);
+            assert!(warning.is_none(), "明示指定に警告を付けている");
+        }
     }
 
     #[test]

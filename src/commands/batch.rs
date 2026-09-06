@@ -133,7 +133,11 @@ fn to_cutout_args(
         feather: settings.feather.unwrap_or(1),
         no_despill: !settings.despill.unwrap_or(true),
         no_refine: !settings.refine.unwrap_or(true),
-        edge_threshold: checked(settings.edge_threshold, 8.0, "edge_threshold")?,
+        // 未指定は未指定のまま渡す。既定値で埋めてしまうと、テクスチャに応じた
+        // 自動調整が spec を書いた人の「8 を指定した」と区別できなくなる
+        // 未指定は未指定のまま渡す。既定値で埋めてしまうと、テクスチャに応じた
+        // 自動調整が「spec に 8 と書いた」と区別できなくなる
+        edge_threshold: checked_opt(settings.edge_threshold, "edge_threshold")?,
         step_tolerance: checked(settings.step_tolerance, 2.2, "step_tolerance")?,
         shadow_tolerance: checked(settings.shadow_tolerance, 35.0, "shadow_tolerance")?,
         seal,
@@ -162,7 +166,18 @@ fn to_cutout_args(
 /// そのまま通ると、その項目だけ機能が黙って無効化されたまま数百点が処理され、
 /// 結果の JSON にも異常が出ない。気づけるのは仕上がりを目で見たときになる。
 fn checked(value: Option<f64>, default: f64, key: &str) -> Result<f64> {
-    let v = value.unwrap_or(default);
+    validate(value.unwrap_or(default), key)
+}
+
+/// 既定値を持たない設定用。未指定は未指定のまま返す。
+///
+/// 「未指定」と「既定値を明示」を区別する設定（edge_threshold）では、ここで
+/// 埋めてしまうと下流の自動調整が働かなくなる。
+fn checked_opt(value: Option<f64>, key: &str) -> Result<Option<f64>> {
+    value.map(|v| validate(v, key)).transpose()
+}
+
+fn validate(v: f64, key: &str) -> Result<f64> {
     if !v.is_finite() || v < 0.0 {
         return Err(Error::argument(
             "INVALID_SETTING",
@@ -197,7 +212,7 @@ mod tests {
         assert_eq!(args.feather, defaults.feather, "feather の既定値");
         assert_eq!(
             args.edge_threshold, defaults.edge_threshold,
-            "edge_threshold の既定値"
+            "edge_threshold の既定値（どちらも未指定）"
         );
         assert_eq!(
             args.step_tolerance, defaults.step_tolerance,

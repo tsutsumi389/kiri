@@ -167,7 +167,8 @@ pub struct CutoutArgs {
     #[arg(long, default_value_t = DEFAULT_BORDER)]
     pub border: u32,
 
-    /// 孤立ノイズ除去の半径(px)。面積 (2n+1)² 未満の連結成分を消す。0 で無効
+    /// 孤立ノイズ除去の半径(px)。長辺 1000px 換算で指定し、面積
+    /// (2n+1)² × (長辺/1000)² 未満の連結成分を消す。0 で無効
     #[arg(long, default_value_t = 2)]
     pub cleanup: u32,
 
@@ -175,10 +176,11 @@ pub struct CutoutArgs {
     #[arg(long, default_value_t = 1)]
     pub feather: u32,
 
-    /// 1px あたりの輝度変化がこの値を超える輪郭でフィルを止める。0 で無効。
-    /// 淡い色の商品が背景ごと消えるのを防ぐ
-    #[arg(long, default_value_t = 8.0, value_parser = non_negative)]
-    pub edge_threshold: f64,
+    /// 1px あたりの輝度変化がこの値を超える輪郭でフィルを止める（既定 8）。
+    /// 0 で無効。淡い色の商品が背景ごと消えるのを防ぐ。
+    /// 未指定なら、背景のテクスチャが堤防を発火させる場合に自動で引き上げる
+    #[arg(long, value_parser = non_negative)]
+    pub edge_threshold: Option<f64>,
 
     /// 背景を広げる際に 1px あたりに許す色差(ΔE)。0 で無効。
     /// なだらかな落ち影は越え、淡い商品の輪郭の段差では止まる

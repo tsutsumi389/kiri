@@ -46,6 +46,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         feather: args.feather,
         despill: !args.no_despill,
         edge_threshold: args.edge_threshold,
+        refine: !args.no_refine,
     };
     let result = cutout(&loaded.image, &opts);
 
@@ -97,6 +98,8 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             bbox: result.stats.bbox.map(|(x1, y1, x2, y2)| [x1, y1, x2, y2]),
             touches_edge: result.stats.touches_edge,
             separability: result.separability.map(round4),
+            halo_ratio: round4(result.diagnostics.halo_ratio),
+            edge_width: round4(result.diagnostics.edge_width),
             debug_mask,
         },
         canvas,

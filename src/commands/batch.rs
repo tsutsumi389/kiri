@@ -121,6 +121,7 @@ fn to_cutout_args(
         cleanup: settings.cleanup.unwrap_or(2),
         feather: settings.feather.unwrap_or(1),
         no_despill: !settings.despill.unwrap_or(true),
+        no_refine: !settings.refine.unwrap_or(true),
         edge_threshold: settings.edge_threshold.unwrap_or(8.0),
         canvas,
         fill_ratio: settings.fill_ratio.unwrap_or(0.85),

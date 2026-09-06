@@ -163,6 +163,11 @@ pub struct CutoutArgs {
     #[arg(long)]
     pub no_despill: bool,
 
+    /// 境界帯のアルファを画像の色から推定し直さず、マスクの形から作る旧方式に戻す。
+    /// 淡い色の商品で新方式が不安定なときの逃げ道
+    #[arg(long)]
+    pub no_refine: bool,
+
     /// 切り抜いた商品を指定サイズのキャンバス中央に配置する。
     /// 1000x1000 または 1000（正方形）の形式
     #[arg(long, value_parser = parse_size)]

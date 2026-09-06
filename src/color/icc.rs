@@ -207,10 +207,28 @@ fn profile_name(bytes: &[u8]) -> Option<String> {
     }
     let data = tag(bytes, b"desc")?;
     let text = match signature(data, 0)? {
-        // v4 は多言語文字列。最初のレコードを採る（英語以外しか無い場合もあるため）
+        // v4 は多言語文字列
         s if s == *b"mluc" => {
-            let length = be_u32(data, 20)? as usize;
-            let offset = be_u32(data, 24)? as usize;
+            let count = be_u32(data, 8)? as usize;
+            let record_size = be_u32(data, 12)? as usize;
+            // ICC のレコードは 12 バイト固定。将来の拡張で伸びることは許されるが、
+            // 縮むことはない。0 を許すと同じレコードを無限に指すことになる
+            if record_size < 12 {
+                return None;
+            }
+            let record = |i: usize| -> Option<&[u8]> {
+                let start = 16usize.checked_add(i.checked_mul(record_size)?)?;
+                data.get(start..start.checked_add(12)?)
+            };
+            // 先頭を無条件に採ると、31 言語を持つ macOS の `Generic RGB Profile`
+            // のようなプロファイルで英語以外の名前が出る。en を優先し、
+            // 英語を持たないプロファイルでは先頭に落とす
+            let chosen = (0..count.min(1024))
+                .filter_map(record)
+                .find(|r| r[0..2] == *b"en")
+                .or_else(|| record(0))?;
+            let length = be_u32(chosen, 4)? as usize;
+            let offset = be_u32(chosen, 8)? as usize;
             let raw = data.get(offset..offset.checked_add(length)?)?;
             let units: Vec<u16> = raw
                 .chunks_exact(2)
@@ -255,7 +273,10 @@ impl Curve {
             Curve::Gamma(g) => x.powf(*g),
             Curve::Table(values) => match values.len() {
                 0 => x,
-                1 => x.powf(values[0]),
+                // 1 点の表は定数。`parse_curve` は count==1 を `Gamma` に振り分ける
+                // のでここへは来ないが、下の補間は 2 点以上を前提にしているため、
+                // 境界を式で閉じておく
+                1 => values[0],
                 n => {
                     let pos = x.clamp(0.0, 1.0) * (n - 1) as f64;
                     let i = (pos as usize).min(n - 2);
@@ -293,7 +314,9 @@ fn parse_curve(data: &[u8]) -> Option<Curve> {
                 // 1 点は u8Fixed8 のガンマ値
                 1 => Some(Curve::Gamma(f64::from(be_u16(data, 12)?) / 256.0)),
                 n => {
-                    let raw = data.get(12..12usize.checked_add(n * 2)?)?;
+                    // 32bit ターゲットでは n * 2 が溢れ得る。壊れた ICC の
+                    // でたらめな点数でパニックさせない
+                    let raw = data.get(12..12usize.checked_add(n.checked_mul(2)?)?)?;
                     Some(Curve::Table(
                         raw.chunks_exact(2)
                             .map(|c| f64::from(u16::from_be_bytes([c[0], c[1]])) / 65535.0)
@@ -598,6 +621,89 @@ mod tests {
         );
     }
 
+    /// 多言語の `mluc` から英語のレコードを選ぶこと。
+    ///
+    /// 先頭を無条件に採ると、macOS の `Generic RGB Profile`（31 言語）のような
+    /// プロファイルで英語以外の名前が結果の JSON に出る。
+    #[test]
+    fn a_multilingual_name_prefers_english() {
+        let mut spec = display_p3();
+        spec.desc_records = vec![
+            (*b"skSK", "Displej P3".into()),
+            (*b"jaJP", "ディスプレイ P3".into()),
+            (*b"enUS", "Display P3".into()),
+        ];
+        assert_eq!(
+            interpret(&build(&spec)).name.as_deref(),
+            Some("Display P3"),
+            "英語のレコードがあるのに採っていない"
+        );
+    }
+
+    /// 英語を持たないプロファイルでは先頭のレコードに落ちること。
+    #[test]
+    fn a_name_without_english_falls_back_to_the_first_record() {
+        let mut spec = display_p3();
+        spec.desc_records = vec![
+            (*b"skSK", "Displej P3".into()),
+            (*b"deDE", "Anzeige P3".into()),
+        ];
+        assert_eq!(interpret(&build(&spec)).name.as_deref(), Some("Displej P3"));
+    }
+
+    /// 実プロファイルは rTRC/gTRC/bTRC が同じ実体を指している。
+    ///
+    /// タグごとに中身を複製した合成 ICC しか通していないと、オフセットを
+    /// 共有する並びで壊れる実装に気づけない。
+    #[test]
+    fn tags_that_share_one_offset_are_read_correctly() {
+        let mut spec = display_p3();
+        spec.share_identical_tags = true;
+        let shared = build(&spec);
+        spec.share_identical_tags = false;
+        let separate = build(&spec);
+        assert!(
+            shared.len() < separate.len(),
+            "共有されていない: {} vs {}",
+            shared.len(),
+            separate.len()
+        );
+        let a = transform_of(&shared);
+        let b = transform_of(&separate);
+        for level in [0u8, 64, 128, 192, 255] {
+            assert_eq!(
+                a.convert_pixel([level, level, level]),
+                b.convert_pixel([level, level, level]),
+                "{level} でタグの並びによって結果が変わっている"
+            );
+        }
+    }
+
+    /// 仮に変換したとしても恒等でなければならない。
+    /// 恒等でない実装は、sRGB を素通しにする判定が外れた瞬間に色を壊す。
+    #[test]
+    fn the_srgb_transform_is_the_identity() {
+        let t = transform_of(&build(&srgb_v2()));
+        for i in 0..=255u8 {
+            let out = t.convert_pixel([i, i, i]);
+            for c in out {
+                assert!(
+                    u32::from(i).abs_diff(u32::from(c)) <= 1,
+                    "{i} が {out:?} に動いた"
+                );
+            }
+        }
+        for rgb in [[190u8, 70, 55], [12, 200, 240], [248, 248, 247]] {
+            let out = t.convert_pixel(rgb);
+            for (a, b) in rgb.iter().zip(out.iter()) {
+                assert!(
+                    u32::from(*a).abs_diff(u32::from(*b)) <= 1,
+                    "{rgb:?} が {out:?} に動いた"
+                );
+            }
+        }
+    }
+
     /// 媒体白色点が D65 でないプロファイルでも中性グレーが中性のまま出ること。
     ///
     /// 相対比色では PCS の値は媒体相対（媒体の白 = PCS の白 = D50）で表され、
@@ -788,6 +894,70 @@ mod tests {
                 "実行ごとに結果が変わっている"
             );
         }
+    }
+
+    /// macOS が配っている実プロファイルをそのまま通す。
+    ///
+    /// 合成 ICC は自分が書いた前提しか踏まない。実ファイルには rTRC/gTRC/bTRC の
+    /// オフセット共有、`desc` と `dscm` の同居、v2 なのに `chad` を持つ並び
+    /// （`Generic RGB Profile` は v2.2 + `chad`）といった、合成では思いつかない
+    /// 組み合わせがある。
+    ///
+    /// プロファイル自体はリポジトリに置かない。Apple / Adobe / HP の著作権表示が
+    /// あり再配布に懸念があるためで、代わりにインストール済みのものを読む。
+    /// 見つからない環境（macOS 以外）では黙って飛ばす。
+    #[test]
+    fn the_real_colorsync_profiles_are_read_correctly() {
+        // 期待値は sips --matchTo "sRGB Profile.icc" と littleCMS 2.17（intent 1）が
+        // 揃って返した値。入力グレー 64 / 128 / 192 / 255 に対応する
+        let cases: [(&str, Option<[u8; 4]>); 6] = [
+            ("sRGB Profile", None), // 素通し
+            ("Display P3", Some([64, 128, 192, 255])),
+            ("AdobeRGB1998", Some([62, 129, 193, 255])),
+            ("Generic RGB Profile", Some([81, 146, 203, 255])),
+            ("ROMM RGB", Some([81, 146, 203, 255])),
+            ("DCI(P3) RGB", Some([46, 113, 184, 255])),
+        ];
+        let mut checked = 0;
+        for (file, expected) in cases {
+            let path = format!("/System/Library/ColorSync/Profiles/{file}.icc");
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            checked += 1;
+            let icc = interpret(&bytes);
+            let name = icc.name.clone().unwrap_or_default();
+            assert!(!name.is_empty(), "{file}: 名前を読めていない");
+
+            let Some(expected) = expected else {
+                assert!(
+                    matches!(icc.interpretation, Interpretation::Srgb),
+                    "{file} は sRGB 相当と判定されるべき（判定は名乗りではなく TRC で決まる）"
+                );
+                continue;
+            };
+            let Interpretation::Convertible(t) = icc.interpretation else {
+                panic!("{file} は行列 + TRC 型なので変換できるはず");
+            };
+            for (level, want) in [64u8, 128, 192, 255].into_iter().zip(expected) {
+                let out = t.convert_pixel([level, level, level]);
+                let spread = u32::from(out.iter().copied().max().unwrap())
+                    - u32::from(out.iter().copied().min().unwrap());
+                assert!(spread <= 1, "{file} の {level} が中性でない: {out:?}");
+                for c in out {
+                    assert!(
+                        u32::from(c).abs_diff(u32::from(want)) <= 1,
+                        "{file} の {level}: 期待 {want} に対して {out:?}"
+                    );
+                }
+            }
+        }
+        // 1 つも見つからない環境はある（macOS 以外）。全部見つかるのに
+        // 一部だけ落ちる状況とは区別する
+        assert!(
+            checked == 0 || checked == 6,
+            "ColorSync のプロファイルが一部しか無い: {checked}/6"
+        );
     }
 
     /// 12MP の変換にかかる時間を出す。判定はしない（機械によって何倍も違う）。

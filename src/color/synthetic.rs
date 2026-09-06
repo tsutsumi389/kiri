@@ -21,6 +21,10 @@ pub(crate) struct ProfileSpec {
     pub desc: String,
     /// v4 の多言語文字列で書くか（false なら v2 の textDescriptionType）
     pub desc_is_mluc: bool,
+    /// `mluc` に書くレコードを並び順ごと指定する。空なら `desc` を `enUS` の
+    /// 1 レコードとして書く。先頭のレコードを無条件に採る実装を炙り出すために持つ
+    /// （`desc_is_mluc` が false のときは使わない）
+    pub desc_records: Vec<([u8; 4], String)>,
     pub colour_space: [u8; 4],
     pub pcs: [u8; 4],
     /// 線形 RGB → XYZ(D50) の列ベクトル [r, g, b]
@@ -65,6 +69,7 @@ pub(crate) fn display_p3() -> ProfileSpec {
             0.015_075_683,
             0.751_678_466,
         ]),
+        desc_records: Vec::new(),
         share_identical_tags: false,
         include_matrix: true,
     }
@@ -88,6 +93,7 @@ pub(crate) fn romm_rgb() -> ProfileSpec {
         ],
         trc: Trc::Parametric3([1.800_003_051, 1.0, 0.0, 0.0625, 0.001_953_125]),
         chad: Some([1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
+        desc_records: Vec::new(),
         share_identical_tags: true,
         include_matrix: true,
     }
@@ -120,6 +126,7 @@ pub(crate) fn dci_p3() -> ProfileSpec {
             0.005_294_799,
             0.862_777_709,
         ]),
+        desc_records: Vec::new(),
         share_identical_tags: true,
         include_matrix: true,
     }
@@ -152,6 +159,7 @@ pub(crate) fn srgb_v2() -> ProfileSpec {
                 .collect(),
         ),
         chad: None,
+        desc_records: Vec::new(),
         share_identical_tags: false,
         include_matrix: true,
     }
@@ -172,6 +180,7 @@ pub(crate) fn adobe_rgb() -> ProfileSpec {
         ],
         trc: Trc::Gamma(2.199_218_75),
         chad: None,
+        desc_records: Vec::new(),
         share_identical_tags: false,
         include_matrix: true,
     }
@@ -223,7 +232,14 @@ fn parametric_tag(kind: u16, params: &[f64]) -> Vec<u8> {
 fn desc_tag(spec: &ProfileSpec) -> Vec<u8> {
     let text = &spec.desc;
     if spec.desc_is_mluc {
-        let records: Vec<([u8; 4], &str)> = vec![(*b"enUS", text.as_str())];
+        let records: Vec<([u8; 4], &str)> = if spec.desc_records.is_empty() {
+            vec![(*b"enUS", text.as_str())]
+        } else {
+            spec.desc_records
+                .iter()
+                .map(|(code, name)| (*code, name.as_str()))
+                .collect()
+        };
 
         let mut out = b"mluc\0\0\0\0".to_vec();
         out.extend_from_slice(&(records.len() as u32).to_be_bytes()); // レコード数

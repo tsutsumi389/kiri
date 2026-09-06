@@ -2216,8 +2216,13 @@ fn no_refine_falls_back_to_the_old_boundary_handling() {
 
     let refined = halo(&[]);
     let legacy = halo(&["--no-refine"]);
+    // 差の下限が 0.02 なのは、旧経路が残す縁そのものが薄くなったため。
+    // 稜線の細線化で堤防が 1px になり、測地的オープニングも堤防の分を
+    // 補うようになったので、背景色のまま不透明で残る画素は実測 3.0% しかない
+    // （どちらも入る前は 33.9% だった）。それでも 0 ではない点が肝で、
+    // 色から決め直す経路だけが 0 にできる
     assert!(
-        legacy > refined + 0.05,
+        legacy > refined + 0.02,
         "--no-refine で旧挙動に戻っていない: {legacy} vs {refined}"
     );
 }

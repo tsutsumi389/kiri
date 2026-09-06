@@ -192,7 +192,7 @@ pub fn foreground_mask(image: &RgbaImage, background: [u8; 3], opts: &FloodOptio
     }
 
     if opts.seal > 0 {
-        is_background = seal_narrow_gaps(w, h, &is_background, opts.seal);
+        is_background = seal_narrow_gaps(w, h, &is_background, opts.seal, &candidates);
     }
 
     // 保護された画素は最後に前景へ戻す（bbox 指定より優先する）
@@ -261,6 +261,11 @@ const STRICT: u8 = 1 << 0;
 const LOOSE: u8 = 1 << 1;
 /// 第3段で吸収してよい影の候補。堤防は織り込まない。
 const SHADOW: u8 = 1 << 2;
+/// 色だけで見れば背景に十分近い。堤防で候補から外した画素にも立つ。
+///
+/// 測地的オープニングが「堤防のせいで欠けた背景」を復元するために使う。
+const NEAR_BG: u8 = 1 << 3;
+
 /// 画素の素性。3 つの段すべてがここを参照する。
 ///
 /// 素性ごとに `Vec<bool>` を持つと、12MP では 4 本で 48MB になる。判定はどれも
@@ -309,7 +314,7 @@ fn classify(
             continue;
         }
         if p[3] == 0 {
-            flags[i] = STRICT | LOOSE;
+            flags[i] = STRICT | LOOSE | NEAR_BG;
             continue;
         }
         // 影候補には堤防を適用しない。
@@ -327,6 +332,10 @@ fn classify(
             f |= SHADOW;
         }
         let d = delta_e_q(lab[i], bg_lab);
+        if d <= tolerance {
+            // 堤防に関わらず立てる。堤防が食べた背景を後から見分けるため
+            f |= NEAR_BG;
+        }
         // let-chain は Rust 1.88 以降。MSRV 1.85 を保つためネストで書く
         if let Some(g) = dam {
             if g[i] {
@@ -530,14 +539,50 @@ fn expand(w: u32, h: u32, seed: Vec<bool>, stage: &Expansion) -> Vec<bool> {
 /// 元の背景マスクと交差させる。既定の k=1 は、1-2px の破れからの浸水を止めつつ、
 /// 取っ手の内側のような正当な隙間を塞がない幅である。
 ///
+/// # 収縮に掛ける前に堤防の分を戻す
+///
+/// 堤防は隙間の**両側 1px** を背景候補から外す。稜線は輪郭の片側 1px に絞って
+/// あるが、隙間には輪郭が 2 本あるので合計で最大 2px が欠ける。そのままだと
+/// 物理的に 3px ある通路が背景マスクの上では 1px になり、半径 1 の収縮で
+/// 消えてしまう。実効の封鎖幅が `2k` ではなく `2k+2` になっていて、
+/// 「取っ手の内側は塞がない」という約束と食い違っていた。
+///
+/// そこで、色だけで見れば背景に十分近い画素（`NEAR_BG`）が背景に隣接している
+/// なら、収縮の入力では背景として数える。復元されるのは「背景色なのに堤防で
+/// 外された画素」だけなので、輪郭そのもの（商品の色をした画素）は戻らない。
+/// 1px の破れは両脇が商品の色なので通路が広がらず、これまでどおり塞がる。
+///
+/// 復元した分はここでしか使わない。最後に元の背景マスクと交差させるので、
+/// 出力に背景が増えることはない。
+///
 /// 収縮の芯が取れなくても外周に接している背景は残す。商品が画面いっぱいに写り、
 /// 背景が 1px の縁しかない場合に、その縁まで前景へ塗り替えてしまわないため。
 /// 外周に接する背景は定義上フィルの起点であり、隙間を通って入ってきたものでは
 /// ありえない。
-fn seal_narrow_gaps(w: u32, h: u32, background: &[bool], radius: u32) -> Vec<bool> {
+fn seal_narrow_gaps(
+    w: u32,
+    h: u32,
+    background: &[bool],
+    radius: u32,
+    candidates: &Candidates,
+) -> Vec<bool> {
     let stride = w as usize;
     let idx = |x: u32, y: u32| (y as usize) * stride + (x as usize);
-    let eroded = erode_bools(w, h, background, radius);
+
+    let mut permeable = vec![false; background.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let i = idx(x, y);
+            permeable[i] = background[i]
+                || (candidates.has(i, NEAR_BG)
+                    && ((x > 0 && background[idx(x - 1, y)])
+                        || (y > 0 && background[idx(x, y - 1)])
+                        || (x + 1 < w && background[idx(x + 1, y)])
+                        || (y + 1 < h && background[idx(x, y + 1)])));
+        }
+    }
+    let eroded = erode_bools(w, h, &permeable, radius);
+    drop(permeable);
 
     // 外周に接する背景も起点として信用する（上のコメントを参照）
     let mut trusted = eroded;
@@ -1257,6 +1302,71 @@ mod tests {
         assert!(
             !mask.is_foreground(11, 12),
             "幅 6px の隙間まで塞いでいる\n{}",
+            render(&mask)
+        );
+    }
+
+    /// 濃色のブロックに、外へ開いた幅 `gap` px のスリットを 1 本入れた画像。
+    ///
+    /// 櫛・メッシュ・取っ手の内側といった「正当な隙間」の最小構成。
+    /// スリットの中心は常に x=16 付近に来る。
+    fn slotted_block(gap: u32) -> RgbaImage {
+        let mut img = RgbaImage::from_pixel(32, 32, Rgba([250, 250, 250, 255]));
+        for y in 8..24 {
+            for x in 8..24 {
+                img.put_pixel(x, y, Rgba([40, 40, 40, 255]));
+            }
+        }
+        let x0 = 16 - gap / 2;
+        for y in 8..20 {
+            for x in x0..x0 + gap {
+                img.put_pixel(x, y, Rgba([250, 250, 250, 255]));
+            }
+        }
+        img
+    }
+
+    /// 堤防と測地的オープニングを**同時に**効かせたときの封鎖幅。
+    ///
+    /// 単体ではどちらも正しく振る舞うのに、組み合わせると壊れていた。堤防は
+    /// 隙間の両側 1px を背景候補から外すので、物理的に 3px ある通路が背景
+    /// マスクの上では 1px になり、半径 1 の収縮で消えてしまう。実効の封鎖幅が
+    /// `2N` ではなく `2N+2` になり、「幅 2N px 以下」という約束と食い違う。
+    ///
+    /// 判定は「堤防の有無で結果が変わらないこと」に置く。封鎖幅は `--seal` だけで
+    /// 決まるべきで、堤防のしきい値に左右されてはいけない。
+    #[test]
+    fn the_seal_closes_only_gaps_up_to_twice_its_radius_even_with_the_dam_on() {
+        for dam in [0.0f64, 8.0] {
+            let mut o = two_stage(12.0);
+            o.edge_threshold = dam;
+            o.seal = 1;
+            for (gap, sealed) in [(1u32, true), (2, true), (3, false), (4, false)] {
+                let mask = foreground_mask(&slotted_block(gap), BG, &o);
+                assert_eq!(
+                    mask.is_foreground(16, 14),
+                    sealed,
+                    "堤防 {dam} で幅 {gap}px のスリットの扱いが違う（塞ぐべき: {sealed}）\n{}",
+                    render(&mask)
+                );
+            }
+        }
+    }
+
+    /// 上の対照。塞いでいるのが測地的オープニングであって堤防ではないこと。
+    ///
+    /// 堤防だけでは幅 1px のスリットしか止められず、2px は素通りする。
+    /// これがないと、堤防が偶然塞いだ結果を「オープニングが効いている」と
+    /// 読み違えたまま通ってしまう。
+    #[test]
+    fn it_is_the_seal_and_not_the_dam_that_closes_a_two_pixel_slit() {
+        let mut o = two_stage(12.0);
+        o.edge_threshold = 8.0;
+        o.seal = 0;
+        let mask = foreground_mask(&slotted_block(2), BG, &o);
+        assert!(
+            !mask.is_foreground(16, 14),
+            "前提が崩れている: 堤防だけで 2px のスリットが塞がっている\n{}",
             render(&mask)
         );
     }

@@ -125,6 +125,10 @@ fn to_cutout_args(
         canvas,
         fill_ratio: settings.fill_ratio.unwrap_or(0.85),
         debug_mask: None,
+        // バッチは JSON だけで回す。数百点でプレビューを吐くと無駄な I/O になる
+        preview: None,
+        preview_size: crate::preview::DEFAULT_PANEL,
+        no_preview_grid: false,
         out: OutputOpts {
             output: output.to_path_buf(),
             format,

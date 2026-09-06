@@ -37,6 +37,7 @@ product.jpg
   色空間    sRGB
   透過      なし
   背景色    #F9F9F7  (均一度 1.00)
+  外周ΔE    p50 0.4  p90 1.2  max 2.8
 ```
 
 ```
@@ -49,13 +50,22 @@ $ kiri info product.jpg --json
   "orientation_applied": false,
   "color_space": "sRGB",
   "has_alpha": false,
-  "background": { "rgb": [249, 249, 247], "uniformity": 1.0 },
+  "background": {
+    "rgb": [249, 249, 247],
+    "uniformity": 1.0,
+    "perimeter_delta_e": { "p50": 0.4, "p90": 1.2, "max": 2.8 }
+  },
   "warnings": []
 }
 ```
 
 `uniformity` は外周サンプルのうち推定背景色から ΔE≤5 に収まる割合。0.9 を下回る画像は
 単色背景ではないため、kiri の対象外として警告が出る。
+
+`perimeter_delta_e` は外周が背景色からどれだけ離れているかの分布。`uniformity` が
+低かったときに、その原因を切り分けるために使う。**`p50` が小さく `max` だけ大きければ
+一部が外れているだけなので `--bbox` で切れば直る。`p50` から大きければ背景全体が
+均一でなく、kiri の対象外である。**
 
 ### kiri convert
 
@@ -113,7 +123,9 @@ $ kiri resize small.jpg -o out.avif --width 3000 --json
 $ kiri cutout product.jpg -o product.png
 product.png  1600x2000  png  841.4 KB  (338 ms)
   背景色    #F9F9F7  (均一度 1.00, tolerance 12)
+  外周ΔE    p50 0.4  p90 1.2  max 2.8
   前景比率  21.6%
+  境界色差  ΔE 68.3  (tolerance 12)
   前景範囲  528,200 - 1073,1601
 ```
 
@@ -130,6 +142,9 @@ product.png  1600x2000  png  841.4 KB  (338 ms)
 | `--fill-ratio` | 0.85 | 商品がキャンバスの何割を占めるか |
 | `--flatten` | | 透過を残さず `--background` の色で塗り潰す |
 | `--debug-mask PATH` | — | 生成したマスクを PNG で書き出す |
+| `--preview PATH` | — | 「元画像 \| マスク \| 結果」を1枚に並べた検証用画像を書き出す |
+| `--preview-size` | 512 | プレビューのパネル1枚あたりの長辺(px) |
+| `--no-preview-grid` | | プレビューの元画像に座標グリッドを重ねない |
 
 #### 仕組み
 
@@ -173,12 +188,16 @@ $ kiri cutout product.jpg -o product.jpg --canvas 1000 --flatten --background "#
 
 ```json
 {
-  "background": { "rgb": [249, 249, 247], "uniformity": 1.0 },
+  "background": {
+    "rgb": [249, 249, 247], "uniformity": 1.0,
+    "perimeter_delta_e": { "p50": 0.4, "p90": 1.2, "max": 2.8 }
+  },
   "tolerance": 12.0,
   "mask": {
     "foreground_ratio": 0.2164,
     "bbox": [528, 200, 1073, 1601],
-    "touches_edge": false
+    "touches_edge": false,
+    "separability": 68.3
   },
   "canvas": {
     "width": 1000, "height": 1000, "fill_ratio": 0.85,
@@ -191,6 +210,49 @@ $ kiri cutout product.jpg -o product.jpg --canvas 1000 --flatten --background "#
 - `foreground_ratio` が極端（0.01未満 / 0.99超）なら警告が出る
 - `touches_edge` が `true` なら商品が見切れている
 - `uniformity` が低ければ単色背景ではない
+- `separability` が `perimeter_delta_e.p50` を下回れば、その画像は救えない
+
+`separability` は切り抜き境界の内側で測った商品と背景の色差。**`foreground_ratio` は
+「どれだけ残ったか」しか言わず、その輪郭が妥当かを何も語らない。**`separability` は
+「輪郭が実際の色の違いによって引かれたのか」を示す。
+
+これが背景自身のばらつき（`perimeter_delta_e.p50`）を下回る場合、背景を飲み込める
+tolerance は商品も飲み込む。**両立する値が存在しないため、パラメータ調整を続けても
+無駄である。**この状況では警告が出るので、AI は再試行を諦めて素材の撮り直しを
+提案できる。
+
+```
+警告: 商品と背景の色差 (ΔE 12.1) が背景自身のばらつき (ΔE 21.5) を下回っています。
+      背景を消せる tolerance では商品も消えるため、パラメータ調整では改善しません
+```
+
+#### AIに結果を見せる
+
+JSON だけで判断できない場合に `--preview` を使う。kiri の出力は原寸（数千 px・
+数十 MB）で視覚モデルにそのまま渡せないため、**外部ツールを挟まずに検証用の1枚を
+書き出せることが依存ゼロの前提を保つうえで要る。**
+
+```
+$ kiri cutout product.jpg -o product.png --preview check.png
+```
+
+`check.png` は「元画像 | マスク | 結果」を横に並べた1枚になる。
+
+- **元画像** — 0.1 刻みの座標グリッドを重ねる。0.5 の線だけ濃い。
+  AI はこれを見て `--bbox --normalized 0.04,0.18,0.99,0.76` のように返せる
+- **マスク** — 白が前景。商品が消えたのか背景が残ったのかを切り分けられる
+- **結果** — 市松模様の上に合成する。透過と白い商品を取り違えないため
+
+3面に分けるのは、**結果だけを見ても「なぜ失敗したか」が分からない**ためである。
+
+`--preview` と `--debug-mask` は `--output` と同じ上書き規約に従う。既存ファイルへ
+書くには `--force` が要り、`--output` と同じパスは指定できない。**付随出力は本出力の
+後に書かれるため、パスが衝突すると成果物を壊したうえで結果 JSON が壊れる前の情報を
+報告してしまい、エージェントには検知できない。**
+
+プレビューの書き出しに失敗しても処理自体は成功として返し、`warnings` で伝える。
+検証用の付随物を理由にエラーを返すと、「成果物は書けているのにエラー」となって
+エージェントが再実行し、今度は `OUTPUT_EXISTS` で二重に詰まるためである。
 
 ### kiri batch
 
@@ -259,6 +321,11 @@ $ kiri batch spec.json --json
 2. `kiri batch spec.json --json` で一括処理する
 3. 結果の `failed` / `with_warnings` と各項目の `mask.foreground_ratio` を検証する
 4. 失敗した項目だけ `tolerance` や `bbox` を調整して再実行する
+5. それでも直らない項目は `kiri cutout --preview` で画像を見て判断する
+
+`batch` は既定でプレビューを書き出さない。数百点を回す通常の経路では JSON だけで
+完結すべきで、全件で画像を吐けば無駄な I/O になるためである。プレビューは
+**救済フェーズの道具**として `cutout` 側にある。
 
 全件の座標を AI が出す必要はない。単色背景では自動判定が成立するため、AI の仕事は
 「結果を見て、うまくいかなかった数枚を救済する」ことに絞られる。

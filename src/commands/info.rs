@@ -6,10 +6,11 @@
 use image::ImageFormat;
 
 use crate::cli::InfoArgs;
+use crate::commands::output::round4;
 use crate::cutout::estimate_background;
 use crate::error::Result;
 use crate::image_io::load;
-use crate::report::{BackgroundReport, InfoReport};
+use crate::report::{BackgroundReport, InfoReport, PerimeterDeltaE};
 
 pub fn run(args: &InfoArgs) -> Result<InfoReport> {
     let loaded = load::load(&args.input)?;
@@ -36,9 +37,12 @@ pub fn run(args: &InfoArgs) -> Result<InfoReport> {
         has_alpha: loaded.has_alpha,
         background: BackgroundReport {
             rgb: background.rgb,
-            // 小数第4位で丸める。実質的な情報量はそこまでで、無用な桁は
-            // エージェントの差分比較を汚すだけであるため。
-            uniformity: (background.uniformity * 10_000.0).round() / 10_000.0,
+            uniformity: round4(background.uniformity),
+            perimeter_delta_e: PerimeterDeltaE {
+                p50: round4(background.delta_e.p50),
+                p90: round4(background.delta_e.p90),
+                max: round4(background.delta_e.max),
+            },
         },
         warnings,
     })

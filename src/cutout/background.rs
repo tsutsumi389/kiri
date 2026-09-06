@@ -15,12 +15,27 @@ const UNIFORM_DELTA_E: f64 = 5.0;
 /// 背景推定に使う外周の既定幅(px)。
 pub const DEFAULT_BORDER: u32 = 2;
 
+/// 外周サンプルが推定背景色からどれだけ離れているかの分布。
+///
+/// `uniformity` は「均一か否か」しか言わないため、低かったときに
+/// 「わずかなムラが広く出ている」のか「一部だけ大きく外れている」のかを
+/// 区別できない。前者は tolerance で吸収できるが、後者は bbox で切るしかない。
+/// AI エージェントがその判断を下すための情報である。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DeltaEQuantiles {
+    pub p50: f64,
+    pub p90: f64,
+    pub max: f64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BackgroundEstimate {
     pub rgb: [u8; 3],
     /// 外周サンプルのうち、推定背景色から ΔE<=5 に収まる割合 (0.0-1.0)
     pub uniformity: f64,
     pub samples: usize,
+    /// 外周サンプルの推定背景色からの ΔE 分布
+    pub delta_e: DeltaEQuantiles,
 }
 
 impl BackgroundEstimate {
@@ -40,19 +55,40 @@ pub fn estimate_background(image: &RgbaImage, border: u32) -> BackgroundEstimate
             rgb: [255, 255, 255],
             uniformity: 0.0,
             samples: 0,
+            delta_e: quantiles(&[]),
         };
     }
 
     let rgb = median_rgb(&samples);
-    let within = samples
-        .iter()
-        .filter(|&&s| delta_e_rgb(s, rgb) <= UNIFORM_DELTA_E)
-        .count();
+    let mut deltas: Vec<f64> = samples.iter().map(|&s| delta_e_rgb(s, rgb)).collect();
+    let within = deltas.iter().filter(|d| **d <= UNIFORM_DELTA_E).count();
+    deltas.sort_by(f64::total_cmp);
 
     BackgroundEstimate {
         rgb,
         uniformity: within as f64 / samples.len() as f64,
         samples: samples.len(),
+        delta_e: quantiles(&deltas),
+    }
+}
+
+/// 昇順に並んだ値から分位を取り出す。
+fn quantiles(sorted: &[f64]) -> DeltaEQuantiles {
+    if sorted.is_empty() {
+        return DeltaEQuantiles {
+            p50: 0.0,
+            p90: 0.0,
+            max: 0.0,
+        };
+    }
+    let at = |q: f64| -> f64 {
+        let i = ((sorted.len() as f64 - 1.0) * q).round() as usize;
+        sorted[i]
+    };
+    DeltaEQuantiles {
+        p50: at(0.5),
+        p90: at(0.9),
+        max: sorted[sorted.len() - 1],
     }
 }
 
@@ -136,6 +172,29 @@ mod tests {
         let est = estimate_background(&img, DEFAULT_BORDER);
         assert_eq!(est.rgb, [255, 255, 255]);
         assert_eq!(est.uniformity, 1.0);
+    }
+
+    #[test]
+    fn quantiles_describe_the_spread_of_a_patchy_border() {
+        // 外周の大半が揃っていても一部だけ大きく外れている場合、uniformity は
+        // 下がるが p50 は小さいままになる。この差が「bbox で切れば直る」か
+        // 「単色背景ではない」かの判断材料になる
+        let mut img = solid(20, 20, [250, 250, 250, 255]);
+        for x in 0..4 {
+            img.put_pixel(x, 0, image::Rgba([10, 10, 10, 255]));
+        }
+        let est = estimate_background(&img, 1);
+        assert!(est.delta_e.p50 < 1.0, "大半は背景色どおり");
+        assert!(est.delta_e.max > 50.0, "外れ値は max に出る");
+        assert!(est.uniformity < 1.0);
+    }
+
+    #[test]
+    fn a_uniform_border_has_no_spread() {
+        let est = estimate_background(&solid(20, 20, [200, 200, 200, 255]), 2);
+        assert_eq!(est.delta_e.p50, 0.0);
+        assert_eq!(est.delta_e.p90, 0.0);
+        assert_eq!(est.delta_e.max, 0.0);
     }
 
     #[test]

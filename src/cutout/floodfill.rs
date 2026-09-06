@@ -86,10 +86,11 @@ fn background_candidates(
             if p[3] == 0 {
                 return true;
             }
-            if let Some(g) = &gradient
-                && f64::from(g[i]) > opts.edge_threshold
-            {
-                return false;
+            // let-chain は Rust 1.88 以降。MSRV 1.85 を保つためネストで書く
+            if let Some(g) = &gradient {
+                if f64::from(g[i]) > opts.edge_threshold {
+                    return false;
+                }
             }
             delta_e_rgb([p[0], p[1], p[2]], background) <= opts.tolerance
         })

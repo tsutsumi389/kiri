@@ -28,14 +28,27 @@ pub fn resolve_format(opts: &OutputOpts) -> Result<OutputFormat> {
 
 /// 上書きの可否を確認する。重い処理を走らせる前に呼ぶこと。
 pub fn ensure_writable(opts: &OutputOpts) -> Result<()> {
-    if opts.output.exists() && !opts.force {
+    ensure_path_writable(&opts.output, opts.force)
+}
+
+/// 本出力以外（プレビュー・デバッグマスク）にも同じ上書き規約を適用する。
+///
+/// 付随物だからと素通しにすると、利用者のファイルを黙って壊しうる。
+pub fn ensure_path_writable(path: &Path, force: bool) -> Result<()> {
+    if path.exists() && !force {
         return Err(Error::argument(
             "OUTPUT_EXISTS",
-            format!("{} は既に存在します", opts.output.display()),
+            format!("{} は既に存在します", path.display()),
         )
         .with_hint("--force を付けると上書きします"));
     }
     Ok(())
+}
+
+/// 小数第4位で丸める。実質的な情報量はそこまでで、無用な桁は
+/// エージェントの差分比較を汚すだけであるため。
+pub fn round4(v: f64) -> f64 {
+    (v * 10_000.0).round() / 10_000.0
 }
 
 /// 画像を書き出し、出力レポートと警告を返す。

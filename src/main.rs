@@ -12,7 +12,9 @@ use serde::Serialize;
 use kiri::cli::{Cli, Command};
 use kiri::commands;
 use kiri::error::{Error, ErrorKind, Result};
-use kiri::report::{BatchReport, CutoutReport, ErrorReport, InfoReport, ProcessReport};
+use kiri::report::{
+    BackgroundReport, BatchReport, CutoutReport, ErrorReport, InfoReport, ProcessReport,
+};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -127,6 +129,7 @@ fn print_info(report: &InfoReport) {
         "  背景色    #{r:02X}{g:02X}{b:02X}  (均一度 {:.2})",
         report.background.uniformity
     );
+    print_perimeter(&report.background);
     print_warnings(&report.warnings);
 }
 
@@ -162,7 +165,12 @@ fn print_cutout(report: &CutoutReport) {
         "  背景色    #{r:02X}{g:02X}{b:02X}  (均一度 {:.2}, tolerance {})",
         report.background.uniformity, report.tolerance
     );
+    print_perimeter(&report.background);
     println!("  前景比率  {:.1}%", report.mask.foreground_ratio * 100.0);
+    if let Some(sep) = report.mask.separability {
+        // tolerance と並べて出す。両者の大小そのものが判断材料であるため
+        println!("  境界色差  ΔE {sep:.1}  (tolerance {})", report.tolerance);
+    }
     match report.mask.bbox {
         Some([x1, y1, x2, y2]) => println!("  前景範囲  {x1},{y1} - {x2},{y2}"),
         None => println!("  前景範囲  なし"),
@@ -185,6 +193,9 @@ fn print_cutout(report: &CutoutReport) {
     }
     if let Some(path) = &report.mask.debug_mask {
         println!("  マスク    {path}");
+    }
+    if let Some(path) = &report.preview {
+        println!("  プレビュー  {path}");
     }
     print_warnings(&report.warnings);
 }
@@ -216,6 +227,14 @@ fn print_batch(report: &BatchReport) {
     println!(
         "\n{} 件中 {} 件成功、{} 件失敗、{} 件に警告  ({} ms)",
         report.total, report.succeeded, report.failed, report.with_warnings, report.elapsed_ms
+    );
+}
+
+fn print_perimeter(bg: &BackgroundReport) {
+    let d = &bg.perimeter_delta_e;
+    println!(
+        "  外周ΔE    p50 {:.1}  p90 {:.1}  max {:.1}",
+        d.p50, d.p90, d.max
     );
 }
 

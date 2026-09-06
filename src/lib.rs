@@ -10,6 +10,7 @@ pub mod commands;
 pub mod cutout;
 pub mod error;
 pub mod image_io;
+pub mod preview;
 pub mod report;
 pub mod transform;
 

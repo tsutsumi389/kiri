@@ -190,6 +190,10 @@ fn every_command_reports_the_color_space() {
         let v = json_stdout(&out);
         assert_eq!(v["color_space"], "sRGB", "{args:?}");
         assert_eq!(v["color_converted"], false, "{args:?}");
+        assert!(
+            v.get("color_profile").is_none(),
+            "ICC が無いのに名乗りが出ている: {args:?}"
+        );
     }
 }
 

@@ -98,15 +98,18 @@ IMG_0251.jpg
   ...
 ```
 
-`info` / `convert` / `resize` / `cutout` の JSON はすべて次の 2 つを返す。
+`info` / `convert` / `resize` / `cutout` の JSON はすべて次の 3 つを返す。
 
 | キー | 意味 |
 |---|---|
 | `color_space` | 検出した色空間の名前（`sRGB` / `Display P3` / `Adobe RGB (1998)` / `uncalibrated` など） |
+| `color_profile` | 埋め込み ICC 自身の名乗り。ICC が無ければ出ない |
 | `color_converted` | 実際に sRGB へ変換したか |
 
-**片方だけでは足りない。** 「sRGB と報告された」が素通しなのか変換済みなのかを
-区別できなければ、色ずれを検証しようがないためである。
+**どれか 1 つでは足りない。** 「sRGB と報告された」が素通しなのか変換済みなのかを
+区別できなければ、色ずれを検証しようがない。sRGB 相当と判定して素通しした場合は
+`color_space` が `sRGB` になるので、**何が埋まっていたのかは `color_profile`
+にしか残らない**（`"sRGB IEC61966-2.1"` など）。
 
 変換するのは**行列 + TRC 型のディスプレイプロファイル**に限る。Display P3、
 Adobe RGB (1998)、各種モニタプロファイルはすべてこの型に収まる。LUT 型（`A2B0` のみを
@@ -413,6 +416,7 @@ $ kiri cutout product.jpg -o product.jpg --canvas 1000 --flatten --background "#
 ```json
 {
   "color_space": "Display P3",
+  "color_profile": "Display P3",
   "color_converted": true,
   "background": {
     "rgb": [249, 249, 247], "uniformity": 1.0,

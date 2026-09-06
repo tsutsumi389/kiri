@@ -125,6 +125,7 @@ pub fn finish(
         },
         outputs: vec![output],
         color_space: loaded.color_space.clone(),
+        color_profile: loaded.color_profile.clone(),
         color_converted: loaded.color_converted,
         elapsed_ms: started.elapsed().as_millis(),
         warnings,

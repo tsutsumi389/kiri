@@ -112,14 +112,17 @@ fn print_info(report: &InfoReport) {
             ""
         }
     );
+    // 名乗りが色空間名と食い違うときは名乗りのほうを出す。sRGB 相当と判定して
+    // 素通ししたとき、どのプロファイルが付いていたのかがここでしか分からない
+    let icc = match &report.color_profile {
+        Some(name) if *name != report.color_space => format!(" (ICC '{name}')"),
+        _ if report.icc_profile => " (ICCあり)".to_string(),
+        _ => String::new(),
+    };
     println!(
         "  色空間    {}{}{}",
         report.color_space,
-        if report.icc_profile {
-            " (ICCあり)"
-        } else {
-            ""
-        },
+        icc,
         if report.color_converted {
             " → sRGB に変換"
         } else {

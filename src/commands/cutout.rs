@@ -87,6 +87,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         },
         outputs: vec![output_report],
         color_space: loaded.color_space.clone(),
+        color_profile: loaded.color_profile.clone(),
         color_converted: loaded.color_converted,
         background: output::background_report(&result.background),
         settings: SettingsReport {

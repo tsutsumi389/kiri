@@ -33,6 +33,7 @@ pub fn run(args: &InfoArgs) -> Result<InfoReport> {
         exif_orientation: loaded.exif_orientation,
         orientation_applied: loaded.orientation_applied,
         color_space: loaded.color_space.clone(),
+        color_profile: loaded.color_profile.clone(),
         color_converted: loaded.color_converted,
         icc_profile: loaded.icc_profile,
         has_alpha: loaded.has_alpha,

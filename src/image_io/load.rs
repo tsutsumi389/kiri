@@ -40,6 +40,9 @@ pub struct LoadedImage {
     pub icc_profile: bool,
     /// 検出した色空間の名前（"sRGB" / "Display P3" / "uncalibrated" など）
     pub color_space: String,
+    /// 埋め込み ICC 自身の名乗り。sRGB 相当と判定して素通ししたときも、
+    /// どのプロファイルが付いていたのかを残すために持つ（ICC が無ければ None）
+    pub color_profile: Option<String>,
     /// 実際に sRGB へ変換したか
     pub color_converted: bool,
     /// 実際に不透明でないピクセルが存在するか
@@ -134,6 +137,7 @@ pub fn load_with(path: &Path, opts: &LoadOptions) -> Result<LoadedImage> {
         orientation_applied,
         icc_profile,
         color_space: color.name,
+        color_profile: color.profile,
         color_converted: color.converted,
         has_alpha,
         color_warnings: color.warnings,
@@ -143,6 +147,8 @@ pub fn load_with(path: &Path, opts: &LoadOptions) -> Result<LoadedImage> {
 /// 色空間の判定と変換の結果。
 struct ColorOutcome {
     name: String,
+    /// 埋め込み ICC 自身の名乗り
+    profile: Option<String>,
     converted: bool,
     warnings: Vec<String>,
 }
@@ -161,6 +167,7 @@ fn normalize_color(
         return match exif_color_space {
             Some(0xFFFF) => ColorOutcome {
                 name: "uncalibrated".into(),
+                profile: None,
                 converted: false,
                 warnings: vec![
                     "入力の色空間が uncalibrated です（AdobeRGB の可能性）。ICC も\
@@ -170,53 +177,62 @@ fn normalize_color(
             },
             _ => ColorOutcome {
                 name: "sRGB".into(),
+                profile: None,
                 converted: false,
                 warnings: Vec::new(),
             },
         };
     };
 
-    let profile = icc::interpret(bytes);
-    let label = || match &profile.name {
+    let icc::Icc {
+        name: profile,
+        interpretation,
+    } = icc::interpret(bytes);
+    let label = match &profile {
         Some(n) => format!("'{n}'"),
         None => "（名前なし）".to_string(),
     };
+    let reported = || profile.clone().unwrap_or_else(|| "unknown".into());
 
-    match profile.interpretation {
+    match interpretation {
+        // 判定は名乗りではなく原色と TRC で決まる。報告する色空間は "sRGB" に
+        // 揃えつつ、名乗りは残す。片方だけでは「sRGB と出たが、そう名乗って
+        // いただけなのか実体もそうなのか」を後から追えない
         Interpretation::Srgb => ColorOutcome {
             name: "sRGB".into(),
+            profile,
             converted: false,
             warnings: Vec::new(),
         },
         Interpretation::Convertible(transform) => {
-            let name = profile.name.clone().unwrap_or_else(|| "unknown".into());
+            let name = reported();
             if opts.convert_color {
                 transform.apply(image);
                 ColorOutcome {
                     name,
+                    profile,
                     converted: true,
                     warnings: Vec::new(),
                 }
             } else {
                 let warning = format!(
-                    "ICC プロファイル {} を検出しましたが、--no-color-convert のため \
-                     sRGB へ変換していません",
-                    label()
+                    "ICC プロファイル {label} を検出しましたが、--no-color-convert のため \
+                     sRGB へ変換していません"
                 );
                 ColorOutcome {
                     name,
+                    profile,
                     converted: false,
                     warnings: vec![warning],
                 }
             }
         }
         Interpretation::Unsupported => {
-            let warning = format!(
-                "ICC プロファイル {} は変換に対応していないため sRGB として扱います",
-                label()
-            );
+            let warning =
+                format!("ICC プロファイル {label} は変換に対応していないため sRGB として扱います");
             ColorOutcome {
-                name: profile.name.unwrap_or_else(|| "unknown".into()),
+                name: reported(),
+                profile,
                 converted: false,
                 warnings: vec![warning],
             }
@@ -413,6 +429,10 @@ mod tests {
         );
     }
 
+    /// sRGB 相当と判定して素通ししても、どのプロファイルが付いていたかは残す。
+    ///
+    /// `color_space` だけでは「sRGB と出たが、名乗りだけだったのか実体もそう
+    /// だったのか」を後から追えない。色を疑ったときに手がかりが消えている。
     #[test]
     fn an_embedded_srgb_profile_is_reported_but_not_converted() {
         use crate::color::synthetic::{build, srgb_v2};
@@ -422,8 +442,23 @@ mod tests {
         let loaded = load(&path).unwrap();
         assert!(loaded.icc_profile);
         assert_eq!(loaded.color_space, "sRGB");
+        assert_eq!(loaded.color_profile.as_deref(), Some("sRGB IEC61966-2.1"));
         assert!(!loaded.color_converted, "sRGB を変換してはいけない");
         assert!(loaded.warnings().is_empty());
+    }
+
+    /// ICC が無ければ名乗りも無い。「sRGB として扱った」と「sRGB を名乗って
+    /// いた」は別のことなので、埋まっていないものを埋まっていたことにしない。
+    #[test]
+    fn an_image_without_a_profile_reports_no_profile_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = image::RgbImage::from_pixel(8, 8, image::Rgb([190, 70, 55]));
+        let path = dir.path().join("plain.png");
+        img.save(&path).unwrap();
+
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.color_space, "sRGB");
+        assert_eq!(loaded.color_profile, None);
     }
 
     #[test]

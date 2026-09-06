@@ -16,12 +16,34 @@ use std::collections::VecDeque;
 
 use crate::cutout::mask::Mask;
 
-/// 孤立ノイズの除去。連結成分のうち、不透明な芯の面積が `(2*radius+1)^2` に
-/// 満たないものを消す。`radius` 0 で無効。
+/// 孤立ノイズとして消す連結成分の面積の下限(px²)。
+///
+/// `radius` は「**長辺 1000px 換算での**半径 px」と読む。面積を
+/// `(2r+1)^2 * (長辺/1000)^2` と画像の大きさに比例させるのは、ゴミの大きさが
+/// 解像度に比例するためである。同じ被写体を 4 倍で撮れば、同じ大きさに見える
+/// ゴミは 16 倍の画素を占める。実写（4284x5712 の不織布）では織り目の 1 粒が
+/// 150px² あり、固定の 25px² では一つも消えなかった。
+///
+/// 長辺 1000px 以下では倍率を 1 に留める。ここを下回るのはサムネイルや
+/// テストの合成画像であり、既に妥当な値で運用されているものを動かす理由が無い。
+///
+/// 半径 0 は「無効」の意味なので 0 を返す。比例させると面積 1 以上、つまり
+/// 「1 画素の成分は消す」という別の意味になってしまう。
+pub fn speck_min_area(radius: u32, width: u32, height: u32) -> usize {
+    if radius == 0 {
+        return 0;
+    }
+    let side = f64::from(2 * radius + 1);
+    let scale = (f64::from(width.max(height)) / 1000.0).max(1.0);
+    (side * scale).powi(2).round() as usize
+}
+
+/// 孤立ノイズの除去。連結成分のうち、不透明な芯の面積が
+/// `speck_min_area(radius, 幅, 高さ)` に満たないものを消す。`radius` 0 で無効。
 ///
 /// 「半径 r のオープニングが消すのは、r の構造要素が入らないもの」という直感を
-/// 面積で置き換えている。同じ `--cleanup` の値で、消える孤立点の大きさは
-/// おおむね従来どおりのまま、細い構造だけが生き残る。
+/// 面積で置き換えている。同じ `--cleanup` の値で、消える孤立点の見た目の
+/// 大きさは解像度によらず一定になり、細い構造だけが生き残る。
 ///
 /// 連結は 8 近傍で、**アルファが 0 より大きい画素**をたどる。面積は
 /// **前景判定(128以上)の画素だけ**で数える。半透明の裾ごと消さないと、
@@ -33,9 +55,8 @@ pub fn remove_specks(mask: &Mask, radius: u32) -> Mask {
     if radius == 0 {
         return mask.clone();
     }
-    let side = 2 * radius + 1;
-    let min_area = (side as usize) * (side as usize);
     let (w, h) = (mask.width(), mask.height());
+    let min_area = speck_min_area(radius, w, h);
     let stride = w as usize;
 
     let mut out = mask.clone();
@@ -365,6 +386,49 @@ mod tests {
             "斜めの線が消えている\n{}",
             render(&out)
         );
+    }
+
+    /// 長辺 1000px 以下では従来どおりの面積で消す。
+    #[test]
+    fn the_area_threshold_is_unchanged_for_small_images() {
+        assert_eq!(speck_min_area(2, 120, 120), 25, "面積 (2*2+1)^2");
+        assert_eq!(speck_min_area(2, 1000, 800), 25, "長辺ちょうど 1000px");
+        assert_eq!(speck_min_area(1, 400, 400), 9);
+        assert_eq!(speck_min_area(0, 4000, 4000), 0, "半径 0 は無効");
+    }
+
+    /// 長辺が伸びれば面積のしきい値も同じ比で伸びる。
+    ///
+    /// 同じ被写体を 4 倍の解像度で撮れば、同じ大きさに見えるゴミの面積は
+    /// 16 倍になる。固定値では 20MP の織り目が消せない。
+    #[test]
+    fn the_area_threshold_follows_the_resolution() {
+        assert_eq!(speck_min_area(2, 3000, 4000), 400, "(2*2+1)^2 * 4^2");
+        assert_eq!(speck_min_area(2, 1600, 1600), 64, "(5*1.6)^2");
+        // 実写の 4284x5712。既定の cleanup 2 で 150px² の織り目が消える
+        assert!(
+            speck_min_area(2, 4284, 5712) > 400,
+            "20MP で織り目(150px²)を超えていない: {}",
+            speck_min_area(2, 4284, 5712)
+        );
+    }
+
+    /// 大きな画像では、小さな画像なら残る大きさのゴミが消えること。
+    #[test]
+    fn a_speck_that_survives_at_low_resolution_is_removed_at_high_resolution() {
+        // 7x7 = 49px²。長辺 1000px 以下では下限 25px² を超えるので残るが、
+        // 長辺 2000px 相当では下限が 100px² になるので消える
+        let speck = |w: u32, h: u32| -> bool {
+            let mut mask = Mask::new(w, h, 0);
+            for y in 10..17 {
+                for x in 10..17 {
+                    mask.set(x, y, 255);
+                }
+            }
+            remove_specks(&mask, 2).is_foreground(13, 13)
+        };
+        assert!(speck(500, 500), "長辺 500px で 7x7 が消えている");
+        assert!(!speck(2000, 2000), "長辺 2000px で 7x7 が残っている");
     }
 
     #[test]

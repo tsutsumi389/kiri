@@ -1,6 +1,6 @@
 # kiri 実装計画
 
-最終更新: 2026-09-05
+最終更新: 2026-09-06
 
 設計の詳細と決定根拠は [design.md](./design.md) を参照。本書は実装の進め方のみを扱う。
 
@@ -23,10 +23,12 @@ src/
   cutout/
     background.rs      背景色推定、uniformity 算出
     floodfill.rs       外周シードの連結フラッドフィル
-    morphology.rs      オープニング / クロージング
+    morphology.rs      連結成分の面積フィルタ / オープニング / クロージング
     edges.rs           Sobel による輪郭強度（フラッドフィルの堤防）
-    feather.rs         境界フェザリング
-    despill.rs         色かぶり除去
+    refine.rs          境界帯のアルファ再推定と色の復元（既定の経路）
+    feather.rs         境界フェザリング（refine のフォールバックと --no-refine 用）
+    despill.rs         色かぶり除去（--no-refine 用）
+    diagnostics.rs     境界の診断値（halo_ratio, edge_width）
     mask.rs            マスク型と統計（foreground_ratio, bbox, touches_edge）
   transform/
     resize.rs          fast_image_resize ラッパ
@@ -67,6 +69,23 @@ src/
 - 商品が画像外周に接している（見切れ）
 - グラデーション背景（`uniformity` が下がり警告が出ること）
 
+### 3.2b 境界品質の回帰テスト（`tests/edge_quality.rs`）
+
+**真の被覆率が解析的に分かる**合成シーンを作り、切り抜き結果を正解と突き合わせる。
+境界の良し悪しは目で見ないと分からないと思われがちだが、正解を持った合成シーンなら
+数値で追える。追えなければ「直したつもりで悪化させた」ことに気づけない。
+
+固定している値: アルファ誤差、背景色のまま不透明な縁の割合、商品が削られた割合、
+黒地に載せたときのハロー輝度、細部（幅 3px のストラップ）の残存率、孤立ノイズの除去、
+同一入力での出力バイト列の一致。
+
+`--ignored` を付けると判定せずに一覧表と所要時間を出す。既定値の変更前後を
+同じ物差しで比べるためのもの。
+
+```
+cargo test --release --test edge_quality -- --ignored --nocapture
+```
+
 ### 3.3 CLI統合テスト（`assert_cmd` + `predicates`）
 
 - 各エラーケースの exit code
@@ -102,3 +121,7 @@ MSRV の検査を CI に入れるのは、**宣言だけ置いても検査しな
 - [x] Phase 4: EC整形
 - [x] Phase 5: バッチ
 - [ ] Phase 6: 仕上げ
+  - [x] 境界品質の改善（境界帯のアルファ再推定、面積フィルタ、診断値と回帰テスト）
+  - [ ] エッジ堤防の頑健化（淡い色の商品で縁が削れる / 縁が 1px 外へずれる）
+  - [ ] README の整備、実素材での既定値の再調整
+  - [ ] リリース用 CI

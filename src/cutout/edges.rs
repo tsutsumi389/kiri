@@ -44,6 +44,12 @@ pub fn edge_ridges(image: &RgbaImage, threshold: f32) -> Vec<bool> {
 
 /// 外周の帯で測った勾配強度の分位。値の意味は `edge_ridges` のしきい値と同じ
 /// 「1px あたりの輝度変化量」で、そのまま比較できる。
+///
+/// **「測れなかった」は 0.0 として返る。** 短辺 3px 以下の画像や、帯がまるごと
+/// 透明な画像では標本が 1 つも取れないが、その場合も平坦な背景と同じ値になり、
+/// 呼び出し側から区別できない。`Option` にしないのは、この 2 つが下流で同じ
+/// 扱いになるためである。測れないなら堤防は既定のまま据え置くのが正しく、
+/// 平坦な背景でも結論は同じになる。
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct GradientQuantiles {
     pub p50: f64,
@@ -60,7 +66,8 @@ pub struct GradientQuantiles {
 ///
 /// 帯だけを走査するのは費用の問題である。12MP で画像全体の Sobel を取ると
 /// 輝度・強度・向きの表で 150MB を積むが、この関数は帯の画素ぶんの f32 一本
-/// （12MP・帯 90px で 5MB）で済む。輝度の表も持たず、3x3 をその場で読む。
+/// （12MP・帯 90px で 121 万標本 = 4.9MB）で済む。輝度の表も持たず、3x3 を
+/// その場で読む。
 ///
 /// **p50 と p90 は別のことを言う。** 帯を横切るだけの商品なら、輪郭は曲線なので
 /// 帯の面積に対して 1 次元でしか効かず、商品の内側は一様なので、どちらもほとんど
@@ -74,21 +81,49 @@ pub struct GradientQuantiles {
 ///
 /// **外周まで織り目で埋まった商品**（畳んだ布そのものを撮る等）は、どちらの
 /// 分位でも背景と区別が付かない。その場合は `--edge-threshold` を明示すること。
+///
+/// 透明な画素は標本に入れない。α=0 の画素の RGB は書き出し側の都合で決まり
+/// （0 や切り抜き前の残骸）、混ぜると存在しない段差が立つ。切り抜き済みの PNG を
+/// もう一度通した実測では、それだけで p90 が 14 まで出ていた。
 pub fn border_gradient_quantiles(image: &RgbaImage, band: u32) -> GradientQuantiles {
+    quantiles(&mut border_gradient_samples(image, band))
+}
+
+/// 外周の帯の勾配強度を集める。分位を取る前の生の標本。
+///
+/// `border_gradient_quantiles` から切り出してあるのは、器が伸びていないことを
+/// テストから見るためである。容量の式が走査範囲とずれても分位の値は変わらず、
+/// 静かに再確保が起きるだけなので、結果を見ていても気づけない。
+fn border_gradient_samples(image: &RgbaImage, band: u32) -> Vec<f32> {
     let (w, h) = (image.width() as usize, image.height() as usize);
     // Sobel は 3x3 を読むので、外周 1px は測れない。帯として意味を持つのは
     // 2px から。半分を超えると「外周の帯」ではなくなるので、そこで頭を打つ
     if w.min(h) < 4 {
-        return GradientQuantiles::default();
+        return Vec::new();
     }
     let band = (band as usize).clamp(2, w.min(h) / 2);
-    let mut samples: Vec<f32> = Vec::new();
+    // 標本数は走査範囲から厳密に決まる（上下の帯 + その間の左右の帯）。
+    // 伸ばすに任せると 2 の冪へ丸められ、24.5MP では 250 万標本に対して
+    // 419 万ぶん（16.8MB）を抱える。透明画素を落とすぶん実際は下回るので、
+    // これは上限として働く
+    let capacity = 2 * (band - 1) * (w - 2) + (h - 2 * band) * 2 * (band - 1);
+    let mut samples: Vec<f32> = Vec::with_capacity(capacity);
 
     let push = |x: usize, y: usize, out: &mut Vec<f32>| {
-        let at = |dx: usize, dy: usize| -> f32 {
-            let p = image.get_pixel((x + dx - 1) as u32, (y + dy - 1) as u32).0;
-            0.2126 * f32::from(p[0]) + 0.7152 * f32::from(p[1]) + 0.0722 * f32::from(p[2])
-        };
+        // 3x3 を先に読み切る。1 画素でも透明なら、その窓の勾配は
+        // 「色の段差」ではなく「切り抜きの境目」なので捨てる
+        let mut luma = [0.0f32; 9];
+        for dy in 0..3 {
+            for dx in 0..3 {
+                let p = image.get_pixel((x + dx - 1) as u32, (y + dy - 1) as u32).0;
+                if p[3] == 0 {
+                    return;
+                }
+                luma[dy * 3 + dx] =
+                    0.2126 * f32::from(p[0]) + 0.7152 * f32::from(p[1]) + 0.0722 * f32::from(p[2]);
+            }
+        }
+        let at = |dx: usize, dy: usize| -> f32 { luma[dy * 3 + dx] };
         let gx = -at(0, 0) + at(2, 0) - 2.0 * at(0, 1) + 2.0 * at(2, 1) - at(0, 2) + at(2, 2);
         let gy = -at(0, 0) - 2.0 * at(1, 0) - at(2, 0) + at(0, 2) + 2.0 * at(1, 2) + at(2, 2);
         out.push((gx * gx + gy * gy).sqrt() / 4.0);
@@ -107,7 +142,7 @@ pub fn border_gradient_quantiles(image: &RgbaImage, band: u32) -> GradientQuanti
         }
     }
 
-    quantiles(&mut samples)
+    samples
 }
 
 /// 分位を取り出す。全体を並べ替えず、必要な順位だけを確定させる。
@@ -458,6 +493,47 @@ mod tests {
         let q = border_gradient_quantiles(&img, 8);
         assert!(q.p90 > 8.0, "柄が p90 に出ていない: {:?}", q);
         assert!(q.p50 < 1.0, "背景はきれいなのに p50 が動いている: {:?}", q);
+    }
+
+    /// 透明な画素は標本に入れない。切り抜き済みの PNG を再度通したときに、
+    /// α=0 の下に残った RGB が存在しない段差として立つのを防ぐ。
+    #[test]
+    fn fully_transparent_pixels_are_not_sampled() {
+        let mut img = RgbaImage::from_pixel(60, 60, Rgba([200, 200, 200, 255]));
+        // 外周 10px が透明。RGB には切り抜き前の残骸が入っている想定
+        for y in 0..60 {
+            for x in 0..60 {
+                if x < 10 || y < 10 || x >= 50 || y >= 50 {
+                    img.put_pixel(x, y, Rgba([20, 220, 40, 0]));
+                }
+            }
+        }
+        let q = border_gradient_quantiles(&img, 12);
+        assert_eq!(q.p90, 0.0, "透明画素の下の色を拾っている: {:?}", q);
+    }
+
+    /// 標本の器は伸ばさない。走査範囲から数が厳密に決まるため。
+    ///
+    /// 12MP・帯 90px では 121 万標本（4.9MB）。伸ばすに任せると 2 の冪へ
+    /// 丸められて 210 万ぶん（8.4MB）を抱えていた。
+    #[test]
+    fn the_sample_buffer_is_sized_exactly() {
+        for (w, h, band) in [(60u32, 60u32, 8usize), (120, 80, 12), (40, 200, 5)] {
+            let img = RgbaImage::from_pixel(w, h, Rgba([200, 200, 200, 255]));
+            let (uw, uh) = (w as usize, h as usize);
+            let expected = 2 * (band - 1) * (uw - 2) + (uh - 2 * band) * 2 * (band - 1);
+            let samples = border_gradient_samples(&img, band as u32);
+            assert_eq!(
+                samples.len(),
+                expected,
+                "{w}x{h} 帯 {band} で標本数が容量の式と合わない"
+            );
+            assert_eq!(
+                samples.capacity(),
+                samples.len(),
+                "{w}x{h} 帯 {band} で器が伸びている"
+            );
+        }
     }
 
     #[test]

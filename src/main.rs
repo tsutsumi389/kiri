@@ -239,6 +239,10 @@ fn print_perimeter(bg: &BackgroundReport) {
         "  外周ΔE    p50 {:.1}  p90 {:.1}  max {:.1}",
         d.p50, d.p90, d.max
     );
+    // 色のばらつき（外周ΔE）と別に出す。両者は別の失敗を予告するためで、
+    // ざらつきは tolerance ではなく堤防のほうを狂わせる
+    let t = &bg.texture;
+    println!("  外周勾配  p50 {:.1}  p90 {:.1}", t.p50, t.p90);
 }
 
 fn print_warnings(warnings: &[String]) {

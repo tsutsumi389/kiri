@@ -78,6 +78,43 @@ fn scenes() -> Vec<EdgeScene> {
             shadow: true,
             ..Default::default()
         },
+        // 織り目のある背景。不織布・キャンバス地のように 1px あたりの変化が
+        // 大きい素材を敷き、その上に濃色の商品を置く。既定の堤防（勾配 8）は
+        // 布の織り目そのものに反応して**背景の中で**壁になり、フィルが商品まで
+        // 届かない（堤防を 8 に固定した実測で前景比率 0.85、縁の残り 100%）。
+        //
+        // 周期 6px・振幅 12 は実写（不織布、外周の勾配 p90 27.9）の性質を
+        // 縮めたもので、外周の勾配 p90 は 14 になる。周期を 8px に広げると
+        // 稜線が疎になって壁にならず、この崩れは再現しない
+        EdgeScene {
+            name: "S11 織り目のある背景",
+            width: 1200,
+            height: 1200,
+            background: [177, 174, 168],
+            product: [35, 35, 38],
+            shading: (1.0, 1.0),
+            weave: Some((12.0, 6.0)),
+            noise: 1.0,
+            ..Default::default()
+        },
+        // S11 の織り目の上に**淡色**の商品を置く。テクスチャ検知が「無効化」では
+        // なく「引き上げ」でなければならない理由がここに出る。S11 は濃色商品
+        // なので堤防を切っても崩れず、引き上げ幅が何倍でも同じ結果になってしまう。
+        //
+        // 商品の輪郭は 1px あたり 28 の段差を持ち、織り目（p90 14.0）より大きい。
+        // 堤防を 21 に置けば織り目は越えられて輪郭では止まる、という
+        // 「引き上げ」の狙いがそのまま成立する唯一のシーンである
+        EdgeScene {
+            name: "S12 織り目のある背景 + 淡色商品",
+            width: 1200,
+            height: 1200,
+            background: [177, 174, 168],
+            product: [205, 202, 196],
+            shading: (1.0, 1.0),
+            weave: Some((12.0, 6.0)),
+            noise: 1.0,
+            ..Default::default()
+        },
         // 解けないケース。商品の明度が上から下へ変化する途中で背景色を
         // **横切る**ため、輪郭のコントラストが 0 になる行が存在する。そこでは
         // 色による分離が原理的に不可能で、いったん入られると商品の内部は
@@ -167,7 +204,7 @@ fn a_three_pixel_strap_survives_without_the_edge_dam() {
     // 堤防を切っても残ることで、面積フィルタが効いていることを確かめる
     let truth = find("S5");
     let opts = CutoutOptions {
-        edge_threshold: 0.0,
+        edge_threshold: Some(0.0),
         ..Default::default()
     };
     let m = run(&truth, &opts);
@@ -299,6 +336,187 @@ fn turning_off_the_shadow_rule_leaves_the_shadow_behind() {
     );
 }
 
+/// 織り目のある背景でも、既定値のままで切り抜けること。
+///
+/// 実写（不織布の上の黒いリモコン）で見つかった崩れを縮めて固定する。布の
+/// 織り目は 1px あたり 8 を超える勾配を持つので、堤防が**背景の中で**壁に
+/// なり、フィルが商品まで届かない。
+///
+/// 利用者が `--edge-threshold 0` を知っていれば救えるが、既定値で通らないなら
+/// AI エージェントには救えない。kiri が既定値で解くべき問題である。
+#[test]
+fn a_woven_background_is_cut_out_with_the_defaults() {
+    let truth = find("S11");
+    let m = run(&truth, &CutoutOptions::default());
+    assert!(
+        m.eaten < 0.02,
+        "商品が削られている: {:.1}%\n{m:?}",
+        m.eaten * 100.0
+    );
+    assert!(
+        m.rim < 0.02,
+        "輪郭の外に布が残っている: {:.1}%\n{m:?}",
+        m.rim * 100.0
+    );
+    assert!(
+        m.speckles < 0.005,
+        "織り目のゴミが背景に残っている: {:.2}%\n{m:?}",
+        m.speckles * 100.0
+    );
+}
+
+/// 画面の端で見切れた柄物の商品が、テクスチャ検知を誤発火させないこと。
+///
+/// EC では「商品が画面の下端で切れている」構図が頻出する。このとき外周の帯の
+/// 1 辺はまるごと商品の内部になり、その商品が無地でなければ帯の勾配が跳ねる。
+/// **背景はきれいなのに堤防が引き上がる**という誤検知で、堤防が守るはずだった
+/// 淡色商品（S3）が背景ごと消える。
+///
+/// 発火条件を p90 だけに置いていた頃の実測（このシーン）では、外周の勾配は
+/// p50 0.4 / p90 19.2 で、堤防は 8 から 28.9 へ上がっていた。淡色商品が
+/// 耐えられるのは 25 までなので、28.9 は堤防を無効化したのと同じで、
+/// 境界近傍の欠けは 8.7% から 38.7% へ跳ねる。
+///
+/// 判定を「既定と同じ」ではなく「堤防 8 を明示したときと同じ」に置くのは、
+/// 誤発火していないことを直接言うためである。
+#[test]
+fn a_patterned_product_cropped_at_the_bottom_does_not_raise_the_dam() {
+    let scene = EdgeScene {
+        name: "H1",
+        width: 1200,
+        height: 1200,
+        product: [232, 232, 230],
+        shading: (0.98, 0.80),
+        // 下端 60px が、周期 10px の柄を持つ別の商品で埋まっている
+        cropped_band: Some((60, 24.0, 10.0)),
+        ..Default::default()
+    };
+    let truth = edge_scene(&scene);
+    let clean = edge_scene(&EdgeScene {
+        cropped_band: None,
+        ..scene
+    });
+
+    let auto = cutout(&truth.image, &CutoutOptions::default());
+    let texture = auto.background.texture;
+    assert!(
+        texture.p90 > 15.0,
+        "前提が崩れている: 見切れた柄が p90 を押し上げていない: {texture:?}"
+    );
+    assert!(
+        texture.p50 < 2.0,
+        "前提が崩れている: 背景そのものはきれいなはず: {texture:?}"
+    );
+    assert_eq!(
+        auto.edge_threshold,
+        kiri::cutout::DEFAULT_EDGE_THRESHOLD,
+        "帯の 1 辺が商品でも堤防が引き上がっている: {texture:?}"
+    );
+
+    // 堤防 8 を明示した場合と、見切れの無い同じシーンと、3 つが揃うこと
+    let pinned = run(
+        &truth,
+        &CutoutOptions {
+            edge_threshold: Some(kiri::cutout::DEFAULT_EDGE_THRESHOLD),
+            ..Default::default()
+        },
+    );
+    let m = measure_edges(&truth, &auto.image, &auto.mask);
+    let without = run(&clean, &CutoutOptions::default());
+    assert!(
+        (m.eaten - pinned.eaten).abs() < 0.005,
+        "既定と「堤防 8 を明示」で結果が違う: {:.1}% と {:.1}%",
+        m.eaten * 100.0,
+        pinned.eaten * 100.0
+    );
+    assert!(
+        (m.eaten - without.eaten).abs() < 0.005,
+        "見切れの有無で淡色商品の削れ方が変わっている: {:.1}% と {:.1}%",
+        m.eaten * 100.0,
+        without.eaten * 100.0
+    );
+}
+
+/// 上の対照実験。堤防を既定値のまま**明示**すれば布の縁が残ること。
+///
+/// 「もともと堤防が邪魔をしていなかっただけ」で上のテストが通るのを防ぐ。
+/// 明示指定に自動調整が割り込まないことも、ここで同時に固定している。
+#[test]
+fn pinning_the_dam_by_hand_leaves_the_woven_background_behind() {
+    let truth = find("S11");
+    let m = run(
+        &truth,
+        &CutoutOptions {
+            edge_threshold: Some(kiri::cutout::DEFAULT_EDGE_THRESHOLD),
+            ..Default::default()
+        },
+    );
+    assert!(
+        m.rim > 0.20,
+        "対照が成立していない（堤防を明示しても布が残らない）: {:.1}%\n{m:?}",
+        m.rim * 100.0
+    );
+}
+
+/// テクスチャ検知は堤防を**無効化するのではなく引き上げる**こと。
+///
+/// S11 は濃色商品なので、堤防が 21 でも 0 でも同じ結果になる。つまり
+/// `TEXTURE_DAM_HEADROOM` を 10 倍にしても S11 は通ってしまい、
+/// 「引き上げ」という設計の核心は何にも固定されていなかった。
+///
+/// S12 は織り目（p90 14.0）の上に、輪郭の段差が 1px あたり 28 の淡色商品を
+/// 置く。堤防を切ると商品はまるごと背景として飲まれ、既定の 8 に置くと
+/// 織り目が壁になって背景が残る。**その間にしか正解が無い。** 実測では
+/// 12〜24 の窓で両立し、既定の 1.5 倍（21）はその中にある。
+#[test]
+fn the_raised_dam_still_protects_a_light_product_on_a_woven_background() {
+    let truth = find("S12");
+    let auto = cutout(&truth.image, &CutoutOptions::default());
+    assert!(
+        auto.edge_threshold > kiri::cutout::DEFAULT_EDGE_THRESHOLD,
+        "テクスチャ検知が発火していない: {:.1}",
+        auto.edge_threshold
+    );
+    let m = measure_edges(&truth, &auto.image, &auto.mask);
+    assert!(
+        m.eaten < 0.02,
+        "引き上げた堤防が淡色商品を守れていない: {:.1}%\n{m:?}",
+        m.eaten * 100.0
+    );
+    assert!(
+        m.rim < 0.02,
+        "引き上げた堤防が織り目を残している: {:.1}%\n{m:?}",
+        m.rim * 100.0
+    );
+
+    // 両端の対照。どちらか一方でも成立していなければ、上の合格は
+    // 「もともと両立していただけ」で引き上げ幅を何も語らない
+    let off = run(
+        &truth,
+        &CutoutOptions {
+            edge_threshold: Some(0.0),
+            ..Default::default()
+        },
+    );
+    assert!(
+        off.eaten > 0.50,
+        "対照が成立していない（堤防を切っても淡色商品が残る）: {:.1}%\n{off:?}",
+        off.eaten * 100.0
+    );
+    let pinned = run(
+        &truth,
+        &CutoutOptions {
+            edge_threshold: Some(kiri::cutout::DEFAULT_EDGE_THRESHOLD),
+            ..Default::default()
+        },
+    );
+    assert!(
+        pinned.rim > 0.50,
+        "対照が成立していない（既定の堤防でも織り目が残らない）: {:.1}%\n{pinned:?}",
+        pinned.rim * 100.0
+    );
+}
+
 #[test]
 fn an_isolated_speck_is_removed_but_a_thin_line_is_not() {
     // 面積フィルタの二面性を1つのシーンで見る。孤立した 3x3 のゴミは消え、
@@ -335,6 +553,51 @@ fn an_isolated_speck_is_removed_but_a_thin_line_is_not() {
     assert!(
         line_kept >= 22,
         "幅 3px の線が消えている: 24 行中 {line_kept} 行しか残っていない"
+    );
+}
+
+/// ゴミの大きさは解像度に比例するので、面積の下限も比例させること。
+///
+/// 同じ被写体を 4 倍で撮れば、同じ大きさに見えるゴミは 16 倍の画素を占める。
+/// 面積を 25px² に固定していた頃、20MP の不織布では織り目の 1 粒が 150px² あり、
+/// 既定の `--cleanup 2` では一つも消えなかった。`--cleanup 8` を渡せば消えたが、
+/// それは「解像度を見て利用者が換算する」ことを求めており、既定値の意味を失う。
+///
+/// 小さい画像では従来どおりであることも同時に見る。単に下限を上げただけなら
+/// サムネイルの細部まで巻き添えになるが、それは改善ではない。
+#[test]
+fn a_speck_scales_with_the_resolution_but_small_images_are_untouched() {
+    let speck_survives = |size: u32| -> bool {
+        let bg = [248u8, 248, 247];
+        let mut img = RgbaImage::from_pixel(size, size, Rgba([bg[0], bg[1], bg[2], 255]));
+        let product = Rgba([40u8, 40, 45, 255]);
+        let (a, b) = (size / 3, size * 2 / 3);
+        for y in a..b {
+            for x in a..b {
+                img.put_pixel(x, y, product);
+            }
+        }
+        // 7x7 = 49px²。長辺 1000px までは下限 25px² を超えるので残り、
+        // 長辺 2000px では下限が 100px² になるので消える。
+        //
+        // 崖に寄せない。長辺 1500px の下限は 56px² で 49px² との差が 12% しか
+        // なく、丸めや境界帯の 1px の増減で符号が変わる。「消えるか残るか」を
+        // 見たいのであって、丸めの向きを見たいのではない
+        let (sx, sy) = (size / 10, size / 10);
+        for y in sy..sy + 7 {
+            for x in sx..sx + 7 {
+                img.put_pixel(x, y, product);
+            }
+        }
+        let result = cutout(&img, &CutoutOptions::default());
+        result.mask.is_foreground(sx + 3, sy + 3)
+    };
+
+    assert!(speck_survives(400), "小さい画像で 7x7 の細部まで消えている");
+    assert!(speck_survives(1000), "長辺ちょうど 1000px で消えている");
+    assert!(
+        !speck_survives(2000),
+        "高解像度で 7x7 相当のゴミが残っている"
     );
 }
 
@@ -504,7 +767,7 @@ fn print_the_refine_cost_on_large_inputs() {
 #[ignore = "計測用。判定はせず表を出すだけ"]
 fn print_the_metrics_table() {
     println!(
-        "\n{:<28} {:<20} {:>8} {:>7} {:>7} {:>9} {:>7} {:>7} {:>8} {:>8}",
+        "\n{:<28} {:<20} {:>8} {:>7} {:>7} {:>9} {:>7} {:>7} {:>8} {:>8} {:>8}",
         "シーン",
         "設定",
         "境界ずれ",
@@ -514,7 +777,8 @@ fn print_the_metrics_table() {
         "halo",
         "白地誤差",
         "strap",
-        "shadow残"
+        "shadow残",
+        "織り目残"
     );
     for scene in scenes() {
         let truth = edge_scene(&scene);
@@ -523,7 +787,7 @@ fn print_the_metrics_table() {
             (
                 "堤防なし",
                 CutoutOptions {
-                    edge_threshold: 0.0,
+                    edge_threshold: Some(0.0),
                     ..Default::default()
                 },
             ),
@@ -531,7 +795,7 @@ fn print_the_metrics_table() {
             let result = cutout(&truth.image, &opts);
             let m = measure_edges(&truth, &result.image, &result.mask);
             println!(
-                "{:<28} {:<20} {:>+8.3} {:>6.1}% {:>6.1}% {:>9.3} {:>7.1} {:>8.1} {:>7.1}% {:>7.1}%",
+                "{:<28} {:<20} {:>+8.3} {:>6.1}% {:>6.1}% {:>9.3} {:>7.1} {:>8.1} {:>7.1}% {:>7.1}% {:>7.2}%",
                 scene.name,
                 label,
                 m.offset,
@@ -542,10 +806,11 @@ fn print_the_metrics_table() {
                 m.white_error,
                 m.strap_kept * 100.0,
                 m.shadow_kept * 100.0,
+                m.speckles * 100.0,
             );
             let round1 = |v: f64| (v * 10.0).round() / 10.0;
             println!(
-                "{:<49} halo_ratio={:?} edge_width={:?} separability={:?}",
+                "{:<49} halo_ratio={:?} edge_width={:?} separability={:?} 外周勾配 p50={:.1}/p90={:.1} 効いた堤防={:.1}",
                 "",
                 result
                     .diagnostics
@@ -553,6 +818,9 @@ fn print_the_metrics_table() {
                     .map(|v| (v * 1000.0).round() / 1000.0),
                 result.diagnostics.edge_width.map(round1),
                 result.separability.map(round1),
+                result.background.texture.p50,
+                result.background.texture.p90,
+                result.edge_threshold,
             );
         }
         println!();

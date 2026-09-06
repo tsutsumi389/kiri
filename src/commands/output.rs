@@ -6,9 +6,12 @@ use std::time::Instant;
 use image::RgbaImage;
 
 use crate::cli::OutputOpts;
+use crate::cutout::BackgroundEstimate;
 use crate::error::{Error, Result};
 use crate::image_io::{OutputFormat, SaveOptions, save};
-use crate::report::{Dimensions, OutputReport, ProcessReport};
+use crate::report::{
+    BackgroundReport, Dimensions, OutputReport, PerimeterDeltaE, PerimeterTexture, ProcessReport,
+};
 
 /// 明示指定がなければ拡張子から出力形式を決める。
 pub fn resolve_format(opts: &OutputOpts) -> Result<OutputFormat> {
@@ -49,6 +52,27 @@ pub fn ensure_path_writable(path: &Path, force: bool) -> Result<()> {
 /// エージェントの差分比較を汚すだけであるため。
 pub fn round4(v: f64) -> f64 {
     (v * 10_000.0).round() / 10_000.0
+}
+
+/// 背景推定を JSON のレポートへ落とす。
+///
+/// `info` と `cutout` の両方が同じ形を返す約束なので、組み立てを 1 箇所に置く。
+/// 片方にだけ項目を足すと、エージェントは「この画像では測れなかった」のか
+/// 「このコマンドは報告しない」のかを区別できない。
+pub fn background_report(background: &BackgroundEstimate) -> BackgroundReport {
+    BackgroundReport {
+        rgb: background.rgb,
+        uniformity: round4(background.uniformity),
+        perimeter_delta_e: PerimeterDeltaE {
+            p50: round4(background.delta_e.p50),
+            p90: round4(background.delta_e.p90),
+            max: round4(background.delta_e.max),
+        },
+        texture: PerimeterTexture {
+            p50: round4(background.texture.p50),
+            p90: round4(background.texture.p90),
+        },
+    }
 }
 
 /// 画像を書き出し、出力レポートと警告を返す。

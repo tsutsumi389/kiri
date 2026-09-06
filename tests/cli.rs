@@ -8,7 +8,9 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
-use common::{ProductSpec, product_image, transparent_product, write_jpeg, write_png};
+use common::{
+    ProductSpec, product_image, transparent_product, woven_background_image, write_jpeg, write_png,
+};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -939,6 +941,118 @@ fn the_edge_dam_alone_stops_a_one_pixel_slit() {
     assert!(
         !slit_is_background(&["--seal", "0"]),
         "堤防が効いていない: 1px のスリットが素通りしている"
+    );
+}
+
+/// 織り目のある背景では堤防を自動で引き上げ、その旨を結果に書くこと。
+///
+/// 布・段ボールのような素材は、背景そのものが 1px あたり十数の変化を持つ。
+/// 既定の堤防（8）はそれに反応して**背景の中で**壁になり、フィルが商品まで
+/// 届かない。`--edge-threshold 0` を知っていれば救えるが、知識を前提にした
+/// 道具は AI エージェントには使えない。
+///
+/// 黙って値を変えるのはもっと悪い。効いた値は `settings` に、変えた理由は
+/// `warnings` に出す。
+#[test]
+fn a_woven_background_raises_the_dam_and_the_report_says_so() {
+    let dir = fixture_dir();
+    let input = write_png(dir.path(), "woven.png", &woven_background_image(240, 240));
+
+    let run = |name: &str, extra: &[&str]| -> Value {
+        let output = dir.path().join(format!("{name}.png"));
+        let mut args = vec![
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        let out = kiri().args(&args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        json_stdout(&out)
+    };
+    let adjusted = |v: &Value| -> bool {
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("テクスチャ"))
+    };
+
+    let auto = run("auto", &[]);
+    // 商品は画像の 1/4 〜 3/4 を占めるので、前景比率は 0.25 前後になるはず
+    let ratio = auto["mask"]["foreground_ratio"].as_f64().unwrap();
+    assert!(
+        (0.20..0.32).contains(&ratio),
+        "織り目が堤防を発火させて背景が残っている: {ratio}"
+    );
+    let raised = auto["settings"]["edge_threshold"].as_f64().unwrap();
+    assert!(raised > 8.0, "堤防が引き上げられていない: {raised}");
+    assert!(
+        adjusted(&auto),
+        "黙って設定を変えている: {}",
+        auto["warnings"]
+    );
+    // 判断の根拠も返す。エージェントが自分で確かめられなければ意味がない
+    let p90 = auto["background"]["texture"]["p90"].as_f64().unwrap();
+    assert!(p90 > 8.0, "外周の勾配が報告されていない: {p90}");
+
+    // 明示指定には従う。従わないと「指定したのに効かない」になる
+    let pinned = run("pinned", &["--edge-threshold", "8"]);
+    assert_eq!(pinned["settings"]["edge_threshold"], 8.0);
+    assert!(!adjusted(&pinned), "明示指定に割り込んでいる");
+    let pinned_ratio = pinned["mask"]["foreground_ratio"].as_f64().unwrap();
+    assert!(
+        pinned_ratio > ratio + 0.1,
+        "対照が成立していない（堤防を明示しても背景が消える）: {pinned_ratio} vs {ratio}"
+    );
+}
+
+/// `kiri info` でも同じ値を返すこと。
+///
+/// 切り抜く前に「この背景は堤防を張れる素材か」を知るための値なので、
+/// cutout でしか出ないのでは遅い。
+#[test]
+fn info_reports_the_texture_of_the_border() {
+    let dir = fixture_dir();
+    let texture = |name: &str, img: &image::RgbaImage| -> (f64, f64) {
+        let input = write_png(dir.path(), name, img);
+        let out = kiri()
+            .args(["info", input.to_str().unwrap(), "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let t = json_stdout(&out)["background"]["texture"].clone();
+        (
+            t["p50"].as_f64().expect("p50 が無い"),
+            t["p90"].as_f64().expect("p90 が無い"),
+        )
+    };
+
+    let studio = product_image(&ProductSpec {
+        width: 240,
+        height: 240,
+        ..Default::default()
+    });
+    let (_, studio_p90) = texture("studio.png", &studio);
+    assert!(
+        studio_p90 < 5.0,
+        "スタジオ背景でテクスチャが立っている: {studio_p90}"
+    );
+
+    let (_, woven_p90) = texture("woven_info.png", &woven_background_image(240, 240));
+    assert!(
+        woven_p90 > 8.0,
+        "織り目を検出できていない: {woven_p90}（スタジオ背景は {studio_p90}）"
     );
 }
 
@@ -2361,9 +2475,17 @@ fn the_cli_defaults_match_the_library_defaults() {
     assert_eq!(args.border, defaults.border, "--border の既定値");
     assert_eq!(args.cleanup, defaults.cleanup, "--cleanup の既定値");
     assert_eq!(args.feather, defaults.feather, "--feather の既定値");
+    // --edge-threshold だけは「既定値」がここに無い。CLI もライブラリも
+    // 未指定を None のまま持ち回り、DEFAULT_EDGE_THRESHOLD を起点にした
+    // 自動調整へ渡すためである。両者が None であることは
+    // 「未指定と 8 の明示を区別する」という約束そのものなので、ここで固定する
     assert_eq!(
-        args.edge_threshold, defaults.edge_threshold,
-        "--edge-threshold の既定値"
+        args.edge_threshold, None,
+        "--edge-threshold の未指定が None のまま渡っていない"
+    );
+    assert_eq!(
+        defaults.edge_threshold, None,
+        "CutoutOptions の edge_threshold が未指定でなくなっている"
     );
     assert_eq!(
         args.step_tolerance, defaults.step_tolerance,
@@ -2376,6 +2498,29 @@ fn the_cli_defaults_match_the_library_defaults() {
     assert_eq!(args.seal, defaults.seal, "--seal の既定値");
     assert_eq!(!args.no_despill, defaults.despill, "デスピルの既定");
     assert_eq!(!args.no_refine, defaults.refine, "アルファ再推定の既定");
+}
+
+/// `--help` が語る既定値が `DEFAULT_EDGE_THRESHOLD` と食い違っていないこと。
+///
+/// `--edge-threshold` の既定値は clap の `default_value_t` に無く、ヘルプの
+/// 文言としてしか現れない。**AI エージェントは `--help` を読んで判断する**ので、
+/// 定数を動かしてヘルプが取り残されると「指定しなくても 8 が効く」という
+/// 誤った前提のまま使われる。上のテストが拾えない唯一の抜け道がここにある。
+#[test]
+fn the_help_text_quotes_the_real_default_edge_threshold() {
+    use clap::CommandFactory;
+    use kiri::cli::Cli;
+
+    let help = Cli::command()
+        .find_subcommand_mut("cutout")
+        .expect("cutout サブコマンドが無い")
+        .render_long_help()
+        .to_string();
+    let expected = format!("既定 {:.0}", kiri::cutout::DEFAULT_EDGE_THRESHOLD);
+    assert!(
+        help.contains(&expected),
+        "--help が「{expected}」を語っていない:\n{help}"
+    );
 }
 
 #[test]
@@ -2495,6 +2640,45 @@ fn the_report_states_the_settings_that_took_effect() {
     assert_eq!(tuned["refine"], false);
 }
 
+/// バッチの spec でも「未指定」と「8 を明示」が区別されること。
+///
+/// spec は clap を通らない経路なので、既定値で埋める実装が残っていると
+/// 自動調整が働かない。数百点を回した後で気づくのでは遅い。
+#[test]
+fn a_batch_spec_distinguishes_an_unset_dam_from_an_explicit_one() {
+    let dir = fixture_dir();
+    write_png(dir.path(), "a.png", &woven_background_image(240, 240));
+    let spec = dir.path().join("spec.json");
+
+    let run = |body: &str| -> Value {
+        std::fs::write(&spec, body).unwrap();
+        let out = kiri()
+            .args(["batch", spec.to_str().unwrap(), "--json", "--force"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        json_stdout(&out)["results"][0]["result"].clone()
+    };
+
+    let auto = run(r#"{"items":[{"input":"a.png","output":"auto.png"}]}"#);
+    assert!(
+        auto["settings"]["edge_threshold"].as_f64().unwrap() > 8.0,
+        "spec で未指定なのに自動調整が働いていない: {}",
+        auto["settings"]
+    );
+
+    let pinned =
+        run(r#"{"defaults":{"edge_threshold":8.0},"items":[{"input":"a.png","output":"p.png"}]}"#);
+    assert_eq!(
+        pinned["settings"]["edge_threshold"], 8.0,
+        "spec の明示指定に割り込んでいる"
+    );
+}
+
 /// 範囲外の数値は受け取る前に断ること。
 ///
 /// 負値や nan は比較が常に偽になるだけなので、通してしまうと「指定したのに
@@ -2517,6 +2701,10 @@ fn out_of_range_numeric_options_are_rejected() {
         "--edge-threshold=inf",
         // 半径に比例して走査量が増えるので、二桁の指定は事故しかない
         "--seal=400",
+        // 長辺 1000px 換算の半径。上限を超えると商品そのものが
+        // 「孤立ノイズ」になり、消す道具ではなく全消しの道具になる
+        "--cleanup=65",
+        "--cleanup=4294967295",
     ] {
         let out = kiri()
             .args([
@@ -2535,7 +2723,7 @@ fn out_of_range_numeric_options_are_rejected() {
 
 /// バッチの spec も同じ約束で弾くこと。clap を通らない経路なので別立てで見る。
 #[test]
-fn a_negative_setting_in_a_batch_spec_is_rejected() {
+fn an_out_of_range_setting_in_a_batch_spec_is_rejected() {
     let dir = fixture_dir();
     let img = product_image(&ProductSpec {
         width: 60,
@@ -2543,23 +2731,32 @@ fn a_negative_setting_in_a_batch_spec_is_rejected() {
         ..Default::default()
     });
     write_png(dir.path(), "a.png", &img);
-    let spec = dir.path().join("spec.json");
-    std::fs::write(
-        &spec,
-        r#"{"defaults":{"step_tolerance":-1.0},
-             "items":[{"input":"a.png","output":"out.png"}]}"#,
-    )
-    .unwrap();
-
-    let out = kiri()
-        .args(["batch", spec.to_str().unwrap(), "--json"])
-        .output()
+    for defaults in [
+        r#"{"step_tolerance":-1.0}"#,
+        r#"{"seal":400}"#,
+        // 上限を超えた cleanup。clap 側と同じ関門を spec にも掛ける
+        r#"{"cleanup":65}"#,
+        r#"{"cleanup":4294967295}"#,
+    ] {
+        let spec = dir.path().join("spec.json");
+        std::fs::write(
+            &spec,
+            format!(
+                r#"{{"defaults":{defaults},"items":[{{"input":"a.png","output":"out.png"}}]}}"#
+            ),
+        )
         .unwrap();
-    let json = json_stdout(&out);
-    assert_eq!(
-        json["results"][0]["error"]["code"], "INVALID_SETTING",
-        "spec の負値が弾かれていない: {json}"
-    );
+
+        let out = kiri()
+            .args(["batch", spec.to_str().unwrap(), "--json", "--force"])
+            .output()
+            .unwrap();
+        let json = json_stdout(&out);
+        assert_eq!(
+            json["results"][0]["error"]["code"], "INVALID_SETTING",
+            "spec の {defaults} が弾かれていない: {json}"
+        );
+    }
 }
 
 /// 落ち影が既定で消えること。CLI から通しで確かめる。

@@ -111,16 +111,8 @@ fn to_cutout_args(
         .transpose()?
         .unwrap_or([255, 255, 255]);
 
-    let seal = settings.seal.unwrap_or(1);
-    if seal > crate::cli::MAX_SEAL {
-        return Err(Error::argument(
-            "INVALID_SETTING",
-            format!(
-                "seal は 0 から {} の範囲で指定してください（{seal} が指定されました）",
-                crate::cli::MAX_SEAL
-            ),
-        ));
-    }
+    let seal = capped(settings.seal, 1, crate::cli::MAX_SEAL, "seal")?;
+    let cleanup = capped(settings.cleanup, 2, crate::cli::MAX_CLEANUP, "cleanup")?;
 
     Ok(CutoutArgs {
         input: input.to_path_buf(),
@@ -129,11 +121,13 @@ fn to_cutout_args(
         fg_seed: settings.fg_seeds.clone().unwrap_or_default(),
         tolerance: checked(settings.tolerance, 12.0, "tolerance")?,
         border: settings.border.unwrap_or(DEFAULT_BORDER),
-        cleanup: settings.cleanup.unwrap_or(2),
+        cleanup,
         feather: settings.feather.unwrap_or(1),
         no_despill: !settings.despill.unwrap_or(true),
         no_refine: !settings.refine.unwrap_or(true),
-        edge_threshold: checked(settings.edge_threshold, 8.0, "edge_threshold")?,
+        // 未指定は未指定のまま渡す。既定値で埋めてしまうと、テクスチャに応じた
+        // 自動調整が spec を書いた人の「8 を指定した」と区別できなくなる
+        edge_threshold: checked_opt(settings.edge_threshold, "edge_threshold")?,
         step_tolerance: checked(settings.step_tolerance, 2.2, "step_tolerance")?,
         shadow_tolerance: checked(settings.shadow_tolerance, 35.0, "shadow_tolerance")?,
         seal,
@@ -162,7 +156,34 @@ fn to_cutout_args(
 /// そのまま通ると、その項目だけ機能が黙って無効化されたまま数百点が処理され、
 /// 結果の JSON にも異常が出ない。気づけるのは仕上がりを目で見たときになる。
 fn checked(value: Option<f64>, default: f64, key: &str) -> Result<f64> {
-    let v = value.unwrap_or(default);
+    validate(value.unwrap_or(default), key)
+}
+
+/// 上限のある整数の設定に CLI と同じ関門を掛ける。
+///
+/// clap の `value_parser` に相当するものが spec には無い。上限を超えた値を
+/// 通すと、`--seal` なら 1MP で秒単位、`--cleanup` なら商品ごと全消しという
+/// 形で表れるが、どちらも「数百点を回し終えてから気づく」種類の失敗になる。
+fn capped(value: Option<u32>, default: u32, max: u32, key: &str) -> Result<u32> {
+    let value = value.unwrap_or(default);
+    if value > max {
+        return Err(Error::argument(
+            "INVALID_SETTING",
+            format!("{key} は 0 から {max} の範囲で指定してください（{value} が指定されました）"),
+        ));
+    }
+    Ok(value)
+}
+
+/// 既定値を持たない設定用。未指定は未指定のまま返す。
+///
+/// 「未指定」と「既定値を明示」を区別する設定（edge_threshold）では、ここで
+/// 埋めてしまうと下流の自動調整が働かなくなる。
+fn checked_opt(value: Option<f64>, key: &str) -> Result<Option<f64>> {
+    value.map(|v| validate(v, key)).transpose()
+}
+
+fn validate(v: f64, key: &str) -> Result<f64> {
     if !v.is_finite() || v < 0.0 {
         return Err(Error::argument(
             "INVALID_SETTING",
@@ -197,7 +218,7 @@ mod tests {
         assert_eq!(args.feather, defaults.feather, "feather の既定値");
         assert_eq!(
             args.edge_threshold, defaults.edge_threshold,
-            "edge_threshold の既定値"
+            "edge_threshold の既定値（どちらも未指定）"
         );
         assert_eq!(
             args.step_tolerance, defaults.step_tolerance,

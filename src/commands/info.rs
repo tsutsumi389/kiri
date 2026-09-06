@@ -6,11 +6,11 @@
 use image::ImageFormat;
 
 use crate::cli::InfoArgs;
-use crate::commands::output::round4;
+use crate::commands::output::background_report;
 use crate::cutout::estimate_background;
 use crate::error::Result;
 use crate::image_io::load;
-use crate::report::{BackgroundReport, InfoReport, PerimeterDeltaE};
+use crate::report::InfoReport;
 
 pub fn run(args: &InfoArgs) -> Result<InfoReport> {
     let loaded = load::load(&args.input)?;
@@ -35,15 +35,7 @@ pub fn run(args: &InfoArgs) -> Result<InfoReport> {
         color_space: loaded.color_space.as_str().to_string(),
         icc_profile: loaded.icc_profile,
         has_alpha: loaded.has_alpha,
-        background: BackgroundReport {
-            rgb: background.rgb,
-            uniformity: round4(background.uniformity),
-            perimeter_delta_e: PerimeterDeltaE {
-                p50: round4(background.delta_e.p50),
-                p90: round4(background.delta_e.p90),
-                max: round4(background.delta_e.max),
-            },
-        },
+        background: background_report(&background),
         warnings,
     })
 }

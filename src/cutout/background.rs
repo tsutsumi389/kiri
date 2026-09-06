@@ -7,6 +7,7 @@
 use image::RgbaImage;
 
 use crate::color::lab::delta_e_rgb;
+use crate::cutout::edges::{GradientQuantiles, border_gradient_quantiles};
 
 /// 外周サンプルが背景色とみなせる ΔE の上限。
 /// CIE76 で 5 前後は「注意すれば違いが分かる」水準にあたる。
@@ -14,6 +15,14 @@ const UNIFORM_DELTA_E: f64 = 5.0;
 
 /// 背景推定に使う外周の既定幅(px)。
 pub const DEFAULT_BORDER: u32 = 2;
+
+/// テクスチャを測る帯の幅を短辺の何分の一にするか（3%）。
+///
+/// 色の推定に使う `--border`（既定 2px）では、織り目の 1 周期（6-10px）すら
+/// 跨げない。3% にすると 600px の合成シーンで 18px、20MP の実写で 128px となり、
+/// どちらでも織り目を何周期ぶんも含む。広く取っても費用は帯の面積にしか
+/// 効かないので、素材によらず十分な標本が得られる幅を選んでいる。
+const TEXTURE_BAND_DIVISOR: u32 = 33;
 
 /// 外周サンプルが推定背景色からどれだけ離れているかの分布。
 ///
@@ -36,6 +45,13 @@ pub struct BackgroundEstimate {
     pub samples: usize,
     /// 外周サンプルの推定背景色からの ΔE 分布
     pub delta_e: DeltaEQuantiles,
+    /// 外周の帯で測った勾配強度（1px あたりの輝度変化量）の分布。
+    ///
+    /// `delta_e` は「背景色からどれだけ離れているか」を測るので、なだらかな
+    /// 照明ムラと、ざらついた織り目を区別できない。前者は tolerance で吸収
+    /// できるが、後者は**堤防を誤発火させる**。両者を分けるのは 1px あたりの
+    /// 変化量だけなので、別に測って持つ
+    pub texture: GradientQuantiles,
 }
 
 impl BackgroundEstimate {
@@ -49,6 +65,7 @@ impl BackgroundEstimate {
 ///
 /// 中央値を使うのは、外周に商品がわずかに掛かっている場合に平均だと引きずられるため。
 pub fn estimate_background(image: &RgbaImage, border: u32) -> BackgroundEstimate {
+    let texture = border_gradient_quantiles(image, texture_band(image, border));
     let samples = collect_border_pixels(image, border);
     if samples.is_empty() {
         return BackgroundEstimate {
@@ -56,6 +73,7 @@ pub fn estimate_background(image: &RgbaImage, border: u32) -> BackgroundEstimate
             uniformity: 0.0,
             samples: 0,
             delta_e: quantiles(&[]),
+            texture,
         };
     }
 
@@ -69,7 +87,17 @@ pub fn estimate_background(image: &RgbaImage, border: u32) -> BackgroundEstimate
         uniformity: within as f64 / samples.len() as f64,
         samples: samples.len(),
         delta_e: quantiles(&deltas),
+        texture,
     }
+}
+
+/// テクスチャを測る帯の幅(px)。
+///
+/// `--border` を明示的に広げた利用者の意図は尊重する。色の推定範囲を広げたなら
+/// テクスチャの測定範囲も同じだけ広いのが自然であるため。
+fn texture_band(image: &RgbaImage, border: u32) -> u32 {
+    let short = image.width().min(image.height());
+    (short / TEXTURE_BAND_DIVISOR).max(border)
 }
 
 /// 昇順に並んだ値から分位を取り出す。
@@ -219,6 +247,56 @@ mod tests {
         }
         let est = estimate_background(&img, DEFAULT_BORDER);
         assert!(est.is_uniform(), "uniformity={}", est.uniformity);
+    }
+
+    /// スタジオ背景ではテクスチャが立たない。ここが 0 に近いことが、
+    /// 堤防を既定のまま張ってよい根拠になる。
+    #[test]
+    fn a_studio_background_has_no_texture() {
+        let est = estimate_background(&solid(120, 120, [248, 248, 247, 255]), DEFAULT_BORDER);
+        assert_eq!(est.texture.p50, 0.0);
+        assert_eq!(est.texture.p90, 0.0);
+    }
+
+    /// センサーノイズ程度のばらつきでは堤防のしきい値に届かない。
+    #[test]
+    fn sensor_noise_stays_well_below_the_dam() {
+        let mut img = solid(120, 120, [248, 248, 247, 255]);
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        for y in 0..120 {
+            for x in 0..120 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let n = ((seed >> 32) % 5) as i16 - 2;
+                let v = (248 + n).clamp(0, 255) as u8;
+                img.put_pixel(x, y, Rgba([v, v, v, 255]));
+            }
+        }
+        let est = estimate_background(&img, DEFAULT_BORDER);
+        assert!(est.texture.p90 < 5.0, "texture={:?}", est.texture);
+    }
+
+    /// 織り目のある布は、色のばらつき（delta_e）だけでは判定できない。
+    /// なだらかな照明ムラと同じ値になりうるためで、両者を分けるのは
+    /// 1px あたりの変化量だけである。
+    #[test]
+    fn a_woven_background_shows_up_in_the_texture_but_not_only_in_delta_e() {
+        let mut img = solid(200, 200, [177, 174, 168, 255]);
+        let k = std::f32::consts::TAU / 8.0;
+        for y in 0..200 {
+            for x in 0..200 {
+                let t = 12.0 * (x as f32 * k).sin() * (y as f32 * k).sin();
+                let v = |c: u8| (f32::from(c) + t).clamp(0.0, 255.0) as u8;
+                img.put_pixel(x, y, Rgba([v(177), v(174), v(168), 255]));
+            }
+        }
+        let est = estimate_background(&img, DEFAULT_BORDER);
+        assert!(
+            est.texture.p90 > 8.0,
+            "織り目を検出できていない: {:?}",
+            est.texture
+        );
     }
 
     #[test]

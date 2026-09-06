@@ -13,10 +13,7 @@ use crate::cutout::{CutoutOptions, cutout};
 use crate::error::{Error, Result};
 use crate::image_io::{OutputFormat, SaveOptions, load, save};
 use crate::preview::{PreviewSpec, contact_sheet};
-use crate::report::{
-    BackgroundReport, CanvasReport, CutoutReport, Dimensions, MaskReport, PerimeterDeltaE,
-    SettingsReport,
-};
+use crate::report::{CanvasReport, CutoutReport, Dimensions, MaskReport, SettingsReport};
 use crate::transform::canvas::{CanvasSpec, apply as canvas_apply, plan as canvas_plan};
 
 pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
@@ -89,18 +86,12 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             height: h,
         },
         outputs: vec![output_report],
-        background: BackgroundReport {
-            rgb: result.background.rgb,
-            uniformity: round4(result.background.uniformity),
-            perimeter_delta_e: PerimeterDeltaE {
-                p50: round4(result.background.delta_e.p50),
-                p90: round4(result.background.delta_e.p90),
-                max: round4(result.background.delta_e.max),
-            },
-        },
+        background: output::background_report(&result.background),
         settings: SettingsReport {
             tolerance: opts.tolerance,
-            edge_threshold: opts.edge_threshold,
+            // 指定値ではなく実際に効いた値。背景のテクスチャで自動調整が
+            // 入った場合、両者は食い違う
+            edge_threshold: result.edge_threshold,
             step_tolerance: opts.step_tolerance,
             shadow_tolerance: opts.shadow_tolerance,
             seal: opts.seal,

@@ -1829,3 +1829,303 @@ fn batch_counts_items_that_need_review() {
     assert_eq!(v["succeeded"], 2);
     assert_eq!(v["with_warnings"], 1, "tolerance 0 の項目に警告が付くはず");
 }
+
+// --- 検証用プレビューと診断値 ---
+
+#[test]
+fn preview_is_written_as_a_three_panel_sheet() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 300,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("cut.png");
+    let preview = dir.path().join("check.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--preview",
+            preview.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    assert!(preview.exists(), "プレビューが書き出されていない");
+    assert_eq!(json_stdout(&out)["preview"], preview.to_str().unwrap());
+
+    // 元画像より小さいのでパネルは原寸のまま 3 枚並ぶ (8 + 300*3 + 8*2 + 8)
+    let sheet = image::open(&preview).unwrap();
+    assert_eq!(sheet.width(), 8 * 2 + 300 * 3 + 8 * 2);
+    assert_eq!(sheet.height(), 8 * 2 + 200);
+}
+
+#[test]
+fn preview_shrinks_a_large_image_to_the_panel_size() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 1200,
+        height: 900,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("cut.png");
+    let preview = dir.path().join("check.png");
+
+    kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--preview",
+            preview.to_str().unwrap(),
+            "--preview-size",
+            "128",
+        ])
+        .assert()
+        .success();
+
+    // 各パネルの長辺が 128 に収まる。原寸を視覚モデルに渡せないことが
+    // --preview の存在理由なので、これが効かなければ意味がない
+    let sheet = image::open(&preview).unwrap();
+    assert_eq!(sheet.width(), 8 * 2 + 128 * 3 + 8 * 2);
+    assert_eq!(sheet.height(), 8 * 2 + 96);
+}
+
+#[test]
+fn an_absurd_preview_size_is_an_argument_error() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_png(dir.path(), "in.png", &img);
+
+    kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            dir.path().join("cut.png").to_str().unwrap(),
+            "--preview",
+            dir.path().join("check.png").to_str().unwrap(),
+            "--preview-size",
+            "4",
+        ])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn cutout_reports_separability_alongside_tolerance() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        background: [248, 248, 247],
+        product: [40, 40, 45],
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            dir.path().join("cut.png").to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let json = json_stdout(&out);
+    let sep = json["mask"]["separability"]
+        .as_f64()
+        .expect("separability がない");
+    assert!(
+        sep > 20.0,
+        "濃い商品と明るい背景なら大きく離れるはず: {sep}"
+    );
+}
+
+#[test]
+fn info_reports_the_spread_of_the_perimeter() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let out = kiri()
+        .args(["info", input.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+
+    let json = json_stdout(&out);
+    let d = &json["background"]["perimeter_delta_e"];
+    for key in ["p50", "p90", "max"] {
+        assert!(d[key].is_number(), "{key} がない: {d}");
+    }
+    assert!(
+        d["p50"].as_f64().unwrap() <= d["max"].as_f64().unwrap(),
+        "p50 は max を超えない"
+    );
+}
+
+#[test]
+fn preview_may_not_overwrite_the_output() {
+    // 付随出力は本出力の後に書かれるため、パスが同じだと成果物が壊れる。
+    // しかも JSON は上書き前の寸法を報告するので、エージェントには検知できない
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_png(dir.path(), "in.png", &img);
+    let same = dir.path().join("same.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            same.to_str().unwrap(),
+            "--preview",
+            same.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success());
+    assert_eq!(json_stdout(&out)["error"]["code"], "SIDE_OUTPUT_CONFLICT");
+    assert!(!same.exists(), "重い処理に入る前に弾くべき");
+}
+
+#[test]
+fn preview_respects_the_overwrite_guard() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_png(dir.path(), "in.png", &img);
+    let taken = dir.path().join("taken.png");
+    std::fs::write(&taken, b"do not clobber me").unwrap();
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            dir.path().join("cut.png").to_str().unwrap(),
+            "--preview",
+            taken.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success());
+    assert_eq!(json_stdout(&out)["error"]["code"], "OUTPUT_EXISTS");
+    assert_eq!(
+        std::fs::read(&taken).unwrap(),
+        b"do not clobber me",
+        "既存ファイルを壊してはいけない"
+    );
+}
+
+#[test]
+fn an_unknown_preview_extension_is_an_argument_error() {
+    // --output は同じ状況でエラーにするので、こちらだけ黙って PNG にはしない
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            dir.path().join("cut.png").to_str().unwrap(),
+            "--preview",
+            dir.path().join("p.webp").to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success());
+    assert_eq!(json_stdout(&out)["error"]["code"], "UNKNOWN_OUTPUT_FORMAT");
+}
+
+#[test]
+fn a_failing_preview_does_not_fail_the_command() {
+    // プレビューは検証用の付随物。これを理由にエラーを返すと「成果物は
+    // 書けているのにエラー」となり、エージェントは再実行して OUTPUT_EXISTS で
+    // 二重に詰まる
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("cut.png");
+
+    // 通常ファイルを親に持つパスは作れない
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, b"x").unwrap();
+    let preview = blocker.join("p.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--preview",
+            preview.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "成果物が書けているなら成功で返すべき");
+    assert!(output.exists());
+    let json = json_stdout(&out);
+    assert!(json["preview"].is_null(), "書けなかったなら報告しない");
+    assert!(
+        json["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap().contains("プレビューを")),
+        "警告として伝えるべき: {}",
+        json["warnings"]
+    );
+}
+
+#[test]
+fn separability_is_reported_as_null_rather_than_omitted() {
+    // null になるのはエージェントが最も知りたい失敗ケース。キーごと消えると
+    // 「値が無い」と「そもそも報告されていない」を区別できない
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            dir.path().join("cut.png").to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    let json = json_stdout(&out);
+    assert!(
+        json["mask"]
+            .as_object()
+            .unwrap()
+            .contains_key("separability"),
+        "キーは常に存在すべき"
+    );
+}

@@ -42,12 +42,24 @@ impl From<&Error> for ErrorReport {
     }
 }
 
+/// 外周サンプルの推定背景色からの色差の分布。
+///
+/// `uniformity` が低かったときに、その原因が「全体に薄いムラ」なのか
+/// 「一部だけ大きく外れている」のかを区別するために使う。
+#[derive(Debug, Serialize)]
+pub struct PerimeterDeltaE {
+    pub p50: f64,
+    pub p90: f64,
+    pub max: f64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct BackgroundReport {
     pub rgb: [u8; 3],
     /// 外周サンプルのうち、推定背景色から ΔE<=5 に収まる割合。
     /// 1.0 に近いほど単色背景で、切り抜きの成功率が高い。
     pub uniformity: f64,
+    pub perimeter_delta_e: PerimeterDeltaE,
 }
 
 #[derive(Debug, Serialize)]
@@ -98,6 +110,14 @@ pub struct MaskReport {
     pub bbox: Option<[u32; 4]>,
     /// 前景が画像の外周に接しているか（商品の見切れ）
     pub touches_edge: bool,
+    /// 切り抜き境界の内側で測った商品と背景の色差(ΔE)の中央値。
+    /// 背景自身のばらつきを下回っていれば、その輪郭は色の違いではなく
+    /// フィルの停止位置で決まっており、結果は信頼できない。
+    ///
+    /// 前景が無ければ null。キー自体は常に出す。null になるのは
+    /// エージェントが最も知りたい失敗ケースであり、キーごと消えると
+    /// 「値が無い」と「そもそも報告されていない」を区別できないため。
+    pub separability: Option<f64>,
     /// --debug-mask で書き出したマスク画像のパス
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug_mask: Option<String>,
@@ -130,6 +150,9 @@ pub struct CutoutReport {
     pub mask: MaskReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canvas: Option<CanvasReport>,
+    /// --preview で書き出した検証用画像のパス
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
     pub elapsed_ms: u128,
     pub warnings: Vec<String>,
 }

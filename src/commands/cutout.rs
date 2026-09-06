@@ -8,17 +8,21 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::cli::CutoutArgs;
-use crate::commands::output;
+use crate::commands::output::{self, round4};
 use crate::cutout::{CutoutOptions, cutout};
 use crate::error::{Error, Result};
-use crate::image_io::load;
-use crate::report::{BackgroundReport, CanvasReport, CutoutReport, Dimensions, MaskReport};
+use crate::image_io::{OutputFormat, SaveOptions, load, save};
+use crate::preview::{PreviewSpec, contact_sheet};
+use crate::report::{
+    BackgroundReport, CanvasReport, CutoutReport, Dimensions, MaskReport, PerimeterDeltaE,
+};
 use crate::transform::canvas::{CanvasSpec, apply as canvas_apply, plan as canvas_plan};
 
 pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     let started = Instant::now();
     let format = output::resolve_format(&args.out)?;
     output::ensure_writable(&args.out)?;
+    let preview_format = check_side_outputs(args)?;
 
     let loaded = load::load(&args.input)?;
     let (w, h) = (loaded.width(), loaded.height());
@@ -61,6 +65,15 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     let (output_report, save_warnings) = output::write_image(&final_image, &args.out, format)?;
     warnings.extend(save_warnings);
 
+    let preview = write_preview(
+        args,
+        preview_format,
+        &loaded.image,
+        &result.mask,
+        &final_image,
+        &mut warnings,
+    );
+
     Ok(CutoutReport {
         input: args.input.display().to_string(),
         source: Dimensions {
@@ -71,6 +84,11 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         background: BackgroundReport {
             rgb: result.background.rgb,
             uniformity: round4(result.background.uniformity),
+            perimeter_delta_e: PerimeterDeltaE {
+                p50: round4(result.background.delta_e.p50),
+                p90: round4(result.background.delta_e.p90),
+                max: round4(result.background.delta_e.max),
+            },
         },
         tolerance: args.tolerance,
         applied_bbox: bbox.map(|(x1, y1, x2, y2)| [x1, y1, x2, y2]),
@@ -78,9 +96,11 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             foreground_ratio: round4(result.stats.foreground_ratio),
             bbox: result.stats.bbox.map(|(x1, y1, x2, y2)| [x1, y1, x2, y2]),
             touches_edge: result.stats.touches_edge,
+            separability: result.separability.map(round4),
             debug_mask,
         },
         canvas,
+        preview,
         elapsed_ms: started.elapsed().as_millis(),
         warnings,
     })
@@ -135,6 +155,103 @@ fn place_on_canvas(
             scale: round4(plan.scale),
         },
     ))
+}
+
+/// 重い処理に入る前に、付随出力（プレビュー・デバッグマスク）のパスを検証する。
+///
+/// 付随出力は本出力を書いた後に書かれるため、パスが衝突していると成果物を
+/// 上書きしてしまう。しかも結果 JSON は上書き前の寸法とサイズを報告するので、
+/// エージェントには検知できない。機械可読なレポートが嘘をつくのは致命的なので、
+/// 必ず事前に弾く。
+///
+/// プレビューの出力形式もここで確定させる。拡張子が解釈できないまま処理を
+/// 進めて最後に落ちるより、着手前に断るほうが無駄がない。
+fn check_side_outputs(args: &CutoutArgs) -> Result<Option<OutputFormat>> {
+    let conflict = |path: &PathBuf, flag: &str| -> Result<()> {
+        if path == &args.out.output {
+            return Err(Error::argument(
+                "SIDE_OUTPUT_CONFLICT",
+                format!("{flag} と --output に同じパスは指定できません"),
+            )
+            .with_hint("付随出力は本出力の後に書かれるため、成果物を壊します"));
+        }
+        output::ensure_path_writable(path, args.out.force)
+    };
+
+    if let Some(mask) = args.debug_mask.as_ref() {
+        conflict(mask, "--debug-mask")?;
+    }
+
+    let Some(preview) = args.preview.as_ref() else {
+        return Ok(None);
+    };
+    conflict(preview, "--preview")?;
+    if let Some(mask) = args.debug_mask.as_ref() {
+        if preview == mask {
+            return Err(Error::argument(
+                "SIDE_OUTPUT_CONFLICT",
+                "--preview と --debug-mask に同じパスは指定できません",
+            ));
+        }
+    }
+
+    // 本出力と同じ規約で拡張子から決める。--output は解釈できない拡張子を
+    // エラーにするので、こちらだけ黙って PNG にすると契約が不揃いになる
+    let format = OutputFormat::from_path(preview).ok_or_else(|| {
+        Error::argument(
+            "UNKNOWN_OUTPUT_FORMAT",
+            format!("{} の拡張子から出力形式を判別できません", preview.display()),
+        )
+        .with_hint("--preview には avif / png / jpeg のいずれかの拡張子を指定してください")
+    })?;
+    Ok(Some(format))
+}
+
+/// 検証用のコンタクトシートを書き出す。
+///
+/// 結果パネルにはキャンバス配置まで済んだ最終画像を使う。AI に見せるのは
+/// 「実際に書き出されたもの」でなければ、判断が実物とずれるため。
+///
+/// 書き出しに失敗しても処理全体は失敗させない。プレビューは検証用の付随物で
+/// あり、これを理由にエラーを返すと「成果物は書けているのにエラー」となって、
+/// エージェントは再実行し、今度は OUTPUT_EXISTS で二重に詰まる。
+fn write_preview(
+    args: &CutoutArgs,
+    format: Option<OutputFormat>,
+    original: &image::RgbaImage,
+    mask: &crate::cutout::Mask,
+    final_image: &image::RgbaImage,
+    warnings: &mut Vec<String>,
+) -> Option<String> {
+    let path = args.preview.as_ref()?;
+    let format = format?;
+
+    let spec = PreviewSpec {
+        panel: args.preview_size,
+        grid: !args.no_preview_grid,
+    };
+    let opts = SaveOptions {
+        format,
+        quality: 85.0,
+        effort: 6,
+        background: [255, 255, 255],
+        flatten: false,
+    };
+
+    let written = contact_sheet(original, mask, final_image, &spec)
+        .and_then(|sheet| save(path, &sheet, &opts));
+
+    match written {
+        Ok(_) => Some(path.display().to_string()),
+        Err(e) => {
+            warnings.push(format!(
+                "プレビューを {} に書けませんでした: {}",
+                path.display(),
+                e.message
+            ));
+            None
+        }
+    }
 }
 
 fn write_debug_mask(path: Option<&PathBuf>, mask: &crate::cutout::Mask) -> Result<Option<String>> {
@@ -217,10 +334,6 @@ fn resolve_point(point: [f64; 2], normalized: bool, width: u32, height: u32) -> 
         ));
     }
     Ok((x.floor() as u32, y.floor() as u32))
-}
-
-fn round4(v: f64) -> f64 {
-    (v * 10_000.0).round() / 10_000.0
 }
 
 #[cfg(test)]

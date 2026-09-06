@@ -9,6 +9,7 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::cutout::background::DEFAULT_BORDER;
 use crate::image_io::OutputFormat;
+use crate::preview::DEFAULT_PANEL;
 use crate::transform::FitMode;
 
 #[derive(Parser, Debug)]
@@ -175,6 +176,21 @@ pub struct CutoutArgs {
     /// 生成したマスクを PNG として書き出す（目視確認用）
     #[arg(long, value_name = "PATH")]
     pub debug_mask: Option<PathBuf>,
+
+    /// 「元画像 | マスク | 結果」を1枚に並べた検証用画像を書き出す。
+    /// 原寸の出力は視覚モデルに渡せないため、AI に結果を見せて
+    /// 調整させるにはこれを使う
+    #[arg(long, value_name = "PATH")]
+    pub preview: Option<PathBuf>,
+
+    /// --preview のパネル1枚あたりの長辺(px)
+    #[arg(long, default_value_t = DEFAULT_PANEL, value_parser = clap::value_parser!(u32).range(32..=4096))]
+    pub preview_size: u32,
+
+    /// --preview の元画像パネルに 0.1 刻みの座標グリッドを重ねない。
+    /// グリッドは --bbox --normalized の値を読み取るためにある
+    #[arg(long)]
+    pub no_preview_grid: bool,
 
     #[command(flatten)]
     pub out: OutputOpts,

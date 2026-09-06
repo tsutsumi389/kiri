@@ -85,6 +85,11 @@ GitHub Actions で以下を実行する。
 - `cargo test`
 - `cargo clippy -- -D warnings`
 - `cargo fmt --check`
+- `cargo +1.85 check --all-targets`（MSRV）
+
+MSRV の検査を CI に入れるのは、**宣言だけ置いても検査しなければ守られない**ためである。実際に一度、`rust-version = "1.85"` を掲げたまま let-chains（安定化は 1.88）が2箇所入り込んでいた。ローカルの新しいツールチェーンでは通ってしまうので、CI でしか検出できない。
+
+1.85 は edition 2024 の下限であり、これ以上下げられない。上げる場合は「その版でしか書けない何か」が必要になったときに限り、理由を添えて上げる。
 
 リリース時は各OS向けバイナリをビルドして GitHub Releases に添付する。pure Rust のためクロスコンパイルは素直に通る。
 

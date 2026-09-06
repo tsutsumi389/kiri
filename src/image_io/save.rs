@@ -125,10 +125,11 @@ pub fn save(path: &Path, image: &RgbaImage, opts: &SaveOptions) -> Result<SaveOu
         OutputFormat::Jpeg => encode_jpeg(target, opts)?,
     };
 
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
+    // let-chain は Rust 1.88 以降。MSRV 1.85 を保つためネストで書く
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
     }
     std::fs::write(path, &encoded).map_err(|e| {
         Error::general(

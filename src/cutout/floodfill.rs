@@ -39,7 +39,7 @@ pub fn foreground_mask(image: &RgbaImage, background: [u8; 3], opts: &FloodOptio
 
     let protected = protected_pixels(w, h, &opts.fg_seeds);
     let candidate = background_candidates(image, background, opts, &protected);
-    let mut is_background = fill_from_border(w, h, &candidate);
+    let mut is_background = fill_from_border(w, h, &candidate, opts.bbox);
 
     // bbox の外側は、色に関わらず背景として扱う。
     // AI が「商品はここにある」と判断した結果をここで効かせる。
@@ -86,10 +86,11 @@ fn background_candidates(
             if p[3] == 0 {
                 return true;
             }
-            if let Some(g) = &gradient
-                && f64::from(g[i]) > opts.edge_threshold
-            {
-                return false;
+            // let-chain は Rust 1.88 以降。MSRV 1.85 を保つためネストで書く
+            if let Some(g) = &gradient {
+                if f64::from(g[i]) > opts.edge_threshold {
+                    return false;
+                }
             }
             delta_e_rgb([p[0], p[1], p[2]], background) <= opts.tolerance
         })
@@ -99,7 +100,12 @@ fn background_candidates(
 /// 外周を起点に 4 近傍で塗り広げる。
 ///
 /// 4 近傍にしているのは、8 近傍だと斜めの隙間を通って商品内部へ漏れるため。
-fn fill_from_border(w: u32, h: u32, candidate: &[bool]) -> Vec<bool> {
+fn fill_from_border(
+    w: u32,
+    h: u32,
+    candidate: &[bool],
+    bbox: Option<(u32, u32, u32, u32)>,
+) -> Vec<bool> {
     let mut filled = vec![false; candidate.len()];
     let mut queue = VecDeque::new();
     let idx = |x: u32, y: u32| (y as usize) * (w as usize) + (x as usize);
@@ -112,13 +118,21 @@ fn fill_from_border(w: u32, h: u32, candidate: &[bool]) -> Vec<bool> {
         }
     };
 
-    for x in 0..w {
-        seed(x, 0, &mut filled, &mut queue);
-        seed(x, h - 1, &mut filled, &mut queue);
+    // bbox が与えられていれば、その矩形の縁から塗り始める。
+    //
+    // bbox の外は色によらず背景と確定しているので、フィルの起点として画像の
+    // 外周より内側にある矩形の縁のほうが正しい。画像の外周からしか塗れないと、
+    // 途中に背景色から外れた領域（照明ムラや別の物体）があるだけでフィルが
+    // 遮られ、bbox の内側に一切届かなくなる。それでは bbox が「商品はここに
+    // ある」という指示ではなく、単なる切り取り枠に留まってしまう。
+    let (sx1, sy1, sx2, sy2) = bbox.unwrap_or((0, 0, w - 1, h - 1));
+    for x in sx1..=sx2 {
+        seed(x, sy1, &mut filled, &mut queue);
+        seed(x, sy2, &mut filled, &mut queue);
     }
-    for y in 0..h {
-        seed(0, y, &mut filled, &mut queue);
-        seed(w - 1, y, &mut filled, &mut queue);
+    for y in sy1..=sy2 {
+        seed(sx1, y, &mut filled, &mut queue);
+        seed(sx2, y, &mut filled, &mut queue);
     }
 
     while let Some((x, y)) = queue.pop_front() {
@@ -358,6 +372,43 @@ mod tests {
             render(&mask)
         );
         assert_eq!(mask.stats().bbox, Some((2, 1, 3, 3)));
+    }
+
+    #[test]
+    fn the_bbox_edge_seeds_the_fill_when_the_image_border_is_blocked() {
+        // 画像の外周と商品の間に背景色から外れた領域（照明ムラや別の物体）が
+        // あると、外周からのフィルはそこで止まり bbox の内側に届かない。
+        // bbox の縁を起点に加えることで、その内側の背景を消せるようにする。
+        let bg = [250, 250, 250];
+        let mut img = RgbaImage::from_pixel(40, 40, Rgba([bg[0], bg[1], bg[2], 255]));
+
+        // 外周からのフィルを遮る枠（背景色から大きく外れた色）
+        for i in 8..32 {
+            for (x, y) in [(i, 8), (i, 31), (8, i), (31, i)] {
+                img.put_pixel(x, y, Rgba([20, 90, 160, 255]));
+            }
+        }
+        // 枠の内側は背景色。その中央に商品を置く
+        for y in 16..24 {
+            for x in 16..24 {
+                img.put_pixel(x, y, Rgba([200, 40, 30, 255]));
+            }
+        }
+
+        let opts = FloodOptions {
+            tolerance: 12.0,
+            bbox: Some((9, 9, 30, 30)),
+            edge_threshold: 0.0,
+            ..Default::default()
+        };
+        let mask = foreground_mask(&img, bg, &opts);
+
+        assert!(mask.is_foreground(20, 20), "商品は残る");
+        assert!(
+            !mask.is_foreground(12, 12),
+            "bbox の内側の背景色は消える（外周からは到達できない位置）"
+        );
+        assert!(!mask.is_foreground(2, 2), "bbox の外は背景");
     }
 
     #[test]

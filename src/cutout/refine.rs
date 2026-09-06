@@ -628,10 +628,15 @@ fn band_map(
             if !binary.is_foreground(x, y) || !binary.touches_background(x, y) {
                 continue;
             }
-            let Some(normal) = binary.outward_normal(x, y) else {
-                continue;
+            let width = match binary.outward_normal(x, y) {
+                Some(normal) => {
+                    transition_width(image, binary, background, x, y, normal, min_r, max_r)
+                }
+                // 幅 1px の構造では背景が両側にあって法線が打ち消し合う。
+                // 遷移幅は測れないが、帯を張らないとその画素だけ二値のまま
+                // 取り残され、色が背景寄りでも不透明で残ってしまう
+                None => min_r,
             };
-            let width = transition_width(image, binary, background, x, y, normal, min_r, max_r);
             paint_disc(&mut band, w, h, x, y, width);
         }
     }
@@ -941,6 +946,35 @@ mod tests {
                 "x={x} でタイルの継ぎ目が出ている"
             );
         }
+    }
+
+    /// 幅 1px の構造にも帯が張られること。
+    ///
+    /// 背景が両側にある画素では法線が打ち消し合い、`outward_normal` が None を
+    /// 返す。以前はそこで帯を諦めていたので、髪の毛やワイヤーのような 1px の
+    /// 構造だけが二値のまま取り残されていた。
+    ///
+    /// 帯を張ってもアルファそのものは 1 のままである（近傍に被覆率 1 の画素が
+    /// 無いので F が決められない。docs/design.md 4.5 を参照）。ここで確かめるのは
+    /// 「帯の外として黙って飛ばされない」ことで、その周囲の画素は色から
+    /// 決め直されるようになる。
+    #[test]
+    fn a_one_pixel_wide_structure_still_gets_a_band() {
+        let (w, h) = (40u32, 12u32);
+        let bg = [250u8, 250, 249];
+        let product = [40u8, 40, 45];
+        let mut img = RgbaImage::from_pixel(w, h, Rgba([bg[0], bg[1], bg[2], 255]));
+        let mut mask = Mask::new(w, h, 0);
+        for y in 0..h {
+            img.put_pixel(20, y, Rgba([product[0], product[1], product[2], 255]));
+            mask.set(20, y, 255);
+        }
+        assert_eq!(mask.outward_normal(20, 6), None, "前提: 法線は決まらない");
+        let band = band_map(&img, &mask, bg, &RefineOptions::default());
+        assert!(
+            band[6 * (w as usize) + 20] > 0,
+            "幅 1px の構造に帯が張られていない"
+        );
     }
 
     /// 帯より細い構造でも、代役前景が本体と同じ濃さの色を返すこと。

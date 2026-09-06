@@ -146,6 +146,311 @@ pub fn write_jpeg(dir: &Path, name: &str, img: &RgbaImage) -> PathBuf {
     path
 }
 
+/// 境界品質を測るための合成シーン。
+///
+/// 真の被覆率を解析的に持たせるのが要点。切り抜き結果を「見た目」ではなく
+/// 「1画素あたり何割が商品か」という正解と突き合わせられるようにする。
+/// これがないと境界のずれやハローを数値で追えず、改善したつもりで悪化する。
+#[derive(Clone)]
+pub struct EdgeScene {
+    pub name: &'static str,
+    pub width: u32,
+    pub height: u32,
+    pub background: [u8; 3],
+    pub product: [u8; 3],
+    /// 輪郭が背景へ溶けるまでの距離(px)。1.0 で「くっきり」、8.0 で「柔らかい」
+    pub softness: f32,
+    /// 商品の真下に落ち影を置く
+    pub shadow: bool,
+    /// 商品の上に伸びる細いストラップの幅(px)
+    pub strap: Option<u32>,
+    /// JPEG で往復させる際の品質。None なら非圧縮
+    pub jpeg: Option<u8>,
+    /// 背景に乗せるセンサーノイズの振幅
+    pub noise: f32,
+}
+
+impl Default for EdgeScene {
+    fn default() -> Self {
+        Self {
+            name: "",
+            width: 600,
+            height: 600,
+            background: [248, 248, 247],
+            product: [190, 70, 55],
+            softness: 1.0,
+            shadow: false,
+            strap: None,
+            jpeg: Some(90),
+            noise: 1.5,
+        }
+    }
+}
+
+/// 合成した画像と、その画素ごとの正解。
+pub struct EdgeTruth {
+    pub image: RgbaImage,
+    /// 真の被覆率 0.0-1.0
+    pub coverage: Vec<f32>,
+    /// 商品形状の符号付き距離(px)。正が外側
+    pub distance: Vec<f32>,
+    /// 落ち影の強さ。商品に覆われた画素では 0
+    pub shadow: Vec<f32>,
+    /// ストラップの芯（被覆率がほぼ 1 の部分）
+    pub strap: Vec<bool>,
+}
+
+impl EdgeTruth {
+    fn index(&self, x: u32, y: u32) -> usize {
+        (y as usize) * (self.image.width() as usize) + (x as usize)
+    }
+}
+
+/// 角丸矩形の符号付き距離関数。
+fn rect_sdf(px: f32, py: f32, cx: f32, cy: f32, hx: f32, hy: f32, corner: f32) -> f32 {
+    let qx = (px - cx).abs() - (hx - corner);
+    let qy = (py - cy).abs() - (hy - corner);
+    qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - corner
+}
+
+/// シーンから画像と正解を生成する。
+pub fn edge_scene(scene: &EdgeScene) -> EdgeTruth {
+    let (w, h) = (scene.width, scene.height);
+    let (fw, fh) = (w as f32, h as f32);
+    let (cx, cy) = (fw / 2.0, fh / 2.0);
+    let (rx, ry) = (fw * 0.28, fh * 0.34);
+    let corner = rx.min(ry) * 0.3;
+    let n = (w as usize) * (h as usize);
+
+    let mut rng = Rng::new();
+    let mut image = RgbaImage::new(w, h);
+    let mut coverage = vec![0f32; n];
+    let mut distance = vec![0f32; n];
+    let mut shadow = vec![0f32; n];
+    let mut strap = vec![false; n];
+
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y as usize) * (w as usize) + (x as usize);
+            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+            let mut d = rect_sdf(fx, fy, cx, cy, rx, ry, corner);
+            if let Some(sw) = scene.strap {
+                let top = fh * 0.08;
+                let bottom = cy - ry + corner;
+                let ds = rect_sdf(
+                    fx,
+                    fy,
+                    cx,
+                    (top + bottom) / 2.0,
+                    sw as f32 / 2.0,
+                    (bottom - top) / 2.0,
+                    0.0,
+                );
+                if ds < d {
+                    d = ds;
+                    if ds <= -0.5 {
+                        strap[i] = true;
+                    }
+                }
+            }
+            let c = (0.5 - d / scene.softness).clamp(0.0, 1.0);
+            let nz = rng.jitter(scene.noise);
+            let mut rgb = [
+                scene.background[0] as f32 + nz,
+                scene.background[1] as f32 + nz,
+                scene.background[2] as f32 + nz,
+            ];
+            let mut sh = 0.0;
+            if scene.shadow {
+                let sx = (fx - cx) / (rx * 1.1);
+                let sy = (fy - (cy + ry * 0.95)) / (ry * 0.16);
+                let v = 1.0 - (sx * sx + sy * sy);
+                if v > 0.0 {
+                    sh = v.min(1.0) * 0.35;
+                    for k in &mut rgb {
+                        *k *= 1.0 - sh;
+                    }
+                }
+            }
+            if c > 0.0 {
+                let t = fy / fh;
+                for (k, slot) in rgb.iter_mut().enumerate() {
+                    let base = scene.product[k] as f32 * (1.15 - 0.35 * t);
+                    *slot = *slot * (1.0 - c) + base.clamp(0.0, 255.0) * c;
+                }
+            }
+            image.put_pixel(
+                x,
+                y,
+                Rgba([
+                    rgb[0].round().clamp(0.0, 255.0) as u8,
+                    rgb[1].round().clamp(0.0, 255.0) as u8,
+                    rgb[2].round().clamp(0.0, 255.0) as u8,
+                    255,
+                ]),
+            );
+            coverage[i] = c;
+            distance[i] = d;
+            shadow[i] = if c > 0.0 { 0.0 } else { sh };
+        }
+    }
+
+    if let Some(q) = scene.jpeg {
+        image = jpeg_roundtrip(&image, q);
+    }
+
+    EdgeTruth {
+        image,
+        coverage,
+        distance,
+        shadow,
+        strap,
+    }
+}
+
+/// JPEG で往復させる。実素材の境界には必ず圧縮由来の滲みが乗るため。
+pub fn jpeg_roundtrip(image: &RgbaImage, quality: u8) -> RgbaImage {
+    use image::codecs::jpeg::JpegEncoder;
+    let rgb = image::DynamicImage::ImageRgba8(image.clone()).to_rgb8();
+    let mut buf = Vec::new();
+    JpegEncoder::new_with_quality(&mut buf, quality)
+        .encode_image(&rgb)
+        .unwrap();
+    image::load_from_memory_with_format(&buf, image::ImageFormat::Jpeg)
+        .unwrap()
+        .to_rgba8()
+}
+
+/// 切り抜き結果の境界品質。値の意味は各フィールドのコメントを参照。
+#[derive(Debug, Clone, Default)]
+pub struct EdgeMetrics {
+    /// 境界位置のずれ(px)。正ならマスクが真の輪郭より外へ膨らんでいる
+    pub offset: f32,
+    /// 背景色のままなのに不透明になった画素の割合(0.0-1.0)。ハローの温床
+    pub rim: f32,
+    /// 商品なのに削られた画素の割合(0.0-1.0)
+    pub eaten: f32,
+    /// 境界近傍のアルファ誤差（真の被覆率との平均絶対誤差）
+    pub alpha_mae: f32,
+    /// 黒地に合成したときに境界の外側が持つ輝度。0 が理想
+    pub halo: f32,
+    /// 白地に合成したときの、商品内部の輝度誤差
+    pub white_error: f32,
+    /// ストラップの芯のうち前景として残った割合(0.0-1.0)。シーンに無ければ NaN
+    pub strap_kept: f32,
+    /// 落ち影のうち前景として残った割合(0.0-1.0)。シーンに無ければ NaN
+    pub shadow_kept: f32,
+}
+
+fn luma(p: [u8; 4]) -> f32 {
+    0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32
+}
+
+/// 切り抜き結果を正解と突き合わせる。
+pub fn measure_edges(
+    truth: &EdgeTruth,
+    output: &RgbaImage,
+    mask: &kiri::cutout::Mask,
+) -> EdgeMetrics {
+    let (w, h) = (truth.image.width(), truth.image.height());
+
+    // 左辺の中央付近で、真の輪郭とマスクの輪郭の距離を測る。
+    // 真の輪郭は符号付き距離の符号反転位置から亜画素で補間する
+    let cy = h / 2;
+    let ry = (h as f32 * 0.34) as u32;
+    let mut offsets = Vec::new();
+    for y in (cy - ry / 2)..(cy + ry / 2) {
+        let true_x = (1..w).find(|&x| truth.coverage[truth.index(x, y)] >= 0.5);
+        let mask_x = (0..w).find(|&x| mask.get(x, y) >= 128);
+        if let (Some(tx), Some(mx)) = (true_x, mask_x) {
+            let d = truth.distance[truth.index(tx, y)];
+            let dp = truth.distance[truth.index(tx - 1, y)];
+            let edge = (tx as f32 - 1.0) + dp / (dp - d) + 0.5;
+            offsets.push(edge - mx as f32);
+        }
+    }
+    let offset = offsets.iter().sum::<f32>() / offsets.len().max(1) as f32;
+
+    let (mut rim, mut rim_n) = (0u32, 0u32);
+    let (mut eaten, mut eaten_n) = (0u32, 0u32);
+    let (mut mae, mut mae_n) = (0f32, 0u32);
+    let (mut halo, mut halo_n) = (0f32, 0u32);
+    let (mut white, mut white_n) = (0f32, 0u32);
+    let (mut strap_kept, mut strap_n) = (0u32, 0u32);
+    let (mut shadow_kept, mut shadow_n) = (0u32, 0u32);
+
+    for y in 0..h {
+        for x in 0..w {
+            let i = truth.index(x, y);
+            let a = mask.get(x, y);
+            let c = truth.coverage[i];
+            let d = truth.distance[i];
+            let fg = a >= 128;
+            let lit = truth.shadow[i] < 0.02;
+
+            if c == 0.0 && d <= 6.0 && lit {
+                rim_n += 1;
+                if fg {
+                    rim += 1;
+                }
+            }
+            if c == 1.0 && d >= -6.0 {
+                eaten_n += 1;
+                if !fg {
+                    eaten += 1;
+                }
+            }
+            if d.abs() <= 3.0 && lit {
+                mae += (a as f32 / 255.0 - c).abs();
+                mae_n += 1;
+            }
+
+            let p = output.get_pixel(x, y).0;
+            let af = p[3] as f32 / 255.0;
+            if c == 0.0 && d > 0.0 && d <= 4.0 && lit {
+                halo += luma(p) * af;
+                halo_n += 1;
+            }
+            if c == 1.0 && d >= -4.0 {
+                let original = truth.image.get_pixel(x, y).0;
+                let composited = luma(p) * af + 255.0 * (1.0 - af);
+                white += (composited - luma(original)).abs();
+                white_n += 1;
+            }
+            if truth.strap[i] {
+                strap_n += 1;
+                if fg {
+                    strap_kept += 1;
+                }
+            }
+            if truth.shadow[i] > 0.1 {
+                shadow_n += 1;
+                if fg {
+                    shadow_kept += 1;
+                }
+            }
+        }
+    }
+
+    let ratio = |num: u32, den: u32| -> f32 {
+        if den == 0 {
+            f32::NAN
+        } else {
+            num as f32 / den as f32
+        }
+    };
+    EdgeMetrics {
+        offset,
+        rim: ratio(rim, rim_n.max(1)),
+        eaten: ratio(eaten, eaten_n.max(1)),
+        alpha_mae: mae / mae_n.max(1) as f32,
+        halo: halo / halo_n.max(1) as f32,
+        white_error: white / white_n.max(1) as f32,
+        strap_kept: ratio(strap_kept, strap_n),
+        shadow_kept: ratio(shadow_kept, shadow_n),
+    }
+}
+
 /// 白背景に「ほぼ白い商品」を置いた、切り抜きの最難ケース。
 ///
 /// 商品本体と背景の色差はごくわずかで、両者を分ける手がかりは商品の輪郭に

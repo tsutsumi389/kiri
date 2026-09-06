@@ -2129,3 +2129,132 @@ fn separability_is_reported_as_null_rather_than_omitted() {
         "キーは常に存在すべき"
     );
 }
+
+#[test]
+fn cutout_reports_the_edge_diagnostics() {
+    // separability は境界の内側を測るため、前景の外側に残った背景色の縁を
+    // 検出できない。縁そのものを測る値を別に返す
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        product: [40, 40, 45],
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            dir.path().join("cut.png").to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let json = json_stdout(&out);
+    let halo = json["mask"]["halo_ratio"]
+        .as_f64()
+        .expect("halo_ratio がない");
+    let width = json["mask"]["edge_width"]
+        .as_f64()
+        .expect("edge_width がない");
+    assert!(halo < 0.05, "既定の経路で縁が残っている: {halo}");
+    assert!(width > 0.0, "境界の遷移幅が測れていない: {width}");
+}
+
+#[test]
+fn no_refine_falls_back_to_the_old_boundary_handling() {
+    // 逃げ道が実際に別の結果を出すこと。旧経路はマスクの形からアルファを作るため、
+    // エッジ堤防が残す背景色の縁がそのまま不透明で残る
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        product: [40, 40, 45],
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let halo = |args: &[&str]| -> f64 {
+        let mut cmd = kiri();
+        cmd.args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            dir.path().join("cut.png").to_str().unwrap(),
+            "--force",
+            "--json",
+        ]);
+        cmd.args(args);
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        json_stdout(&out)["mask"]["halo_ratio"].as_f64().unwrap()
+    };
+
+    let refined = halo(&[]);
+    let legacy = halo(&["--no-refine"]);
+    assert!(
+        legacy > refined + 0.05,
+        "--no-refine で旧挙動に戻っていない: {legacy} vs {refined}"
+    );
+}
+
+#[test]
+fn batch_accepts_the_refine_key() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        ..Default::default()
+    });
+    write_png(dir.path(), "a.png", &img);
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        r#"{"defaults":{"refine":false},
+             "items":[{"input":"a.png","output":"out.png"}]}"#,
+    )
+    .unwrap();
+
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(json_stdout(&out)["succeeded"], 1);
+}
+
+#[test]
+fn a_misspelled_refine_key_suggests_the_right_one() {
+    let dir = fixture_dir();
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        r#"{"items":[{"input":"a.png","output":"b.png","refien":false}]}"#,
+    )
+    .unwrap();
+
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let json = json_stdout(&out);
+    assert_eq!(json["error"]["code"], "SPEC_UNKNOWN_FIELD");
+    assert!(
+        json["error"]["hint"].as_str().unwrap().contains("refine"),
+        "候補に refine が出ていない: {}",
+        json["error"]["hint"]
+    );
+}

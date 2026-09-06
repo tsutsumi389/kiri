@@ -150,7 +150,7 @@ pub struct CutoutArgs {
     #[arg(long, default_value_t = 2)]
     pub cleanup: u32,
 
-    /// 境界の階調を色から決められなかった箇所で使うフェザリング半径(px)。0 で無効
+    /// 境界の階調を色から決められなかった箇所で使うフェザリング半径(px)。0 で無効（--no-refine では境界全体に掛かる）
     #[arg(long, default_value_t = 1)]
     pub feather: u32,
 

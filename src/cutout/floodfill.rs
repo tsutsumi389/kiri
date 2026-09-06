@@ -34,7 +34,7 @@ use std::collections::VecDeque;
 
 use image::RgbaImage;
 
-use crate::color::lab::{delta_e76_f32, linear_to_lab, srgb_linear_lut};
+use crate::color::lab::{linear_to_lab, srgb_linear_lut};
 use crate::cutout::edges::edge_ridges;
 use crate::cutout::mask::Mask;
 
@@ -114,18 +114,30 @@ pub fn foreground_mask(image: &RgbaImage, background: [u8; 3], opts: &FloodOptio
 
     let two_stage = opts.step_tolerance > 0.0 && opts.core_tolerance > 0.0;
     let protected = protected_pixels(w, h, &opts.fg_seeds);
+    // 堤防は Lab の表より**先**に作って先に捨てる。どちらも 12MP では 3 桁 MB を
+    // 占めるので、生存期間が重なるかどうかだけでピーク RSS が 100MB 単位で変わる
+    let dam = (opts.edge_threshold > 0.0).then(|| edge_ridges(image, opts.edge_threshold as f32));
     let lut = srgb_linear_lut();
-    let lab = lab_map(image, lut);
-    let bg_lab = linear_to_lab([
+    let bg_lab = quantize(linear_to_lab([
         lut[background[0] as usize],
         lut[background[1] as usize],
         lut[background[2] as usize],
-    ]);
-    let candidates = classify(image, &lab, bg_lab, opts, &protected, two_stage);
+    ]));
+    let lab = lab_map(image, lut);
+    let candidates = classify(
+        image,
+        &lab,
+        bg_lab,
+        opts,
+        protected.as_deref(),
+        two_stage,
+        dam.as_deref(),
+    );
+    drop(dam);
     let step = opts.step_tolerance as f32;
 
     let mut is_background = if two_stage {
-        let core = fill_from_border(w, h, &candidates.strict, opts.bbox);
+        let core = fill_from_border(w, h, |i| candidates.has(i, STRICT), opts.bbox);
         if core.iter().any(|&b| b) {
             let stage = Expansion {
                 candidates: &candidates,
@@ -136,7 +148,7 @@ pub fn foreground_mask(image: &RgbaImage, background: [u8; 3], opts: &FloodOptio
             };
             // 第2段。商品を守るフィルはここまでで完結している
             let plain = expand(w, h, core, &stage);
-            if candidates.shadow.iter().any(|&s| s) {
+            if candidates.any(SHADOW) {
                 // 第3段。影候補へさらに広げる。ここだけは堤防を無視するので、
                 // 第2段の背景から `shadow_reach` px 以内に閉じ込める
                 expand(
@@ -155,11 +167,14 @@ pub fn foreground_mask(image: &RgbaImage, background: [u8; 3], opts: &FloodOptio
         } else {
             // 芯が 1 画素も取れなかった＝外周が推定背景色から離れている。
             // ここで諦めると全面が前景になってしまうので、従来の 1 段フィルへ落とす
-            fill_from_border(w, h, &candidates.loose, opts.bbox)
+            fill_from_border(w, h, |i| candidates.has(i, LOOSE), opts.bbox)
         }
     } else {
-        fill_from_border(w, h, &candidates.loose, opts.bbox)
+        fill_from_border(w, h, |i| candidates.has(i, LOOSE), opts.bbox)
     };
+    // ここから先で Lab は使わない。12MP では 72MB あるので、
+    // 測地的オープニングの作業領域と重ねない
+    drop(lab);
 
     // bbox の外側は、色に関わらず背景として扱う。
     // AI が「商品はここにある」と判断した結果をここで効かせる。
@@ -181,49 +196,101 @@ pub fn foreground_mask(image: &RgbaImage, background: [u8; 3], opts: &FloodOptio
     }
 
     // 保護された画素は最後に前景へ戻す（bbox 指定より優先する）
-    let foreground: Vec<bool> = is_background
-        .iter()
-        .zip(protected.iter())
-        .map(|(&bg, &prot)| prot || !bg)
-        .collect();
+    let foreground: Vec<bool> = match &protected {
+        Some(protected) => is_background
+            .iter()
+            .zip(protected.iter())
+            .map(|(&bg, &prot)| prot || !bg)
+            .collect(),
+        None => is_background.iter().map(|&bg| !bg).collect(),
+    };
 
     Mask::from_bools(w, h, &foreground)
 }
+
+/// Lab を固定小数で持つときの倍率。1 目盛りが ΔE 1/256。
+///
+/// sRGB が取りうる Lab の範囲（L 0-100、a -87..98、b -108..95）を 256 倍しても
+/// i16 に収まる。刻みは ΔE 0.004 で、段差の判定（しきい値 2.2 前後、下限でも
+/// 0.8 程度）に対して 3 桁小さい。
+const LAB_SCALE: f32 = 256.0;
+
+/// 固定小数の Lab。
+///
+/// `[f32; 3]` で持つと 12MP で 144MB になり、これ 1 本でピーク RSS の
+/// 半分近くを占めていた。判定に要る精度は上のとおり桁違いに粗いので、
+/// i16 に落として 72MB にする。
+type LabQ = [i16; 3];
 
 /// 画素ごとの Lab。
 ///
 /// 段差の判定には隣接画素同士の色差が要るので、フィルの最中に都度変換すると
 /// 同じ画素を何度も変換することになる。一度だけ作って引く。
-fn lab_map(image: &RgbaImage, lut: &[f32; 256]) -> Vec<[f32; 3]> {
+fn lab_map(image: &RgbaImage, lut: &[f32; 256]) -> Vec<LabQ> {
     image
         .pixels()
-        .map(|p| linear_to_lab([lut[p[0] as usize], lut[p[1] as usize], lut[p[2] as usize]]))
+        .map(|p| {
+            quantize(linear_to_lab([
+                lut[p[0] as usize],
+                lut[p[1] as usize],
+                lut[p[2] as usize],
+            ]))
+        })
         .collect()
 }
 
+fn quantize(lab: [f32; 3]) -> LabQ {
+    // f32 → 整数の `as` は飽和するので、想定外の値が来ても巻き戻らない
+    [
+        (lab[0] * LAB_SCALE) as i16,
+        (lab[1] * LAB_SCALE) as i16,
+        (lab[2] * LAB_SCALE) as i16,
+    ]
+}
+
+/// 固定小数どうしの CIE76 色差。差は i16 に収まらないので i32 で取る。
+fn delta_e_q(a: LabQ, b: LabQ) -> f32 {
+    let d = |k: usize| (i32::from(a[k]) - i32::from(b[k])) as f32;
+    let (dl, da, db) = (d(0), d(1), d(2));
+    (dl * dl + da * da + db * db).sqrt() / LAB_SCALE
+}
+
+/// 芯に入れてよい画素（背景と言い切れる）。第2段以降は段差の検査を免除する。
+const STRICT: u8 = 1 << 0;
+/// 第2段で吸収してよい画素。堤防を織り込んである。
+const LOOSE: u8 = 1 << 1;
+/// 第3段で吸収してよい影の候補。堤防は織り込まない。
+const SHADOW: u8 = 1 << 2;
 /// 画素の素性。3 つの段すべてがここを参照する。
-struct Candidates {
-    /// 芯に入れてよい画素（背景と言い切れる）。第2段以降は段差の検査を免除する
-    strict: Vec<bool>,
-    /// 第2段で吸収してよい画素。堤防を織り込んである
-    loose: Vec<bool>,
-    /// 第3段で吸収してよい影の候補。堤防は織り込まない
-    shadow: Vec<bool>,
+///
+/// 素性ごとに `Vec<bool>` を持つと、12MP では 4 本で 48MB になる。判定はどれも
+/// 1bit で足りるので 1 画素 1 バイトのフラグにまとめ、12MB に収める。
+struct Candidates(Vec<u8>);
+
+impl Candidates {
+    fn has(&self, i: usize, flag: u8) -> bool {
+        self.0[i] & flag != 0
+    }
+
+    fn any(&self, flag: u8) -> bool {
+        self.0.iter().any(|&f| f & flag != 0)
+    }
 }
 
 /// 各画素が背景候補かどうかを判定する。既に透明な画素は無条件に背景とする。
 ///
-/// `edge_threshold` が有効なとき、輪郭上の画素は色が背景に近くても候補から外す。
-/// これがなければ、淡い色の商品は落ち影を消せる許容量の下で必ず飲み込まれてしまう。
+/// `dam`（勾配の稜線）が与えられたとき、輪郭上の画素は色が背景に近くても
+/// 候補から外す。これがなければ、淡い色の商品は落ち影を消せる許容量の下で
+/// 必ず飲み込まれてしまう。
 fn classify(
     image: &RgbaImage,
-    lab: &[[f32; 3]],
-    bg_lab: [f32; 3],
+    lab: &[LabQ],
+    bg_lab: LabQ,
     opts: &FloodOptions,
-    protected: &[bool],
+    protected: Option<&[bool]>,
     two_stage: bool,
+    dam: Option<&[bool]>,
 ) -> Candidates {
-    let gradient = (opts.edge_threshold > 0.0).then(|| edge_ridges(image));
     let tolerance = opts.tolerance as f32;
     let core = opts.core_tolerance as f32;
     // 影の専用判定は第2段の段差の検査とセットで初めて安全になる。
@@ -235,18 +302,14 @@ fn classify(
         0.0
     };
 
-    let n = lab.len();
-    let mut strict = vec![false; n];
-    let mut loose = vec![false; n];
-    let mut shadowy = vec![false; n];
+    let mut flags = vec![0u8; lab.len()];
 
     for (i, p) in image.pixels().enumerate() {
-        if protected[i] {
+        if protected.is_some_and(|p| p[i]) {
             continue;
         }
         if p[3] == 0 {
-            strict[i] = true;
-            loose[i] = true;
+            flags[i] = STRICT | LOOSE;
             continue;
         }
         // 影候補には堤防を適用しない。
@@ -259,24 +322,28 @@ fn classify(
         //
         // 代わりに、影の吸収は第2段の背景から `shadow_reach` px 以内に
         // 閉じ込める。堤防を外した分の危険は距離で抑える
-        shadowy[i] = is_shadow(lab[i], bg_lab, shadow);
-
+        let mut f = 0u8;
+        if is_shadow(lab[i], bg_lab, shadow) {
+            f |= SHADOW;
+        }
+        let d = delta_e_q(lab[i], bg_lab);
         // let-chain は Rust 1.88 以降。MSRV 1.85 を保つためネストで書く
-        if let Some(g) = &gradient {
-            if f64::from(g[i]) > opts.edge_threshold {
+        if let Some(g) = dam {
+            if g[i] {
+                flags[i] = f;
                 continue;
             }
         }
-        let d = delta_e76_f32(lab[i], bg_lab);
-        strict[i] = d <= core;
-        loose[i] = d <= tolerance;
+        if d <= core {
+            f |= STRICT;
+        }
+        if d <= tolerance {
+            f |= LOOSE;
+        }
+        flags[i] = f;
     }
 
-    Candidates {
-        strict,
-        loose,
-        shadow: shadowy,
-    }
+    Candidates(flags)
 }
 
 /// 落ち影らしさ。彩度はほぼ動かさず明度だけを下げる画素を影候補とする。
@@ -284,17 +351,18 @@ fn classify(
 /// 背景より**明るい**画素は対象外にする。グレー背景での映り込みや光沢は
 /// 明度が上がる方向に出るが、それを影と同じ規則で飲み込むと、白背景に置いた
 /// 白い商品のハイライトを消してしまう。
-fn is_shadow(lab: [f32; 3], bg_lab: [f32; 3], shadow_tolerance: f32) -> bool {
+fn is_shadow(lab: LabQ, bg_lab: LabQ, shadow_tolerance: f32) -> bool {
     if shadow_tolerance <= 0.0 {
         return false;
     }
-    let drop = bg_lab[0] - lab[0];
+    let drop = f32::from(bg_lab[0] - lab[0]) / LAB_SCALE;
     if drop <= 0.0 || drop > shadow_tolerance {
         return false;
     }
-    let da = lab[1] - bg_lab[1];
-    let db = lab[2] - bg_lab[2];
-    da.hypot(db) <= SHADOW_CHROMA
+    let da = f32::from(lab[1] - bg_lab[1]) / LAB_SCALE;
+    let db = f32::from(lab[2] - bg_lab[2]) / LAB_SCALE;
+    // 平方のまま比べる。全画素で呼ぶので、平方根を取るだけの理由が無い
+    da * da + db * db <= SHADOW_CHROMA * SHADOW_CHROMA
 }
 
 /// 先が平坦な段差に許す色差を、`step_tolerance` のこの割合まで絞る。
@@ -315,7 +383,7 @@ const RIDGE_RATIO: f32 = 2.0;
 #[derive(Clone, Copy)]
 struct Expansion<'a> {
     candidates: &'a Candidates,
-    lab: &'a [[f32; 3]],
+    lab: &'a [LabQ],
     /// 1px あたりに許す色差(ΔE)
     step_tolerance: f32,
     /// 影候補も吸収するか
@@ -354,14 +422,31 @@ fn expand(w: u32, h: u32, seed: Vec<bool>, stage: &Expansion) -> Vec<bool> {
     let stride = w as usize;
     let idx = |x: u32, y: u32| (y as usize) * stride + (x as usize);
     let floor = step_tolerance * RIDGE_FLOOR;
-    // 起点からの測地距離。起点そのものは 0、そこから 1px 進むごとに 1 増える
+    // 起点からの測地距離。起点そのものは 0、そこから 1px 進むごとに 1 増える。
+    //
+    // 距離を数えるのは影の段だけなので、その段でしか確保しない。12MP では
+    // `u32` の表が 48MB あり、使わない段でも積むと丸ごと無駄になる。
+    // 進める距離は `shadow_reach` の上限 64px までなので 1 バイトで足りる
+    // （万一それを超える指定が来ても、飽和して早く止まるだけで壊れない）
     let limit = reach.unwrap_or(u32::MAX);
-    let mut distance = vec![0u32; filled.len()];
+    let mut distance = reach.map(|_| vec![0u8; filled.len()]);
 
+    // キューに積むのは「まだ埋まっていない 4 近傍を持つ画素」だけにする。
+    //
+    // 種は前段の背景そのもので、12MP では 700 万画素に達する。全部積むと
+    // `VecDeque` の倍化だけで 100MB を超えるが、隣がすべて埋まっている画素を
+    // 取り出しても何も起きないので、結果は変わらない
     let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
     for y in 0..h {
         for x in 0..w {
-            if filled[idx(x, y)] {
+            if !filled[idx(x, y)] {
+                continue;
+            }
+            let open = (x > 0 && !filled[idx(x - 1, y)])
+                || (y > 0 && !filled[idx(x, y - 1)])
+                || (x + 1 < w && !filled[idx(x + 1, y)])
+                || (y + 1 < h && !filled[idx(x, y + 1)]);
+            if open {
                 queue.push_back((x, y));
             }
         }
@@ -369,7 +454,11 @@ fn expand(w: u32, h: u32, seed: Vec<bool>, stage: &Expansion) -> Vec<bool> {
 
     // 進行方向の先で続いている変化量。画像の外へ出る向きでは測れないので、
     // その場合は「いくらでも続いている」とみなして段差の検査を見送る。
-    // 端で止めると見切れた商品の周りに背景が残るほうが害が大きい
+    // 端で止めると見切れた商品の周りに背景が残るほうが害が大きい。
+    //
+    // 副作用として、画像の端から 2px の帯では段差の検査が働かない。見切れた
+    // 商品はそこで削れる可能性があるが、その帯には「輪郭の外側」が無いので
+    // どのみち色の手がかりが足りない
     let ahead_change = |nx: u32, ny: u32, dx: i64, dy: i64| -> f32 {
         let here = lab[idx(nx, ny)];
         let mut change = f32::INFINITY;
@@ -378,7 +467,7 @@ fn expand(w: u32, h: u32, seed: Vec<bool>, stage: &Expansion) -> Vec<bool> {
             if ax < 0 || ay < 0 || ax >= i64::from(w) || ay >= i64::from(h) {
                 return f32::INFINITY;
             }
-            let d = delta_e76_f32(lab[idx(ax as u32, ay as u32)], here) / step as f32;
+            let d = delta_e_q(lab[idx(ax as u32, ay as u32)], here) / step as f32;
             change = if step == 1 { d } else { change.max(d) };
         }
         change
@@ -386,7 +475,7 @@ fn expand(w: u32, h: u32, seed: Vec<bool>, stage: &Expansion) -> Vec<bool> {
 
     while let Some((x, y)) = queue.pop_front() {
         let from = lab[idx(x, y)];
-        let travelled = distance[idx(x, y)];
+        let travelled = distance.as_ref().map_or(0, |d| u32::from(d[idx(x, y)]));
         if travelled >= limit {
             continue;
         }
@@ -395,13 +484,13 @@ fn expand(w: u32, h: u32, seed: Vec<bool>, stage: &Expansion) -> Vec<bool> {
             if filled[i] {
                 return;
             }
-            if !candidates.loose[i] && !(with_shadow && candidates.shadow[i]) {
+            if !candidates.has(i, LOOSE) && !(with_shadow && candidates.has(i, SHADOW)) {
                 return;
             }
             // 芯に入れてよい色なら段差は問わない。背景と言い切れる画素を
             // 段差で弾くと、圧縮ノイズの多い背景に穴が残る
-            if !candidates.strict[i] {
-                let step = delta_e76_f32(lab[i], from);
+            if !candidates.has(i, STRICT) {
+                let step = delta_e_q(lab[i], from);
                 let allowance =
                     step_tolerance.min(RIDGE_RATIO * ahead_change(nx, ny, dx, dy) + floor);
                 if step > allowance {
@@ -409,7 +498,9 @@ fn expand(w: u32, h: u32, seed: Vec<bool>, stage: &Expansion) -> Vec<bool> {
                 }
             }
             filled[i] = true;
-            distance[i] = travelled + 1;
+            if let Some(d) = distance.as_mut() {
+                d[i] = u8::try_from(travelled + 1).unwrap_or(u8::MAX);
+            }
             q.push_back((nx, ny));
         };
         if x > 0 {
@@ -464,7 +555,8 @@ fn seal_narrow_gaps(w: u32, h: u32, background: &[bool], radius: u32) -> Vec<boo
     }
 
     // 外周から届く芯だけを残す
-    let reachable = fill_from_border(w, h, &trusted, None);
+    let reachable = fill_from_border(w, h, |i| trusted[i], None);
+    drop(trusted);
     let grown = dilate_bools(w, h, &reachable, radius);
 
     grown
@@ -522,19 +614,22 @@ fn separable(w: u32, h: u32, src: &[bool], radius: u32, take_max: bool) -> Vec<b
 /// 外周を起点に 4 近傍で塗り広げる。
 ///
 /// 4 近傍にしているのは、8 近傍だと斜めの隙間を通って商品内部へ漏れるため。
+///
+/// 候補かどうかは添字を受ける関数で問う。素性のフラグから真偽値の表を
+/// 作り直させないためで、12MP では 1 本 12MB になる。
 fn fill_from_border(
     w: u32,
     h: u32,
-    candidate: &[bool],
+    candidate: impl Fn(usize) -> bool,
     bbox: Option<(u32, u32, u32, u32)>,
 ) -> Vec<bool> {
-    let mut filled = vec![false; candidate.len()];
+    let mut filled = vec![false; (w as usize) * (h as usize)];
     let mut queue = VecDeque::new();
     let idx = |x: u32, y: u32| (y as usize) * (w as usize) + (x as usize);
 
     let seed = |x: u32, y: u32, filled: &mut Vec<bool>, queue: &mut VecDeque<(u32, u32)>| {
         let i = idx(x, y);
-        if candidate[i] && !filled[i] {
+        if candidate(i) && !filled[i] {
             filled[i] = true;
             queue.push_back((x, y));
         }
@@ -560,7 +655,7 @@ fn fill_from_border(
     while let Some((x, y)) = queue.pop_front() {
         let visit = |nx: u32, ny: u32, filled: &mut Vec<bool>, q: &mut VecDeque<(u32, u32)>| {
             let i = idx(nx, ny);
-            if candidate[i] && !filled[i] {
+            if candidate(i) && !filled[i] {
                 filled[i] = true;
                 q.push_back((nx, ny));
             }
@@ -582,12 +677,18 @@ fn fill_from_border(
     filled
 }
 
-/// `--fg-seed` の周囲を保護領域として塗る。
+/// `--fg-seed` の周囲を保護領域として塗る。種が無ければ表そのものを作らない。
 ///
 /// 前景の色を推定して領域ごと救い出す方式は、種が背景と同色だった場合に
 /// 背景全体を巻き込む危険がある。ここでは半径を固定した円に限定し、
 /// 挙動が予測できることを優先している。
-fn protected_pixels(w: u32, h: u32, seeds: &[(u32, u32)]) -> Vec<bool> {
+///
+/// 種の指定は例外的な救済手段で、ほとんどの呼び出しでは空である。
+/// 12MP では表 1 本で 12MB あるので、空のときは `None` を返す。
+fn protected_pixels(w: u32, h: u32, seeds: &[(u32, u32)]) -> Option<Vec<bool>> {
+    if seeds.is_empty() {
+        return None;
+    }
     let mut protected = vec![false; (w as usize) * (h as usize)];
     let r = FG_SEED_RADIUS as i64;
     for &(sx, sy) in seeds {
@@ -607,7 +708,7 @@ fn protected_pixels(w: u32, h: u32, seeds: &[(u32, u32)]) -> Vec<bool> {
             }
         }
     }
-    protected
+    Some(protected)
 }
 
 #[cfg(test)]

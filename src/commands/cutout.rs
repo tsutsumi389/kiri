@@ -58,15 +58,18 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     let mut warnings = loaded.warnings();
     warnings.extend(result.warnings.clone());
 
-    let (final_image, canvas) = match args.canvas {
+    // キャンバスを使わないときは切り抜き結果をそのまま書き出す。複製すると
+    // 12MP で 48MB を余分に積み、batch の並列度ぶんだけ倍になる
+    let (placed, canvas) = match args.canvas {
         Some((cw, ch)) => {
             let (image, report) = place_on_canvas(&result, cw, ch, args, &mut warnings)?;
-            (image, Some(report))
+            (Some(image), Some(report))
         }
-        None => (result.image.clone(), None),
+        None => (None, None),
     };
+    let final_image = placed.as_ref().unwrap_or(&result.image);
 
-    let (output_report, save_warnings) = output::write_image(&final_image, &args.out, format)?;
+    let (output_report, save_warnings) = output::write_image(final_image, &args.out, format)?;
     warnings.extend(save_warnings);
 
     let preview = write_preview(
@@ -74,7 +77,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         preview_format,
         &loaded.image,
         &result.mask,
-        &final_image,
+        final_image,
         &mut warnings,
     );
 

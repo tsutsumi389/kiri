@@ -9,15 +9,8 @@
 
 use image::RgbaImage;
 
-/// Sobel による勾配強度を求める。
-///
-/// 値は「1px あたりの輝度変化量」に正規化してある。輝度 34 の段差なら
-/// おおよそ 34 が返るため、しきい値を輝度の差として直感的に指定できる。
-pub fn gradient_magnitude(image: &RgbaImage) -> Vec<f32> {
-    ridges(image, false)
-}
-
-/// 非極大抑制で稜線を細線化した勾配強度。堤防にはこちらを使う。
+/// 非極大抑制で稜線を細線化し、`threshold` を超えた画素だけを立てた表。
+/// 堤防にはこれを使う。
 ///
 /// Sobel の応答は 1px の段差に対しても輪郭の**両側**に立つ。JPEG の滲みが
 /// 加わると厚さは 3-4px に達し、その帯の画素がすべてフィルの侵入を拒む。
@@ -34,12 +27,30 @@ pub fn gradient_magnitude(image: &RgbaImage) -> Vec<f32> {
 ///
 /// 平坦な傾斜（落ち影のような一定勾配）は極大を持たないため、まるごと落ちる。
 /// これは望ましい。堤防が守るべきなのは段差であって傾斜ではない。
-pub fn edge_ridges(image: &RgbaImage) -> Vec<f32> {
-    ridges(image, true)
+///
+/// 強度ではなく真偽値を返すのは、呼び出し側がしきい値との比較しかしないため。
+/// 12MP では f32 の表というだけで 48MB を積むので、返した先で捨てられる
+/// 精度に払う値段としては高すぎる。
+pub fn edge_ridges(image: &RgbaImage, threshold: f32) -> Vec<bool> {
+    let (w, h) = (image.width() as usize, image.height() as usize);
+    let mut out = vec![false; w * h];
+    if w < 3 || h < 3 {
+        return out;
+    }
+    let (magnitude, direction) = sobel(image, w, h);
+    suppress(w, h, &magnitude, &direction, |i, m| out[i] = m > threshold);
+    out
 }
 
-fn ridges(image: &RgbaImage, suppress: bool) -> Vec<f32> {
-    let (w, h) = (image.width() as usize, image.height() as usize);
+/// Sobel の勾配強度と向き。
+///
+/// 値は「1px あたりの輝度変化量」に正規化してある。輝度 34 の段差なら
+/// おおよそ 34 が返るため、しきい値を輝度の差として直感的に指定できる。
+///
+/// 輝度の表はこの関数の中で捨てる。12MP では輝度・強度・向き・出力の 4 本が
+/// 同時に生きると 156MB になり、フラッドフィルの Lab 表と重なった瞬間に
+/// ピーク RSS を押し上げていた。
+fn sobel(image: &RgbaImage, w: usize, h: usize) -> (Vec<f32>, Vec<u8>) {
     let luma: Vec<f32> = image
         .pixels()
         .map(|p| 0.2126 * f32::from(p[0]) + 0.7152 * f32::from(p[1]) + 0.0722 * f32::from(p[2]))
@@ -47,10 +58,6 @@ fn ridges(image: &RgbaImage, suppress: bool) -> Vec<f32> {
 
     let mut magnitude = vec![0.0f32; w * h];
     let mut direction = vec![0u8; w * h];
-    if w < 3 || h < 3 {
-        return magnitude;
-    }
-
     for y in 1..h - 1 {
         for x in 1..w - 1 {
             let at = |dx: usize, dy: usize| luma[(y + dy - 1) * w + (x + dx - 1)];
@@ -61,15 +68,24 @@ fn ridges(image: &RgbaImage, suppress: bool) -> Vec<f32> {
             direction[y * w + x] = octant(gx, gy);
         }
     }
-    if !suppress {
-        return magnitude;
-    }
+    (magnitude, direction)
+}
 
-    // 勾配の向きに沿った両隣と比べ、極大でなければ落とす。
-    // 手前側は「以上」、奥側は「より大きい」で比べる。段差の応答は 2px の
-    // 平坦な山になるので、両側とも「以上」にすると 2px のまま残り、両側とも
-    // 「より大きい」にすると山がまるごと消えてしまう
-    let mut out = vec![0.0f32; w * h];
+/// 勾配の向きに沿った両隣と比べ、極大でなければ落とす。
+///
+/// 手前側は「以上」、奥側は「より大きい」で比べる。段差の応答は 2px の
+/// 平坦な山になるので、両側とも「以上」にすると 2px のまま残り、両側とも
+/// 「より大きい」にすると山がまるごと消えてしまう。
+///
+/// 結果を溜める器は呼び出し側に決めさせる。本番は真偽値だけ、テストは強度を
+/// そのまま見たい、という違いのために f32 の表を作らずに済む。
+fn suppress(
+    w: usize,
+    h: usize,
+    magnitude: &[f32],
+    direction: &[u8],
+    mut keep: impl FnMut(usize, f32),
+) {
     for y in 1..h - 1 {
         for x in 1..w - 1 {
             let i = y * w + x;
@@ -81,11 +97,10 @@ fn ridges(image: &RgbaImage, suppress: bool) -> Vec<f32> {
             let back = magnitude[(y as isize - dy) as usize * w + (x as isize - dx) as usize];
             let ahead = magnitude[(y as isize + dy) as usize * w + (x as isize + dx) as usize];
             if m >= back && m > ahead {
-                out[i] = m;
+                keep(i, m);
             }
         }
     }
-    out
 }
 
 /// 勾配の向きを 4 方向へ量子化した際の隣接オフセット。
@@ -106,6 +121,33 @@ fn octant(gx: f32, gy: f32) -> u8 {
     } else {
         3
     }
+}
+
+/// 細線化する前の勾配強度。
+///
+/// 本番からは使わない。堤防は真偽値しか要らないので、強度の表を作るだけ無駄に
+/// なる。しきい値の意味（輝度の段差そのもの）が保たれているかを確かめるのは
+/// この関数の役目で、テストからのみ呼ぶ。
+#[cfg(test)]
+fn gradient_magnitude(image: &RgbaImage) -> Vec<f32> {
+    let (w, h) = (image.width() as usize, image.height() as usize);
+    if w < 3 || h < 3 {
+        return vec![0.0; w * h];
+    }
+    sobel(image, w, h).0
+}
+
+/// 細線化した後の勾配強度。`edge_ridges` がしきい値を掛ける前の値。
+#[cfg(test)]
+fn ridge_magnitude(image: &RgbaImage) -> Vec<f32> {
+    let (w, h) = (image.width() as usize, image.height() as usize);
+    let mut out = vec![0.0f32; w * h];
+    if w < 3 || h < 3 {
+        return out;
+    }
+    let (magnitude, direction) = sobel(image, w, h);
+    suppress(w, h, &magnitude, &direction, |i, m| out[i] = m);
+    out
 }
 
 #[cfg(test)]
@@ -180,7 +222,7 @@ mod tests {
         for (w, h) in [(1u32, 1u32), (2, 2), (1, 9), (9, 1)] {
             let img = RgbaImage::from_pixel(w, h, Rgba([10, 10, 10, 255]));
             assert_eq!(gradient_magnitude(&img).len(), (w * h) as usize);
-            assert_eq!(edge_ridges(&img).len(), (w * h) as usize);
+            assert_eq!(edge_ridges(&img, 8.0).len(), (w * h) as usize);
         }
     }
 
@@ -190,16 +232,23 @@ mod tests {
     fn suppression_thins_the_response_to_a_single_column() {
         let img = gray_step(9, 250, 216);
         let raw = gradient_magnitude(&img);
-        let thin = edge_ridges(&img);
-        let count = |g: &[f32]| (0..9).filter(|&x| g[4 * 9 + x] > 8.0).count();
-        assert_eq!(count(&raw), 2, "前提が崩れている: 素の Sobel は 2px に立つ");
-        assert_eq!(count(&thin), 1, "細線化できていない");
+        let thin = edge_ridges(&img, 8.0);
+        assert_eq!(
+            (0..9).filter(|&x| raw[4 * 9 + x] > 8.0).count(),
+            2,
+            "前提が崩れている: 素の Sobel は 2px に立つ"
+        );
+        assert_eq!(
+            (0..9).filter(|&x| thin[4 * 9 + x]).count(),
+            1,
+            "細線化できていない"
+        );
     }
 
     #[test]
     fn suppression_keeps_the_peak_value() {
         // しきい値は「輝度の段差」として指定する契約なので、強度は変えない
-        let thin = edge_ridges(&gray_step(9, 250, 216));
+        let thin = ridge_magnitude(&gray_step(9, 250, 216));
         let peak = thin.iter().cloned().fold(0.0f32, f32::max);
         assert!(
             (peak - 34.0).abs() < 2.0,
@@ -222,7 +271,7 @@ mod tests {
             }
         }
         let raw = gradient_magnitude(&img);
-        let thin = edge_ridges(&img);
+        let thin = ridge_magnitude(&img);
         let count = |g: &[f32]| {
             (1..8u32)
                 .flat_map(|y| (5..30u32).map(move |x| (y * 40 + x) as usize))
@@ -247,9 +296,9 @@ mod tests {
                 img.put_pixel(x, y, Rgba([v, v, v, 255]));
             }
         }
-        let thin = edge_ridges(&img);
+        let thin = edge_ridges(&img, 8.0);
         for y in 2..18u32 {
-            let on_row = (1..19u32).any(|x| thin[(y * 20 + x) as usize] > 8.0);
+            let on_row = (1..19u32).any(|x| thin[(y * 20 + x) as usize]);
             assert!(on_row, "y={y} の行に稜線が無い");
         }
     }

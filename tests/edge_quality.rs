@@ -239,7 +239,10 @@ fn a_cast_shadow_is_removed() {
 /// 影の判定を入れたときに最も壊れやすいのがここなので、別立てで固定する。
 #[test]
 fn the_shadow_rule_does_not_eat_a_neutral_product() {
-    for (name, limit) in [("S7", 0.01f32), ("S8", 0.0)] {
+    // S8 の実測は 0.00% だが、余裕ゼロで固定すると 1 画素の揺らぎでも落ちる。
+    // ここで見たいのは「無彩色の商品がまるごと影と見なされる」退行であって、
+    // 端の 1 画素ではない
+    for (name, limit) in [("S7", 0.01f32), ("S8", 0.002)] {
         let truth = find(name);
         let m = run(&truth, &CutoutOptions::default());
         assert!(

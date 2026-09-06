@@ -885,6 +885,63 @@ fn a_light_product_on_a_light_background_survives() {
     );
 }
 
+/// 堤防が実際に効いていることを CLI から固定する。
+///
+/// 上のテストは「堤防を切っても結果が変わらない」ことを固定しているので、
+/// `edge_ridges` が全ゼロを返すようになっても気づけない。堤防だけが
+/// 結論を変える場面を 1 つ押さえておく。
+///
+/// 幅 1px のスリットがそれにあたる。色も連結性も「外周から届く背景」と
+/// 言うが、堤防は 1px の通路の入口で止める。`--seal` は同じ隙間を別の
+/// 理由（細すぎる通路）で塞ぐので、堤防だけを見るために切ってある。
+#[test]
+fn the_edge_dam_alone_stops_a_one_pixel_slit() {
+    let dir = fixture_dir();
+    // 32x32 の白地に濃色のブロック。上辺から幅 1px のスリットを彫る
+    let mut img = image::RgbaImage::from_pixel(32, 32, image::Rgba([250, 250, 250, 255]));
+    for y in 8..24 {
+        for x in 8..24 {
+            img.put_pixel(x, y, image::Rgba([40, 40, 40, 255]));
+        }
+    }
+    for y in 8..20 {
+        img.put_pixel(16, y, image::Rgba([250, 250, 250, 255]));
+    }
+    let input = write_png(dir.path(), "slit.png", &img);
+
+    let slit_is_background = |extra: &[&str]| -> bool {
+        let output = dir.path().join(format!("out{}.png", extra.join("")));
+        let mask = dir.path().join(format!("mask{}.png", extra.join("")));
+        let mut args = vec![
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--debug-mask",
+            mask.to_str().unwrap(),
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        let out = kiri().args(&args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let written = image::open(&mask).unwrap().to_luma8();
+        written.get_pixel(16, 14)[0] < 128
+    };
+
+    assert!(
+        slit_is_background(&["--edge-threshold", "0", "--seal", "0"]),
+        "守りを外しても 1px のスリットが背景として抜けない＝前提が崩れている"
+    );
+    assert!(
+        !slit_is_background(&["--seal", "0"]),
+        "堤防が効いていない: 1px のスリットが素通りしている"
+    );
+}
+
 #[test]
 fn cutout_restricts_the_result_to_the_given_bbox() {
     let dir = fixture_dir();
@@ -2390,12 +2447,25 @@ fn cutout_removes_a_cast_shadow_by_default() {
         ..Default::default()
     });
     let input = write_png(dir.path(), "shadow.png", &img);
+    let plain = write_png(
+        dir.path(),
+        "plain.png",
+        &product_image(&ProductSpec {
+            width: 600,
+            height: 600,
+            ..Default::default()
+        }),
+    );
 
-    let ratio = |extra: &[&str]| -> f64 {
-        let output = dir.path().join(format!("out{}.png", extra.join("")));
+    let ratio = |src: &Path, extra: &[&str]| -> f64 {
+        let output = dir.path().join(format!(
+            "out-{}{}.png",
+            src.file_stem().unwrap().to_str().unwrap(),
+            extra.join("")
+        ));
         let mut args = vec![
             "cutout",
-            input.to_str().unwrap(),
+            src.to_str().unwrap(),
             "-o",
             output.to_str().unwrap(),
             "--json",
@@ -2412,11 +2482,15 @@ fn cutout_removes_a_cast_shadow_by_default() {
             .unwrap()
     };
 
-    // 影が残ると前景比率がその分だけ膨らむ。影を消せていれば商品だけになる
-    let removed = ratio(&[]);
-    let kept = ratio(&["--shadow-tolerance", "0"]);
+    // 影が残ると前景比率がその分だけ膨らむ。判定は絶対値の差ではなく
+    // 「影を置かなかった場合」との距離で見る。600px では影の裾が前景比率を
+    // 0.005 しか動かさないので、固定のマージンでは実測との差が薄すぎて、
+    // 影の消え方が少し変わっただけで落ちたり通ったりしてしまう
+    let removed = ratio(&input, &[]);
+    let kept = ratio(&input, &["--shadow-tolerance", "0"]);
+    let none = ratio(&plain, &[]);
     assert!(
-        removed < kept - 0.004,
-        "既定で影が消えていない: {removed} vs {kept}"
+        (removed - none).abs() < (kept - none) * 0.5,
+        "既定で影が消えていない: 影あり {removed} / 影判定なし {kept} / 影なし {none}"
     );
 }

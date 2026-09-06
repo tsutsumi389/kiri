@@ -438,6 +438,42 @@ fn unsupported_input_format_exits_with_input_error() {
     );
 }
 
+/// HEIC は読めないが、読めないことと次の一手はきちんと返す。
+///
+/// 実ファイルはリポジトリに置かない（数 MB になる上、pure Rust では
+/// デコードできないのでフィクスチャとしての用が無い）。判別は先頭の
+/// `ftyp` ボックスだけで決まるので、そこだけ持つダミーで固定できる。
+#[test]
+fn a_heic_input_is_refused_with_a_conversion_hint() {
+    let dir = fixture_dir();
+    let input = dir.path().join("IMG_0251.HEIC");
+    let mut heic = 24u32.to_be_bytes().to_vec();
+    heic.extend_from_slice(b"ftypheic");
+    heic.extend_from_slice(&0u32.to_be_bytes());
+    heic.extend_from_slice(b"mif1heic");
+    std::fs::write(&input, heic).unwrap();
+
+    let out = kiri()
+        .args(["info", input.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(3));
+    let v = json_stdout(&out);
+    assert_eq!(v["error"]["code"], "UNSUPPORTED_FORMAT");
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("HEIC"),
+        "何が未対応かを言うべき: {message}"
+    );
+    let hint = v["error"]["hint"].as_str().unwrap();
+    assert!(hint.contains("sips"), "macOS での手順が要る: {hint}");
+    assert!(
+        hint.contains("magick") || hint.contains("heif-convert"),
+        "macOS 以外での手順が要る: {hint}"
+    );
+}
+
 #[test]
 fn unknown_output_extension_exits_with_argument_error() {
     let dir = fixture_dir();

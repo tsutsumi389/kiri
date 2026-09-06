@@ -10,6 +10,7 @@ use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, RgbaImage};
 
 use crate::color::icc::{self, Interpretation};
 use crate::error::{Error, Result};
+use crate::image_io::heif;
 
 /// 読み込み時の振る舞い。
 #[derive(Debug, Clone, Copy)]
@@ -77,6 +78,13 @@ pub fn load_with(path: &Path, opts: &LoadOptions) -> Result<LoadedImage> {
         )
         .with_hint("パスと読み取り権限を確認してください")
     })?;
+
+    // HEIF 系は `image` が形式すら判別できず「判別不能」に落ちる。素材の出所が
+    // iPhone だと分かっているのに手詰まりのメッセージを返すのは不親切なので、
+    // 先に自前で見分けて変換手順まで示す
+    if let Some(family) = heif::detect(&bytes) {
+        return Err(heif::unsupported(family));
+    }
 
     let reader = ImageReader::new(std::io::Cursor::new(&bytes))
         .with_guessed_format()
@@ -331,6 +339,23 @@ mod tests {
             assert!(!applied, "orientation {value} を適用してはいけない");
             assert_eq!((img.width(), img.height()), (2, 3));
         }
+    }
+
+    /// 読み込みの入口で HEIC が弾かれること。検出そのものの網羅は `heif` 側にある。
+    #[test]
+    fn a_heif_input_explains_how_to_convert_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.HEIC");
+        let mut heic = 24u32.to_be_bytes().to_vec();
+        heic.extend_from_slice(b"ftypheic");
+        heic.extend_from_slice(&0u32.to_be_bytes());
+        heic.extend_from_slice(b"mif1heic");
+        std::fs::write(&path, heic).unwrap();
+
+        let err = load(&path).err().expect("HEIC は断るべき");
+        assert_eq!(err.code, "UNSUPPORTED_FORMAT");
+        assert_eq!(err.exit_code(), 3);
+        assert!(err.hint.unwrap().contains("sips"));
     }
 
     /// ICC 付きの実ファイルを通した経路。単体の変換が正しくても、

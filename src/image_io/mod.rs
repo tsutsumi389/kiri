@@ -1,3 +1,4 @@
+pub mod heif;
 pub mod load;
 pub mod save;
 

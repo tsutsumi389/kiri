@@ -13,7 +13,7 @@ use crate::image_io::load;
 use crate::report::InfoReport;
 
 pub fn run(args: &InfoArgs) -> Result<InfoReport> {
-    let loaded = load::load(&args.input)?;
+    let loaded = load::load_with(&args.input, &args.color.to_load_options())?;
     let background = estimate_background(&loaded.image, args.border);
 
     let mut warnings = loaded.warnings();
@@ -32,7 +32,9 @@ pub fn run(args: &InfoArgs) -> Result<InfoReport> {
         format: format_name(loaded.format).to_string(),
         exif_orientation: loaded.exif_orientation,
         orientation_applied: loaded.orientation_applied,
-        color_space: loaded.color_space.as_str().to_string(),
+        color_space: loaded.color_space.clone(),
+        color_profile: loaded.color_profile.clone(),
+        color_converted: loaded.color_converted,
         icc_profile: loaded.icc_profile,
         has_alpha: loaded.has_alpha,
         background: background_report(&background),

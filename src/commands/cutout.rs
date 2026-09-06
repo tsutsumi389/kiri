@@ -22,7 +22,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     output::ensure_writable(&args.out)?;
     let preview_format = check_side_outputs(args)?;
 
-    let loaded = load::load(&args.input)?;
+    let loaded = load::load_with(&args.input, &args.color.to_load_options())?;
     let (w, h) = (loaded.width(), loaded.height());
 
     let bbox = args
@@ -86,6 +86,9 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             height: h,
         },
         outputs: vec![output_report],
+        color_space: loaded.color_space.clone(),
+        color_profile: loaded.color_profile.clone(),
+        color_converted: loaded.color_converted,
         background: output::background_report(&result.background),
         settings: SettingsReport {
             tolerance: opts.tolerance,

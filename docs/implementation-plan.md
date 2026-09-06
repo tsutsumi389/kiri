@@ -16,10 +16,13 @@ src/
   error.rs             エラー型 → exit code のマッピング
   report.rs            JSON 出力の構造体（serde）
   image_io/
-    load.rs            JPEG/PNG 読み込み + EXIF Orientation 正規化
+    load.rs            JPEG/PNG 読み込み + EXIF Orientation 正規化 + ICC → sRGB
+    heif.rs            HEIC/AVIF の判別と、変換手順を添えたエラー
     save.rs            AVIF/PNG/JPEG 書き出し、拡張子からの形式推論
   color/
     lab.rs             sRGB ↔ Lab 変換、知覚的色距離（ΔE）
+    icc.rs             埋め込み ICC の解釈と sRGB への変換（行列 + TRC 型のみ）
+    synthetic.rs       テスト用の合成 ICC 生成（#[cfg(test)]）
   cutout/
     background.rs      背景色推定、uniformity とテクスチャ（外周の勾配分布）算出
     floodfill.rs       外周シードの連結フラッドフィル
@@ -56,6 +59,10 @@ src/
 ### 3.1 ユニットテスト
 
 - **Lab変換**: 既知の値で検証（純白 → L=100、純黒 → L=0）
+- **ICC 変換**: 合成 ICC をテスト内で組み立てて検証する。実写ファイルを置かずに済み、
+  かつ「Display P3 の原色が sRGB でクランプされる」「中性グレーが中性のまま L* を保つ」
+  「sRGB では恒等」といった性質を数値で固定できる。**ColorSync（`sips --matchTo`）との
+  突き合わせは実写でしか取れないので、数値は PR の記録に残し、テストには持ち込まない**
 - **フラッドフィル**: 手書きの小さなビットマップで期待マスクを検証。**白背景×白商品の穴あきケースを必ず含める**（最重要）
 - **EXIF Orientation**: 8方向すべて
 - **canvas / fill_ratio**: 座標計算
@@ -151,6 +158,9 @@ MSRV の検査を CI に入れるのは、**宣言だけ置いても検査しな
         高さを決める）
   - [x] 孤立ノイズの面積を解像度に追従させる（`--cleanup` を長辺 1000px 換算の
         半径として読み替える。20MP の織り目 150px² が既定で消える）
+  - [x] 埋め込み ICC（Display P3 / AdobeRGB 等）から sRGB への変換、
+        `color_space` / `color_converted` の報告、`--no-color-convert`
+  - [x] HEIC 入力を明確に断り、変換手順をヒントで返す
   - [ ] 輪郭のコントラストが ΔE 9 を下回る素材への対処（現状は限界として文書化）
   - [ ] README の整備、実素材での既定値の再調整
   - [ ] リリース用 CI

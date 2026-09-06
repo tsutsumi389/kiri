@@ -9,7 +9,7 @@ use std::time::Instant;
 use rayon::prelude::*;
 
 use crate::batch::{self, BatchItem, ItemSettings};
-use crate::cli::{BatchArgs, CutoutArgs, OutputOpts, parse_hex_color, parse_size};
+use crate::cli::{BatchArgs, ColorOpts, CutoutArgs, OutputOpts, parse_hex_color, parse_size};
 use crate::commands::cutout;
 use crate::cutout::DEFAULT_BORDER;
 use crate::error::{Error, Result};
@@ -125,6 +125,9 @@ fn to_cutout_args(
         feather: settings.feather.unwrap_or(1),
         no_despill: !settings.despill.unwrap_or(true),
         no_refine: !settings.refine.unwrap_or(true),
+        color: ColorOpts {
+            no_color_convert: !settings.color_convert.unwrap_or(true),
+        },
         // 未指定は未指定のまま渡す。既定値で埋めてしまうと、テクスチャに応じた
         // 自動調整が spec を書いた人の「8 を指定した」と区別できなくなる
         edge_threshold: checked_opt(settings.edge_threshold, "edge_threshold")?,
@@ -231,5 +234,12 @@ mod tests {
         assert_eq!(args.seal, defaults.seal, "seal の既定値");
         assert_eq!(!args.no_despill, defaults.despill, "デスピルの既定");
         assert_eq!(!args.no_refine, defaults.refine, "アルファ再推定の既定");
+        // 色変換だけ既定値の持ち主が CutoutOptions ではなく LoadOptions になる。
+        // 読み込み側の設定なので、切り抜きの設定に混ぜるとかえって追えない
+        assert_eq!(
+            !args.color.no_color_convert,
+            crate::image_io::LoadOptions::default().convert_color,
+            "color_convert の既定値"
+        );
     }
 }

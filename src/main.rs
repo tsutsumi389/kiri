@@ -112,11 +112,19 @@ fn print_info(report: &InfoReport) {
             ""
         }
     );
+    // 名乗りが色空間名と食い違うときは名乗りのほうを出す。sRGB 相当と判定して
+    // 素通ししたとき、どのプロファイルが付いていたのかがここでしか分からない
+    let icc = match &report.color_profile {
+        Some(name) if *name != report.color_space => format!(" (ICC '{name}')"),
+        _ if report.icc_profile => " (ICCあり)".to_string(),
+        _ => String::new(),
+    };
     println!(
-        "  色空間    {}{}",
+        "  色空間    {}{}{}",
         report.color_space,
-        if report.icc_profile {
-            " (ICCあり)"
+        icc,
+        if report.color_converted {
+            " → sRGB に変換"
         } else {
             ""
         }
@@ -145,7 +153,15 @@ fn print_process(report: &ProcessReport) {
             report.elapsed_ms
         );
     }
+    print_color(&report.color_space, report.color_converted);
     print_warnings(&report.warnings);
+}
+
+/// 色を触ったときだけ知らせる。sRGB の素材で毎回 1 行増えても意味がない。
+fn print_color(space: &str, converted: bool) {
+    if converted {
+        println!("  色空間    {space} → sRGB に変換");
+    }
 }
 
 fn print_cutout(report: &CutoutReport) {
@@ -161,6 +177,7 @@ fn print_cutout(report: &CutoutReport) {
             report.elapsed_ms
         );
     }
+    print_color(&report.color_space, report.color_converted);
     println!(
         "  背景色    #{r:02X}{g:02X}{b:02X}  (均一度 {:.2}, tolerance {})",
         report.background.uniformity, report.settings.tolerance

@@ -50,6 +50,8 @@ $ kiri info product.jpg --json
   "exif_orientation": 1,
   "orientation_applied": false,
   "color_space": "sRGB",
+  "color_converted": false,
+  "icc_profile": false,
   "has_alpha": false,
   "background": {
     "rgb": [249, 249, 247],
@@ -80,6 +82,62 @@ $ kiri info product.jpg --json
 画面の端で見切れていると外周の帯の 1 辺がまるごと商品になり、その商品が柄物なら
 `p90` は跳ねるが `p50` は動かない。
 
+| オプション | 既定値 | 説明 |
+|---|---|---|
+| `--border` | 2 | 背景色推定に使う外周の幅(px) |
+| `--no-color-convert` | | 埋め込み ICC を解釈せず、画素の値をそのまま使う |
+
+### 色空間の扱い
+
+**埋め込み ICC プロファイルは既定で sRGB へ変換する。** iPhone で撮った素材は
+Display P3 で入ってくる。これを sRGB として素通しすると彩度の高い色ほど誇張されて
+出るため、EC では「届いた商品が写真と違う」に直結する。
+
+```
+$ kiri info IMG_0251.jpg
+IMG_0251.jpg
+  寸法      4284 x 5712
+  形式      jpeg
+  EXIF回転  6 (適用済み)
+  色空間    Display P3 (ICCあり) → sRGB に変換
+  ...
+```
+
+`info` / `convert` / `resize` / `cutout` の JSON はすべて次の 3 つを返す。
+
+| キー | 意味 |
+|---|---|
+| `color_space` | 検出した色空間の名前（`sRGB` / `Display P3` / `Adobe RGB (1998)` / `uncalibrated` など） |
+| `color_profile` | 埋め込み ICC 自身の名乗り。ICC が無ければ出ない |
+| `color_converted` | 実際に sRGB へ変換したか |
+
+**どれか 1 つでは足りない。** 「sRGB と報告された」が素通しなのか変換済みなのかを
+区別できなければ、色ずれを検証しようがない。sRGB 相当と判定して素通しした場合は
+`color_space` が `sRGB` になるので、**何が埋まっていたのかは `color_profile`
+にしか残らない**（`"sRGB IEC61966-2.1"` など）。
+
+変換するのは**行列 + TRC 型のディスプレイプロファイル**に限る。Display P3、
+Adobe RGB (1998)、各種モニタプロファイルはすべてこの型に収まる。LUT 型（`A2B0` のみを
+持つもの）や CMYK / Gray は解釈せず、**その旨を警告して sRGB として扱う**。
+`lcms2` のような C 実装を持ち込まない方針の下では、LUT 型まで自前で背負うと
+割に合わないと判断した（[design.md](docs/design.md) の色管理の節を参照）。
+
+sRGB 相当のプロファイルは変換しない。判定は名前ではなく原色と TRC で行う（「sRGB」を
+名乗りながらガンマが違うプロファイルは実在するため）。往復の丸め誤差を足すだけであり、
+**sRGB 素材の出力バイト列はこの機能の前後で 1 バイトも変わらない。**
+
+> バイト一致は**同じバイナリを同じ環境で走らせたとき**の話である。色変換は `powf` を
+> 経由するので、libm の実装が違うプラットフォームやコンパイラの版をまたぐと最下位
+> ビットが揺れ得る。「同じ入力からは常に同じ出力」の保証もこの範囲を指す。
+
+`--no-color-convert` を付けると変換せず生の値を使う。**入力を読むコマンド
+（`info` / `convert` / `resize` / `cutout`）すべてで受け付ける**（`batch` の spec では
+`"color_convert": false`）。既定を変換に倒したぶん、生の値が要る場面で戻せないと
+詰むため用意している。
+
+変換にかかるコストは 12MP で **5ms 前後**、ピーク RSS の増加は **2MB**（Apple M4 Pro、
+`/usr/bin/time -l`）。画像を複製せずその場で書き換えるため、メモリはほぼ増えない。
+
 ### kiri convert
 
 形式変換のみを行う。
@@ -94,6 +152,7 @@ $ kiri convert product.jpg -o product.avif --json
 | `--quality` | 75 | 0-100。AVIF は75を超えるとサイズが急増する |
 | `--effort` | 6 | AVIFのエンコード速度 1-10。小さいほど高品質・低速 |
 | `--background` | `#FFFFFF` | 透過を保持できない形式へ出力する際の合成色 |
+| `--no-color-convert` | | 埋め込み ICC を解釈せず、画素の値をそのまま使う |
 | `--force` | | 出力先が既に存在する場合に上書きする |
 
 ### kiri resize
@@ -128,6 +187,19 @@ $ kiri resize small.jpg -o out.avif --width 3000 --json
 
 補間は Lanczos3。透過画像は事前乗算つきで補間するため、境界に背景色がにじまない。
 
+| オプション | 既定値 | 説明 |
+|---|---|---|
+| `--width` / `--height` | — | 出力の枠。一方だけならアスペクト比を保つ |
+| `--fit` | `contain` | 両方指定したときの枠への当てはめ方 |
+| `--allow-upscale` | | 元画像より大きくすることを許す |
+| `--format` | 拡張子から推論 | `avif` / `png` / `jpeg` |
+| `--quality` | 75 | 0-100。AVIF は75を超えるとサイズが急増する |
+| `--effort` | 6 | AVIFのエンコード速度 1-10。小さいほど高品質・低速 |
+| `--background` | `#FFFFFF` | 透過を保持できない形式へ出力する際の合成色 |
+| `--flatten` | | 透過を残さず `--background` の色で塗り潰す |
+| `--no-color-convert` | | 埋め込み ICC を解釈せず、画素の値をそのまま使う |
+| `--force` | | 出力先が既に存在する場合に上書きする |
+
 ### kiri cutout
 
 背景を透過して商品を切り抜く。**bbox は任意**で、未指定なら全自動で判定する。
@@ -160,6 +232,7 @@ product.png  1600x2000  png  841.4 KB  (338 ms)
 | `--canvas WxH` | — | 商品をこのサイズのキャンバス中央に配置する。`1000` と書けば正方形 |
 | `--fill-ratio` | 0.85 | 商品がキャンバスの何割を占めるか |
 | `--flatten` | | 透過を残さず `--background` の色で塗り潰す |
+| `--no-color-convert` | | 埋め込み ICC を解釈せず、画素の値をそのまま使う |
 | `--debug-mask PATH` | — | 生成したマスクを PNG で書き出す |
 | `--preview PATH` | — | 「元画像 \| マスク \| 結果」を1枚に並べた検証用画像を書き出す |
 | `--preview-size` | 512 | プレビューのパネル1枚あたりの長辺(px) |
@@ -366,6 +439,9 @@ $ kiri cutout product.jpg -o product.jpg --canvas 1000 --flatten --background "#
 
 ```json
 {
+  "color_space": "Display P3",
+  "color_profile": "Display P3",
+  "color_converted": true,
   "background": {
     "rgb": [249, 249, 247], "uniformity": 1.0,
     "perimeter_delta_e": { "p50": 0.4, "p90": 1.2, "max": 2.8 },
@@ -399,6 +475,7 @@ $ kiri cutout product.jpg -o product.jpg --canvas 1000 --flatten --background "#
 - `halo_ratio` が 0.10 を超えれば境界に背景色が残っている（警告が出る）
 - `edge_width` は鮮鋭な輪郭なら 1〜3。素材の遷移が広ければ 6 前後まで伸びるのが正常で、鮮鋭なはずの輪郭で 6 を超えたらぼやけている
 - `separability` / `halo_ratio` / `edge_width` は測れなければ `null`。0 ではない
+- `color_converted` が `true` なら、以降の数値はすべて sRGB へ変換した後の値
 - `settings` は**実際に効いた**設定。結果が期待と違ったとき、指定が効いたのか
   既定のまま走ったのかを画像を開かずに切り分けられる。`batch` は `defaults` と
   項目の継承が絡むので、項目ごとの結果にも同じものが入る
@@ -502,9 +579,9 @@ x broken.jpg  失敗
 
 `defaults` は全項目に適用され、項目側の指定が優先される。指定できるキーは `cutout` の
 オプションと対応する（`bbox` / `normalized` / `fg_seeds` / `tolerance` / `border` /
-`cleanup` / `feather` / `despill` / `refine` / `edge_threshold` / `step_tolerance` /
-`shadow_tolerance` / `seal` / `canvas` / `fill_ratio` / `format` / `quality` /
-`effort` / `background` / `flatten`）。
+`cleanup` / `feather` / `despill` / `refine` / `color_convert` / `edge_threshold` /
+`step_tolerance` / `shadow_tolerance` / `seal` / `canvas` / `fill_ratio` / `format` /
+`quality` / `effort` / `background` / `flatten`）。
 
 `edge_threshold` は CLI と同じく「書かない」と「`8` と書く」を区別する。書かなければ
 背景のテクスチャに応じて自動調整され、書けばその値に従う。
@@ -557,6 +634,35 @@ $ kiri batch spec.json --json
 
 WebP は実用的なロッシー圧縮に libwebp（C）が必要なため、AVIF入力はデコードに dav1d（C）が
 必要なため、いずれも非対応とした。依存ゼロの単一バイナリを優先した結果である。
+
+### HEIC / HEIF は読めない
+
+**iPhone で撮ったままの HEIC は入力にできない。** HEVC のデコーダは pure Rust に
+存在せず、libheif や libde265（いずれも C）を持ち込まなければ実装できない。
+入稿素材が iPhone 撮影であることは多いが、依存ゼロを崩す判断はしていない。
+
+代わりに**原因と手順を返す**。拡張子や形式の判別に失敗しただけのメッセージでは、
+エージェントは別の拡張子を試すような無駄な再試行に入るためである。
+
+```
+$ kiri info IMG_0251.HEIC --json
+{
+  "error": {
+    "code": "UNSUPPORTED_FORMAT",
+    "message": "HEIC/HEIF は入力として未対応です（pure Rust の HEVC/AV1 デコーダが無いため）",
+    "hint": "macOS: sips -s format jpeg -s formatOptions 95 in.heic --out in.jpg / その他: magick in.heic -quality 95 in.jpg（または libheif の heif-convert）"
+  }
+}
+```
+
+```
+# macOS なら追加インストールなしで変換できる
+$ sips -s format jpeg -s formatOptions 95 IMG_0251.HEIC --out IMG_0251.jpg
+$ kiri cutout IMG_0251.jpg -o out.avif --json
+```
+
+変換後の JPEG には Display P3 の ICC が埋め込まれたままだが、kiri が読み込み時に
+sRGB へ変換するので、そこで色が転ぶことはない。
 
 ## 対象範囲
 

@@ -118,6 +118,136 @@ fn info_detects_existing_transparency() {
     assert_eq!(v["has_alpha"], true);
 }
 
+// --- 色空間 ---
+
+/// ICC を持たない画像は sRGB として報告し、何も変換しない。
+#[test]
+fn info_reports_the_color_space_and_whether_it_was_converted() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 60,
+        height: 60,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let out = kiri()
+        .args(["info", input.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let v = json_stdout(&out);
+    assert_eq!(v["color_space"], "sRGB");
+    assert_eq!(v["color_converted"], false);
+    assert_eq!(v["icc_profile"], false);
+    assert!(v["warnings"].as_array().unwrap().is_empty());
+}
+
+/// 色空間はどのコマンドの結果からも読めること。
+///
+/// エージェントは cutout の JSON しか見ないことがある。そこに色の扱いが
+/// 出ていなければ、色がずれていても気づく手立てが無い。
+#[test]
+fn every_command_reports_the_color_space() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 80,
+        height: 80,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let path = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+
+    let runs: Vec<Vec<String>> = vec![
+        vec![
+            "convert".into(),
+            input.to_str().unwrap().into(),
+            "-o".into(),
+            path("c.png"),
+        ],
+        vec![
+            "resize".into(),
+            input.to_str().unwrap().into(),
+            "--width".into(),
+            "40".into(),
+            "-o".into(),
+            path("r.png"),
+        ],
+        vec![
+            "cutout".into(),
+            input.to_str().unwrap().into(),
+            "-o".into(),
+            path("k.png"),
+        ],
+    ];
+
+    for args in runs {
+        let out = kiri().args(&args).arg("--json").output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let v = json_stdout(&out);
+        assert_eq!(v["color_space"], "sRGB", "{args:?}");
+        assert_eq!(v["color_converted"], false, "{args:?}");
+        assert!(
+            v.get("color_profile").is_none(),
+            "ICC が無いのに名乗りが出ている: {args:?}"
+        );
+    }
+}
+
+/// `--no-color-convert` はどのコマンドでも受け付けること。
+#[test]
+fn no_color_convert_is_accepted_by_every_command() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 60,
+        height: 60,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let path = |name: &str| dir.path().join(name).to_str().unwrap().to_string();
+
+    let runs: Vec<Vec<String>> = vec![
+        vec!["info".into(), input.to_str().unwrap().into()],
+        vec![
+            "convert".into(),
+            input.to_str().unwrap().into(),
+            "-o".into(),
+            path("c.png"),
+        ],
+        vec![
+            "resize".into(),
+            input.to_str().unwrap().into(),
+            "--width".into(),
+            "30".into(),
+            "-o".into(),
+            path("r.png"),
+        ],
+        vec![
+            "cutout".into(),
+            input.to_str().unwrap().into(),
+            "-o".into(),
+            path("k.png"),
+        ],
+    ];
+
+    for args in runs {
+        let out = kiri()
+            .args(&args)
+            .args(["--no-color-convert", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        json_stdout(&out);
+    }
+}
+
 // --- convert ---
 
 #[test]
@@ -309,6 +439,42 @@ fn unsupported_input_format_exits_with_input_error() {
             .as_str()
             .unwrap()
             .starts_with("UNSUPPORTED")
+    );
+}
+
+/// HEIC は読めないが、読めないことと次の一手はきちんと返す。
+///
+/// 実ファイルはリポジトリに置かない（数 MB になる上、pure Rust では
+/// デコードできないのでフィクスチャとしての用が無い）。判別は先頭の
+/// `ftyp` ボックスだけで決まるので、そこだけ持つダミーで固定できる。
+#[test]
+fn a_heic_input_is_refused_with_a_conversion_hint() {
+    let dir = fixture_dir();
+    let input = dir.path().join("IMG_0251.HEIC");
+    let mut heic = 24u32.to_be_bytes().to_vec();
+    heic.extend_from_slice(b"ftypheic");
+    heic.extend_from_slice(&0u32.to_be_bytes());
+    heic.extend_from_slice(b"mif1heic");
+    std::fs::write(&input, heic).unwrap();
+
+    let out = kiri()
+        .args(["info", input.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(3));
+    let v = json_stdout(&out);
+    assert_eq!(v["error"]["code"], "UNSUPPORTED_FORMAT");
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("HEIC"),
+        "何が未対応かを言うべき: {message}"
+    );
+    let hint = v["error"]["hint"].as_str().unwrap();
+    assert!(hint.contains("sips"), "macOS での手順が要る: {hint}");
+    assert!(
+        hint.contains("magick") || hint.contains("heif-convert"),
+        "macOS 以外での手順が要る: {hint}"
     );
 }
 
@@ -1896,6 +2062,31 @@ fn a_misspelled_key_in_the_spec_is_reported_with_a_suggestion() {
     assert!(v["error"]["hint"].as_str().unwrap().contains("tolerance"));
 }
 
+/// 色変換の可否も spec から指定できること。
+///
+/// バッチは数百点を一度に回す。単発だけ `--no-color-convert` を持っていても、
+/// 本命の経路で指定できなければ意味がない。
+#[test]
+fn the_spec_accepts_color_convert() {
+    let dir = fixture_dir();
+    batch_fixture(dir.path(), 1);
+    let spec = write_spec(
+        dir.path(),
+        r#"{"defaults":{"color_convert":false,"format":"png"},
+            "items":[{"input":"p0.png","output":"a.png"}]}"#,
+    );
+
+    let out = run_batch(&spec, &[]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    assert_eq!(v["results"][0]["result"]["color_space"], "sRGB");
+    assert_eq!(v["results"][0]["result"]["color_converted"], false);
+}
+
 #[test]
 fn a_malformed_spec_is_rejected() {
     let dir = fixture_dir();
@@ -2498,6 +2689,13 @@ fn the_cli_defaults_match_the_library_defaults() {
     assert_eq!(args.seal, defaults.seal, "--seal の既定値");
     assert_eq!(!args.no_despill, defaults.despill, "デスピルの既定");
     assert_eq!(!args.no_refine, defaults.refine, "アルファ再推定の既定");
+    // 色変換だけ既定値の持ち主が CutoutOptions ではなく LoadOptions になる。
+    // 読み込み側の設定なので、切り抜きの設定に混ぜるとかえって追えない
+    assert_eq!(
+        !args.color.no_color_convert,
+        kiri::image_io::LoadOptions::default().convert_color,
+        "--no-color-convert の既定値"
+    );
 }
 
 /// `--help` が語る既定値が `DEFAULT_EDGE_THRESHOLD` と食い違っていないこと。

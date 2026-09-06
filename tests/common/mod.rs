@@ -394,6 +394,16 @@ pub struct EdgeMetrics {
     /// `rim` は輪郭の近傍しか見ないので、背景一面に散った織り目のゴミを
     /// 捉えられない。面積フィルタが解像度に追従しているかはここに出る
     pub speckles: f32,
+    /// 境界で復元した色の彩度が、同じ行の商品色の彩度からどれだけ離れたか(0-255)の p90。
+    ///
+    /// `halo` と `白地誤差` は輝度しか見ないので、輪郭が明るいか暗いかしか
+    /// 分からない。復元式 F=(C-(1-a)B)/a は 1/a 倍の増幅なので、崩れるときは
+    /// **チャンネルごとに違う量**で崩れる。輝度は合っているのに輪郭だけ
+    /// 緑や紫の点線になる状態がこれで、目にはハローより目立つ。
+    ///
+    /// 彩度の大きさしか見ないので、緑寄りとマゼンタ寄りは区別しない。
+    /// 「商品には無い色が輪郭にだけ乗った」ことを捉えるための粗い網である
+    pub cast: f32,
 }
 
 fn luma(p: [u8; 4]) -> f32 {
@@ -433,6 +443,27 @@ pub fn measure_edges(
     let (mut strap_kept, mut strap_n) = (0u32, 0u32);
     let (mut shadow_kept, mut shadow_n) = (0u32, 0u32);
     let (mut speckles, mut speckles_n) = (0u32, 0u32);
+    let mut casts: Vec<f32> = Vec::new();
+
+    // 各行の「商品そのものの色」。境界の彩度はこれと比べる。照明の傾きが
+    // あるので、行ごとに内部の画素から取り直す。
+    //
+    // 1 点で代表させると、JPEG のリンギングとセンサーノイズで行ごとに数段
+    // ふらつく。行の内部画素の中央値を採る
+    let chroma =
+        |p: [u8; 4]| f32::from(p[..3].iter().max().unwrap() - p[..3].iter().min().unwrap());
+    let inner_chroma: Vec<f32> = (0..h)
+        .map(|y| {
+            let mut row: Vec<f32> = (0..w)
+                .filter(|&x| {
+                    let i = truth.index(x, y);
+                    truth.coverage[i] == 1.0 && truth.distance[i] <= -4.0
+                })
+                .map(|x| chroma(truth.image.get_pixel(x, y).0))
+                .collect();
+            percentile(&mut row, 0.5)
+        })
+        .collect();
 
     for y in 0..h {
         for x in 0..w {
@@ -472,6 +503,12 @@ pub fn measure_edges(
                 white += (composited - luma(original)).abs();
                 white_n += 1;
             }
+            if d.abs() <= 6.0 && lit && a > 0 && a < 255 {
+                let truth_chroma = inner_chroma[y as usize];
+                if truth_chroma.is_finite() {
+                    casts.push((chroma(p) - truth_chroma).abs());
+                }
+            }
             if truth.strap[i] {
                 strap_n += 1;
                 if fg {
@@ -510,7 +547,18 @@ pub fn measure_edges(
         strap_kept: ratio(strap_kept, strap_n),
         shadow_kept: ratio(shadow_kept, shadow_n),
         speckles: ratio(speckles, speckles_n),
+        cast: percentile(&mut casts, 0.9),
     }
+}
+
+/// 昇順に並べ替えてから分位点を引く。標本が無ければ NaN。
+fn percentile(values: &mut [f32], q: f32) -> f32 {
+    if values.is_empty() {
+        return f32::NAN;
+    }
+    values.sort_by(f32::total_cmp);
+    let idx = ((values.len() - 1) as f32 * q).round() as usize;
+    values[idx]
 }
 
 /// 織り目のある布の上に濃色の商品を置いた画像。

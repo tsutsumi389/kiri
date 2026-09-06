@@ -74,8 +74,15 @@ const CORE_RATIO: f32 = 0.64;
 /// 復元した前景色を局所前景色と観測色の範囲からどれだけはみ出させるか（線形値）。
 const RECOVER_SLACK: f32 = 0.05;
 
-/// 復元式の分母の下限。これ以下では誤差が何十倍にも増幅されて色が暴れる。
+/// 復元式の分母の下限。ゼロ除算と、そこに至るまでの桁の暴走を止める。
+/// この付近のアルファでは復元色をほとんど採らない（`recover_foreground` の
+/// `trust`）ので、出力に直接効くのではなく、負判定に使う値の暴れを抑える。
 const MIN_RECOVER_ALPHA: f32 = 0.05;
+
+/// 復元式が成り立つ下限アルファからこれだけ離れて初めて復元色を全面的に
+/// 信じる。狭くすると下限の近くで色が跳ね、広くすると柔らかい輪郭の色が
+/// 一様に前景色へ寄って平板になる。
+const FEASIBLE_MARGIN: f32 = 0.15;
 
 #[derive(Debug, Clone)]
 pub struct RefineOptions {
@@ -547,18 +554,90 @@ fn estimate_alpha(
             if !ctx.despill || alpha8 == 0 {
                 continue;
             }
+            let recovered = recover_foreground(observed, b, f, alpha);
             let pixel = out.get_pixel_mut(x, y);
             for k in 0..3 {
-                // 合成式を F について解く。線形光で行うのが要点
-                let recovered = b[k] + (observed[k] - b[k]) / alpha.max(MIN_RECOVER_ALPHA);
-                // 局所前景色と観測色が挟む範囲から大きく外れさせない。
-                // 分母が小さいところで誤差が増幅されて色が飛ぶのを抑える
-                let lo = f[k].min(observed[k]) - RECOVER_SLACK;
-                let hi = f[k].max(observed[k]) + RECOVER_SLACK;
-                pixel[k] = linear_to_srgb(recovered.clamp(lo, hi));
+                pixel[k] = linear_to_srgb(recovered[k]);
             }
         }
     }
+}
+
+/// 境界画素の前景色を復元する。引数も戻り値も線形 RGB。
+///
+/// 合成式 C = aF + (1-a)B を F について解くだけなら 1 行で済むが、この式は
+/// **a が小さいほど誤差を 1/a 倍に増幅する**。増幅されるのは「観測色と局所
+/// 背景色の差」で、不織布や段ボールのような背景ではその差そのものが布の
+/// ざらつきと同じ大きさしかない。素直に解くと、復元色は織り目の乱数を
+/// 何十倍にも拡大したものになる（実写で輪郭が緑と紫の点線になって出た）。
+///
+/// そこで 3 つの歯止めを掛ける。いずれも**画素をまたいで滑らかである**こと、
+/// つまり隣り合う画素が別の枝に落ちないことを条件に選んである。分岐で
+/// 切り替えると、直したはずの「点線」が別の形で戻ってくる。
+fn recover_foreground(observed: [f32; 3], b: [f32; 3], f: [f32; 3], alpha: f32) -> [f32; 3] {
+    let inv = 1.0 / alpha.max(MIN_RECOVER_ALPHA);
+    let recovered = [
+        b[0] + (observed[0] - b[0]) * inv,
+        b[1] + (observed[1] - b[1]) * inv,
+        b[2] + (observed[2] - b[2]) * inv,
+    ];
+
+    // (1) 局所前景色と観測色が挟む範囲から大きく外れさせない。
+    //
+    // 当たったチャンネルだけを切ると、そこで動きが止まって色相がねじれる。
+    // 暖色の背景では青だけが下限に張り付き、輪郭が緑の線になって出る。
+    // 補正は観測色から伸びる1本のベクトルなので、向きは変えずに長さだけを
+    // 一律に縮める。
+    //
+    // ここが効くのは淡色〜中間色の商品である。`RECOVER_SLACK` は線形光の
+    // 絶対値なので、暗部では sRGB 換算で ±60 ほどの箱になり、黒い商品では
+    // ほとんど当たらない（合成シーンの実測で、白背景の濃色商品 16% に対し
+    // 黒商品 0.1%）。黒い商品を救うのは下の (2)(3) である
+    let mut scale = 1.0f32;
+    for k in 0..3 {
+        let delta = recovered[k] - observed[k];
+        if delta == 0.0 {
+            continue;
+        }
+        let lo = f[k].min(observed[k]) - RECOVER_SLACK;
+        let hi = f[k].max(observed[k]) + RECOVER_SLACK;
+        let room = if delta > 0.0 { hi } else { lo } - observed[k];
+        scale = scale.min((room / delta).clamp(0.0, 1.0));
+    }
+
+    // (2) 復元式が負の光量を要求する画素では、局所背景色だけで観測色を
+    // 使い切っている。つまり背景の推定が成り立っていない。商品が布に落とす
+    // 接触影の上がこれで、そこで混ざっている背景は窓の平均より暗い。
+    //
+    // recovered_k >= 0 は alpha >= 1 - observed_k / b_k と同値なので、
+    // 「復元式が成り立つ下限アルファ」を書き下せる。下限に触れた画素だけを
+    // 分岐で落とすと、柔らかい輪郭では帯の 1/4 がその枝に入り、ほぼ同じ
+    // アルファの隣同士が別の枝に割れる。下限からの余裕で連続に落とす
+    let mut floor = 0.0f32;
+    for k in 0..3 {
+        if b[k] > 0.0 {
+            floor = floor.max(1.0 - observed[k] / b[k]);
+        }
+    }
+    let feasible = smoothstep((alpha - floor) / FEASIBLE_MARGIN);
+
+    // (3) アルファそのものでも同じだけ慎重になる。a が小さい画素は復元色が
+    // 信じられないだけでなく、合成での寄与も小さいので、局所前景色へ寄せて
+    // 実害が出ない。閾値ではなく S 字で寄せるのは (2) と同じ理由による
+    let trust = smoothstep(alpha) * feasible;
+
+    let mut out = [0.0f32; 3];
+    for k in 0..3 {
+        let value = observed[k] + scale * (recovered[k] - observed[k]);
+        out[k] = f[k] + trust * (value - f[k]);
+    }
+    out
+}
+
+/// 0 で 0、1 で 1、両端で傾きが 0 になる S 字。範囲外は端に張り付く。
+fn smoothstep(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 /// 幾何的フェザーの値。初めて必要になったときだけマスク全体を作る。
@@ -960,6 +1039,63 @@ mod tests {
         let (img, mask) = ramp([40, 40, 45], [250, 250, 249], 0.5);
         let out = refine(&img, &mask, [250, 250, 249], &RefineOptions::default());
         let p = out.image.get_pixel(20, 6).0;
+        assert!(
+            p[0] < 120,
+            "境界画素に背景色が残っている: {:?}",
+            [p[0], p[1], p[2]]
+        );
+    }
+
+    /// 復元色のチャンネルの並びが商品色と同じであること。
+    ///
+    /// 暖色の背景（青が最も低い）を濃色の商品から引くと、素直に解いたときに
+    /// 最初に負へ振れるのは青である。そこだけを切り詰めると、青が下限に
+    /// 張り付いて緑の縁になる。輝度ではなく**並び**を見る
+    #[test]
+    fn the_recovered_colour_keeps_the_product_channel_order() {
+        let product = [40u8, 38, 34];
+        let background = [178u8, 174, 167];
+        for coverage in [0.2, 0.35, 0.5, 0.75] {
+            let (img, mask) = ramp(product, background, coverage);
+            let out = refine(&img, &mask, background, &RefineOptions::default());
+            let p = out.image.get_pixel(20, 6).0;
+            assert!(
+                p[0] >= p[1] && p[1] >= p[2],
+                "被覆率 {coverage}: 商品は R≧G≧B なのに復元色が {:?}",
+                [p[0], p[1], p[2]]
+            );
+        }
+    }
+
+    /// 復元式が負の光量を要求する画素（背景の推定より観測色が暗い＝接触影の
+    /// 上）でも、色が飛ばずに局所前景色の側へ収まること。
+    #[test]
+    fn a_pixel_darker_than_the_background_mix_falls_back_to_the_foreground() {
+        let product = [40u8, 38, 34];
+        let background = [178u8, 174, 167];
+        let (mut img, mask) = ramp(product, background, 0.5);
+        // 混色画素だけを「影で 3 割暗い」状態にする。復元式はここで負を要求する
+        let mixed = img.get_pixel(20, 6).0;
+        for y in 0..img.height() {
+            img.put_pixel(
+                20,
+                y,
+                Rgba([
+                    (f32::from(mixed[0]) * 0.7) as u8,
+                    (f32::from(mixed[1]) * 0.7) as u8,
+                    (f32::from(mixed[2]) * 0.7) as u8,
+                    255,
+                ]),
+            );
+        }
+        let out = refine(&img, &mask, background, &RefineOptions::default());
+        let p = out.image.get_pixel(20, 6).0;
+        let chroma = p[..3].iter().max().unwrap() - p[..3].iter().min().unwrap();
+        assert!(
+            chroma <= 12,
+            "無彩色に近い商品なのに復元色が色を持っている: {:?}",
+            [p[0], p[1], p[2]]
+        );
         assert!(
             p[0] < 120,
             "境界画素に背景色が残っている: {:?}",

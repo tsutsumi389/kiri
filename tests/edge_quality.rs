@@ -810,7 +810,7 @@ fn print_the_metrics_table() {
             );
             let round1 = |v: f64| (v * 10.0).round() / 10.0;
             println!(
-                "{:<49} halo_ratio={:?} edge_width={:?} separability={:?} 外周勾配 p90={:.1} 効いた堤防={:.1}",
+                "{:<49} halo_ratio={:?} edge_width={:?} separability={:?} 外周勾配 p50={:.1}/p90={:.1} 効いた堤防={:.1}",
                 "",
                 result
                     .diagnostics
@@ -818,6 +818,7 @@ fn print_the_metrics_table() {
                     .map(|v| (v * 1000.0).round() / 1000.0),
                 result.diagnostics.edge_width.map(round1),
                 result.separability.map(round1),
+                result.background.texture.p50,
                 result.background.texture.p90,
                 result.edge_threshold,
             );

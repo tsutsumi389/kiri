@@ -25,6 +25,14 @@ static LINEAR: std::sync::LazyLock<[f64; 256]> = std::sync::LazyLock::new(|| {
     })
 });
 
+/// 上の表を f32 に落としたもの。
+///
+/// フラッドフィルは画素ごとに Lab を持つので、f64 では表そのものより
+/// 保持する側の代償が大きい（12MP で 288MB と 144MB の差）。値は `LINEAR`
+/// から作るため、f64 経路との食い違いは f32 の丸め誤差に限られる。
+static LINEAR_F32: std::sync::LazyLock<[f32; 256]> =
+    std::sync::LazyLock::new(|| std::array::from_fn(|i| LINEAR[i] as f32));
+
 fn srgb_to_linear(c: u8) -> f64 {
     LINEAR[c as usize]
 }
@@ -37,17 +45,12 @@ fn pivot(t: f64) -> f64 {
     }
 }
 
-/// sRGB 8bit → 線形 RGB の変換表。
+/// sRGB 8bit → 線形 RGB (f32) の変換表。`linear_to_lab` と組で使う。
 ///
-/// 画像全体を走査する処理（フラッドフィルの Lab 化、境界帯の色復元）では、
-/// 画素ごとに `powf` を呼ぶと変換だけで数百 ms かかる。256 通りしか入力が
-/// 無いので表を引く。
-pub fn srgb_linear_lut() -> [f32; 256] {
-    let mut lut = [0f32; 256];
-    for (i, slot) in lut.iter_mut().enumerate() {
-        *slot = srgb_to_linear(i as u8) as f32;
-    }
-    lut
+/// 参照を返すのは、呼ぶたびに 256 回の変換を走らせないため。表は共有しても
+/// 中身が変わらないので、複製する理由が無い。
+pub fn srgb_linear_lut() -> &'static [f32; 256] {
+    &LINEAR_F32
 }
 
 /// 線形 RGB (0.0-1.0) を CIE Lab に変換する。`srgb_linear_lut` と組で使う。

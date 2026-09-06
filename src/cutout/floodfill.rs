@@ -115,7 +115,7 @@ pub fn foreground_mask(image: &RgbaImage, background: [u8; 3], opts: &FloodOptio
     let two_stage = opts.step_tolerance > 0.0 && opts.core_tolerance > 0.0;
     let protected = protected_pixels(w, h, &opts.fg_seeds);
     let lut = srgb_linear_lut();
-    let lab = lab_map(image, &lut);
+    let lab = lab_map(image, lut);
     let bg_lab = linear_to_lab([
         lut[background[0] as usize],
         lut[background[1] as usize],

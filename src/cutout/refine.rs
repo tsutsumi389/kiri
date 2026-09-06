@@ -633,8 +633,12 @@ fn sliding_max(
         while deque.front().is_some_and(|&j| j < from) {
             deque.pop_front();
         }
-        let head = *deque.front().expect("窓には必ず1つ以上入る");
-        dst[start + i * stride] = src[start + head * stride];
+        // 不変条件: 位置 i 自身は from..=to に必ず入るので、デックは空にならない。
+        // 万一破れても列の値を落とさないよう、自分の値で埋めて進む
+        debug_assert!(!deque.is_empty(), "移動最大の窓が空になった: i={i} n={n}");
+        dst[start + i * stride] = deque
+            .front()
+            .map_or(src[start + i * stride], |&j| src[start + j * stride]);
     }
 }
 

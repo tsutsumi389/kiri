@@ -40,7 +40,6 @@ pub fn remove_specks(mask: &Mask, radius: u32) -> Mask {
 
     let mut out = mask.clone();
     let mut visited = vec![false; stride * (h as usize)];
-    let mut component: Vec<(u32, u32)> = Vec::new();
     let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
 
     for y in 0..h {
@@ -49,27 +48,23 @@ pub fn remove_specks(mask: &Mask, radius: u32) -> Mask {
             if visited[start] || mask.get(x, y) == 0 {
                 continue;
             }
+
+            // 1 周目は面積を数えるだけにする。成分の座標を Vec に実体化すると、
+            // 前景がほぼ全面の 12MP で 1 成分が 1200 万画素になり、それだけで
+            // 96MB を余計に抱える。パイプラインは 2 回呼ぶので、ピーク RSS が
+            // 207MB から 400MB へ跳ねていた
             visited[start] = true;
-            component.clear();
             queue.clear();
             queue.push_back((x, y));
             let mut core = 0usize;
-
             while let Some((cx, cy)) = queue.pop_front() {
-                component.push((cx, cy));
                 if mask.is_foreground(cx, cy) {
                     core += 1;
                 }
-                for dy in -1i64..=1 {
-                    for dx in -1i64..=1 {
-                        if dx == 0 && dy == 0 {
-                            continue;
-                        }
-                        let (nx, ny) = (cx as i64 + dx, cy as i64 + dy);
-                        if nx < 0 || ny < 0 || nx >= w as i64 || ny >= h as i64 {
-                            continue;
-                        }
-                        let (nx, ny) = (nx as u32, ny as u32);
+                let (x0, x1) = (cx.saturating_sub(1), (cx + 1).min(w - 1));
+                let (y0, y1) = (cy.saturating_sub(1), (cy + 1).min(h - 1));
+                for ny in y0..=y1 {
+                    for nx in x0..=x1 {
                         let i = (ny as usize) * stride + (nx as usize);
                         if visited[i] || mask.get(nx, ny) == 0 {
                             continue;
@@ -79,10 +74,26 @@ pub fn remove_specks(mask: &Mask, radius: u32) -> Mask {
                     }
                 }
             }
+            if core >= min_area {
+                continue;
+            }
 
-            if core < min_area {
-                for &(px, py) in &component {
-                    out.set(px, py, 0);
+            // 2 周目で 0 を書きながら同じ成分をたどる。書き込んだ 0 がそのまま
+            // 訪問済みの印になるので、座標を覚えておく必要がない
+            queue.clear();
+            out.set(x, y, 0);
+            queue.push_back((x, y));
+            while let Some((cx, cy)) = queue.pop_front() {
+                let (x0, x1) = (cx.saturating_sub(1), (cx + 1).min(w - 1));
+                let (y0, y1) = (cy.saturating_sub(1), (cy + 1).min(h - 1));
+                for ny in y0..=y1 {
+                    for nx in x0..=x1 {
+                        if out.get(nx, ny) == 0 {
+                            continue;
+                        }
+                        out.set(nx, ny, 0);
+                        queue.push_back((nx, ny));
+                    }
                 }
             }
         }

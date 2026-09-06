@@ -2434,6 +2434,73 @@ fn a_misspelled_shadow_tolerance_key_suggests_the_right_one() {
     );
 }
 
+/// 範囲外の数値は受け取る前に断ること。
+///
+/// 負値や nan は比較が常に偽になるだけなので、通してしまうと「指定したのに
+/// 効かない」という形で黙って無視される。エージェントは結果の JSON を見て
+/// 判断するので、無視されたことに気づく手がかりが無い。
+#[test]
+fn out_of_range_numeric_options_are_rejected() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 60,
+        height: 60,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    for bad in [
+        "--tolerance=-1",
+        "--step-tolerance=-0.5",
+        "--shadow-tolerance=nan",
+        "--edge-threshold=inf",
+        // 半径に比例して走査量が増えるので、二桁の指定は事故しかない
+        "--seal=400",
+    ] {
+        let out = kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                dir.path().join("out.png").to_str().unwrap(),
+                "--force",
+                bad,
+            ])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{bad} が受け付けられてしまった");
+    }
+}
+
+/// バッチの spec も同じ約束で弾くこと。clap を通らない経路なので別立てで見る。
+#[test]
+fn a_negative_setting_in_a_batch_spec_is_rejected() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 60,
+        height: 60,
+        ..Default::default()
+    });
+    write_png(dir.path(), "a.png", &img);
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        r#"{"defaults":{"step_tolerance":-1.0},
+             "items":[{"input":"a.png","output":"out.png"}]}"#,
+    )
+    .unwrap();
+
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let json = json_stdout(&out);
+    assert_eq!(
+        json["results"][0]["error"]["code"], "INVALID_SETTING",
+        "spec の負値が弾かれていない: {json}"
+    );
+}
+
 /// 落ち影が既定で消えること。CLI から通しで確かめる。
 #[test]
 fn cutout_removes_a_cast_shadow_by_default() {

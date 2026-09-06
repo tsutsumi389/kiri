@@ -155,7 +155,9 @@ pub fn refine(
     }
 
     let band = band_map(image, binary, background, opts);
-    if band.iter().all(|&r| r == 0) {
+    // 帯幅の最大は代役前景の近傍半径を決めるのに要る。0 なら帯そのものが無い
+    let band_max = band.iter().copied().max().unwrap_or(0);
+    if band_max == 0 {
         return Refined { image: out, mask };
     }
 
@@ -173,6 +175,7 @@ pub fn refine(
         separation_sq: opts.min_separation * opts.min_separation,
         despill: opts.despill,
         feather_radius: opts.feather,
+        core_window: window_for(band_max),
     };
     // 色で決められなかった画素の受け皿。12MP では単独で 50ms かかるうえ、
     // 1 画素も落ちない素材のほうが多いので、実際に必要になるまで作らない
@@ -202,6 +205,14 @@ struct Context<'a> {
     separation_sq: f32,
     despill: bool,
     feather_radius: u32,
+    /// 代役前景の「芯」を選ぶときに見る近傍の半径。
+    ///
+    /// タイル内の最大窓を使うとタイルごとに「近傍」の定義が変わり、128px ごとに
+    /// アルファの段差が出る。`RADIUS_CEILING` に固定すればタイル非依存にはなるが、
+    /// 積分画像の余白が常に 67px に膨らんで帯から遠い画素まで積む。画像全体の
+    /// 帯幅の最大から一度だけ導けば、タイル非依存のまま余白は実際の帯幅ぶん
+    /// （既定なら 23px）で済む。
+    core_window: u32,
 }
 
 /// タイル1枚分の作業領域。タイルをまたいで使い回し、確保を繰り返さない。
@@ -216,9 +227,8 @@ struct Workspace {
     take: Vec<bool>,
     confirmed_fg: ColourSums,
     confirmed_bg: ColourSums,
-    /// 代役前景用。芯だけの平均と、前景すべての平均
+    /// 代役前景用。芯とみなした画素だけの平均
     core: ColourSums,
-    any_fg: ColourSums,
     /// 芯を選ぶための、背景色からの距離とその近傍最大
     distance: Vec<f32>,
     local_max: Vec<f32>,
@@ -325,10 +335,15 @@ fn refine_tile(
         return;
     }
 
-    let px0 = bx0.saturating_sub(win_max);
-    let py0 = by0.saturating_sub(win_max);
-    let px1 = (bx1 + win_max).min(w - 1);
-    let py1 = (by1 + win_max).min(h - 1);
+    // 余白は窓の最大に加えて代役前景の近傍半径ぶん要る。窓は帯の外接矩形から
+    // win_max まで届き、その届いた先の画素についても「近傍で最も背景から遠いか」を
+    // 正しく判定できなければならない。win_max だけだと外周の近傍が切り落とされ、
+    // 近傍最大が過小に出て芯が増える
+    let pad = win_max + ctx.core_window;
+    let px0 = bx0.saturating_sub(pad);
+    let py0 = by0.saturating_sub(pad);
+    let px1 = (bx1 + pad).min(w - 1);
+    let py1 = (by1 + pad).min(h - 1);
     let pw = (px1 - px0 + 1) as usize;
     let ph = (py1 - py0 + 1) as usize;
     let cells = pw * ph;
@@ -341,7 +356,6 @@ fn refine_tile(
         confirmed_fg,
         confirmed_bg,
         core,
-        any_fg,
         distance,
         local_max,
         scratch,
@@ -404,9 +418,8 @@ fn refine_tile(
                                 linear,
                                 is_fg,
                             },
-                            confirmed_bg,
                             ctx.bg_linear,
-                            win_max,
+                            ctx.core_window as usize,
                             CoreBuffers {
                                 take,
                                 distance,
@@ -414,15 +427,18 @@ fn refine_tile(
                                 scratch,
                                 deque,
                                 core,
-                                any_fg,
                             },
                         );
                         core_ready = true;
                     }
-                    // 芯が窓に入らなければ、窓の前景をそのまま平均する。
-                    // 芯かどうかは近傍最大との比で決めるので、窓の端では取りこぼす
-                    core.mean(qx0, qy0, qx1, qy1)
-                        .or_else(|| any_fg.mean(qx0, qy0, qx1, qy1))
+                    // 芯が窓に1つも入らなければ、窓の中で背景から最も遠い前景画素
+                    // そのものを使う。芯かどうかは近傍最大との比で決めるので、
+                    // 帯幅が混在する場所では窓が芯を1つも含まないことがある。
+                    // ここで帯画素まで混ぜた前景平均に落とすと F が背景寄りになり、
+                    // アルファが過大に出る
+                    core.mean(qx0, qy0, qx1, qy1).or_else(|| {
+                        farthest_from_background(pw, linear, distance, (qx0, qy0, qx1, qy1))
+                    })
                 }
             };
 
@@ -487,7 +503,6 @@ struct CoreBuffers<'a> {
     scratch: &'a mut Vec<f32>,
     deque: &'a mut VecDeque<usize>,
     core: &'a mut ColourSums,
-    any_fg: &'a mut ColourSums,
 }
 
 /// 代役前景（構造が帯より細い場所で使う F）の材料を作る。
@@ -503,13 +518,11 @@ struct CoreBuffers<'a> {
 /// 遠いか」を一度だけ判定して芯の印を付け、窓の平均は積分画像から O(1) で引く。
 /// 1 画素だけを採らずに芯を平均するのは、ノイズと JPEG のリンギングを
 /// そのまま拾わないためである。
-fn build_core(
-    region: Padded<'_>,
-    confirmed_bg: &ColourSums,
-    bg_linear: [f32; 3],
-    win_max: u32,
-    buf: CoreBuffers<'_>,
-) {
+///
+/// 近傍半径 `radius` と順位付けの基準色は、どちらもタイルに依存しない値を
+/// 渡すこと。ここにタイル局所の値を入れると、同じ素材でもタイルの切れ目で
+/// 芯の選ばれ方が変わり、128px ごとにアルファの段差になる。
+fn build_core(region: Padded<'_>, bg_linear: [f32; 3], radius: usize, buf: CoreBuffers<'_>) {
     let Padded {
         pw,
         ph,
@@ -523,12 +536,12 @@ fn build_core(
         scratch,
         deque,
         core,
-        any_fg,
     } = buf;
     let cells = pw * ph;
-    // 参照する背景色は領域全体の確定背景の平均。窓ごとに取り直しても
-    // 同じタイルの中ではほとんど変わらず、順位付けの基準としては同じである
-    let reference = confirmed_bg.mean(0, 0, pw - 1, ph - 1).unwrap_or(bg_linear);
+    // 順位付けの基準は大域の背景色。領域内の確定背景の平均にすると、
+    // グラデーションや照明ムラのある背景でタイルごとに基準がずれ、
+    // 「背景から最も遠い画素」の順位そのものが入れ替わる
+    let reference = bg_linear;
 
     distance.clear();
     distance.resize(cells, -1.0);
@@ -550,7 +563,6 @@ fn build_core(
     scratch.resize(cells, 0.0);
     local_max.clear();
     local_max.resize(cells, 0.0);
-    let radius = win_max as usize;
     for y in 0..ph {
         sliding_max(distance, scratch, y * pw, 1, pw, radius, deque);
     }
@@ -564,8 +576,32 @@ fn build_core(
         *slot = distance[i] > 0.0 && distance[i] >= CORE_RATIO * local_max[i];
     }
     core.build(pw, ph, linear, take);
-    take.copy_from_slice(is_fg);
-    any_fg.build(pw, ph, linear, take);
+}
+
+/// 矩形の中で背景から最も遠い前景画素の色。`distance` は `build_core` が
+/// 埋めた「背景色からの距離の二乗」で、前景でない画素には負が入っている。
+///
+/// 芯が窓に1つも入らなかったときの最後の手段。走査順で最初の最大を採るので、
+/// 同点でも結果は決まる。
+fn farthest_from_background(
+    pw: usize,
+    linear: &[[f32; 3]],
+    distance: &[f32],
+    rect: (usize, usize, usize, usize),
+) -> Option<[f32; 3]> {
+    let (x0, y0, x1, y1) = rect;
+    let mut best = 0.0f32;
+    let mut found = None;
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let i = y * pw + x;
+            if distance[i] > best {
+                best = distance[i];
+                found = Some(linear[i]);
+            }
+        }
+    }
+    found
 }
 
 /// 直線上の移動最大値。単調デックで、窓の大きさに依らず長さに比例する時間で求める。
@@ -946,6 +982,70 @@ mod tests {
                 "x={x} でタイルの継ぎ目が出ている"
             );
         }
+    }
+
+    /// 帯より細い構造でも、結果がタイルの切れ目に依存しないこと。
+    ///
+    /// 上のテストは太い横棒なので、確定前景が窓に必ず入る経路しか通らない。
+    /// 代役前景の経路は「近傍」と「順位付けの基準色」を余分に持つため、
+    /// そこにタイル局所の値を使うと 128px ごとにアルファの段差が出る。
+    /// メッシュ・レース・細いストラップ・髪といった、この経路が狙う素材
+    /// そのものが壊れるので、内容を 16px ずらしても結果が変わらないことで押さえる。
+    ///
+    /// 濃い節と薄い糸を交互に置くのは、そうしないと「背景から最も遠い画素」が
+    /// 近傍の取り方に依らず同じになり、タイル依存が現れないためである。
+    /// 周期を 4 本で変えてあるのは、特定の周期でだけ当たる網にしないため。
+    #[test]
+    fn a_structure_thinner_than_the_band_does_not_depend_on_where_the_tiles_fall() {
+        const SHIFT: u32 = 16;
+        let bg = [250u8, 250, 249];
+        let product = [40u8, 40, 45];
+        let build = |offset: u32| -> Mask {
+            let (w, h) = (760u32, 60u32);
+            let mut img = RgbaImage::from_pixel(w, h, Rgba([bg[0], bg[1], bg[2], 255]));
+            let mut mask = Mask::new(w, h, 0);
+            for (row, period) in [(10u32, 17u32), (22, 23), (34, 31), (46, 41)] {
+                for x in 0..w {
+                    let u = x as i64 - i64::from(offset);
+                    // 画像の端から離しておく。端の扱いは位置をずらせば当然変わる
+                    if !(40..700).contains(&u) {
+                        continue;
+                    }
+                    let u = u as u32;
+                    // 1px の芯と、その上下に半分だけ被った縁。堤防は縁まで前景に
+                    // 含めるので、帯（下限 2px）が構造を丸ごと飲み込む
+                    let coverage = if (u / period) % 3 == 0 { 1.0 } else { 0.55 };
+                    img.put_pixel(x, row, Rgba(mix(product, bg, coverage)));
+                    let edge = mix(product, bg, 0.5 * coverage);
+                    img.put_pixel(x, row - 1, Rgba(edge));
+                    img.put_pixel(x, row + 1, Rgba(edge));
+                    for y in (row - 1)..=(row + 1) {
+                        mask.set(x, y, 255);
+                    }
+                }
+            }
+            refine(&img, &mask, bg, &RefineOptions::default()).mask
+        };
+        let base = build(0);
+        let shifted = build(SHIFT);
+        let (mut differing, mut worst, mut worst_at) = (0usize, 0i32, (0u32, 0u32));
+        // 画像の端に近い列は、内容の位置ではなく端までの距離で結果が変わる
+        for y in 0..base.height() {
+            for x in 64..(base.width() - SHIFT - 64) {
+                let d = i32::from(base.get(x, y)) - i32::from(shifted.get(x + SHIFT, y));
+                if d != 0 {
+                    differing += 1;
+                }
+                if d.abs() > worst {
+                    worst = d.abs();
+                    worst_at = (x, y);
+                }
+            }
+        }
+        assert_eq!(
+            differing, 0,
+            "内容を {SHIFT}px ずらすとアルファが変わる画素がある（最大差 {worst} @ {worst_at:?}）"
+        );
     }
 
     /// 幅 1px の構造にも帯が張られること。

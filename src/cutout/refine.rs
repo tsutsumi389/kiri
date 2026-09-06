@@ -299,6 +299,22 @@ impl ColourSums {
     }
 }
 
+/// タイル1枚が使う積分画像の領域。座標はすべて画像座標で、両端を含む。
+struct Tile {
+    /// タイルそのもの。ここに入る帯画素のアルファを決める
+    tx0: u32,
+    ty0: u32,
+    tx1: u32,
+    ty1: u32,
+    /// 積分画像を張る領域。タイルの帯の外接矩形に余白を足したもの
+    px0: u32,
+    py0: u32,
+    px1: u32,
+    py1: u32,
+    pw: usize,
+    ph: usize,
+}
+
 /// タイル1枚を処理する。
 fn refine_tile(
     ctx: &Context<'_>,
@@ -308,6 +324,15 @@ fn refine_tile(
     out: &mut RgbaImage,
     mask: &mut Mask,
 ) {
+    let Some(tile) = plan_tile(ctx, tile) else {
+        return;
+    };
+    prepare_tile(ctx, ws, &tile);
+    estimate_alpha(ctx, ws, fallback, &tile, out, mask);
+}
+
+/// タイルに帯があるかを調べ、あれば積分画像を張る領域を決める。
+fn plan_tile(ctx: &Context<'_>, tile: (u32, u32)) -> Option<Tile> {
     let (w, h) = (ctx.image.width(), ctx.image.height());
     let stride = w as usize;
     let (tx0, ty0) = tile;
@@ -332,7 +357,7 @@ fn refine_tile(
         }
     }
     if win_max == 0 {
-        return;
+        return None;
     }
 
     // 余白は窓の最大に加えて代役前景の近傍半径ぶん要る。窓は帯の外接矩形から
@@ -344,10 +369,33 @@ fn refine_tile(
     let py0 = by0.saturating_sub(pad);
     let px1 = (bx1 + pad).min(w - 1);
     let py1 = (by1 + pad).min(h - 1);
-    let pw = (px1 - px0 + 1) as usize;
-    let ph = (py1 - py0 + 1) as usize;
-    let cells = pw * ph;
+    Some(Tile {
+        tx0,
+        ty0,
+        tx1,
+        ty1,
+        px0,
+        py0,
+        px1,
+        py1,
+        pw: (px1 - px0 + 1) as usize,
+        ph: (py1 - py0 + 1) as usize,
+    })
+}
 
+/// 領域の画素を作業領域へ写し、確定前景と確定背景の積分画像を張る。
+fn prepare_tile(ctx: &Context<'_>, ws: &mut Workspace, tile: &Tile) {
+    let stride = ctx.image.width() as usize;
+    let &Tile {
+        px0,
+        py0,
+        px1,
+        py1,
+        pw,
+        ph,
+        ..
+    } = tile;
+    let cells = pw * ph;
     let Workspace {
         linear,
         is_fg,
@@ -355,11 +403,7 @@ fn refine_tile(
         take,
         confirmed_fg,
         confirmed_bg,
-        core,
-        distance,
-        local_max,
-        scratch,
-        deque,
+        ..
     } = ws;
 
     linear.clear();
@@ -386,6 +430,43 @@ fn refine_tile(
         *slot = !in_band[i] && !is_fg[i];
     }
     confirmed_bg.build(pw, ph, linear, take);
+}
+
+/// タイルに入る帯画素のアルファを決め、必要なら色を復元する。
+fn estimate_alpha(
+    ctx: &Context<'_>,
+    ws: &mut Workspace,
+    fallback: &OnceCell<Mask>,
+    tile: &Tile,
+    out: &mut RgbaImage,
+    mask: &mut Mask,
+) {
+    let stride = ctx.image.width() as usize;
+    let &Tile {
+        tx0,
+        ty0,
+        tx1,
+        ty1,
+        px0,
+        py0,
+        px1,
+        py1,
+        pw,
+        ph,
+    } = tile;
+    let Workspace {
+        linear,
+        is_fg,
+        take,
+        confirmed_fg,
+        confirmed_bg,
+        core,
+        distance,
+        local_max,
+        scratch,
+        deque,
+        ..
+    } = ws;
 
     // 代役前景の材料は、実際に必要になったタイルでだけ作る
     let mut core_ready = false;

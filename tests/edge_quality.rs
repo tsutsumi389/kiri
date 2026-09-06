@@ -22,6 +22,16 @@ fn scenes() -> Vec<EdgeScene> {
             jpeg: None,
             ..Default::default()
         },
+        // 白背景に置いた淡色商品。上端のハイライトで商品は 221 まで明るくなり、
+        // 背景 248 との輪郭のコントラストは ΔE 9.5 まで落ちる。既定の
+        // tolerance 12 より小さいので、**色だけを見れば商品はまるごと背景**
+        // である。連結性と段差の検査だけがこれを商品として残している
+        EdgeScene {
+            name: "S3 淡色商品(輪郭 ΔE 9.5)",
+            product: [232, 232, 230],
+            shading: (0.98, 0.80),
+            ..Default::default()
+        },
         EdgeScene {
             name: "S4 柔らかい輪郭(8px)",
             softness: 8.0,
@@ -40,6 +50,41 @@ fn scenes() -> Vec<EdgeScene> {
         EdgeScene {
             name: "S6 落ち影あり",
             shadow: true,
+            ..Default::default()
+        },
+        EdgeScene {
+            name: "S7 中間グレー商品+影",
+            product: [150, 150, 150],
+            shadow: true,
+            ..Default::default()
+        },
+        EdgeScene {
+            name: "S8 黒商品+影",
+            product: [20, 20, 20],
+            shadow: true,
+            ..Default::default()
+        },
+        // 高解像度での影の暴走を捕まえるシーン。無彩色の商品・落ち影・柔らかい
+        // 輪郭という、影の判定にとって最悪の 3 つを重ねてある。影の段だけは
+        // 堤防を無視するので、柔らかい輪郭は通り抜けられてしまう。進める距離が
+        // 解像度に比例して伸びると、そこから商品の内部まで届く。
+        // 他のシーンは 600px なので、解像度に依存する崩れはここでしか出ない
+        EdgeScene {
+            name: "S10 高解像度/無彩色商品+影+柔輪郭",
+            width: 1600,
+            height: 1600,
+            product: [150, 150, 150],
+            softness: 4.0,
+            shadow: true,
+            ..Default::default()
+        },
+        // 解けないケース。商品の明度が上から下へ変化する途中で背景色を
+        // **横切る**ため、輪郭のコントラストが 0 になる行が存在する。そこでは
+        // 色による分離が原理的に不可能で、いったん入られると商品の内部は
+        // 一様なのでフィルが広がる。判定はせず、表に出して限界を可視化する
+        EdgeScene {
+            name: "S9 淡色商品(明度が背景を横切る)",
+            product: [232, 232, 230],
             ..Default::default()
         },
     ]
@@ -146,6 +191,111 @@ fn a_three_pixel_strap_does_not_leave_a_halo() {
         m.halo < 5.0,
         "細部の周りにハローが残っている: {:.1}\n{m:?}",
         m.halo
+    );
+}
+
+#[test]
+fn a_light_product_is_not_flooded_through_its_faint_outline() {
+    // 商品の上端は 221、背景は 248。輪郭のコントラストは ΔE 9.5 しかなく、
+    // 既定の tolerance 12 より小さい。つまり **色だけを見れば商品はまるごと
+    // 背景**である。勾配の堤防（1px あたり輝度 8）も、JPEG で滲んだ角では
+    // 反応しない。段差の検査が入る前は、境界近傍の商品の 6 割が削れていた
+    let truth = find("S3");
+    let m = run(&truth, &CutoutOptions::default());
+    assert!(
+        m.eaten < 0.05,
+        "淡色商品が削られている: {:.1}%\n{m:?}",
+        m.eaten * 100.0
+    );
+    assert!(
+        m.rim < 0.01,
+        "背景色のままの画素が不透明で残っている: {:.1}%\n{m:?}",
+        m.rim * 100.0
+    );
+}
+
+#[test]
+fn a_cast_shadow_is_removed() {
+    // tolerance 12 では影の濃い部分（ΔE 20-30）に届かない。影の専用判定が
+    // 入る前は 56% が商品の直下に残っていた
+    let truth = find("S6");
+    let m = run(&truth, &CutoutOptions::default());
+    assert!(
+        m.shadow_kept < 0.05,
+        "落ち影が残っている: {:.1}%\n{m:?}",
+        m.shadow_kept * 100.0
+    );
+    assert!(
+        m.eaten < 0.01,
+        "影を消すために商品まで削っている: {:.1}%\n{m:?}",
+        m.eaten * 100.0
+    );
+}
+
+/// 影の判定が商品を巻き込まないこと。
+///
+/// 「背景より暗い無彩色」という条件だけを見れば、中間グレーや黒の商品も
+/// 影候補になる。それでも消えないのは、輪郭の段差でフィルが止まるからである。
+/// 影の判定を入れたときに最も壊れやすいのがここなので、別立てで固定する。
+#[test]
+fn the_shadow_rule_does_not_eat_a_neutral_product() {
+    // S8 の実測は 0.00% だが、余裕ゼロで固定すると 1 画素の揺らぎでも落ちる。
+    // ここで見たいのは「無彩色の商品がまるごと影と見なされる」退行であって、
+    // 端の 1 画素ではない
+    for (name, limit) in [("S7", 0.01f32), ("S8", 0.002)] {
+        let truth = find(name);
+        let m = run(&truth, &CutoutOptions::default());
+        assert!(
+            m.eaten <= limit,
+            "{name}: 無彩色の商品が影として消されている: {:.2}%\n{m:?}",
+            m.eaten * 100.0
+        );
+    }
+}
+
+/// 高解像度でも影の判定が商品を食わないこと。
+///
+/// 影が進める距離は画像の短辺に比例させてある（同じ被写体を 2 倍で撮れば
+/// 影の裾も 2 倍の画素数になるため）。比例させたままだと 3000px の素材で
+/// 125px まで伸び、柔らかい輪郭を通り抜けた影の判定が商品の内部へ届く。
+/// 受け入れテストが 600px までしか回っていなかったので、この崩れは
+/// 数値に一切現れていなかった。
+#[test]
+fn the_shadow_pass_does_not_eat_into_the_product_at_high_resolution() {
+    let truth = find("S10");
+    let m = run(&truth, &CutoutOptions::default());
+    // 実測 0.00%。0.002 は測り方の揺らぎを吸収するだけの幅で、
+    // 「600px では見えない崩れが入ったら落ちる」ことを狙っている
+    assert!(
+        m.eaten < 0.002,
+        "高解像度で商品が影として削られている: {:.2}%\n{m:?}",
+        m.eaten * 100.0
+    );
+    // 影そのものは消えていること。距離を切りすぎれば eaten は下がるが、
+    // それは影を消さなくなっただけで改善ではない
+    assert!(
+        m.shadow_kept < 0.05,
+        "落ち影が残っている: {:.1}%\n{m:?}",
+        m.shadow_kept * 100.0
+    );
+}
+
+/// 影の判定を切れば影が残ることを確かめる対照実験。
+/// 「もともと残っていなかっただけ」で上のテストが通るのを防ぐ。
+#[test]
+fn turning_off_the_shadow_rule_leaves_the_shadow_behind() {
+    let truth = find("S6");
+    let m = run(
+        &truth,
+        &CutoutOptions {
+            shadow_tolerance: 0.0,
+            ..Default::default()
+        },
+    );
+    assert!(
+        m.shadow_kept > 0.20,
+        "対照が成立していない（影判定なしでも影が消えている）: {:.1}%",
+        m.shadow_kept * 100.0
     );
 }
 
@@ -406,5 +556,61 @@ fn print_the_metrics_table() {
             );
         }
         println!();
+    }
+}
+
+/// 櫛状の素材で、正当な隙間が最終アルファまで抜けること。
+///
+/// `--seal` は「幅 2N px 以下の隙間だけを塞ぐ」と約束している。堤防が隙間の
+/// 両側を背景候補から外すぶん、素直に組み合わせると 3px の通路まで塞がって
+/// いた（実測 7.9% しか抜けない）。メッシュ・レース・ワイヤーラックのように
+/// 隙間が意味を持つ素材では、これは目に見える欠陥になる。
+///
+/// 単体テストは背景マスクを見るが、こちらは最終的なアルファで測る。
+/// 帯の再推定が縁を透明へ戻すので、利用者が受け取る結果はここに出る。
+#[test]
+fn the_gaps_of_a_comb_are_transparent_in_the_result() {
+    for (gap, open_ratio) in [(1u32, false), (2, false), (3, true), (5, true)] {
+        let (w, h) = (240u32, 240u32);
+        let mut img = RgbaImage::from_pixel(w, h, Rgba([248, 248, 247, 255]));
+        let period = 5 + gap;
+        let (x0, x1) = (w / 5, w * 4 / 5);
+        let (y0, y1) = (h / 5, h * 4 / 5);
+        // 歯を 1 つの連結成分にまとめる背骨。面積フィルタで歯だけが消えるのを防ぐ
+        let spine = h * 3 / 4;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if y >= spine || (x - x0) % period < 5 {
+                    img.put_pixel(x, y, Rgba([190, 70, 55, 255]));
+                }
+            }
+        }
+
+        let out = cutout(&img, &CutoutOptions::default());
+        let (mut total, mut clear) = (0u32, 0u32);
+        for y in (y0 + 2)..(spine - 2) {
+            for x in x0..x1 {
+                if (x - x0) % period >= 5 {
+                    total += 1;
+                    if out.image.get_pixel(x, y)[3] < 128 {
+                        clear += 1;
+                    }
+                }
+            }
+        }
+        let ratio = f64::from(clear) / f64::from(total.max(1));
+        if open_ratio {
+            assert!(
+                ratio > 0.90,
+                "幅 {gap}px の隙間が抜けていない: {:.1}%",
+                ratio * 100.0
+            );
+        } else {
+            assert!(
+                ratio < 0.10,
+                "幅 {gap}px の破れが塞がっていない: {:.1}%",
+                ratio * 100.0
+            );
+        }
     }
 }

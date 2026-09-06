@@ -111,18 +111,32 @@ fn to_cutout_args(
         .transpose()?
         .unwrap_or([255, 255, 255]);
 
+    let seal = settings.seal.unwrap_or(1);
+    if seal > crate::cli::MAX_SEAL {
+        return Err(Error::argument(
+            "INVALID_SETTING",
+            format!(
+                "seal は 0 から {} の範囲で指定してください（{seal} が指定されました）",
+                crate::cli::MAX_SEAL
+            ),
+        ));
+    }
+
     Ok(CutoutArgs {
         input: input.to_path_buf(),
         bbox: settings.bbox,
         normalized: settings.normalized.unwrap_or(false),
         fg_seed: settings.fg_seeds.clone().unwrap_or_default(),
-        tolerance: settings.tolerance.unwrap_or(12.0),
+        tolerance: checked(settings.tolerance, 12.0, "tolerance")?,
         border: settings.border.unwrap_or(DEFAULT_BORDER),
         cleanup: settings.cleanup.unwrap_or(2),
         feather: settings.feather.unwrap_or(1),
         no_despill: !settings.despill.unwrap_or(true),
         no_refine: !settings.refine.unwrap_or(true),
-        edge_threshold: settings.edge_threshold.unwrap_or(8.0),
+        edge_threshold: checked(settings.edge_threshold, 8.0, "edge_threshold")?,
+        step_tolerance: checked(settings.step_tolerance, 2.2, "step_tolerance")?,
+        shadow_tolerance: checked(settings.shadow_tolerance, 35.0, "shadow_tolerance")?,
+        seal,
         canvas,
         fill_ratio: settings.fill_ratio.unwrap_or(0.85),
         debug_mask: None,
@@ -140,6 +154,22 @@ fn to_cutout_args(
             force,
         },
     })
+}
+
+/// 数値の設定に CLI と同じ約束を掛ける。
+///
+/// バッチは spec の JSON を直接読むので clap の検証を通らない。負値や nan が
+/// そのまま通ると、その項目だけ機能が黙って無効化されたまま数百点が処理され、
+/// 結果の JSON にも異常が出ない。気づけるのは仕上がりを目で見たときになる。
+fn checked(value: Option<f64>, default: f64, key: &str) -> Result<f64> {
+    let v = value.unwrap_or(default);
+    if !v.is_finite() || v < 0.0 {
+        return Err(Error::argument(
+            "INVALID_SETTING",
+            format!("{key} は 0 以上の有限な数値である必要があります（{v} が指定されました）"),
+        ));
+    }
+    Ok(v)
 }
 
 #[cfg(test)]
@@ -169,6 +199,15 @@ mod tests {
             args.edge_threshold, defaults.edge_threshold,
             "edge_threshold の既定値"
         );
+        assert_eq!(
+            args.step_tolerance, defaults.step_tolerance,
+            "step_tolerance の既定値"
+        );
+        assert_eq!(
+            args.shadow_tolerance, defaults.shadow_tolerance,
+            "shadow_tolerance の既定値"
+        );
+        assert_eq!(args.seal, defaults.seal, "seal の既定値");
         assert_eq!(!args.no_despill, defaults.despill, "デスピルの既定");
         assert_eq!(!args.no_refine, defaults.refine, "アルファ再推定の既定");
     }

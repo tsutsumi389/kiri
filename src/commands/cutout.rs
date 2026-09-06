@@ -15,6 +15,7 @@ use crate::image_io::{OutputFormat, SaveOptions, load, save};
 use crate::preview::{PreviewSpec, contact_sheet};
 use crate::report::{
     BackgroundReport, CanvasReport, CutoutReport, Dimensions, MaskReport, PerimeterDeltaE,
+    SettingsReport,
 };
 use crate::transform::canvas::{CanvasSpec, apply as canvas_apply, plan as canvas_plan};
 
@@ -46,6 +47,9 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         feather: args.feather,
         despill: !args.no_despill,
         edge_threshold: args.edge_threshold,
+        step_tolerance: args.step_tolerance,
+        shadow_tolerance: args.shadow_tolerance,
+        seal: args.seal,
         refine: !args.no_refine,
     };
     let result = cutout(&loaded.image, &opts);
@@ -55,15 +59,18 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     let mut warnings = loaded.warnings();
     warnings.extend(result.warnings.clone());
 
-    let (final_image, canvas) = match args.canvas {
+    // キャンバスを使わないときは切り抜き結果をそのまま書き出す。複製すると
+    // 12MP で 48MB を余分に積み、batch の並列度ぶんだけ倍になる
+    let (placed, canvas) = match args.canvas {
         Some((cw, ch)) => {
             let (image, report) = place_on_canvas(&result, cw, ch, args, &mut warnings)?;
-            (image, Some(report))
+            (Some(image), Some(report))
         }
-        None => (result.image.clone(), None),
+        None => (None, None),
     };
+    let final_image = placed.as_ref().unwrap_or(&result.image);
 
-    let (output_report, save_warnings) = output::write_image(&final_image, &args.out, format)?;
+    let (output_report, save_warnings) = output::write_image(final_image, &args.out, format)?;
     warnings.extend(save_warnings);
 
     let preview = write_preview(
@@ -71,7 +78,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         preview_format,
         &loaded.image,
         &result.mask,
-        &final_image,
+        final_image,
         &mut warnings,
     );
 
@@ -91,7 +98,17 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
                 max: round4(result.background.delta_e.max),
             },
         },
-        tolerance: args.tolerance,
+        settings: SettingsReport {
+            tolerance: opts.tolerance,
+            edge_threshold: opts.edge_threshold,
+            step_tolerance: opts.step_tolerance,
+            shadow_tolerance: opts.shadow_tolerance,
+            seal: opts.seal,
+            cleanup: opts.cleanup,
+            feather: opts.feather,
+            despill: opts.despill,
+            refine: opts.refine,
+        },
         applied_bbox: bbox.map(|(x1, y1, x2, y2)| [x1, y1, x2, y2]),
         mask: MaskReport {
             foreground_ratio: round4(result.stats.foreground_ratio),

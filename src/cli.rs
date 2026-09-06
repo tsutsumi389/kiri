@@ -120,6 +120,27 @@ pub struct ResizeArgs {
     pub out: OutputOpts,
 }
 
+/// `--seal` の上限。
+///
+/// 半径 N の測地的オープニングは走査量が N に比例し、1MP で `--seal 400` は
+/// 1.5 秒かかる。塞ぐ対象は輪郭の破れ（数 px）なので、二桁の値に意味は無い。
+pub const MAX_SEAL: u32 = 8;
+
+/// 0 以上の有限な実数だけを受け付ける。
+///
+/// 許容量やしきい値に負値や nan が入ると、比較が常に偽になってその機能が
+/// 黙って無効化される。「指定したのに効かない」は、結果の JSON を見て
+/// 判断するエージェントにとって最も追いにくい失敗なので、受け取る前に断る。
+pub fn non_negative(s: &str) -> Result<f64, String> {
+    let v: f64 = s
+        .parse()
+        .map_err(|_| format!("'{s}' は数値として読めません"))?;
+    if !v.is_finite() || v < 0.0 {
+        return Err(format!("'{s}' は 0 以上の有限な数値である必要があります"));
+    }
+    Ok(v)
+}
+
 #[derive(Args, Debug)]
 pub struct CutoutArgs {
     /// 入力画像（JPEG または PNG）
@@ -139,7 +160,7 @@ pub struct CutoutArgs {
     pub fg_seed: Vec<[f64; 2]>,
 
     /// 背景色との色差(ΔE)の許容量。大きいほど広く背景として飲み込む
-    #[arg(long, default_value_t = 12.0)]
+    #[arg(long, default_value_t = 12.0, value_parser = non_negative)]
     pub tolerance: f64,
 
     /// 背景色推定に使う外周の幅(px)
@@ -156,8 +177,23 @@ pub struct CutoutArgs {
 
     /// 1px あたりの輝度変化がこの値を超える輪郭でフィルを止める。0 で無効。
     /// 淡い色の商品が背景ごと消えるのを防ぐ
-    #[arg(long, default_value_t = 8.0)]
+    #[arg(long, default_value_t = 8.0, value_parser = non_negative)]
     pub edge_threshold: f64,
+
+    /// 背景を広げる際に 1px あたりに許す色差(ΔE)。0 で無効。
+    /// なだらかな落ち影は越え、淡い商品の輪郭の段差では止まる
+    #[arg(long, default_value_t = 2.2, value_parser = non_negative)]
+    pub step_tolerance: f64,
+
+    /// 落ち影として消す明度(L*)の落ち込みの上限。0 で無効。
+    /// 彩度が背景とほぼ同じで暗いだけの画素に限って適用される
+    #[arg(long, default_value_t = 35.0, value_parser = non_negative)]
+    pub shadow_tolerance: f64,
+
+    /// 幅 2N px 以下の隙間を通ってしか外周につながらない背景を前景へ戻す。
+    /// 0 で無効。輪郭の小さな破れからの浸水を止める（上限 8）
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(0..=i64::from(MAX_SEAL)))]
+    pub seal: u32,
 
     /// 境界の色かぶり除去を行わない
     #[arg(long)]

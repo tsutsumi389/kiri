@@ -727,4 +727,49 @@ mod tests {
             assert_eq!(after[3], before[3], "アルファに触れてはいけない");
         }
     }
+
+    /// 同じ入力からは同じ結果が出ること。
+    ///
+    /// 変換は rayon で塊ごとに走る。画素どうしは独立なので分割の仕方に
+    /// 依存しないはずだが、依存していれば実行ごとに出力バイト列が揺れる。
+    #[test]
+    fn the_result_does_not_depend_on_how_the_work_is_split() {
+        let t = transform_of(&build(&display_p3()));
+        // 1 塊に収まらない大きさにして、分割の境界をまたがせる
+        let source = RgbaImage::from_fn(1024, 64, |x, y| {
+            image::Rgba([
+                (x % 256) as u8,
+                (y * 4 % 256) as u8,
+                ((x + y) % 256) as u8,
+                255,
+            ])
+        });
+        let mut first = source.clone();
+        t.apply(&mut first);
+        for _ in 0..3 {
+            let mut again = source.clone();
+            t.apply(&mut again);
+            assert_eq!(
+                first.as_raw(),
+                again.as_raw(),
+                "実行ごとに結果が変わっている"
+            );
+        }
+    }
+
+    /// 12MP の変換にかかる時間を出す。判定はしない（機械によって何倍も違う）。
+    #[ignore = "計測用。12MP を数回変換するので数秒かかる"]
+    #[test]
+    fn print_the_cost_on_a_twelve_megapixel_image() {
+        let t = transform_of(&build(&display_p3()));
+        let source = RgbaImage::from_fn(3000, 4000, |x, y| {
+            image::Rgba([(x % 256) as u8, (y % 256) as u8, ((x ^ y) % 256) as u8, 255])
+        });
+        for round in 0..3 {
+            let mut image = source.clone();
+            let started = std::time::Instant::now();
+            t.apply(&mut image);
+            println!("12MP の変換 {round}: {:?}", started.elapsed());
+        }
+    }
 }

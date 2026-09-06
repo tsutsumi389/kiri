@@ -199,7 +199,7 @@ fn normalize_color(
                 }
             } else {
                 let warning = format!(
-                    "ICC プロファイル {} を検出しましたが --no-color-convert のため\
+                    "ICC プロファイル {} を検出しましたが、--no-color-convert のため \
                      sRGB へ変換していません",
                     label()
                 );

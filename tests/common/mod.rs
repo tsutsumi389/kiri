@@ -180,6 +180,16 @@ pub struct EdgeScene {
     /// 縦横の正弦の積にするのは、実素材の織り目が線ではなく点として現れ、
     /// 面積フィルタの対象になるためである
     pub weave: Option<(f32, f32)>,
+    /// 画面下端で見切れた、柄のある別の商品。(帯の高さ px, 振幅, 周期 px)。
+    ///
+    /// EC で頻出する「商品が画面の端で切れている」構図を作る。外周の帯の 1 辺が
+    /// まるごと商品の内部になるため、**背景ではないものが外周の勾配に混ざる**。
+    ///
+    /// この帯は正解（`coverage` / `distance`）には入れない。シーンの目的は
+    /// **中央の商品がどれだけ削られたか**を測ることにあり、帯は背景でも
+    /// 中央の商品でもないためである。帯を背景として数える `speckles` だけは
+    /// このシーンで意味を持たない
+    pub cropped_band: Option<(u32, f32, f32)>,
 }
 
 impl Default for EdgeScene {
@@ -198,6 +208,7 @@ impl Default for EdgeScene {
             jpeg: Some(90),
             noise: 1.5,
             weave: None,
+            cropped_band: None,
         }
     }
 }
@@ -317,6 +328,19 @@ pub fn edge_scene(scene: &EdgeScene) -> EdgeTruth {
             coverage[i] = c;
             distance[i] = d;
             shadow[i] = if c > 0.0 { 0.0 } else { sh };
+        }
+    }
+
+    // 見切れた商品は正解を作り終えた後に塗る。圧縮より前に置くのは、実写では
+    // 見切れも含めて 1 枚の JPEG として符号化されるためである
+    if let Some((band, amp, period)) = scene.cropped_band {
+        let k = std::f32::consts::TAU / period;
+        for y in h.saturating_sub(band)..h {
+            for x in 0..w {
+                let t = amp * (x as f32 * k).sin() * (y as f32 * k).sin();
+                let v = |c: f32| (c + t).clamp(0.0, 255.0) as u8;
+                image.put_pixel(x, y, Rgba([v(120.0), v(96.0), v(84.0), 255]));
+            }
         }
     }
 

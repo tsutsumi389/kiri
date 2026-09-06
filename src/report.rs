@@ -58,8 +58,9 @@ pub struct PerimeterDeltaE {
 /// `perimeter_delta_e` は「背景色からどれだけ離れているか」しか言わないので、
 /// なだらかな照明ムラと、ざらついた織り目を区別できない。前者は tolerance で
 /// 吸収できるが、後者は輪郭の堤防を誤発火させ、フィルが商品まで届かなくなる。
-/// `p90` が `settings.edge_threshold` の水準に達していれば、その背景は
-/// 「堤防を張れない素材」である。
+/// `p50` が `settings.edge_threshold` に達していれば、その背景は
+/// 「堤防を張れない素材」である。`p90` だけが高い場合は背景ではなく、
+/// **帯に写り込んだ物**（画面の端で見切れた柄物の商品など）を指している。
 #[derive(Debug, Serialize)]
 pub struct PerimeterTexture {
     pub p50: f64,

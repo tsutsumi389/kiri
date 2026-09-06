@@ -365,6 +365,78 @@ fn a_woven_background_is_cut_out_with_the_defaults() {
     );
 }
 
+/// 画面の端で見切れた柄物の商品が、テクスチャ検知を誤発火させないこと。
+///
+/// EC では「商品が画面の下端で切れている」構図が頻出する。このとき外周の帯の
+/// 1 辺はまるごと商品の内部になり、その商品が無地でなければ帯の勾配が跳ねる。
+/// **背景はきれいなのに堤防が引き上がる**という誤検知で、堤防が守るはずだった
+/// 淡色商品（S3）が背景ごと消える。
+///
+/// 発火条件を p90 だけに置いていた頃の実測（このシーン）では、外周の勾配は
+/// p50 0.4 / p90 19.2 で、堤防は 8 から 28.9 へ上がっていた。淡色商品が
+/// 耐えられるのは 25 までなので、28.9 は堤防を無効化したのと同じで、
+/// 境界近傍の欠けは 8.7% から 38.7% へ跳ねる。
+///
+/// 判定を「既定と同じ」ではなく「堤防 8 を明示したときと同じ」に置くのは、
+/// 誤発火していないことを直接言うためである。
+#[test]
+fn a_patterned_product_cropped_at_the_bottom_does_not_raise_the_dam() {
+    let scene = EdgeScene {
+        name: "H1",
+        width: 1200,
+        height: 1200,
+        product: [232, 232, 230],
+        shading: (0.98, 0.80),
+        // 下端 60px が、周期 10px の柄を持つ別の商品で埋まっている
+        cropped_band: Some((60, 24.0, 10.0)),
+        ..Default::default()
+    };
+    let truth = edge_scene(&scene);
+    let clean = edge_scene(&EdgeScene {
+        cropped_band: None,
+        ..scene
+    });
+
+    let auto = cutout(&truth.image, &CutoutOptions::default());
+    let texture = auto.background.texture;
+    assert!(
+        texture.p90 > 15.0,
+        "前提が崩れている: 見切れた柄が p90 を押し上げていない: {texture:?}"
+    );
+    assert!(
+        texture.p50 < 2.0,
+        "前提が崩れている: 背景そのものはきれいなはず: {texture:?}"
+    );
+    assert_eq!(
+        auto.edge_threshold,
+        kiri::cutout::DEFAULT_EDGE_THRESHOLD,
+        "帯の 1 辺が商品でも堤防が引き上がっている: {texture:?}"
+    );
+
+    // 堤防 8 を明示した場合と、見切れの無い同じシーンと、3 つが揃うこと
+    let pinned = run(
+        &truth,
+        &CutoutOptions {
+            edge_threshold: Some(kiri::cutout::DEFAULT_EDGE_THRESHOLD),
+            ..Default::default()
+        },
+    );
+    let m = measure_edges(&truth, &auto.image, &auto.mask);
+    let without = run(&clean, &CutoutOptions::default());
+    assert!(
+        (m.eaten - pinned.eaten).abs() < 0.005,
+        "既定と「堤防 8 を明示」で結果が違う: {:.1}% と {:.1}%",
+        m.eaten * 100.0,
+        pinned.eaten * 100.0
+    );
+    assert!(
+        (m.eaten - without.eaten).abs() < 0.005,
+        "見切れの有無で淡色商品の削れ方が変わっている: {:.1}% と {:.1}%",
+        m.eaten * 100.0,
+        without.eaten * 100.0
+    );
+}
+
 /// 上の対照実験。堤防を既定値のまま**明示**すれば布の縁が残ること。
 ///
 /// 「もともと堤防が邪魔をしていなかっただけ」で上のテストが通るのを防ぐ。

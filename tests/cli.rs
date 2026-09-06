@@ -2475,9 +2475,17 @@ fn the_cli_defaults_match_the_library_defaults() {
     assert_eq!(args.border, defaults.border, "--border の既定値");
     assert_eq!(args.cleanup, defaults.cleanup, "--cleanup の既定値");
     assert_eq!(args.feather, defaults.feather, "--feather の既定値");
+    // --edge-threshold だけは「既定値」がここに無い。CLI もライブラリも
+    // 未指定を None のまま持ち回り、DEFAULT_EDGE_THRESHOLD を起点にした
+    // 自動調整へ渡すためである。両者が None であることは
+    // 「未指定と 8 の明示を区別する」という約束そのものなので、ここで固定する
     assert_eq!(
-        args.edge_threshold, defaults.edge_threshold,
-        "--edge-threshold の既定値"
+        args.edge_threshold, None,
+        "--edge-threshold の未指定が None のまま渡っていない"
+    );
+    assert_eq!(
+        defaults.edge_threshold, None,
+        "CutoutOptions の edge_threshold が未指定でなくなっている"
     );
     assert_eq!(
         args.step_tolerance, defaults.step_tolerance,
@@ -2490,6 +2498,29 @@ fn the_cli_defaults_match_the_library_defaults() {
     assert_eq!(args.seal, defaults.seal, "--seal の既定値");
     assert_eq!(!args.no_despill, defaults.despill, "デスピルの既定");
     assert_eq!(!args.no_refine, defaults.refine, "アルファ再推定の既定");
+}
+
+/// `--help` が語る既定値が `DEFAULT_EDGE_THRESHOLD` と食い違っていないこと。
+///
+/// `--edge-threshold` の既定値は clap の `default_value_t` に無く、ヘルプの
+/// 文言としてしか現れない。**AI エージェントは `--help` を読んで判断する**ので、
+/// 定数を動かしてヘルプが取り残されると「指定しなくても 8 が効く」という
+/// 誤った前提のまま使われる。上のテストが拾えない唯一の抜け道がここにある。
+#[test]
+fn the_help_text_quotes_the_real_default_edge_threshold() {
+    use clap::CommandFactory;
+    use kiri::cli::Cli;
+
+    let help = Cli::command()
+        .find_subcommand_mut("cutout")
+        .expect("cutout サブコマンドが無い")
+        .render_long_help()
+        .to_string();
+    let expected = format!("既定 {:.0}", kiri::cutout::DEFAULT_EDGE_THRESHOLD);
+    assert!(
+        help.contains(&expected),
+        "--help が「{expected}」を語っていない:\n{help}"
+    );
 }
 
 #[test]

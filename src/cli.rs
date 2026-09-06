@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+use crate::cutout::DEFAULT_EDGE_THRESHOLD;
 use crate::cutout::background::DEFAULT_BORDER;
 use crate::image_io::OutputFormat;
 use crate::preview::DEFAULT_PANEL;
@@ -134,6 +135,32 @@ pub const MAX_SEAL: u32 = 8;
 /// `u32::MAX` 付近で溢れるのを入口で断つためでもある。
 pub const MAX_CLEANUP: u32 = 64;
 
+/// `--edge-threshold` のヘルプ。既定値は `DEFAULT_EDGE_THRESHOLD` から組む。
+///
+/// この項目の既定値は clap の `default_value_t` に置けない。「未指定」と
+/// 「8 を明示」を区別する必要があり、値は `Option` のまま下流へ渡すためである。
+/// そのぶん既定値はヘルプの文言としてしか現れず、直書きすると定数を動かした
+/// ときにヘルプだけが古い値を語り続ける。**AI エージェントは `--help` を読んで
+/// 判断する**ので、その嘘は「指定しなくても 8 が効く」という誤った前提を
+/// そのまま行動へ変える。定数から組み立てて食い違いを構造的に無くす。
+fn edge_threshold_help() -> String {
+    format!(
+        "1px あたりの輝度変化がこの値を超える輪郭でフィルを止める（既定 \
+         {DEFAULT_EDGE_THRESHOLD:.0}、自動調整あり）。0 で無効"
+    )
+}
+
+/// 上の長い版。自動調整の条件まで説明する。
+fn edge_threshold_long_help() -> String {
+    format!(
+        "1px あたりの輝度変化がこの値を超える輪郭でフィルを止める（既定 \
+         {DEFAULT_EDGE_THRESHOLD:.0}）。0 で無効。淡い色の商品が背景ごと消えるのを防ぐ。\n\
+         未指定なら、外周の勾配 p50 が {DEFAULT_EDGE_THRESHOLD:.0} 以上のときに限り、\
+         p90 の 1.5 倍まで自動で引き上げる（不織布・段ボールのような\
+         ざらついた背景で、堤防が背景の中で壁になるのを避けるため）"
+    )
+}
+
 /// 0 以上の有限な実数だけを受け付ける。
 ///
 /// 許容量やしきい値に負値や nan が入ると、比較が常に偽になってその機能が
@@ -184,10 +211,16 @@ pub struct CutoutArgs {
     #[arg(long, default_value_t = 1)]
     pub feather: u32,
 
-    /// 1px あたりの輝度変化がこの値を超える輪郭でフィルを止める（既定 8）。
-    /// 0 で無効。淡い色の商品が背景ごと消えるのを防ぐ。
-    /// 未指定なら、背景のテクスチャが堤防を発火させる場合に自動で引き上げる
-    #[arg(long, value_parser = non_negative)]
+    /// 1px あたりの輝度変化がこの値を超える輪郭でフィルを止める。0 で無効。
+    ///
+    /// ヘルプの文言は `edge_threshold_help` が既定値の定数から組む。
+    /// doc コメントに直書きすると定数と食い違うため、ここには既定値を書かない
+    #[arg(
+        long,
+        value_parser = non_negative,
+        help = edge_threshold_help(),
+        long_help = edge_threshold_long_help()
+    )]
     pub edge_threshold: Option<f64>,
 
     /// 背景を広げる際に 1px あたりに許す色差(ΔE)。0 で無効。

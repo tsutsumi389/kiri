@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 use common::{
-    ProductSpec, bleeding_product_scene, product_image, split_background_scene,
-    transparent_product, woven_background_image, write_jpeg, write_png,
+    ProductSpec, bleeding_product_scene, product_image, shadow_band_scene, split_background_scene,
+    transparent_product, woven_background_image, woven_poisoned_scene, write_jpeg, write_png,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -292,6 +292,13 @@ fn the_subject_line_and_the_hint_round_the_box_the_same_way() {
         .as_str()
         .unwrap()
         .to_string();
+    // **この行が先に要る。** hint に `--bbox` が載るのは信頼度が high のときだけで、
+    // 主体の規則を触ると、丸めとは無関係な理由でこのテストが落ちる。
+    // 「丸めが違う」という失敗文言のまま、原因が別の場所にある状態を避ける
+    assert!(
+        hint.contains("--bbox"),
+        "主体が high でなくなっている。丸めではなく主体の判定を疑うこと: {hint}\n{v}"
+    );
     assert!(
         hint.contains(&format!("--bbox {expected} ")),
         "hint が JSON と違う丸めで出ている: {hint}"
@@ -1714,16 +1721,24 @@ fn a_frame_filling_object_never_earns_high_confidence() {
         .unwrap();
     let v = json_stdout(&out);
 
-    // 前提：外周が二峰性になっている（9 割は単色、1 割超が別物）
-    let d = &v["background"]["perimeter_delta_e"];
-    assert!(d["p50"].as_f64().unwrap() < 5.0, "前提が崩れている: {d}");
-    assert!(d["p90"].as_f64().unwrap() > 15.0, "前提が崩れている: {d}");
+    // 前提：面積も捕捉率もこの構図を通してしまう。**弾けるのは
+    // 「矩形の外に何が残ったか」だけである**
+    let s = &v["subject"];
+    assert!(
+        s["capture_ratio"].as_f64().unwrap() > 0.70,
+        "前提が崩れている: {s}"
+    );
+    assert!(
+        s["leftover_ratio"].as_f64().unwrap() >= 0.15,
+        "矩形の外に残った塊を見落としている: {s}"
+    );
 
-    // 数値は返してよい。信用してよいかだけが問題である
-    assert_ne!(
-        v["subject"]["confidence"], "high",
-        "汚染された閾値の上の面積・捕捉率を信用している: {}",
-        v["subject"]
+    // 数値は返してよい。信用してよいかだけが問題である。
+    // **`assert_ne!` では `subject` が null でも通ってしまう**ので、
+    // 「low が出ている」ことを直接押さえる
+    assert_eq!(
+        s["confidence"], "low",
+        "主体を取りこぼした矩形を信用している: {s}"
     );
 
     // 信頼度が high でない以上、bbox を勧めてはならない
@@ -1742,6 +1757,121 @@ fn a_frame_filling_object_never_earns_high_confidence() {
     assert!(
         !has_warning(&v, "BBOX_RECOMMENDED"),
         "誤った矩形へ誘導している: {:?}",
+        warning_codes(&v)
+    );
+}
+
+/// **同じ汚染構図を、リポジトリ自身の織り目テクスチャの上で固定する。**
+///
+/// 外周統計から汚染を当てる規則は、無地の背景でしか成立しなかった。織り目が
+/// あるだけで外周 ΔE の p50 が 6.3 まで上がり、判定は素通しして、画面の 35% を
+/// 占める物体を丸ごと外した矩形を `confidence: high` で勧めた。
+/// **上の無地版だけを押さえていても、この穴は開いたままになる。**
+#[test]
+fn the_same_poison_on_the_repositorys_own_texture_is_caught_too() {
+    let dir = fixture_dir();
+    let input = write_png(dir.path(), "woven.png", &woven_poisoned_scene(600, 600));
+    let output = dir.path().join("cut.png");
+
+    let v = json_stdout(
+        &kiri()
+            .args(["info", input.to_str().unwrap(), "--json"])
+            .output()
+            .unwrap(),
+    );
+
+    // 前提：**旧規則の指紋（p50 < 5）が出ない。** 織り目そのものが p50 を押し上げる
+    let d = &v["background"]["perimeter_delta_e"];
+    assert!(
+        d["p50"].as_f64().unwrap() > 5.0,
+        "織り目が効いていない。この回帰テストの意味が失われている: {d}"
+    );
+    // 前提：面積も捕捉率も通ってしまう
+    let s = &v["subject"];
+    assert!(
+        s["area_ratio"].as_f64().unwrap() > 0.05 && s["capture_ratio"].as_f64().unwrap() > 0.70,
+        "前提が崩れている: {s}"
+    );
+
+    assert_eq!(
+        s["confidence"], "low",
+        "織り目の上では汚染を見逃している: {s}"
+    );
+
+    let v = json_stdout(
+        &kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        !has_warning(&v, "BBOX_RECOMMENDED"),
+        "誤った矩形へ誘導している: {:?}",
+        warning_codes(&v)
+    );
+}
+
+/// 対照：外周に帯が掛かっていても、主体を捉えられていれば `high` のまま。
+///
+/// **上の 2 本と対で意味を持つ。** 疑わしきを片端から Low に落とせば汚染の
+/// テストは通り続けるが、機能そのものが死ぬ。旧規則はまさにこれを踏んで、
+/// 主体を完璧に検出（area 14.1% / capture 98.1%）している画像を Low へ落とし、
+/// `cutout` の警告を `SUBJECT_TOUCHES_EDGE`——C-1 で誤診として潰したもの——へ
+/// 戻していた。
+#[test]
+fn a_band_on_the_edge_does_not_cost_the_subject_its_confidence() {
+    let dir = fixture_dir();
+    let input = write_png(dir.path(), "band.png", &shadow_band_scene(800, 800, 200));
+    let output = dir.path().join("cut.png");
+
+    let v = json_stdout(
+        &kiri()
+            .args(["info", input.to_str().unwrap(), "--json"])
+            .output()
+            .unwrap(),
+    );
+    let s = &v["subject"];
+    // 前提：帯は外周 ΔE を跳ね上げている（旧規則ならここで Low に落ちた）
+    let d = &v["background"]["perimeter_delta_e"];
+    assert!(
+        d["p90"].as_f64().unwrap() > 15.0,
+        "帯が効いていない。対照の意味が失われている: {d}"
+    );
+    assert_eq!(s["confidence"], "high", "帯を汚染と読んでいる: {s}");
+    assert!(
+        s["leftover_ratio"].as_f64().unwrap() < 0.15,
+        "帯だけが残っているはず: {s}"
+    );
+
+    // **`SUBJECT_TOUCHES_EDGE` へ戻っていないこと。** 商品は中央にあり、
+    // 見切れてはいない
+    let v = json_stdout(
+        &kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(v["mask"]["touches_edge"], true, "前提が崩れている: {v}");
+    assert!(
+        !has_warning(&v, "SUBJECT_TOUCHES_EDGE"),
+        "見切れの誤診が復活している: {:?}",
+        warning_codes(&v)
+    );
+    assert!(
+        has_warning(&v, "BBOX_RECOMMENDED"),
+        "解ける画像で助言が出ていない: {:?}",
         warning_codes(&v)
     );
 }

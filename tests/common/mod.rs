@@ -568,7 +568,6 @@ fn percentile(values: &mut [f32], q: f32) -> f32 {
 /// 周期 6px は実写（不織布）で堤防が壁として立った密度に合わせてある。
 pub fn woven_background_image(width: u32, height: u32) -> RgbaImage {
     let mut img = RgbaImage::new(width, height);
-    let k = std::f32::consts::TAU / 6.0;
     let (x1, y1) = (width / 4, height / 4);
     let (x2, y2) = (width * 3 / 4, height * 3 / 4);
     for y in 0..height {
@@ -577,11 +576,90 @@ pub fn woven_background_image(width: u32, height: u32) -> RgbaImage {
             let p = if inside {
                 Rgba([35, 35, 38, 255])
             } else {
-                let t = 12.0 * (x as f32 * k).sin() * (y as f32 * k).sin();
-                let v = |c: f32| (c + t).clamp(0.0, 255.0) as u8;
-                Rgba([v(177.0), v(174.0), v(168.0), 255])
+                woven_pixel(x, y)
             };
             img.put_pixel(x, y, p);
+        }
+    }
+    img
+}
+
+/// 織り目 1 画素ぶんの色。
+///
+/// `woven_background_image` と `woven_poisoned_scene` が**同じ織り目**を使うために
+/// 切り出してある。片方だけ振幅や周期を変えると、「リポジトリ自身のテクスチャで
+/// 破れた」という回帰テストの前提が静かに崩れる。
+fn woven_pixel(x: u32, y: u32) -> Rgba<u8> {
+    let k = std::f32::consts::TAU / 6.0;
+    let t = 12.0 * (x as f32 * k).sin() * (y as f32 * k).sin();
+    let v = |c: f32| (c + t).clamp(0.0, 255.0) as u8;
+    Rgba([v(177.0), v(174.0), v(168.0), 255])
+}
+
+/// `bleeding_product_scene` と同じ汚染構図を、**リポジトリ自身の織り目の上**に
+/// 置いたシーン。
+///
+/// **今回いちばん重い事実は「リポジトリ自身のテクスチャで規則が破れた」ことである。**
+/// 外周統計から汚染を当てる旧規則（外周 ΔE の `p50` が 5 未満かつ `p90` が 15 超）は、
+/// 無地の背景でしか成立しなかった。織り目があると `p50` が 6.3 まで上がって
+/// 判定が素通しし、画面の 35% を占める物体を丸ごと外した矩形を
+/// `confidence: high` で勧めた。
+///
+/// **必ず 600px 以上で使うこと。** 主体は長辺 250px へ縮小してから測るので、
+/// 小さい画像ではこの経路（縮小 → Lanczos3 のリンギング）を踏まない。
+///
+/// 実測（600x600）: 外周ΔE p50 6.30 / p90 17.74、area 0.100 / capture 0.962 と
+/// 両方の条件を通ってしまう。弾けるのは leftover 35.3% だけである。
+pub fn woven_poisoned_scene(width: u32, height: u32) -> RgbaImage {
+    let mut img = RgbaImage::new(width, height);
+    for y in 0..height {
+        for x in 0..width {
+            img.put_pixel(x, y, woven_pixel(x, y));
+        }
+    }
+    // 汚染する物体の色は、**織り目の地色 (177,174,168) から見て**
+    // `bleeding_product_scene` の灰色が白地から離れているのと同じくらい離す。
+    // 地色が違うのに同じ RGB を使うと、外周 ΔE も leftover も別物になり、
+    // 「同じ構図」を再現したことにならない
+    let edge = width * 35 / 100;
+    for y in 0..height {
+        for x in 0..edge {
+            img.put_pixel(x, y, Rgba([120, 120, 120, 255]));
+        }
+    }
+    let (x1, y1) = (width * 62 / 100, height * 62 / 100);
+    let (x2, y2) = (width * 93 / 100, height * 93 / 100);
+    for y in y1..y2 {
+        for x in x1..x2 {
+            img.put_pixel(x, y, Rgba([35, 35, 38, 255]));
+        }
+    }
+    img
+}
+
+/// 白背景の中央に商品、下端いっぱいに影の帯を敷いたシーン。
+///
+/// **偽陽性の対照である。** 帯は外周に掛かるので外周 ΔE を跳ね上げる
+/// （実測 800x800 で p50 0.00 / p90 17.7）が、**主体の検出は完璧に成功して
+/// いる**（area 14.1% / capture 98.1%）。旧規則はこれを汚染と読んで Low へ落とし、
+/// `cutout` の警告を `BBOX_RECOMMENDED` から `SUBJECT_TOUCHES_EDGE`
+/// ——誤診として潰したはずのもの——へ戻していた。
+///
+/// 新しい規則では、矩形の外に残るのは帯だけ（leftover 3.1%）なので High のまま。
+/// `band` は帯の明度で、小さいほど背景から遠い（200 で ΔE 約 18）。
+pub fn shadow_band_scene(width: u32, height: u32, band: u8) -> RgbaImage {
+    let mut img = RgbaImage::from_pixel(width, height, Rgba([250, 250, 248, 255]));
+    let band_top = height * 96 / 100;
+    for y in band_top..height {
+        for x in 0..width {
+            img.put_pixel(x, y, Rgba([band, band, band.saturating_sub(2), 255]));
+        }
+    }
+    let (x1, y1) = (width * 31 / 100, height * 31 / 100);
+    let (x2, y2) = (width * 69 / 100, height * 69 / 100);
+    for y in y1..y2 {
+        for x in x1..x2 {
+            img.put_pixel(x, y, Rgba([40, 40, 44, 255]));
         }
     }
     img

@@ -25,6 +25,8 @@ pub mod refine;
 
 use image::RgbaImage;
 
+use crate::warning::Warning;
+
 pub use background::{BackgroundEstimate, DEFAULT_BORDER, DeltaEQuantiles, estimate_background};
 pub use diagnostics::Diagnostics;
 pub use edges::GradientQuantiles;
@@ -54,6 +56,23 @@ pub const DEFAULT_EDGE_THRESHOLD: f64 = 8.0;
 /// 固定している。堤防を切ると商品がまるごと飲まれ、既定の 8 では織り目が壁に
 /// なる。両立するのは 12〜24 の窓だけで、1.5 倍（21）はその中にある。
 const TEXTURE_DAM_HEADROOM: f64 = 1.5;
+
+/// 警告の `data` へ載せる値を小数第 1 位で丸める。
+///
+/// 桁を落とすのは、message に `{:.1}` で書いた値と `data` の値が食い違うと、
+/// エージェントが「別の値で判断されたのか」と疑うためである。表示と契約は
+/// 同じ数でなければならない。
+fn round1(v: f64) -> f64 {
+    (v * 10.0).round() / 10.0
+}
+
+/// 比率を小数第 4 位で丸める。`commands::output::round4` と同じ桁にしてある。
+///
+/// 警告の `data` と JSON 本体（`mask.foreground_ratio` など）が別の桁で出ると、
+/// 同じ値の二つの表記をエージェントが突き合わせられない。
+fn round4(v: f64) -> f64 {
+    (v * 10_000.0).round() / 10_000.0
+}
 
 #[derive(Debug, Clone)]
 pub struct CutoutOptions {
@@ -134,7 +153,7 @@ pub struct CutoutResult {
     pub separability: Option<f64>,
     /// 境界の縁と階調の診断値
     pub diagnostics: Diagnostics,
-    pub warnings: Vec<String>,
+    pub warnings: Vec<Warning>,
 }
 
 /// 実際に使う堤防のしきい値と、自動調整したことを知らせる警告を決める。
@@ -189,7 +208,7 @@ pub struct CutoutResult {
 fn resolve_edge_threshold(
     requested: Option<f64>,
     texture: &GradientQuantiles,
-) -> (f64, Option<String>) {
+) -> (f64, Option<Warning>) {
     if let Some(value) = requested {
         return (value, None);
     }
@@ -200,12 +219,22 @@ fn resolve_edge_threshold(
     if texture.p50 < DEFAULT_EDGE_THRESHOLD || raised <= DEFAULT_EDGE_THRESHOLD {
         return (DEFAULT_EDGE_THRESHOLD, None);
     }
-    let warning = format!(
-        "背景のテクスチャ（外周の勾配 p50 = {:.1} / p90 = {:.1}）が堤防を発火させるため、\
-         edge_threshold を {DEFAULT_EDGE_THRESHOLD:.0} から {raised:.1} へ調整しました。\
-         明示指定すれば従います",
-        texture.p50, texture.p90
-    );
+    let warning = Warning::new(
+        "EDGE_THRESHOLD_RAISED",
+        format!(
+            "背景のテクスチャ（外周の勾配 p50 = {:.1} / p90 = {:.1}）が堤防を発火させるため、\
+             edge_threshold を {DEFAULT_EDGE_THRESHOLD:.0} から {raised:.1} へ調整しました。\
+             明示指定すれば従います",
+            texture.p50, texture.p90
+        ),
+    )
+    .with_hint("--edge-threshold を明示すれば自動調整は割り込みません")
+    .with_data("from", DEFAULT_EDGE_THRESHOLD)
+    .with_data("to", raised)
+    // 発火の判定は p50、引き上げ幅は p90 と、別々の役目で使い分けている。
+    // 片方だけ返すとエージェントは調整の是非を自分で検算できない
+    .with_data("texture_p50", round1(texture.p50))
+    .with_data("texture_p90", round1(texture.p90));
     (raised, Some(warning))
 }
 
@@ -401,36 +430,60 @@ fn apply_alpha(image: &mut RgbaImage, mask: &Mask) {
 }
 
 /// AI エージェントが失敗を検出できるように、疑わしい結果へ警告を付ける。
+///
+/// どの警告も機械可読な `code` を持ち、判断に使った数値を `data` に載せる。
+/// 文言は推敲で変わるが、code と data のキーは契約として動かさない。
 fn collect_warnings(
     background: &BackgroundEstimate,
     stats: &MaskStats,
     separability: Option<f64>,
     diagnostics: &Diagnostics,
-) -> Vec<String> {
+) -> Vec<Warning> {
     let mut warnings = Vec::new();
 
     if !background.is_uniform() {
-        warnings.push(format!(
-            "背景の均一度が {:.2} と低く、単色背景ではない可能性があります。\
-             切り抜き結果を確認してください",
-            background.uniformity
-        ));
+        warnings.push(
+            Warning::new(
+                "LOW_UNIFORMITY",
+                format!(
+                    "背景の均一度が {:.2} と低く、単色背景ではない可能性があります",
+                    background.uniformity
+                ),
+            )
+            .with_hint("切り抜き結果を確認してください")
+            .with_data("uniformity", round4(background.uniformity)),
+        );
     }
     if stats.foreground_ratio < 0.01 {
-        warnings.push(format!(
-            "前景がほとんど検出されていません (foreground_ratio={:.4})。\
-             --tolerance を下げるか --bbox で対象を指定してください",
-            stats.foreground_ratio
-        ));
+        warnings.push(
+            Warning::new(
+                "FOREGROUND_TOO_SMALL",
+                format!(
+                    "前景がほとんど検出されていません (foreground_ratio={:.4})",
+                    stats.foreground_ratio
+                ),
+            )
+            .with_hint("--tolerance を下げるか --bbox で対象を指定してください")
+            .with_data("foreground_ratio", round4(stats.foreground_ratio)),
+        );
     } else if stats.foreground_ratio > 0.99 {
-        warnings.push(format!(
-            "背景がほとんど除去されていません (foreground_ratio={:.4})。\
-             --tolerance を上げてください",
-            stats.foreground_ratio
-        ));
+        warnings.push(
+            Warning::new(
+                "FOREGROUND_TOO_LARGE",
+                format!(
+                    "背景がほとんど除去されていません (foreground_ratio={:.4})",
+                    stats.foreground_ratio
+                ),
+            )
+            .with_hint("--tolerance を上げてください")
+            .with_data("foreground_ratio", round4(stats.foreground_ratio)),
+        );
     }
     if stats.touches_edge {
-        warnings.push("前景が画像の外周に接しています。商品が見切れている可能性があります".into());
+        warnings.push(Warning::new(
+            "SUBJECT_TOUCHES_EDGE",
+            "前景が画像の外周に接しています。商品が見切れている可能性があります",
+        ));
     }
 
     // 縁の残りは separability では検出できない。あちらは境界の内側を測るため、
@@ -439,11 +492,17 @@ fn collect_warnings(
     // 納品先の背景が分からない以上、書き出しの時点で知らせる必要がある
     if let Some(halo) = diagnostics.halo_ratio {
         if halo > diagnostics::HALO_WARN {
-            warnings.push(format!(
-                "境界の {:.0}% が背景色のまま不透明で残っています (halo_ratio={halo:.2})。\
-                 白以外の下地に載せると輪郭が光ります",
-                halo * 100.0,
-            ));
+            warnings.push(
+                Warning::new(
+                    "HALO_REMAINS",
+                    format!(
+                        "境界の {:.0}% が背景色のまま不透明で残っています (halo_ratio={halo:.2})。\
+                         白以外の下地に載せると輪郭が光ります",
+                        halo * 100.0,
+                    ),
+                )
+                .with_data("halo_ratio", round4(halo)),
+            );
         }
     }
 
@@ -460,11 +519,19 @@ fn collect_warnings(
     if let Some(sep) = separability {
         let spread = background.delta_e.p50;
         if cut_happened && sep < spread {
-            warnings.push(format!(
-                "商品と背景の色差 (ΔE {sep:.1}) が背景自身のばらつき (ΔE {spread:.1}) を\
-                 下回っています。背景を消せる tolerance では商品も消えるため、\
-                 パラメータ調整では改善しません"
-            ));
+            warnings.push(
+                Warning::new(
+                    "NOT_SEPARABLE",
+                    format!(
+                        "商品と背景の色差 (ΔE {sep:.1}) が背景自身のばらつき (ΔE {spread:.1}) を\
+                         下回っています。背景を消せる tolerance では商品も消えるため、\
+                         パラメータ調整では改善しません"
+                    ),
+                )
+                .with_hint("パラメータ調整では解決しません。単色背景で撮り直してください")
+                .with_data("separability", round1(sep))
+                .with_data("perimeter_delta_e_p50", round1(spread)),
+            );
         }
     }
 
@@ -519,10 +586,9 @@ mod tests {
         }
     }
 
-    fn hopeless(warnings: &[String]) -> bool {
-        warnings
-            .iter()
-            .any(|w| w.contains("パラメータ調整では改善しません"))
+    /// code で拾う。文言は推敲で変わるが、code は契約なので動かない
+    fn hopeless(warnings: &[Warning]) -> bool {
+        warnings.iter().any(|w| w.code == "NOT_SEPARABLE")
     }
 
     #[test]
@@ -642,11 +708,15 @@ mod tests {
         let (value, warning) = resolve_edge_threshold(None, &texture(27.9));
         assert_eq!(value, 41.8, "p90 の 1.5 倍（小数第1位まで）になっていない");
         let warning = warning.expect("黙って設定を変えてはいけない");
-        assert!(warning.contains("テクスチャ"), "{warning}");
-        assert!(warning.contains("27.9"), "根拠の数値が無い: {warning}");
-        assert!(
-            warning.contains("41.8"),
-            "警告と実際に効く値が食い違っている: {warning}"
+        assert_eq!(warning.code, "EDGE_THRESHOLD_RAISED");
+        assert!(warning.message.contains("テクスチャ"), "{warning:?}");
+        // 根拠は文面だけでなく data にも載せる。エージェントが message を
+        // 正規表現で削らずに検算できることが、構造化した理由そのものである
+        assert_eq!(warning.data["texture_p90"], 27.9);
+        assert_eq!(warning.data["from"], 8.0);
+        assert_eq!(
+            warning.data["to"], 41.8,
+            "警告と実際に効く値が食い違っている: {warning:?}"
         );
     }
 

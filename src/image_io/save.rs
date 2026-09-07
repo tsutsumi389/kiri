@@ -9,6 +9,7 @@ use image::{ExtendedColorType, ImageEncoder, RgbaImage};
 use ravif::{AlphaColorMode, Encoder as AvifEncoder, RGBA8};
 
 use crate::error::{Error, Result};
+use crate::warning::Warning;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum OutputFormat {
@@ -81,7 +82,7 @@ impl Default for SaveOptions {
 
 pub struct SaveOutcome {
     pub bytes: u64,
-    pub warnings: Vec<String>,
+    pub warnings: Vec<Warning>,
 }
 
 pub fn save(path: &Path, image: &RgbaImage, opts: &SaveOptions) -> Result<SaveOutcome> {
@@ -105,10 +106,18 @@ pub fn save(path: &Path, image: &RgbaImage, opts: &SaveOptions) -> Result<SaveOu
     let must_flatten = has_alpha && (opts.flatten || !opts.format.supports_alpha());
     if has_alpha && !opts.format.supports_alpha() {
         let [r, g, b] = opts.background;
-        warnings.push(format!(
-            "{} は透過を保持できないため #{r:02X}{g:02X}{b:02X} で合成しました",
-            opts.format.as_str()
-        ));
+        warnings.push(
+            Warning::new(
+                "ALPHA_FLATTENED",
+                format!(
+                    "{} は透過を保持できないため #{r:02X}{g:02X}{b:02X} で合成しました",
+                    opts.format.as_str()
+                ),
+            )
+            .with_hint("透過を残すには --format png を指定してください")
+            .with_data("format", opts.format.as_str())
+            .with_data("background", vec![r, g, b]),
+        );
     }
 
     let flattened;

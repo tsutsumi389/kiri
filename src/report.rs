@@ -6,6 +6,7 @@
 use serde::Serialize;
 
 use crate::error::Error;
+use crate::warning::Warning;
 
 #[derive(Debug, Serialize)]
 pub struct ErrorReport {
@@ -95,7 +96,7 @@ pub struct InfoReport {
     pub icc_profile: bool,
     pub has_alpha: bool,
     pub background: BackgroundReport,
-    pub warnings: Vec<String>,
+    pub warnings: Vec<Warning>,
 }
 
 #[derive(Debug, Serialize)]
@@ -126,7 +127,7 @@ pub struct ProcessReport {
     /// sRGB へ変換したか
     pub color_converted: bool,
     pub elapsed_ms: u128,
-    pub warnings: Vec<String>,
+    pub warnings: Vec<Warning>,
 }
 
 #[derive(Debug, Serialize)]
@@ -232,7 +233,7 @@ pub struct CutoutReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
     pub elapsed_ms: u128,
-    pub warnings: Vec<String>,
+    pub warnings: Vec<Warning>,
 }
 
 #[derive(Debug, Serialize)]

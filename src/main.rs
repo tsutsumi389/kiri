@@ -15,6 +15,7 @@ use kiri::error::{Error, ErrorKind, Result};
 use kiri::report::{
     BackgroundReport, BatchReport, CutoutReport, ErrorReport, InfoReport, ProcessReport,
 };
+use kiri::warning::Warning;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -234,7 +235,7 @@ fn print_batch(report: &BatchReport) {
                     human_bytes(out.bytes)
                 );
                 for w in &r.warnings {
-                    eprintln!("  警告 [{}]: {w}", item.input);
+                    eprintln!("  警告 [{}]: {}", item.input, w.message);
                 }
             }
             (_, Some(e)) => {
@@ -262,9 +263,17 @@ fn print_perimeter(bg: &BackgroundReport) {
     println!("  外周勾配  p50 {:.1}  p90 {:.1}", t.p50, t.p90);
 }
 
-fn print_warnings(warnings: &[String]) {
+/// 人間向けの警告表示。
+///
+/// `code` はテキストには出さない。JSON が持っている以上ここでは冗長で、
+/// 読み手（人間）には文言のほうが速い。`hint` は次の行へインデントして出す。
+/// 「何が起きたか」と「次に何をするか」を 1 行に詰めると、後者が読み飛ばされる。
+fn print_warnings(warnings: &[Warning]) {
     for w in warnings {
-        eprintln!("警告: {w}");
+        eprintln!("警告: {}", w.message);
+        if let Some(hint) = &w.hint {
+            eprintln!("      {hint}");
+        }
     }
 }
 

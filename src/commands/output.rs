@@ -12,6 +12,7 @@ use crate::image_io::{LoadedImage, OutputFormat, SaveOptions, save};
 use crate::report::{
     BackgroundReport, Dimensions, OutputReport, PerimeterDeltaE, PerimeterTexture, ProcessReport,
 };
+use crate::warning::Warning;
 
 /// 明示指定がなければ拡張子から出力形式を決める。
 pub fn resolve_format(opts: &OutputOpts) -> Result<OutputFormat> {
@@ -80,7 +81,7 @@ pub fn write_image(
     image: &RgbaImage,
     opts: &OutputOpts,
     format: OutputFormat,
-) -> Result<(OutputReport, Vec<String>)> {
+) -> Result<(OutputReport, Vec<Warning>)> {
     let save_opts = SaveOptions {
         format,
         quality: opts.quality,
@@ -112,7 +113,7 @@ pub fn finish(
     opts: &OutputOpts,
     format: OutputFormat,
     started: Instant,
-    mut warnings: Vec<String>,
+    mut warnings: Vec<Warning>,
 ) -> Result<ProcessReport> {
     let (output, save_warnings) = write_image(image, opts, format)?;
     warnings.extend(save_warnings);

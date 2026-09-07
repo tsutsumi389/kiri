@@ -29,6 +29,28 @@ fn fixture_dir() -> TempDir {
     TempDir::new().unwrap()
 }
 
+/// 警告に指定の `code` が含まれるか。
+///
+/// 文言ではなく code で照合する。`warnings` は機械可読な契約であり、
+/// テストが散文を掴んでいると、推敲のたびに壊れる（そして推敲を諦めさせる）。
+fn has_warning(v: &Value, code: &str) -> bool {
+    warning_codes(v).iter().any(|c| c == code)
+}
+
+fn warning_codes(v: &Value) -> Vec<String> {
+    v["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("warnings が配列ではない: {v}"))
+        .iter()
+        .map(|w| {
+            w["code"]
+                .as_str()
+                .unwrap_or_else(|| panic!("警告に code がない: {w}"))
+                .to_string()
+        })
+        .collect()
+}
+
 // --- info ---
 
 #[test]
@@ -102,7 +124,102 @@ fn info_warns_when_the_background_is_not_uniform() {
     assert!(v["background"]["uniformity"].as_f64().unwrap() < 0.9);
     let warnings = v["warnings"].as_array().unwrap();
     assert!(!warnings.is_empty(), "均一度が低いのに警告が出ていない");
-    assert!(warnings[0].as_str().unwrap().contains("均一度"));
+    assert!(has_warning(&v, "LOW_UNIFORMITY"), "{warnings:?}");
+    // 判断に使った数値も返す。エージェントが message をパースせずに検算できる
+    assert!(warnings[0]["data"]["uniformity"].as_f64().unwrap() < 0.9);
+}
+
+/// 警告は機械可読でなければならない。
+///
+/// `error.rs` は当初から `code` を持たせているのに、警告だけが日本語の散文だった。
+/// エージェントは文字列マッチで分岐するしかなく、文言を推敲するたびに壊れる。
+/// **同じ道具の中で契約の形が違うほうが不自然である。**
+#[test]
+fn every_warning_carries_a_machine_readable_code() {
+    let dir = fixture_dir();
+    // 左半分だけ暗い背景。均一度が下がり、必ず 1 件以上の警告が出る
+    let mut img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        ..Default::default()
+    });
+    for y in 0..120 {
+        for x in 0..60 {
+            img.put_pixel(x, y, image::Rgba([20, 20, 22, 255]));
+        }
+    }
+    let input = write_png(dir.path(), "split.png", &img);
+    let output = dir.path().join("cut.png");
+
+    let runs: Vec<Vec<String>> = vec![
+        vec![
+            "info".into(),
+            input.to_str().unwrap().into(),
+            "--json".into(),
+        ],
+        vec![
+            "cutout".into(),
+            input.to_str().unwrap().into(),
+            "-o".into(),
+            output.to_str().unwrap().into(),
+            "--json".into(),
+        ],
+    ];
+
+    for args in runs {
+        let out = kiri().args(&args).output().unwrap();
+        let v = json_stdout(&out);
+        let warnings = v["warnings"].as_array().unwrap();
+        assert!(!warnings.is_empty(), "{args:?} で警告が出ていない");
+
+        for w in warnings {
+            let obj = w
+                .as_object()
+                .unwrap_or_else(|| panic!("{args:?}: 警告が文字列のまま: {w}"));
+            let code = obj["code"].as_str().unwrap();
+            assert!(
+                code.chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
+                "code は SCREAMING_SNAKE_CASE であるべき: {code}"
+            );
+            assert!(!obj["message"].as_str().unwrap().is_empty(), "{w}");
+            // 空の hint / data はキーごと消える。null を出すと
+            // 「中身の無い手がかりがある」と読まれる
+            assert!(
+                obj.get("hint").map(|h| h.is_string()).unwrap_or(true),
+                "{w}"
+            );
+            assert!(
+                obj.get("data").map(|d| d.is_object()).unwrap_or(true),
+                "{w}"
+            );
+        }
+    }
+}
+
+/// 均一な背景では `LOW_UNIFORMITY` を出さない。偽陽性の回帰防止。
+///
+/// 警告が常に出る道具は、警告が無いのと同じである。
+#[test]
+fn a_uniform_background_produces_no_uniformity_warning() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 160,
+        height: 160,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "studio.png", &img);
+
+    let out = kiri()
+        .args(["info", input.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let v = json_stdout(&out);
+    assert!(
+        !has_warning(&v, "LOW_UNIFORMITY"),
+        "単色背景で誤警告している: {:?}",
+        warning_codes(&v)
+    );
 }
 
 #[test]
@@ -368,12 +485,10 @@ fn converting_transparency_to_jpeg_warns_about_compositing() {
 
     assert!(out.status.success());
     let v = json_stdout(&out);
-    let warnings = v["warnings"].as_array().unwrap();
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.as_str().unwrap().contains("透過を保持できない")),
-        "透過が失われる旨の警告がない: {warnings:?}"
+        has_warning(&v, "ALPHA_FLATTENED"),
+        "透過が失われる旨の警告がない: {:?}",
+        warning_codes(&v)
     );
 }
 
@@ -792,12 +907,10 @@ fn resize_upscales_with_an_explicit_flag_and_warns() {
     assert!(out.status.success());
     let v = json_stdout(&out);
     assert_eq!(v["outputs"][0]["width"], 400);
-    let warnings = v["warnings"].as_array().unwrap();
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.as_str().unwrap().contains("拡大しました")),
-        "拡大した旨の警告がない: {warnings:?}"
+        has_warning(&v, "UPSCALED"),
+        "拡大した旨の警告がない: {:?}",
+        warning_codes(&v)
     );
 }
 
@@ -1142,13 +1255,7 @@ fn a_woven_background_raises_the_dam_and_the_report_says_so() {
         );
         json_stdout(&out)
     };
-    let adjusted = |v: &Value| -> bool {
-        v["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|w| w.as_str().unwrap().contains("テクスチャ"))
-    };
+    let adjusted = |v: &Value| -> bool { has_warning(v, "EDGE_THRESHOLD_RAISED") };
 
     let auto = run("auto", &[]);
     // 商品は画像の 1/4 〜 3/4 を占めるので、前景比率は 0.25 前後になるはず
@@ -1391,13 +1498,10 @@ fn cutout_warns_when_almost_nothing_is_removed() {
 
     assert!(out.status.success());
     let v = json_stdout(&out);
-    let warnings = v["warnings"].as_array().unwrap();
     assert!(
-        warnings.iter().any(|w| w
-            .as_str()
-            .unwrap()
-            .contains("背景がほとんど除去されていません")),
-        "失敗が検出できていない: {warnings:?}"
+        has_warning(&v, "FOREGROUND_TOO_LARGE"),
+        "失敗が検出できていない: {:?}",
+        warning_codes(&v)
     );
 }
 
@@ -1429,11 +1533,10 @@ fn cutout_flags_a_product_running_off_the_frame() {
     assert!(out.status.success());
     let v = json_stdout(&out);
     assert_eq!(v["mask"]["touches_edge"], true);
-    let warnings = v["warnings"].as_array().unwrap();
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.as_str().unwrap().contains("見切れ"))
+        has_warning(&v, "SUBJECT_TOUCHES_EDGE"),
+        "{:?}",
+        warning_codes(&v)
     );
 }
 
@@ -1492,11 +1595,9 @@ fn cutout_to_jpeg_composites_onto_the_given_background() {
     let v = json_stdout(&out);
     assert_eq!(v["outputs"][0]["format"], "jpeg");
     assert!(
-        v["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|w| w.as_str().unwrap().contains("透過を保持できない"))
+        has_warning(&v, "ALPHA_FLATTENED"),
+        "{:?}",
+        warning_codes(&v)
     );
 }
 
@@ -1771,12 +1872,9 @@ fn scaling_up_onto_a_canvas_is_reported_and_warned() {
     let scale = v["canvas"]["scale"].as_f64().unwrap();
     assert!(scale > 1.0, "拡大しているのに倍率が 1 以下: {scale}");
     assert!(
-        v["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|w| w.as_str().unwrap().contains("拡大して配置")),
-        "拡大の警告がない"
+        has_warning(&v, "CANVAS_UPSCALED"),
+        "拡大の警告がない: {:?}",
+        warning_codes(&v)
     );
 }
 
@@ -2468,11 +2566,7 @@ fn a_failing_preview_does_not_fail_the_command() {
     let json = json_stdout(&out);
     assert!(json["preview"].is_null(), "書けなかったなら報告しない");
     assert!(
-        json["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|w| w.as_str().unwrap().contains("プレビューを")),
+        has_warning(&json, "PREVIEW_FAILED"),
         "警告として伝えるべき: {}",
         json["warnings"]
     );

@@ -15,6 +15,7 @@ use crate::image_io::{OutputFormat, SaveOptions, load, save};
 use crate::preview::{PreviewSpec, contact_sheet};
 use crate::report::{CanvasReport, CutoutReport, Dimensions, MaskReport, SettingsReport};
 use crate::transform::canvas::{CanvasSpec, apply as canvas_apply, plan as canvas_plan};
+use crate::warning::Warning;
 
 pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     let started = Instant::now();
@@ -126,7 +127,7 @@ fn place_on_canvas(
     width: u32,
     height: u32,
     args: &CutoutArgs,
-    warnings: &mut Vec<String>,
+    warnings: &mut Vec<Warning>,
 ) -> Result<(image::RgbaImage, CanvasReport)> {
     // フェザリングされた薄い縁まで含めて切り詰める。前景判定(128以上)で切ると
     // 輪郭の階調が落ちてギザギザに戻ってしまう
@@ -152,10 +153,16 @@ fn place_on_canvas(
     let placed = canvas_apply(&trimmed, &spec)?;
 
     if plan.scale > 1.0 {
-        warnings.push(format!(
-            "商品を {:.2} 倍に拡大して配置しました。元素材以上の解像度にはなりません",
-            plan.scale
-        ));
+        warnings.push(
+            Warning::new(
+                "CANVAS_UPSCALED",
+                format!(
+                    "商品を {:.2} 倍に拡大して配置しました。元素材以上の解像度にはなりません",
+                    plan.scale
+                ),
+            )
+            .with_data("scale", round4(plan.scale)),
+        );
     }
 
     Ok((
@@ -235,7 +242,7 @@ fn write_preview(
     original: &image::RgbaImage,
     mask: &crate::cutout::Mask,
     final_image: &image::RgbaImage,
-    warnings: &mut Vec<String>,
+    warnings: &mut Vec<Warning>,
 ) -> Option<String> {
     let path = args.preview.as_ref()?;
     let format = format?;
@@ -258,11 +265,20 @@ fn write_preview(
     match written {
         Ok(_) => Some(path.display().to_string()),
         Err(e) => {
-            warnings.push(format!(
-                "プレビューを {} に書けませんでした: {}",
-                path.display(),
-                e.message
-            ));
+            warnings.push(
+                Warning::new(
+                    "PREVIEW_FAILED",
+                    format!(
+                        "プレビューを {} に書けませんでした: {}",
+                        path.display(),
+                        e.message
+                    ),
+                )
+                // 成果物そのものは書けている。エージェントが同じ引数で再実行して
+                // OUTPUT_EXISTS に二重で詰まらないよう、原因の code も渡す
+                .with_data("path", path.display().to_string())
+                .with_data("error_code", e.code),
+            );
             None
         }
     }

@@ -90,6 +90,11 @@ pub struct BackgroundReport {
 ///
 /// **kiri はこの矩形を自分では適用しない。** bbox は構図の意思決定であり、
 /// 複数商品や意図的な見切れでは人／AI が決めるべきものである。
+///
+/// **`--bbox` を指定して `cutout` を回したときも、ここは画像全体から測り直した
+/// 矩形であって「適用した bbox」ではない。** 指定した矩形をそのまま返している
+/// と読むと、指定が効いているかの確認に使えてしまう。効いたかどうかは
+/// `mask.bbox` と `settings` を見ること。
 #[derive(Debug, Serialize)]
 pub struct SubjectReport {
     /// 原寸座標での外接矩形 [x1, y1, x2, y2]

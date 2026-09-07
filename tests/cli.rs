@@ -257,6 +257,58 @@ fn the_subject_key_is_always_present_in_both_commands() {
     }
 }
 
+/// テキストの「主体候補」行と hint は、同じ矩形を同じ丸めで出す。
+///
+/// **貼り付け可能と謳う行が、貼り付けたときに違う結果になってはいけない。**
+/// 見栄えのために小数第 2 位へ落とすと、`bbox_argument` 自身のコメントどおり
+/// 20MP で 28px 内側に入る。bbox の外は色によらず背景と確定されるので、
+/// その差はそのまま商品の欠けになる。
+#[test]
+fn the_subject_line_and_the_hint_round_the_box_the_same_way() {
+    let dir = fixture_dir();
+    let input = write_png(dir.path(), "split.png", &split_background_scene(300, 300));
+
+    let v = json_stdout(
+        &kiri()
+            .args(["info", input.to_str().unwrap(), "--json"])
+            .output()
+            .unwrap(),
+    );
+    let expected = v["subject"]["normalized_bbox"]
+        .as_array()
+        .unwrap_or_else(|| panic!("主体が見つかっていない: {v}"))
+        .iter()
+        .map(|c| c.as_f64().unwrap().to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    // hint 側（既に `bbox_argument` を使っている）
+    let hint = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "LOW_UNIFORMITY")
+        .unwrap_or_else(|| panic!("{v}"))["hint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        hint.contains(&format!("--bbox {expected} ")),
+        "hint が JSON と違う丸めで出ている: {hint}"
+    );
+
+    // テキスト出力側
+    let out = kiri()
+        .args(["info", input.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        text.contains(&format!("主体候補  {expected}  ")),
+        "テキストが JSON と違う丸めで出ている: 期待 {expected}\n---\n{text}"
+    );
+}
+
 /// 主体を検出できなければ `null` を返す。0 や空配列で埋めない。
 #[test]
 fn a_background_only_image_reports_a_null_subject() {
@@ -279,8 +331,15 @@ fn a_background_only_image_reports_a_null_subject() {
 /// 主体の検出が切り抜き本体へ影響していないこと。
 ///
 /// `subject` は報告と警告のためだけの情報で、マスクの生成には一切関与しない。
-/// **ここが崩れると「診断を足したら結果が変わった」という最悪の壊れ方をする**
-/// ので、同じ入力で二度走らせて出力バイト列が一致することで固定する。
+/// **ここが崩れると「診断を足したら結果が変わった」という最悪の壊れ方をする。**
+///
+/// 同じバイナリを二度走らせて比べるだけでは足りない。**主体検出が本体へ副作用を
+/// 持ち込めば、二度とも同じように壊れて通り続ける。** 二度走らせるのは決定性の
+/// 検査であって、副作用が無いことの検査ではない。だから期待値を数値で固定する。
+///
+/// 数値は `product_image(200x200, 既定)` の実測。ここが動いたら、切り抜きの
+/// 挙動そのものが変わったということなので、**期待値を書き換える前に何が
+/// 変わったのかを説明できること。**
 #[test]
 fn detecting_the_subject_does_not_change_the_cutout() {
     let dir = fixture_dir();
@@ -310,6 +369,18 @@ fn detecting_the_subject_does_not_change_the_cutout() {
     let (b, vb) = run("b.png");
     assert_eq!(a, b, "同じ入力で出力が揺れている");
     assert_eq!(va["mask"], vb["mask"]);
+
+    let mask = &va["mask"];
+    assert_eq!(
+        mask["bbox"],
+        serde_json::json!([44, 32, 155, 167]),
+        "{mask}"
+    );
+    assert_eq!(mask["touches_edge"], false, "{mask}");
+    // 比率と色差は浮動小数のまま比べる。値が動いたら切り抜きが変わっている
+    assert_eq!(mask["foreground_ratio"].as_f64().unwrap(), 0.3753, "{mask}");
+    assert_eq!(mask["separability"].as_f64().unwrap(), 77.6231, "{mask}");
+    assert_eq!(mask["halo_ratio"].as_f64().unwrap(), 0.0, "{mask}");
 }
 
 /// 均一な背景では `LOW_UNIFORMITY` を出さない。偽陽性の回帰防止。
@@ -2410,6 +2481,37 @@ fn serial_and_parallel_runs_agree() {
     let parallel = ratios(&["--force"]);
     let serial = ratios(&["--jobs", "1", "--force"]);
     assert_eq!(parallel, serial, "並列と直列で結果が食い違っている");
+}
+
+/// batch のテキスト出力でも hint を捨てない。
+///
+/// **同じ画像の同じ失敗が、呼び方によって回復できたりできなかったりしては
+/// いけない。** 単体実行では次の一手が出るのに、数百点を回す本命の経路でだけ
+/// 消えると、そこで詰まった利用者は手がかりを持てない。
+#[test]
+fn batch_prints_the_hint_alongside_the_warning() {
+    let dir = fixture_dir();
+    batch_fixture(dir.path(), 1);
+    // 許容量 0 なら背景がほぼ残り、FOREGROUND_TOO_LARGE が hint 付きで出る
+    let spec = write_spec(
+        dir.path(),
+        r#"{"defaults":{"format":"png"},
+            "items":[{"input":"p0.png","output":"a.png","tolerance":0}]}"#,
+    );
+
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        stderr.contains("警告 ["),
+        "警告そのものが出ていない: {stderr}"
+    );
+    assert!(
+        stderr.contains("--tolerance を上げてください"),
+        "hint が捨てられている: {stderr}"
+    );
 }
 
 /// AI が生成した仕様の綴り違いを黙って無視しない。

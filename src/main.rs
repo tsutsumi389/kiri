@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use kiri::cli::{Cli, Command};
 use kiri::commands;
-use kiri::cutout::Confidence;
+use kiri::cutout::{Confidence, bbox_argument};
 use kiri::error::{Error, ErrorKind, Result};
 use kiri::report::{
     BackgroundReport, BatchReport, CutoutReport, ErrorReport, InfoReport, ProcessReport,
@@ -238,8 +238,14 @@ fn print_batch(report: &BatchReport) {
                     out.height,
                     human_bytes(out.bytes)
                 );
+                // hint も出す。単体実行では出るのに batch でだけ消えると、
+                // **同じ画像の同じ失敗が、呼び方によって回復できたりできなかったり
+                // する。** 行頭に入力名を置く体裁だけを揃えて、中身は落とさない
                 for w in &r.warnings {
                     eprintln!("  警告 [{}]: {}", item.input, w.message);
+                    if let Some(hint) = &w.hint {
+                        eprintln!("         {hint}");
+                    }
                 }
             }
             (_, Some(e)) => {
@@ -261,13 +267,19 @@ fn print_batch(report: &BatchReport) {
 /// 「どこを商品と見たか」が数値で分かることが、結果を疑うための取っ掛かりになる。
 /// 検出できなかったときは黙る。テキスト出力は人間向けなので、無いものを
 /// 「なし」と 1 行使って言う価値が薄い（JSON 側は null を必ず返す）。
+///
+/// **丸めは `bbox_argument` に任せる。** ここで見栄えのために小数第 2 位へ
+/// 落とすと、同じ矩形が「テキストの行」と「警告の hint」で二通りに出る。
+/// しかも貼り付け可能と謳っている側が狭いほうで、`bbox_argument` 自身の
+/// コメントどおり 20MP では 28px 内側に入る。bbox の外は色によらず背景と
+/// 確定されるため、その差はそのまま商品の欠けになる。
 fn print_subject(subject: Option<&SubjectReport>) {
     let Some(s) = subject else {
         return;
     };
-    let [x1, y1, x2, y2] = s.normalized_bbox;
     println!(
-        "  主体候補  {x1:.2},{y1:.2},{x2:.2},{y2:.2}  (面積 {:.1}%, 信頼度 {})",
+        "  主体候補  {}  (面積 {:.1}%, 信頼度 {})",
+        bbox_argument(s.normalized_bbox),
         s.area_ratio * 100.0,
         match s.confidence {
             Confidence::High => "high",

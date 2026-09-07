@@ -8,7 +8,7 @@ use image::ImageFormat;
 use crate::cli::InfoArgs;
 use crate::commands::output::{background_report, round4, subject_report};
 use crate::cutout::{
-    BackgroundEstimate, SubjectHint, bbox_argument, detect_subject, estimate_background,
+    BackgroundEstimate, LowReason, SubjectHint, bbox_argument, detect_subject, estimate_background,
 };
 use crate::error::Result;
 use crate::image_io::load;
@@ -96,17 +96,48 @@ fn low_uniformity_warnings(
             .with_data("subject_delta_e", round4(s.delta_e))
             .with_data("perimeter_delta_e_p50", round4(spread)),
         ],
-        // 丸めてから百分率にする。テキスト出力の「主体候補」行は JSON と同じ
-        // round4 済みの値を使うので、ここで生の値を使うと同じ量が 0.3% と
-        // 0.4% の二通りで出る。**同じ数を二つの表記で見せない**
-        Some(s) => vec![base.with_hint(format!(
-            "主体を特定できませんでした（面積 {:.1}%, 捕捉率 {:.1}%）。\
-             単色背景で撮り直すことを検討してください",
-            round4(s.area_ratio) * 100.0,
-            round4(s.capture_ratio) * 100.0
-        ))],
+        // **Low の理由は 3 つあり、同じ言葉では説明できない。** 矩形の外に
+        // 取りこぼしがあるだけの Low（面積 14.1% / 捕捉率 98.1% でも起きる）で
+        // 「主体を特定できませんでした（面積 14.1%, 捕捉率 98.1%）」と言うと、
+        // 自分が並べた数値と文面が矛盾する。エージェントは次に何を試せばよいか
+        // 判断できず、数値のほうを疑い始める
+        Some(s) => vec![base.with_hint(low_confidence_hint(s))],
         // 主体が 1 つも見つからない = 背景しか写っていない。助言の材料が無い
         None => vec![base.with_hint("kiri が対象とするのは単色背景の画像です")],
+    }
+}
+
+/// 信頼度 Low のときに何が足りなかったかを述べる。
+///
+/// **どの理由でも `--bbox` は勧めない。** 勧めてよいのは High のときだけで、
+/// ここは「なぜ矩形を渡せないか」を人とエージェントに説明する場所である。
+///
+/// 百分率は丸めてから掛ける。テキスト出力の「主体候補」行は JSON と同じ
+/// `round4` 済みの値を使うので、ここで生の値を使うと同じ量が 0.3% と 0.4% の
+/// 二通りで出る。**同じ数を二つの表記で見せない**。
+fn low_confidence_hint(s: &SubjectHint) -> String {
+    let area = round4(s.area_ratio) * 100.0;
+    let capture = round4(s.capture_ratio) * 100.0;
+    let leftover = round4(s.leftover_ratio) * 100.0;
+    match s.low_reason() {
+        // まとまってはいるが小さすぎる。実写のキーボードがこれで、
+        // 主体候補は「キーボードですらない右端の 0.4% の領域」になる
+        Some(LowReason::AreaTooSmall) | None => format!(
+            "主体を特定できませんでした（面積 {area:.1}%, 捕捉率 {capture:.1}%）。\
+             単色背景で撮り直すことを検討してください"
+        ),
+        // 背景そのものが粗く、閾値を超えた画素が画面中に散っている状態
+        Some(LowReason::NotOneBlob) => format!(
+            "背景と違う画素が画面に散っており（捕捉率 {capture:.1}%）、\
+             一つの塊になりません。単色背景で撮り直すことを検討してください"
+        ),
+        // 面積も捕捉率も足りているのに Low。**数値と矛盾しない文面が要る**
+        Some(LowReason::LeftoverOutside) => format!(
+            "検出した矩形（面積 {area:.1}%）の外にも背景でないものが\
+             大きく写っている（{leftover:.1}%）ため、この矩形は主体を\
+             取りこぼしています。商品だけが写るように撮り直すか、\
+             切り抜く範囲を目視で確かめてください"
+        ),
     }
 }
 
@@ -205,6 +236,7 @@ mod tests {
         let mut s = subject(Confidence::Low, 64.4);
         s.area_ratio = 0.0035;
         s.capture_ratio = 0.5077;
+        s.leftover_ratio = 0.2814;
         let w = low_uniformity_warnings(&background(0.155, 21.6), Some(&s));
 
         assert_eq!(codes(&w), ["LOW_UNIFORMITY"], "断定はしない");
@@ -212,8 +244,53 @@ mod tests {
         assert!(!hint.contains("--bbox"), "誤った矩形へ誘導している: {hint}");
         // 数値は返してよい。何が足りなかったのかを人が読めるようにする
         // テキスト出力の「主体候補」行と同じ丸めで出ること（同じ数を二通りで見せない）
-        assert!(hint.contains("0.4%") && hint.contains("50.8%"), "{hint}");
+        assert!(hint.contains("0.4%"), "{hint}");
         assert!(hint.contains("撮り直す"), "{hint}");
+    }
+
+    /// Low の理由が違えば文面も違わなければならない。
+    ///
+    /// **一本の文面しか持たないと、取りこぼし由来の Low で「主体を特定
+    /// できませんでした（面積 14.1%, 捕捉率 98.1%）」と、自分が並べた数値と
+    /// 矛盾することを言う。** エージェントは次の一手を決められず、
+    /// 数値のほうを疑い始める。
+    #[test]
+    fn each_reason_for_low_confidence_gets_its_own_wording() {
+        // 面積不足（実写のキーボード）
+        let mut small = subject(Confidence::Low, 64.4);
+        small.area_ratio = 0.0035;
+        small.capture_ratio = 0.9;
+        assert_eq!(small.low_reason(), Some(LowReason::AreaTooSmall));
+        assert!(
+            low_confidence_hint(&small).contains("主体を特定できませんでした"),
+            "{}",
+            low_confidence_hint(&small)
+        );
+
+        // 捕捉率不足（背景が粗く、閾値超えの画素が散っている）
+        let mut scattered = subject(Confidence::Low, 40.0);
+        scattered.capture_ratio = 0.5033;
+        let hint = low_confidence_hint(&scattered);
+        assert_eq!(scattered.low_reason(), Some(LowReason::NotOneBlob));
+        assert!(hint.contains("散って") && hint.contains("50.3%"), "{hint}");
+
+        // 取りこぼし（面積も捕捉率も足りているのに Low）。**「特定できません
+        // でした」と言ってはならない**
+        let mut leftover = subject(Confidence::Low, 40.0);
+        leftover.area_ratio = 0.1411;
+        leftover.capture_ratio = 0.9808;
+        leftover.leftover_ratio = 0.3524;
+        let hint = low_confidence_hint(&leftover);
+        assert_eq!(leftover.low_reason(), Some(LowReason::LeftoverOutside));
+        assert!(
+            !hint.contains("特定できませんでした"),
+            "面積 14.1% / 捕捉率 98.1% を並べて「特定できません」と言っている: {hint}"
+        );
+        assert!(
+            hint.contains("取りこぼし") && hint.contains("35.2%"),
+            "{hint}"
+        );
+        assert!(!hint.contains("--bbox"), "{hint}");
     }
 
     /// 主体が 1 つも見つからなければ、今までどおりの一般的な説明に留める。

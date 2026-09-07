@@ -561,6 +561,16 @@ fn collect_warnings(
                         halo * 100.0,
                     ),
                 )
+                // **bbox が正しく決まった後の最後の一歩がここだった。** 矩形を
+                // 与えても tolerance が既定のままだと縁が残るのに、この警告は
+                // 「残っている」としか言わず、次の一手を勘に頼らせていた。
+                // 残るのは「背景色に近いが tolerance の内側に入らなかった」画素
+                // なので、上げれば減る。実写（不織布の上のリモコン、bbox 指定済み）
+                // では 12 → 60 で halo 16.3% → 0.1% になった。
+                //
+                // 上げすぎれば商品を食うため、値そのものは示さない。倍率を
+                // 一つ書くと、素材によらずそれが正解であるかのように読まれる
+                .with_hint("--tolerance を上げると背景の残りが減ります")
                 .with_data("halo_ratio", round4(halo)),
             );
         }
@@ -847,6 +857,35 @@ mod tests {
         assert!(hint.contains("--normalized"), "{hint}");
         assert_eq!(w.data["normalized_bbox"][1], 0.354);
         assert_eq!(w.data["foreground_ratio"], 0.53);
+    }
+
+    /// 縁が残っているなら、次の一手まで言う。
+    ///
+    /// **bbox が正しく決まった後の最後の一歩がここだった。** 実写では
+    /// `info` → `cutout --bbox` まで来ても tolerance が既定（12）だと
+    /// halo が 16.3% 残り、そこから先は勘に頼るしかなかった。
+    /// 「何が起きたか」だけ言って「次に何をするか」を言わない警告は、
+    /// エージェントにとって行き止まりと変わらない。
+    #[test]
+    fn a_remaining_rim_says_which_knob_to_turn() {
+        let warnings = collect_warnings(
+            &estimate(0.20, 11.9),
+            &stats(),
+            Some(60.0),
+            &Diagnostics {
+                halo_ratio: Some(0.1627),
+                edge_width: Some(3.0),
+            },
+            None,
+            true,
+        );
+        let w = warnings
+            .iter()
+            .find(|w| w.code == "HALO_REMAINS")
+            .unwrap_or_else(|| panic!("{warnings:?}"));
+        let hint = w.hint.as_deref().expect("次の一手が無い");
+        assert!(hint.contains("--tolerance"), "{hint}");
+        assert_eq!(w.data["halo_ratio"], 0.1627);
     }
 
     /// 対照その 0：外周に接していないなら、何も残っていない。

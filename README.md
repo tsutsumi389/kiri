@@ -39,6 +39,7 @@ product.jpg
   背景色    #F9F9F7  (均一度 1.00)
   外周ΔE    p50 0.4  p90 1.2  max 2.8
   外周勾配  p50 0.0  p90 1.0
+  主体候補  0.24,0.23,0.77,0.77  (面積 25.8%, 信頼度 high)
 ```
 
 ```
@@ -58,6 +59,15 @@ $ kiri info product.jpg --json
     "uniformity": 1.0,
     "perimeter_delta_e": { "p50": 0.4, "p90": 1.2, "max": 2.8 },
     "texture": { "p50": 0.0, "p90": 1.0 }
+  },
+  "subject": {
+    "bbox": [381, 461, 1218, 1538],
+    "normalized_bbox": [0.2384, 0.2308, 0.7616, 0.7692],
+    "area_ratio": 0.2581,
+    "capture_ratio": 0.9969,
+    "delta_e": 55.68,
+    "touches_edge": false,
+    "confidence": "high"
   },
   "warnings": []
 }
@@ -81,6 +91,55 @@ $ kiri info product.jpg --json
 いる」ではなく「**帯にざらついた物が写り込んでいる**」を意味するためである。商品が
 画面の端で見切れていると外周の帯の 1 辺がまるごと商品になり、その商品が柄物なら
 `p90` は跳ねるが `p50` は動かない。
+
+#### `subject` — 商品はどこにあるか
+
+`subject` は「背景色から遠い画素の、最大の連結成分」である。背景推定が既に持って
+いる情報（背景色と外周の ΔE 分布）だけから求まるので、`info` の所要時間はほとんど
+変わらない（20MP で 0.20s → 0.26s）。
+
+`normalized_bbox` は **`--bbox <値> --normalized` にそのまま渡せる**。実写
+（白い不織布の上の黒いリモコン、`uniformity` 0.20）では、ここが返す
+`0,0.354,0.9834,0.662` を渡した結果が、人間が目で見て決めた
+`0.02,0.33,0.98,0.64` と同じ品質（`foreground_ratio` 0.204 / `halo_ratio` 0.001 /
+`separability` 54.7）になった。
+
+**`confidence` が `"high"` のときだけ、この矩形を根拠に動いてよい。** 判定は
+2 つの数値で行う。
+
+| | 意味 | High の条件 |
+|---|---|---|
+| `area_ratio` | 最大成分が画像に占める割合 | 0.05 以上 |
+| `capture_ratio` | 閾値を超えた画素のうち最大成分が占める割合 | 0.70 以上 |
+
+面積だけでは足りない。**背景が広くざらついていれば、大きな塊はいくらでもできる。**
+`capture_ratio` は「背景と違う画素が 1 箇所にまとまっているか」を言い、まとまって
+いれば商品、散っていれば背景の粗さである。実写 2 枚が両側から挟んで較正した。
+
+| 素材 | area_ratio | capture_ratio | 判定 |
+|---|---|---|---|
+| 不織布の上のリモコン | 0.237 | 0.909 | high（bbox で救える） |
+| 暗い机の上のキーボード | 0.004 | 0.508 | low（救えない） |
+
+**`delta_e` は判定に使っていない。** キーボードの誤検出領域は背景との色差が
+ΔE 64 とリモコン（ΔE 50）より大きく出る。色の違いの大きさは「そこが商品か」を
+何も語らない。`delta_e` を返すのは別の用途——それが外周の `p50` を下回るなら、
+背景を消せる `--tolerance` では商品も消えるので、パラメータ調整では救えない——
+のためである。
+
+検出できなければ `null`。キー自体は常に出す（`separability` / `halo_ratio` と
+同じ規約）。
+
+#### なぜ kiri はこの bbox を自動で適用しないのか
+
+**bbox は構図の意思決定だからである。** 商品が 2 つ写っていればどちらを残すのか、
+意図的に見切れさせた構図をそのまま出すのか——kiri には決められない。矩形を黙って
+適用すると、その判断を利用者から取り上げたうえ、結果の JSON からは何が起きたのか
+分からなくなる。
+
+`edge_threshold` の自動調整（背景のテクスチャに応じた引き上げ）とは性質が違う。
+あちらは純粋な内部パラメータで、正解が画像から一意に決まり、値は `settings` に
+出るので後から検算できる。bbox にはその意味での正解が無い。
 
 | オプション | 既定値 | 説明 |
 |---|---|---|
@@ -447,6 +506,12 @@ $ kiri cutout product.jpg -o product.jpg --canvas 1000 --flatten --background "#
     "perimeter_delta_e": { "p50": 0.4, "p90": 1.2, "max": 2.8 },
     "texture": { "p50": 0.0, "p90": 1.0 }
   },
+  "subject": {
+    "bbox": [528, 200, 1073, 1601],
+    "normalized_bbox": [0.33, 0.1, 0.671, 0.801],
+    "area_ratio": 0.2287, "capture_ratio": 0.9932,
+    "delta_e": 68.3, "touches_edge": false, "confidence": "high"
+  },
   "settings": {
     "tolerance": 12.0, "edge_threshold": 8.0,
     "step_tolerance": 2.2, "shadow_tolerance": 35.0, "seal": 1,
@@ -469,7 +534,9 @@ $ kiri cutout product.jpg -o product.jpg --canvas 1000 --flatten --background "#
 ```
 
 - `foreground_ratio` が極端（0.01未満 / 0.99超）なら警告が出る
-- `touches_edge` が `true` なら商品が見切れている
+- `touches_edge` が `true` なら商品が見切れている（ただし後述の誤診に注意）
+- `subject` は商品と思われる塊の位置。意味と信頼度の判定根拠は
+  [`kiri info` の節](#subject--商品はどこにあるか)を参照
 - `uniformity` が低ければ単色背景ではない
 - `separability` が `perimeter_delta_e.p50` を下回れば、その画像は救えない
 - `halo_ratio` が 0.10 を超えれば境界に背景色が残っている（警告が出る）
@@ -518,6 +585,77 @@ refine 済みの鮮鋭な輪郭はちょうど 1.00 になり、**1〜3 なら�
 商品が見切れていて輪郭が画像の中に存在しない場合に出る。`halo_ratio` も同様に、
 測る境界が無ければ `null` を返す。**0 と `null` は区別する。**0 と報告すると
 「縁が残っていない」という良い結果に見えてしまうためである。
+
+#### warnings は機械可読である
+
+警告はエラーと同じ形をしている。**日本語の散文を文字列マッチさせる必要は無い。**
+
+```json
+"warnings": [
+  {
+    "code": "BBOX_RECOMMENDED",
+    "message": "背景が均一でないため背景側が前景として残っています",
+    "hint": "--bbox 0,0.354,0.9834,0.662 --normalized を指定してください",
+    "data": {
+      "normalized_bbox": [0.0, 0.354, 0.9834, 0.662],
+      "foreground_ratio": 0.5305
+    }
+  }
+]
+```
+
+- `code` — 分岐に使う識別子。**文言は推敲で変わるが、これは契約として動かさない**
+- `message` — 人間向けの説明。テキスト出力では `警告: <message>` として出る
+- `hint` — 次に打つ手。無ければキーごと消える（`null` は出さない）
+- `data` — 判断に使った数値そのもの。`message` から正規表現で抜き直さずに済む。
+  無ければキーごと消える
+
+| code | 意味 |
+|---|---|
+| `LOW_UNIFORMITY` | 背景の均一度が低い（単色背景ではない） |
+| `BBOX_RECOMMENDED` | 背景が不均一で背景側が前景として残っている。bbox で解ける |
+| `SUBJECT_TOUCHES_EDGE` | 前景が画像の外周に接している（商品の見切れ） |
+| `NOT_SEPARABLE` | 主体と背景の色差が背景自身のばらつきを下回る。調整では改善しない |
+| `FOREGROUND_TOO_SMALL` / `FOREGROUND_TOO_LARGE` | 前景比率が極端 |
+| `HALO_REMAINS` | 境界に背景色のままの縁が残っている |
+| `EDGE_THRESHOLD_RAISED` | 背景のテクスチャに合わせて堤防を引き上げた |
+| `CANVAS_UPSCALED` | キャンバス配置で商品を拡大した |
+| `UPSCALED` | `resize` で拡大した |
+| `ALPHA_FLATTENED` | 出力形式が透過を保持できないので合成した |
+| `PREVIEW_FAILED` | プレビューを書き出せなかった（成果物自体は書けている） |
+| `COLOR_PROFILE_UNSUPPORTED` | ICC が LUT 型などで sRGB へ変換できなかった |
+| `COLOR_CONVERSION_SKIPPED` | `--no-color-convert` により変換していない |
+| `COLOR_SPACE_UNCALIBRATED` | EXIF が uncalibrated で ICC も無い |
+
+#### 「見切れ」と「bbox が要る」を取り違えないために
+
+`touches_edge` が `true` でも、それが**商品の見切れとは限らない**。
+
+背景が単色でないまま `--bbox` を指定せずに走らせると、外周からのフィルが背景を
+消しきれず、**背景側が前景として残ったまま画像の端に達する**。実写（不織布の上の
+リモコン）ではこれが起きて `foreground_ratio` 0.53 / `touches_edge` true になったが、
+商品はどこも見切れていなかった。bbox を与えると `touches_edge` は false になる。
+
+見切れは撮り直すしかないが、こちらは bbox 一つで解ける。**同じ文言で報せると、
+AI は解ける問題を諦めてしまう。**そこで kiri は両者を別の code で分ける。
+
+- `bbox` 未指定 かつ 背景が不均一 かつ 主体の信頼度が high
+  → `BBOX_RECOMMENDED`（`SUBJECT_TOUCHES_EDGE` は出さない。誤診だから）
+- それ以外で外周に接している → `SUBJECT_TOUCHES_EDGE`
+
+`info` の `LOW_UNIFORMITY` も同じ材料で `hint` を変える。`uniformity` だけでは
+「bbox を足せば救える画像」と「本当に救えない画像」を区別できないためである
+（実写ではリモコン 0.201 / キーボード 0.155 で、どちらも「単色背景ではない」）。
+
+| 主体 | hint |
+|---|---|
+| high かつ `delta_e` > 外周 `p50` | `--bbox <値> --normalized` を勧める |
+| high かつ `delta_e` ≦ 外周 `p50` | 勧めない。加えて `NOT_SEPARABLE` を出す |
+| low | 勧めない。面積と捕捉率を示して撮り直しを提案する |
+
+**実行可能な助言は信頼度 high のときだけ出す。** low で bbox を勧めると、
+キーボードのような素材で「キーボードですらない右端の 1.7% の領域」へ誘導して
+しまう。誤った助言は助言が無いより悪い。数値（`subject`）は low でも返す。
 
 #### AIに結果を見せる
 
@@ -614,7 +752,9 @@ $ kiri batch spec.json --json
 
 想定している流れはこう。
 
-1. AI が対象画像を `kiri info` で確認し、仕様 JSON を書き出す
+1. AI が対象画像を `kiri info` で確認し、仕様 JSON を書き出す。
+   `uniformity` が低い画像では `subject.confidence` を見て、`high` なら
+   `subject.normalized_bbox` をその項目の `bbox` に入れる
 2. `kiri batch spec.json --json` で一括処理する
 3. 結果の `failed` / `with_warnings` と各項目の `mask.foreground_ratio` を検証する
 4. 失敗した項目だけ `tolerance` や `bbox` を調整して再実行する

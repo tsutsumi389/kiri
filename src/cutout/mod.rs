@@ -323,6 +323,8 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
         &stats,
         separability,
         &diagnostics,
+        subject.as_ref(),
+        opts.bbox.is_some(),
     ));
 
     CutoutResult {
@@ -438,6 +440,17 @@ fn apply_alpha(image: &mut RgbaImage, mask: &Mask) {
     }
 }
 
+/// 正規化 bbox を `--bbox` にそのまま貼れる文字列にする。
+///
+/// 桁を丸めない（`round4` までは JSON と揃える）。見栄えのために小数第 2 位へ
+/// 落とすと、**貼り付けた矩形が実際の主体より最大 0.5% 内側に入る**。bbox の外は
+/// 色によらず背景と確定されるため、その差がそのまま商品の欠けになる。
+/// 20MP の実写では 0.005 が 28px にあたる。
+pub fn bbox_argument(bbox: [f64; 4]) -> String {
+    let v = bbox.map(round4);
+    format!("{},{},{},{}", v[0], v[1], v[2], v[3])
+}
+
 /// AI エージェントが失敗を検出できるように、疑わしい結果へ警告を付ける。
 ///
 /// どの警告も機械可読な `code` を持ち、判断に使った数値を `data` に載せる。
@@ -447,6 +460,8 @@ fn collect_warnings(
     stats: &MaskStats,
     separability: Option<f64>,
     diagnostics: &Diagnostics,
+    subject: Option<&SubjectHint>,
+    bbox_given: bool,
 ) -> Vec<Warning> {
     let mut warnings = Vec::new();
 
@@ -488,7 +503,33 @@ fn collect_warnings(
             .with_data("foreground_ratio", round4(stats.foreground_ratio)),
         );
     }
-    if stats.touches_edge {
+    // **「外周に接している」を「見切れている」と読むのは、bbox が無く背景が
+    // 不均一なときには誤診である。** その状態で残っているのは商品ではなく、
+    // 前景として取り残された背景側であり、それが画像の端まで達しているに
+    // 過ぎない。実写（不織布の上のリモコン、fg 0.53）では商品は見切れておらず、
+    // bbox を与えれば touches_edge は false になった。
+    //
+    // 見切れは撮り直すしかないが、こちらは bbox 一つで解ける。**同じ文言で
+    // 報せると、エージェントは解ける問題を諦める。**
+    //
+    // 助言を出せるのは主体の信頼度が High のときだけ。Low で bbox を勧めると、
+    // 誤検出した矩形（キーボードでは右端の 1.7% の領域）へ誘導してしまう。
+    let misread_as_cropped =
+        !bbox_given && !background.is_uniform() && subject.is_some_and(|s| s.confidence.is_high());
+    if let (true, Some(s)) = (misread_as_cropped, subject) {
+        warnings.push(
+            Warning::new(
+                "BBOX_RECOMMENDED",
+                "背景が均一でないため背景側が前景として残っています",
+            )
+            .with_hint(format!(
+                "--bbox {} --normalized を指定してください",
+                bbox_argument(s.normalized_bbox)
+            ))
+            .with_data("normalized_bbox", s.normalized_bbox.map(round4).to_vec())
+            .with_data("foreground_ratio", round4(stats.foreground_ratio)),
+        );
+    } else if stats.touches_edge {
         warnings.push(Warning::new(
             "SUBJECT_TOUCHES_EDGE",
             "前景が画像の外周に接しています。商品が見切れている可能性があります",
@@ -739,10 +780,130 @@ mod tests {
         }
     }
 
+    fn subject(confidence: Confidence) -> SubjectHint {
+        SubjectHint {
+            bbox: [0, 1999, 4198, 3827],
+            normalized_bbox: [0.0, 0.354, 0.9834, 0.662],
+            area_ratio: 0.2342,
+            capture_ratio: 0.9793,
+            delta_e: 49.6,
+            touches_edge: true,
+            confidence,
+        }
+    }
+
+    fn edge_stats() -> MaskStats {
+        MaskStats {
+            foreground_ratio: 0.53,
+            bbox: Some((0, 0, 100, 100)),
+            touches_edge: true,
+        }
+    }
+
+    fn codes(warnings: &[Warning]) -> Vec<&str> {
+        warnings.iter().map(|w| w.code).collect()
+    }
+
+    /// bbox 未指定 + 不均一な背景で外周に接しているのは、**見切れではなく
+    /// 前景の失敗**である。実写（不織布の上のリモコン）では bbox を与えれば
+    /// touches_edge が false になり、商品は見切れていなかった。
+    ///
+    /// **対の実験を必ず添える。** 「BBOX_RECOMMENDED が出ること」だけを固定すると、
+    /// SUBJECT_TOUCHES_EDGE の仕組みが死んでもテストは通り続ける。
+    #[test]
+    fn a_non_uniform_background_without_a_bbox_recommends_one_instead_of_crying_crop() {
+        let warnings = collect_warnings(
+            &estimate(0.20, 11.9),
+            &edge_stats(),
+            Some(60.0),
+            &clean(),
+            Some(&subject(Confidence::High)),
+            false,
+        );
+        let codes = codes(&warnings);
+        assert!(codes.contains(&"BBOX_RECOMMENDED"), "{codes:?}");
+        assert!(
+            !codes.contains(&"SUBJECT_TOUCHES_EDGE"),
+            "誤診が残っている: {codes:?}"
+        );
+
+        // hint はそのまま実行できる形でなければ、助言として役に立たない
+        let w = warnings
+            .iter()
+            .find(|w| w.code == "BBOX_RECOMMENDED")
+            .unwrap();
+        let hint = w.hint.as_deref().unwrap();
+        assert!(hint.contains("--bbox 0,0.354,0.9834,0.662"), "{hint}");
+        assert!(hint.contains("--normalized"), "{hint}");
+        assert_eq!(w.data["normalized_bbox"][1], 0.354);
+        assert_eq!(w.data["foreground_ratio"], 0.53);
+    }
+
+    /// 対照その 1：bbox を与えたうえで外周に接しているなら、本当に見切れている。
+    #[test]
+    fn a_product_cropped_by_the_frame_is_still_reported_as_such() {
+        let warnings = collect_warnings(
+            &estimate(0.20, 11.9),
+            &edge_stats(),
+            Some(60.0),
+            &clean(),
+            Some(&subject(Confidence::High)),
+            true,
+        );
+        let codes = codes(&warnings);
+        assert!(codes.contains(&"SUBJECT_TOUCHES_EDGE"), "{codes:?}");
+        assert!(
+            !codes.contains(&"BBOX_RECOMMENDED"),
+            "bbox は既に指定されている: {codes:?}"
+        );
+    }
+
+    /// 対照その 2：均一な背景で外周に接しているのは、正真正銘の見切れである。
+    #[test]
+    fn a_uniform_background_touching_the_edge_is_a_real_crop() {
+        let warnings = collect_warnings(
+            &estimate(1.0, 0.5),
+            &edge_stats(),
+            Some(60.0),
+            &clean(),
+            Some(&subject(Confidence::High)),
+            false,
+        );
+        let codes = codes(&warnings);
+        assert!(codes.contains(&"SUBJECT_TOUCHES_EDGE"), "{codes:?}");
+        assert!(!codes.contains(&"BBOX_RECOMMENDED"), "{codes:?}");
+    }
+
+    /// 対照その 3：主体を特定できていないなら bbox を勧めない。
+    ///
+    /// 信頼度 Low で矩形を渡すと、実写のキーボードのように「キーボードですらない
+    /// 右端の 1.7%」へ誘導してしまう。**誤った助言は助言が無いより悪い。**
+    #[test]
+    fn a_low_confidence_subject_never_produces_a_bbox_hint() {
+        let warnings = collect_warnings(
+            &estimate(0.16, 21.6),
+            &edge_stats(),
+            Some(60.0),
+            &clean(),
+            Some(&subject(Confidence::Low)),
+            false,
+        );
+        let codes = codes(&warnings);
+        assert!(!codes.contains(&"BBOX_RECOMMENDED"), "{codes:?}");
+        assert!(codes.contains(&"SUBJECT_TOUCHES_EDGE"), "{codes:?}");
+    }
+
     #[test]
     fn a_hopeless_image_is_called_out() {
         // 実写のキーボードがこれ。商品が、背景が背景自身と違う量より背景に近い
-        let warnings = collect_warnings(&estimate(0.16, 20.0), &stats(), Some(12.1), &clean());
+        let warnings = collect_warnings(
+            &estimate(0.16, 20.0),
+            &stats(),
+            Some(12.1),
+            &clean(),
+            None,
+            false,
+        );
         assert!(
             hopeless(&warnings),
             "色差がばらつきを下回るなら警告する: {warnings:?}"
@@ -759,7 +920,14 @@ mod tests {
             bbox: Some((0, 0, 10, 10)),
             touches_edge: true,
         };
-        let warnings = collect_warnings(&estimate(0.21, 11.9), &stats, Some(11.5), &clean());
+        let warnings = collect_warnings(
+            &estimate(0.21, 11.9),
+            &stats,
+            Some(11.5),
+            &clean(),
+            None,
+            false,
+        );
         assert!(
             !hopeless(&warnings),
             "切り抜きが成立していない段階で断定してはいけない: {warnings:?}"
@@ -770,7 +938,14 @@ mod tests {
     fn a_white_product_on_a_uniform_white_background_is_not_called_out() {
         // README の看板ケース。均一な背景では輪郭検出で正しく解けるため、
         // 境界の色差が小さくても失敗ではない
-        let warnings = collect_warnings(&estimate(1.0, 0.8), &stats(), Some(3.0), &clean());
+        let warnings = collect_warnings(
+            &estimate(1.0, 0.8),
+            &stats(),
+            Some(3.0),
+            &clean(),
+            None,
+            false,
+        );
         assert!(
             !hopeless(&warnings),
             "均一背景では警告してはいけない: {warnings:?}"
@@ -780,7 +955,14 @@ mod tests {
     #[test]
     fn a_patchy_background_with_a_distinct_product_is_not_called_out() {
         // 背景が汚れていても商品がはっきり違うなら、tolerance を上げれば解ける
-        let warnings = collect_warnings(&estimate(0.5, 15.0), &stats(), Some(60.0), &clean());
+        let warnings = collect_warnings(
+            &estimate(0.5, 15.0),
+            &stats(),
+            Some(60.0),
+            &clean(),
+            None,
+            false,
+        );
         assert!(
             !hopeless(&warnings),
             "色差が十分ならばらつきがあっても警告しない: {warnings:?}"

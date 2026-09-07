@@ -587,6 +587,36 @@ pub fn woven_background_image(width: u32, height: u32) -> RgbaImage {
     img
 }
 
+/// 明度が上下で大きく違う背景の上に、横長の商品を置いたシーン。
+///
+/// **実写（白い不織布の上の黒いリモコン）で起きた誤診を合成で再現する。**
+/// 背景が単色でないので外周からのフィルが背景を消しきれず、背景側が前景として
+/// 残ったまま画像の端に達する。`touches_edge` は true になるが、**商品は
+/// 見切れていない**。この状態を「商品が見切れている可能性があります」と
+/// 報せるのが誤診で、正しくは bbox を勧めるべき局面である。
+///
+/// 実測（300x300）: uniformity 0.50 / foreground_ratio 0.60 / touches_edge true。
+pub fn split_background_scene(width: u32, height: u32) -> RgbaImage {
+    let mut img = RgbaImage::new(width, height);
+    for y in 0..height {
+        for x in 0..width {
+            // 上半分と下半分で明度を大きく変える。外周の帯が 2 色になるので
+            // uniformity が 0.5 前後まで落ちる
+            let v: u8 = if y < height / 2 { 245 } else { 165 };
+            img.put_pixel(x, y, Rgba([v, v, v.saturating_sub(4), 255]));
+        }
+    }
+    // 画像の左右端すれすれまで伸びる帯状の商品。実写のリモコンと同じ構図で、
+    // 商品自体は外周に接していない
+    let (y1, y2) = (height * 2 / 5, height * 3 / 5);
+    for y in y1..y2 {
+        for x in 5..width - 5 {
+            img.put_pixel(x, y, Rgba([30, 30, 34, 255]));
+        }
+    }
+    img
+}
+
 /// 白背景に「ほぼ白い商品」を置いた、切り抜きの最難ケース。
 ///
 /// 商品本体と背景の色差はごくわずかで、両者を分ける手がかりは商品の輪郭に

@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 use common::{
-    ProductSpec, product_image, transparent_product, woven_background_image, write_jpeg, write_png,
+    ProductSpec, product_image, split_background_scene, transparent_product,
+    woven_background_image, write_jpeg, write_png,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -1651,6 +1652,105 @@ fn cutout_flags_a_product_running_off_the_frame() {
         has_warning(&v, "SUBJECT_TOUCHES_EDGE"),
         "{:?}",
         warning_codes(&v)
+    );
+    // 対照。均一な背景での外周接触は正真正銘の見切れなので、bbox を勧めては
+    // ならない（bbox は見切れを直さない）。
+    // `a_non_uniform_background_recommends_a_bbox_instead_of_crying_crop` と対
+    assert!(
+        !has_warning(&v, "BBOX_RECOMMENDED"),
+        "見切れに bbox を勧めている: {:?}",
+        warning_codes(&v)
+    );
+}
+
+/// **「外周に接している」を「見切れている」と読むのは、bbox が無く背景が
+/// 不均一なときには誤診である。**
+///
+/// その状態で外周に接しているのは商品ではなく、前景として取り残された背景側で
+/// ある。実写（不織布の上のリモコン）では bbox を与えれば `touches_edge` が
+/// false になり、商品は見切れていなかった。見切れは撮り直すしかないが、
+/// こちらは bbox 一つで解ける。同じ文言で報せると、エージェントは解ける問題を
+/// 諦めてしまう。
+///
+/// **対照として `cutout_flags_a_product_running_off_the_frame`（均一背景で
+/// 本当に見切れているシーン）を必ず併せて見ること。** 片側だけを固定すると、
+/// 仕組みが死んで全件が同じ警告になっても、どちらか一方は通り続ける。
+#[test]
+fn a_non_uniform_background_recommends_a_bbox_instead_of_crying_crop() {
+    let dir = fixture_dir();
+    let input = write_png(dir.path(), "split.png", &split_background_scene(300, 300));
+    let output = dir.path().join("cut.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v = json_stdout(&out);
+
+    // 前提：背景が不均一で、背景側が前景として残り、それが端に達している
+    assert!(v["background"]["uniformity"].as_f64().unwrap() < 0.9, "{v}");
+    assert_eq!(v["mask"]["touches_edge"], true, "前提が崩れている: {v}");
+
+    let codes = warning_codes(&v);
+    assert!(codes.contains(&"BBOX_RECOMMENDED".to_string()), "{codes:?}");
+    assert!(
+        !codes.contains(&"SUBJECT_TOUCHES_EDGE".to_string()),
+        "誤診が残っている: {codes:?}"
+    );
+
+    // 勧めた bbox がそのまま実行でき、しかも効くこと。**実行できない助言は
+    // 助言ではない。** hint の文字列をそのまま引数へ割って渡す
+    let hint = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "BBOX_RECOMMENDED")
+        .unwrap()["hint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let bbox = hint
+        .split_whitespace()
+        .nth(1)
+        .expect("hint が --bbox <値> の形になっていない");
+
+    let fixed = dir.path().join("fixed.png");
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            fixed.to_str().unwrap(),
+            "--bbox",
+            bbox,
+            "--normalized",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "勧めた bbox が通らない: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let fixed = json_stdout(&out);
+    let before = v["mask"]["foreground_ratio"].as_f64().unwrap();
+    let after = fixed["mask"]["foreground_ratio"].as_f64().unwrap();
+    assert!(
+        after < before / 2.0,
+        "勧めた bbox が効いていない: {before} -> {after}"
+    );
+    assert!(
+        !warning_codes(&fixed).contains(&"BBOX_RECOMMENDED".to_string()),
+        "bbox を指定したのに勧め続けている: {:?}",
+        warning_codes(&fixed)
     );
 }
 

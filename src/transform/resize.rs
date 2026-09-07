@@ -3,7 +3,7 @@
 //! 出力寸法の決定（`plan`）と実際の画素処理（`apply`）を分けている。寸法計算は
 //! 取り違えが起きやすく、かつ画像なしで網羅的に検証できるためである。
 
-use fast_image_resize::images::{Image as FirDstImage, ImageRef as FirImage};
+use fast_image_resize::images::{Image as FirImage, ImageRef as FirImageRef};
 use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
 use image::RgbaImage;
 
@@ -144,7 +144,7 @@ fn scale(image: &RgbaImage, to: (u32, u32)) -> Result<RgbaImage> {
     // `info` のピーク RSS がそれだけで 1.7 倍になっていた。**`info` は
     // 「着手前の安い見立て」であり、そこが重くなるのは設計意図と食い違う。**
     // 読み出すだけなので所有権は要らない
-    let src = FirImage::new(
+    let src = FirImageRef::new(
         image.width(),
         image.height(),
         image.as_raw().as_slice(),
@@ -152,7 +152,7 @@ fn scale(image: &RgbaImage, to: (u32, u32)) -> Result<RgbaImage> {
     )
     .map_err(|e| Error::processing("RESIZE_FAILED", e.to_string()))?;
 
-    let mut dst = FirDstImage::new(to.0, to.1, PixelType::U8x4);
+    let mut dst = FirImage::new(to.0, to.1, PixelType::U8x4);
 
     // use_alpha により事前乗算つきで補間される。これを怠ると透過の境界に
     // 背景色がにじむ（切り抜き後の画像で顕著に出る）。

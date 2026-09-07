@@ -11,9 +11,11 @@ use serde::Serialize;
 
 use kiri::cli::{Cli, Command};
 use kiri::commands;
+use kiri::cutout::Confidence;
 use kiri::error::{Error, ErrorKind, Result};
 use kiri::report::{
     BackgroundReport, BatchReport, CutoutReport, ErrorReport, InfoReport, ProcessReport,
+    SubjectReport,
 };
 use kiri::warning::Warning;
 
@@ -139,6 +141,7 @@ fn print_info(report: &InfoReport) {
         report.background.uniformity
     );
     print_perimeter(&report.background);
+    print_subject(report.subject.as_ref());
     print_warnings(&report.warnings);
 }
 
@@ -218,6 +221,7 @@ fn print_cutout(report: &CutoutReport) {
     if let Some(path) = &report.preview {
         println!("  プレビュー  {path}");
     }
+    print_subject(report.subject.as_ref());
     print_warnings(&report.warnings);
 }
 
@@ -248,6 +252,27 @@ fn print_batch(report: &BatchReport) {
     println!(
         "\n{} 件中 {} 件成功、{} 件失敗、{} 件に警告  ({} ms)",
         report.total, report.succeeded, report.failed, report.with_warnings, report.elapsed_ms
+    );
+}
+
+/// 主体候補の位置を 1 行で出す。
+///
+/// そのまま `--bbox <値> --normalized` へ貼れる並びにしてある。人間が読む側でも
+/// 「どこを商品と見たか」が数値で分かることが、結果を疑うための取っ掛かりになる。
+/// 検出できなかったときは黙る。テキスト出力は人間向けなので、無いものを
+/// 「なし」と 1 行使って言う価値が薄い（JSON 側は null を必ず返す）。
+fn print_subject(subject: Option<&SubjectReport>) {
+    let Some(s) = subject else {
+        return;
+    };
+    let [x1, y1, x2, y2] = s.normalized_bbox;
+    println!(
+        "  主体候補  {x1:.2},{y1:.2},{x2:.2},{y2:.2}  (面積 {:.1}%, 信頼度 {})",
+        s.area_ratio * 100.0,
+        match s.confidence {
+            Confidence::High => "high",
+            Confidence::Low => "low",
+        }
     );
 }
 

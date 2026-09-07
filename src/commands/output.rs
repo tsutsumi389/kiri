@@ -6,11 +6,12 @@ use std::time::Instant;
 use image::RgbaImage;
 
 use crate::cli::OutputOpts;
-use crate::cutout::BackgroundEstimate;
+use crate::cutout::{BackgroundEstimate, SubjectHint};
 use crate::error::{Error, Result};
 use crate::image_io::{LoadedImage, OutputFormat, SaveOptions, save};
 use crate::report::{
     BackgroundReport, Dimensions, OutputReport, PerimeterDeltaE, PerimeterTexture, ProcessReport,
+    SubjectReport,
 };
 use crate::warning::Warning;
 
@@ -73,6 +74,27 @@ pub fn background_report(background: &BackgroundEstimate) -> BackgroundReport {
             p50: round4(background.texture.p50),
             p90: round4(background.texture.p90),
         },
+    }
+}
+
+/// 主体の推定を JSON のレポートへ落とす。
+///
+/// `background_report` と同じ理由で組み立てを 1 箇所に置く。`info` と `cutout` が
+/// 別々に組むと、片方だけ丸め方や項目が食い違っていても誰も気づかない。
+pub fn subject_report(subject: &SubjectHint) -> SubjectReport {
+    SubjectReport {
+        bbox: subject.bbox,
+        normalized_bbox: [
+            round4(subject.normalized_bbox[0]),
+            round4(subject.normalized_bbox[1]),
+            round4(subject.normalized_bbox[2]),
+            round4(subject.normalized_bbox[3]),
+        ],
+        area_ratio: round4(subject.area_ratio),
+        capture_ratio: round4(subject.capture_ratio),
+        delta_e: round4(subject.delta_e),
+        touches_edge: subject.touches_edge,
+        confidence: subject.confidence,
     }
 }
 

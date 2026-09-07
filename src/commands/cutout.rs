@@ -91,6 +91,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         color_profile: loaded.color_profile.clone(),
         color_converted: loaded.color_converted,
         background: output::background_report(&result.background),
+        subject: result.subject.as_ref().map(output::subject_report),
         settings: SettingsReport {
             tolerance: opts.tolerance,
             // 指定値ではなく実際に効いた値。背景のテクスチャで自動調整が

@@ -6,8 +6,8 @@
 use image::ImageFormat;
 
 use crate::cli::InfoArgs;
-use crate::commands::output::{background_report, round4};
-use crate::cutout::estimate_background;
+use crate::commands::output::{background_report, round4, subject_report};
+use crate::cutout::{detect_subject, estimate_background};
 use crate::error::Result;
 use crate::image_io::load;
 use crate::report::InfoReport;
@@ -16,6 +16,7 @@ use crate::warning::Warning;
 pub fn run(args: &InfoArgs) -> Result<InfoReport> {
     let loaded = load::load_with(&args.input, &args.color.to_load_options())?;
     let background = estimate_background(&loaded.image, args.border);
+    let subject = detect_subject(&loaded.image, &background);
 
     let mut warnings = loaded.warnings();
     if !background.is_uniform() {
@@ -45,6 +46,7 @@ pub fn run(args: &InfoArgs) -> Result<InfoReport> {
         icc_profile: loaded.icc_profile,
         has_alpha: loaded.has_alpha,
         background: background_report(&background),
+        subject: subject.as_ref().map(subject_report),
         warnings,
     })
 }

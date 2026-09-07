@@ -22,6 +22,7 @@ pub mod floodfill;
 pub mod mask;
 pub mod morphology;
 pub mod refine;
+pub mod subject;
 
 use image::RgbaImage;
 
@@ -33,6 +34,7 @@ pub use edges::GradientQuantiles;
 pub use floodfill::{FG_SEED_RADIUS, FloodOptions, foreground_mask};
 pub use mask::{Mask, MaskStats};
 pub use refine::RefineOptions;
+pub use subject::{Confidence, SubjectHint, detect_subject};
 
 /// 堤防の既定のしきい値。1px あたりの輝度変化量。
 ///
@@ -153,6 +155,9 @@ pub struct CutoutResult {
     pub separability: Option<f64>,
     /// 境界の縁と階調の診断値
     pub diagnostics: Diagnostics,
+    /// 主体（商品）と思われる塊。切り抜きには一切使わず、報告と警告にだけ使う。
+    /// **ここで求めた bbox を自動で適用しない**理由は `subject.rs` を参照
+    pub subject: Option<SubjectHint>,
     pub warnings: Vec<Warning>,
 }
 
@@ -240,6 +245,9 @@ fn resolve_edge_threshold(
 
 pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
     let background = estimate_background(image, opts.border);
+    // 元画像から測る。アルファを適用した後の画像を渡すと、透明になった背景が
+    // 「背景色から遠い」に化けて主体が画像全体へ広がる
+    let subject = detect_subject(image, &background);
     let (edge_threshold, texture_warning) =
         resolve_edge_threshold(opts.edge_threshold, &background.texture);
 
@@ -325,6 +333,7 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
         stats,
         separability,
         diagnostics,
+        subject,
         warnings,
     }
 }

@@ -197,6 +197,120 @@ fn every_warning_carries_a_machine_readable_code() {
     }
 }
 
+/// `subject` は `info` と `cutout` の両方に、検出できなくても必ず出る。
+///
+/// `separability` / `halo_ratio` と同じ規約。キーごと消すと「主体が無い」と
+/// 「このコマンドは報告しない」を区別できず、エージェントは分岐を書けない。
+#[test]
+fn the_subject_key_is_always_present_in_both_commands() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("cut.png");
+
+    let runs: Vec<Vec<String>> = vec![
+        vec![
+            "info".into(),
+            input.to_str().unwrap().into(),
+            "--json".into(),
+        ],
+        vec![
+            "cutout".into(),
+            input.to_str().unwrap().into(),
+            "-o".into(),
+            output.to_str().unwrap().into(),
+            "--json".into(),
+        ],
+    ];
+
+    for args in runs {
+        let out = kiri().args(&args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let v = json_stdout(&out);
+        let subject = v
+            .get("subject")
+            .unwrap_or_else(|| panic!("{args:?} に subject キーが無い: {v}"));
+        // 合成の商品画像なので検出できるはず。ここが null なら仕組みが死んでいる
+        let s = subject
+            .as_object()
+            .unwrap_or_else(|| panic!("{args:?}: 主体を見つけられていない: {subject}"));
+        assert_eq!(s["confidence"], "high", "{subject}");
+
+        // そのまま --bbox --normalized へ渡せる形であること
+        let bbox = s["normalized_bbox"].as_array().unwrap();
+        assert_eq!(bbox.len(), 4);
+        for c in bbox {
+            let c = c.as_f64().unwrap();
+            assert!((0.0..=1.0).contains(&c), "正規化されていない: {c}");
+        }
+        assert!(bbox[0].as_f64().unwrap() < bbox[2].as_f64().unwrap());
+        assert!(bbox[1].as_f64().unwrap() < bbox[3].as_f64().unwrap());
+    }
+}
+
+/// 主体を検出できなければ `null` を返す。0 や空配列で埋めない。
+#[test]
+fn a_background_only_image_reports_a_null_subject() {
+    let dir = fixture_dir();
+    let img = image::RgbaImage::from_pixel(120, 120, image::Rgba([250, 250, 248, 255]));
+    let input = write_png(dir.path(), "empty.png", &img);
+
+    let out = kiri()
+        .args(["info", input.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let v = json_stdout(&out);
+    assert!(
+        v["subject"].is_null(),
+        "主体が無いなら null: {}",
+        v["subject"]
+    );
+}
+
+/// 主体の検出が切り抜き本体へ影響していないこと。
+///
+/// `subject` は報告と警告のためだけの情報で、マスクの生成には一切関与しない。
+/// **ここが崩れると「診断を足したら結果が変わった」という最悪の壊れ方をする**
+/// ので、同じ入力で二度走らせて出力バイト列が一致することで固定する。
+#[test]
+fn detecting_the_subject_does_not_change_the_cutout() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let run = |name: &str| -> (Vec<u8>, Value) {
+        let output = dir.path().join(name);
+        let out = kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        (std::fs::read(&output).unwrap(), json_stdout(&out))
+    };
+    let (a, va) = run("a.png");
+    let (b, vb) = run("b.png");
+    assert_eq!(a, b, "同じ入力で出力が揺れている");
+    assert_eq!(va["mask"], vb["mask"]);
+}
+
 /// 均一な背景では `LOW_UNIFORMITY` を出さない。偽陽性の回帰防止。
 ///
 /// 警告が常に出る道具は、警告が無いのと同じである。

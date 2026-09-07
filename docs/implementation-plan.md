@@ -174,6 +174,23 @@ MSRV の検査を CI に入れるのは、**宣言だけ置いても検査しな
   - [x] `SUBJECT_TOUCHES_EDGE` の誤診の解消（`BBOX_RECOMMENDED` への分岐）と、
         `info` 段階での「bbox で救えるか」の判別。合成シーン
         `split_background_scene` で対照実験ごと固定した
+  - [x] 外周が汚染された画像で主体を信用しない。商品が外周サンプルの 1 割以上を
+        占めると閾値がその商品自身の色差を指し、**残る輪郭の滲みだけで
+        `capture_ratio` が 1.0 近くに張り付く**——誤検出を弾くはずの捕捉率が
+        誤検出を後押しする向きに反転する。外周 ΔE の二峰性
+        （p50 < 5 かつ p90 > 15）を指紋にして `low` へ降格する。合成シーン
+        `bleeding_product_scene`（**縮小が走る 600px**）で固定した
+  - [x] `BBOX_RECOMMENDED` の条件に `touches_edge` を戻す。ここは「外周接触を
+        どう読むか」の分岐であって不均一な背景そのものへ反応する警告ではない。
+        `touches_edge: false` の対照を添えた
+  - [x] `HALO_REMAINS` に次の一手（`--tolerance` を上げる）を添える。
+        これで `info` → `cutout --bbox` → `cutout --bbox --tolerance` の
+        3 手で実写が解ける
+  - [x] 縮小の入力を借用ビュー（`images::ImageRef`）にして 20MP の複製をやめる。
+        `info` のピーク RSS 470MB → 372MB（main 比 +71% → +35%）
+  - [ ] `subject` の較正を `--border` から切り離す（現状は既定値前提であることを
+        `MIN_CAPTURE_RATIO` のコメントと README に明記するに留めている。
+        実測: IMG_0238 が `--border 2` で low、`--border 110` で high へ裏返る）
   - [ ] 輪郭のコントラストが ΔE 9 を下回る素材への対処（現状は限界として文書化）
   - [ ] README の整備、実素材での既定値の再調整
   - [ ] リリース用 CI

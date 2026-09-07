@@ -514,8 +514,18 @@ fn collect_warnings(
     //
     // 助言を出せるのは主体の信頼度が High のときだけ。Low で bbox を勧めると、
     // 誤検出した矩形（キーボードでは右端の 1.7% の領域）へ誘導してしまう。
-    let misread_as_cropped =
-        !bbox_given && !background.is_uniform() && subject.is_some_and(|s| s.confidence.is_high());
+    //
+    // **`stats.touches_edge` は外せない。** ここは「外周接触という同じ事実を、
+    // 見切れと読むか前景の失敗と読むか」の分岐であって、不均一な背景そのものへ
+    // 反応する場所ではない。`uniformity < 0.90` が言えるのは「単色背景ではない」
+    // までで、「背景側が前景として残った」の証拠は touches_edge だけが持つ。
+    // 外すと、なだらかな勾配の背景で切り抜きが完璧に決まった画像
+    // （fg 0.16 / touches_edge false / halo 0.0 / sep 76.4）にまで
+    // 「残っています」と断言し、エージェントに不要な 2 周目を回させる。
+    let misread_as_cropped = stats.touches_edge
+        && !bbox_given
+        && !background.is_uniform()
+        && subject.is_some_and(|s| s.confidence.is_high());
     if let (true, Some(s)) = (misread_as_cropped, subject) {
         warnings.push(
             Warning::new(
@@ -837,6 +847,39 @@ mod tests {
         assert!(hint.contains("--normalized"), "{hint}");
         assert_eq!(w.data["normalized_bbox"][1], 0.354);
         assert_eq!(w.data["foreground_ratio"], 0.53);
+    }
+
+    /// 対照その 0：外周に接していないなら、何も残っていない。
+    ///
+    /// **`BBOX_RECOMMENDED` は「外周接触をどう読むか」の分岐であって、不均一な
+    /// 背景そのものへ反応する警告ではない。** なだらかな勾配の背景でも切り抜きが
+    /// 完璧に決まることはある（合成シーン ramp: fg 0.16 / touches_edge false /
+    /// halo 0.0 / sep 76.4）。そこで「背景側が前景として残っています」と断言すると、
+    /// エージェントは直すものが無いまま 2 周目を回す。
+    ///
+    /// 上の 3 本はいずれも `touches_edge: true` の stats を使っており、
+    /// **この抜けを検出できない。**
+    #[test]
+    fn a_clean_cut_on_a_non_uniform_background_is_left_alone() {
+        let clean_cut = MaskStats {
+            foreground_ratio: 0.16,
+            bbox: Some((180, 180, 419, 419)),
+            touches_edge: false,
+        };
+        let warnings = collect_warnings(
+            &estimate(0.24, 10.2),
+            &clean_cut,
+            Some(76.4),
+            &clean(),
+            Some(&subject(Confidence::High)),
+            false,
+        );
+        let codes = codes(&warnings);
+        assert!(
+            !codes.contains(&"BBOX_RECOMMENDED"),
+            "何も残っていないのに残っていると言っている: {codes:?}"
+        );
+        assert!(!codes.contains(&"SUBJECT_TOUCHES_EDGE"), "{codes:?}");
     }
 
     /// 対照その 1：bbox を与えたうえで外周に接しているなら、本当に見切れている。

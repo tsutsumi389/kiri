@@ -3,7 +3,7 @@
 //! 出力寸法の決定（`plan`）と実際の画素処理（`apply`）を分けている。寸法計算は
 //! 取り違えが起きやすく、かつ画像なしで網羅的に検証できるためである。
 
-use fast_image_resize::images::Image as FirImage;
+use fast_image_resize::images::{Image as FirDstImage, ImageRef as FirImage};
 use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
 use image::RgbaImage;
 
@@ -139,15 +139,20 @@ pub fn apply(image: &RgbaImage, plan: &ResizePlan) -> Result<RgbaImage> {
 }
 
 fn scale(image: &RgbaImage, to: (u32, u32)) -> Result<RgbaImage> {
-    let src = FirImage::from_vec_u8(
+    // 借用ビューで渡す。`from_vec_u8` に `as_raw().clone()` を渡すと、縮小の
+    // ためだけに元画像のフル RGBA をもう 1 枚持つことになる。20MP で 98MB、
+    // `info` のピーク RSS がそれだけで 1.7 倍になっていた。**`info` は
+    // 「着手前の安い見立て」であり、そこが重くなるのは設計意図と食い違う。**
+    // 読み出すだけなので所有権は要らない
+    let src = FirImage::new(
         image.width(),
         image.height(),
-        image.as_raw().clone(),
+        image.as_raw().as_slice(),
         PixelType::U8x4,
     )
     .map_err(|e| Error::processing("RESIZE_FAILED", e.to_string()))?;
 
-    let mut dst = FirImage::new(to.0, to.1, PixelType::U8x4);
+    let mut dst = FirDstImage::new(to.0, to.1, PixelType::U8x4);
 
     // use_alpha により事前乗算つきで補間される。これを怠ると透過の境界に
     // 背景色がにじむ（切り抜き後の画像で顕著に出る）。

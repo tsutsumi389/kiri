@@ -64,7 +64,38 @@ const MIN_AREA_RATIO: f64 = 0.05;
 /// **ΔE を信頼度の判定に使ってはならない。** キーボードの誤検出領域は
 /// 背景との ΔE が 60.1 とリモコン（48.1）より大きく出る。色の違いの大きさは
 /// 「そこが商品か」を何も語らない。
+///
+/// **較正は既定の `--border 2` を前提にしている。** 帯を大きく広げると、
+/// 帯そのものが商品や机を含みはじめ、`far` の分布が別物になる。実測では
+/// IMG_0238（救えないはずの画像）が `--border 2` で `low`、`--border 110` で
+/// `high` になり、後者は誤った矩形を勧める。`--border` を既定から大きく
+/// 動かしたときは `confidence` を根拠に動いてはならない。
 const MIN_CAPTURE_RATIO: f64 = 0.70;
+
+/// 外周の ΔE 分布を「汚染されている」と読む p90 の下限（`UNIFORM_DELTA_E` の倍数）。
+///
+/// **`p50` がほぼ 0 なのに `p90` だけが大きい状態は、外周に背景でないものが
+/// 写り込んだ指紋である。** p90 の定義がそのまま根拠になる。p90 を超える
+/// 外周サンプルは全体の 1 割であり、`threshold` を汚染するのに要る量
+/// （下の `detect_subject` の説明を参照）とちょうど一致する。同時に `p50` が
+/// `UNIFORM_DELTA_E` を下回るということは、残り 9 割は文句なく単色である
+/// ——つまり分布が一つの山ではなく二つに割れている。
+///
+/// 倍率を 3 に置くのは、「単色と言える範囲」の裾と別の母集団を分けるためで、
+/// 5.0 の 3 倍（ΔE 15）は目視で明らかに別の色と分かる水準にあたる。
+/// 実測はこの値の両側に大きく開いている。
+///
+/// | シーン | p50 | p90 | 判定 |
+/// |---|---|---|---|
+/// | 大きい物体が画面外へ抜ける合成（poison） | 0.0 | 28.7 | 汚染 |
+/// | 帯状の商品が縦に抜ける合成（bleed） | 0.0 | 86.9 | 汚染 |
+/// | きれいなスタジオ背景 | 0.4 | 1.2 | 汚染ではない |
+/// | 不織布の上のリモコン（IMG_0251） | 11.9 | 26.8 | 汚染ではない |
+/// | 暗い机の上のキーボード（IMG_0238） | 21.6 | 61.4 | 汚染ではない |
+///
+/// 下 2 行が示すとおり、**p90 が大きいこと自体は汚染ではない。** 背景全体が
+/// ざらついていれば p50 も一緒に上がる。二つを合わせて初めて指紋になる。
+const CONTAMINATION_P90_FACTOR: f64 = 3.0;
 
 /// 主体候補をどれだけ信用してよいか。
 ///
@@ -119,10 +150,20 @@ pub fn detect_subject(image: &RgbaImage, background: &BackgroundEstimate) -> Opt
     // 逆にざらついた背景では p90 がそのまま「背景の揺らぎの上限」を語る。
     //
     // p90 を使う以上、**外周サンプルの 1 割以上を商品が占めると p90 が
-    // 商品の色差を指し**、主体が閾値を越えられなくなる（結果は None）。
-    // これは背景推定を土台にした手法の素直な限界で、商品が大きく見切れている
-    // 構図がそれにあたる。ただしその構図では bbox を勧める意味がそもそも薄い
-    // （切るべき外側が存在しない）ため、黙って返さないほうが害が少ない
+    // 商品の色差を指し**、その商品は自分で作った閾値を越えられなくなる。
+    // 商品が大きく見切れている構図がそれにあたる。
+    //
+    // **このとき何も残らないとは限らない。** 縮小（Lanczos3）が走るサイズでは、
+    // 追い出された商品の輪郭にリンギングが 1px の帯として残り、それが `far` の
+    // ほぼ全部になる。すると `capture_ratio` が 1.0 近くに張り付き、**誤検出を
+    // 弾くはずの捕捉率が誤検出を後押しする向きに反転する。** 合成シーン
+    // （左 35% を占める灰色の物体＋小さい暗い四角、600px）では、大きいほうを
+    // まるごと外した矩形が capture 0.96 / confidence high で返っていた。
+    // その助言に従えば大きいほうが丸ごと消える。
+    //
+    // だから閾値の汚染そのものを見て信頼度を落とす（後段の `contaminated`）。
+    // 数値は返す。「主体が無い」ではなく「この画像の主体は信用できない」だからで、
+    // 助言に使わせなければ害は無い
     let threshold = background.delta_e.p90.max(UNIFORM_DELTA_E);
 
     let mut far = vec![false; (w as usize) * (h as usize)];
@@ -172,7 +213,13 @@ pub fn detect_subject(image: &RgbaImage, background: &BackgroundEstimate) -> Opt
         BBOX_MARGIN,
     );
 
-    let confidence = if area_ratio >= MIN_AREA_RATIO && capture_ratio >= MIN_CAPTURE_RATIO {
+    // 外周が汚染されていれば、面積も捕捉率も汚染された閾値の上で測った値であり、
+    // 大きいことに意味が無い。**この一行が無いと、商品を外した矩形ほど
+    // 高い捕捉率を得る。**
+    let confidence = if !perimeter_is_contaminated(background)
+        && area_ratio >= MIN_AREA_RATIO
+        && capture_ratio >= MIN_CAPTURE_RATIO
+    {
         Confidence::High
     } else {
         Confidence::Low
@@ -187,6 +234,18 @@ pub fn detect_subject(image: &RgbaImage, background: &BackgroundEstimate) -> Opt
         touches_edge,
         confidence,
     })
+}
+
+/// 外周サンプルに背景でないものが混じっているか。
+///
+/// 混じっていれば `threshold`（外周 ΔE の p90）が背景の揺らぎではなく、
+/// 写り込んだ物の色差を指す。その閾値の上で測った面積も捕捉率も、**主体を
+/// 正しく捉えたときほど小さくなる**ため、信頼度の根拠として使えない。
+///
+/// 判定の根拠は `CONTAMINATION_P90_FACTOR` のコメントを参照。
+fn perimeter_is_contaminated(background: &BackgroundEstimate) -> bool {
+    background.delta_e.p50 < UNIFORM_DELTA_E
+        && background.delta_e.p90 > UNIFORM_DELTA_E * CONTAMINATION_P90_FACTOR
 }
 
 /// 長辺が `MEASURE_LONG_EDGE` を超えていれば縮小する。既に小さければ複製する。
@@ -328,7 +387,8 @@ fn to_pixels(bbox: [f64; 4], w: u32, h: u32) -> [u32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cutout::background::{DEFAULT_BORDER, estimate_background};
+    use crate::cutout::background::{DEFAULT_BORDER, DeltaEQuantiles, estimate_background};
+    use crate::cutout::edges::GradientQuantiles;
     use image::Rgba;
 
     /// 背景色の上に矩形の商品を置いた画像を作る。
@@ -351,6 +411,27 @@ mod tests {
     fn detect(img: &RgbaImage) -> Option<SubjectHint> {
         let bg = estimate_background(img, DEFAULT_BORDER);
         detect_subject(img, &bg)
+    }
+
+    /// 外周を汚染するシーン。**縮小が走る 600px で作る。**
+    ///
+    /// 左端から x<210 までを灰色の物体が占め、上下左右のうち 3 辺に掛かるので
+    /// 外周サンプルの 1 割を軽く超える。それとは別に、灰色よりずっと濃い
+    /// 小さな四角を右下寄りに置く。汚染された閾値（灰色の ΔE）を越えられるのは
+    /// この四角だけなので、主体候補は「大きいほうを外した小さいほう」になる。
+    fn poisoned_scene() -> RgbaImage {
+        let mut img = RgbaImage::from_pixel(600, 600, Rgba([250, 250, 248, 255]));
+        for y in 0..600 {
+            for x in 0..210 {
+                img.put_pixel(x, y, Rgba([150, 150, 150, 255]));
+            }
+        }
+        for y in 370..560 {
+            for x in 370..560 {
+                img.put_pixel(x, y, Rgba([40, 40, 44, 255]));
+            }
+        }
+        img
     }
 
     #[test]
@@ -454,6 +535,90 @@ mod tests {
 
         let px = to_pixels(out, 4284, 5712);
         assert_eq!(px, [0, 0, 4283, 5711]);
+    }
+
+    /// 外周の帯に別の物が写り込むと、閾値がその物の色差を指して主体を追い出す。
+    ///
+    /// **そのとき何も残らないとは限らない。** 縮小が走るサイズでは Lanczos3 の
+    /// リンギングが輪郭に 1px の帯を残し、それが `far` のほぼ全部になるので
+    /// `capture_ratio` が 1.0 近くへ張り付く。誤検出を弾くはずの捕捉率が、
+    /// この構図では誤検出を後押しする向きに反転する。
+    ///
+    /// このシーンで返る矩形は**左 35% を占める灰色の物体を完全に外し、小さい
+    /// 暗い四角だけを囲む**。従えば大きいほうが丸ごと消える。
+    /// **誤った助言は助言が無いより悪い。**
+    #[test]
+    fn a_frame_filling_object_poisons_the_threshold_and_must_not_be_trusted() {
+        let img = poisoned_scene();
+        let bg = estimate_background(&img, DEFAULT_BORDER);
+        // 前提：外周が二峰性になっている（9 割は文句なく単色、1 割超が別物）
+        assert!(bg.delta_e.p50 < UNIFORM_DELTA_E, "{:?}", bg.delta_e);
+        assert!(bg.delta_e.p90 > 3.0 * UNIFORM_DELTA_E, "{:?}", bg.delta_e);
+
+        let s = detect_subject(&img, &bg).expect("数値そのものは返してよい");
+        // 返る矩形は左の灰色の物体（x < 210）を完全に外している。ここが
+        // 「捕捉率が高いのに間違っている」の実体
+        assert!(
+            s.capture_ratio > MIN_CAPTURE_RATIO,
+            "前提が崩れている: {s:?}"
+        );
+        assert!(s.area_ratio > MIN_AREA_RATIO, "前提が崩れている: {s:?}");
+        assert!(s.normalized_bbox[0] > 0.35, "前提が崩れている: {s:?}");
+
+        assert_eq!(
+            s.confidence,
+            Confidence::Low,
+            "汚染された閾値の上の面積・捕捉率を信用している: {s:?}"
+        );
+    }
+
+    /// 対照：きれいなスタジオ背景を汚染と読んではいけない。
+    ///
+    /// **二峰性の判定が厳しすぎると、今まで正しく High を返していた画像まで
+    /// Low に落ち、機能そのものが死ぬ。** 縮小が走る 600px で確かめる。
+    #[test]
+    fn a_clean_studio_background_is_not_mistaken_for_contamination() {
+        let img = scene(
+            (600, 600),
+            [250, 250, 248],
+            [40, 40, 44],
+            (180, 180, 419, 419),
+        );
+        let bg = estimate_background(&img, DEFAULT_BORDER);
+        assert!(!perimeter_is_contaminated(&bg), "{:?}", bg.delta_e);
+
+        let s = detect(&img).expect("中央の商品を見つけられていない");
+        assert_eq!(s.confidence, Confidence::High, "{s:?}");
+    }
+
+    /// 較正表をそのまま固定する。**係数を動かせばここが落ちる。**
+    ///
+    /// p90 が大きいこと自体は汚染ではない（下 2 行）。背景全体がざらついて
+    /// いれば p50 も一緒に上がるためで、二つを合わせて初めて指紋になる。
+    #[test]
+    fn the_contamination_rule_splits_the_calibration_table() {
+        // (説明, p50, p90, 汚染か)
+        let rows: [(&str, f64, f64, bool); 5] = [
+            ("画面外へ抜ける大きな物体 (poison)", 0.0, 28.7, true),
+            ("縦に抜ける帯状の商品 (bleed)", 0.0, 86.9, true),
+            ("きれいなスタジオ背景", 0.4, 1.2, false),
+            ("不織布の上のリモコン IMG_0251", 11.9, 26.8, false),
+            ("暗い机の上のキーボード IMG_0238", 21.6, 61.4, false),
+        ];
+        for (name, p50, p90, expected) in rows {
+            let bg = BackgroundEstimate {
+                rgb: [250, 250, 248],
+                uniformity: 0.5,
+                samples: 1000,
+                delta_e: DeltaEQuantiles { p50, p90, max: p90 },
+                texture: GradientQuantiles::default(),
+            };
+            assert_eq!(
+                perimeter_is_contaminated(&bg),
+                expected,
+                "{name} (p50={p50}, p90={p90})"
+            );
+        }
     }
 
     /// 大きい画像でも縮小して測るので、成分の位置は原寸の座標で返る。

@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 use common::{
-    ProductSpec, product_image, split_background_scene, transparent_product,
-    woven_background_image, write_jpeg, write_png,
+    ProductSpec, bleeding_product_scene, product_image, split_background_scene,
+    transparent_product, woven_background_image, write_jpeg, write_png,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -1616,6 +1616,61 @@ fn cutout_warns_when_almost_nothing_is_removed() {
     assert!(
         has_warning(&v, "FOREGROUND_TOO_LARGE"),
         "失敗が検出できていない: {:?}",
+        warning_codes(&v)
+    );
+}
+
+/// 商品が画面外へ抜けて外周を汚染したら、主体の数値を信用してはいけない。
+///
+/// **縮小が走る 600px で回すこと。** 主体は長辺 250px へ縮小してから測るので、
+/// 200px の画像ではこの経路を踏まず、下の `cutout_flags_a_product_running_off_the_frame`
+/// では検出できない。縮小が入ると、閾値から追い出された商品の輪郭に
+/// Lanczos3 のリンギングが 1px の帯として残り、それが `far` のほぼ全部になる。
+/// `capture_ratio` が 1.0 近くへ張り付き、**誤検出を弾くはずの捕捉率が誤検出を
+/// 後押しする向きに反転する。**
+///
+/// 返る矩形は画面の 3 分の 1 を占める物体を完全に外している。従えばそれが
+/// 丸ごと消える。**誤った助言は助言が無いより悪い。**
+#[test]
+fn a_frame_filling_object_never_earns_high_confidence() {
+    let dir = fixture_dir();
+    let input = write_png(dir.path(), "bleed.png", &bleeding_product_scene(600, 600));
+    let output = dir.path().join("cut.png");
+
+    let out = kiri()
+        .args(["info", input.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let v = json_stdout(&out);
+
+    // 前提：外周が二峰性になっている（9 割は単色、1 割超が別物）
+    let d = &v["background"]["perimeter_delta_e"];
+    assert!(d["p50"].as_f64().unwrap() < 5.0, "前提が崩れている: {d}");
+    assert!(d["p90"].as_f64().unwrap() > 15.0, "前提が崩れている: {d}");
+
+    // 数値は返してよい。信用してよいかだけが問題である
+    assert_ne!(
+        v["subject"]["confidence"], "high",
+        "汚染された閾値の上の面積・捕捉率を信用している: {}",
+        v["subject"]
+    );
+
+    // 信頼度が high でない以上、bbox を勧めてはならない
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v = json_stdout(&out);
+    assert!(
+        !has_warning(&v, "BBOX_RECOMMENDED"),
+        "誤った矩形へ誘導している: {:?}",
         warning_codes(&v)
     );
 }

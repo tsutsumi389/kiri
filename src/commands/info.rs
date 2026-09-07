@@ -53,7 +53,7 @@ pub fn run(args: &InfoArgs) -> Result<InfoReport> {
 ///
 /// 主体が求まればここで分岐できる。ただし **実行可能な助言を出すのは信頼度が
 /// High のときだけ**である。Low で bbox を勧めると、誤検出した矩形
-/// （キーボードでは右端の 1.7% の領域）へ誘導してしまう。数値そのものは
+/// （キーボードでは右端の 0.4% の領域）へ誘導してしまう。数値そのものは
 /// `subject` として返してよいが、hint で矩形を勧めてはならない。
 fn low_uniformity_warnings(
     background: &BackgroundEstimate,
@@ -197,7 +197,7 @@ mod tests {
     /// **信頼度 Low では絶対に bbox を勧めない。**
     ///
     /// 実写のキーボードがこれで、主体候補は「キーボードですらない右端の
-    /// 1.7% の領域」になる。そこへ誘導すると商品がまるごと消える。
+    /// 0.4% の領域」になる。そこへ誘導すると商品がまるごと消える。
     /// 誤った助言は助言が無いより悪い。
     #[test]
     fn a_low_confidence_subject_never_gets_a_bbox_hint() {

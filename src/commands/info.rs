@@ -96,11 +96,14 @@ fn low_uniformity_warnings(
             .with_data("subject_delta_e", round4(s.delta_e))
             .with_data("perimeter_delta_e_p50", round4(spread)),
         ],
+        // 丸めてから百分率にする。テキスト出力の「主体候補」行は JSON と同じ
+        // round4 済みの値を使うので、ここで生の値を使うと同じ量が 0.3% と
+        // 0.4% の二通りで出る。**同じ数を二つの表記で見せない**
         Some(s) => vec![base.with_hint(format!(
             "主体を特定できませんでした（面積 {:.1}%, 捕捉率 {:.1}%）。\
              単色背景で撮り直すことを検討してください",
-            s.area_ratio * 100.0,
-            s.capture_ratio * 100.0
+            round4(s.area_ratio) * 100.0,
+            round4(s.capture_ratio) * 100.0
         ))],
         // 主体が 1 つも見つからない = 背景しか写っていない。助言の材料が無い
         None => vec![base.with_hint("kiri が対象とするのは単色背景の画像です")],
@@ -207,6 +210,7 @@ mod tests {
         let hint = hint_of(&w, "LOW_UNIFORMITY");
         assert!(!hint.contains("--bbox"), "誤った矩形へ誘導している: {hint}");
         // 数値は返してよい。何が足りなかったのかを人が読めるようにする
+        // テキスト出力の「主体候補」行と同じ丸めで出ること（同じ数を二通りで見せない）
         assert!(hint.contains("0.4%") && hint.contains("50.8%"), "{hint}");
         assert!(hint.contains("撮り直す"), "{hint}");
     }

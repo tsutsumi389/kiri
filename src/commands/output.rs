@@ -93,6 +93,7 @@ pub fn subject_report(subject: &SubjectHint) -> SubjectReport {
         area_ratio: round4(subject.area_ratio),
         capture_ratio: round4(subject.capture_ratio),
         delta_e: round4(subject.delta_e),
+        leftover_ratio: round4(subject.leftover_ratio),
         touches_edge: subject.touches_edge,
         confidence: subject.confidence,
     }

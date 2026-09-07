@@ -144,6 +144,7 @@ mod tests {
             area_ratio: 0.2342,
             capture_ratio: 0.9793,
             delta_e,
+            leftover_ratio: 0.0531,
             touches_edge: true,
             confidence,
         }

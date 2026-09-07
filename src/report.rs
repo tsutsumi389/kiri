@@ -109,6 +109,10 @@ pub struct SubjectReport {
     /// 主体候補の代表色と背景色の色差(ΔE)。
     /// **信頼度の判定には使っていない**（誤検出でも大きく出るため）
     pub delta_e: f64,
+    /// **この矩形の外**に残った「背景とは言えない画素」の、最大の塊が
+    /// 画像に占める割合。大きければ、この矩形は主体を取りこぼしている。
+    /// 0.15 以上で `confidence` は `"low"` になる
+    pub leftover_ratio: f64,
     pub touches_edge: bool,
     /// "high" のときだけ、この矩形を根拠にした助言を出してよい
     pub confidence: Confidence,

@@ -34,7 +34,7 @@ pub use edges::GradientQuantiles;
 pub use floodfill::{FG_SEED_RADIUS, FloodOptions, foreground_mask};
 pub use mask::{Mask, MaskStats};
 pub use refine::RefineOptions;
-pub use subject::{Confidence, SubjectHint, detect_subject};
+pub use subject::{Confidence, LowReason, SubjectHint, detect_subject};
 
 /// 堤防の既定のしきい値。1px あたりの輝度変化量。
 ///
@@ -807,6 +807,7 @@ mod tests {
             area_ratio: 0.2342,
             capture_ratio: 0.9793,
             delta_e: 49.6,
+            leftover_ratio: 0.0531,
             touches_edge: true,
             confidence,
         }

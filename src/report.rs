@@ -156,6 +156,19 @@ pub struct Dimensions {
     pub height: u32,
 }
 
+/// 回転で実際に起きたこと。
+///
+/// 出力寸法だけでは「何度回ったか」も「補間し直したか」も分からない。
+/// 90 度単位かどうかで画質の意味が変わる以上、両方を明示する。
+#[derive(Debug, Serialize)]
+pub struct RotateReport {
+    /// 実際に適用した角度。`[0, 360)` へ正規化した時計回りの度数。
+    /// 指定値をそのまま返さないのは、-90 と 270 が同じ操作だからである
+    pub angle: f64,
+    /// 画素を補間し直したか。90 度単位なら false で、色は 1 バイトも変わらない
+    pub resampled: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ProcessReport {
     pub input: String,
@@ -168,6 +181,9 @@ pub struct ProcessReport {
     pub color_profile: Option<String>,
     /// sRGB へ変換したか
     pub color_converted: bool,
+    /// 回転した場合のみ出す。convert / resize は回さないのでキーごと現れない
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotate: Option<RotateReport>,
     pub elapsed_ms: u128,
     pub warnings: Vec<Warning>,
 }

@@ -58,6 +58,14 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                 print_process(&report);
             }
         }
+        Command::Rotate(args) => {
+            let report = commands::rotate::run(args)?;
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                print_process(&report);
+            }
+        }
         Command::Cutout(args) => {
             let report = commands::cutout::run(args)?;
             if cli.json {
@@ -158,6 +166,19 @@ fn print_process(report: &ProcessReport) {
         );
     }
     print_color(&report.color_space, report.color_converted);
+    if let Some(r) = &report.rotate {
+        // 無劣化かどうかを添える。90 度単位とそれ以外では、同じ「回した」でも
+        // 出力の意味が違う（前者は色が 1 バイトも変わらない）
+        println!(
+            "  回転      {}°  ({})",
+            r.angle,
+            if r.resampled {
+                "再サンプリング"
+            } else {
+                "無劣化"
+            }
+        );
+    }
     print_warnings(&report.warnings);
 }
 

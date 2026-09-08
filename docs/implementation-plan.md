@@ -37,6 +37,7 @@ src/
     subject.rs         主体（商品）の位置の推定。背景推定だけから求める
   transform/
     resize.rs          fast_image_resize ラッパ
+    rotate.rs          回転。90 度単位は画素の入れ替え、それ以外は Catmull-Rom
     canvas.rs          キャンバス配置、fill_ratio
     composite.rs       背景色合成
   batch.rs             spec.json の読み込みと rayon 並列実行
@@ -53,6 +54,7 @@ src/
 | 4 | EC整形：キャンバス配置、fill_ratio、背景色合成 | `kiri cutout`（完成） | 1日 |
 | 5 | バッチ：spec.json、rayon並列 | `kiri batch` | 0.5日 |
 | 6 | 仕上げ：README、実画像での再計測とデフォルト値調整、GitHub Actions | v0.1.0 | 1日 |
+| 7 | 回転：90度単位は無劣化、任意角は Catmull-Rom で外接矩形へ拡張 | `kiri rotate` | 0.5日 |
 
 **Phase 1 の `kiri info` を最初に完成させる。** 最小で end-to-end が通り、JSON規約とエラー処理の型がそこで確定する。型が決まれば以降は同じ形で積み上げられる。
 
@@ -198,6 +200,22 @@ MSRV の検査を CI に入れるのは、**宣言だけ置いても検査しな
   - [x] `HALO_REMAINS` に次の一手（`--tolerance` を上げる）を添える。
         これで `info` → `cutout --bbox` → `cutout --bbox --tolerance` の
         3 手で実写が解ける
+- [x] Phase 7: `kiri rotate`
+  - [x] 時計回りを正とし、`[0, 360)` へ正規化する。`-90` と `270` と `630` は
+        同じ操作なので、分岐を `plan` の 1 箇所へ集約する。JSON は指定値ではなく
+        **適用した角度**を返す
+  - [x] 90 の倍数は `image::imageops` の入れ替えで無劣化に回す。判定は厳密一致で
+        行い、「ほぼ 90 度」を無劣化の枝へ流さない（指定と結果が黙って食い違う）
+  - [x] 任意角は Catmull-Rom（4×4）で逆写像補間する。**事前乗算アルファ**で
+        混ぜる——切り抜き済み PNG を回すのが主用途であり、素の RGB を混ぜると
+        透明画素の色が輪郭に滲む。オーバーシュートは事前乗算のまま `[0, alpha]`
+        へ収めてから戻す
+  - [x] 出力は外接矩形まで拡張し、寸法は**切り上げる**。丸めると四隅が小数画素
+        ぶん欠ける。増えた余白はアルファ 0 で、JPEG へ出せば既存の
+        `ALPHA_FLATTENED` が発火する
+  - [ ] `batch` の spec への追加（現状の spec は `cutout` の設定しか持たない）
+  - [ ] 自動水平出し（`info` が主体の傾き角を返し、`rotate` がそれを使う）。
+        bbox と同じく**自動適用はしない**——傾きを直すかどうかは構図の判断である
   - [x] 縮小の入力を借用ビュー（`images::ImageRef`）にして 20MP の複製をやめる。
         `info` のピーク RSS 470MB → 372MB（main 比 +71% → +35%）
   - [ ] `subject` の較正を `--border` から切り離す（現状は既定値前提であることを

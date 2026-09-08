@@ -1221,6 +1221,197 @@ fn resize_respects_the_overwrite_guard() {
     assert_eq!(std::fs::read(&output).unwrap(), b"existing");
 }
 
+// --- rotate ---
+
+/// 回転結果の JSON を取る。角度以外は常に同じ呼び方をする。
+fn rotate_json(input: &Path, output: &Path, angle: &str, extra: &[&str]) -> Value {
+    let mut args: Vec<String> = vec![
+        "rotate".into(),
+        input.to_str().unwrap().into(),
+        "-o".into(),
+        output.to_str().unwrap().into(),
+        "--angle".into(),
+        angle.into(),
+        "--json".into(),
+    ];
+    args.extend(extra.iter().map(|s| (*s).to_string()));
+
+    let out = kiri().args(&args).output().unwrap();
+    assert!(
+        out.status.success(),
+        "angle={angle}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    json_stdout(&out)
+}
+
+fn rotate_fixture(dir: &TempDir) -> PathBuf {
+    let img = product_image(&ProductSpec {
+        width: 400,
+        height: 500,
+        ..Default::default()
+    });
+    write_png(dir.path(), "in.png", &img)
+}
+
+#[test]
+fn rotate_by_a_quarter_turn_swaps_the_dimensions_without_resampling() {
+    let dir = fixture_dir();
+    let input = rotate_fixture(&dir);
+
+    let v = rotate_json(&input, &dir.path().join("out.png"), "90", &[]);
+    assert_eq!(v["source"]["width"], 400);
+    assert_eq!(v["outputs"][0]["width"], 500);
+    assert_eq!(v["outputs"][0]["height"], 400);
+    assert_eq!(v["rotate"]["angle"], 90.0);
+    assert_eq!(
+        v["rotate"]["resampled"], false,
+        "90 度単位は補間せずに回すこと"
+    );
+}
+
+#[test]
+fn rotate_normalizes_a_negative_angle_to_a_clockwise_one() {
+    let dir = fixture_dir();
+    let input = rotate_fixture(&dir);
+
+    // 反時計回りに 90 は、時計回りに 270 と同じ操作
+    let v = rotate_json(&input, &dir.path().join("out.png"), "-90", &[]);
+    assert_eq!(v["rotate"]["angle"], 270.0);
+    assert_eq!(v["rotate"]["resampled"], false);
+    assert_eq!(v["outputs"][0]["width"], 500);
+}
+
+#[test]
+fn rotate_by_a_full_turn_returns_the_original_bytes() {
+    let dir = fixture_dir();
+    let input = rotate_fixture(&dir);
+    let output = dir.path().join("out.png");
+
+    let v = rotate_json(&input, &output, "360", &[]);
+    assert_eq!(v["rotate"]["angle"], 0.0);
+    assert_eq!(
+        std::fs::read(&input).unwrap(),
+        std::fs::read(&output).unwrap(),
+        "1 周は何もしないのと同じでなければならない"
+    );
+}
+
+#[test]
+fn rotate_by_an_arbitrary_angle_expands_to_hold_the_corners() {
+    let dir = fixture_dir();
+    let input = rotate_fixture(&dir);
+
+    let v = rotate_json(&input, &dir.path().join("out.png"), "45", &[]);
+    assert_eq!(v["rotate"]["resampled"], true);
+    // 400x500 を 45 度回した外接矩形は一辺 (400+500)/sqrt(2) = 636.4
+    assert_eq!(v["outputs"][0]["width"], 637);
+    assert_eq!(v["outputs"][0]["height"], 637);
+}
+
+#[test]
+fn rotate_leaves_the_new_corners_transparent() {
+    let dir = fixture_dir();
+    let input = rotate_fixture(&dir);
+    let output = dir.path().join("out.png");
+    rotate_json(&input, &output, "30", &[]);
+
+    let img = image::open(&output).unwrap().to_rgba8();
+    for (x, y) in [
+        (0, 0),
+        (img.width() - 1, 0),
+        (0, img.height() - 1),
+        (img.width() - 1, img.height() - 1),
+    ] {
+        assert_eq!(
+            img.get_pixel(x, y)[3],
+            0,
+            "({x},{y}) は回転で生じた余白なので透過であるべき"
+        );
+    }
+}
+
+#[test]
+fn rotate_into_a_format_without_alpha_reports_the_flattening() {
+    let dir = fixture_dir();
+    let input = rotate_fixture(&dir);
+
+    // 余白は透過で作るので、JPEG へ出すなら塗り潰すしかない。
+    // 黙って塗ると「背景色の枠が付いた」に見えるため、必ず知らせる
+    let v = rotate_json(&input, &dir.path().join("out.jpg"), "30", &[]);
+    assert!(
+        has_warning(&v, "ALPHA_FLATTENED"),
+        "警告: {:?}",
+        warning_codes(&v)
+    );
+}
+
+#[test]
+fn rotate_rejects_an_angle_that_is_not_a_number() {
+    let dir = fixture_dir();
+    let input = rotate_fixture(&dir);
+
+    for angle in ["nan", "inf", "sideways"] {
+        let out = kiri()
+            .args([
+                "rotate",
+                input.to_str().unwrap(),
+                "-o",
+                dir.path().join("out.png").to_str().unwrap(),
+                "--angle",
+                angle,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "angle={angle} は拒否すること");
+    }
+}
+
+#[test]
+fn rotate_respects_the_overwrite_guard() {
+    let dir = fixture_dir();
+    let input = rotate_fixture(&dir);
+    let output = dir.path().join("out.png");
+    std::fs::write(&output, b"existing").unwrap();
+
+    let out = kiri()
+        .args([
+            "rotate",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--angle",
+            "90",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(json_stdout(&out)["error"]["code"], "OUTPUT_EXISTS");
+    assert_eq!(std::fs::read(&output).unwrap(), b"existing");
+}
+
+#[test]
+fn other_commands_do_not_report_a_rotation() {
+    // rotate だけが持つキーであることを固定する。convert / resize が
+    // `"rotate": null` を返し始めると、「回さなかった」と「回せない」が混ざる
+    let dir = fixture_dir();
+    let input = rotate_fixture(&dir);
+
+    let out = kiri()
+        .args([
+            "convert",
+            input.to_str().unwrap(),
+            "-o",
+            dir.path().join("out.png").to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(json_stdout(&out).get("rotate").is_none());
+}
+
 // --- cutout ---
 
 use common::light_product_image;

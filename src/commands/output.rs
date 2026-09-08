@@ -151,6 +151,8 @@ pub fn finish(
         color_space: loaded.color_space.clone(),
         color_profile: loaded.color_profile.clone(),
         color_converted: loaded.color_converted,
+        // 回転は rotate コマンドだけが後から埋める
+        rotate: None,
         elapsed_ms: started.elapsed().as_millis(),
         warnings,
     })

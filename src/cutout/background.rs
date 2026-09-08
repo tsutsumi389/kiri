@@ -11,7 +11,12 @@ use crate::cutout::edges::{GradientQuantiles, border_gradient_quantiles};
 
 /// 外周サンプルが背景色とみなせる ΔE の上限。
 /// CIE76 で 5 前後は「注意すれば違いが分かる」水準にあたる。
-const UNIFORM_DELTA_E: f64 = 5.0;
+///
+/// `subject.rs` も「背景と違う」の下限としてこの値を使う。均一な背景では
+/// 外周の ΔE p90 がほぼ 0 になり、それをそのまま閾値にすると圧縮ノイズまで
+/// 主体として拾ってしまうためで、**同じ「背景と同じ色と言える範囲」を
+/// 二つの名前で持たない**ようにここを共有する。
+pub const UNIFORM_DELTA_E: f64 = 5.0;
 
 /// 背景推定に使う外周の既定幅(px)。
 pub const DEFAULT_BORDER: u32 = 2;

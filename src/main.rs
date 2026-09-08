@@ -11,10 +11,13 @@ use serde::Serialize;
 
 use kiri::cli::{Cli, Command};
 use kiri::commands;
+use kiri::cutout::{Confidence, bbox_argument};
 use kiri::error::{Error, ErrorKind, Result};
 use kiri::report::{
     BackgroundReport, BatchReport, CutoutReport, ErrorReport, InfoReport, ProcessReport,
+    SubjectReport,
 };
+use kiri::warning::Warning;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -138,6 +141,7 @@ fn print_info(report: &InfoReport) {
         report.background.uniformity
     );
     print_perimeter(&report.background);
+    print_subject(report.subject.as_ref());
     print_warnings(&report.warnings);
 }
 
@@ -217,6 +221,7 @@ fn print_cutout(report: &CutoutReport) {
     if let Some(path) = &report.preview {
         println!("  プレビュー  {path}");
     }
+    print_subject(report.subject.as_ref());
     print_warnings(&report.warnings);
 }
 
@@ -233,8 +238,14 @@ fn print_batch(report: &BatchReport) {
                     out.height,
                     human_bytes(out.bytes)
                 );
+                // hint も出す。単体実行では出るのに batch でだけ消えると、
+                // **同じ画像の同じ失敗が、呼び方によって回復できたりできなかったり
+                // する。** 行頭に入力名を置く体裁だけを揃えて、中身は落とさない
                 for w in &r.warnings {
-                    eprintln!("  警告 [{}]: {w}", item.input);
+                    eprintln!("  警告 [{}]: {}", item.input, w.message);
+                    if let Some(hint) = &w.hint {
+                        eprintln!("         {hint}");
+                    }
                 }
             }
             (_, Some(e)) => {
@@ -250,6 +261,33 @@ fn print_batch(report: &BatchReport) {
     );
 }
 
+/// 主体候補の位置を 1 行で出す。
+///
+/// そのまま `--bbox <値> --normalized` へ貼れる並びにしてある。人間が読む側でも
+/// 「どこを商品と見たか」が数値で分かることが、結果を疑うための取っ掛かりになる。
+/// 検出できなかったときは黙る。テキスト出力は人間向けなので、無いものを
+/// 「なし」と 1 行使って言う価値が薄い（JSON 側は null を必ず返す）。
+///
+/// **丸めは `bbox_argument` に任せる。** ここで見栄えのために小数第 2 位へ
+/// 落とすと、同じ矩形が「テキストの行」と「警告の hint」で二通りに出る。
+/// しかも貼り付け可能と謳っている側が狭いほうで、`bbox_argument` 自身の
+/// コメントどおり 20MP では 28px 内側に入る。bbox の外は色によらず背景と
+/// 確定されるため、その差はそのまま商品の欠けになる。
+fn print_subject(subject: Option<&SubjectReport>) {
+    let Some(s) = subject else {
+        return;
+    };
+    println!(
+        "  主体候補  {}  (面積 {:.1}%, 信頼度 {})",
+        bbox_argument(s.normalized_bbox),
+        s.area_ratio * 100.0,
+        match s.confidence {
+            Confidence::High => "high",
+            Confidence::Low => "low",
+        }
+    );
+}
+
 fn print_perimeter(bg: &BackgroundReport) {
     let d = &bg.perimeter_delta_e;
     println!(
@@ -262,9 +300,17 @@ fn print_perimeter(bg: &BackgroundReport) {
     println!("  外周勾配  p50 {:.1}  p90 {:.1}", t.p50, t.p90);
 }
 
-fn print_warnings(warnings: &[String]) {
+/// 人間向けの警告表示。
+///
+/// `code` はテキストには出さない。JSON が持っている以上ここでは冗長で、
+/// 読み手（人間）には文言のほうが速い。`hint` は次の行へインデントして出す。
+/// 「何が起きたか」と「次に何をするか」を 1 行に詰めると、後者が読み飛ばされる。
+fn print_warnings(warnings: &[Warning]) {
     for w in warnings {
-        eprintln!("警告: {w}");
+        eprintln!("警告: {}", w.message);
+        if let Some(hint) = &w.hint {
+            eprintln!("      {hint}");
+        }
     }
 }
 

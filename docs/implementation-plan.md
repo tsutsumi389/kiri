@@ -1,6 +1,6 @@
 # kiri 実装計画
 
-最終更新: 2026-09-06
+最終更新: 2026-09-08
 
 設計の詳細と決定根拠は [design.md](./design.md) を参照。本書は実装の進め方のみを扱う。
 
@@ -14,6 +14,7 @@ src/
   lib.rs               公開API（テストから利用）
   cli.rs               clap derive による引数定義
   error.rs             エラー型 → exit code のマッピング
+  warning.rs           警告型（code / message / hint / data）。error.rs と同じ契約
   report.rs            JSON 出力の構造体（serde）
   image_io/
     load.rs            JPEG/PNG 読み込み + EXIF Orientation 正規化 + ICC → sRGB
@@ -33,6 +34,7 @@ src/
     despill.rs         色かぶり除去（--no-refine 用）
     diagnostics.rs     境界の診断値（halo_ratio, edge_width）
     mask.rs            マスク型と統計（foreground_ratio, bbox, touches_edge）
+    subject.rs         主体（商品）の位置の推定。背景推定だけから求める
   transform/
     resize.rs          fast_image_resize ラッパ
     canvas.rs          キャンバス配置、fill_ratio
@@ -161,6 +163,46 @@ MSRV の検査を CI に入れるのは、**宣言だけ置いても検査しな
   - [x] 埋め込み ICC（Display P3 / AdobeRGB 等）から sRGB への変換、
         `color_space` / `color_converted` の報告、`--no-color-convert`
   - [x] HEIC 入力を明確に断り、変換手順をヒントで返す
+  - [x] 警告の構造化（`code` / `hint` / `data`）。エラーには当初から機械可読な
+        `code` があったのに、警告だけが日本語の散文で、エージェントは文字列
+        マッチで分岐するしかなかった。同じ道具の中で契約の形が違う理由が無い
+  - [x] 主体（商品）の位置の推定と報告（`subject`）。背景推定だけから最大の
+        連結成分として求まる。`info` / `cutout` の両方に同じ形で出す。
+        信頼度は面積比 0.05 と捕捉率 0.70 で決め、**ΔE は使わない**
+        （誤検出でも大きく出るため）。**求めた bbox は自動適用しない**——
+        bbox は構図の意思決定であり、`edge_threshold` の自動調整とは性質が違う
+  - [x] `SUBJECT_TOUCHES_EDGE` の誤診の解消（`BBOX_RECOMMENDED` への分岐）と、
+        `info` 段階での「bbox で救えるか」の判別。合成シーン
+        `split_background_scene` で対照実験ごと固定した
+  - [x] 外周が汚染された画像で主体を信用しない。商品が外周サンプルの 1 割以上を
+        占めると閾値がその商品自身の色差を指し、**残る輪郭の滲みだけで
+        `capture_ratio` が 1.0 近くに張り付く**——誤検出を弾くはずの捕捉率が
+        誤検出を後押しする向きに反転する。合成シーン
+        `bleeding_product_scene`（**縮小が走る 600px**）で固定した
+  - [x] **その判定を外周統計から「答えの検証」へ入れ替えた。** 外周 ΔE の二峰性
+        （p50 < 5 かつ p90 > 15）を指紋にする最初の実装は両側から破れた——
+        リポジトリ自身の織り目テクスチャの上では p50 が 6.30 まで上がって素通しし
+        （`woven_poisoned_scene`）、下端に帯があるだけの画像では主体を完璧に
+        捉えているのに `low` へ落ちて `SUBJECT_TOUCHES_EDGE` の誤診が復活した
+        （`shadow_band_scene`）。**外周だけでは「背景がざらついている」と
+        「主体が外周に乗っている」を区別できない。** 代わりに、提案した矩形の外に
+        背景と言えない大きな塊が残っていないか（`leftover_ratio` < 0.15）を見る。
+        検証のしきい値は `max(p50, 5)` で、主体検出の `max(p90, 5)` より低い
+        （高いほうは主体自身に汚染されている）。13 シーンで較正し、JSON にも出す
+  - [x] 信頼度 `low` の理由（面積不足／捕捉率不足／取りこぼし）で `info` の
+        hint の文面を分ける。一本の文面では「面積 14.1%, 捕捉率 98.1%」を並べて
+        「特定できませんでした」と、自分の数値と矛盾することを言っていた
+  - [x] `BBOX_RECOMMENDED` の条件に `touches_edge` を戻す。ここは「外周接触を
+        どう読むか」の分岐であって不均一な背景そのものへ反応する警告ではない。
+        `touches_edge: false` の対照を添えた
+  - [x] `HALO_REMAINS` に次の一手（`--tolerance` を上げる）を添える。
+        これで `info` → `cutout --bbox` → `cutout --bbox --tolerance` の
+        3 手で実写が解ける
+  - [x] 縮小の入力を借用ビュー（`images::ImageRef`）にして 20MP の複製をやめる。
+        `info` のピーク RSS 470MB → 372MB（main 比 +71% → +35%）
+  - [ ] `subject` の較正を `--border` から切り離す（現状は既定値前提であることを
+        `MIN_CAPTURE_RATIO` のコメントと README に明記するに留めている。
+        実測: IMG_0238 が `--border 2` で low、`--border 110` で high へ裏返る）
   - [ ] 輪郭のコントラストが ΔE 9 を下回る素材への対処（現状は限界として文書化）
   - [ ] README の整備、実素材での既定値の再調整
   - [ ] リリース用 CI

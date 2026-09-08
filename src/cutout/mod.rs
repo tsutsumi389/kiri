@@ -22,8 +22,11 @@ pub mod floodfill;
 pub mod mask;
 pub mod morphology;
 pub mod refine;
+pub mod subject;
 
 use image::RgbaImage;
+
+use crate::warning::Warning;
 
 pub use background::{BackgroundEstimate, DEFAULT_BORDER, DeltaEQuantiles, estimate_background};
 pub use diagnostics::Diagnostics;
@@ -31,6 +34,7 @@ pub use edges::GradientQuantiles;
 pub use floodfill::{FG_SEED_RADIUS, FloodOptions, foreground_mask};
 pub use mask::{Mask, MaskStats};
 pub use refine::RefineOptions;
+pub use subject::{Confidence, LowReason, SubjectHint, detect_subject};
 
 /// 堤防の既定のしきい値。1px あたりの輝度変化量。
 ///
@@ -54,6 +58,23 @@ pub const DEFAULT_EDGE_THRESHOLD: f64 = 8.0;
 /// 固定している。堤防を切ると商品がまるごと飲まれ、既定の 8 では織り目が壁に
 /// なる。両立するのは 12〜24 の窓だけで、1.5 倍（21）はその中にある。
 const TEXTURE_DAM_HEADROOM: f64 = 1.5;
+
+/// 警告の `data` へ載せる値を小数第 1 位で丸める。
+///
+/// 桁を落とすのは、message に `{:.1}` で書いた値と `data` の値が食い違うと、
+/// エージェントが「別の値で判断されたのか」と疑うためである。表示と契約は
+/// 同じ数でなければならない。
+fn round1(v: f64) -> f64 {
+    (v * 10.0).round() / 10.0
+}
+
+/// 比率を小数第 4 位で丸める。`commands::output::round4` と同じ桁にしてある。
+///
+/// 警告の `data` と JSON 本体（`mask.foreground_ratio` など）が別の桁で出ると、
+/// 同じ値の二つの表記をエージェントが突き合わせられない。
+fn round4(v: f64) -> f64 {
+    (v * 10_000.0).round() / 10_000.0
+}
 
 #[derive(Debug, Clone)]
 pub struct CutoutOptions {
@@ -134,7 +155,10 @@ pub struct CutoutResult {
     pub separability: Option<f64>,
     /// 境界の縁と階調の診断値
     pub diagnostics: Diagnostics,
-    pub warnings: Vec<String>,
+    /// 主体（商品）と思われる塊。切り抜きには一切使わず、報告と警告にだけ使う。
+    /// **ここで求めた bbox を自動で適用しない**理由は `subject.rs` を参照
+    pub subject: Option<SubjectHint>,
+    pub warnings: Vec<Warning>,
 }
 
 /// 実際に使う堤防のしきい値と、自動調整したことを知らせる警告を決める。
@@ -189,7 +213,7 @@ pub struct CutoutResult {
 fn resolve_edge_threshold(
     requested: Option<f64>,
     texture: &GradientQuantiles,
-) -> (f64, Option<String>) {
+) -> (f64, Option<Warning>) {
     if let Some(value) = requested {
         return (value, None);
     }
@@ -200,17 +224,30 @@ fn resolve_edge_threshold(
     if texture.p50 < DEFAULT_EDGE_THRESHOLD || raised <= DEFAULT_EDGE_THRESHOLD {
         return (DEFAULT_EDGE_THRESHOLD, None);
     }
-    let warning = format!(
-        "背景のテクスチャ（外周の勾配 p50 = {:.1} / p90 = {:.1}）が堤防を発火させるため、\
-         edge_threshold を {DEFAULT_EDGE_THRESHOLD:.0} から {raised:.1} へ調整しました。\
-         明示指定すれば従います",
-        texture.p50, texture.p90
-    );
+    let warning = Warning::new(
+        "EDGE_THRESHOLD_RAISED",
+        format!(
+            "背景のテクスチャ（外周の勾配 p50 = {:.1} / p90 = {:.1}）が堤防を発火させるため、\
+             edge_threshold を {DEFAULT_EDGE_THRESHOLD:.0} から {raised:.1} へ調整しました。\
+             明示指定すれば従います",
+            texture.p50, texture.p90
+        ),
+    )
+    .with_hint("--edge-threshold を明示すれば自動調整は割り込みません")
+    .with_data("from", DEFAULT_EDGE_THRESHOLD)
+    .with_data("to", raised)
+    // 発火の判定は p50、引き上げ幅は p90 と、別々の役目で使い分けている。
+    // 片方だけ返すとエージェントは調整の是非を自分で検算できない
+    .with_data("texture_p50", round1(texture.p50))
+    .with_data("texture_p90", round1(texture.p90));
     (raised, Some(warning))
 }
 
 pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
     let background = estimate_background(image, opts.border);
+    // 元画像から測る。アルファを適用した後の画像を渡すと、透明になった背景が
+    // 「背景色から遠い」に化けて主体が画像全体へ広がる
+    let subject = detect_subject(image, &background);
     let (edge_threshold, texture_warning) =
         resolve_edge_threshold(opts.edge_threshold, &background.texture);
 
@@ -286,6 +323,8 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
         &stats,
         separability,
         &diagnostics,
+        subject.as_ref(),
+        opts.bbox.is_some(),
     ));
 
     CutoutResult {
@@ -296,6 +335,7 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
         stats,
         separability,
         diagnostics,
+        subject,
         warnings,
     }
 }
@@ -400,37 +440,110 @@ fn apply_alpha(image: &mut RgbaImage, mask: &Mask) {
     }
 }
 
+/// 正規化 bbox を `--bbox` にそのまま貼れる文字列にする。
+///
+/// 桁を丸めない（`round4` までは JSON と揃える）。見栄えのために小数第 2 位へ
+/// 落とすと、**貼り付けた矩形が実際の主体より最大 0.5% 内側に入る**。bbox の外は
+/// 色によらず背景と確定されるため、その差がそのまま商品の欠けになる。
+/// 20MP の実写では 0.005 が 28px にあたる。
+pub fn bbox_argument(bbox: [f64; 4]) -> String {
+    let v = bbox.map(round4);
+    format!("{},{},{},{}", v[0], v[1], v[2], v[3])
+}
+
 /// AI エージェントが失敗を検出できるように、疑わしい結果へ警告を付ける。
+///
+/// どの警告も機械可読な `code` を持ち、判断に使った数値を `data` に載せる。
+/// 文言は推敲で変わるが、code と data のキーは契約として動かさない。
 fn collect_warnings(
     background: &BackgroundEstimate,
     stats: &MaskStats,
     separability: Option<f64>,
     diagnostics: &Diagnostics,
-) -> Vec<String> {
+    subject: Option<&SubjectHint>,
+    bbox_given: bool,
+) -> Vec<Warning> {
     let mut warnings = Vec::new();
 
     if !background.is_uniform() {
-        warnings.push(format!(
-            "背景の均一度が {:.2} と低く、単色背景ではない可能性があります。\
-             切り抜き結果を確認してください",
-            background.uniformity
-        ));
+        warnings.push(
+            Warning::new(
+                "LOW_UNIFORMITY",
+                format!(
+                    "背景の均一度が {:.2} と低く、単色背景ではない可能性があります",
+                    background.uniformity
+                ),
+            )
+            .with_hint("切り抜き結果を確認してください")
+            .with_data("uniformity", round4(background.uniformity)),
+        );
     }
     if stats.foreground_ratio < 0.01 {
-        warnings.push(format!(
-            "前景がほとんど検出されていません (foreground_ratio={:.4})。\
-             --tolerance を下げるか --bbox で対象を指定してください",
-            stats.foreground_ratio
-        ));
+        warnings.push(
+            Warning::new(
+                "FOREGROUND_TOO_SMALL",
+                format!(
+                    "前景がほとんど検出されていません (foreground_ratio={:.4})",
+                    stats.foreground_ratio
+                ),
+            )
+            .with_hint("--tolerance を下げるか --bbox で対象を指定してください")
+            .with_data("foreground_ratio", round4(stats.foreground_ratio)),
+        );
     } else if stats.foreground_ratio > 0.99 {
-        warnings.push(format!(
-            "背景がほとんど除去されていません (foreground_ratio={:.4})。\
-             --tolerance を上げてください",
-            stats.foreground_ratio
-        ));
+        warnings.push(
+            Warning::new(
+                "FOREGROUND_TOO_LARGE",
+                format!(
+                    "背景がほとんど除去されていません (foreground_ratio={:.4})",
+                    stats.foreground_ratio
+                ),
+            )
+            .with_hint("--tolerance を上げてください")
+            .with_data("foreground_ratio", round4(stats.foreground_ratio)),
+        );
     }
-    if stats.touches_edge {
-        warnings.push("前景が画像の外周に接しています。商品が見切れている可能性があります".into());
+    // **「外周に接している」を「見切れている」と読むのは、bbox が無く背景が
+    // 不均一なときには誤診である。** その状態で残っているのは商品ではなく、
+    // 前景として取り残された背景側であり、それが画像の端まで達しているに
+    // 過ぎない。実写（不織布の上のリモコン、fg 0.53）では商品は見切れておらず、
+    // bbox を与えれば touches_edge は false になった。
+    //
+    // 見切れは撮り直すしかないが、こちらは bbox 一つで解ける。**同じ文言で
+    // 報せると、エージェントは解ける問題を諦める。**
+    //
+    // 助言を出せるのは主体の信頼度が High のときだけ。Low で bbox を勧めると、
+    // 誤検出した矩形（キーボードでは右端の 0.4% の領域）へ誘導してしまう。
+    //
+    // **`stats.touches_edge` は外せない。** ここは「外周接触という同じ事実を、
+    // 見切れと読むか前景の失敗と読むか」の分岐であって、不均一な背景そのものへ
+    // 反応する場所ではない。`uniformity < 0.90` が言えるのは「単色背景ではない」
+    // までで、「背景側が前景として残った」の証拠は touches_edge だけが持つ。
+    // 外すと、なだらかな勾配の背景で切り抜きが完璧に決まった画像
+    // （fg 0.16 / touches_edge false / halo 0.0 / sep 76.4）にまで
+    // 「残っています」と断言し、エージェントに不要な 2 周目を回させる。
+    let misread_as_cropped = stats.touches_edge
+        && !bbox_given
+        && !background.is_uniform()
+        && subject.is_some_and(|s| s.confidence.is_high());
+    if let (true, Some(s)) = (misread_as_cropped, subject) {
+        warnings.push(
+            Warning::new(
+                "BBOX_RECOMMENDED",
+                "背景が均一でないため背景側が前景として残っています",
+            )
+            .with_hint(format!(
+                "--bbox {} --normalized を指定してください",
+                bbox_argument(s.normalized_bbox)
+            ))
+            .with_data("normalized_bbox", s.normalized_bbox.map(round4).to_vec())
+            .with_data("foreground_ratio", round4(stats.foreground_ratio)),
+        );
+    } else if stats.touches_edge {
+        warnings.push(Warning::new(
+            "SUBJECT_TOUCHES_EDGE",
+            "前景が画像の外周に接しています。商品が見切れている可能性があります",
+        ));
     }
 
     // 縁の残りは separability では検出できない。あちらは境界の内側を測るため、
@@ -439,11 +552,27 @@ fn collect_warnings(
     // 納品先の背景が分からない以上、書き出しの時点で知らせる必要がある
     if let Some(halo) = diagnostics.halo_ratio {
         if halo > diagnostics::HALO_WARN {
-            warnings.push(format!(
-                "境界の {:.0}% が背景色のまま不透明で残っています (halo_ratio={halo:.2})。\
-                 白以外の下地に載せると輪郭が光ります",
-                halo * 100.0,
-            ));
+            warnings.push(
+                Warning::new(
+                    "HALO_REMAINS",
+                    format!(
+                        "境界の {:.0}% が背景色のまま不透明で残っています (halo_ratio={halo:.2})。\
+                         白以外の下地に載せると輪郭が光ります",
+                        halo * 100.0,
+                    ),
+                )
+                // **bbox が正しく決まった後の最後の一歩がここだった。** 矩形を
+                // 与えても tolerance が既定のままだと縁が残るのに、この警告は
+                // 「残っている」としか言わず、次の一手を勘に頼らせていた。
+                // 残るのは「背景色に近いが tolerance の内側に入らなかった」画素
+                // なので、上げれば減る。実写（不織布の上のリモコン、bbox 指定済み）
+                // では 12 → 60 で halo 16.3% → 0.1% になった。
+                //
+                // 上げすぎれば商品を食うため、値そのものは示さない。倍率を
+                // 一つ書くと、素材によらずそれが正解であるかのように読まれる
+                .with_hint("--tolerance を上げると背景の残りが減ります")
+                .with_data("halo_ratio", round4(halo)),
+            );
         }
     }
 
@@ -460,11 +589,19 @@ fn collect_warnings(
     if let Some(sep) = separability {
         let spread = background.delta_e.p50;
         if cut_happened && sep < spread {
-            warnings.push(format!(
-                "商品と背景の色差 (ΔE {sep:.1}) が背景自身のばらつき (ΔE {spread:.1}) を\
-                 下回っています。背景を消せる tolerance では商品も消えるため、\
-                 パラメータ調整では改善しません"
-            ));
+            warnings.push(
+                Warning::new(
+                    "NOT_SEPARABLE",
+                    format!(
+                        "商品と背景の色差 (ΔE {sep:.1}) が背景自身のばらつき (ΔE {spread:.1}) を\
+                         下回っています。背景を消せる tolerance では商品も消えるため、\
+                         パラメータ調整では改善しません"
+                    ),
+                )
+                .with_hint("パラメータ調整では解決しません。単色背景で撮り直してください")
+                .with_data("separability", round1(sep))
+                .with_data("perimeter_delta_e_p50", round1(spread)),
+            );
         }
     }
 
@@ -519,10 +656,9 @@ mod tests {
         }
     }
 
-    fn hopeless(warnings: &[String]) -> bool {
-        warnings
-            .iter()
-            .any(|w| w.contains("パラメータ調整では改善しません"))
+    /// code で拾う。文言は推敲で変わるが、code は契約なので動かない
+    fn hopeless(warnings: &[Warning]) -> bool {
+        warnings.iter().any(|w| w.code == "NOT_SEPARABLE")
     }
 
     #[test]
@@ -642,11 +778,15 @@ mod tests {
         let (value, warning) = resolve_edge_threshold(None, &texture(27.9));
         assert_eq!(value, 41.8, "p90 の 1.5 倍（小数第1位まで）になっていない");
         let warning = warning.expect("黙って設定を変えてはいけない");
-        assert!(warning.contains("テクスチャ"), "{warning}");
-        assert!(warning.contains("27.9"), "根拠の数値が無い: {warning}");
-        assert!(
-            warning.contains("41.8"),
-            "警告と実際に効く値が食い違っている: {warning}"
+        assert_eq!(warning.code, "EDGE_THRESHOLD_RAISED");
+        assert!(warning.message.contains("テクスチャ"), "{warning:?}");
+        // 根拠は文面だけでなく data にも載せる。エージェントが message を
+        // 正規表現で削らずに検算できることが、構造化した理由そのものである
+        assert_eq!(warning.data["texture_p90"], 27.9);
+        assert_eq!(warning.data["from"], 8.0);
+        assert_eq!(
+            warning.data["to"], 41.8,
+            "警告と実際に効く値が食い違っている: {warning:?}"
         );
     }
 
@@ -660,10 +800,193 @@ mod tests {
         }
     }
 
+    fn subject(confidence: Confidence) -> SubjectHint {
+        SubjectHint {
+            bbox: [0, 1999, 4198, 3827],
+            normalized_bbox: [0.0, 0.354, 0.9834, 0.662],
+            area_ratio: 0.2342,
+            capture_ratio: 0.9793,
+            delta_e: 49.6,
+            leftover_ratio: 0.0531,
+            touches_edge: true,
+            confidence,
+        }
+    }
+
+    fn edge_stats() -> MaskStats {
+        MaskStats {
+            foreground_ratio: 0.53,
+            bbox: Some((0, 0, 100, 100)),
+            touches_edge: true,
+        }
+    }
+
+    fn codes(warnings: &[Warning]) -> Vec<&str> {
+        warnings.iter().map(|w| w.code).collect()
+    }
+
+    /// bbox 未指定 + 不均一な背景で外周に接しているのは、**見切れではなく
+    /// 前景の失敗**である。実写（不織布の上のリモコン）では bbox を与えれば
+    /// touches_edge が false になり、商品は見切れていなかった。
+    ///
+    /// **対の実験を必ず添える。** 「BBOX_RECOMMENDED が出ること」だけを固定すると、
+    /// SUBJECT_TOUCHES_EDGE の仕組みが死んでもテストは通り続ける。
+    #[test]
+    fn a_non_uniform_background_without_a_bbox_recommends_one_instead_of_crying_crop() {
+        let warnings = collect_warnings(
+            &estimate(0.20, 11.9),
+            &edge_stats(),
+            Some(60.0),
+            &clean(),
+            Some(&subject(Confidence::High)),
+            false,
+        );
+        let codes = codes(&warnings);
+        assert!(codes.contains(&"BBOX_RECOMMENDED"), "{codes:?}");
+        assert!(
+            !codes.contains(&"SUBJECT_TOUCHES_EDGE"),
+            "誤診が残っている: {codes:?}"
+        );
+
+        // hint はそのまま実行できる形でなければ、助言として役に立たない
+        let w = warnings
+            .iter()
+            .find(|w| w.code == "BBOX_RECOMMENDED")
+            .unwrap();
+        let hint = w.hint.as_deref().unwrap();
+        assert!(hint.contains("--bbox 0,0.354,0.9834,0.662"), "{hint}");
+        assert!(hint.contains("--normalized"), "{hint}");
+        assert_eq!(w.data["normalized_bbox"][1], 0.354);
+        assert_eq!(w.data["foreground_ratio"], 0.53);
+    }
+
+    /// 縁が残っているなら、次の一手まで言う。
+    ///
+    /// **bbox が正しく決まった後の最後の一歩がここだった。** 実写では
+    /// `info` → `cutout --bbox` まで来ても tolerance が既定（12）だと
+    /// halo が 16.3% 残り、そこから先は勘に頼るしかなかった。
+    /// 「何が起きたか」だけ言って「次に何をするか」を言わない警告は、
+    /// エージェントにとって行き止まりと変わらない。
+    #[test]
+    fn a_remaining_rim_says_which_knob_to_turn() {
+        let warnings = collect_warnings(
+            &estimate(0.20, 11.9),
+            &stats(),
+            Some(60.0),
+            &Diagnostics {
+                halo_ratio: Some(0.1627),
+                edge_width: Some(3.0),
+            },
+            None,
+            true,
+        );
+        let w = warnings
+            .iter()
+            .find(|w| w.code == "HALO_REMAINS")
+            .unwrap_or_else(|| panic!("{warnings:?}"));
+        let hint = w.hint.as_deref().expect("次の一手が無い");
+        assert!(hint.contains("--tolerance"), "{hint}");
+        assert_eq!(w.data["halo_ratio"], 0.1627);
+    }
+
+    /// 対照その 0：外周に接していないなら、何も残っていない。
+    ///
+    /// **`BBOX_RECOMMENDED` は「外周接触をどう読むか」の分岐であって、不均一な
+    /// 背景そのものへ反応する警告ではない。** なだらかな勾配の背景でも切り抜きが
+    /// 完璧に決まることはある（合成シーン ramp: fg 0.16 / touches_edge false /
+    /// halo 0.0 / sep 76.4）。そこで「背景側が前景として残っています」と断言すると、
+    /// エージェントは直すものが無いまま 2 周目を回す。
+    ///
+    /// 上の 3 本はいずれも `touches_edge: true` の stats を使っており、
+    /// **この抜けを検出できない。**
+    #[test]
+    fn a_clean_cut_on_a_non_uniform_background_is_left_alone() {
+        let clean_cut = MaskStats {
+            foreground_ratio: 0.16,
+            bbox: Some((180, 180, 419, 419)),
+            touches_edge: false,
+        };
+        let warnings = collect_warnings(
+            &estimate(0.24, 10.2),
+            &clean_cut,
+            Some(76.4),
+            &clean(),
+            Some(&subject(Confidence::High)),
+            false,
+        );
+        let codes = codes(&warnings);
+        assert!(
+            !codes.contains(&"BBOX_RECOMMENDED"),
+            "何も残っていないのに残っていると言っている: {codes:?}"
+        );
+        assert!(!codes.contains(&"SUBJECT_TOUCHES_EDGE"), "{codes:?}");
+    }
+
+    /// 対照その 1：bbox を与えたうえで外周に接しているなら、本当に見切れている。
+    #[test]
+    fn a_product_cropped_by_the_frame_is_still_reported_as_such() {
+        let warnings = collect_warnings(
+            &estimate(0.20, 11.9),
+            &edge_stats(),
+            Some(60.0),
+            &clean(),
+            Some(&subject(Confidence::High)),
+            true,
+        );
+        let codes = codes(&warnings);
+        assert!(codes.contains(&"SUBJECT_TOUCHES_EDGE"), "{codes:?}");
+        assert!(
+            !codes.contains(&"BBOX_RECOMMENDED"),
+            "bbox は既に指定されている: {codes:?}"
+        );
+    }
+
+    /// 対照その 2：均一な背景で外周に接しているのは、正真正銘の見切れである。
+    #[test]
+    fn a_uniform_background_touching_the_edge_is_a_real_crop() {
+        let warnings = collect_warnings(
+            &estimate(1.0, 0.5),
+            &edge_stats(),
+            Some(60.0),
+            &clean(),
+            Some(&subject(Confidence::High)),
+            false,
+        );
+        let codes = codes(&warnings);
+        assert!(codes.contains(&"SUBJECT_TOUCHES_EDGE"), "{codes:?}");
+        assert!(!codes.contains(&"BBOX_RECOMMENDED"), "{codes:?}");
+    }
+
+    /// 対照その 3：主体を特定できていないなら bbox を勧めない。
+    ///
+    /// 信頼度 Low で矩形を渡すと、実写のキーボードのように「キーボードですらない
+    /// 右端の 0.4%」へ誘導してしまう。**誤った助言は助言が無いより悪い。**
+    #[test]
+    fn a_low_confidence_subject_never_produces_a_bbox_hint() {
+        let warnings = collect_warnings(
+            &estimate(0.16, 21.6),
+            &edge_stats(),
+            Some(60.0),
+            &clean(),
+            Some(&subject(Confidence::Low)),
+            false,
+        );
+        let codes = codes(&warnings);
+        assert!(!codes.contains(&"BBOX_RECOMMENDED"), "{codes:?}");
+        assert!(codes.contains(&"SUBJECT_TOUCHES_EDGE"), "{codes:?}");
+    }
+
     #[test]
     fn a_hopeless_image_is_called_out() {
         // 実写のキーボードがこれ。商品が、背景が背景自身と違う量より背景に近い
-        let warnings = collect_warnings(&estimate(0.16, 20.0), &stats(), Some(12.1), &clean());
+        let warnings = collect_warnings(
+            &estimate(0.16, 20.0),
+            &stats(),
+            Some(12.1),
+            &clean(),
+            None,
+            false,
+        );
         assert!(
             hopeless(&warnings),
             "色差がばらつきを下回るなら警告する: {warnings:?}"
@@ -680,7 +1003,14 @@ mod tests {
             bbox: Some((0, 0, 10, 10)),
             touches_edge: true,
         };
-        let warnings = collect_warnings(&estimate(0.21, 11.9), &stats, Some(11.5), &clean());
+        let warnings = collect_warnings(
+            &estimate(0.21, 11.9),
+            &stats,
+            Some(11.5),
+            &clean(),
+            None,
+            false,
+        );
         assert!(
             !hopeless(&warnings),
             "切り抜きが成立していない段階で断定してはいけない: {warnings:?}"
@@ -691,7 +1021,14 @@ mod tests {
     fn a_white_product_on_a_uniform_white_background_is_not_called_out() {
         // README の看板ケース。均一な背景では輪郭検出で正しく解けるため、
         // 境界の色差が小さくても失敗ではない
-        let warnings = collect_warnings(&estimate(1.0, 0.8), &stats(), Some(3.0), &clean());
+        let warnings = collect_warnings(
+            &estimate(1.0, 0.8),
+            &stats(),
+            Some(3.0),
+            &clean(),
+            None,
+            false,
+        );
         assert!(
             !hopeless(&warnings),
             "均一背景では警告してはいけない: {warnings:?}"
@@ -701,7 +1038,14 @@ mod tests {
     #[test]
     fn a_patchy_background_with_a_distinct_product_is_not_called_out() {
         // 背景が汚れていても商品がはっきり違うなら、tolerance を上げれば解ける
-        let warnings = collect_warnings(&estimate(0.5, 15.0), &stats(), Some(60.0), &clean());
+        let warnings = collect_warnings(
+            &estimate(0.5, 15.0),
+            &stats(),
+            Some(60.0),
+            &clean(),
+            None,
+            false,
+        );
         assert!(
             !hopeless(&warnings),
             "色差が十分ならばらつきがあっても警告しない: {warnings:?}"

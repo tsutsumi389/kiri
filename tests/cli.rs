@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 use common::{
-    ProductSpec, product_image, transparent_product, woven_background_image, write_jpeg, write_png,
+    ProductSpec, bleeding_product_scene, product_image, shadow_band_scene, split_background_scene,
+    transparent_product, woven_background_image, woven_poisoned_scene, write_jpeg, write_png,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -27,6 +28,28 @@ fn json_stdout(output: &std::process::Output) -> Value {
 
 fn fixture_dir() -> TempDir {
     TempDir::new().unwrap()
+}
+
+/// 警告に指定の `code` が含まれるか。
+///
+/// 文言ではなく code で照合する。`warnings` は機械可読な契約であり、
+/// テストが散文を掴んでいると、推敲のたびに壊れる（そして推敲を諦めさせる）。
+fn has_warning(v: &Value, code: &str) -> bool {
+    warning_codes(v).iter().any(|c| c == code)
+}
+
+fn warning_codes(v: &Value) -> Vec<String> {
+    v["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("warnings が配列ではない: {v}"))
+        .iter()
+        .map(|w| {
+            w["code"]
+                .as_str()
+                .unwrap_or_else(|| panic!("警告に code がない: {w}"))
+                .to_string()
+        })
+        .collect()
 }
 
 // --- info ---
@@ -102,7 +125,294 @@ fn info_warns_when_the_background_is_not_uniform() {
     assert!(v["background"]["uniformity"].as_f64().unwrap() < 0.9);
     let warnings = v["warnings"].as_array().unwrap();
     assert!(!warnings.is_empty(), "均一度が低いのに警告が出ていない");
-    assert!(warnings[0].as_str().unwrap().contains("均一度"));
+    assert!(has_warning(&v, "LOW_UNIFORMITY"), "{warnings:?}");
+    // 判断に使った数値も返す。エージェントが message をパースせずに検算できる
+    assert!(warnings[0]["data"]["uniformity"].as_f64().unwrap() < 0.9);
+}
+
+/// 警告は機械可読でなければならない。
+///
+/// `error.rs` は当初から `code` を持たせているのに、警告だけが日本語の散文だった。
+/// エージェントは文字列マッチで分岐するしかなく、文言を推敲するたびに壊れる。
+/// **同じ道具の中で契約の形が違うほうが不自然である。**
+#[test]
+fn every_warning_carries_a_machine_readable_code() {
+    let dir = fixture_dir();
+    // 左半分だけ暗い背景。均一度が下がり、必ず 1 件以上の警告が出る
+    let mut img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        ..Default::default()
+    });
+    for y in 0..120 {
+        for x in 0..60 {
+            img.put_pixel(x, y, image::Rgba([20, 20, 22, 255]));
+        }
+    }
+    let input = write_png(dir.path(), "split.png", &img);
+    let output = dir.path().join("cut.png");
+
+    let runs: Vec<Vec<String>> = vec![
+        vec![
+            "info".into(),
+            input.to_str().unwrap().into(),
+            "--json".into(),
+        ],
+        vec![
+            "cutout".into(),
+            input.to_str().unwrap().into(),
+            "-o".into(),
+            output.to_str().unwrap().into(),
+            "--json".into(),
+        ],
+    ];
+
+    for args in runs {
+        let out = kiri().args(&args).output().unwrap();
+        let v = json_stdout(&out);
+        let warnings = v["warnings"].as_array().unwrap();
+        assert!(!warnings.is_empty(), "{args:?} で警告が出ていない");
+
+        for w in warnings {
+            let obj = w
+                .as_object()
+                .unwrap_or_else(|| panic!("{args:?}: 警告が文字列のまま: {w}"));
+            let code = obj["code"].as_str().unwrap();
+            assert!(
+                code.chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
+                "code は SCREAMING_SNAKE_CASE であるべき: {code}"
+            );
+            assert!(!obj["message"].as_str().unwrap().is_empty(), "{w}");
+            // 空の hint / data はキーごと消える。null を出すと
+            // 「中身の無い手がかりがある」と読まれる
+            assert!(
+                obj.get("hint").map(|h| h.is_string()).unwrap_or(true),
+                "{w}"
+            );
+            assert!(
+                obj.get("data").map(|d| d.is_object()).unwrap_or(true),
+                "{w}"
+            );
+        }
+    }
+}
+
+/// `subject` は `info` と `cutout` の両方に、検出できなくても必ず出る。
+///
+/// `separability` / `halo_ratio` と同じ規約。キーごと消すと「主体が無い」と
+/// 「このコマンドは報告しない」を区別できず、エージェントは分岐を書けない。
+#[test]
+fn the_subject_key_is_always_present_in_both_commands() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("cut.png");
+
+    let runs: Vec<Vec<String>> = vec![
+        vec![
+            "info".into(),
+            input.to_str().unwrap().into(),
+            "--json".into(),
+        ],
+        vec![
+            "cutout".into(),
+            input.to_str().unwrap().into(),
+            "-o".into(),
+            output.to_str().unwrap().into(),
+            "--json".into(),
+        ],
+    ];
+
+    for args in runs {
+        let out = kiri().args(&args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let v = json_stdout(&out);
+        let subject = v
+            .get("subject")
+            .unwrap_or_else(|| panic!("{args:?} に subject キーが無い: {v}"));
+        // 合成の商品画像なので検出できるはず。ここが null なら仕組みが死んでいる
+        let s = subject
+            .as_object()
+            .unwrap_or_else(|| panic!("{args:?}: 主体を見つけられていない: {subject}"));
+        assert_eq!(s["confidence"], "high", "{subject}");
+
+        // そのまま --bbox --normalized へ渡せる形であること
+        let bbox = s["normalized_bbox"].as_array().unwrap();
+        assert_eq!(bbox.len(), 4);
+        for c in bbox {
+            let c = c.as_f64().unwrap();
+            assert!((0.0..=1.0).contains(&c), "正規化されていない: {c}");
+        }
+        assert!(bbox[0].as_f64().unwrap() < bbox[2].as_f64().unwrap());
+        assert!(bbox[1].as_f64().unwrap() < bbox[3].as_f64().unwrap());
+    }
+}
+
+/// テキストの「主体候補」行と hint は、同じ矩形を同じ丸めで出す。
+///
+/// **貼り付け可能と謳う行が、貼り付けたときに違う結果になってはいけない。**
+/// 見栄えのために小数第 2 位へ落とすと、`bbox_argument` 自身のコメントどおり
+/// 20MP で 28px 内側に入る。bbox の外は色によらず背景と確定されるので、
+/// その差はそのまま商品の欠けになる。
+#[test]
+fn the_subject_line_and_the_hint_round_the_box_the_same_way() {
+    let dir = fixture_dir();
+    let input = write_png(dir.path(), "split.png", &split_background_scene(300, 300));
+
+    let v = json_stdout(
+        &kiri()
+            .args(["info", input.to_str().unwrap(), "--json"])
+            .output()
+            .unwrap(),
+    );
+    let expected = v["subject"]["normalized_bbox"]
+        .as_array()
+        .unwrap_or_else(|| panic!("主体が見つかっていない: {v}"))
+        .iter()
+        .map(|c| c.as_f64().unwrap().to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    // hint 側（既に `bbox_argument` を使っている）
+    let hint = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "LOW_UNIFORMITY")
+        .unwrap_or_else(|| panic!("{v}"))["hint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // **この行が先に要る。** hint に `--bbox` が載るのは信頼度が high のときだけで、
+    // 主体の規則を触ると、丸めとは無関係な理由でこのテストが落ちる。
+    // 「丸めが違う」という失敗文言のまま、原因が別の場所にある状態を避ける
+    assert!(
+        hint.contains("--bbox"),
+        "主体が high でなくなっている。丸めではなく主体の判定を疑うこと: {hint}\n{v}"
+    );
+    assert!(
+        hint.contains(&format!("--bbox {expected} ")),
+        "hint が JSON と違う丸めで出ている: {hint}"
+    );
+
+    // テキスト出力側
+    let out = kiri()
+        .args(["info", input.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        text.contains(&format!("主体候補  {expected}  ")),
+        "テキストが JSON と違う丸めで出ている: 期待 {expected}\n---\n{text}"
+    );
+}
+
+/// 主体を検出できなければ `null` を返す。0 や空配列で埋めない。
+#[test]
+fn a_background_only_image_reports_a_null_subject() {
+    let dir = fixture_dir();
+    let img = image::RgbaImage::from_pixel(120, 120, image::Rgba([250, 250, 248, 255]));
+    let input = write_png(dir.path(), "empty.png", &img);
+
+    let out = kiri()
+        .args(["info", input.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let v = json_stdout(&out);
+    assert!(
+        v["subject"].is_null(),
+        "主体が無いなら null: {}",
+        v["subject"]
+    );
+}
+
+/// 主体の検出が切り抜き本体へ影響していないこと。
+///
+/// `subject` は報告と警告のためだけの情報で、マスクの生成には一切関与しない。
+/// **ここが崩れると「診断を足したら結果が変わった」という最悪の壊れ方をする。**
+///
+/// 同じバイナリを二度走らせて比べるだけでは足りない。**主体検出が本体へ副作用を
+/// 持ち込めば、二度とも同じように壊れて通り続ける。** 二度走らせるのは決定性の
+/// 検査であって、副作用が無いことの検査ではない。だから期待値を数値で固定する。
+///
+/// 数値は `product_image(200x200, 既定)` の実測。ここが動いたら、切り抜きの
+/// 挙動そのものが変わったということなので、**期待値を書き換える前に何が
+/// 変わったのかを説明できること。**
+#[test]
+fn detecting_the_subject_does_not_change_the_cutout() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let run = |name: &str| -> (Vec<u8>, Value) {
+        let output = dir.path().join(name);
+        let out = kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        (std::fs::read(&output).unwrap(), json_stdout(&out))
+    };
+    let (a, va) = run("a.png");
+    let (b, vb) = run("b.png");
+    assert_eq!(a, b, "同じ入力で出力が揺れている");
+    assert_eq!(va["mask"], vb["mask"]);
+
+    let mask = &va["mask"];
+    assert_eq!(
+        mask["bbox"],
+        serde_json::json!([44, 32, 155, 167]),
+        "{mask}"
+    );
+    assert_eq!(mask["touches_edge"], false, "{mask}");
+    // 比率と色差は浮動小数のまま比べる。値が動いたら切り抜きが変わっている
+    assert_eq!(mask["foreground_ratio"].as_f64().unwrap(), 0.3753, "{mask}");
+    assert_eq!(mask["separability"].as_f64().unwrap(), 77.6231, "{mask}");
+    assert_eq!(mask["halo_ratio"].as_f64().unwrap(), 0.0, "{mask}");
+}
+
+/// 均一な背景では `LOW_UNIFORMITY` を出さない。偽陽性の回帰防止。
+///
+/// 警告が常に出る道具は、警告が無いのと同じである。
+#[test]
+fn a_uniform_background_produces_no_uniformity_warning() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 160,
+        height: 160,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "studio.png", &img);
+
+    let out = kiri()
+        .args(["info", input.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let v = json_stdout(&out);
+    assert!(
+        !has_warning(&v, "LOW_UNIFORMITY"),
+        "単色背景で誤警告している: {:?}",
+        warning_codes(&v)
+    );
 }
 
 #[test]
@@ -368,12 +678,10 @@ fn converting_transparency_to_jpeg_warns_about_compositing() {
 
     assert!(out.status.success());
     let v = json_stdout(&out);
-    let warnings = v["warnings"].as_array().unwrap();
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.as_str().unwrap().contains("透過を保持できない")),
-        "透過が失われる旨の警告がない: {warnings:?}"
+        has_warning(&v, "ALPHA_FLATTENED"),
+        "透過が失われる旨の警告がない: {:?}",
+        warning_codes(&v)
     );
 }
 
@@ -792,12 +1100,10 @@ fn resize_upscales_with_an_explicit_flag_and_warns() {
     assert!(out.status.success());
     let v = json_stdout(&out);
     assert_eq!(v["outputs"][0]["width"], 400);
-    let warnings = v["warnings"].as_array().unwrap();
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.as_str().unwrap().contains("拡大しました")),
-        "拡大した旨の警告がない: {warnings:?}"
+        has_warning(&v, "UPSCALED"),
+        "拡大した旨の警告がない: {:?}",
+        warning_codes(&v)
     );
 }
 
@@ -1142,13 +1448,7 @@ fn a_woven_background_raises_the_dam_and_the_report_says_so() {
         );
         json_stdout(&out)
     };
-    let adjusted = |v: &Value| -> bool {
-        v["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|w| w.as_str().unwrap().contains("テクスチャ"))
-    };
+    let adjusted = |v: &Value| -> bool { has_warning(v, "EDGE_THRESHOLD_RAISED") };
 
     let auto = run("auto", &[]);
     // 商品は画像の 1/4 〜 3/4 を占めるので、前景比率は 0.25 前後になるはず
@@ -1391,13 +1691,188 @@ fn cutout_warns_when_almost_nothing_is_removed() {
 
     assert!(out.status.success());
     let v = json_stdout(&out);
-    let warnings = v["warnings"].as_array().unwrap();
     assert!(
-        warnings.iter().any(|w| w
-            .as_str()
-            .unwrap()
-            .contains("背景がほとんど除去されていません")),
-        "失敗が検出できていない: {warnings:?}"
+        has_warning(&v, "FOREGROUND_TOO_LARGE"),
+        "失敗が検出できていない: {:?}",
+        warning_codes(&v)
+    );
+}
+
+/// 商品が画面外へ抜けて外周を汚染したら、主体の数値を信用してはいけない。
+///
+/// **縮小が走る 600px で回すこと。** 主体は長辺 250px へ縮小してから測るので、
+/// 200px の画像ではこの経路を踏まず、下の `cutout_flags_a_product_running_off_the_frame`
+/// では検出できない。縮小が入ると、閾値から追い出された商品の輪郭に
+/// Lanczos3 のリンギングが 1px の帯として残り、それが `far` のほぼ全部になる。
+/// `capture_ratio` が 1.0 近くへ張り付き、**誤検出を弾くはずの捕捉率が誤検出を
+/// 後押しする向きに反転する。**
+///
+/// 返る矩形は画面の 3 分の 1 を占める物体を完全に外している。従えばそれが
+/// 丸ごと消える。**誤った助言は助言が無いより悪い。**
+#[test]
+fn a_frame_filling_object_never_earns_high_confidence() {
+    let dir = fixture_dir();
+    let input = write_png(dir.path(), "bleed.png", &bleeding_product_scene(600, 600));
+    let output = dir.path().join("cut.png");
+
+    let out = kiri()
+        .args(["info", input.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let v = json_stdout(&out);
+
+    // 前提：面積も捕捉率もこの構図を通してしまう。**弾けるのは
+    // 「矩形の外に何が残ったか」だけである**
+    let s = &v["subject"];
+    assert!(
+        s["capture_ratio"].as_f64().unwrap() > 0.70,
+        "前提が崩れている: {s}"
+    );
+    assert!(
+        s["leftover_ratio"].as_f64().unwrap() >= 0.15,
+        "矩形の外に残った塊を見落としている: {s}"
+    );
+
+    // 数値は返してよい。信用してよいかだけが問題である。
+    // **`assert_ne!` では `subject` が null でも通ってしまう**ので、
+    // 「low が出ている」ことを直接押さえる
+    assert_eq!(
+        s["confidence"], "low",
+        "主体を取りこぼした矩形を信用している: {s}"
+    );
+
+    // 信頼度が high でない以上、bbox を勧めてはならない
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v = json_stdout(&out);
+    assert!(
+        !has_warning(&v, "BBOX_RECOMMENDED"),
+        "誤った矩形へ誘導している: {:?}",
+        warning_codes(&v)
+    );
+}
+
+/// **同じ汚染構図を、リポジトリ自身の織り目テクスチャの上で固定する。**
+///
+/// 外周統計から汚染を当てる規則は、無地の背景でしか成立しなかった。織り目が
+/// あるだけで外周 ΔE の p50 が 6.3 まで上がり、判定は素通しして、画面の 35% を
+/// 占める物体を丸ごと外した矩形を `confidence: high` で勧めた。
+/// **上の無地版だけを押さえていても、この穴は開いたままになる。**
+#[test]
+fn the_same_poison_on_the_repositorys_own_texture_is_caught_too() {
+    let dir = fixture_dir();
+    let input = write_png(dir.path(), "woven.png", &woven_poisoned_scene(600, 600));
+    let output = dir.path().join("cut.png");
+
+    let v = json_stdout(
+        &kiri()
+            .args(["info", input.to_str().unwrap(), "--json"])
+            .output()
+            .unwrap(),
+    );
+
+    // 前提：**旧規則の指紋（p50 < 5）が出ない。** 織り目そのものが p50 を押し上げる
+    let d = &v["background"]["perimeter_delta_e"];
+    assert!(
+        d["p50"].as_f64().unwrap() > 5.0,
+        "織り目が効いていない。この回帰テストの意味が失われている: {d}"
+    );
+    // 前提：面積も捕捉率も通ってしまう
+    let s = &v["subject"];
+    assert!(
+        s["area_ratio"].as_f64().unwrap() > 0.05 && s["capture_ratio"].as_f64().unwrap() > 0.70,
+        "前提が崩れている: {s}"
+    );
+
+    assert_eq!(
+        s["confidence"], "low",
+        "織り目の上では汚染を見逃している: {s}"
+    );
+
+    let v = json_stdout(
+        &kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        !has_warning(&v, "BBOX_RECOMMENDED"),
+        "誤った矩形へ誘導している: {:?}",
+        warning_codes(&v)
+    );
+}
+
+/// 対照：外周に帯が掛かっていても、主体を捉えられていれば `high` のまま。
+///
+/// **上の 2 本と対で意味を持つ。** 疑わしきを片端から Low に落とせば汚染の
+/// テストは通り続けるが、機能そのものが死ぬ。旧規則はまさにこれを踏んで、
+/// 主体を完璧に検出（area 14.1% / capture 98.1%）している画像を Low へ落とし、
+/// `cutout` の警告を `SUBJECT_TOUCHES_EDGE`——C-1 で誤診として潰したもの——へ
+/// 戻していた。
+#[test]
+fn a_band_on_the_edge_does_not_cost_the_subject_its_confidence() {
+    let dir = fixture_dir();
+    let input = write_png(dir.path(), "band.png", &shadow_band_scene(800, 800, 200));
+    let output = dir.path().join("cut.png");
+
+    let v = json_stdout(
+        &kiri()
+            .args(["info", input.to_str().unwrap(), "--json"])
+            .output()
+            .unwrap(),
+    );
+    let s = &v["subject"];
+    // 前提：帯は外周 ΔE を跳ね上げている（旧規則ならここで Low に落ちた）
+    let d = &v["background"]["perimeter_delta_e"];
+    assert!(
+        d["p90"].as_f64().unwrap() > 15.0,
+        "帯が効いていない。対照の意味が失われている: {d}"
+    );
+    assert_eq!(s["confidence"], "high", "帯を汚染と読んでいる: {s}");
+    assert!(
+        s["leftover_ratio"].as_f64().unwrap() < 0.15,
+        "帯だけが残っているはず: {s}"
+    );
+
+    // **`SUBJECT_TOUCHES_EDGE` へ戻っていないこと。** 商品は中央にあり、
+    // 見切れてはいない
+    let v = json_stdout(
+        &kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(v["mask"]["touches_edge"], true, "前提が崩れている: {v}");
+    assert!(
+        !has_warning(&v, "SUBJECT_TOUCHES_EDGE"),
+        "見切れの誤診が復活している: {:?}",
+        warning_codes(&v)
+    );
+    assert!(
+        has_warning(&v, "BBOX_RECOMMENDED"),
+        "解ける画像で助言が出ていない: {:?}",
+        warning_codes(&v)
     );
 }
 
@@ -1429,11 +1904,109 @@ fn cutout_flags_a_product_running_off_the_frame() {
     assert!(out.status.success());
     let v = json_stdout(&out);
     assert_eq!(v["mask"]["touches_edge"], true);
-    let warnings = v["warnings"].as_array().unwrap();
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.as_str().unwrap().contains("見切れ"))
+        has_warning(&v, "SUBJECT_TOUCHES_EDGE"),
+        "{:?}",
+        warning_codes(&v)
+    );
+    // 対照。均一な背景での外周接触は正真正銘の見切れなので、bbox を勧めては
+    // ならない（bbox は見切れを直さない）。
+    // `a_non_uniform_background_recommends_a_bbox_instead_of_crying_crop` と対
+    assert!(
+        !has_warning(&v, "BBOX_RECOMMENDED"),
+        "見切れに bbox を勧めている: {:?}",
+        warning_codes(&v)
+    );
+}
+
+/// **「外周に接している」を「見切れている」と読むのは、bbox が無く背景が
+/// 不均一なときには誤診である。**
+///
+/// その状態で外周に接しているのは商品ではなく、前景として取り残された背景側で
+/// ある。実写（不織布の上のリモコン）では bbox を与えれば `touches_edge` が
+/// false になり、商品は見切れていなかった。見切れは撮り直すしかないが、
+/// こちらは bbox 一つで解ける。同じ文言で報せると、エージェントは解ける問題を
+/// 諦めてしまう。
+///
+/// **対照として `cutout_flags_a_product_running_off_the_frame`（均一背景で
+/// 本当に見切れているシーン）を必ず併せて見ること。** 片側だけを固定すると、
+/// 仕組みが死んで全件が同じ警告になっても、どちらか一方は通り続ける。
+#[test]
+fn a_non_uniform_background_recommends_a_bbox_instead_of_crying_crop() {
+    let dir = fixture_dir();
+    let input = write_png(dir.path(), "split.png", &split_background_scene(300, 300));
+    let output = dir.path().join("cut.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v = json_stdout(&out);
+
+    // 前提：背景が不均一で、背景側が前景として残り、それが端に達している
+    assert!(v["background"]["uniformity"].as_f64().unwrap() < 0.9, "{v}");
+    assert_eq!(v["mask"]["touches_edge"], true, "前提が崩れている: {v}");
+
+    let codes = warning_codes(&v);
+    assert!(codes.contains(&"BBOX_RECOMMENDED".to_string()), "{codes:?}");
+    assert!(
+        !codes.contains(&"SUBJECT_TOUCHES_EDGE".to_string()),
+        "誤診が残っている: {codes:?}"
+    );
+
+    // 勧めた bbox がそのまま実行でき、しかも効くこと。**実行できない助言は
+    // 助言ではない。** hint の文字列をそのまま引数へ割って渡す
+    let hint = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "BBOX_RECOMMENDED")
+        .unwrap()["hint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let bbox = hint
+        .split_whitespace()
+        .nth(1)
+        .expect("hint が --bbox <値> の形になっていない");
+
+    let fixed = dir.path().join("fixed.png");
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            fixed.to_str().unwrap(),
+            "--bbox",
+            bbox,
+            "--normalized",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "勧めた bbox が通らない: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let fixed = json_stdout(&out);
+    let before = v["mask"]["foreground_ratio"].as_f64().unwrap();
+    let after = fixed["mask"]["foreground_ratio"].as_f64().unwrap();
+    assert!(
+        after < before / 2.0,
+        "勧めた bbox が効いていない: {before} -> {after}"
+    );
+    assert!(
+        !warning_codes(&fixed).contains(&"BBOX_RECOMMENDED".to_string()),
+        "bbox を指定したのに勧め続けている: {:?}",
+        warning_codes(&fixed)
     );
 }
 
@@ -1492,11 +2065,9 @@ fn cutout_to_jpeg_composites_onto_the_given_background() {
     let v = json_stdout(&out);
     assert_eq!(v["outputs"][0]["format"], "jpeg");
     assert!(
-        v["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|w| w.as_str().unwrap().contains("透過を保持できない"))
+        has_warning(&v, "ALPHA_FLATTENED"),
+        "{:?}",
+        warning_codes(&v)
     );
 }
 
@@ -1771,12 +2342,9 @@ fn scaling_up_onto_a_canvas_is_reported_and_warned() {
     let scale = v["canvas"]["scale"].as_f64().unwrap();
     assert!(scale > 1.0, "拡大しているのに倍率が 1 以下: {scale}");
     assert!(
-        v["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|w| w.as_str().unwrap().contains("拡大して配置")),
-        "拡大の警告がない"
+        has_warning(&v, "CANVAS_UPSCALED"),
+        "拡大の警告がない: {:?}",
+        warning_codes(&v)
     );
 }
 
@@ -2043,6 +2611,37 @@ fn serial_and_parallel_runs_agree() {
     let parallel = ratios(&["--force"]);
     let serial = ratios(&["--jobs", "1", "--force"]);
     assert_eq!(parallel, serial, "並列と直列で結果が食い違っている");
+}
+
+/// batch のテキスト出力でも hint を捨てない。
+///
+/// **同じ画像の同じ失敗が、呼び方によって回復できたりできなかったりしては
+/// いけない。** 単体実行では次の一手が出るのに、数百点を回す本命の経路でだけ
+/// 消えると、そこで詰まった利用者は手がかりを持てない。
+#[test]
+fn batch_prints_the_hint_alongside_the_warning() {
+    let dir = fixture_dir();
+    batch_fixture(dir.path(), 1);
+    // 許容量 0 なら背景がほぼ残り、FOREGROUND_TOO_LARGE が hint 付きで出る
+    let spec = write_spec(
+        dir.path(),
+        r#"{"defaults":{"format":"png"},
+            "items":[{"input":"p0.png","output":"a.png","tolerance":0}]}"#,
+    );
+
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        stderr.contains("警告 ["),
+        "警告そのものが出ていない: {stderr}"
+    );
+    assert!(
+        stderr.contains("--tolerance を上げてください"),
+        "hint が捨てられている: {stderr}"
+    );
 }
 
 /// AI が生成した仕様の綴り違いを黙って無視しない。
@@ -2468,11 +3067,7 @@ fn a_failing_preview_does_not_fail_the_command() {
     let json = json_stdout(&out);
     assert!(json["preview"].is_null(), "書けなかったなら報告しない");
     assert!(
-        json["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|w| w.as_str().unwrap().contains("プレビューを")),
+        has_warning(&json, "PREVIEW_FAILED"),
         "警告として伝えるべき: {}",
         json["warnings"]
     );

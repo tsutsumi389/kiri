@@ -5,7 +5,9 @@
 
 use serde::Serialize;
 
+use crate::cutout::Confidence;
 use crate::error::Error;
+use crate::warning::Warning;
 
 #[derive(Debug, Serialize)]
 pub struct ErrorReport {
@@ -77,6 +79,45 @@ pub struct BackgroundReport {
     pub texture: PerimeterTexture,
 }
 
+/// 主体（商品）と思われる塊の位置。
+///
+/// **`background` と同じく `info` と `cutout` の両方が同じ形で返す。**
+/// 片方にしか無いと、エージェントは「この画像では測れなかった」のか
+/// 「このコマンドは報告しない」のかを区別できない。
+///
+/// 検出できなければ `null`。キー自体は常に出す（`separability` / `halo_ratio`
+/// と同じ規約）。
+///
+/// **kiri はこの矩形を自分では適用しない。** bbox は構図の意思決定であり、
+/// 複数商品や意図的な見切れでは人／AI が決めるべきものである。
+///
+/// **`--bbox` を指定して `cutout` を回したときも、ここは画像全体から測り直した
+/// 矩形であって「適用した bbox」ではない。** 指定した矩形をそのまま返している
+/// と読むと、指定が効いているかの確認に使えてしまう。効いたかどうかは
+/// `mask.bbox` と `settings` を見ること。
+#[derive(Debug, Serialize)]
+pub struct SubjectReport {
+    /// 原寸座標での外接矩形 [x1, y1, x2, y2]
+    pub bbox: [u32; 4],
+    /// `--bbox <これ> --normalized` にそのまま渡せる正規化座標
+    pub normalized_bbox: [f64; 4],
+    /// 最大連結成分が画像に占める割合
+    pub area_ratio: f64,
+    /// 閾値を超えた画素のうち最大連結成分が占める割合。
+    /// まとまった塊なら高く、散った雑音なら低い
+    pub capture_ratio: f64,
+    /// 主体候補の代表色と背景色の色差(ΔE)。
+    /// **信頼度の判定には使っていない**（誤検出でも大きく出るため）
+    pub delta_e: f64,
+    /// **この矩形の外**に残った「背景とは言えない画素」の、最大の塊が
+    /// 画像に占める割合。大きければ、この矩形は主体を取りこぼしている。
+    /// 0.15 以上で `confidence` は `"low"` になる
+    pub leftover_ratio: f64,
+    pub touches_edge: bool,
+    /// "high" のときだけ、この矩形を根拠にした助言を出してよい
+    pub confidence: Confidence,
+}
+
 #[derive(Debug, Serialize)]
 pub struct InfoReport {
     pub input: String,
@@ -95,7 +136,9 @@ pub struct InfoReport {
     pub icc_profile: bool,
     pub has_alpha: bool,
     pub background: BackgroundReport,
-    pub warnings: Vec<String>,
+    /// 主体候補。検出できなければ null（キーは常に出す）
+    pub subject: Option<SubjectReport>,
+    pub warnings: Vec<Warning>,
 }
 
 #[derive(Debug, Serialize)]
@@ -126,7 +169,7 @@ pub struct ProcessReport {
     /// sRGB へ変換したか
     pub color_converted: bool,
     pub elapsed_ms: u128,
-    pub warnings: Vec<String>,
+    pub warnings: Vec<Warning>,
 }
 
 #[derive(Debug, Serialize)]
@@ -220,6 +263,8 @@ pub struct CutoutReport {
     /// sRGB へ変換したか
     pub color_converted: bool,
     pub background: BackgroundReport,
+    /// 主体候補。検出できなければ null（キーは常に出す）
+    pub subject: Option<SubjectReport>,
     /// 実際に効いた切り抜きの設定
     pub settings: SettingsReport,
     /// 実際に適用された bbox（未指定なら None）
@@ -232,7 +277,7 @@ pub struct CutoutReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
     pub elapsed_ms: u128,
-    pub warnings: Vec<String>,
+    pub warnings: Vec<Warning>,
 }
 
 #[derive(Debug, Serialize)]

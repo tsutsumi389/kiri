@@ -11,6 +11,7 @@ use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, RgbaImage};
 use crate::color::icc::{self, Interpretation};
 use crate::error::{Error, Result};
 use crate::image_io::heif;
+use crate::warning::Warning;
 
 /// 読み込み時の振る舞い。
 #[derive(Debug, Clone, Copy)]
@@ -48,7 +49,7 @@ pub struct LoadedImage {
     /// 実際に不透明でないピクセルが存在するか
     pub has_alpha: bool,
     /// 色空間に起因する警告
-    color_warnings: Vec<String>,
+    color_warnings: Vec<Warning>,
 }
 
 impl LoadedImage {
@@ -64,7 +65,7 @@ impl LoadedImage {
     ///
     /// 変換できたときは黙る。何が起きたかは `color_space` と `color_converted`
     /// が答えており、成功を警告として流すとエージェントが本当の警告を見落とす。
-    pub fn warnings(&self) -> Vec<String> {
+    pub fn warnings(&self) -> Vec<Warning> {
         self.color_warnings.clone()
     }
 }
@@ -150,7 +151,7 @@ struct ColorOutcome {
     /// 埋め込み ICC 自身の名乗り
     profile: Option<String>,
     converted: bool,
-    warnings: Vec<String>,
+    warnings: Vec<Warning>,
 }
 
 /// 埋め込み ICC があれば sRGB へ寄せ、無ければ EXIF の申告をそのまま報告する。
@@ -169,10 +170,17 @@ fn normalize_color(
                 name: "uncalibrated".into(),
                 profile: None,
                 converted: false,
+                // ICC が無いので実体を確かめる術がない。sRGB として扱ったことを
+                // 伝えるしかなく、次の一手も「変換して渡し直す」以外に無い
                 warnings: vec![
-                    "入力の色空間が uncalibrated です（AdobeRGB の可能性）。ICC も\
-                     埋め込まれていないため sRGB として扱います"
-                        .into(),
+                    Warning::new(
+                        "COLOR_SPACE_UNCALIBRATED",
+                        "入力の色空間が uncalibrated です（AdobeRGB の可能性）。ICC も\
+                         埋め込まれていないため sRGB として扱います",
+                    )
+                    .with_hint(
+                        "色が合わない場合は、あらかじめ sRGB へ変換した素材を渡してください",
+                    ),
                 ],
             },
             _ => ColorOutcome {
@@ -215,10 +223,16 @@ fn normalize_color(
                     warnings: Vec::new(),
                 }
             } else {
-                let warning = format!(
-                    "ICC プロファイル {label} を検出しましたが、--no-color-convert のため \
-                     sRGB へ変換していません"
+                let mut warning = Warning::new(
+                    "COLOR_CONVERSION_SKIPPED",
+                    format!(
+                        "ICC プロファイル {label} を検出しましたが、--no-color-convert のため \
+                         sRGB へ変換していません"
+                    ),
                 );
+                if let Some(n) = &profile {
+                    warning = warning.with_data("profile", n.clone());
+                }
                 ColorOutcome {
                     name,
                     profile,
@@ -228,8 +242,13 @@ fn normalize_color(
             }
         }
         Interpretation::Unsupported => {
-            let warning =
-                format!("ICC プロファイル {label} は変換に対応していないため sRGB として扱います");
+            let mut warning = Warning::new(
+                "COLOR_PROFILE_UNSUPPORTED",
+                format!("ICC プロファイル {label} は変換に対応していないため sRGB として扱います"),
+            );
+            if let Some(n) = &profile {
+                warning = warning.with_data("profile", n.clone());
+            }
             ColorOutcome {
                 name: reported(),
                 profile,
@@ -474,7 +493,11 @@ mod tests {
         assert_eq!(loaded.color_space, "Display P3");
         let warnings = loaded.warnings();
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("変換に対応していない"), "{warnings:?}");
+        assert_eq!(warnings[0].code, "COLOR_PROFILE_UNSUPPORTED");
+        assert!(
+            warnings[0].message.contains("変換に対応していない"),
+            "{warnings:?}"
+        );
     }
 
     /// ICC が無い画像は今までどおり触らない。

@@ -13,5 +13,7 @@ pub mod image_io;
 pub mod preview;
 pub mod report;
 pub mod transform;
+pub mod warning;
 
 pub use error::{Error, ErrorKind, Result};
+pub use warning::Warning;

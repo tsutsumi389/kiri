@@ -39,6 +39,8 @@ pub enum Command {
     Convert(ConvertArgs),
     /// 画像をリサイズする
     Resize(ResizeArgs),
+    /// 画像を回転する
+    Rotate(RotateArgs),
     /// 背景を透過して商品を切り抜く
     Cutout(CutoutArgs),
     /// 仕様ファイルに従って複数の画像を一括処理する
@@ -147,6 +149,46 @@ pub struct ResizeArgs {
     pub out: OutputOpts,
 }
 
+#[derive(Args, Debug)]
+pub struct RotateArgs {
+    /// 入力画像（JPEG または PNG）
+    pub input: PathBuf,
+
+    /// 時計回りに回す角度(度)。負値は反時計回り。
+    ///
+    /// ヘルプの本文は `angle_long_help` に置く。90 度単位が無劣化である
+    /// ことと余白の扱いは、指定の前に知っていないと選びようがない
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        value_parser = finite,
+        long_help = angle_long_help()
+    )]
+    pub angle: f64,
+
+    #[command(flatten)]
+    pub color: ColorOpts,
+
+    #[command(flatten)]
+    pub out: OutputOpts,
+}
+
+/// `--angle` の長いヘルプ。
+///
+/// **AI エージェントは `--help` を読んで判断する**ので、「90 度単位だけは
+/// 無劣化」「それ以外は四隅に透過の余白が出る」をここに書いておかないと、
+/// 出力寸法が入力と違うことを失敗と読み違える。
+fn angle_long_help() -> String {
+    "時計回りに回す角度(度)。負値は反時計回り。360 を超える値や負値は \
+     [0, 360) へ正規化する。\n\
+     90 / 180 / 270 は画素を入れ替えるだけで回すため無劣化で、寸法は縦横が\
+     入れ替わるだけになる。それ以外の角度は Catmull-Rom で補間し直し、\
+     出力は四隅を欠かさない外接矩形まで広がる（増えた余白はアルファ 0）。\n\
+     EXIF の向きは読み込み時に適用済みなので、指定は「見えている絵を何度\
+     回すか」を意味する"
+        .to_string()
+}
+
 /// `--seal` の上限。
 ///
 /// 半径 N の測地的オープニングは走査量が N に比例し、1MP で `--seal 400` は
@@ -198,6 +240,21 @@ pub fn non_negative(s: &str) -> Result<f64, String> {
         .map_err(|_| format!("'{s}' は数値として読めません"))?;
     if !v.is_finite() || v < 0.0 {
         return Err(format!("'{s}' は 0 以上の有限な数値である必要があります"));
+    }
+    Ok(v)
+}
+
+/// 有限な実数だけを受け付ける。符号は問わない。
+///
+/// `non_negative` と分けているのは、角度だけが負値に意味を持つためである
+/// （反時計回り）。nan / inf を弾く理由は同じで、以降の三角関数と寸法計算が
+/// 黙って壊れるより、受け取る前に断るほうがよい。
+pub fn finite(s: &str) -> Result<f64, String> {
+    let v: f64 = s
+        .parse()
+        .map_err(|_| format!("'{s}' は数値として読めません"))?;
+    if !v.is_finite() {
+        return Err(format!("'{s}' は有限な数値である必要があります"));
     }
     Ok(v)
 }
@@ -495,6 +552,17 @@ mod tests {
         assert_eq!(parse_point("120,80"), Ok([120.0, 80.0]));
         assert_eq!(parse_point("0.5,0.5"), Ok([0.5, 0.5]));
         assert!(parse_point("1,2,3").is_err());
+    }
+
+    #[test]
+    fn finite_accepts_both_signs_but_not_nan_or_infinity() {
+        assert_eq!(finite("90"), Ok(90.0));
+        assert_eq!(finite("-3.5"), Ok(-3.5), "角度は負値に意味がある");
+        assert_eq!(finite("0"), Ok(0.0));
+        assert!(finite("nan").is_err());
+        assert!(finite("inf").is_err());
+        assert!(finite("-inf").is_err());
+        assert!(finite("sideways").is_err());
     }
 
     #[test]

@@ -18,9 +18,10 @@ use crate::transform::FitMode;
     name = "kiri",
     version,
     about = "EC商品画像のための切り抜き・変換CLI",
-    long_about = "単色背景のEC商品画像を対象に、背景透過の切り抜き・リサイズ・\
-                  Web配信形式への変換を行う。--json を付けると結果を機械可読な \
-                  JSON で stdout に出力し、ログは stderr に分離する。"
+    long_about = "単色背景のEC商品画像を対象に、背景透過の切り抜き・リサイズ・回転・\
+                  キャンバス配置・Web配信形式への変換を行う。--json を付けると結果を\
+                  機械可読な JSON で stdout に出力し、ログは stderr に分離する。\
+                  オプションと code の一覧は kiri schema が返す。"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -45,6 +46,12 @@ pub enum Command {
     Cutout(CutoutArgs),
     /// 仕様ファイルに従って複数の画像を一括処理する
     Batch(BatchArgs),
+
+    /// オプションと code の一覧（契約）を出力する
+    ///
+    /// **エージェントはまずこれを読む。** README を読み込まずに、呼び方と
+    /// 返ってきた code の意味を引ける
+    Schema,
 }
 
 #[derive(Args, Debug)]

@@ -10,12 +10,14 @@ use std::time::Instant;
 use crate::cli::CutoutArgs;
 use crate::commands::output::{self, round4};
 use crate::cutout::{CutoutOptions, cutout};
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::{OutputFormat, SaveOptions, load, save};
 use crate::preview::{PreviewSpec, contact_sheet};
-use crate::report::{CanvasReport, CutoutReport, Dimensions, MaskReport, SettingsReport};
+use crate::report::{
+    CanvasReport, CutoutReport, Dimensions, MaskReport, SCHEMA_VERSION, SettingsReport,
+};
 use crate::transform::canvas::{CanvasSpec, apply as canvas_apply, plan as canvas_plan};
-use crate::warning::Warning;
+use crate::warning::{Warning, WarningCode};
 
 pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     let started = Instant::now();
@@ -82,6 +84,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     );
 
     Ok(CutoutReport {
+        schema_version: SCHEMA_VERSION,
         input: args.input.display().to_string(),
         source: Dimensions {
             width: w,
@@ -135,8 +138,8 @@ fn place_on_canvas(
     // フェザリングされた薄い縁まで含めて切り詰める。前景判定(128以上)で切ると
     // 輪郭の階調が落ちてギザギザに戻ってしまう
     let (x1, y1, x2, y2) = result.mask.bbox_above(0).ok_or_else(|| {
-        Error::processing(
-            "NO_FOREGROUND",
+        Error::new(
+            ErrorCode::NoForeground,
             "前景が検出されなかったためキャンバスに配置できません",
         )
         .with_hint("--tolerance を下げるか --bbox で対象範囲を指定してください")
@@ -158,7 +161,7 @@ fn place_on_canvas(
     if plan.scale > 1.0 {
         warnings.push(
             Warning::new(
-                "CANVAS_UPSCALED",
+                WarningCode::CanvasUpscaled,
                 format!(
                     "商品を {:.2} 倍に拡大して配置しました。元素材以上の解像度にはなりません",
                     plan.scale
@@ -193,8 +196,8 @@ fn place_on_canvas(
 fn check_side_outputs(args: &CutoutArgs) -> Result<Option<OutputFormat>> {
     let conflict = |path: &PathBuf, flag: &str| -> Result<()> {
         if path == &args.out.output {
-            return Err(Error::argument(
-                "SIDE_OUTPUT_CONFLICT",
+            return Err(Error::new(
+                ErrorCode::SideOutputConflict,
                 format!("{flag} と --output に同じパスは指定できません"),
             )
             .with_hint("付随出力は本出力の後に書かれるため、成果物を壊します"));
@@ -212,8 +215,8 @@ fn check_side_outputs(args: &CutoutArgs) -> Result<Option<OutputFormat>> {
     conflict(preview, "--preview")?;
     if let Some(mask) = args.debug_mask.as_ref() {
         if preview == mask {
-            return Err(Error::argument(
-                "SIDE_OUTPUT_CONFLICT",
+            return Err(Error::new(
+                ErrorCode::SideOutputConflict,
                 "--preview と --debug-mask に同じパスは指定できません",
             ));
         }
@@ -222,8 +225,8 @@ fn check_side_outputs(args: &CutoutArgs) -> Result<Option<OutputFormat>> {
     // 本出力と同じ規約で拡張子から決める。--output は解釈できない拡張子を
     // エラーにするので、こちらだけ黙って PNG にすると契約が不揃いになる
     let format = OutputFormat::from_path(preview).ok_or_else(|| {
-        Error::argument(
-            "UNKNOWN_OUTPUT_FORMAT",
+        Error::new(
+            ErrorCode::UnknownOutputFormat,
             format!("{} の拡張子から出力形式を判別できません", preview.display()),
         )
         .with_hint("--preview には avif / png / jpeg のいずれかの拡張子を指定してください")
@@ -270,7 +273,7 @@ fn write_preview(
         Err(e) => {
             warnings.push(
                 Warning::new(
-                    "PREVIEW_FAILED",
+                    WarningCode::PreviewFailed,
                     format!(
                         "プレビューを {} に書けませんでした: {}",
                         path.display(),
@@ -280,7 +283,7 @@ fn write_preview(
                 // 成果物そのものは書けている。エージェントが同じ引数で再実行して
                 // OUTPUT_EXISTS に二重で詰まらないよう、原因の code も渡す
                 .with_data("path", path.display().to_string())
-                .with_data("error_code", e.code),
+                .with_data("error_code", e.code.as_str()),
             );
             None
         }
@@ -292,8 +295,8 @@ fn write_debug_mask(path: Option<&PathBuf>, mask: &crate::cutout::Mask) -> Resul
         return Ok(None);
     };
     mask.to_image().save(path).map_err(|e| {
-        Error::general(
-            "DEBUG_MASK_WRITE_FAILED",
+        Error::new(
+            ErrorCode::DebugMaskWriteFailed,
             format!("{} に書けません: {e}", path.display()),
         )
     })?;
@@ -312,8 +315,8 @@ pub fn resolve_bbox(
 ) -> Result<(u32, u32, u32, u32)> {
     let scaled = if normalized {
         if bbox.iter().any(|v| *v > 1.0) {
-            return Err(Error::argument(
-                "INVALID_BBOX",
+            return Err(Error::new(
+                ErrorCode::InvalidBbox,
                 "--normalized 指定時、bbox の各値は 0.0-1.0 である必要があります",
             )
             .with_hint("画素座標で指定する場合は --normalized を外してください"));
@@ -329,8 +332,8 @@ pub fn resolve_bbox(
     };
 
     if scaled[0] >= f64::from(width) || scaled[1] >= f64::from(height) {
-        return Err(Error::argument(
-            "INVALID_BBOX",
+        return Err(Error::new(
+            ErrorCode::InvalidBbox,
             format!(
                 "bbox の始点 ({:.0},{:.0}) が画像 {width}x{height} の外です",
                 scaled[0], scaled[1]
@@ -350,8 +353,8 @@ pub fn resolve_bbox(
 fn resolve_point(point: [f64; 2], normalized: bool, width: u32, height: u32) -> Result<(u32, u32)> {
     let (x, y) = if normalized {
         if point[0] > 1.0 || point[1] > 1.0 {
-            return Err(Error::argument(
-                "INVALID_SEED",
+            return Err(Error::new(
+                ErrorCode::InvalidSeed,
                 "--normalized 指定時、座標は 0.0-1.0 である必要があります",
             ));
         }
@@ -361,8 +364,8 @@ fn resolve_point(point: [f64; 2], normalized: bool, width: u32, height: u32) -> 
     };
 
     if x >= f64::from(width) || y >= f64::from(height) {
-        return Err(Error::argument(
-            "INVALID_SEED",
+        return Err(Error::new(
+            ErrorCode::InvalidSeed,
             format!("座標 ({x:.0},{y:.0}) が画像 {width}x{height} の外です"),
         ));
     }
@@ -394,7 +397,7 @@ mod tests {
     #[test]
     fn a_bbox_starting_outside_the_image_is_an_error() {
         let err = resolve_bbox([500.0, 10.0, 600.0, 40.0], false, 100, 50).unwrap_err();
-        assert_eq!(err.code, "INVALID_BBOX");
+        assert_eq!(err.code.as_str(), "INVALID_BBOX");
         assert_eq!(err.exit_code(), 2);
     }
 
@@ -402,7 +405,7 @@ mod tests {
     fn normalized_values_above_one_are_rejected() {
         // 画素座標を --normalized で渡す取り違えを検出する
         let err = resolve_bbox([120.0, 80.0, 900.0, 1400.0], true, 1600, 2000).unwrap_err();
-        assert_eq!(err.code, "INVALID_BBOX");
+        assert_eq!(err.code.as_str(), "INVALID_BBOX");
         assert!(err.hint.unwrap().contains("--normalized"));
     }
 
@@ -421,6 +424,6 @@ mod tests {
     #[test]
     fn a_point_outside_the_image_is_an_error() {
         let err = resolve_point([200.0, 10.0], false, 100, 100).unwrap_err();
-        assert_eq!(err.code, "INVALID_SEED");
+        assert_eq!(err.code.as_str(), "INVALID_SEED");
     }
 }

@@ -12,9 +12,86 @@
 use serde::Serialize;
 use serde_json::{Map, Value};
 
+/// 警告の一覧。**これが唯一の定義である。**
+///
+/// `WarningCode` そのものと、`kiri schema` が配る一覧と、意味の説明を 1 つの表から
+/// 生成する。別々に持つと必ず離れ、離れた表は「載っていない code が飛んでくる」
+/// という、受け手が分岐を書きようがない壊れ方をする。ここへ足す以外に警告を
+/// 作る方法が無いので、その状態が構造的に起こらない。
+///
+/// `summary` は「何が起きたか」を 1 行で言う。個々の実行が返す `message` とは別で、
+/// **こちらは事前に読むためのもの**である。`message` は数値を含み実行ごとに変わるが、
+/// `summary` は分岐を書く前に code の意味を知るために引く。
+macro_rules! warning_catalog {
+    ($($variant:ident = $code:literal => $summary:literal,)*) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum WarningCode {
+            $($variant,)*
+        }
+
+        impl WarningCode {
+            /// 契約に載っているすべての警告。
+            pub const ALL: &'static [WarningCode] = &[$(WarningCode::$variant,)*];
+
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(WarningCode::$variant => $code,)*
+                }
+            }
+
+            pub fn summary(self) -> &'static str {
+                match self {
+                    $(WarningCode::$variant => $summary,)*
+                }
+            }
+        }
+    };
+}
+
+warning_catalog! {
+    LowUniformity = "LOW_UNIFORMITY"
+        => "背景の均一度が低い（単色背景ではない）",
+    BboxRecommended = "BBOX_RECOMMENDED"
+        => "背景が不均一で背景側が前景として残っている。bbox で解ける",
+    SubjectTouchesEdge = "SUBJECT_TOUCHES_EDGE"
+        => "前景が画像の外周に接している（商品の見切れ）",
+    NotSeparable = "NOT_SEPARABLE"
+        => "主体と背景の色差が背景自身のばらつきを下回る。調整では改善しない",
+    ForegroundTooSmall = "FOREGROUND_TOO_SMALL"
+        => "前景比率が小さすぎる。商品が消えている可能性がある",
+    ForegroundTooLarge = "FOREGROUND_TOO_LARGE"
+        => "前景比率が大きすぎる。背景が残っている可能性がある",
+    HaloRemains = "HALO_REMAINS"
+        => "境界に背景色のままの縁が残っている。--tolerance を上げると減る",
+    EdgeThresholdRaised = "EDGE_THRESHOLD_RAISED"
+        => "背景のテクスチャに合わせて輪郭の堤防を引き上げた",
+    CanvasUpscaled = "CANVAS_UPSCALED"
+        => "キャンバス配置で商品を拡大した",
+    Upscaled = "UPSCALED"
+        => "resize で元画像より大きくした",
+    AlphaFlattened = "ALPHA_FLATTENED"
+        => "出力形式が透過を保持できないので背景色で合成した",
+    PreviewFailed = "PREVIEW_FAILED"
+        => "プレビューを書き出せなかった（成果物自体は書けている）",
+    ColorProfileUnsupported = "COLOR_PROFILE_UNSUPPORTED"
+        => "ICC が LUT 型などで sRGB へ変換できなかった",
+    ColorConversionSkipped = "COLOR_CONVERSION_SKIPPED"
+        => "--no-color-convert により色を変換していない",
+    ColorSpaceUncalibrated = "COLOR_SPACE_UNCALIBRATED"
+        => "EXIF が uncalibrated で ICC も無い。sRGB と仮定した",
+    DryRunOutputExists = "DRY_RUN_OUTPUT_EXISTS"
+        => "--dry-run の出力先が既にある。本番実行には --force が要る",
+}
+
+impl Serialize for WarningCode {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Warning {
-    pub code: &'static str,
+    pub code: WarningCode,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
@@ -24,7 +101,7 @@ pub struct Warning {
 }
 
 impl Warning {
-    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+    pub fn new(code: WarningCode, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -56,7 +133,7 @@ mod tests {
 
     #[test]
     fn code_message_hint_and_data_all_reach_the_json() {
-        let w = Warning::new("LOW_UNIFORMITY", "背景の均一度が低い")
+        let w = Warning::new(WarningCode::LowUniformity, "背景の均一度が低い")
             .with_hint("--bbox を指定してください")
             .with_data("uniformity", 0.201);
         let v: Value = serde_json::to_value(&w).unwrap();
@@ -73,7 +150,7 @@ mod tests {
     /// 読んで分岐を書いてしまう。無い情報は無いと分かる形で出さない。
     #[test]
     fn empty_hint_and_data_disappear_from_the_json() {
-        let w = Warning::new("SUBJECT_TOUCHES_EDGE", "外周に接しています");
+        let w = Warning::new(WarningCode::SubjectTouchesEdge, "外周に接しています");
         let v: Value = serde_json::to_value(&w).unwrap();
 
         assert_eq!(v.as_object().unwrap().len(), 2, "{v}");
@@ -85,7 +162,7 @@ mod tests {
     /// 「いくつからいくつへ」と「その根拠」を同時に語る必要がある。
     #[test]
     fn several_numbers_can_be_attached() {
-        let w = Warning::new("EDGE_THRESHOLD_RAISED", "堤防を引き上げました")
+        let w = Warning::new(WarningCode::EdgeThresholdRaised, "堤防を引き上げました")
             .with_data("from", 8.0)
             .with_data("to", 41.8)
             .with_data("texture_p50", 11.3)
@@ -102,7 +179,7 @@ mod tests {
     /// 4 つのキーへばらすと、そのまま `--bbox` へ渡せなくなる。
     #[test]
     fn an_array_survives_the_round_trip() {
-        let w = Warning::new("BBOX_RECOMMENDED", "bbox を指定してください")
+        let w = Warning::new(WarningCode::BboxRecommended, "bbox を指定してください")
             .with_data("normalized_bbox", vec![0.0, 0.35, 0.98, 0.67]);
         let v: Value = serde_json::to_value(&w).unwrap();
 

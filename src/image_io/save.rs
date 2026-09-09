@@ -8,8 +8,8 @@ use std::path::Path;
 use image::{ExtendedColorType, ImageEncoder, RgbaImage};
 use ravif::{AlphaColorMode, Encoder as AvifEncoder, RGBA8};
 
-use crate::error::{Error, Result};
-use crate::warning::Warning;
+use crate::error::{Error, ErrorCode, Result};
+use crate::warning::{Warning, WarningCode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum OutputFormat {
@@ -95,14 +95,14 @@ pub fn encode(image: &RgbaImage, opts: &SaveOptions) -> Result<(Vec<u8>, Vec<War
     let mut warnings = Vec::new();
 
     if !(0.0..=100.0).contains(&opts.quality) {
-        return Err(Error::argument(
-            "INVALID_QUALITY",
+        return Err(Error::new(
+            ErrorCode::InvalidQuality,
             "quality は 0-100 の範囲で指定してください",
         ));
     }
     if !(1..=10).contains(&opts.effort) {
-        return Err(Error::argument(
-            "INVALID_EFFORT",
+        return Err(Error::new(
+            ErrorCode::InvalidEffort,
             "effort は 1-10 の範囲で指定してください",
         ));
     }
@@ -114,7 +114,7 @@ pub fn encode(image: &RgbaImage, opts: &SaveOptions) -> Result<(Vec<u8>, Vec<War
         let [r, g, b] = opts.background;
         warnings.push(
             Warning::new(
-                "ALPHA_FLATTENED",
+                WarningCode::AlphaFlattened,
                 format!(
                     "{} は透過を保持できないため #{r:02X}{g:02X}{b:02X} で合成しました",
                     opts.format.as_str()
@@ -153,8 +153,8 @@ pub fn save(path: &Path, image: &RgbaImage, opts: &SaveOptions) -> Result<SaveOu
         }
     }
     std::fs::write(path, &encoded).map_err(|e| {
-        Error::general(
-            "OUTPUT_WRITE_FAILED",
+        Error::new(
+            ErrorCode::OutputWriteFailed,
             format!("{} に書き出せません: {e}", path.display()),
         )
     })?;
@@ -189,7 +189,7 @@ fn encode_avif(image: &RgbaImage, opts: &SaveOptions) -> Result<Vec<u8>> {
         .with_speed(opts.effort)
         .with_alpha_color_mode(AlphaColorMode::UnassociatedClean)
         .encode_rgba(src)
-        .map_err(|e| Error::general("AVIF_ENCODE_FAILED", e.to_string()))?;
+        .map_err(|e| Error::new(ErrorCode::AvifEncodeFailed, e.to_string()))?;
 
     Ok(encoded.avif_file)
 }
@@ -203,7 +203,7 @@ fn encode_png(image: &RgbaImage) -> Result<Vec<u8>> {
             image.height(),
             ExtendedColorType::Rgba8,
         )
-        .map_err(|e| Error::general("PNG_ENCODE_FAILED", e.to_string()))?;
+        .map_err(|e| Error::new(ErrorCode::PngEncodeFailed, e.to_string()))?;
     Ok(buf)
 }
 
@@ -212,7 +212,7 @@ fn encode_jpeg(image: &RgbaImage, opts: &SaveOptions) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, opts.quality.round() as u8)
         .write_image(&rgb, image.width(), image.height(), ExtendedColorType::Rgb8)
-        .map_err(|e| Error::general("JPEG_ENCODE_FAILED", e.to_string()))?;
+        .map_err(|e| Error::new(ErrorCode::JpegEncodeFailed, e.to_string()))?;
     Ok(buf)
 }
 

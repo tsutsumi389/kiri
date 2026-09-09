@@ -5,6 +5,8 @@
 
 use std::fmt;
 
+use serde::Serialize;
+
 /// エラーの分類。exit code に 1:1 で対応する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
@@ -19,6 +21,24 @@ pub enum ErrorKind {
 }
 
 impl ErrorKind {
+    /// 分類のすべて。`kiri schema` が exit code の表を組むのに使う。
+    pub const ALL: &'static [ErrorKind] = &[
+        ErrorKind::General,
+        ErrorKind::Argument,
+        ErrorKind::Input,
+        ErrorKind::Processing,
+    ];
+
+    /// exit code の意味。README の表と同じ文言をここから配る。
+    pub fn meaning(self) -> &'static str {
+        match self {
+            ErrorKind::General => "一般エラー",
+            ErrorKind::Argument => "引数不正",
+            ErrorKind::Input => "入力ファイル異常",
+            ErrorKind::Processing => "処理失敗",
+        }
+    }
+
     pub fn exit_code(self) -> i32 {
         match self {
             ErrorKind::General => 1,
@@ -29,38 +49,145 @@ impl ErrorKind {
     }
 }
 
+/// エラーの一覧。**これが唯一の定義である。**
+///
+/// `warning.rs` の `warning_catalog!` と同じ理由でここに集約する。加えて
+/// **kind（= exit code）を code から引く。** 呼び出し側が kind を選べる形だと、
+/// 同じ code が場所によって違う exit code を返しうる。エージェントは
+/// 「この失敗なら何番」で分岐を書くので、そこが揺れると分岐が成立しない。
+macro_rules! error_catalog {
+    ($($variant:ident = $code:literal, $kind:ident => $summary:literal,)*) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum ErrorCode {
+            $($variant,)*
+        }
+
+        impl ErrorCode {
+            /// 契約に載っているすべてのエラー。
+            pub const ALL: &'static [ErrorCode] = &[$(ErrorCode::$variant,)*];
+
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(ErrorCode::$variant => $code,)*
+                }
+            }
+
+            /// この code が返す分類。exit code はここから決まる。
+            pub fn kind(self) -> ErrorKind {
+                match self {
+                    $(ErrorCode::$variant => ErrorKind::$kind,)*
+                }
+            }
+
+            pub fn summary(self) -> &'static str {
+                match self {
+                    $(ErrorCode::$variant => $summary,)*
+                }
+            }
+        }
+    };
+}
+
+error_catalog! {
+    // 一般 (exit 1)
+    IoError = "IO_ERROR", General
+        => "ファイル入出力に失敗した",
+    OutputWriteFailed = "OUTPUT_WRITE_FAILED", General
+        => "出力先へ書き出せなかった",
+    DebugMaskWriteFailed = "DEBUG_MASK_WRITE_FAILED", General
+        => "--debug-mask を書き出せなかった",
+    AvifEncodeFailed = "AVIF_ENCODE_FAILED", General
+        => "AVIF のエンコードに失敗した",
+    PngEncodeFailed = "PNG_ENCODE_FAILED", General
+        => "PNG のエンコードに失敗した",
+    JpegEncodeFailed = "JPEG_ENCODE_FAILED", General
+        => "JPEG のエンコードに失敗した",
+    JsonEncodeFailed = "JSON_ENCODE_FAILED", General
+        => "結果を JSON にできなかった",
+    ThreadPoolFailed = "THREAD_POOL_FAILED", General
+        => "並列実行の準備に失敗した",
+
+    // 引数 (exit 2)
+    InvalidAngle = "INVALID_ANGLE", Argument
+        => "--angle が数値として解釈できない",
+    InvalidBbox = "INVALID_BBOX", Argument
+        => "--bbox の書式か範囲が不正",
+    InvalidSeed = "INVALID_SEED", Argument
+        => "--fg-seed の書式か範囲が不正",
+    InvalidCanvas = "INVALID_CANVAS", Argument
+        => "--canvas の書式か寸法が不正",
+    InvalidColor = "INVALID_COLOR", Argument
+        => "色の指定が 16 進表記として解釈できない",
+    InvalidDimension = "INVALID_DIMENSION", Argument
+        => "--width / --height が不正",
+    InvalidFillRatio = "INVALID_FILL_RATIO", Argument
+        => "--fill-ratio が 0 より大きく 1 以下でない",
+    InvalidQuality = "INVALID_QUALITY", Argument
+        => "--quality が 0-100 の外",
+    InvalidEffort = "INVALID_EFFORT", Argument
+        => "--effort が 1-10 の外",
+    InvalidSetting = "INVALID_SETTING", Argument
+        => "spec の設定値が不正（負値や nan）",
+    MissingDimension = "MISSING_DIMENSION", Argument
+        => "--width も --height も指定されていない",
+    UpscaleNotAllowed = "UPSCALE_NOT_ALLOWED", Argument
+        => "拡大が必要だが --allow-upscale が無い",
+    OutputExists = "OUTPUT_EXISTS", Argument
+        => "出力先が既に存在する。--force が要る",
+    SideOutputConflict = "SIDE_OUTPUT_CONFLICT", Argument
+        => "--preview / --debug-mask のパスが本出力や互いと衝突している",
+    UnknownOutputFormat = "UNKNOWN_OUTPUT_FORMAT", Argument
+        => "拡張子から出力形式を判別できない",
+    SpecEmpty = "SPEC_EMPTY", Argument
+        => "spec に項目が 1 つも無い",
+
+    // 入力 (exit 3)
+    InputUnreadable = "INPUT_UNREADABLE", Input
+        => "入力ファイルを読めない",
+    InputDecodeFailed = "INPUT_DECODE_FAILED", Input
+        => "入力画像をデコードできない（破損）",
+    UnsupportedFormat = "UNSUPPORTED_FORMAT", Input
+        => "対応していない入力形式（HEIC など）",
+    SpecUnreadable = "SPEC_UNREADABLE", Input
+        => "spec ファイルを読めない",
+    SpecInvalidJson = "SPEC_INVALID_JSON", Input
+        => "spec が JSON として壊れている",
+    SpecInvalid = "SPEC_INVALID", Input
+        => "spec の構造が仕様に合わない",
+    SpecUnknownField = "SPEC_UNKNOWN_FIELD", Input
+        => "spec に未知のキーがある（綴り違いの疑い）",
+
+    // 処理 (exit 4)
+    EmptyImage = "EMPTY_IMAGE", Processing
+        => "幅か高さが 0 の画像",
+    EmptyContent = "EMPTY_CONTENT", Processing
+        => "キャンバスに載せる中身が無い",
+    NoForeground = "NO_FOREGROUND", Processing
+        => "キャンバスに配置する前景が 1 画素も残らなかった",
+    ResizeFailed = "RESIZE_FAILED", Processing
+        => "リサイズに失敗した",
+}
+
+impl Serialize for ErrorCode {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
 #[derive(Debug)]
 pub struct Error {
-    pub kind: ErrorKind,
-    pub code: &'static str,
+    pub code: ErrorCode,
     pub message: String,
     pub hint: Option<String>,
 }
 
 impl Error {
-    fn new(kind: ErrorKind, code: &'static str, message: impl Into<String>) -> Self {
+    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
-            kind,
             code,
             message: message.into(),
             hint: None,
         }
-    }
-
-    pub fn general(code: &'static str, message: impl Into<String>) -> Self {
-        Self::new(ErrorKind::General, code, message)
-    }
-
-    pub fn argument(code: &'static str, message: impl Into<String>) -> Self {
-        Self::new(ErrorKind::Argument, code, message)
-    }
-
-    pub fn input(code: &'static str, message: impl Into<String>) -> Self {
-        Self::new(ErrorKind::Input, code, message)
-    }
-
-    pub fn processing(code: &'static str, message: impl Into<String>) -> Self {
-        Self::new(ErrorKind::Processing, code, message)
     }
 
     /// 回復のための手がかりを添える。
@@ -69,14 +196,18 @@ impl Error {
         self
     }
 
+    pub fn kind(&self) -> ErrorKind {
+        self.code.kind()
+    }
+
     pub fn exit_code(&self) -> i32 {
-        self.kind.exit_code()
+        self.code.kind().exit_code()
     }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.code, self.message)?;
+        write!(f, "{}: {}", self.code.as_str(), self.message)?;
         if let Some(hint) = &self.hint {
             write!(f, " ({hint})")?;
         }
@@ -88,7 +219,7 @@ impl std::error::Error for Error {}
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
-        Error::general("IO_ERROR", e.to_string())
+        Error::new(ErrorCode::IoError, e.to_string())
     }
 }
 
@@ -108,7 +239,7 @@ mod tests {
 
     #[test]
     fn hint_is_included_in_display() {
-        let e = Error::input("NOT_FOUND", "見つからない").with_hint("パスを確認");
-        assert_eq!(e.to_string(), "NOT_FOUND: 見つからない (パスを確認)");
+        let e = Error::new(ErrorCode::InputUnreadable, "見つからない").with_hint("パスを確認");
+        assert_eq!(e.to_string(), "INPUT_UNREADABLE: 見つからない (パスを確認)");
     }
 }

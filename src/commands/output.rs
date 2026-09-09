@@ -7,21 +7,21 @@ use image::RgbaImage;
 
 use crate::cli::OutputOpts;
 use crate::cutout::{BackgroundEstimate, SubjectHint};
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::{LoadedImage, OutputFormat, SaveOptions, encode, save};
 use crate::report::{
     BackgroundReport, Dimensions, OutputReport, PerimeterDeltaE, PerimeterTexture, ProcessReport,
-    SubjectReport,
+    SCHEMA_VERSION, SubjectReport,
 };
-use crate::warning::Warning;
+use crate::warning::{Warning, WarningCode};
 
 /// 明示指定がなければ拡張子から出力形式を決める。
 pub fn resolve_format(opts: &OutputOpts) -> Result<OutputFormat> {
     opts.format
         .or_else(|| OutputFormat::from_path(&opts.output))
         .ok_or_else(|| {
-            Error::argument(
-                "UNKNOWN_OUTPUT_FORMAT",
+            Error::new(
+                ErrorCode::UnknownOutputFormat,
                 format!(
                     "{} の拡張子から出力形式を判別できません",
                     opts.output.display()
@@ -47,7 +47,7 @@ pub fn ensure_writable(opts: &OutputOpts) -> Result<Option<Warning>> {
     }
     Ok(Some(
         Warning::new(
-            "DRY_RUN_OUTPUT_EXISTS",
+            WarningCode::DryRunOutputExists,
             format!(
                 "{} は既に存在します。dry-run なので書いていませんが、本番実行は上書きを拒みます",
                 opts.output.display()
@@ -63,8 +63,8 @@ pub fn ensure_writable(opts: &OutputOpts) -> Result<Option<Warning>> {
 /// 付随物だからと素通しにすると、利用者のファイルを黙って壊しうる。
 pub fn ensure_path_writable(path: &Path, force: bool) -> Result<()> {
     if path.exists() && !force {
-        return Err(Error::argument(
-            "OUTPUT_EXISTS",
+        return Err(Error::new(
+            ErrorCode::OutputExists,
             format!("{} は既に存在します", path.display()),
         )
         .with_hint("--force を付けると上書きします"));
@@ -172,6 +172,7 @@ pub fn finish(
     warnings.extend(save_warnings);
 
     Ok(ProcessReport {
+        schema_version: SCHEMA_VERSION,
         input: input.display().to_string(),
         source: Dimensions {
             width: loaded.width(),

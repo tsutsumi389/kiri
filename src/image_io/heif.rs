@@ -8,7 +8,7 @@
 //! 落ちる。原因が HEIC だと分からないメッセージでは、エージェントは
 //! 別の拡張子を試すような無駄な再試行に入る。
 
-use crate::error::Error;
+use crate::error::{Error, ErrorCode};
 
 /// ISO 基本メディアファイルのブランド分類。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,8 +52,8 @@ pub fn unsupported(family: Family) -> Error {
         Family::Heif => ("HEIC/HEIF", "heic", "libheif の heif-convert"),
         Family::Avif => ("AVIF", "avif", "libavif の avifdec"),
     };
-    Error::input(
-        "UNSUPPORTED_FORMAT",
+    Error::new(
+        ErrorCode::UnsupportedFormat,
         format!("{what} は入力として未対応です（pure Rust の HEVC/AV1 デコーダが無いため）"),
     )
     .with_hint(format!(
@@ -126,7 +126,7 @@ mod tests {
             (Family::Avif, "avif", "heic"),
         ] {
             let err = unsupported(family);
-            assert_eq!(err.code, "UNSUPPORTED_FORMAT");
+            assert_eq!(err.code.as_str(), "UNSUPPORTED_FORMAT");
             assert_eq!(err.exit_code(), 3, "入力ファイル異常として扱う");
             let hint = err.hint.unwrap();
             assert!(hint.contains("sips"), "macOS 向けの手順が要る: {hint}");

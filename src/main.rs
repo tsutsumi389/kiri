@@ -12,10 +12,10 @@ use serde::Serialize;
 use kiri::cli::{Cli, Command};
 use kiri::commands;
 use kiri::cutout::{Confidence, bbox_argument};
-use kiri::error::{Error, ErrorKind, Result};
+use kiri::error::{Error, ErrorCode, ErrorKind, Result};
 use kiri::report::{
     BackgroundReport, BatchReport, CutoutReport, ErrorReport, InfoReport, ProcessReport,
-    SubjectReport,
+    SchemaReport, SubjectReport,
 };
 use kiri::warning::Warning;
 
@@ -74,6 +74,14 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                 print_cutout(&report);
             }
         }
+        Command::Schema => {
+            let report = commands::schema::run();
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                print_schema(&report);
+            }
+        }
         Command::Batch(args) => {
             let report = commands::batch::run(args)?;
             if cli.json {
@@ -90,9 +98,63 @@ fn dispatch(cli: &Cli) -> Result<i32> {
     Ok(0)
 }
 
+/// 契約の人間向け要約。
+///
+/// **オプションの一覧はここに出さない。** 7 コマンド分を並べると 100 行を超えて
+/// 読めなくなるし、人間には `--help` という専用の入口がある。テキスト出力で
+/// 価値があるのは「どんな code が返りうるか」の見通しで、これは `--help` の
+/// どこにも無い。完全な契約は `--json` が返す。
+fn print_schema(report: &SchemaReport) {
+    println!(
+        "kiri {}  (schema {})",
+        report.kiri_version, report.schema_version
+    );
+
+    println!("\nexit code");
+    for e in &report.exit_codes {
+        println!("  {}  {}", e.code, e.meaning);
+    }
+
+    let width = |codes: Vec<&str>| codes.iter().map(|c| c.chars().count()).max().unwrap_or(0);
+
+    println!("\n警告 ({})", report.warnings.len());
+    let w = width(report.warnings.iter().map(|e| e.code.as_str()).collect());
+    for e in &report.warnings {
+        println!("  {:<w$}  {}", e.code.as_str(), e.summary, w = w);
+    }
+
+    println!("\nエラー ({})", report.errors.len());
+    let w = width(report.errors.iter().map(|e| e.code.as_str()).collect());
+    for e in &report.errors {
+        println!(
+            "  {:<w$}  [{}]  {}",
+            e.code.as_str(),
+            e.exit_code,
+            e.summary,
+            w = w
+        );
+    }
+
+    if !report.global_options.is_empty() {
+        let names: Vec<&str> = report
+            .global_options
+            .iter()
+            .map(|o| o.name.as_str())
+            .collect();
+        println!("\n全コマンドで受ける  {}", names.join("  "));
+    }
+
+    println!("\nコマンド");
+    for c in &report.commands {
+        println!("  {:<9}{}", c.name, c.about.as_deref().unwrap_or(""));
+    }
+
+    println!("\nオプションの既定値と綴りは --json が返す（kiri schema --json）");
+}
+
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
     let text = serde_json::to_string_pretty(value)
-        .map_err(|e| Error::general("JSON_ENCODE_FAILED", e.to_string()))?;
+        .map_err(|e| Error::new(ErrorCode::JsonEncodeFailed, e.to_string()))?;
     println!("{text}");
     Ok(())
 }
@@ -284,7 +346,12 @@ fn print_batch(report: &BatchReport) {
             }
             (_, Some(e)) => {
                 println!("x {}  失敗", item.input);
-                eprintln!("  エラー [{}]: {}: {}", item.input, e.code, e.message);
+                eprintln!(
+                    "  エラー [{}]: {}: {}",
+                    item.input,
+                    e.code.as_str(),
+                    e.message
+                );
             }
             _ => {}
         }

@@ -6,17 +6,29 @@
 use serde::Serialize;
 
 use crate::cutout::Confidence;
-use crate::error::Error;
-use crate::warning::Warning;
+use crate::error::{Error, ErrorCode};
+use crate::warning::{Warning, WarningCode};
+
+/// 結果 JSON の契約の版。
+///
+/// **キーが増えただけでは上げない。** 既存のキーの意味や型が変わったとき、
+/// つまり今までの読み方が誤読になるときだけ上げる。エージェントは自分が知って
+/// いる版と違えば、README を引き直すか、値の解釈を保留できる。
+///
+/// 版を名乗らないと、契約が動いたときに古い読み手が黙って誤読する。
+/// **黙って間違えるのが最も高くつく**ので、成功にも失敗にも必ず添える。
+pub const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Serialize)]
 pub struct ErrorReport {
+    /// 契約の版。`SCHEMA_VERSION` を参照
+    pub schema_version: u32,
     pub error: ErrorBody,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ErrorBody {
-    pub code: &'static str,
+    pub code: ErrorCode,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
@@ -35,6 +47,7 @@ impl From<&Error> for ErrorBody {
 impl From<&Error> for ErrorReport {
     fn from(e: &Error) -> Self {
         ErrorReport {
+            schema_version: SCHEMA_VERSION,
             error: ErrorBody {
                 code: e.code,
                 message: e.message.clone(),
@@ -120,6 +133,8 @@ pub struct SubjectReport {
 
 #[derive(Debug, Serialize)]
 pub struct InfoReport {
+    /// 契約の版。`SCHEMA_VERSION` を参照
+    pub schema_version: u32,
     pub input: String,
     pub width: u32,
     pub height: u32,
@@ -171,6 +186,8 @@ pub struct RotateReport {
 
 #[derive(Debug, Serialize)]
 pub struct ProcessReport {
+    /// 契約の版。`SCHEMA_VERSION` を参照
+    pub schema_version: u32,
     pub input: String,
     pub source: Dimensions,
     pub outputs: Vec<OutputReport>,
@@ -273,6 +290,8 @@ pub struct SettingsReport {
 
 #[derive(Debug, Serialize)]
 pub struct CutoutReport {
+    /// 契約の版。`SCHEMA_VERSION` を参照
+    pub schema_version: u32,
     pub input: String,
     pub source: Dimensions,
     pub outputs: Vec<OutputReport>,
@@ -320,6 +339,8 @@ pub struct BatchItemReport {
 
 #[derive(Debug, Serialize)]
 pub struct BatchReport {
+    /// 契約の版。`SCHEMA_VERSION` を参照
+    pub schema_version: u32,
     pub spec: String,
     pub total: usize,
     pub succeeded: usize,
@@ -330,4 +351,78 @@ pub struct BatchReport {
     pub dry_run: bool,
     pub elapsed_ms: u128,
     pub results: Vec<BatchItemReport>,
+}
+
+/// `kiri schema` が返す契約そのもの。
+///
+/// README は 1000 行あり、エージェントの文脈に丸ごと載せられる長さではない。
+/// **オプションの綴りと既定値、code の意味、exit code だけを機械可読で配る。**
+/// 中身はすべて実装（clap のパーサと 2 つのカタログ）から組み立てるので、
+/// 手で書いた表のように実装から離れることがない。
+#[derive(Debug, Serialize)]
+pub struct SchemaReport {
+    pub schema_version: u32,
+    pub kiri_version: &'static str,
+    pub exit_codes: Vec<ExitCodeEntry>,
+    pub errors: Vec<ErrorCodeEntry>,
+    pub warnings: Vec<WarningCodeEntry>,
+    /// どのサブコマンドでも受けるオプション。**コマンド側には重複させない。**
+    /// clap のグローバル引数はサブコマンドの引数一覧に現れないので、
+    /// 素直に組むと schema から丸ごと落ちる
+    pub global_options: Vec<ArgEntry>,
+    pub commands: Vec<CommandEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExitCodeEntry {
+    pub code: i32,
+    pub meaning: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ErrorCodeEntry {
+    pub code: ErrorCode,
+    /// この失敗で返る exit code。code から一意に決まる
+    pub exit_code: i32,
+    pub summary: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WarningCodeEntry {
+    pub code: WarningCode,
+    pub summary: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CommandEntry {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub about: Option<String>,
+    /// 位置引数。並び順は指定する順序と同じ
+    pub arguments: Vec<ArgEntry>,
+    pub options: Vec<ArgEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ArgEntry {
+    /// 位置引数なら名前、オプションなら `--long` の形
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub short: Option<String>,
+    pub required: bool,
+    /// 値を取るか。false ならフラグ
+    pub takes_value: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_name: Option<String>,
+    /// 既定値。**「未指定」と「明示」を区別する項目は null になる。**
+    /// キーごと消さないのは、null と「既定値が無い」を同じ形にしないため
+    pub default: Option<String>,
+    /// 複数回指定できるか（`--fg-seed` など）
+    pub repeatable: bool,
+    /// どのサブコマンドでも受けるか（`--json`）
+    pub global: bool,
+    pub summary: String,
+    /// 長い説明。**指定の前に知っていないと選びようがないこと**が書いてある
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }

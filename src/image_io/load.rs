@@ -9,9 +9,9 @@ use exif::{In, Tag};
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, RgbaImage};
 
 use crate::color::icc::{self, Interpretation};
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::heif;
-use crate::warning::Warning;
+use crate::warning::{Warning, WarningCode};
 
 /// 読み込み時の振る舞い。
 #[derive(Debug, Clone, Copy)]
@@ -76,8 +76,8 @@ pub fn load(path: &Path) -> Result<LoadedImage> {
 
 pub fn load_with(path: &Path, opts: &LoadOptions) -> Result<LoadedImage> {
     let bytes = std::fs::read(path).map_err(|e| {
-        Error::input(
-            "INPUT_UNREADABLE",
+        Error::new(
+            ErrorCode::InputUnreadable,
             format!("{} を読めません: {e}", path.display()),
         )
         .with_hint("パスと読み取り権限を確認してください")
@@ -92,19 +92,19 @@ pub fn load_with(path: &Path, opts: &LoadOptions) -> Result<LoadedImage> {
 
     let reader = ImageReader::new(std::io::Cursor::new(&bytes))
         .with_guessed_format()
-        .map_err(|e| Error::input("INPUT_UNREADABLE", e.to_string()))?;
+        .map_err(|e| Error::new(ErrorCode::InputUnreadable, e.to_string()))?;
 
     let format = reader.format().ok_or_else(|| {
-        Error::input(
-            "UNSUPPORTED_FORMAT",
+        Error::new(
+            ErrorCode::UnsupportedFormat,
             format!("{} の形式を判別できません", path.display()),
         )
         .with_hint("対応入力形式は JPEG と PNG です")
     })?;
 
     if !matches!(format, ImageFormat::Jpeg | ImageFormat::Png) {
-        return Err(Error::input(
-            "UNSUPPORTED_FORMAT",
+        return Err(Error::new(
+            ErrorCode::UnsupportedFormat,
             format!("{format:?} は入力として未対応です"),
         )
         .with_hint("対応入力形式は JPEG と PNG です"));
@@ -112,7 +112,7 @@ pub fn load_with(path: &Path, opts: &LoadOptions) -> Result<LoadedImage> {
 
     let mut decoder = reader
         .into_decoder()
-        .map_err(|e| Error::input("INPUT_DECODE_FAILED", e.to_string()))?;
+        .map_err(|e| Error::new(ErrorCode::InputDecodeFailed, e.to_string()))?;
 
     let icc = decoder
         .icc_profile()
@@ -122,7 +122,7 @@ pub fn load_with(path: &Path, opts: &LoadOptions) -> Result<LoadedImage> {
     let icc_profile = icc.is_some();
 
     let dynamic = DynamicImage::from_decoder(decoder)
-        .map_err(|e| Error::input("INPUT_DECODE_FAILED", e.to_string()))?;
+        .map_err(|e| Error::new(ErrorCode::InputDecodeFailed, e.to_string()))?;
 
     let (exif_orientation, exif_color_space) = read_exif(&bytes);
     let (image, orientation_applied) = apply_orientation(dynamic, exif_orientation);
@@ -174,7 +174,7 @@ fn normalize_color(
                 // 伝えるしかなく、次の一手も「変換して渡し直す」以外に無い
                 warnings: vec![
                     Warning::new(
-                        "COLOR_SPACE_UNCALIBRATED",
+                        WarningCode::ColorSpaceUncalibrated,
                         "入力の色空間が uncalibrated です（AdobeRGB の可能性）。ICC も\
                          埋め込まれていないため sRGB として扱います",
                     )
@@ -224,7 +224,7 @@ fn normalize_color(
                 }
             } else {
                 let mut warning = Warning::new(
-                    "COLOR_CONVERSION_SKIPPED",
+                    WarningCode::ColorConversionSkipped,
                     format!(
                         "ICC プロファイル {label} を検出しましたが、--no-color-convert のため \
                          sRGB へ変換していません"
@@ -243,7 +243,7 @@ fn normalize_color(
         }
         Interpretation::Unsupported => {
             let mut warning = Warning::new(
-                "COLOR_PROFILE_UNSUPPORTED",
+                WarningCode::ColorProfileUnsupported,
                 format!("ICC プロファイル {label} は変換に対応していないため sRGB として扱います"),
             );
             if let Some(n) = &profile {
@@ -388,7 +388,7 @@ mod tests {
         std::fs::write(&path, heic).unwrap();
 
         let err = load(&path).err().expect("HEIC は断るべき");
-        assert_eq!(err.code, "UNSUPPORTED_FORMAT");
+        assert_eq!(err.code.as_str(), "UNSUPPORTED_FORMAT");
         assert_eq!(err.exit_code(), 3);
         assert!(err.hint.unwrap().contains("sips"));
     }
@@ -493,7 +493,7 @@ mod tests {
         assert_eq!(loaded.color_space, "Display P3");
         let warnings = loaded.warnings();
         assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].code, "COLOR_PROFILE_UNSUPPORTED");
+        assert_eq!(warnings[0].code.as_str(), "COLOR_PROFILE_UNSUPPORTED");
         assert!(
             warnings[0].message.contains("変換に対応していない"),
             "{warnings:?}"

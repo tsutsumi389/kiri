@@ -4,7 +4,7 @@ AIエージェントから使われることを前提とした、EC商品画像�
 
 単色背景の商品写真を対象に、背景透過の切り抜き・リサイズ・回転・キャンバス配置・Web配信形式への変換を1コマンドで行う。
 
-> **開発中です。** 主要なコマンドは一通り動作します（`info` / `convert` / `resize` / `rotate` / `cutout` / `batch`）。
+> **開発中です。** 主要なコマンドは一通り動作します（`info` / `convert` / `resize` / `rotate` / `cutout` / `batch` / `schema`）。
 > 残るは README の整備、実素材での既定値の再調整、リリース用 CI です。
 > 進捗は [docs/implementation-plan.md](docs/implementation-plan.md) を参照してください。
 
@@ -12,6 +12,8 @@ AIエージェントから使われることを前提とした、EC商品画像�
 
 - **依存ゼロの単一バイナリ** — Python環境も外部ツールもMLモデルも不要。pure Rust で完結する
 - **AIエージェント向けの構造化I/O** — `--json` で結果を返し、stdout はJSONのみ、ログは stderr に分離
+- **契約を自分で配る** — `kiri schema` がオプションと警告・エラー code の一覧を返す。README を読ませなくてよい
+- **書かずに試せる** — `--dry-run` は成果物を 1 バイトも変えずに、書いたときと同じ結果を返す
 - **決定的な動作** — 同じ入力からは常に同じ出力が得られる
 - **AVIF出力** — Web配信に適した形式。1000×1000 を約57msでエンコードする
 
@@ -22,6 +24,73 @@ cargo install --path .
 ```
 
 ## 使い方
+
+### kiri schema
+
+オプションと code の一覧を返す。**エージェントが最初に読むのはこれ。**
+
+```
+$ kiri schema --json
+{
+  "schema_version": 1,
+  "kiri_version": "0.1.0",
+  "exit_codes": [{ "code": 0, "meaning": "成功" }, ...],
+  "errors":   [{ "code": "OUTPUT_EXISTS",  "exit_code": 2, "summary": "出力先が既に存在する。--force が要る" }, ...],
+  "warnings": [{ "code": "LOW_UNIFORMITY", "summary": "背景の均一度が低い（単色背景ではない）" }, ...],
+  "global_options": [{ "name": "--json", "global": true, "takes_value": false, ... }],
+  "commands": [
+    {
+      "name": "cutout",
+      "about": "背景を透過して商品を切り抜く",
+      "arguments": [{ "name": "input", "required": true, ... }],
+      "options": [
+        { "name": "--tolerance", "default": "12", "takes_value": true, "summary": "背景色との色差(ΔE)の許容量..." },
+        { "name": "--edge-threshold", "default": null, ... }
+      ]
+    }, ...
+  ]
+}
+```
+
+**この README は 1000 行ある。** 文脈に丸ごと載せられる長さではないし、載せたところで
+オプションの綴りと既定値は散文の中に埋まっている。必要なのは「どう呼ぶか」と
+「返ってきた code が何を意味するか」だけなので、それを 1 コマンドで配る。
+
+- `commands[].options[]` は **clap のパーサそのものから組み立てる。** 手で書いた一覧は
+  必ず実装から離れ、離れた一覧は「指定したのに効かない」という最も追いにくい失敗を招く
+- **`default` が `null` の項目は既定値を名乗らない。** `--edge-threshold` は「未指定」と
+  「8 を明示」を区別するので、ここに 8 が出てはならない。出れば「指定しなくても 8 が
+  効く」という誤った前提がそのまま行動に変わる
+- `errors[].exit_code` は code から一意に決まる。**同じ code が場所によって違う番号を
+  返すことはない。**「この失敗なら何番」で分岐が書ける
+- `warnings[]` / `errors[]` は実装と同じ表から生成される。警告もエラーもそこへ足す以外に
+  作る方法が無いので、**載っていない code が飛んでくることは構造的に起こらない**
+- `detail` は `--help` の長い説明。**指定の前に知っていないと選びようがないこと**が
+  書いてある（90 度単位だけが無劣化、など）。無ければキーごと消える
+
+全体で 36KB ある。必要な節だけ引くとよい。
+
+```
+$ kiri schema --json | jq '.warnings'
+$ kiri schema --json | jq '.commands[] | select(.name == "cutout") | .options'
+```
+
+`--json` を付けなければ人間向けの要約を返す（他のコマンドと同じ規約）。そちらには
+オプションの一覧を出さない。7 コマンド分を並べると読めなくなるし、人間には `--help`
+という専用の入口がある。テキストで価値があるのは「どんな code が返りうるか」の
+見通しで、これは `--help` のどこにも無い。
+
+#### schema_version
+
+結果 JSON はすべて `schema_version` を名乗る。**失敗の JSON も同じ。**
+
+```json
+{ "schema_version": 1, "error": { "code": "NOT_FOUND", "message": "..." } }
+```
+
+**キーが増えただけでは上げない。** 既存のキーの意味や型が変わったとき、つまり
+今までの読み方が誤読になるときだけ上げる。版を名乗らなければ、契約が動いたときに
+古い読み手が黙って誤読する。**黙って間違えるのが最も高くつく。**
 
 ### kiri info
 
@@ -798,6 +867,9 @@ refine 済みの鮮鋭な輪郭はちょうど 1.00 になり、**1〜3 なら�
 | `COLOR_CONVERSION_SKIPPED` | `--no-color-convert` により変換していない |
 | `COLOR_SPACE_UNCALIBRATED` | EXIF が uncalibrated で ICC も無い |
 
+この表は `kiri schema --json` の `warnings[]` が同じものを返す。**README を読ませる
+代わりにそれを引けばよい。**
+
 #### 「見切れ」と「bbox が要る」を取り違えないために
 
 `touches_edge` が `true` でも、それが**商品の見切れとは限らない**。
@@ -975,6 +1047,7 @@ $ kiri batch spec.json --json
 
 想定している流れはこう。
 
+0. `kiri schema --json` で呼び方と code の意味を引く（初回のみ）
 1. AI が対象画像を `kiri info` で確認し、仕様 JSON を書き出す。
    `uniformity` が低い画像では `subject.confidence` を見て、`high` なら
    `subject.normalized_bbox` をその項目の `bbox` に入れる
@@ -1057,7 +1130,8 @@ sRGB へ変換するので、そこで色が転ぶことはない。
 | 3 | 入力ファイル異常 |
 | 4 | 処理失敗 |
 
-`--json` 指定時はエラーも JSON で stdout に返る。
+`--json` 指定時はエラーも JSON で stdout に返る。**code と exit code の対応は
+`kiri schema --json` の `errors[]` が返す**（35 種ある）。
 
 ```json
 { "error": { "code": "OUTPUT_EXISTS", "message": "...", "hint": "--force を付けると上書きします" } }

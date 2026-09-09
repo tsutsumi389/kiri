@@ -19,7 +19,7 @@ use crate::transform::rotate::{self, RotateSpec};
 pub fn run(args: &RotateArgs) -> Result<ProcessReport> {
     let started = Instant::now();
     let format = output::resolve_format(&args.out)?;
-    output::ensure_writable(&args.out)?;
+    let overwrite_warning = output::ensure_writable(&args.out)?;
 
     let loaded = load::load_with(&args.input, &args.color.to_load_options())?;
     let source = (loaded.width(), loaded.height());
@@ -28,6 +28,9 @@ pub fn run(args: &RotateArgs) -> Result<ProcessReport> {
     let plan = rotate::plan(source, &spec)?;
     let rotated = rotate::apply(&loaded.image, &plan)?;
 
+    let mut warnings = loaded.warnings();
+    warnings.extend(overwrite_warning);
+
     let mut report = output::finish(
         &args.input,
         &loaded,
@@ -35,7 +38,7 @@ pub fn run(args: &RotateArgs) -> Result<ProcessReport> {
         &args.out,
         format,
         started,
-        loaded.warnings(),
+        warnings,
     )?;
 
     // 「何度回ったか」は出力寸法からは読み取れない（180 度は寸法が変わらず、

@@ -153,10 +153,19 @@ fn print_info(report: &InfoReport) {
     print_warnings(&report.warnings);
 }
 
+/// dry-run の行頭に付ける印。
+///
+/// 人間向けの出力でも「書いていない」を最初に言う。パスとバイト数だけが
+/// 並んでいると、ファイルが出来ている前提で次の作業に移ってしまう。
+fn dry_run_prefix(dry_run: bool) -> &'static str {
+    if dry_run { "[dry-run] " } else { "" }
+}
+
 fn print_process(report: &ProcessReport) {
     for out in &report.outputs {
         println!(
-            "{}  {}x{}  {}  {}  ({} ms)",
+            "{}{}  {}x{}  {}  {}  ({} ms)",
+            dry_run_prefix(report.dry_run),
             out.path,
             out.width,
             out.height,
@@ -193,7 +202,8 @@ fn print_cutout(report: &CutoutReport) {
     let [r, g, b] = report.background.rgb;
     for out in &report.outputs {
         println!(
-            "{}  {}x{}  {}  {}  ({} ms)",
+            "{}{}  {}x{}  {}  {}  ({} ms)",
+            dry_run_prefix(report.dry_run),
             out.path,
             out.width,
             out.height,
@@ -252,8 +262,11 @@ fn print_batch(report: &BatchReport) {
             (Some(r), _) => {
                 let out = &r.outputs[0];
                 let mark = if r.warnings.is_empty() { " " } else { "!" };
+                // 行そのものにも印を付ける。サマリは数百行の後ろにあり、
+                // 途中の 1 行だけを見た目には成果物が出来ているように読める
                 println!(
-                    "{mark} {}  {}x{}  {}",
+                    "{mark} {}{}  {}x{}  {}",
+                    dry_run_prefix(r.dry_run),
                     item.output,
                     out.width,
                     out.height,
@@ -277,8 +290,13 @@ fn print_batch(report: &BatchReport) {
         }
     }
     println!(
-        "\n{} 件中 {} 件成功、{} 件失敗、{} 件に警告  ({} ms)",
-        report.total, report.succeeded, report.failed, report.with_warnings, report.elapsed_ms
+        "\n{}{} 件中 {} 件成功、{} 件失敗、{} 件に警告  ({} ms)",
+        dry_run_prefix(report.dry_run),
+        report.total,
+        report.succeeded,
+        report.failed,
+        report.with_warnings,
+        report.elapsed_ms
     );
 }
 

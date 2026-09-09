@@ -291,6 +291,7 @@ $ kiri convert product.jpg -o product.avif --json
 | `--background` | `#FFFFFF` | 透過を保持できない形式へ出力する際の合成色 |
 | `--no-color-convert` | | 埋め込み ICC を解釈せず、画素の値をそのまま使う |
 | `--force` | | 出力先が既に存在する場合に上書きする |
+| `--dry-run` | | 書き出さずに結果だけ返す |
 
 ### kiri resize
 
@@ -336,6 +337,7 @@ $ kiri resize small.jpg -o out.avif --width 3000 --json
 | `--flatten` | | 透過を残さず `--background` の色で塗り潰す |
 | `--no-color-convert` | | 埋め込み ICC を解釈せず、画素の値をそのまま使う |
 | `--force` | | 出力先が既に存在する場合に上書きする |
+| `--dry-run` | | 書き出さずに結果だけ返す |
 
 ### kiri rotate
 
@@ -420,6 +422,7 @@ rotated.jpg  2386x2533  jpeg  688.4 KB  (78 ms)
 | `--flatten` | | 透過を残さず `--background` の色で塗り潰す |
 | `--no-color-convert` | | 埋め込み ICC を解釈せず、画素の値をそのまま使う |
 | `--force` | | 出力先が既に存在する場合に上書きする |
+| `--dry-run` | | 書き出さずに結果だけ返す |
 
 **`batch` はまだ回転を受け付けない。** `batch` の spec は `cutout` の設定を
 並べるもので、回転はそこに無い。一括で回すなら `rotate` を個別に呼ぶこと。
@@ -461,6 +464,8 @@ product.png  1600x2000  png  841.4 KB  (338 ms)
 | `--preview PATH` | — | 「元画像 \| マスク \| 結果」を1枚に並べた検証用画像を書き出す |
 | `--preview-size` | 512 | プレビューのパネル1枚あたりの長辺(px) |
 | `--no-preview-grid` | | プレビューの元画像に座標グリッドを重ねない |
+| `--force` | | 出力先が既に存在する場合に上書きする |
+| `--dry-run` | | 書き出さずに結果だけ返す |
 
 #### 仕組み
 
@@ -785,6 +790,7 @@ refine 済みの鮮鋭な輪郭はちょうど 1.00 になり、**1〜3 なら�
 | `HALO_REMAINS` | 境界に背景色のままの縁が残っている。`--tolerance` を上げると減る |
 | `EDGE_THRESHOLD_RAISED` | 背景のテクスチャに合わせて堤防を引き上げた |
 | `CANVAS_UPSCALED` | キャンバス配置で商品を拡大した |
+| `DRY_RUN_OUTPUT_EXISTS` | `--dry-run` の出力先が既にある。本番実行には `--force` が要る |
 | `UPSCALED` | `resize` で拡大した |
 | `ALPHA_FLATTENED` | 出力形式が透過を保持できないので合成した |
 | `PREVIEW_FAILED` | プレビューを書き出せなかった（成果物自体は書けている） |
@@ -864,6 +870,43 @@ $ kiri cutout product.jpg -o product.png --preview check.png
 検証用の付随物を理由にエラーを返すと、「成果物は書けているのにエラー」となって
 エージェントが再実行し、今度は `OUTPUT_EXISTS` で二重に詰まるためである。
 
+#### 書き出さずに試す
+
+`--dry-run` は成果物を書かずに、書いたときと同じ結果 JSON を返す。
+
+```
+$ kiri cutout product.jpg -o product.png --tolerance 18 --dry-run --json
+{
+  "dry_run": true,
+  "outputs": [{ "path": "product.png", "format": "png", "width": 1600, "height": 2000, "bytes": 861432 }],
+  "mask": { "foreground_ratio": 0.2164, "separability": 68.3, "halo_ratio": 0.0, "edge_width": 1.0 },
+  "warnings": []
+}
+```
+
+**救済フェーズは同じ画像へ何度もパラメータを振る。** そのたびに本番のパスへ書かせると、
+失敗した試行が納品物を上書きする。成果物を守るために `--force` を常用させるのは順序が
+逆で、探索そのものが書かなければよい。
+
+- **エンコードまでは実際に行う。** `bytes` は見積もりではなく実測値で、品質と形式の
+  判断を本番実行なしに下せる。`ALPHA_FLATTENED` のような書き出し由来の警告も同じに出る
+- **`--preview` と `--debug-mask` は書き出す。** 本出力は成果物だが、この 2 つは検証用の
+  付随物である。**「本番を壊さずに目で確かめる」ことこそ dry-run の用途**なので、
+  ここで書かないと `--dry-run` と `--preview` が併用できず、目視のたびに納品物を潰す
+- **上書き検査をしない。** 1 バイトも書かない実行を止める理由が無いため。ただし本番実行
+  なら `OUTPUT_EXISTS` で落ちていた場合は `DRY_RUN_OUTPUT_EXISTS` で先に知らせる。
+  黙って通すと、dry-run の成功を見て本番へ進んだ AI がそこで初めて詰まる
+- **`dry_run` キーは常に出す。** 省いて「無ければ書いた」にすると、古いバージョンで
+  走った結果と書いた結果が同じ形になり、成果物が無いのにあるものとして次へ進む事故を
+  防げない
+
+`batch` にも同じフラグがある。数百点の spec を本番へ流す前に、警告の出る項目だけを
+洗い出せる。
+
+```
+$ kiri batch spec.json --dry-run --json
+```
+
 ### kiri batch
 
 仕様ファイルに従って複数の画像を一括処理する。**AI エージェントから使う際の本命はこれ。**
@@ -908,6 +951,7 @@ x broken.jpg  失敗
 | `--base-dir DIR` | 仕様ファイルの場所 | 相対パスの基準ディレクトリ |
 | `--jobs N` | CPU数 | 並列実行数 |
 | `--force` | | 全項目で上書きを許可する |
+| `--dry-run` | | 1 件も書き出さずに全項目の結果だけ返す |
 
 **1件の失敗で全体を止めない。** 数百点を回すバッチでは、失敗を報告しつつ残りを処理し
 切るほうが有用なため。失敗があった場合は終了コード 4 で知らせ、詳細は `results[]` に入る。
@@ -936,7 +980,8 @@ $ kiri batch spec.json --json
    `subject.normalized_bbox` をその項目の `bbox` に入れる
 2. `kiri batch spec.json --json` で一括処理する
 3. 結果の `failed` / `with_warnings` と各項目の `mask.foreground_ratio` を検証する
-4. 失敗した項目だけ `tolerance` や `bbox` を調整して再実行する
+4. 失敗した項目だけ `tolerance` や `bbox` を調整して再実行する。
+   **探索は `--dry-run` で回す**（成功している他の項目の成果物を壊さないため）
 5. それでも直らない項目は `kiri cutout --preview` で画像を見て判断する
 
 `batch` は既定でプレビューを書き出さない。数百点を回す通常の経路では JSON だけで

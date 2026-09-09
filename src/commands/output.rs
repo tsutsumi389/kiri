@@ -8,7 +8,7 @@ use image::RgbaImage;
 use crate::cli::OutputOpts;
 use crate::cutout::{BackgroundEstimate, SubjectHint};
 use crate::error::{Error, Result};
-use crate::image_io::{LoadedImage, OutputFormat, SaveOptions, save};
+use crate::image_io::{LoadedImage, OutputFormat, SaveOptions, encode, save};
 use crate::report::{
     BackgroundReport, Dimensions, OutputReport, PerimeterDeltaE, PerimeterTexture, ProcessReport,
     SubjectReport,
@@ -32,8 +32,30 @@ pub fn resolve_format(opts: &OutputOpts) -> Result<OutputFormat> {
 }
 
 /// 上書きの可否を確認する。重い処理を走らせる前に呼ぶこと。
-pub fn ensure_writable(opts: &OutputOpts) -> Result<()> {
-    ensure_path_writable(&opts.output, opts.force)
+///
+/// `--dry-run` では検査しない。上書き検査は成果物を守るためのもので、
+/// 1 バイトも書かない実行を止める理由が無いためである。**代わりに、本番実行なら
+/// ここで落ちていた事実を警告で返す。** 黙って通すと、エージェントは dry-run の
+/// 成功を見て本番へ進み、`OUTPUT_EXISTS` で二度手間になる。
+pub fn ensure_writable(opts: &OutputOpts) -> Result<Option<Warning>> {
+    if !opts.dry_run {
+        ensure_path_writable(&opts.output, opts.force)?;
+        return Ok(None);
+    }
+    if !opts.output.exists() || opts.force {
+        return Ok(None);
+    }
+    Ok(Some(
+        Warning::new(
+            "DRY_RUN_OUTPUT_EXISTS",
+            format!(
+                "{} は既に存在します。dry-run なので書いていませんが、本番実行は上書きを拒みます",
+                opts.output.display()
+            ),
+        )
+        .with_hint("本番実行には --force が要ります")
+        .with_data("path", opts.output.display().to_string()),
+    ))
 }
 
 /// 本出力以外（プレビュー・デバッグマスク）にも同じ上書き規約を適用する。
@@ -112,16 +134,24 @@ pub fn write_image(
         background: opts.background,
         flatten: opts.flatten,
     };
-    let outcome = save(&opts.output, image, &save_opts)?;
+    // dry-run でもエンコードは通す。`bytes` を見積もりにすると、
+    // 品質と形式の判断が本番実行を挟まないと下せなくなる
+    let (bytes, warnings) = if opts.dry_run {
+        let (encoded, warnings) = encode(image, &save_opts)?;
+        (encoded.len() as u64, warnings)
+    } else {
+        let outcome = save(&opts.output, image, &save_opts)?;
+        (outcome.bytes, outcome.warnings)
+    };
     Ok((
         OutputReport {
             path: opts.output.display().to_string(),
             format: format.as_str().to_string(),
             width: image.width(),
             height: image.height(),
-            bytes: outcome.bytes,
+            bytes,
         },
-        outcome.warnings,
+        warnings,
     ))
 }
 
@@ -151,6 +181,7 @@ pub fn finish(
         color_space: loaded.color_space.clone(),
         color_profile: loaded.color_profile.clone(),
         color_converted: loaded.color_converted,
+        dry_run: opts.dry_run,
         // 回転は rotate コマンドだけが後から埋める
         rotate: None,
         elapsed_ms: started.elapsed().as_millis(),

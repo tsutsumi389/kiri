@@ -26,7 +26,7 @@ pub fn run(args: &BatchArgs) -> Result<BatchReport> {
         let output = batch::resolve(&base, &item.output);
         let settings = item.settings.merged_over(&spec.defaults);
 
-        let outcome = to_cutout_args(&input, &output, &settings, args.force)
+        let outcome = to_cutout_args(&input, &output, &settings, args.force, args.dry_run)
             .and_then(|args| cutout::run(&args));
 
         match outcome {
@@ -70,6 +70,7 @@ pub fn run(args: &BatchArgs) -> Result<BatchReport> {
         succeeded: results.len() - failed,
         failed,
         with_warnings,
+        dry_run: args.dry_run,
         elapsed_ms: started.elapsed().as_millis(),
         results,
     })
@@ -83,6 +84,7 @@ fn to_cutout_args(
     output: &Path,
     settings: &ItemSettings,
     force: bool,
+    dry_run: bool,
 ) -> Result<CutoutArgs> {
     let format = settings
         .format
@@ -149,6 +151,7 @@ fn to_cutout_args(
             background,
             flatten: settings.flatten.unwrap_or(false),
             force,
+            dry_run,
         },
     })
 }
@@ -211,8 +214,14 @@ mod tests {
     #[test]
     fn the_batch_defaults_match_the_library_defaults() {
         let settings = ItemSettings::default();
-        let args = to_cutout_args(Path::new("in.png"), Path::new("out.png"), &settings, false)
-            .expect("既定値だけの項目は解釈できるはず");
+        let args = to_cutout_args(
+            Path::new("in.png"),
+            Path::new("out.png"),
+            &settings,
+            false,
+            false,
+        )
+        .expect("既定値だけの項目は解釈できるはず");
         let defaults = CutoutOptions::default();
 
         assert_eq!(args.tolerance, defaults.tolerance, "tolerance の既定値");

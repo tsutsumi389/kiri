@@ -3803,3 +3803,258 @@ fn cutout_removes_a_cast_shadow_by_default() {
         "既定で影が消えていない: 影あり {removed} / 影判定なし {kept} / 影なし {none}"
     );
 }
+
+// --- dry-run ---
+
+/// `--dry-run` は成果物を書かない。書かないが、書いたときと同じ数値を返す。
+///
+/// 救済フェーズでは同じ画像へ tolerance を何度も振る。そのたびに本番のパスへ
+/// 書かせると、失敗した試行が納品物を上書きする。**成果物を守るために
+/// `--force` を常用させるのは順序が逆で**、探索そのものが書かなければよい。
+#[test]
+fn dry_run_reports_the_result_without_writing_the_output() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_jpeg(dir.path(), "product.jpg", &img);
+    let output = dir.path().join("out.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+
+    assert!(!output.exists(), "--dry-run なのに書き出されている");
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["outputs"][0]["path"], output.to_str().unwrap());
+    // 書かないだけでエンコードまでは実際に行う。バイト数は見積もりではない
+    assert!(
+        v["outputs"][0]["bytes"].as_u64().unwrap() > 0,
+        "bytes が実測値になっていない: {v}"
+    );
+    assert!(v["mask"]["foreground_ratio"].as_f64().unwrap() > 0.0);
+}
+
+/// 書いた実行では `dry_run` が false で出る。
+///
+/// キーを省略して「無ければ書いた」にはしない。エージェントから見て
+/// 「古いバージョンで走った」と「書いた」が同じ形になり、成果物が無いのに
+/// あるものとして次へ進む事故が起きる。
+#[test]
+fn a_real_run_says_dry_run_is_false() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_jpeg(dir.path(), "product.jpg", &img);
+    let output = dir.path().join("out.png");
+
+    let v = json_stdout(
+        &kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+
+    assert_eq!(v["dry_run"], false);
+    assert!(output.exists());
+}
+
+/// 既存の出力があっても `--dry-run` は落ちない。中身も変わらない。
+///
+/// 上書き検査は成果物を守るためのもので、書かない実行を止める理由が無い。
+/// ただし本番実行では `--force` が要る事実は、往復を 1 回減らすために
+/// 警告として先に告げる。
+#[test]
+fn dry_run_leaves_an_existing_output_untouched_and_warns_about_the_real_run() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_jpeg(dir.path(), "product.jpg", &img);
+    let output = dir.path().join("out.png");
+    std::fs::write(&output, b"deliverable").unwrap();
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "既存ファイルがあるだけで dry-run が落ちている: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let v = json_stdout(&out);
+    assert!(has_warning(&v, "DRY_RUN_OUTPUT_EXISTS"), "{v}");
+    assert_eq!(
+        std::fs::read(&output).unwrap(),
+        b"deliverable",
+        "dry-run が既存の成果物を壊している"
+    );
+}
+
+/// `--force` があれば本番実行も通るので、その警告は出さない。
+#[test]
+fn dry_run_with_force_does_not_warn_about_the_existing_output() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_jpeg(dir.path(), "product.jpg", &img);
+    let output = dir.path().join("out.png");
+    std::fs::write(&output, b"deliverable").unwrap();
+
+    let v = json_stdout(
+        &kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--dry-run",
+                "--force",
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+
+    assert!(!has_warning(&v, "DRY_RUN_OUTPUT_EXISTS"), "{v}");
+    assert_eq!(std::fs::read(&output).unwrap(), b"deliverable");
+}
+
+/// プレビューは `--dry-run` でも書く。
+///
+/// 本出力は成果物だが、プレビューは検証用の付随物である。**「本番を壊さずに
+/// 目で確かめる」が救済フェーズそのもの**なので、ここで書かないと
+/// `--dry-run` と `--preview` が併用できず、探索のたびに納品物を潰すことになる。
+#[test]
+fn dry_run_still_writes_the_preview() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_jpeg(dir.path(), "product.jpg", &img);
+    let output = dir.path().join("out.png");
+    let preview = dir.path().join("check.png");
+
+    let v = json_stdout(
+        &kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--preview",
+                preview.to_str().unwrap(),
+                "--dry-run",
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+
+    assert!(!output.exists(), "本出力が書かれている");
+    assert!(preview.exists(), "プレビューが書かれていない");
+    assert_eq!(v["preview"], preview.to_str().unwrap());
+}
+
+/// 出力を伴うコマンドはすべて `--dry-run` を受ける。
+///
+/// cutout だけに付けると、エージェントは「convert では試せない」を
+/// 覚えなければならない。共通オプションは全部で同じ意味を持つべきである。
+#[test]
+fn every_writing_command_accepts_dry_run() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_jpeg(dir.path(), "product.jpg", &img);
+
+    let cases: Vec<(&str, Vec<&str>)> = vec![
+        ("convert", vec![]),
+        ("resize", vec!["--width", "80"]),
+        ("rotate", vec!["--angle", "90"]),
+    ];
+
+    for (command, extra) in cases {
+        let output = dir.path().join(format!("{command}.png"));
+        let mut args = vec![
+            command,
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--dry-run",
+            "--json",
+        ];
+        args.extend_from_slice(&extra);
+
+        let out = kiri().args(&args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{command}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let v = json_stdout(&out);
+
+        assert!(!output.exists(), "{command} が書き出している");
+        assert_eq!(v["dry_run"], true, "{command}: {v}");
+        assert!(
+            v["outputs"][0]["bytes"].as_u64().unwrap() > 0,
+            "{command}: {v}"
+        );
+    }
+}
+
+/// batch も 1 件も書かずに全件の統計を返す。
+///
+/// 数百点の spec を本番へ流す前に、警告の出る項目を洗い出せる必要がある。
+#[test]
+fn batch_dry_run_writes_nothing_but_reports_every_item() {
+    let dir = fixture_dir();
+    batch_fixture(dir.path(), 3);
+    let spec = write_spec(
+        dir.path(),
+        r#"{"defaults":{"canvas":"400x400","format":"png"},
+            "items":[{"input":"p0.png","output":"out/a.png"},
+                     {"input":"p1.png","output":"out/b.png"},
+                     {"input":"p2.png","output":"out/c.png"}]}"#,
+    );
+
+    let out = run_batch(&spec, &["--dry-run"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+
+    assert_eq!(v["total"], 3);
+    assert_eq!(v["succeeded"], 3);
+    assert_eq!(v["dry_run"], true);
+    for name in ["a", "b", "c"] {
+        assert!(
+            !dir.path().join(format!("out/{name}.png")).exists(),
+            "{name} が書き出されている"
+        );
+    }
+    // 項目ごとの結果も「書いていない」と言う。results[] だけを見て回る
+    // エージェントが、成果物があるものとして次へ進まないため
+    assert_eq!(v["results"][0]["result"]["dry_run"], true);
+}

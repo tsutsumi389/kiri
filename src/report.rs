@@ -181,6 +181,11 @@ pub struct ProcessReport {
     pub color_profile: Option<String>,
     /// sRGB へ変換したか
     pub color_converted: bool,
+    /// この実行が実際に書き出したか。`--dry-run` なら true で、`outputs[].path`
+    /// にファイルは無い。**キーは常に出す。** 省いて「無ければ書いた」にすると、
+    /// 古いバージョンで走った結果と書いた結果が同じ形になり、成果物が無いのに
+    /// あるものとして次へ進む事故を防げない
+    pub dry_run: bool,
     /// 回転した場合のみ出す。convert / resize は回さないのでキーごと現れない
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rotate: Option<RotateReport>,
@@ -278,6 +283,11 @@ pub struct CutoutReport {
     pub color_profile: Option<String>,
     /// sRGB へ変換したか
     pub color_converted: bool,
+    /// この実行が実際に書き出したか。`--dry-run` なら true で、`outputs[].path`
+    /// にファイルは無い。**キーは常に出す。** 省いて「無ければ書いた」にすると、
+    /// 古いバージョンで走った結果と書いた結果が同じ形になり、成果物が無いのに
+    /// あるものとして次へ進む事故を防げない
+    pub dry_run: bool,
     pub background: BackgroundReport,
     /// 主体候補。検出できなければ null（キーは常に出す）
     pub subject: Option<SubjectReport>,
@@ -316,6 +326,8 @@ pub struct BatchReport {
     pub failed: usize,
     /// 成功したが警告が付いた項目の数。目視確認の対象になる
     pub with_warnings: usize,
+    /// この実行が実際に書き出したか。項目ごとの結果にも同じものが入る
+    pub dry_run: bool,
     pub elapsed_ms: u128,
     pub results: Vec<BatchItemReport>,
 }

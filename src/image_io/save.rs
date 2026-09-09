@@ -85,7 +85,13 @@ pub struct SaveOutcome {
     pub warnings: Vec<Warning>,
 }
 
-pub fn save(path: &Path, image: &RgbaImage, opts: &SaveOptions) -> Result<SaveOutcome> {
+/// エンコードだけを行い、書き出さない。
+///
+/// `--dry-run` はここで止まる。「書かない」を「何もしない」にはしない。
+/// エンコードまで通しておかないと `bytes` が見積もりになり、品質やサイズを
+/// 決めるための実行に使えなくなる。**書き出しの直前までは同じ道を通る**ので、
+/// `ALPHA_FLATTENED` のような書き出し由来の警告も本番と同じに出る。
+pub fn encode(image: &RgbaImage, opts: &SaveOptions) -> Result<(Vec<u8>, Vec<Warning>)> {
     let mut warnings = Vec::new();
 
     if !(0.0..=100.0).contains(&opts.quality) {
@@ -133,6 +139,12 @@ pub fn save(path: &Path, image: &RgbaImage, opts: &SaveOptions) -> Result<SaveOu
         OutputFormat::Png => encode_png(target)?,
         OutputFormat::Jpeg => encode_jpeg(target, opts)?,
     };
+
+    Ok((encoded, warnings))
+}
+
+pub fn save(path: &Path, image: &RgbaImage, opts: &SaveOptions) -> Result<SaveOutcome> {
+    let (encoded, warnings) = encode(image, opts)?;
 
     // let-chain は Rust 1.88 以降。MSRV 1.85 を保つためネストで書く
     if let Some(parent) = path.parent() {

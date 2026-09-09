@@ -107,6 +107,10 @@ pub struct OutputOpts {
     /// 出力先が既に存在する場合に上書きする
     #[arg(long)]
     pub force: bool,
+
+    /// 書き出さずに結果だけ返す
+    #[arg(long, long_help = DRY_RUN_HELP)]
+    pub dry_run: bool,
 }
 
 #[derive(Args, Debug)]
@@ -188,6 +192,19 @@ fn angle_long_help() -> String {
      回すか」を意味する"
         .to_string()
 }
+
+/// `--dry-run` の長いヘルプ。
+///
+/// **AI エージェントは `--help` を読んで判断する**ので、「何が書かれないか」
+/// だけでなく「何は書かれるか」を書いておかないと、プレビューまで出ないものと
+/// 思い込んで `--dry-run` を諦める。上書き検査を外すことも同様で、
+/// 書かないのに `--force` を足す誤用を生む。
+const DRY_RUN_HELP: &str = "書き出さずに結果だけ返す。成果物は 1 バイトも変わらない。\n\
+     エンコードまでは実際に行うので、outputs[].bytes は見積もりではなく実測値である。\n\
+     --preview と --debug-mask は書き出す。本出力は成果物だが、この 2 つは検証用の\
+     付随物であり、「本番を壊さずに目で確かめる」ことこそ dry-run の用途であるため。\n\
+     出力先が既にあっても失敗しない（書かないので壊しようがない）。ただし本番実行に\
+     --force が要る場合は DRY_RUN_OUTPUT_EXISTS で先に知らせる";
 
 /// `--seal` の上限。
 ///
@@ -383,6 +400,10 @@ pub struct BatchArgs {
     /// 出力先が既に存在する場合に上書きする
     #[arg(long)]
     pub force: bool,
+
+    /// 1 件も書き出さずに全項目の結果だけ返す
+    #[arg(long, long_help = DRY_RUN_HELP)]
+    pub dry_run: bool,
 }
 
 /// `1000x1000` または `1000`（正方形）を受け付ける。

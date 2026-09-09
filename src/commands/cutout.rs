@@ -20,7 +20,7 @@ use crate::warning::Warning;
 pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     let started = Instant::now();
     let format = output::resolve_format(&args.out)?;
-    output::ensure_writable(&args.out)?;
+    let overwrite_warning = output::ensure_writable(&args.out)?;
     let preview_format = check_side_outputs(args)?;
 
     let loaded = load::load_with(&args.input, &args.color.to_load_options())?;
@@ -55,6 +55,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     let debug_mask = write_debug_mask(args.debug_mask.as_ref(), &result.mask)?;
 
     let mut warnings = loaded.warnings();
+    warnings.extend(overwrite_warning);
     warnings.extend(result.warnings.clone());
 
     // キャンバスを使わないときは切り抜き結果をそのまま書き出す。複製すると
@@ -90,6 +91,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         color_space: loaded.color_space.clone(),
         color_profile: loaded.color_profile.clone(),
         color_converted: loaded.color_converted,
+        dry_run: args.out.dry_run,
         background: output::background_report(&result.background),
         subject: result.subject.as_ref().map(output::subject_report),
         settings: SettingsReport {

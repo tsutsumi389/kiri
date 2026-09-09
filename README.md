@@ -4,7 +4,7 @@ AIエージェントから使われることを前提とした、EC商品画像�
 
 単色背景の商品写真を対象に、背景透過の切り抜き・リサイズ・回転・キャンバス配置・Web配信形式への変換を1コマンドで行う。
 
-> **開発中です。** 主要なコマンドは一通り動作します（`info` / `convert` / `resize` / `rotate` / `cutout` / `batch`）。
+> **開発中です。** 主要なコマンドは一通り動作します（`info` / `convert` / `resize` / `rotate` / `cutout` / `batch` / `schema`）。
 > 残るは README の整備、実素材での既定値の再調整、リリース用 CI です。
 > 進捗は [docs/implementation-plan.md](docs/implementation-plan.md) を参照してください。
 
@@ -12,6 +12,8 @@ AIエージェントから使われることを前提とした、EC商品画像�
 
 - **依存ゼロの単一バイナリ** — Python環境も外部ツールもMLモデルも不要。pure Rust で完結する
 - **AIエージェント向けの構造化I/O** — `--json` で結果を返し、stdout はJSONのみ、ログは stderr に分離
+- **契約を自分で配る** — `kiri schema` がオプションと警告・エラー code の一覧を返す。README を読ませなくてよい
+- **書かずに試せる** — `--dry-run` は成果物を 1 バイトも変えずに、書いたときと同じ結果を返す
 - **決定的な動作** — 同じ入力からは常に同じ出力が得られる
 - **AVIF出力** — Web配信に適した形式。1000×1000 を約57msでエンコードする
 
@@ -22,6 +24,77 @@ cargo install --path .
 ```
 
 ## 使い方
+
+### kiri schema
+
+オプションと code の一覧を返す。**エージェントが最初に読むのはこれ。**
+
+```
+$ kiri schema --json
+{
+  "schema_version": 1,
+  "kiri_version": "0.1.0",
+  "exit_codes": [{ "code": 0, "meaning": "成功" }, ...],
+  "errors":   [{ "code": "OUTPUT_EXISTS",  "exit_code": 2, "summary": "出力先が既に存在する。--force が要る" }, ...],
+  "warnings": [{ "code": "LOW_UNIFORMITY", "summary": "背景の均一度が低い（単色背景ではない）" }, ...],
+  "global_options": [{ "name": "--json", "global": true, "takes_value": false, ... }],
+  "commands": [
+    {
+      "name": "cutout",
+      "about": "背景を透過して商品を切り抜く",
+      "arguments": [{ "name": "input", "required": true, ... }],
+      "options": [
+        { "name": "--tolerance", "default": "12", "takes_value": true, "summary": "背景色との色差(ΔE)の許容量..." },
+        { "name": "--edge-threshold", "default": null, ... }
+      ]
+    }, ...
+  ]
+}
+```
+
+**この README は 1000 行ある。** 文脈に丸ごと載せられる長さではないし、載せたところで
+オプションの綴りと既定値は散文の中に埋まっている。必要なのは「どう呼ぶか」と
+「返ってきた code が何を意味するか」だけなので、それを 1 コマンドで配る。
+
+- `commands[].options[]` は **clap のパーサそのものから組み立てる。** 手で書いた一覧は
+  必ず実装から離れ、離れた一覧は「指定したのに効かない」という最も追いにくい失敗を招く
+- **`default` が `null` の項目は既定値を名乗らない。** `--edge-threshold` は「未指定」と
+  「8 を明示」を区別するので、ここに 8 が出てはならない。出れば「指定しなくても 8 が
+  効く」という誤った前提がそのまま行動に変わる
+- `errors[].exit_code` は code から一意に決まる。**同じ code が場所によって違う番号を
+  返すことはない。**「この失敗なら何番」で分岐が書ける
+- `warnings[]` / `errors[]` は実装と同じ表から生成される。警告もエラーもそこへ足す以外に
+  作る方法が無いので、**載っていない code が飛んでくることは構造的に起こらない**
+- `accepts` は受け付ける値の一覧（`--format` なら avif / png / jpeg）。**綴りを外すと
+  clap が code 無しの exit 2 で落ちる**ので、呼ぶ前に知れる必要がある。自由な値を取る
+  項目ではキーごと消える。数値の範囲は clap から読めないため、必要なものは `summary`
+  の文面に書いてある（`--preview-size` は 32-4096）
+- `detail` は `--help` の長い説明。**指定の前に知っていないと選びようがないこと**が
+  書いてある（90 度単位だけが無劣化、など）。無ければキーごと消える
+
+全体で 40KB ある。必要な節だけ引くとよい。
+
+```
+$ kiri schema --json | jq '.warnings'
+$ kiri schema --json | jq '.commands[] | select(.name == "cutout") | .options'
+```
+
+`--json` を付けなければ人間向けの要約を返す（他のコマンドと同じ規約）。そちらには
+オプションの一覧を出さない。7 コマンド分を並べると読めなくなるし、人間には `--help`
+という専用の入口がある。テキストで価値があるのは「どんな code が返りうるか」の
+見通しで、これは `--help` のどこにも無い。
+
+#### schema_version
+
+結果 JSON はすべて `schema_version` を名乗る。**失敗の JSON も同じ。**
+
+```json
+{ "schema_version": 1, "error": { "code": "INPUT_UNREADABLE", "message": "..." } }
+```
+
+**キーが増えただけでは上げない。** 既存のキーの意味や型が変わったとき、つまり
+今までの読み方が誤読になるときだけ上げる。版を名乗らなければ、契約が動いたときに
+古い読み手が黙って誤読する。**黙って間違えるのが最も高くつく。**
 
 ### kiri info
 
@@ -291,6 +364,7 @@ $ kiri convert product.jpg -o product.avif --json
 | `--background` | `#FFFFFF` | 透過を保持できない形式へ出力する際の合成色 |
 | `--no-color-convert` | | 埋め込み ICC を解釈せず、画素の値をそのまま使う |
 | `--force` | | 出力先が既に存在する場合に上書きする |
+| `--dry-run` | | 書き出さずに結果だけ返す |
 
 ### kiri resize
 
@@ -336,6 +410,7 @@ $ kiri resize small.jpg -o out.avif --width 3000 --json
 | `--flatten` | | 透過を残さず `--background` の色で塗り潰す |
 | `--no-color-convert` | | 埋め込み ICC を解釈せず、画素の値をそのまま使う |
 | `--force` | | 出力先が既に存在する場合に上書きする |
+| `--dry-run` | | 書き出さずに結果だけ返す |
 
 ### kiri rotate
 
@@ -420,6 +495,7 @@ rotated.jpg  2386x2533  jpeg  688.4 KB  (78 ms)
 | `--flatten` | | 透過を残さず `--background` の色で塗り潰す |
 | `--no-color-convert` | | 埋め込み ICC を解釈せず、画素の値をそのまま使う |
 | `--force` | | 出力先が既に存在する場合に上書きする |
+| `--dry-run` | | 書き出さずに結果だけ返す |
 
 **`batch` はまだ回転を受け付けない。** `batch` の spec は `cutout` の設定を
 並べるもので、回転はそこに無い。一括で回すなら `rotate` を個別に呼ぶこと。
@@ -461,6 +537,8 @@ product.png  1600x2000  png  841.4 KB  (338 ms)
 | `--preview PATH` | — | 「元画像 \| マスク \| 結果」を1枚に並べた検証用画像を書き出す |
 | `--preview-size` | 512 | プレビューのパネル1枚あたりの長辺(px) |
 | `--no-preview-grid` | | プレビューの元画像に座標グリッドを重ねない |
+| `--force` | | 出力先が既に存在する場合に上書きする |
+| `--dry-run` | | 書き出さずに結果だけ返す |
 
 #### 仕組み
 
@@ -781,16 +859,21 @@ refine 済みの鮮鋭な輪郭はちょうど 1.00 になり、**1〜3 なら�
 | `BBOX_RECOMMENDED` | 背景が不均一で背景側が前景として残っている。bbox で解ける |
 | `SUBJECT_TOUCHES_EDGE` | 前景が画像の外周に接している（商品の見切れ） |
 | `NOT_SEPARABLE` | 主体と背景の色差が背景自身のばらつきを下回る。調整では改善しない |
-| `FOREGROUND_TOO_SMALL` / `FOREGROUND_TOO_LARGE` | 前景比率が極端 |
+| `FOREGROUND_TOO_SMALL` | 前景比率が小さすぎる。商品が消えている可能性がある |
+| `FOREGROUND_TOO_LARGE` | 前景比率が大きすぎる。背景が残っている可能性がある |
 | `HALO_REMAINS` | 境界に背景色のままの縁が残っている。`--tolerance` を上げると減る |
 | `EDGE_THRESHOLD_RAISED` | 背景のテクスチャに合わせて堤防を引き上げた |
 | `CANVAS_UPSCALED` | キャンバス配置で商品を拡大した |
+| `DRY_RUN_OUTPUT_EXISTS` | `--dry-run` の出力先が既にある。本番実行には `--force` が要る |
 | `UPSCALED` | `resize` で拡大した |
 | `ALPHA_FLATTENED` | 出力形式が透過を保持できないので合成した |
 | `PREVIEW_FAILED` | プレビューを書き出せなかった（成果物自体は書けている） |
 | `COLOR_PROFILE_UNSUPPORTED` | ICC が LUT 型などで sRGB へ変換できなかった |
 | `COLOR_CONVERSION_SKIPPED` | `--no-color-convert` により変換していない |
 | `COLOR_SPACE_UNCALIBRATED` | EXIF が uncalibrated で ICC も無い |
+
+この表は `kiri schema --json` の `warnings[]` が同じものを返す。**README を読ませる
+代わりにそれを引けばよい。**
 
 #### 「見切れ」と「bbox が要る」を取り違えないために
 
@@ -864,6 +947,46 @@ $ kiri cutout product.jpg -o product.png --preview check.png
 検証用の付随物を理由にエラーを返すと、「成果物は書けているのにエラー」となって
 エージェントが再実行し、今度は `OUTPUT_EXISTS` で二重に詰まるためである。
 
+#### 書き出さずに試す
+
+`--dry-run` は成果物を書かずに、書いたときと同じ結果 JSON を返す。
+
+```
+$ kiri cutout product.jpg -o product.png --tolerance 18 --dry-run --json
+{
+  "dry_run": true,
+  "outputs": [{ "path": "product.png", "format": "png", "width": 1600, "height": 2000, "bytes": 861432 }],
+  "mask": { "foreground_ratio": 0.2164, "separability": 68.3, "halo_ratio": 0.0, "edge_width": 1.0 },
+  "warnings": []
+}
+```
+
+**救済フェーズは同じ画像へ何度もパラメータを振る。** そのたびに本番のパスへ書かせると、
+失敗した試行が納品物を上書きする。成果物を守るために `--force` を常用させるのは順序が
+逆で、探索そのものが書かなければよい。
+
+- **エンコードまでは実際に行う。** `bytes` は見積もりではなく実測値で、品質と形式の
+  判断を本番実行なしに下せる。`ALPHA_FLATTENED` のような書き出し由来の警告も同じに出る
+- **`--preview` と `--debug-mask` は書き出す。** 本出力は成果物だが、この 2 つは検証用の
+  付随物である。**「本番を壊さずに目で確かめる」ことこそ dry-run の用途**なので、
+  ここで書かないと `--dry-run` と `--preview` が併用できず、目視のたびに納品物を潰す
+- **本出力の上書き検査をしない。** 1 バイトも書かない実行を止める理由が無いため。
+  ただし本番実行なら `OUTPUT_EXISTS` で落ちていた場合は `DRY_RUN_OUTPUT_EXISTS` で先に
+  知らせる。黙って通すと、dry-run の成功を見て本番へ進んだ AI がそこで初めて詰まる
+- **`--preview` / `--debug-mask` の検査は残る。** こちらは実際に書くので、既存のファイルを
+  壊しうる。同じ検証パスへ繰り返し書きたければ `--force` を添える。**dry-run と併せた
+  `--force` は本出力を書かないので安全である**（本出力は `--dry-run` が先に止める）
+- **`dry_run` キーは常に出す。** 省いて「無ければ書いた」にすると、古いバージョンで
+  走った結果と書いた結果が同じ形になり、成果物が無いのにあるものとして次へ進む事故を
+  防げない
+
+`batch` にも同じフラグがある。数百点の spec を本番へ流す前に、警告の出る項目だけを
+洗い出せる。
+
+```
+$ kiri batch spec.json --dry-run --json
+```
+
 ### kiri batch
 
 仕様ファイルに従って複数の画像を一括処理する。**AI エージェントから使う際の本命はこれ。**
@@ -908,6 +1031,7 @@ x broken.jpg  失敗
 | `--base-dir DIR` | 仕様ファイルの場所 | 相対パスの基準ディレクトリ |
 | `--jobs N` | CPU数 | 並列実行数 |
 | `--force` | | 全項目で上書きを許可する |
+| `--dry-run` | | 1 件も書き出さずに全項目の結果だけ返す |
 
 **1件の失敗で全体を止めない。** 数百点を回すバッチでは、失敗を報告しつつ残りを処理し
 切るほうが有用なため。失敗があった場合は終了コード 4 で知らせ、詳細は `results[]` に入る。
@@ -931,12 +1055,14 @@ $ kiri batch spec.json --json
 
 想定している流れはこう。
 
+0. `kiri schema --json` で呼び方と code の意味を引く（初回のみ）
 1. AI が対象画像を `kiri info` で確認し、仕様 JSON を書き出す。
    `uniformity` が低い画像では `subject.confidence` を見て、`high` なら
    `subject.normalized_bbox` をその項目の `bbox` に入れる
 2. `kiri batch spec.json --json` で一括処理する
 3. 結果の `failed` / `with_warnings` と各項目の `mask.foreground_ratio` を検証する
-4. 失敗した項目だけ `tolerance` や `bbox` を調整して再実行する
+4. 失敗した項目だけ `tolerance` や `bbox` を調整して再実行する。
+   **探索は `--dry-run` で回す**（成功している他の項目の成果物を壊さないため）
 5. それでも直らない項目は `kiri cutout --preview` で画像を見て判断する
 
 `batch` は既定でプレビューを書き出さない。数百点を回す通常の経路では JSON だけで
@@ -1008,14 +1134,25 @@ sRGB へ変換するので、そこで色が転ぶことはない。
 |---|---|
 | 0 | 成功 |
 | 1 | 一般エラー |
-| 2 | 引数不正 |
+| 2 | 引数不正（書式や値域の誤りは code を伴わず stderr にのみ出る） |
 | 3 | 入力ファイル異常 |
 | 4 | 処理失敗 |
 
-`--json` 指定時はエラーも JSON で stdout に返る。
+`--json` 指定時はエラーも JSON で stdout に返る。**code と exit code の対応は
+`kiri schema --json` の `errors[]` が返す**（35 種ある）。
+
+**ただし引数の書式や値域で落ちた場合は JSON が返らない。** 検証は clap が行い、
+kiri のエラー型を通らないため、`--json` を付けても **stdout は空のまま exit 2 で
+終わる**（説明は stderr に出る）。`errors[]` のどの code にも対応しない唯一の失敗
+なので、`stdout` が空で終了コードが 2 なら、綴りか値域の誤りとして stderr を読む。
+
+```
+$ kiri rotate product.jpg -o out.png --angle sideways --json
+error: invalid value 'sideways' for '--angle <ANGLE>': 'sideways' は有限な数値である必要があります
+```
 
 ```json
-{ "error": { "code": "OUTPUT_EXISTS", "message": "...", "hint": "--force を付けると上書きします" } }
+{ "schema_version": 1, "error": { "code": "OUTPUT_EXISTS", "message": "...", "hint": "--force を付けると上書きします" } }
 ```
 
 ## ドキュメント

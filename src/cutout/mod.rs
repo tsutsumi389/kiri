@@ -26,7 +26,7 @@ pub mod subject;
 
 use image::RgbaImage;
 
-use crate::warning::Warning;
+use crate::warning::{Warning, WarningCode};
 
 pub use background::{BackgroundEstimate, DEFAULT_BORDER, DeltaEQuantiles, estimate_background};
 pub use diagnostics::Diagnostics;
@@ -225,7 +225,7 @@ fn resolve_edge_threshold(
         return (DEFAULT_EDGE_THRESHOLD, None);
     }
     let warning = Warning::new(
-        "EDGE_THRESHOLD_RAISED",
+        WarningCode::EdgeThresholdRaised,
         format!(
             "背景のテクスチャ（外周の勾配 p50 = {:.1} / p90 = {:.1}）が堤防を発火させるため、\
              edge_threshold を {DEFAULT_EDGE_THRESHOLD:.0} から {raised:.1} へ調整しました。\
@@ -468,7 +468,7 @@ fn collect_warnings(
     if !background.is_uniform() {
         warnings.push(
             Warning::new(
-                "LOW_UNIFORMITY",
+                WarningCode::LowUniformity,
                 format!(
                     "背景の均一度が {:.2} と低く、単色背景ではない可能性があります",
                     background.uniformity
@@ -481,7 +481,7 @@ fn collect_warnings(
     if stats.foreground_ratio < 0.01 {
         warnings.push(
             Warning::new(
-                "FOREGROUND_TOO_SMALL",
+                WarningCode::ForegroundTooSmall,
                 format!(
                     "前景がほとんど検出されていません (foreground_ratio={:.4})",
                     stats.foreground_ratio
@@ -493,7 +493,7 @@ fn collect_warnings(
     } else if stats.foreground_ratio > 0.99 {
         warnings.push(
             Warning::new(
-                "FOREGROUND_TOO_LARGE",
+                WarningCode::ForegroundTooLarge,
                 format!(
                     "背景がほとんど除去されていません (foreground_ratio={:.4})",
                     stats.foreground_ratio
@@ -529,7 +529,7 @@ fn collect_warnings(
     if let (true, Some(s)) = (misread_as_cropped, subject) {
         warnings.push(
             Warning::new(
-                "BBOX_RECOMMENDED",
+                WarningCode::BboxRecommended,
                 "背景が均一でないため背景側が前景として残っています",
             )
             .with_hint(format!(
@@ -541,7 +541,7 @@ fn collect_warnings(
         );
     } else if stats.touches_edge {
         warnings.push(Warning::new(
-            "SUBJECT_TOUCHES_EDGE",
+            WarningCode::SubjectTouchesEdge,
             "前景が画像の外周に接しています。商品が見切れている可能性があります",
         ));
     }
@@ -554,7 +554,7 @@ fn collect_warnings(
         if halo > diagnostics::HALO_WARN {
             warnings.push(
                 Warning::new(
-                    "HALO_REMAINS",
+                    WarningCode::HaloRemains,
                     format!(
                         "境界の {:.0}% が背景色のまま不透明で残っています (halo_ratio={halo:.2})。\
                          白以外の下地に載せると輪郭が光ります",
@@ -591,7 +591,7 @@ fn collect_warnings(
         if cut_happened && sep < spread {
             warnings.push(
                 Warning::new(
-                    "NOT_SEPARABLE",
+                    WarningCode::NotSeparable,
                     format!(
                         "商品と背景の色差 (ΔE {sep:.1}) が背景自身のばらつき (ΔE {spread:.1}) を\
                          下回っています。背景を消せる tolerance では商品も消えるため、\
@@ -658,7 +658,7 @@ mod tests {
 
     /// code で拾う。文言は推敲で変わるが、code は契約なので動かない
     fn hopeless(warnings: &[Warning]) -> bool {
-        warnings.iter().any(|w| w.code == "NOT_SEPARABLE")
+        warnings.iter().any(|w| w.code.as_str() == "NOT_SEPARABLE")
     }
 
     #[test]
@@ -778,7 +778,7 @@ mod tests {
         let (value, warning) = resolve_edge_threshold(None, &texture(27.9));
         assert_eq!(value, 41.8, "p90 の 1.5 倍（小数第1位まで）になっていない");
         let warning = warning.expect("黙って設定を変えてはいけない");
-        assert_eq!(warning.code, "EDGE_THRESHOLD_RAISED");
+        assert_eq!(warning.code.as_str(), "EDGE_THRESHOLD_RAISED");
         assert!(warning.message.contains("テクスチャ"), "{warning:?}");
         // 根拠は文面だけでなく data にも載せる。エージェントが message を
         // 正規表現で削らずに検算できることが、構造化した理由そのものである
@@ -822,7 +822,7 @@ mod tests {
     }
 
     fn codes(warnings: &[Warning]) -> Vec<&str> {
-        warnings.iter().map(|w| w.code).collect()
+        warnings.iter().map(|w| w.code.as_str()).collect()
     }
 
     /// bbox 未指定 + 不均一な背景で外周に接しているのは、**見切れではなく
@@ -851,7 +851,7 @@ mod tests {
         // hint はそのまま実行できる形でなければ、助言として役に立たない
         let w = warnings
             .iter()
-            .find(|w| w.code == "BBOX_RECOMMENDED")
+            .find(|w| w.code.as_str() == "BBOX_RECOMMENDED")
             .unwrap();
         let hint = w.hint.as_deref().unwrap();
         assert!(hint.contains("--bbox 0,0.354,0.9834,0.662"), "{hint}");
@@ -882,7 +882,7 @@ mod tests {
         );
         let w = warnings
             .iter()
-            .find(|w| w.code == "HALO_REMAINS")
+            .find(|w| w.code.as_str() == "HALO_REMAINS")
             .unwrap_or_else(|| panic!("{warnings:?}"));
         let hint = w.hint.as_deref().expect("次の一手が無い");
         assert!(hint.contains("--tolerance"), "{hint}");

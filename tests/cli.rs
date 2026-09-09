@@ -3803,3 +3803,772 @@ fn cutout_removes_a_cast_shadow_by_default() {
         "既定で影が消えていない: 影あり {removed} / 影判定なし {kept} / 影なし {none}"
     );
 }
+
+// --- dry-run ---
+
+/// `--dry-run` は成果物を書かない。書かないが、書いたときと同じ数値を返す。
+///
+/// 救済フェーズでは同じ画像へ tolerance を何度も振る。そのたびに本番のパスへ
+/// 書かせると、失敗した試行が納品物を上書きする。**成果物を守るために
+/// `--force` を常用させるのは順序が逆で**、探索そのものが書かなければよい。
+#[test]
+fn dry_run_reports_the_result_without_writing_the_output() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_jpeg(dir.path(), "product.jpg", &img);
+    let output = dir.path().join("out.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+
+    assert!(!output.exists(), "--dry-run なのに書き出されている");
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["outputs"][0]["path"], output.to_str().unwrap());
+    // 書かないだけでエンコードまでは実際に行う。バイト数は見積もりではない
+    assert!(
+        v["outputs"][0]["bytes"].as_u64().unwrap() > 0,
+        "bytes が実測値になっていない: {v}"
+    );
+    assert!(v["mask"]["foreground_ratio"].as_f64().unwrap() > 0.0);
+}
+
+/// 書いた実行では `dry_run` が false で出る。
+///
+/// キーを省略して「無ければ書いた」にはしない。エージェントから見て
+/// 「古いバージョンで走った」と「書いた」が同じ形になり、成果物が無いのに
+/// あるものとして次へ進む事故が起きる。
+#[test]
+fn a_real_run_says_dry_run_is_false() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_jpeg(dir.path(), "product.jpg", &img);
+    let output = dir.path().join("out.png");
+
+    let v = json_stdout(
+        &kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+
+    assert_eq!(v["dry_run"], false);
+    assert!(output.exists());
+}
+
+/// 既存の出力があっても `--dry-run` は落ちない。中身も変わらない。
+///
+/// 上書き検査は成果物を守るためのもので、書かない実行を止める理由が無い。
+/// ただし本番実行では `--force` が要る事実は、往復を 1 回減らすために
+/// 警告として先に告げる。
+#[test]
+fn dry_run_leaves_an_existing_output_untouched_and_warns_about_the_real_run() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_jpeg(dir.path(), "product.jpg", &img);
+    let output = dir.path().join("out.png");
+    std::fs::write(&output, b"deliverable").unwrap();
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "既存ファイルがあるだけで dry-run が落ちている: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let v = json_stdout(&out);
+    assert!(has_warning(&v, "DRY_RUN_OUTPUT_EXISTS"), "{v}");
+    assert_eq!(
+        std::fs::read(&output).unwrap(),
+        b"deliverable",
+        "dry-run が既存の成果物を壊している"
+    );
+}
+
+/// `--force` があれば本番実行も通るので、その警告は出さない。
+#[test]
+fn dry_run_with_force_does_not_warn_about_the_existing_output() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_jpeg(dir.path(), "product.jpg", &img);
+    let output = dir.path().join("out.png");
+    std::fs::write(&output, b"deliverable").unwrap();
+
+    let v = json_stdout(
+        &kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--dry-run",
+                "--force",
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+
+    assert!(!has_warning(&v, "DRY_RUN_OUTPUT_EXISTS"), "{v}");
+    assert_eq!(std::fs::read(&output).unwrap(), b"deliverable");
+}
+
+/// プレビューは `--dry-run` でも書く。
+///
+/// 本出力は成果物だが、プレビューは検証用の付随物である。**「本番を壊さずに
+/// 目で確かめる」が救済フェーズそのもの**なので、ここで書かないと
+/// `--dry-run` と `--preview` が併用できず、探索のたびに納品物を潰すことになる。
+#[test]
+fn dry_run_still_writes_the_preview() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_jpeg(dir.path(), "product.jpg", &img);
+    let output = dir.path().join("out.png");
+    let preview = dir.path().join("check.png");
+
+    let v = json_stdout(
+        &kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--preview",
+                preview.to_str().unwrap(),
+                "--dry-run",
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+
+    assert!(!output.exists(), "本出力が書かれている");
+    assert!(preview.exists(), "プレビューが書かれていない");
+    assert_eq!(v["preview"], preview.to_str().unwrap());
+}
+
+/// `--dry-run` でも付随出力の上書き検査は掛かる。
+///
+/// **本出力と付随出力で規約が違う。** dry-run が外すのは本出力の検査だけで、
+/// `--preview` / `--debug-mask` は実際に書くので既存のファイルを壊しうる。
+/// 探索のたびに同じ検証パスへ書きたければ `--force` を添える——**dry-run と
+/// 併せた `--force` は本出力を書かないので安全**である。
+#[test]
+fn dry_run_still_guards_the_side_outputs() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_jpeg(dir.path(), "product.jpg", &img);
+    let output = dir.path().join("out.png");
+    let preview = dir.path().join("check.png");
+
+    let run = |extra: &[&str]| -> std::process::Output {
+        let mut args = vec![
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--preview",
+            preview.to_str().unwrap(),
+            "--dry-run",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        kiri().args(&args).output().unwrap()
+    };
+
+    assert!(run(&[]).status.success(), "1 回目が通らない");
+
+    // 2 回目は検証ファイルが残っているので止まる
+    let second = run(&[]);
+    assert_eq!(second.status.code(), Some(2));
+    assert_eq!(json_stdout(&second)["error"]["code"], "OUTPUT_EXISTS");
+
+    // --force で通る。本出力は dry-run のまま書かれない
+    let third = run(&["--force"]);
+    assert!(
+        third.status.success(),
+        "{}",
+        String::from_utf8_lossy(&third.stderr)
+    );
+    let v = json_stdout(&third);
+    assert_eq!(v["dry_run"], true);
+    assert!(!output.exists(), "--force が本出力まで書いている");
+}
+
+/// 出力を伴うコマンドはすべて `--dry-run` を受ける。
+///
+/// cutout だけに付けると、エージェントは「convert では試せない」を
+/// 覚えなければならない。共通オプションは全部で同じ意味を持つべきである。
+#[test]
+fn every_writing_command_accepts_dry_run() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_jpeg(dir.path(), "product.jpg", &img);
+
+    let cases: Vec<(&str, Vec<&str>)> = vec![
+        ("convert", vec![]),
+        ("resize", vec!["--width", "80"]),
+        ("rotate", vec!["--angle", "90"]),
+    ];
+
+    for (command, extra) in cases {
+        let output = dir.path().join(format!("{command}.png"));
+        let mut args = vec![
+            command,
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--dry-run",
+            "--json",
+        ];
+        args.extend_from_slice(&extra);
+
+        let out = kiri().args(&args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{command}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let v = json_stdout(&out);
+
+        assert!(!output.exists(), "{command} が書き出している");
+        assert_eq!(v["dry_run"], true, "{command}: {v}");
+        assert!(
+            v["outputs"][0]["bytes"].as_u64().unwrap() > 0,
+            "{command}: {v}"
+        );
+    }
+}
+
+/// batch も 1 件も書かずに全件の統計を返す。
+///
+/// 数百点の spec を本番へ流す前に、警告の出る項目を洗い出せる必要がある。
+#[test]
+fn batch_dry_run_writes_nothing_but_reports_every_item() {
+    let dir = fixture_dir();
+    batch_fixture(dir.path(), 3);
+    let spec = write_spec(
+        dir.path(),
+        r#"{"defaults":{"canvas":"400x400","format":"png"},
+            "items":[{"input":"p0.png","output":"out/a.png"},
+                     {"input":"p1.png","output":"out/b.png"},
+                     {"input":"p2.png","output":"out/c.png"}]}"#,
+    );
+
+    let out = run_batch(&spec, &["--dry-run"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+
+    assert_eq!(v["total"], 3);
+    assert_eq!(v["succeeded"], 3);
+    assert_eq!(v["dry_run"], true);
+    for name in ["a", "b", "c"] {
+        assert!(
+            !dir.path().join(format!("out/{name}.png")).exists(),
+            "{name} が書き出されている"
+        );
+    }
+    // 項目ごとの結果も「書いていない」と言う。results[] だけを見て回る
+    // エージェントが、成果物があるものとして次へ進まないため
+    assert_eq!(v["results"][0]["result"]["dry_run"], true);
+}
+
+// --- schema ---
+
+fn schema_json() -> Value {
+    let out = kiri().args(["schema", "--json"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    json_stdout(&out)
+}
+
+fn codes_of(v: &Value, section: &str) -> Vec<String> {
+    v[section]
+        .as_array()
+        .unwrap_or_else(|| panic!("{section} が配列ではない: {v}"))
+        .iter()
+        .map(|e| e["code"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// `kiri schema --json` は契約そのものを返す。
+///
+/// README は 1000 行ある。**エージェントに読ませられる長さではない**ので、
+/// 契約（code / exit code / オプション）だけを機械可読で配る。
+#[test]
+fn schema_returns_the_whole_contract() {
+    let v = schema_json();
+
+    assert!(v["schema_version"].as_u64().unwrap() >= 1, "{v}");
+    assert_eq!(v["kiri_version"], env!("CARGO_PKG_VERSION"));
+
+    // 出口の 5 通りが揃っている
+    let exits: Vec<u64> = v["exit_codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["code"].as_u64().unwrap())
+        .collect();
+    assert_eq!(exits, vec![0, 1, 2, 3, 4], "{v}");
+
+    // 説明のない code を配らない。code だけ渡されても次の一手は決まらない
+    for section in ["warnings", "errors"] {
+        let entries = v[section].as_array().unwrap();
+        assert!(!entries.is_empty(), "{section} が空: {v}");
+        for e in entries {
+            let code = e["code"].as_str().unwrap();
+            assert!(
+                !e["summary"].as_str().unwrap().is_empty(),
+                "{section} の {code} に説明が無い"
+            );
+        }
+    }
+
+    // 同じ code が 2 度出ない
+    for section in ["warnings", "errors"] {
+        let mut codes = codes_of(&v, section);
+        let total = codes.len();
+        codes.sort();
+        codes.dedup();
+        assert_eq!(codes.len(), total, "{section} に重複した code がある");
+    }
+}
+
+/// エラーの code は exit code を伴う。
+///
+/// `errors[]` を引けば「この失敗で何番が返るか」が分かる。実際に起こして
+/// 突き合わせ、表と実装が離れていないことを固定する。
+#[test]
+fn an_error_that_actually_fires_matches_the_schema() {
+    let v = schema_json();
+    let dir = fixture_dir();
+
+    let out = kiri()
+        .args([
+            "convert",
+            dir.path().join("no-such-file.jpg").to_str().unwrap(),
+            "-o",
+            dir.path().join("out.png").to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let observed = json_stdout(&out);
+    let code = observed["error"]["code"].as_str().unwrap();
+
+    let documented = v["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["code"] == code)
+        .unwrap_or_else(|| panic!("{code} が schema に載っていない"));
+
+    assert_eq!(
+        documented["exit_code"].as_i64().unwrap(),
+        i64::from(out.status.code().unwrap()),
+        "{code} の exit code が schema と食い違う"
+    );
+}
+
+/// 実際に出た警告の code は必ず schema に載っている。
+#[test]
+fn a_warning_that_actually_fires_is_documented_in_the_schema() {
+    let documented = codes_of(&schema_json(), "warnings");
+    let dir = fixture_dir();
+
+    // 背景が単色でない素材は LOW_UNIFORMITY を出す
+    let img = split_background_scene(200, 200);
+    let input = write_png(dir.path(), "split.png", &img);
+    let v = json_stdout(
+        &kiri()
+            .args(["info", input.to_str().unwrap(), "--json"])
+            .output()
+            .unwrap(),
+    );
+
+    let observed = warning_codes(&v);
+    assert!(!observed.is_empty(), "警告が 1 つも出ていない: {v}");
+    for code in observed {
+        assert!(
+            documented.contains(&code),
+            "{code} が schema に載っていない（載っている: {documented:?}）"
+        );
+    }
+}
+
+/// オプションはパーサから組み立てる。README ではなく実装が真実である。
+///
+/// 手で書いた表は必ず離れる。**離れた表は、指定したのに効かないという
+/// 最も追いにくい失敗をそのまま招く。**
+#[test]
+fn schema_options_come_from_the_parser() {
+    let v = schema_json();
+    let cutout = v["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "cutout")
+        .expect("cutout が無い");
+
+    let option = |name: &str| -> Value {
+        cutout["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["name"] == name)
+            .unwrap_or_else(|| panic!("{name} が無い: {cutout}"))
+            .clone()
+    };
+
+    assert_eq!(option("--tolerance")["default"], "12");
+    assert_eq!(option("--dry-run")["takes_value"], false);
+    // 「未指定」と「8 を明示」を区別する項目は既定値を名乗らない。
+    // ここに 8 が出ると、指定しなくても 8 が効くという誤った前提を招く
+    assert!(
+        option("--edge-threshold")["default"].is_null(),
+        "--edge-threshold が既定値を名乗っている"
+    );
+
+    // 位置引数も出す。エージェントは入力の渡し方から知る必要がある
+    assert_eq!(cutout["arguments"][0]["name"], "input");
+    assert_eq!(cutout["arguments"][0]["required"], true);
+}
+
+/// 契約に載っている code はすべて、実際に返りうる。
+///
+/// **返らない code を配るのは、誤った助言と同じ害を持つ。** エージェントはそれ用の
+/// 分岐を書き、その枝は永久に死んだままになる。実装の側から使われているかを
+/// 走査して、カタログに書いたまま使われていない code を落とす。
+///
+/// 走査はテストモジュールの手前までに限る。**テストの中の 1 回を「使われている」と
+/// 数えると、実運用では返らない code が通ってしまう。** 実際にこの検査で
+/// `NOT_FOUND` が見つかった（error.rs のテストでしか使われていなかった）。
+#[test]
+fn every_documented_code_is_actually_reachable() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut body = String::new();
+    collect_source(&src, &mut body);
+
+    let v = schema_json();
+    let mut dead = Vec::new();
+    for (section, prefix) in [("errors", "ErrorCode::"), ("warnings", "WarningCode::")] {
+        for code in codes_of(&v, section) {
+            let variant = format!("{prefix}{}", pascal_case(&code));
+            if !body.contains(&variant) {
+                dead.push(code);
+            }
+        }
+    }
+    assert!(
+        dead.is_empty(),
+        "契約に載っているが実装から返らない code: {dead:?}"
+    );
+}
+
+/// `src` 配下の Rust ソースを、各ファイルのテストモジュールの手前まで連結する。
+fn collect_source(dir: &Path, out: &mut String) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            collect_source(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            let text = std::fs::read_to_string(&path).unwrap();
+            out.push_str(text.split("#[cfg(test)]").next().unwrap_or(""));
+        }
+    }
+}
+
+fn pascal_case(screaming_snake: &str) -> String {
+    screaming_snake
+        .split('_')
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_string() + &chars.as_str().to_lowercase(),
+                None => String::new(),
+            }
+        })
+        .collect()
+}
+
+/// 引数の書式や値域で落ちたときは JSON が返らない。
+///
+/// clap の検証は kiri のエラー型を通らないので、`--json` を付けても **stdout は
+/// 空のまま exit 2 で終わる。** `errors[]` のどの code にも対応しない唯一の
+/// 失敗なので、契約として固定し、`exit_codes` の説明でも言う。
+#[test]
+fn a_parser_level_failure_returns_no_json() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_jpeg(dir.path(), "product.jpg", &img);
+
+    let output = dir.path().join("o.png");
+    for args in [vec!["--angle", "nan"], vec!["--angle", "sideways"]] {
+        let mut full = vec![
+            "rotate",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--json",
+        ];
+        full.extend_from_slice(&args);
+        let out = kiri().args(&full).output().unwrap();
+
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?} で stdout に何か出ている");
+        assert!(!out.stderr.is_empty(), "{args:?} で stderr が空");
+    }
+
+    // 値域の検証も同じ経路。schema の exit_codes がこれを述べている
+    let meaning = schema_json()["exit_codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["code"] == 2)
+        .unwrap()["meaning"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        meaning.contains("code"),
+        "exit 2 の説明が code 無しの失敗に触れていない: {meaning}"
+    );
+}
+
+/// ドキュメントが名指しする code は、実在する code か実在する定数のどちらかである。
+///
+/// `every_documented_code_is_actually_reachable` はカタログ → 実装の向きしか見ない。
+/// **逆向き（文書 → カタログ）が抜けていて、実際に幽霊を 2 つ通した**
+/// （README の `NOT_FOUND` と design.md の `BACKGROUND_NOT_UNIFORM`）。
+/// 書き写した例は、エージェントが最も写し取りやすい場所にある。
+#[test]
+fn every_code_named_in_the_docs_exists() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let v = schema_json();
+    let mut known: Vec<String> = codes_of(&v, "errors");
+    known.extend(codes_of(&v, "warnings"));
+
+    // ドキュメントは Rust の定数名にも触れる（`MAX_CLEANUP` など）。
+    // 実装に存在する定数は code ではないので、幽霊と区別して通す
+    let mut source = String::new();
+    collect_source(&root.join("src"), &mut source);
+
+    for doc in ["README.md", "docs/design.md", "docs/implementation-plan.md"] {
+        let text = std::fs::read_to_string(root.join(doc)).unwrap();
+        for name in all_caps_words(&text) {
+            let is_code = known.contains(&name);
+            let is_constant = source.contains(&format!("const {name}"));
+            assert!(
+                is_code || is_constant,
+                "{doc} が実在しない code を名指ししている: {name}"
+            );
+        }
+    }
+}
+
+/// 大文字とアンダースコアだけで綴られた語を拾う。
+///
+/// 引用符の内側だけを見ようとすると、**バッククォートと二重引用符が混ざった
+/// 文書で区切りの数え方が崩れる**（実際に `NOT_FOUND` を取りこぼした）。
+/// 囲みに頼らず、語の形だけで拾う。数字だけの区画を持つ語は除く——
+/// `IMG_0251` のような実写素材のファイル名がそれで、code ではない。
+fn all_caps_words(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for token in text.split(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')) {
+        let segments: Vec<&str> = token.split('_').collect();
+        let looks_like_a_code = segments.len() >= 2
+            && segments
+                .iter()
+                .all(|seg| seg.chars().any(|c| c.is_ascii_uppercase()));
+        if looks_like_a_code && !found.contains(&token.to_string()) {
+            found.push(token.to_string());
+        }
+    }
+    found
+}
+
+/// 値が決まっている項目は、受け付ける値も返す。
+///
+/// `--format` / `--fit` は選択肢のある項目で、**綴りを外すと clap が
+/// code 無しの exit 2 で落ちる。** 返ってきた結果から `errors[]` へ辿れない
+/// 失敗なので、呼ぶ前に選択肢を知れることが要る。
+#[test]
+fn schema_lists_the_accepted_values_for_enum_options() {
+    let v = schema_json();
+    let find = |command: &str, option: &str| -> Value {
+        v["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == command)
+            .unwrap()["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["name"] == option)
+            .unwrap_or_else(|| panic!("{command} に {option} が無い"))
+            .clone()
+    };
+
+    let format: Vec<String> = find("cutout", "--format")["accepts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("--format が accepts を返さない"))
+        .iter()
+        .map(|x| x.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(format, vec!["avif", "png", "jpeg"]);
+
+    assert!(
+        find("resize", "--fit")["accepts"].is_array(),
+        "--fit が accepts を返さない"
+    );
+    // 自由な値を取る項目には付けない。空配列は「選択肢が無い」と読めてしまう
+    assert!(find("cutout", "--tolerance").get("accepts").is_none());
+}
+
+/// 全コマンドで受けるオプションは 1 箇所にまとめて返す。
+///
+/// `--json` は契約の中心にありながら、clap のサブコマンドの引数一覧には現れない
+/// （グローバル引数は実行時に伝播する）。**素直に組むと schema から丸ごと
+/// 落ちる。** 各コマンドへ複製するのではなく「全部で受ける」と 1 度言う。
+#[test]
+fn schema_lists_the_options_that_every_command_accepts() {
+    let v = schema_json();
+    let globals = v["global_options"].as_array().unwrap();
+
+    let json = globals
+        .iter()
+        .find(|o| o["name"] == "--json")
+        .unwrap_or_else(|| panic!("--json が無い: {v}"));
+    assert_eq!(json["global"], true);
+    assert_eq!(json["takes_value"], false);
+
+    // コマンド側には重複させない
+    let cutout = v["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "cutout")
+        .unwrap();
+    assert!(
+        !cutout["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["name"] == "--json"),
+        "--json がコマンド側にも出ている"
+    );
+}
+
+/// すべての結果 JSON が schema_version を名乗る。
+///
+/// 契約が動いたときに、古い読み手が黙って誤読するのを防ぐ。
+#[test]
+fn every_report_carries_the_schema_version() {
+    let expected = schema_json()["schema_version"].clone();
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_jpeg(dir.path(), "product.jpg", &img);
+    let spec = write_spec(
+        dir.path(),
+        r#"{"items":[{"input":"product.jpg","output":"out/a.png"}]}"#,
+    );
+
+    let runs: Vec<Vec<String>> = vec![
+        vec!["info".into(), input.display().to_string()],
+        vec![
+            "convert".into(),
+            input.display().to_string(),
+            "-o".into(),
+            dir.path().join("c.png").display().to_string(),
+        ],
+        vec![
+            "cutout".into(),
+            input.display().to_string(),
+            "-o".into(),
+            dir.path().join("k.png").display().to_string(),
+        ],
+        vec!["batch".into(), spec.display().to_string()],
+    ];
+
+    for mut args in runs {
+        let name = args[0].clone();
+        args.push("--json".into());
+        let out = kiri().args(&args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(json_stdout(&out)["schema_version"], expected, "{name}");
+    }
+}
+
+/// エラーの JSON も版を名乗る。失敗の形だけ契約から外れる理由が無い。
+#[test]
+fn the_error_json_carries_the_schema_version_too() {
+    let expected = schema_json()["schema_version"].clone();
+    let dir = fixture_dir();
+
+    let out = kiri()
+        .args([
+            "info",
+            dir.path().join("missing.jpg").to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(json_stdout(&out)["schema_version"], expected);
+}
+
+/// `--json` を付けなければ人間向けの要約を返す。既存の規約と同じ。
+#[test]
+fn schema_without_json_is_a_human_summary() {
+    let out = kiri().args(["schema"]).output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        serde_json::from_str::<Value>(&text).is_err(),
+        "--json 無しで JSON を返している"
+    );
+    assert!(text.contains("LOW_UNIFORMITY"), "{text}");
+    assert!(text.contains("OUTPUT_EXISTS"), "{text}");
+}

@@ -11,12 +11,12 @@ use crate::error::Result;
 use crate::image_io::load;
 use crate::report::ProcessReport;
 use crate::transform::{ResizeSpec, apply, plan};
-use crate::warning::Warning;
+use crate::warning::{Warning, WarningCode};
 
 pub fn run(args: &ResizeArgs) -> Result<ProcessReport> {
     let started = Instant::now();
     let format = output::resolve_format(&args.out)?;
-    output::ensure_writable(&args.out)?;
+    let overwrite_warning = output::ensure_writable(&args.out)?;
 
     let loaded = load::load_with(&args.input, &args.color.to_load_options())?;
     let source = (loaded.width(), loaded.height());
@@ -31,10 +31,11 @@ pub fn run(args: &ResizeArgs) -> Result<ProcessReport> {
     let resized = apply(&loaded.image, &plan)?;
 
     let mut warnings = loaded.warnings();
+    warnings.extend(overwrite_warning);
     if args.allow_upscale && (plan.scaled.0 > source.0 || plan.scaled.1 > source.1) {
         warnings.push(
             Warning::new(
-                "UPSCALED",
+                WarningCode::Upscaled,
                 format!(
                     "{}x{} から {}x{} へ拡大しました。画質は元素材を超えません",
                     source.0, source.1, plan.scaled.0, plan.scaled.1

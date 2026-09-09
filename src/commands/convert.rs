@@ -13,9 +13,12 @@ use crate::report::ProcessReport;
 pub fn run(args: &ConvertArgs) -> Result<ProcessReport> {
     let started = Instant::now();
     let format = output::resolve_format(&args.out)?;
-    output::ensure_writable(&args.out)?;
+    let overwrite_warning = output::ensure_writable(&args.out)?;
 
     let loaded = load::load_with(&args.input, &args.color.to_load_options())?;
+
+    let mut warnings = loaded.warnings();
+    warnings.extend(overwrite_warning);
 
     output::finish(
         &args.input,
@@ -24,6 +27,6 @@ pub fn run(args: &ConvertArgs) -> Result<ProcessReport> {
         &args.out,
         format,
         started,
-        loaded.warnings(),
+        warnings,
     )
 }

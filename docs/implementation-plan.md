@@ -13,8 +13,8 @@ src/
   main.rs              エントリ、サブコマンドのディスパッチ
   lib.rs               公開API（テストから利用）
   cli.rs               clap derive による引数定義
-  error.rs             エラー型 → exit code のマッピング
-  warning.rs           警告型（code / message / hint / data）。error.rs と同じ契約
+  error.rs             エラー型とカタログ（code → exit code / 意味）。kind は code から引く
+  warning.rs           警告型（code / message / hint / data）とカタログ。error.rs と同じ契約
   report.rs            JSON 出力の構造体（serde）
   image_io/
     load.rs            JPEG/PNG 読み込み + EXIF Orientation 正規化 + ICC → sRGB
@@ -55,6 +55,7 @@ src/
 | 5 | バッチ：spec.json、rayon並列 | `kiri batch` | 0.5日 |
 | 6 | 仕上げ：README、実画像での再計測とデフォルト値調整、GitHub Actions | v0.1.0 | 1日 |
 | 7 | 回転：90度単位は無劣化、任意角は Catmull-Rom で外接矩形へ拡張 | `kiri rotate` | 0.5日 |
+| 8 | 自己記述：code をカタログ化、パーサから契約を組み立て、書かずに試せるようにする | `kiri schema` / `--dry-run` | 0.5日 |
 
 **Phase 1 の `kiri info` を最初に完成させる。** 最小で end-to-end が通り、JSON規約とエラー処理の型がそこで確定する。型が決まれば以降は同じ形で積み上げられる。
 

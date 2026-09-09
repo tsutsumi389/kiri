@@ -7,7 +7,7 @@ use fast_image_resize::images::{Image as FirImage, ImageRef as FirImageRef};
 use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
 use image::RgbaImage;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorCode, Result};
 
 /// 指定した枠に対する当てはめ方。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -43,25 +43,25 @@ pub struct ResizePlan {
 pub fn plan(source: (u32, u32), spec: &ResizeSpec) -> Result<ResizePlan> {
     let (sw, sh) = source;
     if sw == 0 || sh == 0 {
-        return Err(Error::processing("EMPTY_IMAGE", "画像の寸法が 0 です"));
+        return Err(Error::new(ErrorCode::EmptyImage, "画像の寸法が 0 です"));
     }
     if let Some(0) = spec.width {
-        return Err(Error::argument(
-            "INVALID_DIMENSION",
+        return Err(Error::new(
+            ErrorCode::InvalidDimension,
             "width に 0 は指定できません",
         ));
     }
     if let Some(0) = spec.height {
-        return Err(Error::argument(
-            "INVALID_DIMENSION",
+        return Err(Error::new(
+            ErrorCode::InvalidDimension,
             "height に 0 は指定できません",
         ));
     }
 
     let scaled = match (spec.width, spec.height) {
         (None, None) => {
-            return Err(Error::argument(
-                "MISSING_DIMENSION",
+            return Err(Error::new(
+                ErrorCode::MissingDimension,
                 "--width か --height の少なくとも一方を指定してください",
             )
             .with_hint("例: --width 1000"));
@@ -85,8 +85,8 @@ pub fn plan(source: (u32, u32), spec: &ResizeSpec) -> Result<ResizePlan> {
     };
 
     if !spec.allow_upscale && (scaled.0 > sw || scaled.1 > sh) {
-        return Err(Error::argument(
-            "UPSCALE_NOT_ALLOWED",
+        return Err(Error::new(
+            ErrorCode::UpscaleNotAllowed,
             format!(
                 "{}x{} から {}x{} への拡大が必要です",
                 sw, sh, scaled.0, scaled.1
@@ -150,7 +150,7 @@ fn scale(image: &RgbaImage, to: (u32, u32)) -> Result<RgbaImage> {
         image.as_raw().as_slice(),
         PixelType::U8x4,
     )
-    .map_err(|e| Error::processing("RESIZE_FAILED", e.to_string()))?;
+    .map_err(|e| Error::new(ErrorCode::ResizeFailed, e.to_string()))?;
 
     let mut dst = FirImage::new(to.0, to.1, PixelType::U8x4);
 
@@ -162,10 +162,10 @@ fn scale(image: &RgbaImage, to: (u32, u32)) -> Result<RgbaImage> {
 
     Resizer::new()
         .resize(&src, &mut dst, &options)
-        .map_err(|e| Error::processing("RESIZE_FAILED", e.to_string()))?;
+        .map_err(|e| Error::new(ErrorCode::ResizeFailed, e.to_string()))?;
 
     RgbaImage::from_raw(to.0, to.1, dst.into_vec())
-        .ok_or_else(|| Error::processing("RESIZE_FAILED", "リサイズ結果を復元できません"))
+        .ok_or_else(|| Error::new(ErrorCode::ResizeFailed, "リサイズ結果を復元できません"))
 }
 
 #[cfg(test)]
@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn upscaling_is_rejected_by_default() {
         let err = plan((800, 600), &spec(Some(1600), None, FitMode::Contain)).unwrap_err();
-        assert_eq!(err.code, "UPSCALE_NOT_ALLOWED");
+        assert_eq!(err.code.as_str(), "UPSCALE_NOT_ALLOWED");
         assert_eq!(err.exit_code(), 2);
         assert!(err.hint.unwrap().contains("--allow-upscale"));
     }
@@ -260,7 +260,7 @@ mod tests {
     fn shrinking_one_axis_while_growing_the_other_is_still_rejected() {
         // contain なら縮小に倒れるが、exact は片側が伸びるので弾かれるべき
         let err = plan((1000, 1000), &spec(Some(500), Some(2000), FitMode::Exact)).unwrap_err();
-        assert_eq!(err.code, "UPSCALE_NOT_ALLOWED");
+        assert_eq!(err.code.as_str(), "UPSCALE_NOT_ALLOWED");
     }
 
     #[test]
@@ -276,7 +276,7 @@ mod tests {
     #[test]
     fn missing_both_dimensions_is_an_argument_error() {
         let err = plan((100, 100), &spec(None, None, FitMode::Contain)).unwrap_err();
-        assert_eq!(err.code, "MISSING_DIMENSION");
+        assert_eq!(err.code.as_str(), "MISSING_DIMENSION");
         assert_eq!(err.exit_code(), 2);
     }
 
@@ -285,13 +285,15 @@ mod tests {
         assert_eq!(
             plan((100, 100), &spec(Some(0), None, FitMode::Contain))
                 .unwrap_err()
-                .code,
+                .code
+                .as_str(),
             "INVALID_DIMENSION"
         );
         assert_eq!(
             plan((100, 100), &spec(None, Some(0), FitMode::Contain))
                 .unwrap_err()
-                .code,
+                .code
+                .as_str(),
             "INVALID_DIMENSION"
         );
     }

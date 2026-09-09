@@ -9,7 +9,7 @@
 
 use image::RgbaImage;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorCode, Result};
 use crate::transform::resize::{FitMode, ResizeSpec, apply as resize_apply, plan as resize_plan};
 
 #[derive(Debug, Clone)]
@@ -35,14 +35,14 @@ pub struct CanvasPlan {
 /// 商品をキャンバス中央に、指定の占有率で収める配置を決める。
 pub fn plan(content: (u32, u32), spec: &CanvasSpec) -> Result<CanvasPlan> {
     if spec.width == 0 || spec.height == 0 {
-        return Err(Error::argument(
-            "INVALID_CANVAS",
+        return Err(Error::new(
+            ErrorCode::InvalidCanvas,
             "キャンバスの寸法に 0 は指定できません",
         ));
     }
     if !(spec.fill_ratio > 0.0 && spec.fill_ratio <= 1.0) {
-        return Err(Error::argument(
-            "INVALID_FILL_RATIO",
+        return Err(Error::new(
+            ErrorCode::InvalidFillRatio,
             format!(
                 "fill-ratio は 0.0 より大きく 1.0 以下である必要があります（指定: {}）",
                 spec.fill_ratio
@@ -50,8 +50,8 @@ pub fn plan(content: (u32, u32), spec: &CanvasSpec) -> Result<CanvasPlan> {
         ));
     }
     if content.0 == 0 || content.1 == 0 {
-        return Err(Error::processing(
-            "EMPTY_CONTENT",
+        return Err(Error::new(
+            ErrorCode::EmptyContent,
             "配置する内容の寸法が 0 です",
         ));
     }
@@ -206,7 +206,7 @@ mod tests {
     fn invalid_ratios_are_rejected() {
         for bad in [0.0, -0.5, 1.5] {
             let err = plan((100, 100), &spec(500, 500, bad)).unwrap_err();
-            assert_eq!(err.code, "INVALID_FILL_RATIO", "fill_ratio={bad}");
+            assert_eq!(err.code.as_str(), "INVALID_FILL_RATIO", "fill_ratio={bad}");
             assert_eq!(err.exit_code(), 2);
         }
     }
@@ -214,11 +214,17 @@ mod tests {
     #[test]
     fn a_zero_sized_canvas_is_rejected() {
         assert_eq!(
-            plan((100, 100), &spec(0, 500, 0.9)).unwrap_err().code,
+            plan((100, 100), &spec(0, 500, 0.9))
+                .unwrap_err()
+                .code
+                .as_str(),
             "INVALID_CANVAS"
         );
         assert_eq!(
-            plan((100, 100), &spec(500, 0, 0.9)).unwrap_err().code,
+            plan((100, 100), &spec(500, 0, 0.9))
+                .unwrap_err()
+                .code
+                .as_str(),
             "INVALID_CANVAS"
         );
     }

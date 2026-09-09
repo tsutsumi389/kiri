@@ -13,7 +13,7 @@
 
 use image::RgbaImage;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorCode, Result};
 
 #[derive(Debug, Clone, Copy)]
 pub struct RotateSpec {
@@ -42,11 +42,11 @@ impl RotatePlan {
 pub fn plan(source: (u32, u32), spec: &RotateSpec) -> Result<RotatePlan> {
     let (sw, sh) = source;
     if sw == 0 || sh == 0 {
-        return Err(Error::processing("EMPTY_IMAGE", "画像の寸法が 0 です"));
+        return Err(Error::new(ErrorCode::EmptyImage, "画像の寸法が 0 です"));
     }
     if !spec.angle.is_finite() {
-        return Err(Error::argument(
-            "INVALID_ANGLE",
+        return Err(Error::new(
+            ErrorCode::InvalidAngle,
             format!("'{}' は角度として扱えません", spec.angle),
         )
         .with_hint("--angle には有限の数値を指定してください（例: --angle 90、--angle -3.5）"));
@@ -305,7 +305,7 @@ mod tests {
     fn rejects_a_non_finite_angle() {
         for angle in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let err = plan((400, 500), &spec(angle)).unwrap_err();
-            assert_eq!(err.code, "INVALID_ANGLE");
+            assert_eq!(err.code.as_str(), "INVALID_ANGLE");
             assert_eq!(err.exit_code(), 2);
         }
     }
@@ -334,7 +334,7 @@ mod tests {
     #[test]
     fn rejects_an_empty_image() {
         let err = plan((0, 500), &spec(90.0)).unwrap_err();
-        assert_eq!(err.code, "EMPTY_IMAGE");
+        assert_eq!(err.code.as_str(), "EMPTY_IMAGE");
     }
 
     // --- apply: 90 度単位は無劣化 ---

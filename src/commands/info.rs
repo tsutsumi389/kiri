@@ -12,8 +12,8 @@ use crate::cutout::{
 };
 use crate::error::Result;
 use crate::image_io::load;
-use crate::report::InfoReport;
-use crate::warning::Warning;
+use crate::report::{InfoReport, SCHEMA_VERSION};
+use crate::warning::{Warning, WarningCode};
 
 pub fn run(args: &InfoArgs) -> Result<InfoReport> {
     let loaded = load::load_with(&args.input, &args.color.to_load_options())?;
@@ -26,6 +26,7 @@ pub fn run(args: &InfoArgs) -> Result<InfoReport> {
     }
 
     Ok(InfoReport {
+        schema_version: SCHEMA_VERSION,
         input: args.input.display().to_string(),
         width: loaded.width(),
         height: loaded.height(),
@@ -60,7 +61,7 @@ fn low_uniformity_warnings(
     subject: Option<&SubjectHint>,
 ) -> Vec<Warning> {
     let base = Warning::new(
-        "LOW_UNIFORMITY",
+        WarningCode::LowUniformity,
         format!(
             "背景の均一度が {:.2} と低く、単色背景ではない可能性があります",
             background.uniformity
@@ -82,7 +83,7 @@ fn low_uniformity_warnings(
         Some(s) if s.confidence.is_high() => vec![
             base.with_hint("kiri が対象とするのは単色背景の画像です"),
             Warning::new(
-                "NOT_SEPARABLE",
+                WarningCode::NotSeparable,
                 format!(
                     "主体と背景の色差 (ΔE {:.1}) が背景自身のばらつき (ΔE {spread:.1}) を\
                      下回るため、パラメータ調整では改善しません",
@@ -184,7 +185,7 @@ mod tests {
     fn hint_of(warnings: &[Warning], code: &str) -> String {
         warnings
             .iter()
-            .find(|w| w.code == code)
+            .find(|w| w.code.as_str() == code)
             .unwrap_or_else(|| panic!("{code} が無い: {warnings:?}"))
             .hint
             .clone()
@@ -192,7 +193,7 @@ mod tests {
     }
 
     fn codes(warnings: &[Warning]) -> Vec<&str> {
-        warnings.iter().map(|w| w.code).collect()
+        warnings.iter().map(|w| w.code.as_str()).collect()
     }
 
     /// 救える画像（実写のリモコン）では、そのまま実行できる bbox を勧める。

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorCode, Result};
 
 #[derive(Debug, Deserialize, Default)]
 pub struct BatchSpec {
@@ -123,15 +123,15 @@ const ROOT_KEYS: &[&str] = &["defaults", "items"];
 /// 仕様ファイルを読み込む。
 pub fn load(path: &Path) -> Result<BatchSpec> {
     let text = std::fs::read_to_string(path).map_err(|e| {
-        Error::input(
-            "SPEC_UNREADABLE",
+        Error::new(
+            ErrorCode::SpecUnreadable,
             format!("{} を読めません: {e}", path.display()),
         )
     })?;
 
     let raw: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-        Error::input(
-            "SPEC_INVALID_JSON",
+        Error::new(
+            ErrorCode::SpecInvalidJson,
             format!("{} は JSON として不正です: {e}", path.display()),
         )
     })?;
@@ -139,14 +139,14 @@ pub fn load(path: &Path) -> Result<BatchSpec> {
     validate_keys(&raw)?;
 
     let spec: BatchSpec = serde_json::from_value(raw).map_err(|e| {
-        Error::input(
-            "SPEC_INVALID",
+        Error::new(
+            ErrorCode::SpecInvalid,
             format!("{} の内容が不正です: {e}", path.display()),
         )
     })?;
 
     if spec.items.is_empty() {
-        return Err(Error::argument("SPEC_EMPTY", "items が空です")
+        return Err(Error::new(ErrorCode::SpecEmpty, "items が空です")
             .with_hint("処理する画像を items に列挙してください"));
     }
     Ok(spec)
@@ -155,8 +155,8 @@ pub fn load(path: &Path) -> Result<BatchSpec> {
 /// 未知のキーを拾ってエラーにする。serde の flatten では検出できないため自前で行う。
 fn validate_keys(raw: &serde_json::Value) -> Result<()> {
     let object = raw.as_object().ok_or_else(|| {
-        Error::input(
-            "SPEC_INVALID",
+        Error::new(
+            ErrorCode::SpecInvalid,
             "仕様ファイルの最上位はオブジェクトである必要があります",
         )
     })?;
@@ -165,8 +165,8 @@ fn validate_keys(raw: &serde_json::Value) -> Result<()> {
 
     if let Some(defaults) = object.get("defaults") {
         let d = defaults.as_object().ok_or_else(|| {
-            Error::input(
-                "SPEC_INVALID",
+            Error::new(
+                ErrorCode::SpecInvalid,
                 "defaults はオブジェクトである必要があります",
             )
         })?;
@@ -176,8 +176,8 @@ fn validate_keys(raw: &serde_json::Value) -> Result<()> {
     let items = object.get("items").and_then(|v| v.as_array());
     for (i, item) in items.into_iter().flatten().enumerate() {
         let o = item.as_object().ok_or_else(|| {
-            Error::input(
-                "SPEC_INVALID",
+            Error::new(
+                ErrorCode::SpecInvalid,
                 format!("items[{i}] はオブジェクトである必要があります"),
             )
         })?;
@@ -198,8 +198,8 @@ fn check<'a>(
             continue;
         }
         let suggestion = closest(key, allowed);
-        let mut err = Error::input(
-            "SPEC_UNKNOWN_FIELD",
+        let mut err = Error::new(
+            ErrorCode::SpecUnknownField,
             format!("{location} に未知のキー '{key}' があります"),
         );
         err = match suggestion {
@@ -320,7 +320,7 @@ mod tests {
     fn a_misspelled_key_is_rejected_with_a_suggestion() {
         let err = spec_from(r#"{"items":[{"input":"a.jpg","output":"a.avif","tolerence":5}]}"#)
             .unwrap_err();
-        assert_eq!(err.code, "SPEC_UNKNOWN_FIELD");
+        assert_eq!(err.code.as_str(), "SPEC_UNKNOWN_FIELD");
         assert!(err.message.contains("tolerence"));
         assert!(
             err.hint.unwrap().contains("tolerance"),
@@ -332,7 +332,7 @@ mod tests {
     fn an_unknown_key_without_a_near_match_lists_the_valid_ones() {
         let err = spec_from(r#"{"items":[{"input":"a.jpg","output":"a.avif","sharpen":true}]}"#)
             .unwrap_err();
-        assert_eq!(err.code, "SPEC_UNKNOWN_FIELD");
+        assert_eq!(err.code.as_str(), "SPEC_UNKNOWN_FIELD");
         let hint = err.hint.unwrap();
         assert!(hint.contains("tolerance") && hint.contains("canvas"));
     }
@@ -345,7 +345,7 @@ mod tests {
             r#"{"items":[{"input":"a","output":"b","nope":1}]}"#,
         ] {
             let err = spec_from(json).unwrap_err();
-            assert_eq!(err.code, "SPEC_UNKNOWN_FIELD", "見逃した: {json}");
+            assert_eq!(err.code.as_str(), "SPEC_UNKNOWN_FIELD", "見逃した: {json}");
         }
     }
 

@@ -12,9 +12,9 @@ use crate::batch::{self, BatchItem, ItemSettings};
 use crate::cli::{BatchArgs, ColorOpts, CutoutArgs, OutputOpts, parse_hex_color, parse_size};
 use crate::commands::cutout;
 use crate::cutout::DEFAULT_BORDER;
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::OutputFormat;
-use crate::report::{BatchItemReport, BatchReport, ErrorBody};
+use crate::report::{BatchItemReport, BatchReport, ErrorBody, SCHEMA_VERSION};
 
 pub fn run(args: &BatchArgs) -> Result<BatchReport> {
     let started = Instant::now();
@@ -26,7 +26,7 @@ pub fn run(args: &BatchArgs) -> Result<BatchReport> {
         let output = batch::resolve(&base, &item.output);
         let settings = item.settings.merged_over(&spec.defaults);
 
-        let outcome = to_cutout_args(&input, &output, &settings, args.force)
+        let outcome = to_cutout_args(&input, &output, &settings, args.force, args.dry_run)
             .and_then(|args| cutout::run(&args));
 
         match outcome {
@@ -54,7 +54,7 @@ pub fn run(args: &BatchArgs) -> Result<BatchReport> {
         rayon::ThreadPoolBuilder::new()
             .num_threads(args.jobs)
             .build()
-            .map_err(|e| Error::general("THREAD_POOL_FAILED", e.to_string()))?
+            .map_err(|e| Error::new(ErrorCode::ThreadPoolFailed, e.to_string()))?
             .install(|| spec.items.par_iter().map(process).collect())
     };
 
@@ -65,11 +65,13 @@ pub fn run(args: &BatchArgs) -> Result<BatchReport> {
         .count();
 
     Ok(BatchReport {
+        schema_version: SCHEMA_VERSION,
         spec: args.spec.display().to_string(),
         total: results.len(),
         succeeded: results.len() - failed,
         failed,
         with_warnings,
+        dry_run: args.dry_run,
         elapsed_ms: started.elapsed().as_millis(),
         results,
     })
@@ -83,14 +85,15 @@ fn to_cutout_args(
     output: &Path,
     settings: &ItemSettings,
     force: bool,
+    dry_run: bool,
 ) -> Result<CutoutArgs> {
     let format = settings
         .format
         .as_deref()
         .map(|name| {
             OutputFormat::from_name(name).ok_or_else(|| {
-                Error::argument(
-                    "UNKNOWN_OUTPUT_FORMAT",
+                Error::new(
+                    ErrorCode::UnknownOutputFormat,
                     format!("'{name}' は未対応の形式です"),
                 )
                 .with_hint("avif / png / jpeg のいずれかを指定してください")
@@ -101,13 +104,13 @@ fn to_cutout_args(
     let canvas = settings
         .canvas
         .as_deref()
-        .map(|s| parse_size(s).map_err(|e| Error::argument("INVALID_CANVAS", e)))
+        .map(|s| parse_size(s).map_err(|e| Error::new(ErrorCode::InvalidCanvas, e)))
         .transpose()?;
 
     let background = settings
         .background
         .as_deref()
-        .map(|s| parse_hex_color(s).map_err(|e| Error::argument("INVALID_COLOR", e)))
+        .map(|s| parse_hex_color(s).map_err(|e| Error::new(ErrorCode::InvalidColor, e)))
         .transpose()?
         .unwrap_or([255, 255, 255]);
 
@@ -149,6 +152,7 @@ fn to_cutout_args(
             background,
             flatten: settings.flatten.unwrap_or(false),
             force,
+            dry_run,
         },
     })
 }
@@ -170,8 +174,8 @@ fn checked(value: Option<f64>, default: f64, key: &str) -> Result<f64> {
 fn capped(value: Option<u32>, default: u32, max: u32, key: &str) -> Result<u32> {
     let value = value.unwrap_or(default);
     if value > max {
-        return Err(Error::argument(
-            "INVALID_SETTING",
+        return Err(Error::new(
+            ErrorCode::InvalidSetting,
             format!("{key} は 0 から {max} の範囲で指定してください（{value} が指定されました）"),
         ));
     }
@@ -188,8 +192,8 @@ fn checked_opt(value: Option<f64>, key: &str) -> Result<Option<f64>> {
 
 fn validate(v: f64, key: &str) -> Result<f64> {
     if !v.is_finite() || v < 0.0 {
-        return Err(Error::argument(
-            "INVALID_SETTING",
+        return Err(Error::new(
+            ErrorCode::InvalidSetting,
             format!("{key} は 0 以上の有限な数値である必要があります（{v} が指定されました）"),
         ));
     }
@@ -211,8 +215,14 @@ mod tests {
     #[test]
     fn the_batch_defaults_match_the_library_defaults() {
         let settings = ItemSettings::default();
-        let args = to_cutout_args(Path::new("in.png"), Path::new("out.png"), &settings, false)
-            .expect("既定値だけの項目は解釈できるはず");
+        let args = to_cutout_args(
+            Path::new("in.png"),
+            Path::new("out.png"),
+            &settings,
+            false,
+            false,
+        )
+        .expect("既定値だけの項目は解釈できるはず");
         let defaults = CutoutOptions::default();
 
         assert_eq!(args.tolerance, defaults.tolerance, "tolerance の既定値");

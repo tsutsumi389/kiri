@@ -72,7 +72,7 @@ warning_catalog! {
     AlphaFlattened = "ALPHA_FLATTENED"
         => "出力形式が透過を保持できないので背景色で合成した",
     PreviewFailed = "PREVIEW_FAILED"
-        => "プレビューを書き出せなかった（成果物自体は書けている）",
+        => "プレビューを書き出せなかった（本出力の成否とは独立。--dry-run なら本出力は無い）",
     ColorProfileUnsupported = "COLOR_PROFILE_UNSUPPORTED"
         => "ICC が LUT 型などで sRGB へ変換できなかった",
     ColorConversionSkipped = "COLOR_CONVERSION_SKIPPED"

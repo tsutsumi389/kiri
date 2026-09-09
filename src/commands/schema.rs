@@ -123,6 +123,14 @@ fn arg_entry(arg: &clap::Arg) -> ArgEntry {
                 .collect::<Vec<_>>()
                 .join(",")
         }),
+        accepts: {
+            let values: Vec<String> = arg
+                .get_possible_values()
+                .iter()
+                .map(|v| v.get_name().to_string())
+                .collect();
+            (!values.is_empty()).then_some(values)
+        },
         repeatable: matches!(arg.get_action(), ArgAction::Append),
         global: arg.is_global_set(),
         summary: arg.get_help().map(|h| h.to_string()).unwrap_or_default(),

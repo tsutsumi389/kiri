@@ -33,7 +33,11 @@ impl ErrorKind {
     pub fn meaning(self) -> &'static str {
         match self {
             ErrorKind::General => "一般エラー",
-            ErrorKind::Argument => "引数不正",
+            // 引数の書式や値域は clap が先に検証する。そこで落ちた場合は
+            // kiri のエラー型を通らないので、--json を付けても stdout は空に
+            // なる。**errors[] のどの code にも対応しない唯一の失敗**なので、
+            // exit code の説明で言っておく以外に伝える場所が無い
+            ErrorKind::Argument => "引数不正（書式や値域の誤りは code を伴わず stderr にのみ出る）",
             ErrorKind::Input => "入力ファイル異常",
             ErrorKind::Processing => "処理失敗",
         }
@@ -109,11 +113,11 @@ error_catalog! {
 
     // 引数 (exit 2)
     InvalidAngle = "INVALID_ANGLE", Argument
-        => "--angle が数値として解釈できない",
+        => "角度が有限な数値でない（CLI では引数検証が先に弾くため届かない）",
     InvalidBbox = "INVALID_BBOX", Argument
-        => "--bbox の書式か範囲が不正",
+        => "bbox の座標が 0.0-1.0 または画像の範囲に収まらない",
     InvalidSeed = "INVALID_SEED", Argument
-        => "--fg-seed の書式か範囲が不正",
+        => "--fg-seed の座標が 0.0-1.0 または画像の範囲に収まらない",
     InvalidCanvas = "INVALID_CANVAS", Argument
         => "--canvas の書式か寸法が不正",
     InvalidColor = "INVALID_COLOR", Argument
@@ -127,7 +131,7 @@ error_catalog! {
     InvalidEffort = "INVALID_EFFORT", Argument
         => "--effort が 1-10 の外",
     InvalidSetting = "INVALID_SETTING", Argument
-        => "spec の設定値が不正（負値や nan）",
+        => "spec の設定値が不正（負値・nan・上限超過）",
     MissingDimension = "MISSING_DIMENSION", Argument
         => "--width も --height も指定されていない",
     UpscaleNotAllowed = "UPSCALE_NOT_ALLOWED", Argument
@@ -137,7 +141,7 @@ error_catalog! {
     SideOutputConflict = "SIDE_OUTPUT_CONFLICT", Argument
         => "--preview / --debug-mask のパスが本出力や互いと衝突している",
     UnknownOutputFormat = "UNKNOWN_OUTPUT_FORMAT", Argument
-        => "拡張子から出力形式を判別できない",
+        => "出力形式を判別できない（拡張子、または spec の format 名）",
     SpecEmpty = "SPEC_EMPTY", Argument
         => "spec に項目が 1 つも無い",
 

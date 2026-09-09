@@ -204,14 +204,27 @@ fn angle_long_help() -> String {
 ///
 /// **AI エージェントは `--help` を読んで判断する**ので、「何が書かれないか」
 /// だけでなく「何は書かれるか」を書いておかないと、プレビューまで出ないものと
-/// 思い込んで `--dry-run` を諦める。上書き検査を外すことも同様で、
-/// 書かないのに `--force` を足す誤用を生む。
+/// 思い込んで `--dry-run` を諦める。上書き検査の扱いも同様で、本出力と付随出力で
+/// 規約が違うことを言わないと、2 周目で `OUTPUT_EXISTS` に当たって止まる。
 const DRY_RUN_HELP: &str = "書き出さずに結果だけ返す。成果物は 1 バイトも変わらない。\n\
      エンコードまでは実際に行うので、outputs[].bytes は見積もりではなく実測値である。\n\
      --preview と --debug-mask は書き出す。本出力は成果物だが、この 2 つは検証用の\
      付随物であり、「本番を壊さずに目で確かめる」ことこそ dry-run の用途であるため。\n\
-     出力先が既にあっても失敗しない（書かないので壊しようがない）。ただし本番実行に\
-     --force が要る場合は DRY_RUN_OUTPUT_EXISTS で先に知らせる";
+     本出力の上書き検査はしない（書かないので壊しようがない）。ただし本番実行に \
+     --force が要る場合は DRY_RUN_OUTPUT_EXISTS で先に知らせる。\n\
+     --preview / --debug-mask は実際に書くので検査は残る。同じ検証パスへ繰り返し\
+     書くなら --force を添える（dry-run と併せた --force は本出力を書かないので安全）";
+
+/// `batch --dry-run` の長いヘルプ。
+///
+/// **`batch` は `--preview` も `--debug-mask` も受けない**（数百点で画像を吐けば
+/// 無駄な I/O になるため、救済の道具は `cutout` 側にある）。共通の文面を使うと、
+/// この 2 つについての 2 段落がそのまま嘘になる。
+const BATCH_DRY_RUN_HELP: &str = "1 件も書き出さずに全項目の結果だけ返す。成果物は 1 バイトも変わらない。\n\
+     エンコードまでは実際に行うので、outputs[].bytes は見積もりではなく実測値である。\n\
+     上書き検査はしない（書かないので壊しようがない）。ただし本番実行に --force が\
+     要る項目は DRY_RUN_OUTPUT_EXISTS で知らせる。\n\
+     数百点の spec を本番へ流す前に、警告の出る項目だけを洗い出せる";
 
 /// `--seal` の上限。
 ///
@@ -374,7 +387,11 @@ pub struct CutoutArgs {
     #[arg(long, value_name = "PATH")]
     pub preview: Option<PathBuf>,
 
-    /// --preview のパネル1枚あたりの長辺(px)
+    /// --preview のパネル1枚あたりの長辺(px)。32-4096。
+    ///
+    /// 範囲を文面に書くのは、**clap の `range` が外から読めない**ためである。
+    /// `kiri schema` は値の候補を返せるが範囲は返せず、外した値は code を伴わない
+    /// exit 2 になる。ヘルプに書いておけば `summary` として schema に乗る
     #[arg(long, default_value_t = DEFAULT_PANEL, value_parser = clap::value_parser!(u32).range(32..=4096))]
     pub preview_size: u32,
 
@@ -409,7 +426,7 @@ pub struct BatchArgs {
     pub force: bool,
 
     /// 1 件も書き出さずに全項目の結果だけ返す
-    #[arg(long, long_help = DRY_RUN_HELP)]
+    #[arg(long, long_help = BATCH_DRY_RUN_HELP)]
     pub dry_run: bool,
 }
 

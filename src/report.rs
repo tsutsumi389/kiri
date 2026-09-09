@@ -417,6 +417,14 @@ pub struct ArgEntry {
     /// 既定値。**「未指定」と「明示」を区別する項目は null になる。**
     /// キーごと消さないのは、null と「既定値が無い」を同じ形にしないため
     pub default: Option<String>,
+    /// 受け付ける値が決まっている項目の選択肢（`--format` など）。
+    ///
+    /// **綴りを外すと clap が code 無しの exit 2 で落ちる。** 返ってきた結果から
+    /// `errors[]` へ辿れない失敗なので、呼ぶ前に選択肢を知れる必要がある。
+    /// 自由な値を取る項目ではキーごと消える。空配列を返すと「選択肢が無い」と
+    /// 読めてしまうため
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accepts: Option<Vec<String>>,
     /// 複数回指定できるか（`--fg-seed` など）
     pub repeatable: bool,
     /// どのサブコマンドでも受けるか（`--json`）

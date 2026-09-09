@@ -65,10 +65,14 @@ $ kiri schema --json
   返すことはない。**「この失敗なら何番」で分岐が書ける
 - `warnings[]` / `errors[]` は実装と同じ表から生成される。警告もエラーもそこへ足す以外に
   作る方法が無いので、**載っていない code が飛んでくることは構造的に起こらない**
+- `accepts` は受け付ける値の一覧（`--format` なら avif / png / jpeg）。**綴りを外すと
+  clap が code 無しの exit 2 で落ちる**ので、呼ぶ前に知れる必要がある。自由な値を取る
+  項目ではキーごと消える。数値の範囲は clap から読めないため、必要なものは `summary`
+  の文面に書いてある（`--preview-size` は 32-4096）
 - `detail` は `--help` の長い説明。**指定の前に知っていないと選びようがないこと**が
   書いてある（90 度単位だけが無劣化、など）。無ければキーごと消える
 
-全体で 36KB ある。必要な節だけ引くとよい。
+全体で 40KB ある。必要な節だけ引くとよい。
 
 ```
 $ kiri schema --json | jq '.warnings'
@@ -85,7 +89,7 @@ $ kiri schema --json | jq '.commands[] | select(.name == "cutout") | .options'
 結果 JSON はすべて `schema_version` を名乗る。**失敗の JSON も同じ。**
 
 ```json
-{ "schema_version": 1, "error": { "code": "NOT_FOUND", "message": "..." } }
+{ "schema_version": 1, "error": { "code": "INPUT_UNREADABLE", "message": "..." } }
 ```
 
 **キーが増えただけでは上げない。** 既存のキーの意味や型が変わったとき、つまり
@@ -855,7 +859,8 @@ refine 済みの鮮鋭な輪郭はちょうど 1.00 になり、**1〜3 なら�
 | `BBOX_RECOMMENDED` | 背景が不均一で背景側が前景として残っている。bbox で解ける |
 | `SUBJECT_TOUCHES_EDGE` | 前景が画像の外周に接している（商品の見切れ） |
 | `NOT_SEPARABLE` | 主体と背景の色差が背景自身のばらつきを下回る。調整では改善しない |
-| `FOREGROUND_TOO_SMALL` / `FOREGROUND_TOO_LARGE` | 前景比率が極端 |
+| `FOREGROUND_TOO_SMALL` | 前景比率が小さすぎる。商品が消えている可能性がある |
+| `FOREGROUND_TOO_LARGE` | 前景比率が大きすぎる。背景が残っている可能性がある |
 | `HALO_REMAINS` | 境界に背景色のままの縁が残っている。`--tolerance` を上げると減る |
 | `EDGE_THRESHOLD_RAISED` | 背景のテクスチャに合わせて堤防を引き上げた |
 | `CANVAS_UPSCALED` | キャンバス配置で商品を拡大した |
@@ -965,9 +970,12 @@ $ kiri cutout product.jpg -o product.png --tolerance 18 --dry-run --json
 - **`--preview` と `--debug-mask` は書き出す。** 本出力は成果物だが、この 2 つは検証用の
   付随物である。**「本番を壊さずに目で確かめる」ことこそ dry-run の用途**なので、
   ここで書かないと `--dry-run` と `--preview` が併用できず、目視のたびに納品物を潰す
-- **上書き検査をしない。** 1 バイトも書かない実行を止める理由が無いため。ただし本番実行
-  なら `OUTPUT_EXISTS` で落ちていた場合は `DRY_RUN_OUTPUT_EXISTS` で先に知らせる。
-  黙って通すと、dry-run の成功を見て本番へ進んだ AI がそこで初めて詰まる
+- **本出力の上書き検査をしない。** 1 バイトも書かない実行を止める理由が無いため。
+  ただし本番実行なら `OUTPUT_EXISTS` で落ちていた場合は `DRY_RUN_OUTPUT_EXISTS` で先に
+  知らせる。黙って通すと、dry-run の成功を見て本番へ進んだ AI がそこで初めて詰まる
+- **`--preview` / `--debug-mask` の検査は残る。** こちらは実際に書くので、既存のファイルを
+  壊しうる。同じ検証パスへ繰り返し書きたければ `--force` を添える。**dry-run と併せた
+  `--force` は本出力を書かないので安全である**（本出力は `--dry-run` が先に止める）
 - **`dry_run` キーは常に出す。** 省いて「無ければ書いた」にすると、古いバージョンで
   走った結果と書いた結果が同じ形になり、成果物が無いのにあるものとして次へ進む事故を
   防げない
@@ -1126,15 +1134,25 @@ sRGB へ変換するので、そこで色が転ぶことはない。
 |---|---|
 | 0 | 成功 |
 | 1 | 一般エラー |
-| 2 | 引数不正 |
+| 2 | 引数不正（書式や値域の誤りは code を伴わず stderr にのみ出る） |
 | 3 | 入力ファイル異常 |
 | 4 | 処理失敗 |
 
 `--json` 指定時はエラーも JSON で stdout に返る。**code と exit code の対応は
 `kiri schema --json` の `errors[]` が返す**（35 種ある）。
 
+**ただし引数の書式や値域で落ちた場合は JSON が返らない。** 検証は clap が行い、
+kiri のエラー型を通らないため、`--json` を付けても **stdout は空のまま exit 2 で
+終わる**（説明は stderr に出る）。`errors[]` のどの code にも対応しない唯一の失敗
+なので、`stdout` が空で終了コードが 2 なら、綴りか値域の誤りとして stderr を読む。
+
+```
+$ kiri rotate product.jpg -o out.png --angle sideways --json
+error: invalid value 'sideways' for '--angle <ANGLE>': 'sideways' は有限な数値である必要があります
+```
+
 ```json
-{ "error": { "code": "OUTPUT_EXISTS", "message": "...", "hint": "--force を付けると上書きします" } }
+{ "schema_version": 1, "error": { "code": "OUTPUT_EXISTS", "message": "...", "hint": "--force を付けると上書きします" } }
 ```
 
 ## ドキュメント

@@ -4572,3 +4572,394 @@ fn schema_without_json_is_a_human_summary() {
     assert!(text.contains("LOW_UNIFORMITY"), "{text}");
     assert!(text.contains("OUTPUT_EXISTS"), "{text}");
 }
+
+// --- 値の読み方（fields） ---
+
+fn fields_of(v: &Value) -> Vec<Value> {
+    v["fields"]
+        .as_array()
+        .expect("fields が配列ではない")
+        .clone()
+}
+
+/// ドット区切りの path で JSON を辿る。無ければ None。
+fn pick<'a>(report: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut node = report;
+    for segment in path.split('.') {
+        node = node.get(segment)?;
+    }
+    Some(node)
+}
+
+/// しきい値は実装の定数と同じ値で配られる。
+///
+/// **散文では配れない種類の情報である。** 警告はしきい値を越えたときにしか
+/// 出ないので、出ていない値が良いのか悪いのかは、しきい値を知らなければ
+/// 判断できない。そこを知るために README を読ませるのでは、`kiri schema` が
+/// 契約を配る意味が半分しか果たせない。
+#[test]
+fn schema_publishes_the_thresholds_behind_the_warnings() {
+    let v = schema_json();
+    let fields = fields_of(&v);
+    assert!(!fields.is_empty(), "fields が空: {v}");
+
+    let field = |path: &str| -> Value {
+        fields
+            .iter()
+            .find(|f| f["path"] == path)
+            .unwrap_or_else(|| panic!("{path} が fields に無い"))
+            .clone()
+    };
+
+    let warn = |path: &str, code: &str| -> Value {
+        field(path)["warns"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{path} が warns を持たない"))
+            .iter()
+            .find(|w| w["code"] == code)
+            .unwrap_or_else(|| panic!("{path} に {code} が無い"))
+            .clone()
+    };
+
+    // 実装の定数をそのまま配る。書き写した数値はここで落ちる
+    assert_eq!(
+        warn("background.uniformity", "LOW_UNIFORMITY")["threshold"]
+            .as_f64()
+            .unwrap(),
+        kiri::cutout::background::MIN_UNIFORMITY
+    );
+    assert_eq!(
+        warn("mask.halo_ratio", "HALO_REMAINS")["threshold"]
+            .as_f64()
+            .unwrap(),
+        kiri::cutout::diagnostics::HALO_WARN
+    );
+    assert_eq!(
+        warn("mask.foreground_ratio", "FOREGROUND_TOO_SMALL")["threshold"]
+            .as_f64()
+            .unwrap(),
+        kiri::cutout::MIN_FOREGROUND_RATIO
+    );
+    assert_eq!(
+        warn("mask.foreground_ratio", "FOREGROUND_TOO_LARGE")["threshold"]
+            .as_f64()
+            .unwrap(),
+        kiri::cutout::MAX_FOREGROUND_RATIO
+    );
+
+    // 信頼度 high の 3 条件も同じ形で配る
+    let gate = |path: &str| -> Value { field(path)["gates"].clone() };
+    assert_eq!(
+        gate("subject.area_ratio")["threshold"].as_f64().unwrap(),
+        kiri::cutout::subject::MIN_AREA_RATIO
+    );
+    assert_eq!(
+        gate("subject.capture_ratio")["threshold"].as_f64().unwrap(),
+        kiri::cutout::subject::MIN_CAPTURE_RATIO
+    );
+    assert_eq!(
+        gate("subject.leftover_ratio")["threshold"]
+            .as_f64()
+            .unwrap(),
+        kiri::cutout::subject::MAX_LEFTOVER_RATIO
+    );
+    assert_eq!(gate("subject.area_ratio")["confidence"], "high");
+
+    // 警告の code は契約に載っているものだけ
+    let known = codes_of(&v, "warnings");
+    for f in &fields {
+        for w in f["warns"].as_array().unwrap_or(&vec![]) {
+            let code = w["code"].as_str().unwrap().to_string();
+            assert!(known.contains(&code), "{} の {code} が未知", f["path"]);
+            assert!(
+                ["lt", "lte", "gt", "gte"].contains(&w["operator"].as_str().unwrap()),
+                "{} の operator が不正: {w}",
+                f["path"]
+            );
+        }
+    }
+}
+
+/// 配る文面に、日本語どうしの間の半角スペースが混ざっていない。
+///
+/// Rust の行継続（`\` の前のスペース）と clap の doc コメント連結（改行を
+/// スペースへ置き換える）は、どちらも英文を前提にしている。日本語では
+/// 「固定の しきい値」のような隙間になって残る。**`--help` では折り返しに
+/// 紛れて見えないが、schema は文面をそのまま配る**ので、受け取った側が
+/// 人間に見せたときに露出する。
+///
+/// 複数行で書きたい doc コメントは、空行で段落に分ける（clap が 1 行目を
+/// `summary`、以降を `detail` に回す）。文字列リテラルは `\` の前の
+/// スペースを落とす。
+#[test]
+fn the_published_prose_has_no_stray_spaces() {
+    let v = schema_json();
+    let japanese = |c: char| {
+        matches!(c,
+            'ぁ'..='ん' | 'ァ'..='ヶ' | '一'..='\u{9fff}'
+            | 'ー' | '。' | '、' | '「' | '」' | '（' | '）')
+    };
+
+    let mut stray = Vec::new();
+    let mut check = |label: String, text: Option<&str>| {
+        let Some(text) = text else { return };
+        let chars: Vec<char> = text.chars().collect();
+        for window in chars.windows(3) {
+            if japanese(window[0]) && window[1] == ' ' && japanese(window[2]) {
+                stray.push(format!(
+                    "{label}: 「{}{}{}」",
+                    window[0], window[1], window[2]
+                ));
+            }
+        }
+    };
+
+    for f in v["fields"].as_array().unwrap() {
+        let path = f["path"].as_str().unwrap();
+        check(format!("fields/{path}/summary"), f["summary"].as_str());
+        check(format!("fields/{path}/notes"), f["notes"].as_str());
+        check(
+            format!("fields/{path}/null_means"),
+            f["null_means"].as_str(),
+        );
+    }
+    for section in ["warnings", "errors"] {
+        for e in v[section].as_array().unwrap() {
+            let code = e["code"].as_str().unwrap();
+            check(format!("{section}/{code}"), e["summary"].as_str());
+        }
+    }
+    let empty = vec![];
+    for c in v["commands"].as_array().unwrap() {
+        let name = c["name"].as_str().unwrap();
+        for arg in c["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(c["arguments"].as_array().unwrap_or(&empty))
+        {
+            let option = arg["name"].as_str().unwrap();
+            check(format!("{name} {option}/summary"), arg["summary"].as_str());
+            check(format!("{name} {option}/detail"), arg["detail"].as_str());
+        }
+    }
+
+    assert!(
+        stray.is_empty(),
+        "配る文面に余分な半角スペースがある（{} 件）:\n{}",
+        stray.len(),
+        stray.join("\n")
+    );
+}
+
+/// 値を取らない項目に選択肢は無い。
+///
+/// clap は bool のフラグにも `true` / `false` を possible_values として持つが、
+/// **`--flatten true` と書けるわけではない。** そのまま配ると、受け付けない
+/// 書き方を契約が勧めることになる。
+#[test]
+fn a_flag_does_not_claim_to_accept_values() {
+    let v = schema_json();
+    for command in v["commands"].as_array().unwrap() {
+        let empty = vec![];
+        let args = command["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(command["arguments"].as_array().unwrap_or(&empty));
+        for arg in args {
+            if arg["takes_value"] == Value::Bool(false) {
+                assert!(
+                    arg.get("accepts").is_none(),
+                    "{} の {} が選択肢を名乗っている: {}",
+                    command["name"],
+                    arg["name"],
+                    arg["accepts"]
+                );
+            }
+        }
+    }
+    for arg in v["global_options"].as_array().unwrap() {
+        if arg["takes_value"] == Value::Bool(false) {
+            assert!(
+                arg.get("accepts").is_none(),
+                "{} が選択肢を名乗っている",
+                arg["name"]
+            );
+        }
+    }
+}
+
+/// `null` を返しうる項目は、`null` が何を意味するかを言う。
+///
+/// **0 と `null` を混同させないことが要点である。** 0 と報告すると
+/// 「縁が残っていない」という良い結果に見えてしまう。
+#[test]
+fn a_nullable_field_says_what_null_means() {
+    for f in fields_of(&schema_json()) {
+        if f["nullable"] == Value::Bool(true) {
+            let explained = f["null_means"].as_str().unwrap_or("");
+            assert!(
+                !explained.is_empty(),
+                "{} が null の意味を言わない",
+                f["path"]
+            );
+        } else {
+            assert!(
+                f.get("null_means").is_none(),
+                "{} は null を返さないのに説明がある",
+                f["path"]
+            );
+        }
+    }
+}
+
+/// 配った path は実際の結果に存在する。
+///
+/// `appears_in` が嘘をつくと、エージェントは `info` で取れない値を待つ。
+#[test]
+fn every_published_field_exists_in_the_result() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_jpeg(dir.path(), "product.jpg", &img);
+
+    let run = |args: &[&str]| -> Value {
+        let out = kiri().args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        json_stdout(&out)
+    };
+
+    let output = dir.path().join("out.png");
+    let info = run(&["info", input.to_str().unwrap(), "--json"]);
+    let cutout = run(&[
+        "cutout",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--dry-run",
+        "--json",
+    ]);
+
+    for f in fields_of(&schema_json()) {
+        let path = f["path"].as_str().unwrap();
+        let commands: Vec<&str> = f["appears_in"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{path} が appears_in を持たない"))
+            .iter()
+            .map(|c| c.as_str().unwrap())
+            .collect();
+        assert!(!commands.is_empty(), "{path} の appears_in が空");
+
+        for command in commands {
+            let report = match command {
+                "info" => &info,
+                "cutout" => &cutout,
+                other => panic!("{path} が未知のコマンド {other} を名指ししている"),
+            };
+            assert!(
+                pick(report, path).is_some(),
+                "{command} の結果に {path} が無い"
+            );
+            if f["nullable"] == Value::Bool(false) {
+                assert!(
+                    !pick(report, path).unwrap().is_null(),
+                    "{command} の {path} が null を返した（nullable: false）"
+                );
+            }
+        }
+    }
+}
+
+/// 配ったしきい値は、実際に出る警告と一致する。
+///
+/// ここが見るのは **`operator` の向き**である。`FOREGROUND_TOO_SMALL` を `gt` と
+/// 書けば、前景が十分にある画像で「小さすぎる警告が出ていない」として落ちる。
+/// 定数を正しく参照していても向きは間違えられるので、実行でしか確かめられない。
+///
+/// **数値の誤りはここでは捕まらない。** しきい値の近傍の値を持つ素材が無いと、
+/// どんな値を書いても整合してしまう（`uniformity` 0.90 に対して手元の素材は
+/// 1.00 と 0.50 しかない）。そちらは
+/// `schema_publishes_the_thresholds_behind_the_warnings` が定数との照合で守る。
+/// 2 つで「書き写しの誤り」と「向きの誤り」を分担している。
+#[test]
+fn the_published_thresholds_agree_with_the_warnings_that_fire() {
+    let v = schema_json();
+    let dir = fixture_dir();
+
+    // 警告が出る素材と出ない素材の両方を通す。片側だけでは
+    // 「出るべきときに出る」か「出ないべきときに出ない」の一方しか見られない
+    let plain = write_jpeg(
+        dir.path(),
+        "plain.jpg",
+        &product_image(&ProductSpec::default()),
+    );
+    let split = write_png(dir.path(), "split.png", &split_background_scene(200, 200));
+    let empty = write_png(
+        dir.path(),
+        "empty.png",
+        &product_image(&ProductSpec {
+            product: [248, 248, 247],
+            shadow: false,
+            noise: false,
+            ..Default::default()
+        }),
+    );
+
+    let mut reports = Vec::new();
+    for (name, input) in [("plain", &plain), ("split", &split), ("empty", &empty)] {
+        for command in ["info", "cutout"] {
+            let output = dir.path().join(format!("{name}-{command}.png"));
+            let args: Vec<String> = if command == "info" {
+                vec!["info".into(), input.display().to_string(), "--json".into()]
+            } else {
+                vec![
+                    "cutout".into(),
+                    input.display().to_string(),
+                    "-o".into(),
+                    output.display().to_string(),
+                    "--dry-run".into(),
+                    "--json".into(),
+                ]
+            };
+            let out = kiri().args(&args).output().unwrap();
+            // 前景が 1 画素も残らない素材は cutout が失敗しうる。その結果は使わない
+            if out.status.success() {
+                reports.push((format!("{name}/{command}"), json_stdout(&out)));
+            }
+        }
+    }
+    assert!(reports.len() >= 4, "比べられる結果が足りない");
+
+    for f in fields_of(&v) {
+        let path = f["path"].as_str().unwrap();
+        for w in f["warns"].as_array().unwrap_or(&vec![]) {
+            let code = w["code"].as_str().unwrap();
+            let threshold = w["threshold"].as_f64().unwrap();
+            let operator = w["operator"].as_str().unwrap();
+
+            for (label, report) in &reports {
+                let Some(value) = pick(report, path).and_then(Value::as_f64) else {
+                    continue;
+                };
+                let crossed = match operator {
+                    "lt" => value < threshold,
+                    "lte" => value <= threshold,
+                    "gt" => value > threshold,
+                    "gte" => value >= threshold,
+                    other => panic!("未知の operator: {other}"),
+                };
+                if crossed {
+                    assert!(
+                        has_warning(report, code),
+                        "{label}: {path}={value} は {operator} {threshold} を満たすのに \
+                         {code} が出ていない。配ったしきい値が実際の発火点と違う"
+                    );
+                }
+            }
+        }
+    }
+}

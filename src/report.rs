@@ -366,6 +366,8 @@ pub struct SchemaReport {
     pub exit_codes: Vec<ExitCodeEntry>,
     pub errors: Vec<ErrorCodeEntry>,
     pub warnings: Vec<WarningCodeEntry>,
+    /// 結果の値をどう読むか。しきい値と `null` の意味を配る
+    pub fields: Vec<FieldEntry>,
     /// どのサブコマンドでも受けるオプション。**コマンド側には重複させない。**
     /// clap のグローバル引数はサブコマンドの引数一覧に現れないので、
     /// 素直に組むと schema から丸ごと落ちる
@@ -433,4 +435,56 @@ pub struct ArgEntry {
     /// 長い説明。**指定の前に知っていないと選びようがないこと**が書いてある
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+}
+
+/// 結果 JSON の 1 項目の読み方。
+///
+/// **警告はしきい値を越えたときにしか出ない。** 越えていない値が良いのか悪いのかは、
+/// しきい値を知らなければ判断できず、そこを知るために README を読ませるのでは
+/// `kiri schema` が契約を配る意味が半分しか果たせない。
+///
+/// 数値（`warns` / `gates` のしきい値）は実装の定数から組み立てる。散文
+/// （`summary` / `null_means` / `notes`）は手で書く。**最も動きやすいものを
+/// 最も強く守る**という分け方で、較正のたびに動く数値は書き写す余地を残さない。
+#[derive(Debug, Serialize)]
+pub struct FieldEntry {
+    /// 結果 JSON での位置。`mask.halo_ratio` のようにドットで辿る
+    pub path: &'static str,
+    /// この項目が現れるコマンド。`info` で取れない値を待たせないため
+    pub appears_in: Vec<&'static str>,
+    /// 値の種類。`ratio` / `delta_e` / `gradient` / `px` / `bool` /
+    /// `normalized_bbox` / `enum`
+    pub unit: &'static str,
+    pub nullable: bool,
+    /// `null` が何を意味するか。**0 と混同させないために要る。**
+    /// 0 と報告すると「縁が残っていない」という良い結果に見えてしまう
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub null_means: Option<&'static str>,
+    /// 越えると出る警告。**単一のしきい値で決まるものだけを載せる。**
+    /// 複合条件のものを載せると `threshold` が嘘になるので `notes` へ回す
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warns: Vec<FieldThreshold>,
+    /// `subject.confidence` が `high` になるための条件（3 つすべての AND）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gates: Option<FieldGate>,
+    pub summary: &'static str,
+    /// しきい値では表せない読み方。複合条件の警告もここで述べる
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FieldThreshold {
+    pub code: WarningCode,
+    /// `lt` / `lte` / `gt` / `gte`。値がこの関係を満たすと警告が出る
+    pub operator: &'static str,
+    pub threshold: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FieldGate {
+    /// 満たしたときに到達しうる信頼度
+    pub confidence: &'static str,
+    pub operator: &'static str,
+    pub threshold: f64,
 }

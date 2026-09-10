@@ -70,7 +70,8 @@ pub struct InfoArgs {
 /// 入力の色の扱い。読み込みを伴うコマンドすべてで同じものを使う。
 #[derive(Args, Debug, Default)]
 pub struct ColorOpts {
-    /// 埋め込み ICC を解釈せず、画素の値をそのまま使う。
+    /// 埋め込み ICC を解釈せず、画素の値をそのまま使う
+    ///
     /// 既定では Display P3 や AdobeRGB を sRGB へ変換する
     #[arg(long)]
     pub no_color_convert: bool,
@@ -301,7 +302,8 @@ pub struct CutoutArgs {
     /// 入力画像（JPEG または PNG）
     pub input: PathBuf,
 
-    /// 切り抜く範囲 x1,y1,x2,y2（左上原点）。この外側は無条件に背景とする。
+    /// 切り抜く範囲 x1,y1,x2,y2（左上原点）。この外側は無条件に背景とする
+    ///
     /// 未指定なら全自動で判定する
     #[arg(long, value_parser = parse_bbox, allow_hyphen_values = false)]
     pub bbox: Option<[f64; 4]>,
@@ -343,18 +345,21 @@ pub struct CutoutArgs {
     )]
     pub edge_threshold: Option<f64>,
 
-    /// 背景を広げる際に 1px あたりに許す色差(ΔE)。0 で無効。
+    /// 背景を広げる際に 1px あたりに許す色差(ΔE)。0 で無効
+    ///
     /// なだらかな落ち影は越え、淡い商品の輪郭の段差では止まる
     #[arg(long, default_value_t = 2.2, value_parser = non_negative)]
     pub step_tolerance: f64,
 
-    /// 落ち影として消す明度(L*)の落ち込みの上限。0 で無効。
+    /// 落ち影として消す明度(L*)の落ち込みの上限。0 で無効
+    ///
     /// 彩度が背景とほぼ同じで暗いだけの画素に限って適用される
     #[arg(long, default_value_t = 35.0, value_parser = non_negative)]
     pub shadow_tolerance: f64,
 
-    /// 幅 2N px 以下の隙間を通ってしか外周につながらない背景を前景へ戻す。
-    /// 0 で無効。輪郭の小さな破れからの浸水を止める（上限 8）
+    /// 幅 2N px 以下の隙間を通ってしか外周につながらない背景を前景へ戻す。0 で無効
+    ///
+    /// 輪郭の小さな破れからの浸水を止める（上限 8）
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(0..=i64::from(MAX_SEAL)))]
     pub seal: u32,
 
@@ -362,17 +367,20 @@ pub struct CutoutArgs {
     #[arg(long)]
     pub no_despill: bool,
 
-    /// 境界帯のアルファを画像の色から推定し直さず、マスクの形から作る旧方式に戻す。
+    /// 境界帯のアルファを画像の色から推定し直さず、マスクの形から作る旧方式に戻す
+    ///
     /// 淡い色の商品で新方式が不安定なときの逃げ道
     #[arg(long)]
     pub no_refine: bool,
 
-    /// 切り抜いた商品を指定サイズのキャンバス中央に配置する。
+    /// 切り抜いた商品を指定サイズのキャンバス中央に配置する
+    ///
     /// 1000x1000 または 1000（正方形）の形式
     #[arg(long, value_parser = parse_size)]
     pub canvas: Option<(u32, u32)>,
 
-    /// 商品がキャンバスの何割を占めるか (0.0-1.0)。--canvas 指定時のみ有効。
+    /// 商品がキャンバスの何割を占めるか (0.0-1.0)。--canvas 指定時のみ有効
+    ///
     /// 既定の 0.85 は EC プラットフォームで広く求められる占有率に合わせている
     #[arg(long, default_value_t = 0.85)]
     pub fill_ratio: f64,
@@ -381,9 +389,9 @@ pub struct CutoutArgs {
     #[arg(long, value_name = "PATH")]
     pub debug_mask: Option<PathBuf>,
 
-    /// 「元画像 | マスク | 結果」を1枚に並べた検証用画像を書き出す。
-    /// 原寸の出力は視覚モデルに渡せないため、AI に結果を見せて
-    /// 調整させるにはこれを使う
+    /// 「元画像 | マスク | 結果」を1枚に並べた検証用画像を書き出す
+    ///
+    /// 原寸の出力は視覚モデルに渡せないため、AI に結果を見せて調整させるにはこれを使う
     #[arg(long, value_name = "PATH")]
     pub preview: Option<PathBuf>,
 
@@ -395,7 +403,8 @@ pub struct CutoutArgs {
     #[arg(long, default_value_t = DEFAULT_PANEL, value_parser = clap::value_parser!(u32).range(32..=4096))]
     pub preview_size: u32,
 
-    /// --preview の元画像パネルに 0.1 刻みの座標グリッドを重ねない。
+    /// --preview の元画像パネルに 0.1 刻みの座標グリッドを重ねない
+    ///
     /// グリッドは --bbox --normalized の値を読み取るためにある
     #[arg(long)]
     pub no_preview_grid: bool,
@@ -412,7 +421,8 @@ pub struct BatchArgs {
     /// 処理内容を記した JSON ファイル
     pub spec: PathBuf,
 
-    /// 仕様ファイル中の相対パスを解決する基準ディレクトリ。
+    /// 仕様ファイル中の相対パスを解決する基準ディレクトリ
+    ///
     /// 既定では仕様ファイルのある場所
     #[arg(long, value_name = "DIR")]
     pub base_dir: Option<PathBuf>,

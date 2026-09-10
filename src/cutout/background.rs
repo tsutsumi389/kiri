@@ -59,10 +59,16 @@ pub struct BackgroundEstimate {
     pub texture: GradientQuantiles,
 }
 
+/// 単色背景として扱える `uniformity` の下限。
+///
+/// `kiri schema` が `fields[]` で配る。**直書きのままでは配れない**——定数から
+/// 組み立てられない数値は、schema へ書き写すことになって必ず離れる。
+pub const MIN_UNIFORMITY: f64 = 0.90;
+
 impl BackgroundEstimate {
     /// 単色背景として扱えるか。切り抜きの成否をおおむねこの値が決める。
     pub fn is_uniform(&self) -> bool {
-        self.uniformity >= 0.90
+        self.uniformity >= MIN_UNIFORMITY
     }
 }
 

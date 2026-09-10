@@ -58,7 +58,7 @@ const BBOX_MARGIN: f64 = 0.01;
 ///
 /// **較正は既定の `--border 2` を前提にしている。** 詳細は
 /// `MIN_CAPTURE_RATIO` のコメントを参照。
-const MIN_AREA_RATIO: f64 = 0.05;
+pub const MIN_AREA_RATIO: f64 = 0.05;
 
 /// 主体候補と認めるのに要る捕捉率（最大成分 / 閾値を超えた画素の総数）の下限。
 ///
@@ -85,7 +85,7 @@ const MIN_AREA_RATIO: f64 = 0.05;
 /// 救えないほうだけが裏返る。**`--border` を既定から大きく動かしたときは、
 /// `confidence` を根拠に動いてはならない。** しきい値を `--border` から
 /// 切り離す改修は範囲が大きいので、いまは前提を書き残すに留める。
-const MIN_CAPTURE_RATIO: f64 = 0.70;
+pub const MIN_CAPTURE_RATIO: f64 = 0.70;
 
 /// 提案した矩形の外に残ってよい塊の上限（画像に占める割合）。
 ///
@@ -144,7 +144,7 @@ const MIN_CAPTURE_RATIO: f64 = 0.70;
 /// 支えている行ではない。** 2 つ目の商品を「取りこぼし」として leftover だけで
 /// 弾こうとすると閾値を 0.10 付近まで下げることになり、影や小道具の側
 /// （実写 4.1%、合成の帯 4.0%）との余裕が消える。役割を分けたまま置く。
-const MAX_LEFTOVER_RATIO: f64 = 0.15;
+pub const MAX_LEFTOVER_RATIO: f64 = 0.15;
 
 /// 主体候補をどれだけ信用してよいか。
 ///

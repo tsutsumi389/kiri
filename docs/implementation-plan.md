@@ -56,6 +56,7 @@ src/
 | 6 | 仕上げ：README、実画像での再計測とデフォルト値調整、GitHub Actions | v0.1.0 | 1日 |
 | 7 | 回転：90度単位は無劣化、任意角は Catmull-Rom で外接矩形へ拡張 | `kiri rotate` | 0.5日 |
 | 8 | 自己記述：code をカタログ化、パーサから契約を組み立て、書かずに試せるようにする | `kiri schema` / `--dry-run` | 0.5日 |
+| 9 | 値の読み方：しきい値を定数へ寄せ、`fields[]` として配る | `kiri schema` の `fields[]` | 0.5日 |
 
 **Phase 1 の `kiri info` を最初に完成させる。** 最小で end-to-end が通り、JSON規約とエラー処理の型がそこで確定する。型が決まれば以降は同じ形で積み上げられる。
 

@@ -42,6 +42,16 @@ pub use subject::{Confidence, LowReason, SubjectHint, detect_subject};
 /// 超えない値。実測に基づく。
 pub const DEFAULT_EDGE_THRESHOLD: f64 = 8.0;
 
+/// 前景比率が「極端」と言える下限と上限。
+///
+/// この外へ出たら、切り抜きが商品を消したか背景を残したかのどちらかである。
+/// **3 箇所で同じ値を使う**——警告 2 つと、`separability` を測る価値があるかの
+/// 判定（`cut_happened`）。直書きを散らすと、片方だけ動かしたときに
+/// 「警告は出ないのに切り抜けていない」が成立してしまう。
+pub const MIN_FOREGROUND_RATIO: f64 = 0.01;
+/// `MIN_FOREGROUND_RATIO` の対。
+pub const MAX_FOREGROUND_RATIO: f64 = 0.99;
+
 /// 背景のテクスチャに対して堤防を何倍のところへ置くか。
 ///
 /// p90 は「帯の 1 割がこれを超える」という水準なので、そのままを堤防にすると
@@ -478,7 +488,7 @@ fn collect_warnings(
             .with_data("uniformity", round4(background.uniformity)),
         );
     }
-    if stats.foreground_ratio < 0.01 {
+    if stats.foreground_ratio < MIN_FOREGROUND_RATIO {
         warnings.push(
             Warning::new(
                 WarningCode::ForegroundTooSmall,
@@ -490,7 +500,7 @@ fn collect_warnings(
             .with_hint("--tolerance を下げるか --bbox で対象を指定してください")
             .with_data("foreground_ratio", round4(stats.foreground_ratio)),
         );
-    } else if stats.foreground_ratio > 0.99 {
+    } else if stats.foreground_ratio > MAX_FOREGROUND_RATIO {
         warnings.push(
             Warning::new(
                 WarningCode::ForegroundTooLarge,
@@ -585,7 +595,8 @@ fn collect_warnings(
     // 全部消えた）状態では「境界」が切り抜きの輪郭を表しておらず、測っても
     // 意味がないためである。実際、布の上のリモコンで tolerance が低すぎた際に
     // 「tolerance を上げてください」と「調整では改善しません」が同時に出た。
-    let cut_happened = stats.foreground_ratio > 0.01 && stats.foreground_ratio < 0.99;
+    let cut_happened = stats.foreground_ratio > MIN_FOREGROUND_RATIO
+        && stats.foreground_ratio < MAX_FOREGROUND_RATIO;
     if let Some(sep) = separability {
         let spread = background.delta_e.p50;
         if cut_happened && sep < spread {

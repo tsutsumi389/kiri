@@ -65,6 +65,7 @@ $ kiri schema --json
   返すことはない。**「この失敗なら何番」で分岐が書ける
 - `warnings[]` / `errors[]` は実装と同じ表から生成される。警告もエラーもそこへ足す以外に
   作る方法が無いので、**載っていない code が飛んでくることは構造的に起こらない**
+- `fields[]` は結果の値の読み方（しきい値と `null` の意味）。後述
 - `accepts` は受け付ける値の一覧（`--format` なら avif / png / jpeg）。**綴りを外すと
   clap が code 無しの exit 2 で落ちる**ので、呼ぶ前に知れる必要がある。自由な値を取る
   項目ではキーごと消える。数値の範囲は clap から読めないため、必要なものは `summary`
@@ -72,10 +73,11 @@ $ kiri schema --json
 - `detail` は `--help` の長い説明。**指定の前に知っていないと選びようがないこと**が
   書いてある（90 度単位だけが無劣化、など）。無ければキーごと消える
 
-全体で 40KB ある。必要な節だけ引くとよい。
+全体で 44KB ある。必要な節だけ引くとよい。
 
 ```
 $ kiri schema --json | jq '.warnings'
+$ kiri schema --json | jq '.fields[] | select(.path | startswith("mask."))'
 $ kiri schema --json | jq '.commands[] | select(.name == "cutout") | .options'
 ```
 
@@ -83,6 +85,46 @@ $ kiri schema --json | jq '.commands[] | select(.name == "cutout") | .options'
 オプションの一覧を出さない。7 コマンド分を並べると読めなくなるし、人間には `--help`
 という専用の入口がある。テキストで価値があるのは「どんな code が返りうるか」の
 見通しで、これは `--help` のどこにも無い。
+
+#### fields — 値の読み方
+
+`fields[]` は結果 JSON の各項目について、**しきい値と `null` の意味**を返す。
+
+```json
+{
+  "path": "mask.halo_ratio",
+  "appears_in": ["cutout"],
+  "unit": "ratio",
+  "nullable": true,
+  "null_means": "測る境界が無かった。0（縁が残っていない）ではない",
+  "warns": [{ "code": "HALO_REMAINS", "operator": "gt", "threshold": 0.1 }],
+  "summary": "境界近傍で不透明なのに、元の色が局所背景と見分けがつかない画素の割合",
+  "notes": "白い下地では見えず、黒や色付きの下地に載せて初めて輪郭の光として現れる"
+}
+```
+
+**警告はしきい値を越えたときにしか出ない。** `halo_ratio` が 0.07 だったとき、
+それが良い値なのかは、しきい値がどこにあるかを知らなければ判断できない。そこを
+知るために README を読ませるのでは、`kiri schema` が契約を配る意味が半分しか
+果たせない。
+
+- `warns[].threshold` は**実装の定数そのもの**。較正で定数を動かせば schema も動く
+- **単一のしきい値で決まる警告だけを載せる。** `NOT_SEPARABLE` は固定値ではなく
+  `background.perimeter_delta_e.p50`（画像ごとの値）と比べるので、`threshold` を
+  載せられない。こういう条件は `notes` で述べる。**載せられないものを載せて
+  `threshold` を嘘にするより、載せないほうがよい**
+- `gates` は `subject.confidence` が `high` になる条件（`area_ratio` ≥ 0.05、
+  `capture_ratio` ≥ 0.70、`leftover_ratio` < 0.15 の AND）
+- `appears_in` は値が現れるコマンド。`mask.*` は `cutout` にしか出ないので、
+  `info` で待っても来ない
+- `nullable` が `true` の項目は `null_means` を必ず持つ。**0 と `null` を
+  混同させないため**で、`halo_ratio` を 0 と読むと「縁が残っていない」という
+  良い結果に見えてしまう
+- `notes` はしきい値では表せない読み方。`edge_width` の「1〜3 なら鮮鋭、8px
+  かけて溶ける素材では 6.5 が正解」のような、文脈に依存する判断がここに入る
+
+数値は定数から、散文は手で書いている。**最も動きやすいものを最も強く守る**分け方で、
+較正のたびに動く数値には書き写す余地を残していない。
 
 #### schema_version
 

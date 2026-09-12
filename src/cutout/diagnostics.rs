@@ -62,56 +62,107 @@ const RIM_WINDOW: f64 = 8.0;
 
 /// 「局所背景のほうが近い」と言うために要求する近さの倍率。
 ///
-/// 素朴に `ΔE(C,B) < ΔE(C,F)` とすると、**正しく混色している画素が軒並み汚染に
-/// 転ぶ**。合成式 C = aF + (1-a)B の下では ΔE(C,B) / ΔE(C,F) = a / (1-a) なので、
-/// 等号すれすれ（a = 0.5）が境目になるが、帯の画素はまさにアルファ 0.5 の
-/// あたりに集まっている。8px かけて溶ける輪郭（合成 S4、正解では汚染 0）で
-/// 28% が汚染と出た。
+/// 素朴に `d_B < d_F` とすると、**正しく混色している画素が軒並み汚染に転ぶ**。
+/// 合成式 C = aF + (1-a)B の下では汚染の境目が a = (σ_B+σ0)/(k(σ_F+σ0)+σ_B+σ0)
+/// に来るので、k = 1 で σ_B ≒ σ_F なら境目はちょうど a = 0.5 ——帯の画素が
+/// いちばん集まっているところ——になる。実測でも 8px かけて溶ける輪郭
+/// （合成 S4、正解では汚染 0）が 0.263 と出た。
 ///
-/// 2.0 を要求すると条件は「**色から読めるアルファが 1/3 を下回る**」になる。
-/// 帯の画素はマスク上 0.5 以上の不透明度を持つのだから、色が 1/3 未満を
-/// 指すのは明確な食い違いであり、混色の揺らぎでは届かない。
+/// **散らばりで正規化しても、この倍率は要る。** 正規化が効くのは σ が
+/// 素材ごとに違うとき（布の繊維は σ 10 台、無地の紙は σ 1 台）であって、
+/// クリーンな合成背景では σ_B ≒ σ_F ≒ 1 で σ0 の 4.0 に埋もれ、判定は平均色の
+/// 最近傍へ退化する。2.0 を要求すると条件は「**色から読めるアルファが 1/3 を
+/// 下回る**」になり、S4 は 0.000 へ落ちる。帯の画素はマスク上 0.5 以上の
+/// 不透明度を持つのだから、色が 1/3 未満を指すのは明確な食い違いである。
+///
+/// 較正の 27 点（`tests/real_backgrounds.rs`）では、この 2.0 のままでも
+/// 欠陥側は散らばり正規化の前より**桁で強く出る**。R1 assisted は 0.028 から
+/// 0.148 へ（5.3 倍）、20MP の実写リモコン（最良設定）は 0.019 から 0.102 へ
+/// （5.4 倍）上がった。**倍率で余裕を作る話と、何を物差しにするかの話は別である。**
 const RIM_NEARER: f64 = 2.0;
 
-/// 局所前景色と局所背景色がこれだけ離れていなければ「判定不能」とする(ΔE)。
+/// 局所背景・局所前景の散らばりに足す下駄(sRGB)。
+///
+/// **これが無いとクリーンな背景で判定が壊れる。** 単色で撮れた背景は σ が 0 に
+/// なり、正しい混色画素まで「背景の散らばりの外」へ出る。すると d_B / d_F は
+/// 平均色までの距離の比に退化し、σ で正規化した意味が消える。4.0 は JPEG の
+/// ノイズ床——q90 で往復した平坦部が持つ画素間のばらつき——に合わせてある。
+const RIM_SIGMA_FLOOR: f64 = 4.0;
+
+/// 局所前景色と局所背景色がこれだけ離れていなければ「判定不能」とする。
+/// 単位は「両側の散らばり（`σ_B + σ_F + 2σ0`）の何倍か」。
 ///
 /// 淡色商品 × 白背景では F と B がほとんど同じ色になり、2 択の最近傍分類は
 /// 雑音を拾うだけで何も決められない。`refine` の `min_separation` と同じ思想で、
 /// 決められないものを 0 か 1 かに丸めないために要る。
-const MIN_RIM_SEPARATION: f64 = 6.0;
+///
+/// **絶対的な色差（旧 ΔE 6）ではなく散らばりに対する比で問う。** 繊維の
+/// ばらつきが ΔE 10 ある布の上では ΔE 6 の分離は何も分離していないし、
+/// 逆に無地の背景なら ΔE 4 でも 2 つの分布ははっきり割れている。2.0 は
+/// 「両側の散らばりを足して 2 倍してもなお届かない」水準で、白地に ΔE 2 の
+/// 商品を置いた単体テスト（`a_pale_product_on_white_is_not_judged`）を
+/// None に保ったまま、布の上の淡色商品（R3、真の汚染 0.99）は 0.164 と
+/// 拾えている。
+const MIN_RIM_SEPARATION_SIGMA: f64 = 2.0;
 
 /// この値を超える `contour_roughness` は目視確認に値する(px, 長辺 1000px 換算)。
 ///
 /// 較正規則は「クリーンなシーンの最大値の 2 倍以上、かつ欠陥シーンの最小値の
-/// 1/2 以下」。26 点のベンチ（`tests/real_backgrounds.rs`）での実測は、
-/// クリーン側（S1〜S12 の既定、3px ストラップの S5 を含む）が**すべて 0.00**、
-/// 欠陥側（実写背景の R1〜R6 既定）の最小が 0.83 で、窓は (0.00, 0.42] になる。
-/// 26 点で唯一の中間は R4（暗い机）既定の 1.67 で、これも欠陥側にある。
+/// 1/2 以下」。27 点のベンチ（`tests/real_backgrounds.rs`）での実測は、
+/// クリーン側（S1〜S12 の既定と、実写の照明を持つ R7 assisted）の最大が
+/// **S3（淡色商品）の 0.062**、欠陥側の最小が **R7 既定の 0.317** で、窓は
+/// [0.124, 0.158] になる。0.15 はその中に入る。
 ///
-/// **窓の中で下のほうを採る。** 距離はチャンファーの刻み（1px）より細かく
-/// 測れないので、この値が実際に言っているのは「輪郭画素の半分以上が平滑化参照
-/// から 1px 以上離れている」である。0.15 はそれが**長辺 6600px までの素材で
-/// 発火する**水準で、20MP の実写リモコン（最良設定で 0.175）がちょうど入る。
-/// 0.2 まで上げると長辺 5000px で頭打ちになり、実写を取り逃がす。
+/// | | 値 | 0.15 との余裕 |
+/// |---|---|---|
+/// | クリーン最大 S3 | 0.062 | 2.42 倍 |
+/// | 3px ストラップ S5 | 0.082 | 1.83 倍 |
+/// | 欠陥最小 R7 既定 | 0.317 | 2.11 倍 |
+/// | 20MP 実写リモコン（最良設定） | 0.391 | 2.60 倍 |
+///
+/// **3px のストラップ（S5）だけは 2 倍の余裕を割る。** 平滑化参照は
+/// σ = 2 × scale px でぼかすので幅 3px の細部は参照から消え、その分が
+/// まるごと距離になる。「幅 3px 級の細部は粗さとして数える」という
+/// 指標の性質であって、較正の失敗ではない（`schema` の `notes` にも書く）。
+///
+/// **中央値ではなく平均を採るので、しきい値が刻みの上に乗らない。** 中央値は
+/// チャンファーの 1px 刻みしか取れず、値は 0 か 1/scale かの 2 値だった。
+/// 0.15 はその段の上に置かれていたので、長辺 6600px を超える素材では
+/// 中央値 2px 以上でないと発火しない、という解像度依存が出ていた。平均なら
+/// 上の表のとおり 0.000 から 35.026 まで段なしに分布する。
 pub const CONTOUR_ROUGH_WARN: f64 = 0.15;
 
 /// この値を超える `rim_contamination` は目視確認に値する。
 ///
-/// 較正規則は `CONTOUR_ROUGH_WARN` と同じ。クリーン側（受け入れ基準が名指しする
-/// S1/S2/S6/S8 の既定）の最大が 0.005 なので下限は 0.010、欠陥側の最小
-/// （実写背景 R2 の assisted 0.025）から上限は 0.0125 で、窓は [0.010, 0.0125]。
-/// 20MP の実写リモコンは最良設定（bbox + tolerance 60）で 0.019、tolerance を
-/// 40 へ落とすと 0.195 になる。
+/// 較正規則は `CONTOUR_ROUGH_WARN` と同じ。27 点での実測は、クリーン側の最大が
+/// **R7 assisted（実写の照明とノイズを持つが欠陥は無い）の 0.007**、欠陥側の
+/// 最小が **R2 assisted の 0.094** で、窓は [0.014, 0.047] になる。
 ///
-/// **最も近いクリーンな点は S4（8px かけて溶ける輪郭）の 0.009 で、余裕は
-/// 1.3 倍しかない。** 柔らかい輪郭は原理的にこの指標の苦手な側にあり、
-/// `RIM_NEARER` の 2 倍要求で 0.282 から 0.009 まで落としてなお最も近い。
-pub const RIM_CONTAMINATION_WARN: f64 = 0.012;
+/// | | 値 | 0.025 との余裕 |
+/// |---|---|---|
+/// | クリーン最大 R7 assisted | 0.007 | 3.57 倍 |
+/// | 合成のクリーン最大 S8/S11 | 0.006 | 4.17 倍 |
+/// | 欠陥最小 R2 assisted | 0.094 | 3.76 倍 |
+/// | 20MP 実写リモコン（最良設定） | 0.102 | 4.07 倍 |
+///
+/// **散らばりで正規化する前は、両側の余裕が 1.3 倍しかなかった。** 平均色への
+/// 近さで問うていた頃は、柔らかい輪郭（S4）が 0.009 で最も近いクリーン点、
+/// 欠陥側の最小が 0.025 で、窓は [0.010, 0.0125] という針の穴だった。
+/// σ で割ると S4 は 0.000 へ落ち、欠陥側は桁で上がる。
+///
+/// # 見えない欠陥がある
+///
+/// **局所前景そのものが背景であるとき、2 択は答えを持たない。** マスクが背景を
+/// 大きく飲み込むと、窓の中の「確定前景」が背景色になり、帯の画素は素直に
+/// 前景寄りと出る。R4 既定（真の汚染 0.224 に対し 0.000）と R7 既定
+/// （0.655 に対し 0.017）がこれで、どちらも `contour_roughness` と
+/// `BBOX_RECOMMENDED` / `HALO_REMAINS` の側で捕まる。
+pub const RIM_CONTAMINATION_WARN: f64 = 0.025;
 
 /// チャンファー距離の 1px ぶんの重み。斜めは `CHAMFER_DIAGONAL`。
 ///
 /// 距離を f32 で持つと 12MP で 48MB になる。3-4 チャンファーを u8 に畳めば
-/// 12MB で済み、飽和する 85px は帯（長辺 1000px 換算で 3px）にも粗さの中央値にも
+/// 12MB で済み、飽和する 85px は帯（長辺 1000px 換算で 3px）にも粗さの平均にも
 /// 遠く届かない。精度より決定性と O(N) を採る。
 const CHAMFER_STEP: u8 = 3;
 const CHAMFER_DIAGONAL: u8 = 4;
@@ -131,7 +182,7 @@ pub struct Diagnostics {
     /// 遷移を1本も追えなければ None。前景が無い場合と、見切れて輪郭が
     /// 画像の中に存在しない場合がこれに当たる
     pub edge_width: Option<f64>,
-    /// 二値輪郭が、それを滑らかにした参照輪郭からどれだけ離れているかの中央値
+    /// 二値輪郭が、それを滑らかにした参照輪郭からどれだけ離れているかの平均
     /// (px, 長辺 1000px 換算)。大きいほど輪郭がギザギザに蛇行している。
     ///
     /// 測れる輪郭が無ければ None
@@ -139,6 +190,10 @@ pub struct Diagnostics {
     /// 境界の内側の帯にある前景画素のうち、元の色が局所前景より局所背景に
     /// はっきり近いものの割合。大きいほど、背景のテクスチャが縁に
     /// 張り付いている。
+    ///
+    /// 近さは**それぞれの散らばり（σ）で正規化してから**比べる。布の繊維の
+    /// 影は「背景の散らばりの範囲内」に収まるが、平均色からの距離では
+    /// 正しい混色と見分けがつかないためである
     ///
     /// 判定できる画素が 1 つも無ければ None
     pub rim_contamination: Option<f64>,
@@ -248,7 +303,7 @@ pub fn contour_distance_px(width: u32, height: u32, seeds: &[(u32, u32)]) -> Vec
         .collect()
 }
 
-/// 二値輪郭が、平滑化した参照輪郭からどれだけ離れているかの中央値
+/// 二値輪郭が、平滑化した参照輪郭からどれだけ離れているかの平均
 /// (px, 長辺 1000px 換算)。測れる輪郭が無ければ None。
 pub fn contour_roughness(mask: &Mask, bbox: Option<(u32, u32, u32, u32)>) -> Option<f64> {
     roughness_of(mask, &contour_pixels(mask, bbox), bbox)
@@ -264,7 +319,7 @@ pub fn rim_contamination(
 }
 
 /// 輪郭を σ = 2.0 × scale px 相当で滑らかにしたものを参照に、そこからの距離の
-/// 中央値を採る。
+/// 平均を採る。
 ///
 /// **「正解の輪郭」を持たずに粗さを測るための道具立てである。** 実素材に正解は
 /// 無いが、「自分自身を滑らかにしたもの」なら必ず作れる。滑らかな輪郭は
@@ -297,13 +352,17 @@ fn roughness_of(
     }
 
     let distance = chamfer_distance(w, h, &smooth_contour, roi);
-    let mut d: Vec<u8> = contour
+    // **中央値ではなく平均を採る。** チャンファー距離は 1px 刻みでしか
+    // 測れないので、中央値は「0 か 1px か」の 2 値にしかならず、しきい値が
+    // その段の上に乗ってしまっていた（長辺 6600px を超える素材では中央値
+    // 2px 以上でないと発火しない、という解像度依存がそこから出ていた）。
+    // 平均なら「輪郭画素の何割が参照から離れているか」が連続量として出る
+    let total: u64 = contour
         .iter()
-        .map(|&(x, y)| distance[(y as usize) * (w as usize) + (x as usize)])
-        .collect();
-    d.sort_unstable();
-    let median = f64::from(d[d.len() / 2]) / f64::from(CHAMFER_STEP);
-    Some(median / scale)
+        .map(|&(x, y)| u64::from(distance[(y as usize) * (w as usize) + (x as usize)]))
+        .sum();
+    let mean = total as f64 / contour.len() as f64 / f64::from(CHAMFER_STEP);
+    Some(mean / scale)
 }
 
 /// 帯の各画素を「局所前景 F」と「局所背景 B」の 2 択で分類し、B 寄りの割合を返す。
@@ -312,6 +371,29 @@ fn roughness_of(
 /// 「局所背景と ΔE≤3」という絶対的な基準なので、繊維のばらつきが ΔE 5〜10 ある
 /// 不織布では、張り付いた繊維が基準を外れて数から漏れる。どちらに近いかだけを
 /// 問えば、絶対値によらず「商品の色ではないもの」を数えられる。
+///
+/// # 平均色への近さではなく、散らばりで正規化した近さで問う
+///
+/// 平均色までの距離をそのまま比べていた頃、この指標は**定義上ほとんど 0 に
+/// なっていた**。`refine` は色から解いたアルファで縁を半透明にするので、
+/// 最終マスクで 128 以上の帯画素は「refine 自身が F/B から読んだアルファが
+/// 0.5 以上」の画素に限られる。そこへ同じ発想（局所平均 F/B への近さ）の
+/// 物差しを当てても、**refine が既に一貫させたものを同じ物差しで測り直す**
+/// ことにしかならない。正解が「帯の半分は純粋な背景」と言う R1 assisted で、
+/// 値は 0.028 しか出なかった。
+///
+/// 見落としていたのは、不織布の**暗い孔・繊維の影**である。黒い商品との混色
+/// （アルファ 0.3〜0.6）と平均色からの距離では区別がつかない。区別できるのは
+/// 「その色は背景テクスチャの**散らばりの範囲内**か」だけである。そこで
+/// 格子セルごとに平均 μ だけでなく標準偏差 σ も持ち、
+///
+/// ```text
+/// d_B = |C − μ_B| / (σ_B + σ0)      d_F = |C − μ_F| / (σ_F + σ0)
+/// 汚染 ⇔ d_B × RIM_NEARER < d_F
+/// ```
+///
+/// で分類する。繊維の影は σ_B の中に収まるので d_B が小さくなり、正しい混色は
+/// どちらの分布からも離れているので比が 1 の近くで割れる。
 ///
 /// # 局所平均は縮めた格子で取る
 ///
@@ -388,18 +470,22 @@ fn contamination_of(image: &RgbaImage, mask: &Mask, contour: &[(u32, u32)]) -> O
                 continue;
             }
             let cell = cells + column[x as usize];
-            let (Some(b), Some(f)) = (behind[cell].mean(), front[cell].mean()) else {
+            let (Some((b, sb)), Some((f, sf))) = (behind[cell].stats(), front[cell].stats()) else {
                 // 窓に確定背景か確定前景が無ければ、どちらに近いかを問えない
                 continue;
             };
-            let (b, f) = (srgb_to_lab(b), srgb_to_lab(f));
-            if delta_e76(f, b) < MIN_RIM_SEPARATION {
+            // 2 つの分布が散らばりの中で重なっていれば、どちらに近いかは
+            // 答えようがない。淡色商品 × 白背景がここで落ちる
+            let spread = sb + sf + 2.0 * RIM_SIGMA_FLOOR;
+            if distance3(f, b) < MIN_RIM_SEPARATION_SIGMA * spread {
                 continue;
             }
             let p = &pixels[i * 4..i * 4 + 3];
-            let c = srgb_to_lab([p[0], p[1], p[2]]);
+            let c = [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])];
+            let to_background = distance3(c, b) / (sb + RIM_SIGMA_FLOOR);
+            let to_foreground = distance3(c, f) / (sf + RIM_SIGMA_FLOOR);
             decided += 1;
-            if delta_e76(c, b) * RIM_NEARER < delta_e76(c, f) {
+            if to_background * RIM_NEARER < to_foreground {
                 contaminated += 1;
             }
         }
@@ -424,11 +510,19 @@ fn around(contour: &[(u32, u32)], w: u32, h: u32, margin: u32) -> (u32, u32, u32
     )
 }
 
-/// 格子 1 セルぶんの色の合計と画素数。箱平均を running sum で取るために、
+/// 格子 1 セルぶんの色の合計・二乗和・画素数。箱平均を running sum で取るために、
 /// 平均ではなく合計のまま持つ。
+///
+/// **二乗和は 3 チャンネルまとめて 1 本しか持たない。** 欲しいのは
+/// 「3 チャンネルの分散の平均」であり、それは
+/// `(Σ(r²+g²+b²)/n − (μr²+μg²+μb²)) / 3` と書けるので、チャンネルごとに
+/// 分けて持つ必要が無い。12MP の格子で 3 本持つと 1 面あたり 7.5MB 増えるが、
+/// 1 本なら 2.5MB で済む。
 #[derive(Debug, Clone, Copy, Default)]
 struct Sums {
     rgb: [u32; 3],
+    /// Σ(r² + g² + b²)。窓いっぱいまで足すと 20MP で 7×10⁸ に達するので u64
+    squares: u64,
     n: u32,
 }
 
@@ -436,6 +530,7 @@ impl Sums {
     fn add(&mut self, p: &[u8]) {
         for (k, slot) in self.rgb.iter_mut().enumerate() {
             *slot += u32::from(p[k]);
+            self.squares += u64::from(p[k]) * u64::from(p[k]);
         }
         self.n += 1;
     }
@@ -444,6 +539,7 @@ impl Sums {
         for (k, slot) in self.rgb.iter_mut().enumerate() {
             *slot += other.rgb[k];
         }
+        self.squares += other.squares;
         self.n += other.n;
     }
 
@@ -451,19 +547,34 @@ impl Sums {
         for (k, slot) in self.rgb.iter_mut().enumerate() {
             *slot -= other.rgb[k];
         }
+        self.squares -= other.squares;
         self.n -= other.n;
     }
 
-    fn mean(&self) -> Option<[u8; 3]> {
+    /// 平均色(sRGB)と、3 チャンネルの分散の平均の平方根。画素が無ければ None。
+    fn stats(&self) -> Option<([f64; 3], f64)> {
         (self.n > 0).then(|| {
-            let half = self.n / 2;
-            [
-                ((self.rgb[0] + half) / self.n) as u8,
-                ((self.rgb[1] + half) / self.n) as u8,
-                ((self.rgb[2] + half) / self.n) as u8,
-            ]
+            let n = f64::from(self.n);
+            let mean = [
+                f64::from(self.rgb[0]) / n,
+                f64::from(self.rgb[1]) / n,
+                f64::from(self.rgb[2]) / n,
+            ];
+            let squared: f64 = mean.iter().map(|m| m * m).sum();
+            // 桁落ちで負に振れることがある。分散に負は無いので 0 で止める
+            let variance = ((self.squares as f64) / n - squared).max(0.0) / 3.0;
+            (mean, variance.sqrt())
         })
     }
+}
+
+/// sRGB 3 チャンネルのユークリッド距離。
+fn distance3(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a.iter()
+        .zip(&b)
+        .map(|(x, y)| (x - y) * (x - y))
+        .sum::<f64>()
+        .sqrt()
 }
 
 /// 半径 `radius` セルの箱和を格子へ書き戻す。行と列に分けて running sum で回すので
@@ -993,9 +1104,13 @@ mod tests {
 
     /// 円盤の輪郭を `amplitude` px でギザギザにしたマスク。
     ///
-    /// 半径方向に周期 4px の矩形波を足す。実写の不織布で見えたのと同じ
-    /// 「輪郭に沿った 1〜3px の蛇行」を、正解を持った形で作る。
-    fn jagged_disc(size: u32, amplitude: f32) -> Mask {
+    /// 半径方向に周期 `period` px（弧長で刻む）の矩形波を足す。実写の不織布で
+    /// 見えたのと同じ「輪郭に沿った 1〜3px の蛇行」を、正解を持った形で作る。
+    ///
+    /// **周期を引数に取るのは、換算の検査で相似な 2 つを作るためである。**
+    /// 周期を 4px に固定したまま寸法と振幅だけを倍にすると、形が相似にならず、
+    /// 「換算が効いていない」のか「形が違う」のか分けられない。
+    fn jagged_disc(size: u32, amplitude: f32, period: f32) -> Mask {
         let mut mask = Mask::new(size, size, 0);
         let c = size as f32 / 2.0;
         for y in 0..size {
@@ -1003,7 +1118,7 @@ mod tests {
                 let (fx, fy) = (x as f32 + 0.5 - c, y as f32 + 0.5 - c);
                 let theta = fy.atan2(fx);
                 // 角度ではなく弧長で刻む。半径に依らず周期を 4px に保つ
-                let teeth = (theta * (size as f32 * 0.3) / 4.0).floor() as i32;
+                let teeth = (theta * (size as f32 * 0.3) / period).floor() as i32;
                 let wobble = if teeth % 2 == 0 {
                     amplitude
                 } else {
@@ -1019,7 +1134,7 @@ mod tests {
 
     #[test]
     fn a_smooth_contour_is_not_called_rough() {
-        let r = contour_roughness(&jagged_disc(400, 0.0), None).expect("輪郭があるので測れる");
+        let r = contour_roughness(&jagged_disc(400, 0.0, 4.0), None).expect("輪郭があるので測れる");
         assert!(
             r < CONTOUR_ROUGH_WARN / 2.0,
             "滑らかな円盤が粗いと出た: {r}"
@@ -1030,7 +1145,7 @@ mod tests {
     fn roughness_grows_with_the_amplitude_of_the_wobble() {
         let mut last = -1.0;
         for amplitude in [0.0f32, 1.0, 2.0, 3.0] {
-            let r = contour_roughness(&jagged_disc(400, amplitude), None).unwrap();
+            let r = contour_roughness(&jagged_disc(400, amplitude, 4.0), None).unwrap();
             assert!(
                 r > last,
                 "蛇行 {amplitude}px で値が増えていない: {r} <= {last}"
@@ -1045,10 +1160,15 @@ mod tests {
 
     /// 粗さは**長辺 1000px 換算**で報告する。同じ形を 2 倍で撮れば、蛇行も
     /// 2 倍の画素を占めるが、納品時に見える大きさは変わらない。
+    ///
+    /// 1000px と 2000px で比べるのは、`scale` が 1 を下回らないためである。
+    /// 500px を使うと換算が効かない側（scale = 1 に張り付く）と比べることになる。
+    /// 寸法・振幅・周期をそろって 2 倍にすれば、平滑化の σ（2.0 × scale）まで
+    /// 含めて完全に相似になる。
     #[test]
     fn roughness_is_reported_at_a_thousand_pixels() {
-        let small = contour_roughness(&jagged_disc(500, 1.0), None).unwrap();
-        let large = contour_roughness(&jagged_disc(2000, 4.0), None).unwrap();
+        let small = contour_roughness(&jagged_disc(1000, 2.0, 8.0), None).unwrap();
+        let large = contour_roughness(&jagged_disc(2000, 4.0, 16.0), None).unwrap();
         assert!(
             (small - large).abs() < 0.35,
             "換算が効いていない: {small:.2} と {large:.2}"

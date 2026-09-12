@@ -1601,8 +1601,22 @@ fn the_edge_dam_alone_stops_a_one_pixel_slit() {
         slit_is_background(&["--edge-threshold", "0", "--seal", "0"]),
         "守りを外しても 1px のスリットが背景として抜けない＝前提が崩れている"
     );
+    // **色で決め直す段を切って問う。** 堤防が守るのはフィルであって、境界の
+    // アルファではない。既定の経路（Phase 3）は帯の中のアルファを色から解き
+    // 直すので、**背景色そのもので彫られた 1px のスリットは色の側が透明と
+    // 答える**——帯幅の下限が輪郭の粗さで持ち上がるぶん、帯がスリットを丸ごと
+    // 覆うためである。マッティングの道具としてはそれが正しい答えで、堤防が
+    // 効いていない証拠ではない。堤防そのものは二値マスクの上で見る
     assert!(
-        !slit_is_background(&["--seal", "0"]),
+        !slit_is_background(&[
+            "--seal",
+            "0",
+            "--no-reclassify",
+            "--smooth-contour",
+            "0",
+            "--matting",
+            "projection",
+        ]),
         "堤防が効いていない: 1px のスリットが素通りしている"
     );
 }
@@ -4209,6 +4223,170 @@ fn batch_accepts_the_refine_key() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(json_stdout(&out)["succeeded"], 1);
+}
+
+/// matting の 3 つのスイッチが `settings` に出て、**実際に効いた**帯幅の
+/// 下限も出ること。
+///
+/// `band_min_radius` は指定値からは読めない——輪郭が粗ければ粗さぶんだけ
+/// 持ち上がる。`edge_threshold` の自動調整と同じで、**黙って変えた値は
+/// 結果に出す**という約束の側にある。
+#[test]
+fn the_report_states_which_matting_took_effect() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    let settings = |extra: &[&str]| -> Value {
+        let mut args = vec![
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--force",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        let out = kiri().args(&args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        json_stdout(&out)["settings"].clone()
+    };
+
+    let defaults = settings(&[]);
+    assert_eq!(defaults["matting"], "guided");
+    assert_eq!(defaults["smooth_contour"], 2.0);
+    assert_eq!(defaults["reclassify"], true);
+    assert!(
+        defaults["band_min_radius"].as_u64().is_some(),
+        "実際に効いた帯幅の下限が出ていない: {defaults}"
+    );
+
+    let plain = settings(&[
+        "--matting",
+        "projection",
+        "--smooth-contour",
+        "0",
+        "--no-reclassify",
+    ]);
+    assert_eq!(plain["matting"], "projection");
+    assert_eq!(plain["smooth_contour"], 0.0);
+    assert_eq!(plain["reclassify"], false);
+
+    // 帯そのものが無い経路では、帯幅の下限はキーごと出さない。
+    // **0 と「帯が無い」を同じ形にしない**
+    let legacy = settings(&["--no-refine"]);
+    assert!(
+        legacy.get("band_min_radius").is_none(),
+        "--no-refine なのに帯幅の下限を名乗っている: {legacy}"
+    );
+}
+
+/// 綴りを外した `matting` を黙って既定へ落とさないこと。
+///
+/// 数百点を回した後に仕上がりを見るまで気づけない種類の失敗になる。
+#[test]
+fn an_unknown_matting_is_refused_everywhere() {
+    // CLI は clap が弾く（code の無い exit 2）
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_png(dir.path(), "a.png", &img);
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            dir.path().join("o.png").to_str().unwrap(),
+            "--matting",
+            "closed-form",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "未知の matting が通っている");
+
+    // spec は自前の関門を通す
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        r#"{"items":[{"input":"a.png","output":"b.png","matting":"closed-form"}]}"#,
+    )
+    .unwrap();
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let json = json_stdout(&out);
+    assert_eq!(json["results"][0]["error"]["code"], "SPEC_INVALID");
+}
+
+/// spec が matting の 3 つを受けること。
+#[test]
+fn batch_accepts_the_matting_keys() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        ..Default::default()
+    });
+    write_png(dir.path(), "a.png", &img);
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        r#"{"defaults":{"matting":"projection","smooth_contour":0,"reclassify":false},
+             "items":[{"input":"a.png","output":"out.png"}]}"#,
+    )
+    .unwrap();
+
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = json_stdout(&out);
+    assert_eq!(json["succeeded"], 1);
+    let settings = &json["results"][0]["result"]["settings"];
+    assert_eq!(settings["matting"], "projection");
+    assert_eq!(settings["smooth_contour"], 0.0);
+    assert_eq!(settings["reclassify"], false);
+}
+
+/// spec の綴り違いに候補を返すこと（`refine` と同じ関門）。
+#[test]
+fn a_misspelled_matting_key_suggests_the_right_one() {
+    let dir = fixture_dir();
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        r#"{"items":[{"input":"a.png","output":"b.png","smooth_contur":1}]}"#,
+    )
+    .unwrap();
+
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let json = json_stdout(&out);
+    assert_eq!(json["error"]["code"], "SPEC_UNKNOWN_FIELD");
+    assert!(
+        json["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("smooth_contour"),
+        "候補に smooth_contour が出ていない: {}",
+        json["error"]["hint"]
+    );
 }
 
 #[test]

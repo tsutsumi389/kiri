@@ -264,9 +264,16 @@ fn spatial_instructions_are_kept_and_do_not_worsen_the_contour() {
 /// 輪郭の粗さが実写背景でだけ跳ねること。
 ///
 /// **既定値の側で見る。** bbox と tolerance で救った後（assisted）でも実写背景の
-/// 輪郭は蛇行しているが（R1 assisted 1.00）、蛇行が桁で出るのは既定値のまま
-/// 布が前景として残っている状態のほう（R1 defaults 1.80、R4 defaults 14.00）で、
-/// 「合成のきれいなシーンとの比」で語るならそちらが素直である。
+/// 輪郭は蛇行しているが、蛇行が桁で出るのは既定値のまま布が前景として残って
+/// いる状態のほう（R1 defaults 0.98、R2 defaults 0.69）で、「合成のきれいな
+/// シーンとの比」で語るならそちらが素直である。
+///
+/// **R4 既定はこの一覧から外した。** Phase 3 の縁の再分類が、暗い机の上の
+/// 白い商品を既定値のまま解けるようにしたためである（輪郭誤差 36.23 → 0.41、
+/// 粗さ 2.44 → 0.002、警告なし）。**壊れていないシーンに「壊れている」ことを
+/// 求め続けるのは、改善を退行として報告するのと同じである。** 代わりに、
+/// 同じく既定値では解けない R2 既定を置いた——背景が別の不織布なので、
+/// 「1 枚の素材でだけ成り立つ話」にならない。
 #[test]
 fn the_contour_roughness_rises_only_on_a_real_background() {
     let points = bench();
@@ -276,7 +283,7 @@ fn the_contour_roughness_rises_only_on_a_real_background() {
         .expect("輪郭がある");
     for label in [
         "R1 不織布 + 黒商品 / defaults",
-        "R4 暗い机 + 白商品 / defaults",
+        "R2 照明勾配の不織布 + 黒商品 / defaults",
     ] {
         let p = point(&points, label);
         let rough = p.diagnostics.contour_roughness.expect("輪郭がある");
@@ -389,6 +396,66 @@ fn a_three_pixel_strap_is_not_called_a_rough_contour() {
     );
 }
 
+/// Phase 3 の 3 段が、実写背景の**正解由来の**指標を実際に下げること。
+///
+/// **これが Phase 3 の目的そのものである。** 診断値（`contour_roughness` /
+/// `rim_contamination`）は処理が自分で均せる量なので、良くなったことの証拠に
+/// ならない。正解の輪郭からの距離（`contour_error`）と、帯のうち真に背景だった
+/// 割合（`rim_truth`）だけが、外から見て嘘をつけない。
+///
+/// 基準は「Phase 2 までの経路（3 つのスイッチを明示）の半分以下」。設計書の
+/// 合格条件（R1 assisted で 18.4 → 9.2、rim 正解 0.512 → 0.26）と同じ −50% で、
+/// **絶対値ではなく比で書く**のは、シーンの生成や較正が動いても意味が変わらない
+/// ようにするためである。
+#[test]
+fn the_matting_stages_halve_the_truth_side_error_on_a_real_background() {
+    use kiri::cutout::Matting;
+
+    let scene = real_scenes()
+        .into_iter()
+        .find(|s| s.name.starts_with("R1"))
+        .unwrap();
+    let truth = common::real_scene(&scene);
+    let bbox = common::assisted_bbox(&truth);
+    let measure = |opts: &CutoutOptions| {
+        let result = cutout(&truth.image, opts);
+        common::measure_edges_with(&truth, &result.image, &result.mask, opts.bbox, None)
+    };
+    let assisted = CutoutOptions {
+        bbox: Some(bbox),
+        tolerance: scene.assisted_tolerance,
+        ..Default::default()
+    };
+    let before = measure(&CutoutOptions {
+        matting: Matting::Projection,
+        smooth_contour: 0.0,
+        reclassify: false,
+        ..assisted.clone()
+    });
+    let after = measure(&assisted);
+
+    assert!(
+        after.contour_error <= before.contour_error * 0.5,
+        "輪郭誤差が半分になっていない: {:.2} → {:.2}",
+        before.contour_error,
+        after.contour_error
+    );
+    assert!(
+        after.rim_truth <= before.rim_truth * 0.5,
+        "帯の正解側の汚染が半分になっていない: {:.3} → {:.3}",
+        before.rim_truth,
+        after.rim_truth
+    );
+    // **代わりに何を払ったかも固定する。** 帯を均すぶんアルファ誤差は増える。
+    // 増分に上限が無ければ、輪郭の位置を稼ぐために matte を潰し放題になる
+    assert!(
+        after.alpha_mae <= before.alpha_mae + 0.01,
+        "輪郭を稼ぐためにアルファ誤差を払いすぎている: {:.3} → {:.3}",
+        before.alpha_mae,
+        after.alpha_mae
+    );
+}
+
 /// 診断値が正解由来の誤差と同じ向きに動くこと。
 ///
 /// **相関しなければ、指標は欠陥ではない何かを測っている。** 値そのものではなく
@@ -470,21 +537,36 @@ fn listing(points: &[Point], metric: &str) -> String {
 ///
 /// **これは較正そのものの回帰テストである。** 母集団は正解だけで決まる
 /// （`roughness_side` / `contamination_side`）ので、しきい値を動かしても
-/// 母集団は動かない。クリーン側の最大としきい値のあいだ、しきい値と欠陥側の
-/// 最小のあいだに、それぞれ余裕があることを固定する。
+/// 母集団は動かない。
 ///
-/// 規則は「クリーン最大の 2 倍以上、かつ欠陥最小の 1/2 以下」だが、粗さの側は
-/// 窓が 4% だけ空かない（S5、幅 3px のストラップ）。**1.9 倍で固定するのは
-/// その事実を含めて動かさないためである**——ここが 1.9 を割ったら、それは
-/// 較正が壊れたということである。
+/// 問うことは 2 つある。
+///
+/// 1. **誤分類が 1 点も無いこと。** クリーン側の最大がしきい値を下回り、
+///    欠陥側の最小がしきい値を上回る。これが契約そのもので、余裕の話ではない
+/// 2. **その余裕が記録どおりであること。** 余裕が縮むこと自体は退行ではない
+///    （処理が良くなれば群は近づく）が、**黙って縮むのは退行である**
+///
+/// # 粗さの欠陥側の余裕は Phase 3 で 1.97 倍から 1.12 倍へ縮んだ
+///
+/// Phase 3 は輪郭を**実際に均す**（色の門つきメディアンと guided
+/// feathering）。すると壊れた切り抜きの輪郭まで滑らかになり、
+/// `contour_roughness` は「輪郭が真の位置から遠い」ことを見なくなる——
+/// 欠陥側の最小は R7 既定（輪郭誤差 59.7px、正解の帯の 57% が背景）で、
+/// 粗さは 0.316 から 0.180 へ落ちた。しきい値 0.16 は今も全 29 点を
+/// 正しく分けるが、**この指標は「輪郭が汚い」ことしか見ておらず、
+/// 「輪郭が違う場所にある」ことは `halo_ratio` と `rim_contamination` と
+/// `BBOX_RECOMMENDED` が見る**、という分担がはっきりした。
+///
+/// クリーン側は 1.96 倍のまま動かない（S5、幅 3px のストラップ）。
 #[test]
 fn the_thresholds_sit_between_the_clean_and_the_defective() {
     let points = bench();
-    for (name, threshold, margin, side, value) in [
+    for (name, threshold, clean_margin, defective_margin, side, value) in [
         (
             "contour_roughness",
             CONTOUR_ROUGH_WARN,
             1.9,
+            1.1,
             roughness_side as fn(&EdgeMetrics) -> Side,
             (|p: &Point| p.diagnostics.contour_roughness) as fn(&Point) -> Option<f64>,
         ),
@@ -492,18 +574,26 @@ fn the_thresholds_sit_between_the_clean_and_the_defective() {
             "rim_contamination",
             RIM_CONTAMINATION_WARN,
             2.0,
+            2.0,
             contamination_side as fn(&EdgeMetrics) -> Side,
             (|p: &Point| p.diagnostics.rim_contamination) as fn(&Point) -> Option<f64>,
         ),
     ] {
         let (clean, defective) = window(&points, side, value);
+        // まず誤分類。**ここは余裕ではなく契約である**
         assert!(
-            clean * margin <= threshold,
+            clean < threshold && defective > threshold,
+            "{name}: しきい値 {threshold} が 2 つの群を分けていない \
+             (クリーン最大 {clean:.3} / 欠陥最小 {defective:.3})\n{}",
+            listing(&points, name)
+        );
+        assert!(
+            clean * clean_margin <= threshold,
             "{name}: クリーン側の最大 {clean:.3} がしきい値 {threshold} に近すぎる\n{}",
             listing(&points, name)
         );
         assert!(
-            defective >= threshold * margin,
+            defective >= threshold * defective_margin,
             "{name}: 欠陥側の最小 {defective:.3} がしきい値 {threshold} に近すぎる\n{}",
             listing(&points, name)
         );
@@ -770,6 +860,148 @@ fn print_the_calibration_table() {
                 samples.len()
             );
         }
+    }
+}
+
+/// 段ごとの対照表。`--ignored` を付けたときだけ走る。
+///
+/// **全部入りだけを固定すると、1 段が死んでも気づけない。** 再分類 (b) /
+/// 色の門つき平滑化 (c) / guided feathering (e) を個別に切って、どの段が
+/// どの指標を動かしたかを並べる。
+///
+/// ```text
+/// cargo test --release --test real_backgrounds -- --ignored --nocapture print_the_stage_table
+/// ```
+#[test]
+#[ignore = "計測用。判定はせず表を出すだけ"]
+fn print_the_stage_table() {
+    use kiri::cutout::Matting;
+
+    let base = CutoutOptions::default();
+    let stages: Vec<(&str, CutoutOptions)> = vec![
+        (
+            "phase2",
+            CutoutOptions {
+                matting: Matting::Projection,
+                smooth_contour: 0.0,
+                reclassify: false,
+                ..base.clone()
+            },
+        ),
+        (
+            "+b 再分類",
+            CutoutOptions {
+                matting: Matting::Projection,
+                smooth_contour: 0.0,
+                reclassify: true,
+                ..base.clone()
+            },
+        ),
+        (
+            "+c 平滑化",
+            CutoutOptions {
+                matting: Matting::Projection,
+                smooth_contour: base.smooth_contour,
+                reclassify: false,
+                ..base.clone()
+            },
+        ),
+        (
+            "+e guided",
+            CutoutOptions {
+                matting: Matting::Guided,
+                smooth_contour: 0.0,
+                reclassify: false,
+                ..base.clone()
+            },
+        ),
+        ("既定(b+c+e)", base.clone()),
+        (
+            "-b",
+            CutoutOptions {
+                reclassify: false,
+                ..base.clone()
+            },
+        ),
+        (
+            "-c",
+            CutoutOptions {
+                smooth_contour: 0.0,
+                ..base.clone()
+            },
+        ),
+        (
+            "-e",
+            CutoutOptions {
+                matting: Matting::Projection,
+                ..base.clone()
+            },
+        ),
+    ];
+
+    println!(
+        "\n{:<34} {:<12} {:>9} {:>8} {:>9} {:>8} {:>7} {:>8} {:>8} {:>9}",
+        "シーン",
+        "段",
+        "輪郭誤差",
+        "rim正解",
+        "alphaMAE",
+        "eaten",
+        "strap",
+        "shadow残",
+        "粗さ",
+        "縁の汚染"
+    );
+    // 帯幅の下限も並べる。値が動いたときに「段が効いた」のか「帯が変わった」
+    // のかを、同じ表の上で切り分けられる
+    let show = |v: Option<f64>| match v {
+        Some(v) => format!("{v:.3}"),
+        None => "null".to_string(),
+    };
+    let percent = |v: f32| {
+        if v.is_finite() {
+            format!("{:.1}%", v * 100.0)
+        } else {
+            "-".to_string()
+        }
+    };
+
+    let row = |label: &str, truth: &common::EdgeTruth, opts: &CutoutOptions, stage: &str| {
+        let result = cutout(&truth.image, opts);
+        let m = common::measure_edges_with(truth, &result.image, &result.mask, opts.bbox, None);
+        println!(
+            "{label:<34} {stage:<12} {:>9.2} {:>8.3} {:>9.3} {:>8.4} {:>7} {:>8} {:>8} {:>9} r={:?}",
+            m.contour_error,
+            m.rim_truth,
+            m.alpha_mae,
+            m.eaten,
+            percent(m.strap_kept),
+            percent(m.shadow_kept),
+            show(result.diagnostics.contour_roughness),
+            show(result.diagnostics.rim_contamination),
+            result.band_min_radius,
+        );
+    };
+
+    for scene in edge_scenes() {
+        let truth = edge_scene(&scene);
+        for (stage, opts) in &stages {
+            row(scene.name, &truth, opts, stage);
+        }
+        println!();
+    }
+    for scene in real_scenes() {
+        let truth = common::real_scene(&scene);
+        let bbox = common::assisted_bbox(&truth);
+        for (stage, opts) in &stages {
+            let opts = CutoutOptions {
+                bbox: Some(bbox),
+                tolerance: scene.assisted_tolerance,
+                ..opts.clone()
+            };
+            row(scene.name, &truth, &opts, stage);
+        }
+        println!();
     }
 }
 

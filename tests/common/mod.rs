@@ -912,9 +912,16 @@ pub struct ExternalPair {
 /// 人にしかできない作業なので、リポジトリには置かず、環境変数で差し込めるように
 /// しておく。対が揃っていないファイルは黙って飛ばす——素材の置き場所に
 /// 別のものが混ざっているのは普通のことで、そこで落ちても誰も得をしない。
+/// **ただし、対として認識したものの読めない・設定を解釈できない素材は
+/// 黙って飛ばさない。** 既定の設定で回した数字を指定した設定の数字として
+/// 表に出すのが、いちばん質の悪い嘘になる。
 pub fn external_bench_pairs(dir: &Path) -> Vec<ExternalPair> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("{}: 読めない ({e})", dir.display());
+            return Vec::new();
+        }
     };
     let mut names: Vec<String> = entries
         .filter_map(|e| e.ok())
@@ -941,44 +948,62 @@ pub fn external_bench_pairs(dir: &Path) -> Vec<ExternalPair> {
                 eprintln!("{name}: 画像と正解アルファの寸法が違う");
                 return None;
             }
-            let options = external_options(&dir.join(format!("{name}.json")), &image);
+            let options = external_options(&dir.join(format!("{name}.json")), &image)?;
+            let Some(truth) = truth_from_alpha(image, &alpha) else {
+                eprintln!("{name}: 正解アルファに輪郭が無い（全面が商品か背景）");
+                return None;
+            };
             Some(ExternalPair {
                 name,
-                truth: truth_from_alpha(image, &alpha),
+                truth,
                 options,
             })
         })
         .collect()
 }
 
-/// `<name>.json` から切り抜きの設定を読む。無ければ既定値。
-fn external_options(path: &Path, image: &RgbaImage) -> kiri::cutout::CutoutOptions {
+/// `<name>.json` から切り抜きの設定を読む。ファイルが無ければ既定値。
+///
+/// **書いてあるのに読めなかったら素材ごと飛ばす。** `--bbox` を指定した
+/// つもりの素材を既定値で回し、その数字を表に出すと、読み手には区別がつかない。
+/// 「設定が効いていない」は黙って起きてはいけない種類の失敗である。
+fn external_options(path: &Path, image: &RgbaImage) -> Option<kiri::cutout::CutoutOptions> {
     use kiri::cutout::CutoutOptions;
     let mut options = CutoutOptions::default();
     let Ok(text) = std::fs::read_to_string(path) else {
-        return options;
+        return Some(options);
     };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-        eprintln!("{}: JSON として読めない", path.display());
-        return options;
+    let value = match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("{}: JSON として読めない ({e})", path.display());
+            return None;
+        }
     };
     if let Some(tolerance) = value["tolerance"].as_f64() {
         options.tolerance = tolerance;
     }
     if let Some(bbox) = value["bbox"].as_array() {
         let v: Vec<f64> = bbox.iter().filter_map(serde_json::Value::as_f64).collect();
-        if v.len() == 4 {
-            let normalized = value["normalized"].as_bool().unwrap_or(false);
-            options.bbox = kiri::commands::cutout::resolve_bbox(
-                [v[0], v[1], v[2], v[3]],
-                normalized,
-                image.width(),
-                image.height(),
-            )
-            .ok();
+        if v.len() != 4 {
+            eprintln!("{}: bbox は数値 4 つで書く", path.display());
+            return None;
+        }
+        let normalized = value["normalized"].as_bool().unwrap_or(false);
+        match kiri::commands::cutout::resolve_bbox(
+            [v[0], v[1], v[2], v[3]],
+            normalized,
+            image.width(),
+            image.height(),
+        ) {
+            Ok(bbox) => options.bbox = Some(bbox),
+            Err(e) => {
+                eprintln!("{}: bbox を解釈できない ({e})", path.display());
+                return None;
+            }
         }
     }
-    options
+    Some(options)
 }
 
 /// 正解アルファ（8bit グレー、255 = 商品）から `EdgeTruth` を組み立てる。
@@ -986,7 +1011,10 @@ fn external_options(path: &Path, image: &RgbaImage) -> kiri::cutout::CutoutOptio
 /// `distance` は正解の二値輪郭からの符号付き距離（外が正）。合成シーンでは
 /// 解析的な距離場を持てるが、実写では正解アルファからの距離変換で代用する。
 /// `shadow` と `strap` は空——実写では「どこが影か」を人が塗り分けていない。
-pub fn truth_from_alpha(image: RgbaImage, alpha: &image::GrayImage) -> EdgeTruth {
+///
+/// 正解アルファに輪郭が無ければ（全面が商品、あるいは全面が背景）None。
+/// 距離場の基準そのものが無いので、組み立てても意味のある正解にならない。
+pub fn truth_from_alpha(image: RgbaImage, alpha: &image::GrayImage) -> Option<EdgeTruth> {
     use kiri::cutout::Mask;
     use kiri::cutout::diagnostics::{contour_distance_px, contour_pixels};
 
@@ -997,8 +1025,8 @@ pub fn truth_from_alpha(image: RgbaImage, alpha: &image::GrayImage) -> EdgeTruth
         h,
         &alpha.pixels().map(|p| p[0] >= 128).collect::<Vec<_>>(),
     );
-    let distance = contour_distance_px(w, h, &contour_pixels(&mask, None));
-    EdgeTruth {
+    let distance = contour_distance_px(w, h, &contour_pixels(&mask, None))?;
+    Some(EdgeTruth {
         coverage: alpha.pixels().map(|p| f32::from(p[0]) / 255.0).collect(),
         distance: (0..n)
             .map(|i| {
@@ -1009,7 +1037,7 @@ pub fn truth_from_alpha(image: RgbaImage, alpha: &image::GrayImage) -> EdgeTruth
         shadow: vec![0f32; n],
         strap: vec![false; n],
         image,
-    }
+    })
 }
 
 /// JPEG で往復させる。実素材の境界には必ず圧縮由来の滲みが乗るため。
@@ -1238,7 +1266,8 @@ pub fn measure_edges_with(
         contour_error = errors.iter().sum::<f32>() / errors.len() as f32 / scale;
 
         let band = kiri::cutout::diagnostics::rim_band(f64::from(scale)) as f32;
-        let distance = kiri::cutout::diagnostics::contour_distance_px(w, h, &contour);
+        let distance = kiri::cutout::diagnostics::contour_distance_px(w, h, &contour)
+            .expect("輪郭画素があるので距離場は作れる");
         let (mut background_in_band, mut band_n) = (0u32, 0u32);
         for y in 0..h {
             for x in 0..w {

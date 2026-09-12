@@ -162,10 +162,13 @@ pub const RIM_CONTAMINATION_WARN: f64 = 0.025;
 /// チャンファー距離の 1px ぶんの重み。斜めは `CHAMFER_DIAGONAL`。
 ///
 /// 距離を f32 で持つと 12MP で 48MB になる。3-4 チャンファーを u8 に畳めば
-/// 12MB で済み、飽和する 85px は帯（長辺 1000px 換算で 3px）にも粗さの平均にも
+/// 12MB で済み、飽和する `CHAMFER_MAX_PX` は帯（長辺 1000px 換算で 3px）に
 /// 遠く届かない。精度より決定性と O(N) を採る。
 const CHAMFER_STEP: u8 = 3;
 const CHAMFER_DIAGONAL: u8 = 4;
+/// チャンファー距離が飽和する距離(px)。u8 に畳んだ都合であって、意味のある
+/// 上限ではない。**飽和した値を平均に混ぜてはいけない**（`roughness_of`）。
+const CHAMFER_MAX_PX: u32 = (u8::MAX / CHAMFER_STEP) as u32;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Diagnostics {
@@ -292,15 +295,26 @@ fn contour_pixels_in(
     pixels
 }
 
-/// 与えた画素からの距離(px)。85px で飽和する。
+/// 与えた画素からの距離(px)。`CHAMFER_MAX_PX` で飽和する。種が無ければ None。
 ///
 /// ベンチが正解側の指標を**同じ帯**で測るために公開している。内部の
 /// `diagnose` は 12MP を 12MB に収めるために u8 のまま使う。
-pub fn contour_distance_px(width: u32, height: u32, seeds: &[(u32, u32)]) -> Vec<f32> {
-    chamfer_distance(width, height, seeds, (0, 0, width - 1, height - 1))
-        .into_iter()
-        .map(|d| f32::from(d) / f32::from(CHAMFER_STEP))
-        .collect()
+///
+/// **種が空のときに全面 85px の配列を返さない。** 「どこからも遠い」と
+/// 「距離を測る相手がいない」はまったく別の状態で、前者として返すと
+/// 呼び出し側は 85 を本当の距離として読んでしまう。
+pub fn contour_distance_px(width: u32, height: u32, seeds: &[(u32, u32)]) -> Option<Vec<f32>> {
+    if seeds.is_empty() {
+        return None;
+    }
+    let field = chamfer_distance(seeds, (0, 0, width - 1, height - 1));
+    Some(
+        field
+            .data
+            .into_iter()
+            .map(|d| f32::from(d) / f32::from(CHAMFER_STEP))
+            .collect(),
+    )
 }
 
 /// 二値輪郭が、平滑化した参照輪郭からどれだけ離れているかの平均
@@ -351,15 +365,24 @@ fn roughness_of(
         return None;
     }
 
-    let distance = chamfer_distance(w, h, &smooth_contour, roi);
+    let distance = chamfer_distance(&smooth_contour, roi);
     // **中央値ではなく平均を採る。** チャンファー距離は 1px 刻みでしか
     // 測れないので、中央値は「0 か 1px か」の 2 値にしかならず、しきい値が
     // その段の上に乗ってしまっていた（長辺 6600px を超える素材では中央値
     // 2px 以上でないと発火しない、という解像度依存がそこから出ていた）。
-    // 平均なら「輪郭画素の何割が参照から離れているか」が連続量として出る
+    // 平均なら「輪郭画素の何割が参照から離れているか」が連続量として出る。
+    //
+    // **ただし平均には罠がある。** 平滑化で参照輪郭がまるごと消えた場所
+    // （細いストラップ、背景を飲み込んで崩れたマスク）では、距離は近傍に
+    // 参照が無いまま伸び続け、チャンファーの飽和値（`CHAMFER_MAX_PX`）まで
+    // 行ってそのまま平均に入る。S9（明度が背景を横切る淡色商品）が 35.026 と
+    // 出ていたのがこれで、**輪郭の粗さではなく u8 の上限を報告していた**。
+    // 平滑化が届く距離は箱ぼかし 3 回ぶんの `3r` しかないのだから、それより
+    // 遠い距離に情報は無い。**画素ごとに 3r で clamp してから平均する**
+    let cap = (3 * radius * u32::from(CHAMFER_STEP)).min(u32::from(u8::MAX));
     let total: u64 = contour
         .iter()
-        .map(|&(x, y)| u64::from(distance[(y as usize) * (w as usize) + (x as usize)]))
+        .map(|&(x, y)| u64::from(u32::from(distance.at(x, y)).min(cap)))
         .sum();
     let mean = total as f64 / contour.len() as f64 / f64::from(CHAMFER_STEP);
     Some(mean / scale)
@@ -410,10 +433,10 @@ fn contamination_of(image: &RgbaImage, mask: &Mask, contour: &[(u32, u32)]) -> O
     let scale = scale_at_1000(w, h);
     // 帯の判定はチャンファーの単位(1px = 3)のまま行う。px へ戻すと
     // 画素ごとに割り算が入るだけで、境目は何も変わらない
-    let band = rim_band(scale).min(85) * u32::from(CHAMFER_STEP);
+    let band = rim_band(scale).min(CHAMFER_MAX_PX) * u32::from(CHAMFER_STEP);
     let window = (RIM_WINDOW * scale).ceil() as u32;
     // 帯の判定にしか使わないので、輪郭から帯幅ぶん離れた外までで足りる
-    let distance = chamfer_distance(w, h, contour, around(contour, w, h, rim_band(scale) + 1));
+    let distance = chamfer_distance(contour, around(contour, w, h, rim_band(scale) + 1));
 
     // 参照色を集める範囲は「帯 + 窓」までで足りる。輪郭から遠い画素は
     // どの帯画素の窓にも入らないので、全面を舐める理由が無い
@@ -444,7 +467,7 @@ fn contamination_of(image: &RgbaImage, mask: &Mask, contour: &[(u32, u32)]) -> O
             // 完全に透明／完全に不透明な画素だけを参照色に使う。中間の画素は
             // 混色そのものなので、平均に混ぜると F と B が互いに寄ってしまう
             let a = alpha[i];
-            if a != 0 && (a != u8::MAX || u32::from(distance[i]) <= band) {
+            if a != 0 && (a != u8::MAX || u32::from(distance.at(x, y)) <= band) {
                 continue;
             }
             let p = &pixels[i * 4..i * 4 + 3];
@@ -466,7 +489,7 @@ fn contamination_of(image: &RgbaImage, mask: &Mask, contour: &[(u32, u32)]) -> O
         let cells = ((y as usize / step) - cy) * gw;
         for x in x0..=x1 {
             let i = row + (x as usize);
-            if alpha[i] < FOREGROUND_THRESHOLD || u32::from(distance[i]) > band {
+            if alpha[i] < FOREGROUND_THRESHOLD || u32::from(distance.at(x, y)) > band {
                 continue;
             }
             let cell = cells + column[x as usize];
@@ -753,28 +776,60 @@ fn window_step(line: &[u8], radius: usize, at: usize, sum: &mut u32, n: &mut u32
     }
 }
 
+/// 枠の中だけを持つ距離場。枠の外は 255（飽和）として読める。
+///
+/// **全面の Vec を確保しない。** 12MP の全面は 12MB だが、輪郭の外接矩形を
+/// 必要なだけ広げた枠は商品の大きさでしか増えない。読む側から見た値は
+/// 全面版とまったく同じである——枠の外は計算していない（＝255）のだから、
+/// 全面の配列に 255 が入っていたのと区別がつかない。
+struct Field {
+    data: Vec<u8>,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+    w: usize,
+}
+
+impl Field {
+    /// 枠の外は 255。**これは「遠い」ではなく「測っていない」の意味である。**
+    #[inline]
+    fn at(&self, x: u32, y: u32) -> u8 {
+        let (x, y) = (x as usize, y as usize);
+        if x < self.x0 || x > self.x1 || y < self.y0 || y > self.y1 {
+            return u8::MAX;
+        }
+        self.data[(y - self.y0) * self.w + (x - self.x0)]
+    }
+}
+
 /// 3-4 チャンファー距離変換。値は 1px = `CHAMFER_STEP` の単位で持ち、255 で飽和する。
 ///
 /// `roi` の外は計算しない（255 のまま）。**枠の外まで測っても誰も読まない**ので、
 /// 12MP で全面を 2 パス舐める理由が無い。枠の中で閉じた経路しか辿らないぶん
 /// 距離は真の値以上になるが、読む位置（輪郭画素）は枠の縁から十分内側にある。
-fn chamfer_distance(
-    width: u32,
-    height: u32,
-    seeds: &[(u32, u32)],
-    roi: (u32, u32, u32, u32),
-) -> Vec<u8> {
-    let w = width as usize;
-    let mut d = vec![u8::MAX; w * (height as usize)];
-    for &(x, y) in seeds {
-        d[(y as usize) * w + (x as usize)] = 0;
-    }
+///
+/// 種は枠の中にあるものだけを使う。呼び出し側はいずれも「種の外接矩形を
+/// 広げたもの」を枠にしているので、落ちる種は無い。
+fn chamfer_distance(seeds: &[(u32, u32)], roi: (u32, u32, u32, u32)) -> Field {
     let (x0, y0, x1, y1) = (
         roi.0 as usize,
         roi.1 as usize,
         roi.2 as usize,
         roi.3 as usize,
     );
+    let w = x1 - x0 + 1;
+    let h = y1 - y0 + 1;
+    let mut d = vec![u8::MAX; w * h];
+    for &(x, y) in seeds {
+        let (x, y) = (x as usize, y as usize);
+        if x >= x0 && x <= x1 && y >= y0 && y <= y1 {
+            d[(y - y0) * w + (x - x0)] = 0;
+        }
+    }
+    // 枠の中を 0 起点の座標で舐める。値は全面版と 1 ビットも変わらない
+    let (x1, y1) = (w - 1, h - 1);
+    let (x0, y0) = (0usize, 0usize);
 
     for y in y0..=y1 {
         for x in x0..=x1 {
@@ -814,7 +869,14 @@ fn chamfer_distance(
             d[i] = best;
         }
     }
-    d
+    Field {
+        data: d,
+        x0: roi.0 as usize,
+        y0: roi.1 as usize,
+        x1: roi.2 as usize,
+        y1: roi.3 as usize,
+        w,
+    }
 }
 
 /// 境界近傍で「背景色のままなのに不透明」な画素の割合。測る対象が無ければ None。

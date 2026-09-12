@@ -168,7 +168,13 @@ impl Default for CutoutOptions {
             seal: 1,
             refine: true,
             // 既定をベンチで決めた根拠は docs/design.md 4.10 を参照。
-            // guided は S1〜S12 を動かさず、R1〜R7 の正解由来の指標を下げる
+            //
+            // **3 段（再分類・平滑化・guided）は実写背景の正解由来の指標を
+            // 半分にするが、合成では払うものがある。** 実測（Phase 2 → 既定）:
+            // S3（淡色商品）の `eaten` 1.86% → 3.00%、S7 の `shadow_kept`
+            // 23.9% → 20.4%、S11 / S12 の `alpha_mae` +0.007 / +0.031、
+            // R1 / R2 / R5 の `alpha_mae` +0.009 前後。得るほうは R1 の
+            // 輪郭誤差 18.42 → 6.03、rim 正解 0.512 → 0.224 で、桁が違う
             matting: Matting::Guided,
             smooth_contour: DEFAULT_SMOOTH_CONTOUR,
             reclassify: true,

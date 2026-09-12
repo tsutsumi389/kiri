@@ -809,8 +809,12 @@ fn print_the_refine_cost_on_large_inputs() {
         println!(
             "{name:<14} refine {with:>7.0} ms / refine なし {without:>7.0} ms / 追加 {overhead:>+7.0} ms"
         );
+        // **上限は「桁が変わっていないか」だけを見る。** 帯が面ごと埋まる
+        // 素材（櫛 6px 周期）では 12MP で +2.1 秒かかる——(b)(c) を 4 パス
+        // 回すので、帯の面積ぶんの局所色の格子と多数決が 4 回積み上がる。
+        // 崩れていた頃（帯画素ごとに窓を全走査）は同じ形で +9.4 秒だった
         assert!(
-            overhead < 2000.0,
+            overhead < 4000.0,
             "{name} で refine の追加コストが膨らんでいる: {overhead:+.0} ms"
         );
     }

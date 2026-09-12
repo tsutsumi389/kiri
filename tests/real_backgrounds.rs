@@ -463,6 +463,97 @@ fn the_matting_stages_halve_the_truth_side_error_on_a_real_background() {
     );
 }
 
+/// **段ごとに、その段が主に下げる指標を固定する。**
+///
+/// 3 段まとめてしか見ない判定では、1 段が死んでも他の 2 段が埋め合わせれば
+/// 通ってしまう。そこで (b) / (c) / (e) を**単独で**足した経路を Phase 2 の
+/// 経路と比べ、担当の指標が下がっていることを比で押さえる。
+///
+/// | 段 | シーン | 指標 | Phase 2 | その段だけ | 比 | 上限 |
+/// |---|---|---|---|---|---|---|
+/// | (b) 再分類 | R1 assisted | `rim_truth` | 0.512 | 0.422 | 0.82 | 0.90 |
+/// | (c) 平滑化 | R5 assisted | `contour_error` | 33.39 | 23.96 | 0.72 | 0.85 |
+/// | (e) guided | R1 assisted | `contour_roughness` | 0.851 | 0.466 | 0.55 | 0.70 |
+///
+/// **担当が違う。** (b) は帯の中の粒を色で落とすので正解側の汚染に、(c) は
+/// 形の多数決なので輪郭の位置に、(e) は matte を均すので蛇行に効く。上限は
+/// 実測の比から 1 割ほど緩めた値で、**どれか 1 段を切れば必ず赤になる**。
+#[test]
+fn each_stage_moves_the_metric_it_is_responsible_for() {
+    use kiri::cutout::Matting;
+
+    let run = |name: &str, opts: CutoutOptions| -> (EdgeMetrics, Diagnostics) {
+        let scene = real_scenes()
+            .into_iter()
+            .find(|s| s.name.starts_with(name))
+            .unwrap_or_else(|| panic!("{name} がベンチに無い"));
+        let truth = common::real_scene(&scene);
+        let opts = CutoutOptions {
+            bbox: Some(common::assisted_bbox(&truth)),
+            tolerance: scene.assisted_tolerance,
+            ..opts
+        };
+        let result = cutout(&truth.image, &opts);
+        let m = common::measure_edges_with(&truth, &result.image, &result.mask, opts.bbox, None);
+        (m, result.diagnostics)
+    };
+    let phase2 = || CutoutOptions {
+        matting: Matting::Projection,
+        smooth_contour: 0.0,
+        reclassify: false,
+        ..Default::default()
+    };
+
+    // (b) だけ足す → 正解側の縁の汚染
+    let before = run("R1", phase2()).0.rim_truth;
+    let after = run(
+        "R1",
+        CutoutOptions {
+            reclassify: true,
+            ..phase2()
+        },
+    )
+    .0
+    .rim_truth;
+    assert!(
+        after <= before * 0.90,
+        "(b) 再分類が R1 の帯の汚染を下げていない: {before:.3} → {after:.3}"
+    );
+
+    // (c) だけ足す → 輪郭の位置
+    let before = run("R5", phase2()).0.contour_error;
+    let after = run(
+        "R5",
+        CutoutOptions {
+            smooth_contour: CutoutOptions::default().smooth_contour,
+            ..phase2()
+        },
+    )
+    .0
+    .contour_error;
+    assert!(
+        after <= before * 0.85,
+        "(c) 平滑化が R5 の輪郭誤差を下げていない: {before:.2} → {after:.2}"
+    );
+
+    // (e) だけ足す → 輪郭の蛇行
+    let before = run("R1", phase2()).1.contour_roughness.expect("帯がある");
+    let after = run(
+        "R1",
+        CutoutOptions {
+            matting: Matting::Guided,
+            ..phase2()
+        },
+    )
+    .1
+    .contour_roughness
+    .expect("帯がある");
+    assert!(
+        after <= before * 0.70,
+        "(e) guided が R1 の粗さを下げていない: {before:.3} → {after:.3}"
+    );
+}
+
 /// 診断値が正解由来の誤差と同じ向きに動くこと。
 ///
 /// **相関しなければ、指標は欠陥ではない何かを測っている。** 値そのものではなく

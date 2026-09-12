@@ -26,6 +26,7 @@ pub mod local_colour;
 pub mod mask;
 pub mod morphology;
 pub mod refine;
+pub mod reshape;
 pub mod subject;
 
 use image::RgbaImage;

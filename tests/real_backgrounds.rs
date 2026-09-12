@@ -229,12 +229,19 @@ fn spatial_instructions_are_kept_and_do_not_worsen_the_contour() {
         );
     }
 
-    // **確定前景は 1 画素も落ちない。** 指示は色より強いという約束そのもの
+    // **確定前景は 1 画素も落ちず、確定背景は 1 画素も埋まらない。** 指示は
+    // 色より強いという約束そのもので、**両側を見る**——片側だけを固定すると、
+    // 境界処理が確定背景を前景へ塗り替えても気づけない
     for p in [trimap, polygon] {
         assert_eq!(
             p.metrics.forced_kept, 1.0,
             "{}: 確定前景が前景として残っていない: {:.4}",
             p.label, p.metrics.forced_kept
+        );
+        assert_eq!(
+            p.metrics.forced_bg_kept, 1.0,
+            "{}: 確定背景が前景へ塗り替えられている: {:.4}",
+            p.label, p.metrics.forced_bg_kept
         );
     }
 
@@ -925,7 +932,11 @@ fn print_the_calibration_table() {
         // 渡した確定前景がどれだけ残ったか。**「悪くなっていない」だけを見る
         // 判定は空振りする**ので、指示が届いたかどうかを同じ表に並べて出す
         let kept = if p.metrics.forced_kept.is_finite() {
-            format!("{:.1}%", p.metrics.forced_kept * 100.0)
+            format!(
+                "{:.1}/{:.1}%",
+                p.metrics.forced_kept * 100.0,
+                p.metrics.forced_bg_kept * 100.0
+            )
         } else {
             "-".to_string()
         };

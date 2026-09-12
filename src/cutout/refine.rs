@@ -43,6 +43,7 @@ use std::collections::VecDeque;
 use image::RgbaImage;
 
 use crate::color::lab::{delta_e76, srgb_to_lab};
+use crate::cutout::constraints::Constraints;
 use crate::cutout::local_colour::{self, Lean, LocalColours, Role};
 use crate::cutout::mask::Mask;
 use crate::cutout::morphology::{self, BitPlane};
@@ -180,7 +181,7 @@ pub enum Matting {
 }
 
 #[derive(Debug, Clone)]
-pub struct RefineOptions {
+pub struct RefineOptions<'a> {
     pub min_radius: u32,
     pub max_radius: u32,
     pub min_separation: f32,
@@ -199,9 +200,20 @@ pub struct RefineOptions {
     /// フィルが「幅 2N px 以下の隙間は前景へ戻す」と約束した以上、色の塗り直しが
     /// それを取り消してはいけない（`close_new_gaps`）
     pub seal: u32,
+    /// 画素ごとの確定前景／確定背景（トライマップ・マスク画像・ポリゴン）。
+    ///
+    /// **確定した画素は帯に入れない。** 帯は「色で決め直してよい場所」の
+    /// 印であり、利用者が確定させた画素はその外にある。指示は色より強いという
+    /// 規約そのもので、帯から外せば (b)(c)(d)(e) のどれも触らない。
+    pub constraints: Option<&'a Constraints>,
+    /// 指定された矩形。輪郭の粗さを診断と同じ規約で測るのに要る。
+    ///
+    /// bbox の辺は色から引かれた輪郭ではないので、粗さに数えると帯幅の下限が
+    /// 「矩形をどこに置いたか」で決まってしまう。
+    pub bbox: Option<(u32, u32, u32, u32)>,
 }
 
-impl Default for RefineOptions {
+impl Default for RefineOptions<'_> {
     fn default() -> Self {
         Self {
             min_radius: DEFAULT_MIN_RADIUS,
@@ -213,6 +225,8 @@ impl Default for RefineOptions {
             smooth_contour: DEFAULT_SMOOTH_CONTOUR,
             reclassify: true,
             seal: 1,
+            constraints: None,
+            bbox: None,
         }
     }
 }
@@ -221,7 +235,7 @@ impl Default for RefineOptions {
 ///
 /// 新しい 3 段（再分類・平滑化・guided feathering）をすべて切った設定で、
 /// ここから出る画素は Phase 2 のものと 1 バイトも変わらない。
-impl RefineOptions {
+impl<'a> RefineOptions<'a> {
     pub fn projection_only(self) -> Self {
         Self {
             matting: Matting::Projection,
@@ -297,7 +311,7 @@ pub fn refine(
     image: &RgbaImage,
     binary: &Mask,
     background: [u8; 3],
-    opts: &RefineOptions,
+    opts: &RefineOptions<'_>,
 ) -> Refined {
     let (w, h) = (image.width(), image.height());
     let mut out = image.clone();
@@ -314,7 +328,16 @@ pub fn refine(
 
     // (a)〜(c)。二値マスクを書き換えるので、アルファを載せる前に済ませる
     let mut shape = binary.clone();
-    let mut band = band_map(image, &shape, background, min_radius, max_radius);
+    let mut band = vec![0u8; (w as usize) * (h as usize)];
+    band_map_into(
+        image,
+        &shape,
+        background,
+        min_radius,
+        max_radius,
+        opts.constraints,
+        &mut band,
+    );
     // `--seal` が塞いだ隙間。帯からも参照色からも外す（`close_new_gaps`）
     let mut sealed = BitPlane::default();
     reshape(
@@ -454,7 +477,7 @@ fn for_each_tile(w: u32, h: u32, mut body: impl FnMut((u32, u32))) {
 /// **旧経路（`projection_only`）は絶対 px のまま。** 持ち上げた帯は新しい 3 段に
 /// 働く場所を与えるためのもので、射影アルファだけを回す経路には何の用も無い。
 /// ここを共有すると Phase 2 のバイト列が黙って変わる。
-fn band_radii(binary: &Mask, scale: f64, opts: &RefineOptions) -> (u32, u32) {
+fn band_radii(binary: &Mask, scale: f64, opts: &RefineOptions<'_>) -> (u32, u32) {
     if !opts.staged() {
         return (opts.min_radius, opts.max_radius);
     }
@@ -473,7 +496,7 @@ fn band_radii(binary: &Mask, scale: f64, opts: &RefineOptions) -> (u32, u32) {
     // 6.03 → 8.75 と、高解像度でも合成でも悪くなった（10 / 14 / 20 / 30 px と
     // 振っても単調に悪い）。下限だけを掛け戻す
     let max_r = opts.max_radius.clamp(1, RADIUS_CEILING);
-    let roughness = diagnostics::contour_roughness(binary, None).unwrap_or(0.0) * scale;
+    let roughness = diagnostics::contour_roughness(binary, opts.bbox).unwrap_or(0.0) * scale;
     let wanted = (BAND_ROUGHNESS_GAIN * roughness).ceil();
     let wanted = if wanted.is_finite() && wanted > 0.0 {
         wanted as u32
@@ -492,7 +515,7 @@ fn reshape(
     band: &mut [u8],
     sealed: &mut BitPlane,
     background: [u8; 3],
-    opts: &RefineOptions,
+    opts: &RefineOptions<'_>,
     scale: f64,
     min_radius: u32,
     max_radius: u32,
@@ -555,7 +578,15 @@ fn reshape(
         // 戻り値（塞いだ画素数）は捨てる。ここで数えたいのは「色が動かした画素」
         // であって、連結性が戻した画素ではない
         let _ = close_new_gaps(shape, original, band, sealed, bounds, opts.seal);
-        band_map_into(image, shape, background, min_radius, max_radius, band);
+        band_map_into(
+            image,
+            shape,
+            background,
+            min_radius,
+            max_radius,
+            opts.constraints,
+            band,
+        );
     }
     // 塞いだ隙間を帯から外す。**パスの途中では外さない**——途中で外すとその
     // 画素が次のパスの局所色から消え、塗り直しの答えが連鎖して変わる
@@ -1575,6 +1606,7 @@ fn pixel_linear(image: &RgbaImage, lut: &[f32; 256], x: u32, y: u32) -> [f32; 3]
 ///
 /// 帯幅は輪郭ごとに測る。くっきりした輪郭に 10px の帯を張れば商品の内側まで
 /// 巻き込むし、8px かけて溶ける輪郭に 2px の帯では遷移を跨げない。
+#[cfg(test)]
 fn band_map(
     image: &RgbaImage,
     binary: &Mask,
@@ -1583,7 +1615,9 @@ fn band_map(
     max_radius: u32,
 ) -> Vec<u8> {
     let mut band = vec![0u8; (binary.width() as usize) * (binary.height() as usize)];
-    band_map_into(image, binary, background, min_radius, max_radius, &mut band);
+    band_map_into(
+        image, binary, background, min_radius, max_radius, None, &mut band,
+    );
     band
 }
 
@@ -1592,12 +1626,14 @@ fn band_map(
 /// 塗り直しはパスごとに帯を引き直すので、素直に作り直すと旧と新が同時に
 /// 生きて 24.5MP で 49MB を余分に抱える。中身を 0 に戻してから塗れば、
 /// 同じ結果を確保なしで得られる。
+#[allow(clippy::too_many_arguments)]
 fn band_map_into(
     image: &RgbaImage,
     binary: &Mask,
     background: [u8; 3],
     min_radius: u32,
     max_radius: u32,
+    constraints: Option<&Constraints>,
     band: &mut [u8],
 ) {
     let (w, h) = (binary.width(), binary.height());
@@ -1620,6 +1656,22 @@ fn band_map_into(
                 None => min_r,
             };
             paint_disc(band, w, h, x, y, width);
+        }
+    }
+    // **確定した画素は帯から外す。** 指示は色より強いという規約の帰結で、
+    // ここを外せば (b) の塗り直しも (d)(e) のアルファも触らない。寸法の合わない
+    // 指示は無かったことにする（`foreground_mask` と同じ規約）。
+    //
+    // **不明領域をまるごと帯にはしない。** 設計書 (a) はそう書いていたが、
+    // トライマップの不明の帯は長辺の 4%（R1 で 48px）あり、そこを一様に帯へ
+    // すると遷移そのものより広い帯が張られて確定 F/B が窓から消える。実測でも
+    // R1 trimap の輪郭誤差は 1.39 → 3.86、rim 正解は 0.128 → 0.256 と悪化した。
+    // 帯は遷移幅から引き、指示は「触ってはいけない場所」を教える側に徹する
+    if let Some(c) = constraints.filter(|c| c.width() == w && c.height() == h) {
+        for (i, slot) in band.iter_mut().enumerate() {
+            if c.has_fg(i) || c.has_bg(i) {
+                *slot = 0;
+            }
         }
     }
 }

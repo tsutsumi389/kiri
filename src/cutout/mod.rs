@@ -323,6 +323,10 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
                 smooth_contour: opts.smooth_contour,
                 reclassify: opts.reclassify,
                 seal: opts.seal,
+                // 指示と矩形を境界処理まで通す。確定した画素は帯から外れ、
+                // 輪郭の粗さは診断と同じ規約（矩形の辺を数えない）で測られる
+                constraints: opts.constraints.as_ref(),
+                bbox: opts.bbox,
                 ..Default::default()
             },
         );

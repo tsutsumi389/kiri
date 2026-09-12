@@ -240,6 +240,23 @@ pub struct MaskReport {
     /// 鮮鋭な輪郭では 1 前後、6 以上なら輪郭がぼやけている。
     /// 遷移を1本も追えなければ null
     pub edge_width: Option<f64>,
+    /// 二値輪郭が、それを滑らかにした参照輪郭からどれだけ離れているかの中央値
+    /// （px、**長辺 1000px 換算**）。輪郭が輪郭に沿って蛇行していれば大きくなる。
+    ///
+    /// `edge_width` はアルファ遷移の**幅**しか見ないので、ギザギザには反応
+    /// しない。実写（不織布の上のリモコン）は `halo_ratio` 0.001 /
+    /// `separability` 54.7 と合格を返しながら上辺・下辺がギザギザだった。
+    ///
+    /// 測れる輪郭が無ければ null
+    pub contour_roughness: Option<f64>,
+    /// 境界の内側の帯にある不透明画素のうち、元の色が局所前景より局所背景に
+    /// 近いものの割合。背景のテクスチャが縁に張り付いていれば大きくなる。
+    ///
+    /// `halo_ratio` は「局所背景と ΔE≤3」という絶対的な基準なので、繊維の
+    /// ばらつきが ΔE 5〜10 ある不織布では張り付いた繊維が数から漏れる。
+    ///
+    /// 判定できる画素が無ければ null
+    pub rim_contamination: Option<f64>,
     /// --debug-mask で書き出したマスク画像のパス
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug_mask: Option<String>,

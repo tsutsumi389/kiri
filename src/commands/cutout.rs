@@ -118,6 +118,8 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             separability: result.separability.map(round4),
             halo_ratio: result.diagnostics.halo_ratio.map(round4),
             edge_width: result.diagnostics.edge_width.map(round4),
+            contour_roughness: result.diagnostics.contour_roughness.map(round4),
+            rim_contamination: result.diagnostics.rim_contamination.map(round4),
             debug_mask,
         },
         canvas,

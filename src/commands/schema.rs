@@ -339,6 +339,46 @@ fn fields() -> Vec<FieldEntry> {
             ),
         },
         FieldEntry {
+            path: "mask.contour_roughness",
+            appears_in: vec!["cutout"],
+            unit: "px_at_1000",
+            nullable: true,
+            null_means: Some("測れる輪郭が無かった。0（完全に滑らか）ではない"),
+            warns: vec![FieldThreshold {
+                code: WarningCode::ContourRough,
+                operator: "gt",
+                threshold: diagnostics::CONTOUR_ROUGH_WARN,
+            }],
+            gates: None,
+            summary: "二値輪郭が、それを滑らかにした参照輪郭からどれだけ離れているかの中位値",
+            notes: Some(
+                "長辺 1000px へ縮めたときの px で報告する。納品先がその寸法だからで、20MP の \
+                 1px は縮めると 0.18px になって見えない。きれいに解けた合成シーンは 0.00 で、\
+                 実写背景でフィルが届かなかった結果は 0.83 以上になる。0.1 未満なら滑らかと\
+                 読んでよい",
+            ),
+        },
+        FieldEntry {
+            path: "mask.rim_contamination",
+            appears_in: vec!["cutout"],
+            unit: "ratio",
+            nullable: true,
+            null_means: Some("判定できる帯の画素が無かった。0（汚染が無い）ではない"),
+            warns: vec![FieldThreshold {
+                code: WarningCode::RimContaminated,
+                operator: "gt",
+                threshold: diagnostics::RIM_CONTAMINATION_WARN,
+            }],
+            gates: None,
+            summary: "境界の内側の帯で、元の色が局所前景より局所背景に近い画素の割合",
+            notes: Some(
+                "halo_ratio が見落とすものを見る。あちらは「局所背景と ΔE≤3」という絶対的な\
+                 基準なので、繊維のばらつきが ΔE 5〜10 ある不織布では張り付いた繊維が数から\
+                 漏れる。局所前景と局所背景の色差が ΔE 6 未満の画素は判定しない。柔らかい\
+                 輪郭は原理的に苦手な側で、8px かけて溶ける合成シーンが 0.009 と最も近い",
+            ),
+        },
+        FieldEntry {
             path: "mask.touches_edge",
             appears_in: vec!["cutout"],
             unit: "bool",

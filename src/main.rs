@@ -288,6 +288,21 @@ fn print_cutout(report: &CutoutReport) {
             report.settings.tolerance
         );
     }
+    // 「境界色差」の並びに合わせて、境界の質を語る値をここへ続ける。
+    // どちらも長辺 1000px 換算／割合で、しきい値と並べて初めて読める
+    if let Some(roughness) = report.mask.contour_roughness {
+        println!(
+            "  輪郭粗さ  {roughness:.2} px  (1000px 換算, 警告 {:.2} 超)",
+            kiri::cutout::diagnostics::CONTOUR_ROUGH_WARN
+        );
+    }
+    if let Some(rim) = report.mask.rim_contamination {
+        println!(
+            "  縁の汚染  {:.1}%  (警告 {:.1}% 超)",
+            rim * 100.0,
+            kiri::cutout::diagnostics::RIM_CONTAMINATION_WARN * 100.0
+        );
+    }
     match report.mask.bbox {
         Some([x1, y1, x2, y2]) => println!("  前景範囲  {x1},{y1} - {x2},{y2}"),
         None => println!("  前景範囲  なし"),

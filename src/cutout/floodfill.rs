@@ -160,7 +160,20 @@ pub fn foreground_mask(image: &RgbaImage, background: [u8; 3], opts: &FloodOptio
 
     let mut is_background = if two_stage {
         let core = fill_from_border(w, h, |i| candidates.has(i, STRICT), opts.bbox, forced);
-        if core.iter().any(|&b| b) {
+        // **芯が取れたかどうかは色で問う。確定背景の画素は数えない。**
+        //
+        // 確定背景は候補判定を通さずに塗られるので、そのまま `any()` で問うと
+        // 1 画素の指示があるだけで芯が取れたことになり、下の 1 段フィルへの
+        // 救済が到達不能になる。芯が取れない素材（外周が推定背景色から離れて
+        // いる）では、第 2 段の段差を越えられない背景がまるごと前景に残る——
+        // **指示を足したせいで結果が悪くなる**、いちばん筋の悪い壊れ方である。
+        //
+        // 落ちた先の 1 段フィルでも確定背景は効く（種になり、最後に強制される）
+        let colour_core = core
+            .iter()
+            .enumerate()
+            .any(|(i, &b)| b && !forced.is_some_and(|c| c.has_bg(i)));
+        if colour_core {
             let stage = Expansion {
                 candidates: &candidates,
                 lab: &lab,
@@ -1081,6 +1094,79 @@ mod tests {
             mask.is_foreground(6, 5),
             "確定背景が確定前景に勝っている\n{}",
             render(&mask)
+        );
+    }
+
+    /// 白枠の内側を 2 色の薄いグレーに割り、中央に濃い商品を置いた 200x200。
+    ///
+    /// 外周は白なので、推定背景色（白）から見ると内側のグレーは芯の許容量の
+    /// 外にある。**芯が 1 画素も取れない素材**がこれで、2 段フィルは成立せず
+    /// 1 段フィルへ落ちるのが正しい。2 色の境目は 1px あたり ΔE 3.5 の段差で、
+    /// 第 2 段の段差判定（既定 2.2）では越えられない。
+    fn two_tone_inside_a_white_frame() -> RgbaImage {
+        let mut img = RgbaImage::from_pixel(200, 200, Rgba([255, 255, 255, 255]));
+        for y in 25..=175 {
+            for x in 25..=175 {
+                let v = if x < 100 { 242 } else { 232 };
+                img.put_pixel(x, y, Rgba([v, v, v, 255]));
+            }
+        }
+        for y in 80..=120 {
+            for x in 80..=120 {
+                img.put_pixel(x, y, Rgba([40, 40, 40, 255]));
+            }
+        }
+        img
+    }
+
+    fn framed_opts(bbox: (u32, u32, u32, u32)) -> FloodOptions<'static> {
+        FloodOptions {
+            tolerance: 12.0,
+            bbox: Some(bbox),
+            core_tolerance: core_tolerance(12.0, 0.0),
+            step_tolerance: 2.2,
+            shadow_tolerance: 35.0,
+            seal: 1,
+            ..Default::default()
+        }
+    }
+
+    /// **確定背景を足しただけで、指示なしより前景が増えてはいけない。**
+    ///
+    /// 芯が取れたかどうかを「フィルの結果が空でないか」で問うと、確定背景は
+    /// 候補判定を通さずに塗られるぶん、1 画素あるだけで芯が取れたことになる。
+    /// そこで 1 段フィルへの救済が消え、第 2 段の段差を越えられない背景が
+    /// まるごと前景に残る。**指示は結果を良くするためのものなので、足して
+    /// 悪くなる経路があってはならない。**
+    #[test]
+    fn a_forced_background_never_leaves_more_foreground_than_no_instruction_at_all() {
+        let img = two_tone_inside_a_white_frame();
+        let bare = foreground_mask(&img, [255, 255, 255], &framed_opts((25, 25, 175, 175)));
+        let bare_ratio = bare.stats().foreground_ratio;
+
+        // 確定背景は 4x4 の 1 枚だけ。薄いほうのグレーの上に置く
+        let mut constraints = Constraints::new(200, 200);
+        constraints.fill_polygon(
+            &[[30.0, 30.0], [34.0, 30.0], [34.0, 34.0], [30.0, 34.0]],
+            Constraint::ForcedBg,
+        );
+        let hinted = foreground_mask(
+            &img,
+            [255, 255, 255],
+            &FloodOptions {
+                constraints: Some(&constraints),
+                ..framed_opts((25, 25, 175, 175))
+            },
+        );
+        let hinted_ratio = hinted.stats().foreground_ratio;
+
+        assert!(
+            hinted_ratio <= bare_ratio + 1e-6,
+            "確定背景を 16 画素足しただけで前景が増えた: {hinted_ratio:.4} vs 指示なし {bare_ratio:.4}"
+        );
+        assert!(
+            !hinted.is_foreground(150, 100),
+            "濃いほうのグレーが前景として残っている"
         );
     }
 

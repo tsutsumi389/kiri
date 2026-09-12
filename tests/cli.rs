@@ -4287,6 +4287,12 @@ fn the_report_states_which_matting_took_effect() {
         defaults["band_min_radius"].as_u64().is_some(),
         "実際に効いた帯幅の下限が出ていない: {defaults}"
     );
+    // **要求値と実効値を並べて出す。** `--smooth-contour` は長辺 1000px 換算
+    // なので、指定値だけでは「実寸で何 px 均したか」を語らない
+    assert!(
+        defaults["smooth_radius_px"].as_u64().is_some(),
+        "実際に効いた平滑化の半径が出ていない: {defaults}"
+    );
 
     let plain = settings(&[
         "--matting",
@@ -4305,6 +4311,77 @@ fn the_report_states_which_matting_took_effect() {
     assert!(
         legacy.get("band_min_radius").is_none(),
         "--no-refine なのに帯幅の下限を名乗っている: {legacy}"
+    );
+    assert!(
+        legacy.get("smooth_radius_px").is_none(),
+        "--no-refine なのに平滑化の半径を名乗っている: {legacy}"
+    );
+}
+
+/// `--smooth-contour` の上限が CLI と spec の両方で効くこと。
+///
+/// **要求値をそのまま結果に書き写していた。** 実効の半径は `RADIUS_CEILING`
+/// （48px）で頭打ちになるので、100 と指定しても効くのはそこまでなのに
+/// `settings.smooth_contour` には 100 が出ていた。「指定したのに効かない」が
+/// 数値の上では見分けられない。入口で断り、実効値は別のキーで出す。
+#[test]
+fn an_out_of_range_smooth_contour_is_refused_everywhere() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--force",
+            "--json",
+            "--smooth-contour",
+            "100",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "上限を越えた指定が通っている");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("16"), "上限を文面に出していない: {stderr}");
+
+    // spec も同じ関門を通ること。**CLI だけに置くと batch が素通りする**
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        serde_json::json!({
+            "items": [{
+                "input": input.to_str().unwrap(),
+                "output": dir.path().join("b.png").to_str().unwrap(),
+                "smooth_contour": 100.0,
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--json", "--force"])
+        .output()
+        .unwrap();
+    let report = json_stdout(&out);
+    let item = &report["results"][0];
+    assert_eq!(
+        item["status"], "error",
+        "spec の上限越えが通っている: {report}"
+    );
+    assert!(
+        item["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("16"),
+        "上限を文面に出していない: {item}"
     );
 }
 

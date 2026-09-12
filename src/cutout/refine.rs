@@ -44,6 +44,7 @@ use image::RgbaImage;
 
 use crate::color::lab::{delta_e76, srgb_to_lab};
 use crate::cutout::constraints::Constraints;
+use crate::cutout::integral::Integral;
 use crate::cutout::local_colour::{self, Lean, LocalColours, Role};
 use crate::cutout::mask::Mask;
 use crate::cutout::morphology::{self, BitPlane};
@@ -261,6 +262,10 @@ pub struct Refined {
     pub mask: Mask,
     /// 実際に効いた帯幅の下限(px)。輪郭の粗さで持ち上がることがある
     pub band_min_radius: u32,
+    /// 実際に効いた平滑化の半径(px)。**指定値からは読めない**——
+    /// `--smooth-contour` は長辺 1000px 換算なので解像度で掛け戻され、
+    /// `RADIUS_CEILING` で頭打ちになる
+    pub smooth_radius_px: u32,
 }
 
 /// sRGB 8bit → 線形 RGB の変換表。境界帯では同じ変換を何十回も引くため。
@@ -320,11 +325,13 @@ pub fn refine(
             image: out,
             mask: binary.clone(),
             band_min_radius: 0,
+            smooth_radius_px: 0,
         };
     }
 
     let scale = diagnostics::scale_at_1000(w, h);
     let (min_radius, max_radius) = band_radii(binary, scale, opts);
+    let smooth_radius = smooth_radius_px(opts.smooth_contour, scale);
 
     // (a)〜(c)。二値マスクを書き換えるので、アルファを載せる前に済ませる
     let mut shape = binary.clone();
@@ -362,6 +369,7 @@ pub fn refine(
             image: out,
             mask,
             band_min_radius: min_radius,
+            smooth_radius_px: smooth_radius,
         };
     }
 
@@ -445,6 +453,21 @@ pub fn refine(
         image: out,
         mask,
         band_min_radius: min_radius,
+        smooth_radius_px: smooth_radius,
+    }
+}
+
+/// `--smooth-contour`（長辺 1000px 換算）が実際に効く実寸の半径。
+///
+/// **要求値と実効値は違う。** 換算値なので解像度で掛け戻され、`RADIUS_CEILING`
+/// で頭打ちになる。結果の `settings.smooth_radius_px` に出すのはこちらで、
+/// 「指定したのに効かない」を数値の上で見分けられるようにする。
+fn smooth_radius_px(smooth_contour: f64, scale: f64) -> u32 {
+    let r = (smooth_contour * scale).ceil();
+    if r.is_finite() && r > 0.0 {
+        (r as u32).min(RADIUS_CEILING)
+    } else {
+        0
     }
 }
 
@@ -520,12 +543,7 @@ fn reshape(
     min_radius: u32,
     max_radius: u32,
 ) {
-    let smooth_radius = (opts.smooth_contour * scale).ceil();
-    let smooth_radius = if smooth_radius.is_finite() && smooth_radius > 0.0 {
-        (smooth_radius as u32).min(RADIUS_CEILING)
-    } else {
-        0
-    };
+    let smooth_radius = smooth_radius_px(opts.smooth_contour, scale);
     if !opts.reclassify && smooth_radius == 0 {
         return;
     }
@@ -1007,64 +1025,34 @@ struct Workspace {
 
 /// 3 チャンネルの色の合計と画素数を、まとめて積分画像で持つ。
 ///
-/// 合計を f64 で持つのは、窓の合計を大きな累積どうしの差として取り出すため。
-/// f32 では桁落ちし、窓の位置によってアルファが揺れる。
+/// **`guided::Integral` と同じ 1 本を使う。** 中身は「色 3 面 + 数えた画素数
+/// 1 面」で、画素数も f64 の面として混ぜる——24.5MP を足しても 2^53 には遠く
+/// 届かないので、整数としての厳密さは失われない。積分画像を 2 つ持っていた
+/// 頃は、片方だけ精度を変えれば桁落ちの性質が黙って食い違った。
 #[derive(Default)]
-struct ColourSums {
-    stride: usize,
-    sum: [Vec<f64>; 3],
-    count: Vec<u32>,
-}
+struct ColourSums(Integral<4>);
 
 impl ColourSums {
     /// `take` が立っている画素だけを積分する。`linear` と `take` は w×h の並び。
     fn build(&mut self, w: usize, h: usize, linear: &[[f32; 3]], take: &[bool]) {
-        let stride = w + 1;
-        self.stride = stride;
-        let cells = stride * (h + 1);
-        for plane in &mut self.sum {
-            plane.clear();
-            plane.resize(cells, 0.0);
-        }
-        self.count.clear();
-        self.count.resize(cells, 0);
-
-        for y in 0..h {
-            let (row, prev) = ((y + 1) * stride, y * stride);
-            let mut acc = [0f64; 3];
-            let mut n = 0u32;
-            for x in 0..w {
-                let i = y * w + x;
-                if take[i] {
-                    let c = linear[i];
-                    for (k, slot) in acc.iter_mut().enumerate() {
-                        *slot += f64::from(c[k]);
-                    }
-                    n += 1;
-                }
-                for (k, plane) in self.sum.iter_mut().enumerate() {
-                    plane[row + x + 1] = plane[prev + x + 1] + acc[k];
-                }
-                self.count[row + x + 1] = self.count[prev + x + 1] + n;
+        self.0.build(w, h, |i| {
+            if !take[i] {
+                return [0.0; 4];
             }
-        }
+            let c = linear[i];
+            [f64::from(c[0]), f64::from(c[1]), f64::from(c[2]), 1.0]
+        });
     }
 
     /// 局所座標の矩形 [x0,x1] × [y0,y1]（両端を含む）に入った画素の平均色。
     /// 1 画素も入っていなければ None。
     fn mean(&self, x0: usize, y0: usize, x1: usize, y1: usize) -> Option<[f32; 3]> {
-        let s = self.stride;
-        let (a, b) = (y0 * s + x0, y0 * s + x1 + 1);
-        let (c, d) = ((y1 + 1) * s + x0, (y1 + 1) * s + x1 + 1);
-        let n = self.count[d] + self.count[a] - self.count[b] - self.count[c];
-        if n == 0 {
+        let s = self.0.sum(x0, y0, x1, y1);
+        if s[3] < 1.0 {
             return None;
         }
-        let inv = 1.0 / f64::from(n);
-        Some(std::array::from_fn(|k| {
-            let p = &self.sum[k];
-            ((p[d] + p[a] - p[b] - p[c]) * inv) as f32
-        }))
+        let inv = 1.0 / s[3];
+        Some(std::array::from_fn(|k| (s[k] * inv) as f32))
     }
 }
 

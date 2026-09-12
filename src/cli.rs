@@ -9,7 +9,7 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::cutout::background::DEFAULT_BORDER;
 use crate::cutout::constraints::{MASK_THRESHOLD, TRIMAP_BACKGROUND, TRIMAP_FOREGROUND};
-use crate::cutout::{DEFAULT_EDGE_THRESHOLD, DEFAULT_SMOOTH_CONTOUR, Matting};
+use crate::cutout::{DEFAULT_EDGE_THRESHOLD, Matting};
 use crate::image_io::OutputFormat;
 use crate::preview::DEFAULT_PANEL;
 use crate::transform::FitMode;
@@ -425,6 +425,29 @@ pub fn non_negative(s: &str) -> Result<f64, String> {
     Ok(v)
 }
 
+/// `--smooth-contour` の上限(px, 長辺 1000px 換算)。
+///
+/// **要求値をそのまま返していた。** 実効の半径は `RADIUS_CEILING` で頭打ちに
+/// なるので、`--smooth-contour 100` と指定しても効くのは 48px までで、結果の
+/// `settings.smooth_contour` には 100 が出ていた。「指定したのに効かない」が
+/// 数値の上では見分けられない状態である。
+///
+/// 16 は、長辺 1000px の素材で「商品の角（曲率半径 20px 級）が丸まり始める」
+/// 手前の値で、`RADIUS_CEILING`（48）に当たるのは長辺 3000px を超えてからに
+/// なる。実効半径は `settings.smooth_radius_px` に出す。
+pub const MAX_SMOOTH_CONTOUR: f64 = 16.0;
+
+/// 0 以上 `MAX_SMOOTH_CONTOUR` 以下の実数だけを受け付ける。
+pub fn smooth_contour_px(s: &str) -> Result<f64, String> {
+    let v = non_negative(s)?;
+    if v > MAX_SMOOTH_CONTOUR {
+        return Err(format!(
+            "'{s}' は 0 から {MAX_SMOOTH_CONTOUR} の範囲で指定してください"
+        ));
+    }
+    Ok(v)
+}
+
 /// 有限な実数だけを受け付ける。符号は問わない。
 ///
 /// `non_negative` と分けているのは、角度だけが負値に意味を持つためである
@@ -565,10 +588,12 @@ pub struct CutoutArgs {
     #[arg(long, value_enum, default_value_t = Matting::Guided)]
     pub matting: Matting,
 
-    /// 帯の中の二値輪郭に掛けるメディアンの半径(px)。長辺 1000px 換算。0 で無効
+    /// 帯の中の二値輪郭に掛けるメディアンの半径(px)。長辺 1000px 換算。0 で無効（上限 16）
     ///
     /// 変わった画素のうち、色が変化に矛盾するものは元へ戻す。幅 3px のストラップ（商品色）はメディアンで消えても色の門で戻り、織り目の粒（背景色）は戻らない。
-    #[arg(long, default_value_t = DEFAULT_SMOOTH_CONTOUR, value_parser = non_negative)]
+    ///
+    /// 実際に効いた実寸の半径は結果の settings.smooth_radius_px に出る。長辺 1000px 換算の値なので、20MP では指定値の 5 倍前後になり、48px で頭打ちになる。
+    #[arg(long, default_value = "2.0", value_parser = smooth_contour_px)]
     pub smooth_contour: f64,
 
     /// 帯の中の二値画素を局所の前景色・背景色で塗り直さない
@@ -748,6 +773,36 @@ pub fn parse_hex_color(s: &str) -> Result<[u8; 3], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--smooth-contour` の既定値の綴りが定数と食い違わないこと。
+    ///
+    /// **schema の `default` と結果の `smooth_contour` は同じ数でなければ
+    /// ならない。** `default_value_t` に f64 を渡すと clap は `"2"` と綴り、
+    /// 結果の JSON は `2.0` を出す。エージェントは 2 つの表記を突き合わせ
+    /// られない。文字列で `"2.0"` と書く代わりに、定数との一致をここで守る。
+    #[test]
+    fn the_smooth_contour_default_matches_the_constant() {
+        use clap::CommandFactory;
+        let command = Cli::command();
+        let cutout = command
+            .get_subcommands()
+            .find(|c| c.get_name() == "cutout")
+            .expect("cutout がある");
+        let arg = cutout
+            .get_arguments()
+            .find(|a| a.get_id() == "smooth_contour")
+            .expect("--smooth-contour がある");
+        let spelled = arg.get_default_values()[0].to_str().unwrap();
+        assert_eq!(
+            spelled.parse::<f64>().unwrap(),
+            crate::cutout::DEFAULT_SMOOTH_CONTOUR,
+            "--help の既定値 '{spelled}' が DEFAULT_SMOOTH_CONTOUR と食い違っている"
+        );
+        assert!(
+            spelled.contains('.'),
+            "schema の default '{spelled}' が結果の JSON（2.0）と別の綴りになる"
+        );
+    }
 
     #[test]
     fn parses_six_digit_hex() {

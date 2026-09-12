@@ -127,6 +127,9 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
                 Matting::Guided => "guided",
             },
             smooth_contour: opts.smooth_contour,
+            // 実際に効いた値。指定値は長辺 1000px 換算なので、そのままでは
+            // 「実寸で何 px 均したか」を語らない
+            smooth_radius_px: result.smooth_radius_px,
             reclassify: opts.reclassify,
             // 実際に効いた値。指定値ではなく、輪郭の粗さで持ち上がった後の値
             band_min_radius: result.band_min_radius,

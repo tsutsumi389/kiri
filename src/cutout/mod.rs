@@ -21,6 +21,7 @@ pub mod edges;
 pub mod feather;
 pub mod floodfill;
 pub mod guided;
+pub mod integral;
 pub mod local_colour;
 pub mod mask;
 pub mod morphology;
@@ -185,6 +186,9 @@ pub struct CutoutResult {
     /// 実際に効いた帯幅の下限(px)。輪郭の粗さで持ち上がることがあるので、
     /// 指定値からは読めない。`--no-refine` では帯そのものが無いので None
     pub band_min_radius: Option<u32>,
+    /// 実際に効いた輪郭の平滑化半径(px)。`--smooth-contour` は長辺 1000px 換算
+    /// なので、指定値からは読めない。`--no-refine` では None
+    pub smooth_radius_px: Option<u32>,
     pub stats: MaskStats,
     /// 切り抜き境界での商品と背景の色差(ΔE)の中央値。前景が無ければ None
     pub separability: Option<f64>,
@@ -311,6 +315,7 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
     restore_forced_foreground(&mut mask, opts);
 
     let mut band_min_radius = None;
+    let mut smooth_radius_px = None;
     let mut out = if opts.refine {
         let refined = refine::refine(
             image,
@@ -332,6 +337,7 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
         );
         mask = refined.mask;
         band_min_radius = Some(refined.band_min_radius);
+        smooth_radius_px = Some(refined.smooth_radius_px);
         refined.image
     } else {
         mask = feather::feather(&mask, opts.feather);
@@ -388,6 +394,7 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
         background,
         edge_threshold,
         band_min_radius,
+        smooth_radius_px,
         stats,
         separability,
         diagnostics,

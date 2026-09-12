@@ -41,6 +41,7 @@
 
 use image::RgbaImage;
 
+use crate::cutout::integral::Integral;
 use crate::cutout::mask::Mask;
 
 /// ε の下限（線形 RGB の分散）。
@@ -80,93 +81,49 @@ const TILE: u32 = 128;
 /// だけ良く見える**状態が再現した）。
 ///
 /// 12MP で 1.5MB。画素ごとに 1 バイト持つと 12MB になる。
+///
+/// **「印を取らない」を型で表す。** `--matting projection` では印そのものが
+/// 要らないので 12MP で 1.5MB を確保しないが、`Vec` が空のまま `set` を
+/// 黙って捨てる実装だと、**確保し忘れ**と**要らないから空**が同じ形になる。
+/// 後者を `Off` として書き下せば、`set` は必ず効くか、何もしないと宣言した
+/// 相手にしか届かない。
 #[derive(Default)]
-pub struct Solved(Vec<u64>);
+pub enum Solved {
+    /// 印を取らない（射影だけを回す経路）
+    #[default]
+    Off,
+    /// 画素ごとの印
+    On(Vec<u64>),
+}
 
 impl Solved {
     pub fn new(cells: usize) -> Self {
-        Self(vec![0u64; cells.div_ceil(64)])
+        Self::On(vec![0u64; cells.div_ceil(64)])
     }
 
-    /// 印を付ける。**空（`Default`）なら何もしない。**
+    /// 印を付ける。`Off` なら何もしない。
     ///
-    /// `--matting projection` では印そのものが要らないので、12MP で 1.5MB を
-    /// 確保しないまま同じ経路を通す。呼ぶ側に分岐を持たせると、印を取る設定と
-    /// 取らない設定でアルファの計算そのものが 2 本に割れる。
+    /// 呼ぶ側に分岐を持たせると、印を取る設定と取らない設定でアルファの
+    /// 計算そのものが 2 本に割れる。
     #[inline]
     pub fn set(&mut self, index: usize) {
-        if self.0.is_empty() {
-            return;
+        if let Self::On(words) = self {
+            words[index / 64] |= 1u64 << (index % 64);
         }
-        self.0[index / 64] |= 1u64 << (index % 64);
     }
 
     #[inline]
     pub fn get(&self, index: usize) -> bool {
-        !self.0.is_empty() && (self.0[index / 64] >> (index % 64)) & 1 == 1
+        match self {
+            Self::Off => false,
+            Self::On(words) => (words[index / 64] >> (index % 64)) & 1 == 1,
+        }
     }
 }
 
 /// 行列が退化したとみなす行列式。ε ≥ `EPS_FLOOR` なので正定値のはずだが、
 /// 公開 API に何が渡っても除算を破綻させない。
 const MIN_DET: f64 = 1e-18;
-
-/// 複数面の積分画像。面ごとに連続に持つ。
-///
-/// 合計を f64 で持つのは `refine::ColourSums` と同じ理由である——窓の合計を
-/// 大きな累積どうしの差として取り出すので、f32 では桁落ちして窓の位置で
-/// 答えが揺れる。
-struct Integral<const N: usize> {
-    stride: usize,
-    plane: usize,
-    data: Vec<f64>,
-}
-
-impl<const N: usize> Default for Integral<N> {
-    fn default() -> Self {
-        Self {
-            stride: 0,
-            plane: 0,
-            data: Vec::new(),
-        }
-    }
-}
-
-impl<const N: usize> Integral<N> {
-    fn build(&mut self, w: usize, h: usize, value: impl Fn(usize) -> [f64; N]) {
-        let stride = w + 1;
-        let plane = stride * (h + 1);
-        self.stride = stride;
-        self.plane = plane;
-        self.data.clear();
-        self.data.resize(plane * N, 0.0);
-        for y in 0..h {
-            let (row, prev) = ((y + 1) * stride, y * stride);
-            let mut acc = [0f64; N];
-            for x in 0..w {
-                let v = value(y * w + x);
-                for (k, slot) in acc.iter_mut().enumerate() {
-                    *slot += v[k];
-                }
-                for (k, a) in acc.iter().enumerate() {
-                    let p = k * plane;
-                    self.data[p + row + x + 1] = self.data[p + prev + x + 1] + a;
-                }
-            }
-        }
-    }
-
-    /// 局所座標の矩形 [x0,x1] × [y0,y1]（両端を含む）の合計。
-    fn sum(&self, x0: usize, y0: usize, x1: usize, y1: usize) -> [f64; N] {
-        let s = self.stride;
-        let (a, b) = (y0 * s + x0, y0 * s + x1 + 1);
-        let (c, d) = ((y1 + 1) * s + x0, (y1 + 1) * s + x1 + 1);
-        std::array::from_fn(|k| {
-            let p = k * self.plane;
-            self.data[p + d] + self.data[p + a] - self.data[p + b] - self.data[p + c]
-        })
-    }
-}
 
 /// タイル1枚分の作業領域。タイルをまたいで使い回し、確保を繰り返さない。
 #[derive(Default)]

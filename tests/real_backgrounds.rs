@@ -497,6 +497,94 @@ fn the_diagnostics_track_the_truth() {
     }
 }
 
+/// **新しい 3 段が警告を増やさないこと。**
+///
+/// 指標が良くなったのに警告が増えるのは、利用者にとっては後退である。
+/// エージェントは警告を見て次の一手を決めるので、**解けない警告が 1 本出るだけで
+/// 直すものが無いまま 2 周目を回す**。しかも `HALO_REMAINS` の hint
+/// （「`--tolerance` を上げると減る」）は、原因が tolerance でない場合には
+/// 何周回しても値を動かさない。
+///
+/// 合成 S1〜S12 と、実写 R7 の assisted（正解が「欠陥なし」と言う唯一の実写点）
+/// を、Phase 2 の経路（3 スイッチ明示）と突き合わせる。**減るのは歓迎、増える
+/// のは不可**という非対称な検査である。
+#[test]
+fn the_matting_stages_never_add_a_warning() {
+    use std::collections::BTreeSet;
+
+    let phase2 = |opts: &CutoutOptions| CutoutOptions {
+        matting: kiri::cutout::Matting::Projection,
+        smooth_contour: 0.0,
+        reclassify: false,
+        ..opts.clone()
+    };
+    let codes = |opts: &CutoutOptions, image: &image::RgbaImage| -> BTreeSet<String> {
+        cutout(image, opts)
+            .warnings
+            .iter()
+            .map(|w| w.code.as_str().to_string())
+            .collect()
+    };
+    // **既知の未達を 1 つだけ許す。** 緩めた事実を隠さないために、消えたら
+    // **テストのほうが落ちる**書き方にしてある。
+    //
+    // 合成 S3（淡色商品、輪郭 ΔE 9.5）の `HALO_REMAINS` がそれで、機構は
+    // `docs/design.md` 4.10 の「S3 の HALO_REMAINS」に書いた。要点だけ再掲する。
+    //
+    // - 増えた 180 画素は**すべて真の被覆率 1.0**、つまり純粋な商品である。
+    //   `halo_ratio` が「背景色」と言っているのは、その画素の**局所背景の参照色**
+    //   が大域の背景から ΔE 10.4 ずれて商品色そのもの（sRGB 219、大域は 248）に
+    //   なっているからで、参照は matting が削り込んだ跡から測られている
+    // - 削り込みの側は、塗り直しが輪郭を鋭くした場所で帯幅が 10 → 3 に落ち、
+    //   F/B を集める窓が 23px → 9px に縮んで局所背景 B が商品側へ寄る
+    //   （線形 0.893 → 0.828）ことで起きる
+    //
+    // 7 通りの直し方を実測した。**S3 を直すものはすべて別のシーンを壊す**——
+    // 帯を単調にすると R1 の輪郭誤差が 6.2 → 16.5、窓に下限を置くと S6 の
+    // 落ち影の残りが 0.1% → 5.5%、`halo_ratio` の局所背景に分離を要求すると
+    // 実写リモコン tol 12 の halo が 0.163 → 0.053 になって `--tolerance` を
+    // 上げる導線が切れる。`HALO_WARN` は動かしていない。
+    let known_gap = |name: &str, code: &str| name.starts_with("S3") && code == "HALO_REMAINS";
+    let check = |name: &str, image: &image::RgbaImage, opts: &CutoutOptions| {
+        let before = codes(&phase2(opts), image);
+        let after = codes(opts, image);
+        let added: Vec<_> = after.difference(&before).cloned().collect();
+        let unexpected: Vec<_> = added
+            .iter()
+            .filter(|c| !known_gap(name, c))
+            .cloned()
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "{name}: 新しい 3 段が警告を増やしている: {unexpected:?}\n  Phase 2 {before:?}\n  既定   {after:?}"
+        );
+        let stale: Vec<_> = added.iter().filter(|c| known_gap(name, c)).collect();
+        if name.starts_with("S3") {
+            assert!(
+                !stale.is_empty(),
+                "S3 の HALO_REMAINS が消えた。**この免除を消すこと**（テストと \
+                 design.md 4.10 の節を両方）"
+            );
+        }
+    };
+
+    for scene in edge_scenes() {
+        let truth = edge_scene(&scene);
+        check(scene.name, &truth.image, &CutoutOptions::default());
+    }
+    let scene = real_scenes()
+        .into_iter()
+        .find(|s| s.name.starts_with("R7"))
+        .expect("R7 がベンチに無い");
+    let truth = common::real_scene(&scene);
+    let opts = CutoutOptions {
+        bbox: Some(common::assisted_bbox(&truth)),
+        tolerance: scene.assisted_tolerance,
+        ..Default::default()
+    };
+    check("R7 assisted", &truth.image, &opts);
+}
+
 /// R シーンの `defaults`——切り抜きそのものが失敗している点——を除いた部分集合。
 fn without_broken_cuts(points: &[Point]) -> Vec<Point> {
     points

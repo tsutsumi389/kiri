@@ -20,6 +20,7 @@ pub mod diagnostics;
 pub mod edges;
 pub mod feather;
 pub mod floodfill;
+pub mod local_colour;
 pub mod mask;
 pub mod morphology;
 pub mod refine;

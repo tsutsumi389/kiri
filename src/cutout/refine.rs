@@ -45,6 +45,7 @@ use image::RgbaImage;
 use crate::color::lab::{delta_e76, srgb_to_lab};
 use crate::cutout::local_colour::{self, Lean, LocalColours, Role};
 use crate::cutout::mask::Mask;
+use crate::cutout::morphology::{self, BitPlane};
 use crate::cutout::{diagnostics, feather, guided};
 
 /// 帯幅の下限(px)。くっきりした輪郭でも、堤防が残す 1px の縁と JPEG の滲みを
@@ -295,6 +296,7 @@ pub fn refine(
     reshape(
         image, &mut shape, binary, &mut band, background, opts, scale, min_radius,
     );
+    let band = band;
 
     let mut mask = shape.clone();
     // 帯幅の最大は代役前景の近傍半径を決めるのに要る。0 なら帯そのものが無い
@@ -432,7 +434,7 @@ fn reshape(
     image: &RgbaImage,
     shape: &mut Mask,
     original: &Mask,
-    band: &mut Vec<u8>,
+    band: &mut [u8],
     background: [u8; 3],
     opts: &RefineOptions,
     scale: f64,
@@ -454,27 +456,34 @@ fn reshape(
         let Some(bounds) = band_bounds(band, w, h) else {
             return;
         };
-        let grid = local_colour::build(image, grow(bounds, window, w, h), scale, |x, y| {
-            if band[(y as usize) * stride + (x as usize)] != 0 {
-                Role::Skip
-            } else if shape.is_foreground(x, y) {
-                Role::Foreground
-            } else {
-                Role::Background
-            }
-        });
+        // 局所色の格子は 24.5MP で 38MB になる。**隙間の閉じ直しへ入る前に
+        // 手放す**——両方を同時に生かすと、削ったはずのピークがそこで戻る
         let mut changed = 0usize;
-        if opts.reclassify {
-            changed += reclassify_rim(image, shape, band, &grid, bounds);
-        }
-        if smooth_radius > 0 {
-            changed += smooth_in_band(shape, original, band, &grid, image, smooth_radius, bounds);
+        {
+            let grid = local_colour::build(image, grow(bounds, window, w, h), scale, |x, y| {
+                if band[(y as usize) * stride + (x as usize)] != 0 {
+                    Role::Skip
+                } else if shape.is_foreground(x, y) {
+                    Role::Foreground
+                } else {
+                    Role::Background
+                }
+            });
+            if opts.reclassify {
+                changed += reclassify_rim(image, shape, band, &grid, bounds);
+            }
+            if smooth_radius > 0 {
+                changed +=
+                    smooth_in_band(shape, original, band, &grid, image, smooth_radius, bounds);
+            }
         }
         if changed == 0 {
             return;
         }
-        close_new_gaps(shape, original, band, bounds, opts.seal);
-        *band = band_map(image, shape, background, min_radius, opts.max_radius);
+        // 戻り値（塞いだ画素数）は捨てる。ここで数えたいのは「色が動かした画素」
+        // であって、連結性が戻した画素ではない
+        let _ = close_new_gaps(shape, original, band, bounds, opts.seal);
+        band_map_into(image, shape, background, min_radius, opts.max_radius, band);
     }
 }
 
@@ -581,72 +590,118 @@ fn smooth_in_band(
     let (w, h) = (shape.width(), shape.height());
     let stride = w as usize;
     let pixels = image.as_raw();
-    // 多数決はマスクの**写し**から取る。書きながら読むと、走査順が答えを変える
+    // 多数決はマスクの**写し**から取る。書きながら読むと、走査順が答えを変える。
+    //
+    // 写しは 1 画素 1 ビットで持ち、積分画像はタイルごとに作り直す。全面に
+    // u32 の積分画像を張ると 24.5MP で 98MB になるが、写しなら 3MB、タイルの
+    // 積分画像は「128px + 窓の余白」ぶんの数百 KB にしかならない。窓は画素ごとに
+    // [x-r, x+r]（画像の外は含めない）なので、タイルを半径ぶん広げた矩形を
+    // 覆えば全面に張ったのと同じ合計が引ける
     let (ex0, ey0, ex1, ey1) = grow(bounds, radius, w, h);
-    let (pw, ph) = ((ex1 - ex0 + 1) as usize, (ey1 - ey0 + 1) as usize);
-    let span = pw + 1;
-    let mut integral = vec![0u32; span * (ph + 1)];
-    for y in 0..ph {
-        let (row, prev) = ((y + 1) * span, y * span);
-        let mut acc = 0u32;
-        for x in 0..pw {
-            acc += u32::from(shape.is_foreground(ex0 + x as u32, ey0 + y as u32));
-            integral[row + x + 1] = integral[prev + x + 1] + acc;
+    let ew = (ex1 - ex0 + 1) as usize;
+    let mut snapshot = BitPlane::new(ew * ((ey1 - ey0 + 1) as usize));
+    for y in ey0..=ey1 {
+        let row = ((y - ey0) as usize) * ew;
+        for x in ex0..=ex1 {
+            if shape.is_foreground(x, y) {
+                snapshot.insert(row + (x - ex0) as usize);
+            }
         }
     }
-    let count = |x0: usize, y0: usize, x1: usize, y1: usize| -> u32 {
-        let (a, b) = (y0 * span + x0, y0 * span + x1 + 1);
-        let (c, d) = ((y1 + 1) * span + x0, (y1 + 1) * span + x1 + 1);
-        integral[d] + integral[a] - integral[b] - integral[c]
-    };
 
     let (x0, y0, x1, y1) = bounds;
+    let mut integral: Vec<u32> = Vec::new();
     let mut changed = 0usize;
-    for y in y0..=y1 {
-        let row = (y as usize) * stride;
-        for x in x0..=x1 {
-            let i = row + (x as usize);
-            if band[i] == 0 {
+    let mut tile_y = y0;
+    while tile_y <= y1 {
+        let ty1 = (tile_y + TILE - 1).min(y1);
+        let mut tile_x = x0;
+        while tile_x <= x1 {
+            let tx1 = (tile_x + TILE - 1).min(x1);
+            // 帯の無いタイルには積分画像も要らない
+            let mut has_band = false;
+            'scan: for y in tile_y..=ty1 {
+                let row = (y as usize) * stride;
+                for x in tile_x..=tx1 {
+                    if band[row + (x as usize)] != 0 {
+                        has_band = true;
+                        break 'scan;
+                    }
+                }
+            }
+            if !has_band {
+                tile_x += TILE;
                 continue;
             }
-            let qx0 = (x.saturating_sub(radius).max(ex0) - ex0) as usize;
-            let qy0 = (y.saturating_sub(radius).max(ey0) - ey0) as usize;
-            let qx1 = ((x + radius).min(ex1) - ex0) as usize;
-            let qy1 = ((y + radius).min(ey1) - ey0) as usize;
-            let inside = count(qx0, qy0, qx1, qy1);
-            let total = ((qx1 - qx0 + 1) * (qy1 - qy0 + 1)) as u32;
-            // 同数なら動かさない。どちらへ倒しても根拠が無い
-            if inside * 2 == total {
-                continue;
+            let (px0, py0, px1, py1) = grow((tile_x, tile_y, tx1, ty1), radius, w, h);
+            let (pw, ph) = ((px1 - px0 + 1) as usize, (py1 - py0 + 1) as usize);
+            let span = pw + 1;
+            integral.clear();
+            integral.resize(span * (ph + 1), 0);
+            for y in 0..ph {
+                let (row, prev) = ((y + 1) * span, y * span);
+                let src = ((py0 - ey0) as usize + y) * ew + (px0 - ex0) as usize;
+                let mut acc = 0u32;
+                for x in 0..pw {
+                    acc += u32::from(snapshot.get(src + x));
+                    integral[row + x + 1] = integral[prev + x + 1] + acc;
+                }
             }
-            let want = inside * 2 > total;
-            let (lx, ly) = ((x - ex0) as usize, (y - ey0) as usize);
-            if want == (count(lx, ly, lx, ly) == 1) {
-                continue;
-            }
-            // **形だけの多数決で、フィルが背景と決めた画素を前景へ戻さない。**
-            // フィルの決定は連結性・堤防・`--seal`・空間的な指示という、色より
-            // 多くの情報を使っている。ここで戻してよいのは、同じ refine の中で
-            // (b) や前のパスが動かした画素だけである。これが無いと、櫛の
-            // 幅 3px の隙間（`--seal 1` が「塞がない」と約束した幅）が
-            // メディアンで塞がる——堤防が隙間の両側 1px を背景候補から外すので、
-            // 二値マスクの上では 1px にしか見えないためである
-            if want && !original.is_foreground(x, y) {
-                continue;
-            }
-            // 色の門。変化に矛盾する色なら形の言い分を採らない
-            let lean = grid.classify(grid.cell(x, y), &pixels[i * 4..i * 4 + 3]);
-            let contradicts = if want {
-                lean == Some(Lean::Background)
-            } else {
-                lean == Some(Lean::Foreground)
+            let count = |x0: usize, y0: usize, x1: usize, y1: usize| -> u32 {
+                let (a, b) = (y0 * span + x0, y0 * span + x1 + 1);
+                let (c, d) = ((y1 + 1) * span + x0, (y1 + 1) * span + x1 + 1);
+                integral[d] + integral[a] - integral[b] - integral[c]
             };
-            if contradicts {
-                continue;
+
+            for y in tile_y..=ty1 {
+                let row = (y as usize) * stride;
+                for x in tile_x..=tx1 {
+                    let i = row + (x as usize);
+                    if band[i] == 0 {
+                        continue;
+                    }
+                    let qx0 = (x.saturating_sub(radius).max(px0) - px0) as usize;
+                    let qy0 = (y.saturating_sub(radius).max(py0) - py0) as usize;
+                    let qx1 = ((x + radius).min(px1) - px0) as usize;
+                    let qy1 = ((y + radius).min(py1) - py0) as usize;
+                    let inside = count(qx0, qy0, qx1, qy1);
+                    let total = ((qx1 - qx0 + 1) * (qy1 - qy0 + 1)) as u32;
+                    // 同数なら動かさない。どちらへ倒しても根拠が無い
+                    if inside * 2 == total {
+                        continue;
+                    }
+                    let want = inside * 2 > total;
+                    let (lx, ly) = ((x - px0) as usize, (y - py0) as usize);
+                    if want == (count(lx, ly, lx, ly) == 1) {
+                        continue;
+                    }
+                    // **形だけの多数決で、フィルが背景と決めた画素を前景へ戻さない。**
+                    // フィルの決定は連結性・堤防・`--seal`・空間的な指示という、色より
+                    // 多くの情報を使っている。ここで戻してよいのは、同じ refine の中で
+                    // (b) や前のパスが動かした画素だけである。これが無いと、櫛の
+                    // 幅 3px の隙間（`--seal 1` が「塞がない」と約束した幅）が
+                    // メディアンで塞がる——堤防が隙間の両側 1px を背景候補から外すので、
+                    // 二値マスクの上では 1px にしか見えないためである
+                    if want && !original.is_foreground(x, y) {
+                        continue;
+                    }
+                    // 色の門。変化に矛盾する色なら形の言い分を採らない
+                    let lean = grid.classify(grid.cell(x, y), &pixels[i * 4..i * 4 + 3]);
+                    let contradicts = if want {
+                        lean == Some(Lean::Background)
+                    } else {
+                        lean == Some(Lean::Foreground)
+                    };
+                    if contradicts {
+                        continue;
+                    }
+                    shape.set(x, y, if want { u8::MAX } else { 0 });
+                    changed += 1;
+                }
             }
-            shape.set(x, y, if want { u8::MAX } else { 0 });
-            changed += 1;
+            tile_x += TILE;
         }
+        tile_y += TILE;
     }
     changed
 }
@@ -680,45 +735,59 @@ fn close_new_gaps(
     let (pw, ph) = ((rx1 - rx0 + 1) as usize, (ry1 - ry0 + 1) as usize);
     let local = |x: u32, y: u32| ((y - ry0) as usize) * pw + (x - rx0) as usize;
 
-    let mut background = vec![false; pw * ph];
+    // 面は 1 画素 1 ビットで持つ。`Vec<bool>` だと元の面・芯・到達済み・膨張の
+    // 4 枚で 24.5MP の実写が 98MB になる
+    let mut background = BitPlane::new(pw * ph);
     for y in ry0..=ry1 {
         for x in rx0..=rx1 {
-            background[local(x, y)] = !shape.is_foreground(x, y);
+            if !shape.is_foreground(x, y) {
+                background.insert(local(x, y));
+            }
         }
     }
     // 収縮で残った芯と、「帯の外の背景」「画像の外周の背景」を信用する。帯の外の
     // 背景はフィルが外周から到達した画素なので、隙間を通って入ってきたもので
     // はありえない（`floodfill::seal_narrow_gaps` と同じ扱い）
-    let mut trusted = separable(pw, ph, &background, seal, false);
+    let mut trusted = morphology::separable(pw, ph, &background, seal, false);
+
+    // **芯の上だけを辿る。** 背景の上を辿ると、細い通路がそのまま外周へ
+    // つながってしまい、収縮した意味が消える。
+    //
+    // 起点（帯の外の背景と外周の背景）は**キューへ積まない**。24.5MP の実写
+    // では帯の外の背景が 2000 万画素あり、`VecDeque` の倍々確保だけでピークが
+    // 400MB 級に跳ねていた。起点は定義上すべて到達済みなので印だけ付け、
+    // 積むのは「そこから帯の中の芯へ入る一歩」だけでよい
+    let mut seen = BitPlane::new(pw * ph);
     for y in ry0..=ry1 {
         for x in rx0..=rx1 {
             let i = local(x, y);
-            if !background[i] {
+            if !background.get(i) {
                 continue;
             }
-            trusted[i] |= band[(y as usize) * stride + (x as usize)] == 0
+            if band[(y as usize) * stride + (x as usize)] == 0
                 || x == 0
                 || y == 0
                 || x + 1 == w
-                || y + 1 == h;
+                || y + 1 == h
+            {
+                trusted.insert(i);
+                seen.insert(i);
+            }
         }
     }
-
-    // **芯の上だけを辿る。** 背景の上を辿ると、細い通路がそのまま外周へ
-    // つながってしまい、収縮した意味が消える
-    let mut seen = vec![false; pw * ph];
     let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
     for y in ry0..=ry1 {
         for x in rx0..=rx1 {
             let i = local(x, y);
-            let seed = trusted[i]
-                && (band[(y as usize) * stride + (x as usize)] == 0
-                    || x == 0
-                    || y == 0
-                    || x + 1 == w
-                    || y + 1 == h);
-            if seed && !seen[i] {
-                seen[i] = true;
+            if seen.get(i) || !trusted.get(i) {
+                continue;
+            }
+            let touches = (x > rx0 && seen.get(i - 1))
+                || (x < rx1 && seen.get(i + 1))
+                || (y > ry0 && seen.get(i - pw))
+                || (y < ry1 && seen.get(i + pw));
+            if touches {
+                seen.insert(i);
                 queue.push_back((x, y));
             }
         }
@@ -734,23 +803,23 @@ fn close_new_gaps(
                 continue;
             }
             let j = local(nx, ny);
-            if seen[j] || !trusted[j] {
+            if seen.get(j) || !trusted.get(j) {
                 continue;
             }
-            seen[j] = true;
+            seen.insert(j);
             queue.push_back((nx, ny));
         }
     }
-    let grown = separable(pw, ph, &seen, seal, true);
+    drop(trusted);
+    let grown = morphology::separable(pw, ph, &seen, seal, true);
+    drop(seen);
 
     let mut changed = 0usize;
     for y in ry0..=ry1 {
         for x in rx0..=rx1 {
             let i = local(x, y);
-            if band[(y as usize) * stride + (x as usize)] == 0
-                || !background[i]
-                || grown[i]
-                || !original.is_foreground(x, y)
+            let at = (y as usize) * stride + (x as usize);
+            if band[at] == 0 || !background.get(i) || grown.get(i) || !original.is_foreground(x, y)
             {
                 continue;
             }
@@ -759,41 +828,6 @@ fn close_new_gaps(
         }
     }
     changed
-}
-
-/// 正方形の構造要素による収縮（`take_max` が false）／膨張（true）。
-///
-/// 横と縦に分けて O(n * radius) に収める。**枠の外は窓に含めない**——
-/// `floodfill::separable` と同じ規約で、枠の縁で背景が削れないようにする。
-fn separable(w: usize, h: usize, src: &[bool], radius: u32, take_max: bool) -> Vec<bool> {
-    if radius == 0 {
-        return src.to_vec();
-    }
-    let r = radius as usize;
-    let combine = |acc: bool, v: bool| if take_max { acc || v } else { acc && v };
-    let mut horizontal = vec![false; src.len()];
-    for y in 0..h {
-        for x in 0..w {
-            let (from, to) = (x.saturating_sub(r), (x + r).min(w - 1));
-            let mut acc = !take_max;
-            for k in from..=to {
-                acc = combine(acc, src[y * w + k]);
-            }
-            horizontal[y * w + x] = acc;
-        }
-    }
-    let mut out = vec![false; src.len()];
-    for y in 0..h {
-        for x in 0..w {
-            let (from, to) = (y.saturating_sub(r), (y + r).min(h - 1));
-            let mut acc = !take_max;
-            for k in from..=to {
-                acc = combine(acc, horizontal[k * w + x]);
-            }
-            out[y * w + x] = acc;
-        }
-    }
-    out
 }
 
 /// タイルをまたいで変わらない入力。
@@ -1444,9 +1478,26 @@ fn band_map(
     min_radius: u32,
     max_radius: u32,
 ) -> Vec<u8> {
+    let mut band = vec![0u8; (binary.width() as usize) * (binary.height() as usize)];
+    band_map_into(image, binary, background, min_radius, max_radius, &mut band);
+    band
+}
+
+/// `band_map` を既にある領域へ書き直す。
+///
+/// 塗り直しはパスごとに帯を引き直すので、素直に作り直すと旧と新が同時に
+/// 生きて 24.5MP で 49MB を余分に抱える。中身を 0 に戻してから塗れば、
+/// 同じ結果を確保なしで得られる。
+fn band_map_into(
+    image: &RgbaImage,
+    binary: &Mask,
+    background: [u8; 3],
+    min_radius: u32,
+    max_radius: u32,
+    band: &mut [u8],
+) {
     let (w, h) = (binary.width(), binary.height());
-    let stride = w as usize;
-    let mut band = vec![0u8; stride * (h as usize)];
+    band.fill(0);
     let min_r = min_radius.clamp(1, RADIUS_CEILING);
     let max_r = max_radius.clamp(min_r, RADIUS_CEILING);
 
@@ -1464,10 +1515,9 @@ fn band_map(
                 // 取り残され、色が背景寄りでも不透明で残ってしまう
                 None => min_r,
             };
-            paint_disc(&mut band, w, h, x, y, width);
+            paint_disc(band, w, h, x, y, width);
         }
     }
-    band
 }
 
 /// (cx, cy) を中心に半径 `width` の円を、既にある値との大きいほうで塗る。

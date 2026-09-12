@@ -38,6 +38,7 @@ use crate::color::lab::{linear_to_lab, srgb_linear_lut};
 use crate::cutout::constraints::{Constraints, disc_pixels};
 use crate::cutout::edges::edge_ridges;
 use crate::cutout::mask::Mask;
+use crate::cutout::morphology;
 
 /// `--fg-seed` が保護する円の半径(px)。
 pub const FG_SEED_RADIUS: u32 = 5;
@@ -658,7 +659,7 @@ fn seal_narrow_gaps(
                         || (y + 1 < h && background[idx(x, y + 1)])));
         }
     }
-    let eroded = erode_bools(w, h, &permeable, radius);
+    let eroded = morphology::separable(stride, h as usize, &permeable[..], radius, false);
     drop(permeable);
 
     // 外周に接する背景も起点として信用する（上のコメントを参照）
@@ -666,13 +667,17 @@ fn seal_narrow_gaps(
     for x in 0..w {
         for y in [0, h - 1] {
             let i = idx(x, y);
-            trusted[i] |= background[i];
+            if background[i] {
+                trusted.insert(i);
+            }
         }
     }
     for y in 0..h {
         for x in [0, w - 1] {
             let i = idx(x, y);
-            trusted[i] |= background[i];
+            if background[i] {
+                trusted.insert(i);
+            }
         }
     }
 
@@ -682,60 +687,13 @@ fn seal_narrow_gaps(
     // 定義上「隙間を通って入ってきた浸水」ではありえない。収縮で芯が取れない
     // 細い指示や、商品に囲まれた小道具をここで前景へ塗り戻すと、
     // 「指定したのに効かない」がいちばん分かりにくい形で起きる
-    let reachable = fill_from_border(w, h, |i| trusted[i], None, forced);
+    let reachable = fill_from_border(w, h, |i| trusted.get(i), None, forced);
     drop(trusted);
-    let grown = dilate_bools(w, h, &reachable, radius);
+    let grown = morphology::separable(stride, h as usize, &reachable[..], radius, true);
 
-    grown
-        .iter()
-        .zip(background.iter())
-        .map(|(&g, &b)| g && b)
+    (0..background.len())
+        .map(|i| grown.get(i) && background[i])
         .collect()
-}
-
-/// 正方形の構造要素による収縮／膨張。横と縦に分けて O(n * radius) に収める。
-///
-/// 画像の外は「窓に含めない」扱いにする。外を前景とみなすと、画面の端で
-/// 切れている背景まで削れてしまう。
-fn erode_bools(w: u32, h: u32, src: &[bool], radius: u32) -> Vec<bool> {
-    separable(w, h, src, radius, false)
-}
-
-fn dilate_bools(w: u32, h: u32, src: &[bool], radius: u32) -> Vec<bool> {
-    separable(w, h, src, radius, true)
-}
-
-fn separable(w: u32, h: u32, src: &[bool], radius: u32, take_max: bool) -> Vec<bool> {
-    let stride = w as usize;
-    let r = radius as i64;
-    let combine = |acc: bool, v: bool| if take_max { acc || v } else { acc && v };
-
-    let mut horizontal = vec![false; src.len()];
-    for y in 0..h {
-        for x in 0..w {
-            let from = (i64::from(x) - r).max(0) as u32;
-            let to = ((i64::from(x) + r) as u32).min(w - 1);
-            let mut acc = !take_max;
-            for k in from..=to {
-                acc = combine(acc, src[(y as usize) * stride + (k as usize)]);
-            }
-            horizontal[(y as usize) * stride + (x as usize)] = acc;
-        }
-    }
-
-    let mut out = vec![false; src.len()];
-    for y in 0..h {
-        for x in 0..w {
-            let from = (i64::from(y) - r).max(0) as u32;
-            let to = ((i64::from(y) + r) as u32).min(h - 1);
-            let mut acc = !take_max;
-            for k in from..=to {
-                acc = combine(acc, horizontal[(k as usize) * stride + (x as usize)]);
-            }
-            out[(y as usize) * stride + (x as usize)] = acc;
-        }
-    }
-    out
 }
 
 /// 外周を起点に 4 近傍で塗り広げる。

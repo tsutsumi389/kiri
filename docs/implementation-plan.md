@@ -1,6 +1,6 @@
 # kiri 実装計画
 
-最終更新: 2026-09-08
+最終更新: 2026-09-12
 
 設計の詳細と決定根拠は [design.md](./design.md) を参照。本書は実装の進め方のみを扱う。
 
@@ -32,6 +32,7 @@ src/
     refine.rs          境界帯のアルファ再推定と色の復元（既定の経路）
     feather.rs         境界フェザリング（refine のフォールバックと --no-refine 用）
     despill.rs         色かぶり除去（--no-refine 用）
+    constraints.rs     空間的な指示（トライマップ / マスク / 多角形）の画素表現
     diagnostics.rs     境界の診断値（halo_ratio, edge_width）
     mask.rs            マスク型と統計（foreground_ratio, bbox, touches_edge）
     subject.rs         主体（商品）の位置の推定。背景推定だけから求める
@@ -58,6 +59,7 @@ src/
 | 8 | 自己記述：code をカタログ化、パーサから契約を組み立て、書かずに試せるようにする | `kiri schema` / `--dry-run` | 0.5日 |
 | 9 | 値の読み方：しきい値を定数へ寄せ、`fields[]` として配る | `kiri schema` の `fields[]` | 0.5日 |
 | 10 | 境界の欠陥を測れるようにする：実写背景のベンチと、輪郭の粗さ・縁の汚染の診断値 | `mask.contour_roughness` / `mask.rim_contamination` / `tests/real_backgrounds.rs` | 1日 |
+| 11 | 空間的な指示：トライマップ / マスク画像 / 多角形を入口として受け、画素ごとの制約へ畳む | `--trimap` / `--fg-mask` / `--bg-mask` / `--fg-polygon` / `--bg-polygon` / `constraints` ブロック | 1日 |
 
 **Phase 1 の `kiri info` を最初に完成させる。** 最小で end-to-end が通り、JSON規約とエラー処理の型がそこで確定する。型が決まれば以降は同じ形で積み上げられる。
 
@@ -296,6 +298,29 @@ MSRV の検査を CI に入れるのは、**宣言だけ置いても検査しな
           較正がテストを見てテストが較正を見ることになる
         - `RIM_CONTAMINATED` の hint は `HALO_REMAINS` が一緒に出ているときだけ
           付ける。汚染だけが出ている状態では tolerance を動かしても値が動かない
-  - [ ] トライマップ入力（`--trimap`）
+  - [x] トライマップ入力（`--trimap`）→ Phase 11
   - [ ] matting と境界の平滑化
   - [ ] 照明場を持つ背景モデル
+- [x] Phase 11: 空間的な指示
+  - [x] `--trimap` / `--fg-mask` / `--bg-mask` / `--fg-polygon` / `--bg-polygon`
+        を足し、入口が何であれ画素ごとの `Constraint` 1 つへ畳む。**数値ノブには
+        もう余地が無い**——最良設定の周りで 4 ノブを振っても指標は 1 桁目まで
+        動かなかった。AI が得意なのは「どこが商品か」の判断のほうである
+        （根拠は design.md 4.9）
+  - [x] 確定背景をフィルの種にする。**商品に囲まれて外周から届かない背景は、
+        種にしない限りどんな色の規則でも消せない。** 測地的オープニングでも
+        起点にして、細い指示を前景へ塗り戻さない
+  - [x] 重なりは `CONSTRAINT_CONFLICT`、寸法違いは `MASK_SIZE_MISMATCH` で断る。
+        黙って解決すると「指定が効いていない」が起きる
+  - [x] `constraints` ブロック（効いた入口と 3 つの比率）と、`--preview` への
+        重ね描き（確定前景が緑、確定背景が赤）。**座標は自分で書いたものなので
+        数字では検算できない**
+  - [x] `batch` の spec と `KIRI_BENCH_DIR` の `<name>.json` でも同じキーで受ける
+  - [x] ベンチに R1 の `trimap` / `polygon` 設定を足した。輪郭誤差は
+        assisted 18.42 に対して trimap 3.76 / polygon 19.76。**粗いトライマップ
+        （不明の帯が長辺の 4%）でも、輪郭の位置を絞り込むだけで 5 分の 1 になる**
+  - [x] 指示を渡さない経路の出力が 1 バイトも変わらないことを、旧バイナリとの
+        突き合わせ（本出力・プレビュー・デバッグマスク・12MP の AVIF）と
+        S/R 全 29 点の数値で確認した
+  - [ ] 不明の帯を matting の作業領域にする（Phase 3 の matting と合わせて）
+  - [ ] 切り抜き済み PNG のアルファをそのまま指示として受ける入口

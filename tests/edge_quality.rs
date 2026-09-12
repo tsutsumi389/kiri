@@ -833,8 +833,15 @@ fn print_the_metrics_table() {
         for run in &runs {
             print_row(scene.name, run.setting, &run.metrics);
             second_line(&run.metrics, &run.diagnostics);
+            // **指示の占有率を並べる。** 指標が良くなったのが「指示が良かった」
+            // からなのか「画像の 7 割を確定背景だと言い切った」からなのかは、
+            // 占有率を見なければ分けられない
+            let constraints = match run.constraints {
+                Some((fg, bg)) => format!(" 制約 fg={:.3}/bg={:.3}", fg, bg),
+                None => String::new(),
+            };
             println!(
-                "{:<39} tolerance={:.0} fg={:.3} separability={:?} warnings={:?}",
+                "{:<39} tolerance={:.0} fg={:.3} separability={:?}{constraints} warnings={:?}",
                 "",
                 run.tolerance,
                 run.foreground_ratio,

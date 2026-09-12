@@ -35,6 +35,7 @@ use std::collections::VecDeque;
 use image::RgbaImage;
 
 use crate::color::lab::{linear_to_lab, srgb_linear_lut};
+use crate::cutout::constraints::{Constraints, disc_pixels};
 use crate::cutout::edges::edge_ridges;
 use crate::cutout::mask::Mask;
 
@@ -49,13 +50,19 @@ pub const FG_SEED_RADIUS: u32 = 5;
 pub const SHADOW_CHROMA: f32 = 4.0;
 
 #[derive(Debug, Clone, Default)]
-pub struct FloodOptions {
+pub struct FloodOptions<'a> {
     /// 背景色との色差(ΔE)がこの値以下なら背景候補とみなす
     pub tolerance: f64,
     /// 指定された場合、この矩形の外側は無条件に背景とする (x1, y1, x2, y2)
     pub bbox: Option<(u32, u32, u32, u32)>,
     /// 「ここは必ず前景」と指定された座標。周囲を保護し、フィルの侵入を防ぐ
     pub fg_seeds: Vec<(u32, u32)>,
+    /// 画素ごとの確定前景／確定背景。
+    ///
+    /// **借用で持つ。** 12MP では 12MB あり、`CutoutOptions` から
+    /// `FloodOptions` を組むたびに複製すると、指示を渡した実行だけが
+    /// 倍のメモリを使う。寸法が入力画像と違うものは呼び出し側で外す
+    pub constraints: Option<&'a Constraints>,
     /// 1px あたりの輝度変化がこの値を超える画素にはフィルを侵入させない。
     /// 0 で無効。商品の輪郭は急峻、落ち影はなだらかという差を使って両者を分ける
     pub edge_threshold: f64,
@@ -112,14 +119,23 @@ fn shadow_reach(width: u32, height: u32) -> u32 {
 }
 
 /// 前景マスクを生成する。255 = 前景、0 = 背景。
-pub fn foreground_mask(image: &RgbaImage, background: [u8; 3], opts: &FloodOptions) -> Mask {
+pub fn foreground_mask(image: &RgbaImage, background: [u8; 3], opts: &FloodOptions<'_>) -> Mask {
     let (w, h) = (image.width(), image.height());
     if w == 0 || h == 0 {
         return Mask::new(w, h, 0);
     }
 
     let two_stage = opts.step_tolerance > 0.0 && opts.core_tolerance > 0.0;
-    let protected = protected_pixels(w, h, &opts.fg_seeds);
+    // 寸法の合わない指示はここで外す。公開関数なので、`commands/cutout.rs` の
+    // 検査（`MASK_SIZE_MISMATCH`）を通らずに届きうる。添字が破裂して panic する
+    // より、指示が効かないことを呼び出し側の検査に任せるほうが安全である
+    let forced = opts
+        .constraints
+        .filter(|c| c.width() == w && c.height() == h);
+    let protected = Protected {
+        seeds: protected_pixels(w, h, &opts.fg_seeds),
+        forced,
+    };
     // 堤防は Lab の表より**先**に作って先に捨てる。どちらも 12MP では 3 桁 MB を
     // 占めるので、生存期間が重なるかどうかだけでピーク RSS が 100MB 単位で変わる
     let dam = (opts.edge_threshold > 0.0).then(|| edge_ridges(image, opts.edge_threshold as f32));
@@ -135,7 +151,7 @@ pub fn foreground_mask(image: &RgbaImage, background: [u8; 3], opts: &FloodOptio
         &lab,
         bg_lab,
         opts,
-        protected.as_deref(),
+        &protected,
         two_stage,
         dam.as_deref(),
     );
@@ -143,8 +159,21 @@ pub fn foreground_mask(image: &RgbaImage, background: [u8; 3], opts: &FloodOptio
     let step = opts.step_tolerance as f32;
 
     let mut is_background = if two_stage {
-        let core = fill_from_border(w, h, |i| candidates.has(i, STRICT), opts.bbox);
-        if core.iter().any(|&b| b) {
+        let core = fill_from_border(w, h, |i| candidates.has(i, STRICT), opts.bbox, forced);
+        // **芯が取れたかどうかは色で問う。確定背景の画素は数えない。**
+        //
+        // 確定背景は候補判定を通さずに塗られるので、そのまま `any()` で問うと
+        // 1 画素の指示があるだけで芯が取れたことになり、下の 1 段フィルへの
+        // 救済が到達不能になる。芯が取れない素材（外周が推定背景色から離れて
+        // いる）では、第 2 段の段差を越えられない背景がまるごと前景に残る——
+        // **指示を足したせいで結果が悪くなる**、いちばん筋の悪い壊れ方である。
+        //
+        // 落ちた先の 1 段フィルでも確定背景は効く（種になり、最後に強制される）
+        let colour_core = core
+            .iter()
+            .enumerate()
+            .any(|(i, &b)| b && !forced.is_some_and(|c| c.has_bg(i)));
+        if colour_core {
             let stage = Expansion {
                 candidates: &candidates,
                 lab: &lab,
@@ -173,10 +202,10 @@ pub fn foreground_mask(image: &RgbaImage, background: [u8; 3], opts: &FloodOptio
         } else {
             // 芯が 1 画素も取れなかった＝外周が推定背景色から離れている。
             // ここで諦めると全面が前景になってしまうので、従来の 1 段フィルへ落とす
-            fill_from_border(w, h, |i| candidates.has(i, LOOSE), opts.bbox)
+            fill_from_border(w, h, |i| candidates.has(i, LOOSE), opts.bbox, forced)
         }
     } else {
-        fill_from_border(w, h, |i| candidates.has(i, LOOSE), opts.bbox)
+        fill_from_border(w, h, |i| candidates.has(i, LOOSE), opts.bbox, forced)
     };
     // ここから先で Lab は使わない。12MP では 72MB あるので、
     // 測地的オープニングの作業領域と重ねない
@@ -197,18 +226,31 @@ pub fn foreground_mask(image: &RgbaImage, background: [u8; 3], opts: &FloodOptio
         }
     }
 
-    if opts.seal > 0 {
-        is_background = seal_narrow_gaps(w, h, &is_background, opts.seal, &candidates);
+    // 確定背景も bbox の外側と同じ扱いにする。
+    //
+    // 測地的オープニングより先に効かせるのも同じ理由で、確定背景は「利用者が
+    // 背景だと言い切った領域」なので、隙間の判定でも背景として数えるのが正しい
+    if let Some(c) = forced {
+        for (i, slot) in is_background.iter_mut().enumerate() {
+            if c.has_bg(i) {
+                *slot = true;
+            }
+        }
     }
 
-    // 保護された画素は最後に前景へ戻す（bbox 指定より優先する）
-    let foreground: Vec<bool> = match &protected {
-        Some(protected) => is_background
+    if opts.seal > 0 {
+        is_background = seal_narrow_gaps(w, h, &is_background, opts.seal, &candidates, forced);
+    }
+
+    // 保護された画素は最後に前景へ戻す（bbox 指定・確定背景より優先する）
+    let foreground: Vec<bool> = if protected.any() {
+        is_background
             .iter()
-            .zip(protected.iter())
-            .map(|(&bg, &prot)| prot || !bg)
-            .collect(),
-        None => is_background.iter().map(|&bg| !bg).collect(),
+            .enumerate()
+            .map(|(i, &bg)| protected.has(i) || !bg)
+            .collect()
+    } else {
+        is_background.iter().map(|&bg| !bg).collect()
     };
 
     Mask::from_bools(w, h, &foreground)
@@ -288,6 +330,34 @@ impl Candidates {
     }
 }
 
+/// 「色によらず前景として守る画素」の集合。
+///
+/// **種の円と確定前景を 1 つの問いにまとめる。** 守る理由は 2 つあるが、
+/// 守り方は同じ（候補から外し、最後に前景へ戻す）である。別々に持つと、
+/// 候補の判定と最後の戻しのどちらかで片方を忘れたときに、
+/// 「指定したのに効かない」が静かに成立する。
+///
+/// 確定前景の側は表を作り直さない。`Constraints` が既に 1 画素 1 バイトで
+/// 持っており、12MP でもう 1 本 `Vec<bool>` を積む理由が無い。
+struct Protected<'a> {
+    /// `--fg-seed` の円。種が無ければ表そのものを作らない
+    seeds: Option<Vec<bool>>,
+    forced: Option<&'a Constraints>,
+}
+
+impl Protected<'_> {
+    #[inline]
+    fn has(&self, index: usize) -> bool {
+        self.seeds.as_ref().is_some_and(|p| p[index])
+            || self.forced.is_some_and(|c| c.has_fg(index))
+    }
+
+    /// 守る画素が 1 つでもあるか。無ければ最後の走査そのものを省ける
+    fn any(&self) -> bool {
+        self.seeds.is_some() || self.forced.is_some_and(Constraints::any_fg)
+    }
+}
+
 /// 各画素が背景候補かどうかを判定する。既に透明な画素は無条件に背景とする。
 ///
 /// `dam`（勾配の稜線）が与えられたとき、輪郭上の画素は色が背景に近くても
@@ -297,8 +367,8 @@ fn classify(
     image: &RgbaImage,
     lab: &[LabQ],
     bg_lab: LabQ,
-    opts: &FloodOptions,
-    protected: Option<&[bool]>,
+    opts: &FloodOptions<'_>,
+    protected: &Protected<'_>,
     two_stage: bool,
     dam: Option<&[bool]>,
 ) -> Candidates {
@@ -316,7 +386,7 @@ fn classify(
     let mut flags = vec![0u8; lab.len()];
 
     for (i, p) in image.pixels().enumerate() {
-        if protected.is_some_and(|p| p[i]) {
+        if protected.has(i) {
             continue;
         }
         if p[3] == 0 {
@@ -571,6 +641,7 @@ fn seal_narrow_gaps(
     background: &[bool],
     radius: u32,
     candidates: &Candidates,
+    forced: Option<&Constraints>,
 ) -> Vec<bool> {
     let stride = w as usize;
     let idx = |x: u32, y: u32| (y as usize) * stride + (x as usize);
@@ -605,8 +676,13 @@ fn seal_narrow_gaps(
         }
     }
 
-    // 外周から届く芯だけを残す
-    let reachable = fill_from_border(w, h, |i| trusted[i], None);
+    // 外周から届く芯だけを残す。
+    //
+    // **確定背景はそれ自身が起点になる。** 利用者が背景だと言い切った領域は、
+    // 定義上「隙間を通って入ってきた浸水」ではありえない。収縮で芯が取れない
+    // 細い指示や、商品に囲まれた小道具をここで前景へ塗り戻すと、
+    // 「指定したのに効かない」がいちばん分かりにくい形で起きる
+    let reachable = fill_from_border(w, h, |i| trusted[i], None, forced);
     drop(trusted);
     let grown = dilate_bools(w, h, &reachable, radius);
 
@@ -668,15 +744,51 @@ fn separable(w: u32, h: u32, src: &[bool], radius: u32, take_max: bool) -> Vec<b
 ///
 /// 候補かどうかは添字を受ける関数で問う。素性のフラグから真偽値の表を
 /// 作り直させないためで、12MP では 1 本 12MB になる。
+///
+/// `forced` に確定背景があれば、その画素も起点にする。**種そのものは色に
+/// よらず背景**で、候補の規則を通さない——利用者が「ここは背景だ」と言った
+/// のだから、色が背景と違うことは指示を退ける理由にならない。そこから先の
+/// 拡張は既存の規則どおりなので、商品と違う色の小道具を確定背景にしても、
+/// そこから商品へは色の規則で進めず侵入しない。
 fn fill_from_border(
     w: u32,
     h: u32,
     candidate: impl Fn(usize) -> bool,
     bbox: Option<(u32, u32, u32, u32)>,
+    forced: Option<&Constraints>,
 ) -> Vec<bool> {
     let mut filled = vec![false; (w as usize) * (h as usize)];
     let mut queue = VecDeque::new();
     let idx = |x: u32, y: u32| (y as usize) * (w as usize) + (x as usize);
+
+    // 確定背景を先に埋め、**縁の画素だけ**をキューへ積む。
+    //
+    // 種を全部積むと、トライマップのように画像の 7 割を背景だと言い切った指示で
+    // キューが数百万要素になる（12MP の実測でピーク RSS が 160MB 増えた）。
+    // 隣がすべて埋まっている画素を取り出しても何も起きないので、結果は
+    // 変わらない（`expand` が同じ理由で同じことをしている）。
+    //
+    // 確定背景が 1 画素も無ければ走査そのものを省く。`--fg-polygon` だけを
+    // 渡した実行や、渡したのに空だった指示で、12MP の表を 2 度舐める理由が無い
+    if let Some(c) = forced.filter(|c| c.any_bg()) {
+        for (i, slot) in filled.iter_mut().enumerate() {
+            *slot = c.has_bg(i);
+        }
+        for y in 0..h {
+            for x in 0..w {
+                if !filled[idx(x, y)] {
+                    continue;
+                }
+                let open = (x > 0 && !filled[idx(x - 1, y)])
+                    || (y > 0 && !filled[idx(x, y - 1)])
+                    || (x + 1 < w && !filled[idx(x + 1, y)])
+                    || (y + 1 < h && !filled[idx(x, y + 1)]);
+                if open {
+                    queue.push_back((x, y));
+                }
+            }
+        }
+    }
 
     let seed = |x: u32, y: u32, filled: &mut Vec<bool>, queue: &mut VecDeque<(u32, u32)>| {
         let i = idx(x, y);
@@ -743,28 +855,17 @@ fn fill_from_border(
 ///
 /// 種の指定は例外的な救済手段で、ほとんどの呼び出しでは空である。
 /// 12MP では表 1 本で 12MB あるので、空のときは `None` を返す。
+///
+/// 円そのものは `constraints::disc_pixels` が描く。**同じ種が保護円としても
+/// 制約（`fg_seed`）としても効く**ので、2 つの実装が 1px でも食い違えば、
+/// 報告される `fg_ratio` と実際に守られた画素が別のものになる。
 fn protected_pixels(w: u32, h: u32, seeds: &[(u32, u32)]) -> Option<Vec<bool>> {
     if seeds.is_empty() {
         return None;
     }
     let mut protected = vec![false; (w as usize) * (h as usize)];
-    let r = FG_SEED_RADIUS as i64;
     for &(sx, sy) in seeds {
-        if sx >= w || sy >= h {
-            continue;
-        }
-        for dy in -r..=r {
-            for dx in -r..=r {
-                if dx * dx + dy * dy > r * r {
-                    continue;
-                }
-                let (x, y) = (sx as i64 + dx, sy as i64 + dy);
-                if x < 0 || y < 0 || x >= w as i64 || y >= h as i64 {
-                    continue;
-                }
-                protected[(y as usize) * (w as usize) + (x as usize)] = true;
-            }
-        }
+        disc_pixels(w, h, sx, sy, FG_SEED_RADIUS, |i| protected[i] = true);
     }
     Some(protected)
 }
@@ -772,6 +873,7 @@ fn protected_pixels(w: u32, h: u32, seeds: &[(u32, u32)]) -> Option<Vec<bool>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cutout::constraints::Constraint;
     use image::Rgba;
 
     const BG: [u8; 3] = [250, 250, 250];
@@ -801,7 +903,7 @@ mod tests {
         img
     }
 
-    fn opts(tolerance: f64) -> FloodOptions {
+    fn opts(tolerance: f64) -> FloodOptions<'static> {
         FloodOptions {
             tolerance,
             ..Default::default()
@@ -857,6 +959,237 @@ mod tests {
             "外側の白が残っている\n{}",
             render(&mask)
         );
+    }
+
+    /// ascii シーンと同じ寸法（8x6）の指示を組む。
+    fn constrained(build: impl FnOnce(&mut Constraints)) -> Constraints {
+        let mut constraints = Constraints::new(8, 6);
+        build(&mut constraints);
+        constraints
+    }
+
+    /// **確定背景は種になる。** 外周から届かない囲まれた背景を、そこを指すだけで
+    /// 消せる。商品と同じ色の小道具が商品に囲まれている状況がこれで解ける。
+    #[test]
+    fn a_forced_background_seed_clears_an_enclosed_region() {
+        let img = ascii(&[
+            "........", "..####..", "..#oo#..", "..#oo#..", "..####..", "........",
+        ]);
+        // 対照：指示が無ければ、この白は連結性のおかげで前景として残る
+        assert!(foreground_mask(&img, BG, &opts(5.0)).is_foreground(3, 2));
+
+        let constraints = constrained(|c| c.mark(3, 2, Constraint::ForcedBg));
+        let mask = foreground_mask(
+            &img,
+            BG,
+            &FloodOptions {
+                constraints: Some(&constraints),
+                ..opts(5.0)
+            },
+        );
+        assert!(
+            !mask.is_foreground(3, 2) && !mask.is_foreground(4, 3),
+            "指した画素から囲まれた背景が消えていない\n{}",
+            render(&mask)
+        );
+        assert!(
+            mask.is_foreground(2, 1) && mask.is_foreground(5, 4),
+            "商品まで巻き込んでいる\n{}",
+            render(&mask)
+        );
+    }
+
+    /// 確定背景は測地的オープニングも越える。
+    ///
+    /// **隙間を通ってしか外周に届かない背景**を前景へ戻すのが `--seal` の役目
+    /// だが、利用者が背景だと言い切った領域はそもそも浸水ではない。ここで
+    /// 塗り戻すと、指示が効かない理由がいちばん分かりにくい形で現れる。
+    #[test]
+    fn a_forced_background_survives_the_geodesic_opening() {
+        let img = ascii(&[
+            "........", "..####..", "..#oo#..", "..#oo#..", "..####..", "........",
+        ]);
+        let constraints = constrained(|c| {
+            c.mark(3, 2, Constraint::ForcedBg);
+            c.mark(4, 2, Constraint::ForcedBg);
+            c.mark(3, 3, Constraint::ForcedBg);
+            c.mark(4, 3, Constraint::ForcedBg);
+        });
+        let mask = foreground_mask(
+            &img,
+            BG,
+            &FloodOptions {
+                constraints: Some(&constraints),
+                seal: 1,
+                ..opts(5.0)
+            },
+        );
+        assert!(
+            !mask.is_foreground(3, 2) && !mask.is_foreground(4, 3),
+            "seal が確定背景を前景へ塗り戻している\n{}",
+            render(&mask)
+        );
+    }
+
+    /// **確定前景は色によらず守られる。** 背景と同じ色でも前景として残る。
+    #[test]
+    fn a_forced_foreground_area_is_protected() {
+        let img = ascii(&[
+            "........", "........", "........", "........", "........", "........",
+        ]);
+        // 対照：指示が無ければ全面が背景になる
+        assert_eq!(foreground_mask(&img, BG, &opts(5.0)).stats().bbox, None);
+
+        let constraints = constrained(|c| {
+            c.fill_polygon(
+                &[[2.0, 2.0], [5.0, 2.0], [5.0, 4.0], [2.0, 4.0]],
+                Constraint::ForcedFg,
+            );
+        });
+        let mask = foreground_mask(
+            &img,
+            BG,
+            &FloodOptions {
+                constraints: Some(&constraints),
+                ..opts(5.0)
+            },
+        );
+        assert_eq!(
+            mask.stats().bbox,
+            Some((2, 2, 4, 3)),
+            "指した面が守られていない\n{}",
+            render(&mask)
+        );
+    }
+
+    /// 確定前景は bbox の外側にも、確定背景にも勝つ。
+    ///
+    /// 衝突は `commands/cutout.rs` が `CONSTRAINT_CONFLICT` で断るので通常は
+    /// ここへ届かないが、**公開関数なので「どちらとも言えない」で panic しては
+    /// いけない**。順位を決めておけば、少なくとも挙動は予測できる。
+    #[test]
+    fn a_forced_foreground_beats_both_the_bbox_and_a_forced_background() {
+        let img = ascii(&[
+            "........", "..####..", "..####..", "..####..", "..####..", "........",
+        ]);
+        let constraints = constrained(|c| {
+            // bbox の外
+            c.mark(0, 0, Constraint::ForcedFg);
+            // 確定背景と重なった画素
+            c.mark(6, 5, Constraint::ForcedFg);
+            c.mark(6, 5, Constraint::ForcedBg);
+        });
+        let mask = foreground_mask(
+            &img,
+            BG,
+            &FloodOptions {
+                bbox: Some((2, 1, 5, 4)),
+                constraints: Some(&constraints),
+                ..opts(5.0)
+            },
+        );
+        assert!(
+            mask.is_foreground(0, 0),
+            "bbox の外側が確定前景に勝っている\n{}",
+            render(&mask)
+        );
+        assert!(
+            mask.is_foreground(6, 5),
+            "確定背景が確定前景に勝っている\n{}",
+            render(&mask)
+        );
+    }
+
+    /// 白枠の内側を 2 色の薄いグレーに割り、中央に濃い商品を置いた 200x200。
+    ///
+    /// 外周は白なので、推定背景色（白）から見ると内側のグレーは芯の許容量の
+    /// 外にある。**芯が 1 画素も取れない素材**がこれで、2 段フィルは成立せず
+    /// 1 段フィルへ落ちるのが正しい。2 色の境目は 1px あたり ΔE 3.5 の段差で、
+    /// 第 2 段の段差判定（既定 2.2）では越えられない。
+    fn two_tone_inside_a_white_frame() -> RgbaImage {
+        let mut img = RgbaImage::from_pixel(200, 200, Rgba([255, 255, 255, 255]));
+        for y in 25..=175 {
+            for x in 25..=175 {
+                let v = if x < 100 { 242 } else { 232 };
+                img.put_pixel(x, y, Rgba([v, v, v, 255]));
+            }
+        }
+        for y in 80..=120 {
+            for x in 80..=120 {
+                img.put_pixel(x, y, Rgba([40, 40, 40, 255]));
+            }
+        }
+        img
+    }
+
+    fn framed_opts(bbox: (u32, u32, u32, u32)) -> FloodOptions<'static> {
+        FloodOptions {
+            tolerance: 12.0,
+            bbox: Some(bbox),
+            core_tolerance: core_tolerance(12.0, 0.0),
+            step_tolerance: 2.2,
+            shadow_tolerance: 35.0,
+            seal: 1,
+            ..Default::default()
+        }
+    }
+
+    /// **確定背景を足しただけで、指示なしより前景が増えてはいけない。**
+    ///
+    /// 芯が取れたかどうかを「フィルの結果が空でないか」で問うと、確定背景は
+    /// 候補判定を通さずに塗られるぶん、1 画素あるだけで芯が取れたことになる。
+    /// そこで 1 段フィルへの救済が消え、第 2 段の段差を越えられない背景が
+    /// まるごと前景に残る。**指示は結果を良くするためのものなので、足して
+    /// 悪くなる経路があってはならない。**
+    #[test]
+    fn a_forced_background_never_leaves_more_foreground_than_no_instruction_at_all() {
+        let img = two_tone_inside_a_white_frame();
+        let bare = foreground_mask(&img, [255, 255, 255], &framed_opts((25, 25, 175, 175)));
+        let bare_ratio = bare.stats().foreground_ratio;
+
+        // 確定背景は 4x4 の 1 枚だけ。薄いほうのグレーの上に置く
+        let mut constraints = Constraints::new(200, 200);
+        constraints.fill_polygon(
+            &[[30.0, 30.0], [34.0, 30.0], [34.0, 34.0], [30.0, 34.0]],
+            Constraint::ForcedBg,
+        );
+        let hinted = foreground_mask(
+            &img,
+            [255, 255, 255],
+            &FloodOptions {
+                constraints: Some(&constraints),
+                ..framed_opts((25, 25, 175, 175))
+            },
+        );
+        let hinted_ratio = hinted.stats().foreground_ratio;
+
+        assert!(
+            hinted_ratio <= bare_ratio + 1e-6,
+            "確定背景を 16 画素足しただけで前景が増えた: {hinted_ratio:.4} vs 指示なし {bare_ratio:.4}"
+        );
+        assert!(
+            !hinted.is_foreground(150, 100),
+            "濃いほうのグレーが前景として残っている"
+        );
+    }
+
+    /// 寸法の合わない指示は無かったことにする（panic させない）。
+    #[test]
+    fn constraints_of_the_wrong_size_are_ignored() {
+        let img = ascii(&[
+            "........", "..####..", "..####..", "..####..", "..####..", "........",
+        ]);
+        let mut constraints = Constraints::new(4, 4);
+        constraints.mark(0, 0, Constraint::ForcedFg);
+        let mask = foreground_mask(
+            &img,
+            BG,
+            &FloodOptions {
+                constraints: Some(&constraints),
+                ..opts(5.0)
+            },
+        );
+        assert!(!mask.is_foreground(0, 0));
     }
 
     /// 上の対照実験。同じ色の領域でも外周とつながっていれば消える。
@@ -1097,7 +1430,7 @@ mod tests {
         img
     }
 
-    fn two_stage(tolerance: f64) -> FloodOptions {
+    fn two_stage(tolerance: f64) -> FloodOptions<'static> {
         FloodOptions {
             tolerance,
             core_tolerance: core_tolerance(tolerance, 0.0),
@@ -1197,7 +1530,7 @@ mod tests {
 
     // ---- 影の専用判定 ----
 
-    fn with_shadow(tolerance: f64) -> FloodOptions {
+    fn with_shadow(tolerance: f64) -> FloodOptions<'static> {
         FloodOptions {
             shadow_tolerance: 35.0,
             ..two_stage(tolerance)

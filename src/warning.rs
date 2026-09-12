@@ -69,6 +69,10 @@ warning_catalog! {
         => "縁の色が商品より背景に近い（HALO_REMAINS も出ていれば --tolerance で減る）",
     EdgeThresholdRaised = "EDGE_THRESHOLD_RAISED"
         => "背景のテクスチャに合わせて輪郭の堤防を引き上げた",
+    MaskOrientationIgnored = "MASK_ORIENTATION_IGNORED"
+        => "指示の画像が EXIF Orientation を持つが、マスクは生の画素として読むので適用していない",
+    ConstraintEmpty = "CONSTRAINT_EMPTY"
+        => "渡した空間的な指示が 1 画素も塗らなかった（空のマスク、画像の外だけを指す多角形）",
     CanvasUpscaled = "CANVAS_UPSCALED"
         => "キャンバス配置で商品を拡大した",
     Upscaled = "UPSCALED"

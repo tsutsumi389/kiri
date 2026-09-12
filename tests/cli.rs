@@ -1822,6 +1822,806 @@ fn pixel_coordinates_passed_as_normalized_are_rejected() {
     assert_eq!(json_stdout(&out)["error"]["code"], "INVALID_BBOX");
 }
 
+// --- 空間的な指示（トライマップ / マスク画像 / ポリゴン） ---
+
+/// 指示つきの実験に使う素材。200x200 の中央に角丸の商品が載っている。
+///
+/// 商品はおおよそ x 44-156 / y 32-168 を占める。指示の座標はこれを基準に置く。
+fn constraint_fixture(dir: &Path) -> PathBuf {
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    write_png(dir, "in.png", &img)
+}
+
+/// グレー画像を書き出す。トライマップとマスクはこれで作る。
+fn write_gray(dir: &Path, name: &str, width: u32, height: u32, value: u8) -> PathBuf {
+    let img = image::RgbaImage::from_pixel(width, height, image::Rgba([value, value, value, 255]));
+    write_png(dir, name, &img)
+}
+
+/// EXIF Orientation を持つ JPEG を書く。
+///
+/// APP1 セグメントを SOI の直後へ差し込むだけ。**画素は回さない**ので、
+/// 「向きの申告だけがある画像」になる——`--trimap` / `--fg-mask` が寸法の
+/// 検査を素通りしてしまう状況そのものである。
+fn write_jpeg_with_orientation(
+    dir: &Path,
+    name: &str,
+    img: &image::RgbaImage,
+    orientation: u16,
+) -> PathBuf {
+    use image::ImageEncoder;
+
+    let rgb = image::DynamicImage::ImageRgba8(img.clone()).to_rgb8();
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90)
+        .write_image(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            image::ExtendedColorType::Rgb8,
+        )
+        .unwrap();
+
+    // TIFF ヘッダ（リトルエンディアン）+ IFD0 に Orientation ただ 1 つ
+    let [lo, hi] = orientation.to_le_bytes();
+    let mut tiff: Vec<u8> = vec![0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00];
+    tiff.extend_from_slice(&[0x01, 0x00]); // エントリ数
+    tiff.extend_from_slice(&[0x12, 0x01]); // タグ 0x0112 = Orientation
+    tiff.extend_from_slice(&[0x03, 0x00]); // 型 3 = SHORT
+    tiff.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // 個数 1
+    tiff.extend_from_slice(&[lo, hi, 0x00, 0x00]); // 値（4 バイト枠の先頭 2 バイト）
+    tiff.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // 次の IFD は無し
+
+    let mut app1: Vec<u8> = vec![0xFF, 0xE1];
+    let length = u16::try_from(tiff.len() + 8).unwrap();
+    app1.extend_from_slice(&length.to_be_bytes());
+    app1.extend_from_slice(b"Exif\0\0");
+    app1.extend_from_slice(&tiff);
+
+    let mut out = Vec::with_capacity(jpeg.len() + app1.len());
+    out.extend_from_slice(&jpeg[..2]); // SOI
+    out.extend_from_slice(&app1);
+    out.extend_from_slice(&jpeg[2..]);
+
+    let path = dir.join(name);
+    std::fs::write(&path, out).unwrap();
+    path
+}
+
+fn paint(img: &mut image::RgbaImage, rect: (u32, u32, u32, u32), value: u8) {
+    let (x1, y1, x2, y2) = rect;
+    for y in y1..=y2 {
+        for x in x1..=x2 {
+            img.put_pixel(x, y, image::Rgba([value, value, value, 255]));
+        }
+    }
+}
+
+fn run_cutout(args: &[&str]) -> std::process::Output {
+    let mut full = vec!["cutout"];
+    full.extend_from_slice(args);
+    full.push("--json");
+    kiri().args(&full).output().unwrap()
+}
+
+/// トライマップで切り抜けること。
+///
+/// 確定前景は不透明のまま残り、確定背景は透明になる。**その 2 つが同時に
+/// 成り立たなければ、指示は届いていない。** 片方だけなら、たまたま色で
+/// そうなっただけということがありうる。
+#[test]
+fn a_trimap_decides_both_sides() {
+    let dir = fixture_dir();
+    let input = constraint_fixture(dir.path());
+    let output = dir.path().join("cut.png");
+
+    // 中央の 60x60 を確定前景、外周 20px を確定背景、あいだは不明
+    let mut trimap = image::RgbaImage::from_pixel(200, 200, image::Rgba([128, 128, 128, 255]));
+    paint(&mut trimap, (0, 0, 199, 19), 0);
+    paint(&mut trimap, (0, 180, 199, 199), 0);
+    paint(&mut trimap, (70, 70, 129, 129), 255);
+    let path = write_png(dir.path(), "trimap.png", &trimap);
+
+    let out = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--trimap",
+        path.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    assert_eq!(v["constraints"]["sources"][0], "trimap");
+    assert!(v["constraints"]["fg_ratio"].as_f64().unwrap() > 0.0);
+    assert!(v["constraints"]["bg_ratio"].as_f64().unwrap() > 0.0);
+    assert!(
+        v["constraints"]["unknown_ratio"].as_f64().unwrap() > 0.0,
+        "不明の帯が消えている: {v}"
+    );
+
+    let cut = image::open(&output).unwrap().to_rgba8();
+    assert_eq!(cut.get_pixel(100, 100)[3], 255, "確定前景が透けている");
+    assert_eq!(cut.get_pixel(5, 5)[3], 0, "確定背景が残っている");
+}
+
+/// 商品の色をした画素でも、確定背景と言われれば消えること。
+///
+/// **色では区別できないものを空間で教えるのが、この入口の存在理由である。**
+/// 商品と同じ色の小道具を指しても、そこから商品へは色の規則で進めないので
+/// 商品は残る。
+#[test]
+fn a_background_mask_removes_a_prop_that_matches_the_product() {
+    let dir = fixture_dir();
+    let mut img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    // 商品と同じ色の小道具を左上に置く（商品からは離れている）
+    let product = img.get_pixel(100, 100).0;
+    for y in 10..30 {
+        for x in 10..30 {
+            img.put_pixel(x, y, image::Rgba(product));
+        }
+    }
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("cut.png");
+
+    let plain = run_cutout(&[input.to_str().unwrap(), "-o", output.to_str().unwrap()]);
+    assert!(plain.status.success());
+    let kept = image::open(&output).unwrap().to_rgba8();
+    assert_eq!(kept.get_pixel(20, 20)[3], 255, "対照：小道具は前景で残る");
+
+    let mut mask = image::RgbaImage::from_pixel(200, 200, image::Rgba([0, 0, 0, 255]));
+    paint(&mut mask, (5, 5, 35, 35), 255);
+    let path = write_png(dir.path(), "bg.png", &mask);
+
+    let out = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--force",
+        "--bg-mask",
+        path.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    assert_eq!(v["constraints"]["sources"][0], "bg_mask");
+
+    let cut = image::open(&output).unwrap().to_rgba8();
+    assert_eq!(cut.get_pixel(20, 20)[3], 0, "指した小道具が消えていない");
+    assert_eq!(cut.get_pixel(100, 100)[3], 255, "商品まで巻き込んでいる");
+}
+
+/// 多角形を正規化座標で受けること。ビジョンモデルは 0.0-1.0 で返す。
+#[test]
+fn a_polygon_is_accepted_in_normalized_coordinates() {
+    let dir = fixture_dir();
+    let input = constraint_fixture(dir.path());
+    let output = dir.path().join("cut.png");
+
+    // 画像の左上 1/4 を確定前景にする（商品の外なので、色では前景にならない）
+    let out = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--normalized",
+        "--fg-polygon",
+        "0.05,0.05,0.25,0.05,0.25,0.25,0.05,0.25",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    assert_eq!(v["constraints"]["sources"][0], "fg_polygon");
+    // 0.2 x 0.2 = 全体の 4%
+    let fg = v["constraints"]["fg_ratio"].as_f64().unwrap();
+    assert!((fg - 0.04).abs() < 0.005, "面の大きさが合わない: {fg}");
+
+    let cut = image::open(&output).unwrap().to_rgba8();
+    assert_eq!(cut.get_pixel(30, 30)[3], 255, "指した面が守られていない");
+    assert_eq!(cut.get_pixel(60, 10)[3], 0, "面の外まで守っている");
+}
+
+/// **小さい確定前景が面積フィルタに黙って消えないこと。**
+///
+/// `--cleanup` の下限は解像度に比例するので、高解像度ほど大きな指示が消える
+/// （5712x4284 では 20x20 の `--fg-polygon` が丸ごと落ちた）。しかも
+/// `constraints.sources` には入口の名前が出たままなので、結果の JSON からは
+/// 「指示は効いた」としか読めない。ここでは 200x200 と `--cleanup 12`
+/// （下限 625px²）で同じ大きさ関係を作る。
+///
+/// **同じ実行の中に対照を置く。** 指示の無い 20x20 の塊は消えるので、
+/// しきい値が本当に指示より大きいことがその場で確かめられる。対照を商品から
+/// 離して置くのは、堤防が残す 1px の縁どうしが 8 近傍でつながると、
+/// 成分が商品と合体して面積フィルタに掛からなくなるためである。
+#[test]
+fn a_small_forced_foreground_survives_the_speck_filter() {
+    let dir = fixture_dir();
+    let mut img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    // 対照：指示を伴わない 20x20 の濃い塊（商品は x 44-156 / y 32-168）
+    paint(&mut img, (10, 160, 29, 179), 30);
+    let input = write_png(dir.path(), "speck.png", &img);
+    let output = dir.path().join("cut.png");
+
+    // 20x20 = 400px² は下限 625px² を下回る
+    let out = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--cleanup",
+        "12",
+        "--fg-polygon",
+        "10,10,30,10,30,30,10,30",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(json_stdout(&out)["constraints"]["sources"][0], "fg_polygon");
+
+    let cut = image::open(&output).unwrap().to_rgba8();
+    assert_eq!(
+        cut.get_pixel(20, 170)[3],
+        0,
+        "対照が消えていない。--cleanup 12 の下限が 400px² を超えていない"
+    );
+    assert_eq!(
+        cut.get_pixel(20, 20)[3],
+        255,
+        "確定前景が面積フィルタに消された"
+    );
+
+    // 種の円（半径 5px = 81px²）も同じ約束の下にある
+    let seeded = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--force",
+        "--cleanup",
+        "12",
+        "--fg-seed",
+        "20,20",
+    ]);
+    assert!(
+        seeded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seeded.stderr)
+    );
+    let cut = image::open(&output).unwrap().to_rgba8();
+    assert_eq!(
+        cut.get_pixel(20, 20)[3],
+        255,
+        "--fg-seed の円が面積フィルタに消された"
+    );
+}
+
+/// 指示が決めた境界しか無ければ `separability` は `null` になること。
+///
+/// **契約が禁じているのは 0.0 のほうである。** `null_means` は「測れる境界が
+/// 無かった。0（色差が無い）ではない」と言っている。確定前景と確定背景を
+/// 隙間なく接して置けば、そこに色の判断は 1 つも入っていないので、
+/// 返すべきものは「測れなかった」でしかない。
+///
+/// 除外を「前景側が確定前景 **かつ** 背景側が確定背景」の厳密一致で問うと、
+/// 境界が 1px でもずれた瞬間に素通りして 0.0 が出る。refine と feather が
+/// 動かす場合もあれば、ここのように**不明の帯を挟んだだけ**でもそうなる
+/// （フィルが指示にぶつかって止まった線は、やはり色の判断ではない）。
+#[test]
+fn a_boundary_drawn_entirely_by_the_instructions_is_not_measurable() {
+    let dir = fixture_dir();
+    // 一様な背景。色の手がかりはどこにも無い
+    let img = image::RgbaImage::from_pixel(200, 200, image::Rgba([248, 248, 247, 255]));
+    let input = write_png(dir.path(), "flat.png", &img);
+    let output = dir.path().join("cut.png");
+
+    // 中央の 40x40 を確定前景、その外側を 4 枚の帯で確定背景にする
+    // （多角形 1 つでは「矩形の外」を表せない）。帯と確定前景の隙間 `gap` を
+    // 広げて、隙間なく接する場合と 2px の不明帯を挟む場合の両方を見る
+    let run = |name: &str, gap: u32| -> Value {
+        let (a, b) = (80 - gap, 120 + gap);
+        let out = run_cutout(&[
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--force",
+            "--fg-polygon",
+            "80,80,120,80,120,120,80,120",
+            &format!("--bg-polygon=40,40,160,40,160,{a},40,{a}"),
+            &format!("--bg-polygon=40,{b},160,{b},160,160,40,160"),
+            &format!("--bg-polygon=40,{a},{a},{a},{a},{b},40,{b}"),
+            &format!("--bg-polygon={b},{a},160,{a},160,{b},{b},{b}"),
+        ]);
+        assert!(
+            out.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        json_stdout(&out)
+    };
+
+    for (name, gap) in [("隙間なく接する", 0), ("2px の不明帯を挟む", 2)] {
+        let v = run(name, gap);
+        assert!(
+            v["constraints"]["fg_ratio"].as_f64().unwrap() > 0.0
+                && v["constraints"]["bg_ratio"].as_f64().unwrap() > 0.0,
+            "{name}: 指示が置かれていない: {v}"
+        );
+        assert!(
+            v["mask"]["separability"].is_null(),
+            "{name}: 指示が引いた線を色の境界として数えている: {}",
+            v["mask"]["separability"]
+        );
+    }
+}
+
+/// 画素座標を `--normalized` で渡す取り違えを断ること。
+#[test]
+fn a_pixel_polygon_passed_as_normalized_is_rejected() {
+    let dir = fixture_dir();
+    let input = constraint_fixture(dir.path());
+    let output = dir.path().join("cut.png");
+
+    let out = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--normalized",
+        "--fg-polygon",
+        "10,10,50,10,50,50",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(json_stdout(&out)["error"]["code"], "INVALID_POLYGON");
+}
+
+/// 点数が足りない多角形は clap が断る。**code を伴わない exit 2 になる。**
+#[test]
+fn a_two_point_polygon_never_reaches_the_command() {
+    let dir = fixture_dir();
+    let input = constraint_fixture(dir.path());
+    let output = dir.path().join("cut.png");
+
+    let out = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--fg-polygon",
+        "10,10,50,50",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty(), "パーサの失敗で JSON が出ている");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("3"));
+}
+
+/// 寸法の違うマスクは拡縮せずに断ること。
+///
+/// **黙って伸ばすと、指示した境界が商品の輪郭から半画素ずつずれたまま、
+/// 結果だけがそれらしく返る。**
+#[test]
+fn a_mask_of_the_wrong_size_is_refused() {
+    let dir = fixture_dir();
+    let input = constraint_fixture(dir.path());
+    let output = dir.path().join("cut.png");
+    let mask = write_gray(dir.path(), "mask.png", 100, 200, 255);
+
+    let out = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--fg-mask",
+        mask.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    let v = json_stdout(&out);
+    assert_eq!(v["error"]["code"], "MASK_SIZE_MISMATCH");
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("100x200") && message.contains("200x200"),
+        "両方の寸法を出すべき: {message}"
+    );
+    assert!(
+        v["error"]["hint"].as_str().unwrap().contains("kiri info"),
+        "合わせ方を言うべき: {v}"
+    );
+}
+
+/// 読めないマスクは、どの指示のどのファイルかまで言うこと。
+#[test]
+fn an_unreadable_mask_names_the_flag_and_the_path() {
+    let dir = fixture_dir();
+    let input = constraint_fixture(dir.path());
+    let output = dir.path().join("cut.png");
+    let missing = dir.path().join("nope.png");
+
+    let out = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--trimap",
+        missing.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(3), "入力の失敗と同じ分類になる");
+    let v = json_stdout(&out);
+    assert_eq!(v["error"]["code"], "INPUT_UNREADABLE");
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("--trimap"),
+        "どの指示かが分からない: {message}"
+    );
+    assert!(
+        message.contains("nope.png"),
+        "どのファイルかが分からない: {message}"
+    );
+}
+
+/// JPEG で渡したマスクでも、指示された面積が膨らまないこと。
+///
+/// **「輝度が 0 でない」ではリンギングを拾う。** 黒く塗ったはずの周囲に
+/// 1 桁の値が散り、実測で指示面積が 2.4 倍になっていた。中点（128）で
+/// 切れば、可逆でない形式を経由しても指示は動かない。
+#[test]
+fn a_lossy_mask_does_not_inflate_the_instructed_area() {
+    let dir = fixture_dir();
+    let input = constraint_fixture(dir.path());
+    let output = dir.path().join("cut.png");
+
+    // 黒地に 60x60 の白い矩形。境目の周りに JPEG のリンギングが出る
+    let mut mask = image::RgbaImage::from_pixel(200, 200, image::Rgba([0, 0, 0, 255]));
+    paint(&mut mask, (70, 70, 129, 129), 255);
+    let path = write_jpeg(dir.path(), "mask.jpg", &mask);
+
+    let out = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--bg-mask",
+        path.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    let pixels = v["constraints"]["bg_pixels"].as_u64().unwrap();
+    assert!(
+        (3400..=3800).contains(&pixels),
+        "指示された面積が 60x60=3600 から離れている: {pixels}"
+    );
+}
+
+/// EXIF Orientation を持つ指示画像は、黙って向き違いのまま使わないこと。
+///
+/// **180 度（3）や鏡像（2/4）は寸法が変わらない。** `MASK_SIZE_MISMATCH` を
+/// 素通りして、上下逆さまの指示がそのまま効く。結果の数値からは
+/// 「切り抜きが下手」としか読めない失敗である。
+#[test]
+fn a_mask_carrying_an_exif_orientation_is_reported() {
+    let dir = fixture_dir();
+    let input = constraint_fixture(dir.path());
+    let output = dir.path().join("cut.png");
+
+    let mut mask = image::RgbaImage::from_pixel(200, 200, image::Rgba([0, 0, 0, 255]));
+    paint(&mut mask, (10, 10, 60, 60), 255);
+    let path = write_jpeg_with_orientation(dir.path(), "rotated.jpg", &mask, 3);
+
+    let out = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--bg-mask",
+        path.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    assert!(
+        has_warning(&v, "MASK_ORIENTATION_IGNORED"),
+        "向きを無視したことを報せていない: {:?}",
+        warning_codes(&v)
+    );
+    let w = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "MASK_ORIENTATION_IGNORED")
+        .unwrap();
+    assert_eq!(w["data"]["orientation"], 3);
+    assert!(
+        w["message"].as_str().unwrap().contains("rotated.jpg"),
+        "どのファイルかが分からない: {w}"
+    );
+    assert!(w["hint"].as_str().unwrap().contains("向き"), "{w}");
+}
+
+/// 渡したのに 1 画素も塗らなかった指示は、黙って無かったことにしないこと。
+///
+/// **`sources` に無いことを「空だった」と読ませるのは無理がある。**
+/// 渡し忘れと空振りは打つ手が違うので、code で分ける。ブロックそのものは
+/// 出す（比率 0、`sources` は空配列）。
+#[test]
+fn an_instruction_that_marked_nothing_is_reported() {
+    let dir = fixture_dir();
+    let input = constraint_fixture(dir.path());
+    let output = dir.path().join("cut.png");
+
+    let out = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--fg-polygon",
+        "500,500,600,500,600,600",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    assert!(
+        has_warning(&v, "CONSTRAINT_EMPTY"),
+        "空振りを報せていない: {:?}",
+        warning_codes(&v)
+    );
+    let w = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "CONSTRAINT_EMPTY")
+        .unwrap();
+    assert_eq!(w["data"]["source"], "fg_polygon");
+
+    let c = &v["constraints"];
+    assert!(!c.is_null(), "constraints ごと消えている: {v}");
+    assert_eq!(c["sources"].as_array().unwrap().len(), 0);
+    assert_eq!(c["fg_ratio"], 0.0);
+    assert_eq!(c["fg_pixels"], 0);
+}
+
+/// 確定前景と確定背景が重なったら断ること。
+///
+/// **黙ってどちらかを選ぶと「指定が効いていない」という最も追いにくい失敗に
+/// なる。** 重なった画素数と外接矩形まで返して、どこを直せばよいかを示す。
+#[test]
+fn overlapping_instructions_are_refused() {
+    let dir = fixture_dir();
+    let input = constraint_fixture(dir.path());
+    let output = dir.path().join("cut.png");
+
+    let out = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--fg-polygon",
+        "10,10,60,10,60,60,10,60",
+        "--bg-polygon",
+        "50,50,120,50,120,120,50,120",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    let v = json_stdout(&out);
+    assert_eq!(v["error"]["code"], "CONSTRAINT_CONFLICT");
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("100") && message.contains("50,50"),
+        "重なりの量と場所を言うべき: {message}"
+    );
+    assert!(
+        v["error"]["hint"].as_str().unwrap().contains("片方"),
+        "直し方を言うべき: {v}"
+    );
+    assert!(!output.exists(), "断ったのに書き出している");
+}
+
+/// 指示を渡さなければ `constraints` はキーごと現れないこと。
+///
+/// **`null` も出さない。** 「指示していない」と「指示したが空だった」を
+/// 同じ形にすると、読み手は自分の指示が届いたかを判断できない。
+#[test]
+fn the_constraints_block_appears_only_when_something_was_given() {
+    let dir = fixture_dir();
+    let input = constraint_fixture(dir.path());
+    let output = dir.path().join("cut.png");
+
+    let plain = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--dry-run",
+    ]);
+    assert!(plain.status.success());
+    assert!(
+        json_stdout(&plain).get("constraints").is_none(),
+        "指示が無いのに constraints が出ている"
+    );
+
+    // --fg-seed も空間的な指示の 1 つ。半径 5px の円が確定前景になる
+    let seeded = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--dry-run",
+        "--fg-seed",
+        "100,100",
+    ]);
+    assert!(seeded.status.success());
+    let v = json_stdout(&seeded);
+    assert_eq!(v["constraints"]["sources"][0], "fg_seed");
+    assert!(v["constraints"]["fg_ratio"].as_f64().unwrap() > 0.0);
+    assert_eq!(v["constraints"]["bg_ratio"], 0.0);
+}
+
+/// 指示を重ねると、効いた入口が並ぶこと。
+#[test]
+fn every_source_that_marked_a_pixel_is_listed() {
+    let dir = fixture_dir();
+    let input = constraint_fixture(dir.path());
+    let output = dir.path().join("cut.png");
+    let mask = write_gray(dir.path(), "empty.png", 200, 200, 0);
+
+    let out = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--dry-run",
+        "--fg-polygon",
+        "80,80,120,80,120,120,80,120",
+        "--bg-polygon",
+        "0,0,20,0,20,20,0,20",
+        // 1 画素も塗らないマスク。**渡しても sources には出ない**
+        "--fg-mask",
+        mask.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let sources = json_stdout(&out)["constraints"]["sources"].clone();
+    assert_eq!(sources[0], "fg_polygon");
+    assert_eq!(sources[1], "bg_polygon");
+    assert_eq!(
+        sources.as_array().unwrap().len(),
+        2,
+        "空の入口が出ている: {sources}"
+    );
+}
+
+/// プレビューの重ね描きは、指示があるときにだけ現れること。
+///
+/// **指示が無い実行のバイト列は 1 バイトも動かない。** 重ね描きは指示の
+/// 置き場所を確かめるためのもので、既存の検証画像を変える理由が無い。
+#[test]
+fn the_preview_overlay_appears_only_with_instructions() {
+    let dir = fixture_dir();
+    let input = constraint_fixture(dir.path());
+    let output = dir.path().join("cut.png");
+
+    let preview = |name: &str, extra: &[&str]| -> Vec<u8> {
+        let path = dir.path().join(name);
+        let mut args = vec![
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--force",
+            "--preview",
+            path.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        let out = run_cutout(&args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::read(&path).unwrap()
+    };
+
+    let plain = preview("a.png", &[]);
+    let again = preview("b.png", &[]);
+    assert_eq!(plain, again, "指示なしのプレビューが決定的でない");
+
+    let marked = preview("c.png", &["--fg-polygon", "80,80,120,80,120,120,80,120"]);
+    assert_ne!(plain, marked, "指示が重ね描きされていない");
+}
+
+/// spec からも同じ指示を渡せること。**相対パスは spec の場所を基準に解く。**
+#[test]
+fn the_batch_spec_accepts_spatial_instructions() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    write_png(dir.path(), "p0.png", &img);
+    let mut mask = image::RgbaImage::from_pixel(200, 200, image::Rgba([0, 0, 0, 255]));
+    paint(&mut mask, (10, 10, 40, 40), 255);
+    write_png(dir.path(), "fg.png", &mask);
+
+    let spec = write_spec(
+        dir.path(),
+        r#"{"defaults":{"format":"png"},
+            "items":[{"input":"p0.png","output":"out/a.png",
+                      "fg_mask":"fg.png",
+                      "bg_polygons":[[100,10,140,10,140,40,100,40]]}]}"#,
+    );
+    let out = run_batch(&spec, &[]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    let constraints = &v["results"][0]["result"]["constraints"];
+    assert_eq!(constraints["sources"][0], "fg_mask");
+    assert_eq!(constraints["sources"][1], "bg_polygon");
+    assert!(constraints["fg_ratio"].as_f64().unwrap() > 0.0);
+
+    let cut = image::open(dir.path().join("out/a.png"))
+        .unwrap()
+        .to_rgba8();
+    assert_eq!(cut.get_pixel(25, 25)[3], 255, "マスクが効いていない");
+}
+
+/// 新しいキーの綴り違いも候補を示して断ること。
+#[test]
+fn a_misspelled_spatial_key_suggests_the_right_one() {
+    let dir = fixture_dir();
+    batch_fixture(dir.path(), 1);
+    let spec = write_spec(
+        dir.path(),
+        r#"{"items":[{"input":"p0.png","output":"a.png","fg_polygon":[[0,0,1,0,1,1]]}]}"#,
+    );
+
+    let out = run_batch(&spec, &[]);
+    assert_eq!(out.status.code(), Some(3));
+    let v = json_stdout(&out);
+    assert_eq!(v["error"]["code"], "SPEC_UNKNOWN_FIELD");
+    assert!(
+        v["error"]["hint"].as_str().unwrap().contains("fg_polygons"),
+        "綴り違いの候補を示すべき: {v}"
+    );
+}
+
+/// spec の多角形も CLI と同じ関門を通ること。
+#[test]
+fn a_two_point_polygon_in_a_spec_is_rejected() {
+    let dir = fixture_dir();
+    batch_fixture(dir.path(), 1);
+    let spec = write_spec(
+        dir.path(),
+        r#"{"items":[{"input":"p0.png","output":"a.png","fg_polygons":[[0,0,1,1]]}]}"#,
+    );
+
+    let out = run_batch(&spec, &[]);
+    // 項目の失敗は全体を止めない。exit 4 で results[] に理由が入る
+    assert_eq!(out.status.code(), Some(4));
+    let v = json_stdout(&out);
+    assert_eq!(v["results"][0]["error"]["code"], "INVALID_POLYGON");
+}
+
 #[test]
 fn debug_mask_is_written_and_reported() {
     let dir = fixture_dir();
@@ -4881,6 +5681,20 @@ fn every_published_field_exists_in_the_result() {
         "--dry-run",
         "--json",
     ]);
+    // **`constraints` は指示を渡したときだけ現れる。** 指示なしの結果で探すと
+    // 「配った path が存在しない」になるので、指示を渡した実行も用意する。
+    // `notes` がそう述べていることは `a_nullable_field_says_what_null_means` と
+    // 同じ流儀で文面の側が守る
+    let constrained = run(&[
+        "cutout",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--dry-run",
+        "--json",
+        "--fg-seed",
+        "100,100",
+    ]);
 
     for f in fields_of(&schema_json()) {
         let path = f["path"].as_str().unwrap();
@@ -4895,6 +5709,7 @@ fn every_published_field_exists_in_the_result() {
         for command in commands {
             let report = match command {
                 "info" => &info,
+                "cutout" if path.starts_with("constraints.") => &constrained,
                 "cutout" => &cutout,
                 other => panic!("{path} が未知のコマンド {other} を名指ししている"),
             };

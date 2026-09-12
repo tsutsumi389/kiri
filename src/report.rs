@@ -307,6 +307,37 @@ pub struct SettingsReport {
     pub refine: bool,
 }
 
+/// 空間的な指示（トライマップ・マスク画像・多角形・種）が何を占めたか。
+///
+/// **指定があったときだけ出す**（`rotate` と同じ規約で、無ければキーごと無い）。
+/// `null` も出さないのは、「指示していない」と「指示したが空だった」を同じ形に
+/// しないためである。後者は `sources` に名前が出ないうえ、比率が 0 になる。
+///
+/// `--bbox` はここに入れない。`settings` と `applied_bbox` が既に同じことを
+/// 言っており、2 箇所で名乗ると別の指定が 2 つあるように読める。
+#[derive(Debug, Serialize)]
+pub struct ConstraintsReport {
+    /// 効いた入口の名前（trimap / fg_mask / bg_mask / fg_polygon / bg_polygon /
+    /// fg_seed）。**渡したのにここへ出ていなければ、その指示は 1 画素も
+    /// 塗っていない**（空のマスク、画像の外だけを指す多角形など）
+    pub sources: Vec<String>,
+    /// 確定前景が画像に占める割合
+    pub fg_ratio: f64,
+    /// 確定背景が画像に占める割合
+    pub bg_ratio: f64,
+    /// どちらでもない画素の割合。トライマップの不明帯はここに入る
+    pub unknown_ratio: f64,
+    /// 確定前景として指示された画素数。
+    ///
+    /// **比率は桁落ちする。** `round4` は 12MP の 1000 画素を 0.0001 に落とし、
+    /// 5712x4284 の 20x20 に至っては 0.0000 になる。`sources` に名前が出ている
+    /// のに比率が 0.0 という結果を、エージェントは「効かなかった」としか
+    /// 読めない。画素数なら 1 画素でも 1 と出る
+    pub fg_pixels: u64,
+    /// 確定背景として指示された画素数
+    pub bg_pixels: u64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CutoutReport {
     /// 契約の版。`SCHEMA_VERSION` を参照
@@ -334,6 +365,9 @@ pub struct CutoutReport {
     /// 実際に適用された bbox（未指定なら None）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub applied_bbox: Option<[u32; 4]>,
+    /// 空間的な指示が何を占めたか。指示が無ければキーごと現れない
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub constraints: Option<ConstraintsReport>,
     pub mask: MaskReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canvas: Option<CanvasReport>,

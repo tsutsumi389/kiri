@@ -118,6 +118,13 @@ error_catalog! {
         => "bbox の座標が 0.0-1.0 または画像の範囲に収まらない",
     InvalidSeed = "INVALID_SEED", Argument
         => "--fg-seed の座標が 0.0-1.0 または画像の範囲に収まらない",
+    InvalidPolygon = "INVALID_POLYGON", Argument
+        => "--fg-polygon / --bg-polygon の座標が不正（--normalized で絶対値 2.0 超え = 画素座標の渡し違い）。\
+            3 点未満・奇数個は spec 経由でのみこの code で、CLI では clap が code 無しの exit 2 で断る",
+    ConstraintConflict = "CONSTRAINT_CONFLICT", Argument
+        => "同じ画素が確定前景と確定背景の両方に指定されている",
+    MaskSizeMismatch = "MASK_SIZE_MISMATCH", Argument
+        => "トライマップやマスク画像の寸法が入力画像と違う",
     InvalidCanvas = "INVALID_CANVAS", Argument
         => "--canvas の書式か寸法が不正",
     InvalidColor = "INVALID_COLOR", Argument

@@ -9,7 +9,9 @@ use std::time::Instant;
 use rayon::prelude::*;
 
 use crate::batch::{self, BatchItem, ItemSettings};
-use crate::cli::{BatchArgs, ColorOpts, CutoutArgs, OutputOpts, parse_hex_color, parse_size};
+use crate::cli::{
+    BatchArgs, ColorOpts, CutoutArgs, OutputOpts, Polygon, parse_hex_color, parse_size,
+};
 use crate::commands::cutout;
 use crate::cutout::DEFAULT_BORDER;
 use crate::error::{Error, ErrorCode, Result};
@@ -26,7 +28,7 @@ pub fn run(args: &BatchArgs) -> Result<BatchReport> {
         let output = batch::resolve(&base, &item.output);
         let settings = item.settings.merged_over(&spec.defaults);
 
-        let outcome = to_cutout_args(&input, &output, &settings, args.force, args.dry_run)
+        let outcome = to_cutout_args(&base, &input, &output, &settings, args.force, args.dry_run)
             .and_then(|args| cutout::run(&args));
 
         match outcome {
@@ -80,7 +82,13 @@ pub fn run(args: &BatchArgs) -> Result<BatchReport> {
 /// 仕様の 1 項目を cutout の引数へ落とす。
 ///
 /// cutout コマンドをそのまま呼ぶことで、単体実行とバッチで挙動が食い違わないようにする。
+///
+/// `base` を受けるのは、指示として渡される画像（`trimap` / `fg_mask` /
+/// `bg_mask`）のパスを `input` と同じ規則で解決するためである。**片方だけ
+/// カレントディレクトリ基準にすると、同じ spec が実行場所によって違う
+/// マスクを読む。**
 fn to_cutout_args(
+    base: &Path,
     input: &Path,
     output: &Path,
     settings: &ItemSettings,
@@ -117,11 +125,18 @@ fn to_cutout_args(
     let seal = capped(settings.seal, 1, crate::cli::MAX_SEAL, "seal")?;
     let cleanup = capped(settings.cleanup, 2, crate::cli::MAX_CLEANUP, "cleanup")?;
 
+    let path = |p: &Option<std::path::PathBuf>| p.as_ref().map(|p| batch::resolve(base, p));
+
     Ok(CutoutArgs {
         input: input.to_path_buf(),
         bbox: settings.bbox,
         normalized: settings.normalized.unwrap_or(false),
         fg_seed: settings.fg_seeds.clone().unwrap_or_default(),
+        trimap: path(&settings.trimap),
+        fg_mask: path(&settings.fg_mask),
+        bg_mask: path(&settings.bg_mask),
+        fg_polygon: polygons(settings.fg_polygons.as_deref(), "fg_polygons")?,
+        bg_polygon: polygons(settings.bg_polygons.as_deref(), "bg_polygons")?,
         tolerance: checked(settings.tolerance, 12.0, "tolerance")?,
         border: settings.border.unwrap_or(DEFAULT_BORDER),
         cleanup,
@@ -155,6 +170,25 @@ fn to_cutout_args(
             dry_run,
         },
     })
+}
+
+/// spec の `[[x,y,x,y,...], ...]` を多角形へ落とす。
+///
+/// **検証は CLI と同じ関門（`Polygon::from_values`）を通す。** spec 経由でだけ
+/// 2 点の「多角形」や奇数個の座標が通ると、その項目の指示だけが黙って
+/// 無視される。数百点を回した後に、仕上がりを目で見るまで気づけない。
+fn polygons(values: Option<&[Vec<f64>]>, key: &str) -> Result<Vec<Polygon>> {
+    values
+        .unwrap_or_default()
+        .iter()
+        .map(|v| {
+            Polygon::from_values(v).map_err(|e| {
+                Error::new(ErrorCode::InvalidPolygon, format!("{key}: {e}")).with_hint(
+                    "1 つの多角形は [x1,y1,x2,y2,...] の並びで、3 点以上を書いてください",
+                )
+            })
+        })
+        .collect()
 }
 
 /// 数値の設定に CLI と同じ約束を掛ける。
@@ -216,6 +250,7 @@ mod tests {
     fn the_batch_defaults_match_the_library_defaults() {
         let settings = ItemSettings::default();
         let args = to_cutout_args(
+            Path::new("."),
             Path::new("in.png"),
             Path::new("out.png"),
             &settings,

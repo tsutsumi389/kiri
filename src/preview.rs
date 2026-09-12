@@ -10,7 +10,7 @@
 
 use image::{Rgba, RgbaImage};
 
-use crate::cutout::Mask;
+use crate::cutout::{Constraint, Constraints, Mask};
 use crate::error::Result;
 use crate::transform::resize::{ResizePlan, apply as resize_apply};
 
@@ -27,6 +27,13 @@ const CHECKER_DARK: [u8; 3] = [204, 204, 204];
 const CHECKER_SIZE: u32 = 8;
 /// グリッド線の色。商品写真に自然には出にくい色を選ぶ
 const GRID_RGB: [u8; 3] = [255, 51, 102];
+/// 確定前景の重ね色。確定背景と補色の関係にして、縮小しても取り違えないようにする
+const FORCED_FG_RGB: [u8; 3] = [0, 220, 60];
+/// 確定背景の重ね色。
+const FORCED_BG_RGB: [u8; 3] = [230, 30, 30];
+/// 指示の重ね具合。**元の画素が読めなくなってはいけない。** 置き場所を
+/// 確かめるための重ね描きなので、下の商品と背景が透けて見える必要がある
+const CONSTRAINT_ALPHA: f64 = 0.35;
 
 #[derive(Debug, Clone)]
 pub struct PreviewSpec {
@@ -50,15 +57,27 @@ impl Default for PreviewSpec {
 ///
 /// 結果パネルは市松模様の上に合成する。透過と白い商品を区別できないと
 /// 「切り抜けた」のか「商品ごと消えた」のかが見て分からないため。
+///
+/// `constraints` を渡すと、元画像パネルに確定前景を緑・確定背景を赤で重ねる。
+/// **エージェントが自分の指示の置き場所を目で確かめられる唯一の手段である。**
+/// 座標は自分で書いたものなので数字では検算できず、ずれていても結果の数値には
+/// 「切り抜きが下手」としか出ない。指示が無ければ何も描かない（既存の
+/// プレビューのバイト列を動かさないため）。
 pub fn contact_sheet(
     original: &RgbaImage,
     mask: &Mask,
     result: &RgbaImage,
+    constraints: Option<&Constraints>,
     spec: &PreviewSpec,
 ) -> Result<RgbaImage> {
     let mut source = fit(original, spec.panel)?;
     if spec.grid {
         draw_grid(&mut source);
+    }
+    // グリッドの上に重ねる。指示のほうが後から確かめたいものだからで、
+    // 下に敷くと 0.1 刻みの線が指示を横切って読み取りを邪魔する
+    if let Some(c) = constraints {
+        draw_constraints(&mut source, c, original.width(), original.height());
     }
     let mask_panel = fit_mask(mask, spec.panel);
     let result_panel = over_checkerboard(&fit(result, spec.panel)?);
@@ -182,6 +201,36 @@ fn draw_grid(image: &mut RgbaImage) {
     }
 }
 
+/// 確定前景を緑、確定背景を赤で重ねる。
+///
+/// パネルは縮小済みなので、画素ごとに元の座標へ引き戻して問う。`fit_mask` と
+/// 同じ最近傍の対応にしてある——指示の縁が半画素ずれて見えるより、
+/// 「どのあたりを塗ったか」が読めることのほうが要る。
+///
+/// 寸法が食い違う指示は描かない。`foreground_mask` と同じ規約で、
+/// 公開 API に届いた食い違いで panic させない。
+fn draw_constraints(panel: &mut RgbaImage, constraints: &Constraints, width: u32, height: u32) {
+    if constraints.width() != width || constraints.height() != height {
+        return;
+    }
+    let (pw, ph) = (panel.width(), panel.height());
+    if pw == 0 || ph == 0 || width == 0 || height == 0 {
+        return;
+    }
+    for py in 0..ph {
+        let sy = (u64::from(py) * u64::from(height) / u64::from(ph)) as u32;
+        for px in 0..pw {
+            let sx = (u64::from(px) * u64::from(width) / u64::from(pw)) as u32;
+            let rgb = match constraints.at(sx.min(width - 1), sy.min(height - 1)) {
+                Constraint::Free => continue,
+                Constraint::ForcedFg => FORCED_FG_RGB,
+                Constraint::ForcedBg => FORCED_BG_RGB,
+            };
+            blend_toward(panel, px, py, rgb, CONSTRAINT_ALPHA);
+        }
+    }
+}
+
 fn blend_toward(image: &mut RgbaImage, x: u32, y: u32, rgb: [u8; 3], amount: f64) {
     let p = image.get_pixel_mut(x, y);
     for c in 0..3 {
@@ -251,7 +300,8 @@ mod tests {
         let original = solid(200, 100, [255, 0, 0, 255]);
         let result = solid(200, 100, [0, 255, 0, 128]);
         let mask = Mask::new(200, 100, 255);
-        let sheet = contact_sheet(&original, &mask, &result, &PreviewSpec::default()).unwrap();
+        let sheet =
+            contact_sheet(&original, &mask, &result, None, &PreviewSpec::default()).unwrap();
 
         assert_eq!(sheet.width(), MARGIN * 2 + 200 * 3 + GUTTER * 2);
         assert_eq!(sheet.height(), MARGIN * 2 + 100);

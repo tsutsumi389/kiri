@@ -18,6 +18,14 @@ use crate::warning::{Warning, WarningCode};
 pub struct LoadOptions {
     /// 埋め込み ICC を解釈して sRGB へ変換する
     pub convert_color: bool,
+    /// EXIF Orientation を適用する。
+    ///
+    /// **素材の画像では必ず適用する。** 切る側と指す側で座標系がずれると
+    /// bbox がすべて狂う。切るのは `--trimap` / `--fg-mask` / `--bg-mask` の
+    /// ように**画素そのものが指示である**入力だけで、そちらは
+    /// 「EXIF 適用後の入力画像と同じ寸法」と約束しているため、向きを
+    /// 勝手に直すとその約束のほうが崩れる
+    pub apply_orientation: bool,
 }
 
 impl Default for LoadOptions {
@@ -26,6 +34,7 @@ impl Default for LoadOptions {
     fn default() -> Self {
         Self {
             convert_color: true,
+            apply_orientation: true,
         }
     }
 }
@@ -125,7 +134,11 @@ pub fn load_with(path: &Path, opts: &LoadOptions) -> Result<LoadedImage> {
         .map_err(|e| Error::new(ErrorCode::InputDecodeFailed, e.to_string()))?;
 
     let (exif_orientation, exif_color_space) = read_exif(&bytes);
-    let (image, orientation_applied) = apply_orientation(dynamic, exif_orientation);
+    let (image, orientation_applied) = if opts.apply_orientation {
+        apply_orientation(dynamic, exif_orientation)
+    } else {
+        (dynamic, false)
+    };
 
     let mut image = image.to_rgba8();
     let color = normalize_color(&mut image, icc.as_deref(), exif_color_space, opts);
@@ -434,6 +447,7 @@ mod tests {
             &path,
             &LoadOptions {
                 convert_color: false,
+                ..Default::default()
             },
         )
         .unwrap();

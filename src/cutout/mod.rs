@@ -550,7 +550,7 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
         mask = feather::feather(&mask, opts.feather);
         let mut out = image.clone();
         if opts.despill {
-            despill::despill(&mut out, &mask, background.rgb);
+            despill::despill(&mut out, &mask, &field);
         }
         out
     };
@@ -577,7 +577,7 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
     let separability = boundary_separability(
         image,
         &mask,
-        background.rgb,
+        &field,
         inset,
         opts.bbox,
         opts.constraints.as_ref(),
@@ -590,6 +590,7 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
     warnings.extend(field_skipped);
     warnings.extend(collect_warnings(
         &background,
+        &residual,
         &stats,
         separability,
         &diagnostics,
@@ -726,10 +727,21 @@ fn restore_forced_foreground(mask: &mut Mask, opts: &CutoutOptions) {
 /// 厳密一致（両側とも指示）にしていた頃は、refine と feather で境界が 1px
 /// 動くだけで除外が素通りし、契約が禁じた 0.0 を返していた——`null_means` は
 /// 「測れる境界が無かった。0 ではない」と言っているのに、である。
+///
+/// # 効いたモデルで測る
+///
+/// 色差は**その場の背景色**との差で測る。1 色で測っていた頃は、場でフィルして
+/// 直っていない切り抜き（実写キーボード: 前景比率 0.647、外周接触）の値が
+/// 15.6 → 31.7 へ跳ね、`NOT_SEPARABLE`（「調整では無駄」の信号）が消えていた。
+/// **分子だけを新しいモデルに乗せ替えたのが原因である。** 比較先（`residual`）
+/// も場に対する分布なので、分子もそこへ揃える。
+///
+/// `flat` の場では `rgb_at` が大域の 1 色を返すので、1 色で測っていた頃と
+/// 1 ビットも変わらない。
 pub fn boundary_separability(
     image: &RgbaImage,
     mask: &Mask,
-    bg: [u8; 3],
+    field: &BackgroundField,
     inset: u32,
     bbox: Option<(u32, u32, u32, u32)>,
     constraints: Option<&Constraints>,
@@ -740,7 +752,9 @@ pub fn boundary_separability(
         return None;
     }
 
-    let bg_lab = crate::color::lab::srgb_to_lab(bg);
+    // 1 色の場では毎回同じ値になる。**呼び出しごとに作り直さない**——
+    // 8bit へ戻して測り直すと、1 色で測っていた頃と丸めが 1 つずれる
+    let flat_lab = crate::color::lab::srgb_to_lab(field.rgb());
     let inside = |x: i64, y: i64| -> bool {
         if x < 0 || y < 0 || (x as u32) >= w || (y as u32) >= h {
             return false;
@@ -765,6 +779,10 @@ pub fn boundary_separability(
     };
     let delta_at = |x: u32, y: u32| -> f64 {
         let p = image.get_pixel(x, y).0;
+        let bg_lab = match field.lab_at(x, y) {
+            Some(lab) => lab.map(f64::from),
+            None => flat_lab,
+        };
         crate::color::lab::delta_e76(crate::color::lab::srgb_to_lab([p[0], p[1], p[2]]), bg_lab)
     };
     let depth = i64::from(inset.max(1));
@@ -835,8 +853,10 @@ pub fn bbox_argument(bbox: [f64; 4]) -> String {
 ///
 /// どの警告も機械可読な `code` を持ち、判断に使った数値を `data` に載せる。
 /// 文言は推敲で変わるが、code と data のキーは契約として動かさない。
+#[allow(clippy::too_many_arguments)]
 fn collect_warnings(
     background: &BackgroundEstimate,
+    residual: &DeltaEQuantiles,
     stats: &MaskStats,
     separability: Option<f64>,
     diagnostics: &Diagnostics,
@@ -1016,10 +1036,19 @@ fn collect_warnings(
     // 全部消えた）状態では「境界」が切り抜きの輪郭を表しておらず、測っても
     // 意味がないためである。実際、布の上のリモコンで tolerance が低すぎた際に
     // 「tolerance を上げてください」と「調整では改善しません」が同時に出た。
+    //
+    // **分子と分母は同じモデルで測る。** `separability` は効いた背景（1 色なら
+    // 1 色、場なら場）との色差なので、比べる相手も同じ背景に対する分布——
+    // `residual` でなければならない。1 色モデルでは `residual` は
+    // `perimeter_delta_e` と定義から一致するので、ここは何も変わらない。
+    //
+    // 揃えていなかった頃は、場でフィルしても直っていない実写（キーボード:
+    // 前景比率 0.647、外周接触）で分子だけが 15.6 → 31.7 へ跳ね、分母が
+    // 1 色のままだったせいで「調整では無駄」の信号が消えていた。
     let cut_happened = stats.foreground_ratio > MIN_FOREGROUND_RATIO
         && stats.foreground_ratio < MAX_FOREGROUND_RATIO;
     if let Some(sep) = separability {
-        let spread = background.delta_e.p50;
+        let spread = residual.p50;
         if cut_happened && sep < spread {
             warnings.push(
                 Warning::new(
@@ -1032,7 +1061,7 @@ fn collect_warnings(
                 )
                 .with_hint("パラメータ調整では解決しません。単色背景で撮り直してください")
                 .with_data("separability", round1(sep))
-                .with_data("perimeter_delta_e_p50", round1(spread)),
+                .with_data("residual_p50", round1(spread)),
             );
         }
     }
@@ -1098,7 +1127,15 @@ mod tests {
     #[test]
     fn a_dark_product_on_a_light_background_separates_clearly() {
         let (image, mask) = scene([250, 250, 250], [40, 40, 40]);
-        let sep = boundary_separability(&image, &mask, [250, 250, 250], 7, None, None).unwrap();
+        let sep = boundary_separability(
+            &image,
+            &mask,
+            &BackgroundField::flat([250, 250, 250]),
+            7,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(sep > 60.0, "明暗が離れていれば大きな値になる: {sep}");
     }
 
@@ -1106,7 +1143,15 @@ mod tests {
     fn a_product_the_same_colour_as_the_background_does_not_separate() {
         // 今回の実写がこれ。輪郭は色の違いではなくフィルの停止位置で決まっている
         let (image, mask) = scene([84, 78, 70], [86, 80, 72]);
-        let sep = boundary_separability(&image, &mask, [84, 78, 70], 7, None, None).unwrap();
+        let sep = boundary_separability(
+            &image,
+            &mask,
+            &BackgroundField::flat([84, 78, 70]),
+            7,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(sep < 5.0, "ほぼ同色なら小さな値になる: {sep}");
     }
 
@@ -1130,7 +1175,9 @@ mod tests {
                     mask.set(x, y, 255);
                 }
             }
-            let sep = boundary_separability(&image, &mask, bg, 7, None, None).unwrap();
+            let sep =
+                boundary_separability(&image, &mask, &BackgroundField::flat(bg), 7, None, None)
+                    .unwrap();
             assert!(sep > 60.0, "縁 {rim}px でも商品との色差を捉えるべき: {sep}");
         }
     }
@@ -1151,10 +1198,20 @@ mod tests {
         }
 
         // bbox を伝えなければ、矩形の辺を色の輪郭と誤認して値を返す
-        assert!(boundary_separability(&image, &mask, bg, 7, None, None).is_some());
+        assert!(
+            boundary_separability(&image, &mask, &BackgroundField::flat(bg), 7, None, None)
+                .is_some()
+        );
         // 伝えれば、色から引かれた輪郭が1つも無いと分かる
         assert_eq!(
-            boundary_separability(&image, &mask, bg, 7, Some((10, 10, 30, 30)), None),
+            boundary_separability(
+                &image,
+                &mask,
+                &BackgroundField::flat(bg),
+                7,
+                Some((10, 10, 30, 30)),
+                None
+            ),
             None
         );
     }
@@ -1166,7 +1223,7 @@ mod tests {
         let mut mask = Mask::new(10, 10, 0);
         mask.set(5, 5, 255);
         assert_eq!(
-            boundary_separability(&image, &mask, [0; 3], 7, None, None),
+            boundary_separability(&image, &mask, &BackgroundField::flat([0; 3]), 7, None, None),
             None
         );
     }
@@ -1175,7 +1232,14 @@ mod tests {
     fn separability_is_none_without_a_boundary() {
         let image = RgbaImage::from_pixel(10, 10, Rgba([0, 0, 0, 255]));
         assert_eq!(
-            boundary_separability(&image, &Mask::new(10, 10, 0), [0; 3], 7, None, None),
+            boundary_separability(
+                &image,
+                &Mask::new(10, 10, 0),
+                &BackgroundField::flat([0; 3]),
+                7,
+                None,
+                None
+            ),
             None
         );
     }
@@ -1187,7 +1251,14 @@ mod tests {
         let image = RgbaImage::from_pixel(10, 10, Rgba([255, 255, 255, 255]));
         let mask = Mask::new(10, 10, 255);
         assert_eq!(
-            boundary_separability(&image, &mask, [255, 255, 255], 7, None, None),
+            boundary_separability(
+                &image,
+                &mask,
+                &BackgroundField::flat([255, 255, 255]),
+                7,
+                None,
+                None
+            ),
             None
         );
     }
@@ -1258,6 +1329,28 @@ mod tests {
         }
     }
 
+    /// 1 色モデルでの警告。**残差は 1 色に対する分布と定義から一致する**ので、
+    /// 場を持たない検査はここを通す。分子と分母を揃えたことの検査だけが
+    /// `collect_warnings` を直に呼ぶ
+    fn flat_warnings(
+        background: &BackgroundEstimate,
+        stats: &MaskStats,
+        separability: Option<f64>,
+        diagnostics: &Diagnostics,
+        subject: Option<&SubjectHint>,
+        bbox_given: bool,
+    ) -> Vec<Warning> {
+        collect_warnings(
+            background,
+            &background.delta_e,
+            stats,
+            separability,
+            diagnostics,
+            subject,
+            bbox_given,
+        )
+    }
+
     fn codes(warnings: &[Warning]) -> Vec<&str> {
         warnings.iter().map(|w| w.code.as_str()).collect()
     }
@@ -1270,7 +1363,7 @@ mod tests {
     /// SUBJECT_TOUCHES_EDGE の仕組みが死んでもテストは通り続ける。
     #[test]
     fn a_non_uniform_background_without_a_bbox_recommends_one_instead_of_crying_crop() {
-        let warnings = collect_warnings(
+        let warnings = flat_warnings(
             &estimate(0.20, 11.9),
             &edge_stats(),
             Some(60.0),
@@ -1306,7 +1399,7 @@ mod tests {
     /// エージェントにとって行き止まりと変わらない。
     #[test]
     fn a_remaining_rim_says_which_knob_to_turn() {
-        let warnings = collect_warnings(
+        let warnings = flat_warnings(
             &estimate(0.20, 11.9),
             &stats(),
             Some(60.0),
@@ -1345,7 +1438,7 @@ mod tests {
             bbox: Some((180, 180, 419, 419)),
             touches_edge: false,
         };
-        let warnings = collect_warnings(
+        let warnings = flat_warnings(
             &estimate(0.24, 10.2),
             &clean_cut,
             Some(76.4),
@@ -1364,7 +1457,7 @@ mod tests {
     /// 対照その 1：bbox を与えたうえで外周に接しているなら、本当に見切れている。
     #[test]
     fn a_product_cropped_by_the_frame_is_still_reported_as_such() {
-        let warnings = collect_warnings(
+        let warnings = flat_warnings(
             &estimate(0.20, 11.9),
             &edge_stats(),
             Some(60.0),
@@ -1383,7 +1476,7 @@ mod tests {
     /// 対照その 2：均一な背景で外周に接しているのは、正真正銘の見切れである。
     #[test]
     fn a_uniform_background_touching_the_edge_is_a_real_crop() {
-        let warnings = collect_warnings(
+        let warnings = flat_warnings(
             &estimate(1.0, 0.5),
             &edge_stats(),
             Some(60.0),
@@ -1402,7 +1495,7 @@ mod tests {
     /// 右端の 0.4%」へ誘導してしまう。**誤った助言は助言が無いより悪い。**
     #[test]
     fn a_low_confidence_subject_never_produces_a_bbox_hint() {
-        let warnings = collect_warnings(
+        let warnings = flat_warnings(
             &estimate(0.16, 21.6),
             &edge_stats(),
             Some(60.0),
@@ -1418,7 +1511,7 @@ mod tests {
     #[test]
     fn a_hopeless_image_is_called_out() {
         // 実写のキーボードがこれ。商品が、背景が背景自身と違う量より背景に近い
-        let warnings = collect_warnings(
+        let warnings = flat_warnings(
             &estimate(0.16, 20.0),
             &stats(),
             Some(12.1),
@@ -1442,7 +1535,7 @@ mod tests {
             bbox: Some((0, 0, 10, 10)),
             touches_edge: true,
         };
-        let warnings = collect_warnings(
+        let warnings = flat_warnings(
             &estimate(0.21, 11.9),
             &stats,
             Some(11.5),
@@ -1460,7 +1553,7 @@ mod tests {
     fn a_white_product_on_a_uniform_white_background_is_not_called_out() {
         // README の看板ケース。均一な背景では輪郭検出で正しく解けるため、
         // 境界の色差が小さくても失敗ではない
-        let warnings = collect_warnings(
+        let warnings = flat_warnings(
             &estimate(1.0, 0.8),
             &stats(),
             Some(3.0),
@@ -1477,7 +1570,7 @@ mod tests {
     #[test]
     fn a_patchy_background_with_a_distinct_product_is_not_called_out() {
         // 背景が汚れていても商品がはっきり違うなら、tolerance を上げれば解ける
-        let warnings = collect_warnings(
+        let warnings = flat_warnings(
             &estimate(0.5, 15.0),
             &stats(),
             Some(60.0),

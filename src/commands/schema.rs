@@ -182,8 +182,10 @@ fn fields() -> Vec<FieldEntry> {
             gates: None,
             summary: "外周が推定背景色からどれだけ離れているかの中位値",
             notes: Some(
-                "背景自身のばらつき。mask.separability がこれを下回る画像は、背景を飲み込める \
-                 tolerance が商品も飲み込むので救えない（NOT_SEPARABLE）",
+                "背景を 1 色で表したときのばらつき。**主体検出のしきい値はここから導く**——\
+                 info の NOT_SEPARABLE は subject.delta_e をこれと比べる。切り抜き後の \
+                 mask.separability が比べる相手は background.residual.p50 のほうである\
+                 （model が flat なら両者は同じ値になる）",
             ),
         },
         FieldEntry {
@@ -197,8 +199,11 @@ fn fields() -> Vec<FieldEntry> {
             summary: "実際に効いた背景のモデル（flat / field）",
             notes: Some(
                 "--background-model の既定は auto で、background.uniformity が下限を切ったときだけ \
-                 field になる。field のときは BACKGROUND_FIELD_USED が 1 行出る——**直すものが\
+                 field になる。auto の cutout が field を選んだときだけ BACKGROUND_FIELD_USED が \
+                 1 行出る（--background-model で明示したときと info では出ない）——**直すものが\
                  あるという意味ではない**（既定で正しく動いた報告で、hint も付かない）。\
+                 field を求めても、外周の帯のうち背景として使えた割合が下限を切れば flat へ落ち、\
+                 そのときは BACKGROUND_FIELD_SKIPPED が出る（info でも出る）。\
                  info が返す値は「この画像なら cutout がどちらを使うか」の予告である",
             ),
         },
@@ -229,8 +234,10 @@ fn fields() -> Vec<FieldEntry> {
             notes: Some(
                 "perimeter_delta_e.p50（1 色に対する分布）との差がそのまま「場が吸った量」である。\
                  residual が小さいのに perimeter_delta_e が大きい画像は、単色でないのではなく\
-                 **単色に照明が乗っている**ので、照明場モデルで救える。芯の許容量と主体検出の\
-                 しきい値は、1 色に対する分布ではなくこちらから導く",
+                 **単色に照明が乗っている**ので、照明場モデルで救える。芯の許容量と \
+                 NOT_SEPARABLE の判定はこちらから導く（model が flat なら定義から \
+                 perimeter_delta_e と同じ値になる）。**主体検出だけは 1 色に対する分布から導く**\
+                 ——--background-model を変えても subject の判定は動かない",
             ),
         },
         FieldEntry {
@@ -350,10 +357,12 @@ fn fields() -> Vec<FieldEntry> {
             null_means: Some("測れる境界が無かった。0（色差が無い）ではない"),
             warns: vec![],
             gates: None,
-            summary: "切り抜き境界の内側で測った商品と背景の色差の中位値",
+            summary: "切り抜き境界の内側で測った、商品と**効いたモデルの背景**との色差の中位値",
             notes: Some(
-                "background.perimeter_delta_e.p50 を下回ると NOT_SEPARABLE が出る。固定の\
-                 しきい値ではなく画像ごとの値と比べるので、ここには threshold を載せられない",
+                "background.residual.p50 を下回ると NOT_SEPARABLE が出る。固定のしきい値ではなく\
+                 画像ごとの値と比べるので、ここには threshold を載せられない。**分子と分母は\
+                 同じモデルで測る**——model が field ならここも場に対する色差で、比べる相手も\
+                 場に対する分布である（model が flat ならどちらも 1 色に対する値になる）",
             ),
         },
         FieldEntry {

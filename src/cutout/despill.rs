@@ -16,6 +16,7 @@
 
 use image::RgbaImage;
 
+use crate::cutout::background::BackgroundField;
 use crate::cutout::mask::Mask;
 
 /// これを下回るアルファでは復元式の分母が小さすぎて色が暴れるため触らない。
@@ -23,7 +24,12 @@ use crate::cutout::mask::Mask;
 const MIN_ALPHA: u8 = 16;
 
 /// マスクの中間値を持つ画素から背景色の寄与を取り除く。
-pub fn despill(image: &mut RgbaImage, mask: &Mask, background: [u8; 3]) {
+///
+/// 引くのは**その場の背景色**である。照明の勾配がある背景で大域の 1 色を引くと、
+/// 明るい側では引きすぎ、暗い側では引き足りず、境界の 1px が画像の左右で
+/// 逆向きにずれる。`flat` の場では `rgb_at` が大域の 1 色を返すので、
+/// 1 色で引いていた頃と 1 ビットも変わらない。
+pub fn despill(image: &mut RgbaImage, mask: &Mask, field: &BackgroundField) {
     for y in 0..image.height() {
         for x in 0..image.width() {
             let a = mask.get(x, y);
@@ -31,6 +37,7 @@ pub fn despill(image: &mut RgbaImage, mask: &Mask, background: [u8; 3]) {
                 continue;
             }
             let alpha = f32::from(a) / 255.0;
+            let background = field.rgb_at(x, y);
             let pixel = image.get_pixel_mut(x, y);
             for c in 0..3 {
                 let observed = f32::from(pixel[c]);
@@ -60,7 +67,7 @@ mod tests {
     #[test]
     fn opaque_pixels_are_left_alone() {
         let mut img = single([190, 70, 55, 255]);
-        despill(&mut img, &mask_with(255), WHITE);
+        despill(&mut img, &mask_with(255), &BackgroundField::flat(WHITE));
         assert_eq!(img.get_pixel(0, 0).0, [190, 70, 55, 255]);
     }
 
@@ -68,7 +75,7 @@ mod tests {
     fn nearly_transparent_pixels_are_left_alone() {
         // 分母が小さすぎて色が暴れる領域には触れない
         let mut img = single([250, 250, 250, 255]);
-        despill(&mut img, &mask_with(8), WHITE);
+        despill(&mut img, &mask_with(8), &BackgroundField::flat(WHITE));
         assert_eq!(img.get_pixel(0, 0).0[0], 250);
     }
 
@@ -83,7 +90,7 @@ mod tests {
             255,
         ];
         let mut img = single(observed);
-        despill(&mut img, &mask_with(128), WHITE);
+        despill(&mut img, &mask_with(128), &BackgroundField::flat(WHITE));
 
         let out = img.get_pixel(0, 0).0;
         for c in 0..3 {
@@ -102,7 +109,7 @@ mod tests {
         // 背景そのものの色に中途半端なアルファが付いた場合、復元結果は
         // 0 に張り付く。少なくとも範囲外の値やオーバーフローは起こさない
         let mut img = single([255, 255, 255, 255]);
-        despill(&mut img, &mask_with(64), WHITE);
+        despill(&mut img, &mask_with(64), &BackgroundField::flat(WHITE));
         let out = img.get_pixel(0, 0).0;
         assert_eq!([out[0], out[1], out[2]], [255, 255, 255]);
     }
@@ -118,7 +125,11 @@ mod tests {
             255,
         ];
         let mut img = single(observed);
-        despill(&mut img, &mask_with(128), background);
+        despill(
+            &mut img,
+            &mask_with(128),
+            &BackgroundField::flat(background),
+        );
         let out = img.get_pixel(0, 0).0;
         for c in 0..3 {
             assert!(

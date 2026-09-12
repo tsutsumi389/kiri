@@ -725,7 +725,7 @@ fn print_the_refine_cost_on_large_inputs() {
     // 返さないので、`cutout()` の後に測るかぎりこれ以上のことは分からない。
     // 診断が確保する量そのものは design.md 4.8 の表にある（12MP で
     // チェビシェフ距離 12MB + 二値マスク 12MB + 枠ぶんの距離場と格子）
-    if after - before == 0 {
+    if (after - before) / 1024 == 0 {
         println!("               （RSS 0 は cutout() の解放済みページを使い回したという意味）");
     }
     drop(result);

@@ -280,6 +280,16 @@ fn print_cutout(report: &CutoutReport) {
         report.background.uniformity, report.settings.tolerance
     );
     print_perimeter(&report.background);
+    // 指示を渡したときだけ 1 行増やす。**どの入口が効いたかまで出す**のは、
+    // 渡したはずの入口が並びに無いことが「その指示は空だった」を意味するため
+    if let Some(c) = &report.constraints {
+        println!(
+            "  制約      前景 {:.1}%  背景 {:.1}%  ({})",
+            c.fg_ratio * 100.0,
+            c.bg_ratio * 100.0,
+            c.sources.join(", ")
+        );
+    }
     println!("  前景比率  {:.1}%", report.mask.foreground_ratio * 100.0);
     if let Some(sep) = report.mask.separability {
         // tolerance と並べて出す。両者の大小そのものが判断材料であるため

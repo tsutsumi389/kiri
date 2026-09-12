@@ -388,6 +388,49 @@ fn fields() -> Vec<FieldEntry> {
             ),
         },
         FieldEntry {
+            path: "constraints.fg_ratio",
+            appears_in: vec!["cutout"],
+            unit: "ratio",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "確定前景として指示された画素が、画像に占める割合",
+            notes: Some(
+                "空間的な指示（--trimap / --fg-mask / --bg-mask / --fg-polygon / --bg-polygon / \
+                 --fg-seed）を渡したときだけ現れる。渡していなければ constraints ごと無い。\
+                 --bbox はここに入らない（settings と applied_bbox が言う）",
+            ),
+        },
+        FieldEntry {
+            path: "constraints.bg_ratio",
+            appears_in: vec!["cutout"],
+            unit: "ratio",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "確定背景として指示された画素が、画像に占める割合",
+            notes: Some(
+                "指示があったときだけ現れる。確定背景はフィルの種にもなるので、商品に囲まれて\
+                 外周から届かない背景もここで消える",
+            ),
+        },
+        FieldEntry {
+            path: "constraints.unknown_ratio",
+            appears_in: vec!["cutout"],
+            unit: "ratio",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "どちらも指示されていない画素の割合。色と連結性で決まる領域",
+            notes: Some(
+                "指示があったときだけ現れる。トライマップの不明帯（輝度 64-191）はここに入る。\
+                 3 つの比率の和は 1 になる",
+            ),
+        },
+        FieldEntry {
             path: "mask.touches_edge",
             appears_in: vec!["cutout"],
             unit: "bool",

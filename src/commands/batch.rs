@@ -13,7 +13,7 @@ use crate::cli::{
     BatchArgs, ColorOpts, CutoutArgs, OutputOpts, Polygon, parse_hex_color, parse_size,
 };
 use crate::commands::cutout;
-use crate::cutout::DEFAULT_BORDER;
+use crate::cutout::{CutoutOptions, DEFAULT_BORDER, Matting};
 use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::OutputFormat;
 use crate::report::{BatchItemReport, BatchReport, ErrorBody, SCHEMA_VERSION};
@@ -143,6 +143,13 @@ fn to_cutout_args(
         feather: settings.feather.unwrap_or(1),
         no_despill: !settings.despill.unwrap_or(true),
         no_refine: !settings.refine.unwrap_or(true),
+        matting: matting(settings.matting.as_deref())?,
+        smooth_contour: checked(
+            settings.smooth_contour,
+            crate::cutout::DEFAULT_SMOOTH_CONTOUR,
+            "smooth_contour",
+        )?,
+        no_reclassify: !settings.reclassify.unwrap_or(true),
         color: ColorOpts {
             no_color_convert: !settings.color_convert.unwrap_or(true),
         },
@@ -170,6 +177,24 @@ fn to_cutout_args(
             dry_run,
         },
     })
+}
+
+/// spec の `matting` を解き方へ落とす。
+///
+/// **綴りを外したら断る。** 未知の値を既定へ落とすと、その項目だけ黙って
+/// 別の解き方で処理され、数百点を回した後に仕上がりを見るまで気づけない。
+/// CLI では clap が同じ役目を果たしている。
+fn matting(name: Option<&str>) -> Result<Matting> {
+    match name {
+        None => Ok(CutoutOptions::default().matting),
+        Some("projection") => Ok(Matting::Projection),
+        Some("guided") => Ok(Matting::Guided),
+        Some(other) => Err(Error::new(
+            ErrorCode::SpecInvalid,
+            format!("'{other}' は未対応の matting です"),
+        )
+        .with_hint("projection / guided のいずれかを指定してください")),
+    }
 }
 
 /// spec の `[[x,y,x,y,...], ...]` を多角形へ落とす。

@@ -7,9 +7,9 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::cutout::DEFAULT_EDGE_THRESHOLD;
 use crate::cutout::background::DEFAULT_BORDER;
 use crate::cutout::constraints::{MASK_THRESHOLD, TRIMAP_BACKGROUND, TRIMAP_FOREGROUND};
+use crate::cutout::{DEFAULT_EDGE_THRESHOLD, DEFAULT_SMOOTH_CONTOUR, Matting};
 use crate::image_io::OutputFormat;
 use crate::preview::DEFAULT_PANEL;
 use crate::transform::FitMode;
@@ -556,6 +556,26 @@ pub struct CutoutArgs {
     /// 境界の色かぶり除去を行わない
     #[arg(long)]
     pub no_despill: bool,
+
+    /// 境界のアルファの解き方。guided は射影のアルファを元画像に導かれて均す
+    ///
+    /// projection は近傍の前景色と背景色を各 1 色とみなし、観測色をその直線へ射影するだけで決める。きれいな素材ではこれが最も正確だが、背景が織り目で散らばる素材では散らばりがそのままアルファの雑音になる。
+    ///
+    /// guided は同じ射影のアルファを入力に、線形 RGB の元画像を案内としてカラー guided filter を帯に掛ける。均す強さは窓の中の背景の分散から決まるので、きれいな背景ではほぼ恒等になる。
+    #[arg(long, value_enum, default_value_t = Matting::Guided)]
+    pub matting: Matting,
+
+    /// 帯の中の二値輪郭に掛けるメディアンの半径(px)。長辺 1000px 換算。0 で無効
+    ///
+    /// 変わった画素のうち、色が変化に矛盾するものは元へ戻す。幅 3px のストラップ（商品色）はメディアンで消えても色の門で戻り、織り目の粒（背景色）は戻らない。
+    #[arg(long, default_value_t = DEFAULT_SMOOTH_CONTOUR, value_parser = non_negative)]
+    pub smooth_contour: f64,
+
+    /// 帯の中の二値画素を局所の前景色・背景色で塗り直さない
+    ///
+    /// 塗り直しは mask.rim_contamination とまったく同じ 2 択で、前景なのに背景寄りの画素を背景へ、背景なのに前景寄りの画素を前景へ移す。切り分けのために切れるようにしてある。
+    #[arg(long)]
+    pub no_reclassify: bool,
 
     /// 境界帯のアルファを画像の色から推定し直さず、マスクの形から作る旧方式に戻す
     ///

@@ -207,8 +207,13 @@ pub struct BackgroundAnalysis {
     pub residual: DeltaEQuantiles,
     /// 主体候補。**1 色の背景に対して測る**（上の `analyse_background` を参照）
     pub subject: Option<SubjectHint>,
-    /// `auto` が場を選んだことの報告。明示指定には付かない
+    /// `auto` が場を選んだことの報告。**`cutout` だけが出す**——明示指定には
+    /// 付かず、`info` も出さない。切り抜いていない `info` で「場を使いました」と
+    /// 報せても、使った結果がどこにも無い
     pub field_warning: Option<Warning>,
+    /// 場を作ろうとして諦めたことの報告。**`info` も出す**——`background.model`
+    /// が求めたモデルと違う理由は、この 1 行にしか書いていない
+    pub field_skipped: Option<Warning>,
 }
 
 /// 背景色・照明場・主体を 1 度に見立てる。
@@ -259,6 +264,7 @@ pub fn analyse_background(
             model: resolved,
             subject,
             field_warning: None,
+            field_skipped: None,
         };
     }
 
@@ -273,7 +279,22 @@ pub fn analyse_background(
         constraints,
         filled: None,
     };
-    let field = background::estimate_field(image, estimate.rgb, &known);
+    let built = background::estimate_field(image, &estimate, &known);
+    // **場を作れなかったなら、場を名乗らない。** 帯の大半が門に弾かれた
+    // （＝帯のほとんどが商品だった）ときは 1 色へ落ち、明示指定であっても
+    // 効いたモデルは `flat` として報せる——効いた値だけを報告する規約である
+    if built.field.is_flat() {
+        return BackgroundAnalysis {
+            residual: estimate.delta_e,
+            estimate,
+            field: built.field,
+            model: ResolvedModel::Flat,
+            subject,
+            field_warning: None,
+            field_skipped: Some(field_skipped(built.band_material)),
+        };
+    }
+    let field = built.field;
     let residual = background::perimeter_residual(image, border, &estimate, &field);
     let field_warning = (model == BackgroundModel::Auto).then(|| field_used(&field, &residual));
 
@@ -284,6 +305,7 @@ pub fn analyse_background(
         residual,
         subject,
         field_warning,
+        field_skipped: None,
     }
 }
 
@@ -304,6 +326,24 @@ fn field_used(field: &BackgroundField, residual: &DeltaEQuantiles) -> Warning {
     .with_data("field_range", range.map(round1).to_vec())
     .with_data("residual_p50", round1(residual.p50))
     .with_data("residual_p90", round1(residual.p90))
+}
+
+/// 場を作ろうとしてやめたことを知らせる。**hint は無い。**
+///
+/// 直す手は無い——帯の大半が商品である構図で場を作れないのは素材の話であり、
+/// 1 色へ落ちたことは失敗ではない。`--bbox` や `--trimap` で「ここから外は
+/// 背景」を教えれば材料は増えるが、それは場のための助言ではなく切り抜き
+/// そのものの助言なので、他の警告（`BBOX_RECOMMENDED`）の仕事である。
+fn field_skipped(band_material: f64) -> Warning {
+    Warning::new(
+        WarningCode::BackgroundFieldSkipped,
+        format!(
+            "外周の帯のうち背景として使えたのが {:.0}% しかないため、照明場を諦めて\
+             背景を 1 色で測りました",
+            band_material * 100.0
+        ),
+    )
+    .with_data("band_material", round4(band_material))
 }
 
 pub struct CutoutResult {
@@ -436,6 +476,7 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
         mut residual,
         subject,
         field_warning,
+        field_skipped,
     } = analysis;
     let (edge_threshold, texture_warning) =
         resolve_edge_threshold(opts.edge_threshold, &background.texture);
@@ -463,11 +504,13 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
     //
     // 1 色モデルでは走らせない。場が無いのだから作り直すものも無い
     if model == ResolvedModel::Field {
-        let (again, next_field, next_residual) =
-            second_pass(image, &background, &mask, opts, &flood);
-        mask = again;
-        field = next_field;
-        residual = next_residual;
+        if let Some((again, next_field, next_residual)) =
+            second_pass(image, &background, &mask, opts, &flood)
+        {
+            mask = again;
+            field = next_field;
+            residual = next_residual;
+        }
     }
 
     // 孤立ノイズは面積で落とす。オープニングは幅で落とすため、ストラップや
@@ -544,6 +587,7 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
     // ついてのものなので、順序が逆だと読み手が原因を後から知ることになる
     let mut warnings = Vec::from_iter(texture_warning);
     warnings.extend(field_warning);
+    warnings.extend(field_skipped);
     warnings.extend(collect_warnings(
         &background,
         &stats,
@@ -586,7 +630,7 @@ fn second_pass(
     mask: &Mask,
     opts: &CutoutOptions,
     flood: &FloodOptions<'_>,
-) -> (Mask, BackgroundField, DeltaEQuantiles) {
+) -> Option<(Mask, BackgroundField, DeltaEQuantiles)> {
     let field = {
         // 1 画素 1 バイトの表は 20MP で 20MB ある。場を作り終えたら手放す
         let filled: Vec<bool> = mask.as_slice().iter().map(|&v| v < 128).collect();
@@ -599,13 +643,19 @@ fn second_pass(
             constraints: opts.constraints.as_ref(),
             filled: Some(&filled),
         };
-        background::estimate_field(image, background.rgb, &known)
+        background::estimate_field(image, background, &known).field
     };
+    // 作り直せなかったなら 1 回目のまま進む。**ここで 1 色へ落とすと、
+    // 効いたモデル（`field`）と実際に使った場が食い違う。** 門は 1 回目と
+    // 同じ帯・同じしきい値なので、通常はここへ来ない
+    if field.is_flat() {
+        return None;
+    }
     let residual = background::perimeter_residual(image, opts.border, background, &field);
     let mut flood = flood.clone();
     flood.core_tolerance = floodfill::core_tolerance(opts.tolerance, residual.p90);
     let mask = foreground_mask(image, &field, &flood);
-    (mask, field, residual)
+    Some((mask, field, residual))
 }
 
 /// 確定前景（`--fg-seed` の円を含む）を不透明へ塗り戻す。

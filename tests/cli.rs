@@ -2806,6 +2806,15 @@ fn a_frame_filling_object_never_earns_high_confidence() {
         "誤った矩形へ誘導している: {:?}",
         warning_codes(&v)
     );
+    // **「助言が出ない」だけでは、最悪の結果で通ってしまう。** 場が外周の
+    // 灰色を背景として学べば物体はまるごと消え、消えた結果として
+    // `BBOX_RECOMMENDED` も出なくなる。物体が残っていることまで言う
+    // （灰色 35% + 右下の四角で正解は 0.45 前後）
+    assert!(
+        v["mask"]["foreground_ratio"].as_f64().unwrap() > 0.40,
+        "物体が消えた結果として警告が消えている: {}",
+        v["mask"]
+    );
 }
 
 /// **同じ汚染構図を、リポジトリ自身の織り目テクスチャの上で固定する。**
@@ -2882,6 +2891,13 @@ fn the_same_poison_on_the_repositorys_own_texture_is_caught_too() {
         "誤った矩形へ誘導している: {:?}",
         warning_codes(&v)
     );
+    // 上と同じ理由で、物体が残っていることまで言う。**物体が消えれば
+    // 警告も消えるので、警告の不在だけを見ていると最悪の結果で通る**
+    assert!(
+        v["mask"]["foreground_ratio"].as_f64().unwrap() > 0.40,
+        "物体が消えた結果として警告が消えている: {}",
+        v["mask"]
+    );
 }
 
 /// 対照：外周に帯が掛かっていても、主体を捉えられていれば `high` のまま。
@@ -2948,9 +2964,18 @@ fn a_band_on_the_edge_does_not_cost_the_subject_its_confidence() {
         warning_codes(&v)
     );
 
-    // **既定（照明場）では助言そのものが要らなくなる。** 帯は背景として
-    // 吸われ、残るのは中央の商品だけになる。「残っています」と言われないこと
-    // までを対で押さえないと、場が効いたのか助言が壊れたのかを分けられない
+    // **既定（照明場）でも同じ答えになる。帯は場の材料から外れる。**
+    //
+    // 場の材料には 1 色の中央値からの色の門が掛かっており、この帯（ΔE 17.67）は
+    // 門（既定 15）の外側にある。吸わせようと門を広げると、**同じ ΔE の物体まで
+    // 背景として学ぶ**——`woven_poisoned_scene` の灰色の物体は ΔE 17.74 で、
+    // この帯と 0.07 しか違わない。色差だけでは「背景に落ちた影」と「背景に
+    // 置かれた物体」を分けられないので、**物体を消さない側へ倒してある**
+    // （門を 18 まで広げると、この帯は吸われる代わりに画面の 35% を占める
+    // 灰色の物体が消え、前景比率は 0.4461 → 0.1068 になる）。
+    //
+    // 残るのは 1 色モデルと同じ「bbox を勧める」で、これは**実行できる助言**
+    // である。帯が前景に残ること自体は矩形ひとつで解ける
     let auto = json_stdout(
         &kiri()
             .args([
@@ -2967,15 +2992,26 @@ fn a_band_on_the_edge_does_not_cost_the_subject_its_confidence() {
         auto["settings"]["background_model"], "field",
         "既定で照明場が効いていない: {auto}"
     );
-    assert_eq!(
-        auto["mask"]["touches_edge"], false,
-        "帯が前景として残っている: {auto}"
-    );
     let codes = warning_codes(&auto);
     assert!(
-        !codes.contains(&"BBOX_RECOMMENDED".to_string())
-            && !codes.contains(&"SUBJECT_TOUCHES_EDGE".to_string()),
-        "何も残っていないのに残っていると言っている: {codes:?}"
+        codes.contains(&"BBOX_RECOMMENDED".to_string()),
+        "解ける画像で助言が出ていない: {codes:?}"
+    );
+    assert!(
+        !codes.contains(&"SUBJECT_TOUCHES_EDGE".to_string()),
+        "見切れの誤診が復活している: {codes:?}"
+    );
+    // **1 色と同じ画素になっていること。** 場が効いていながら帯を吸わない以上、
+    // 結果は 1 色モデルと変わらないはずで、そこがずれていたら場が別の何かを
+    // 学んでいる
+    assert!(
+        (auto["mask"]["foreground_ratio"].as_f64().unwrap()
+            - v["mask"]["foreground_ratio"].as_f64().unwrap())
+        .abs()
+            < 0.01,
+        "1 色と場で結果が食い違っている: {} と {}",
+        auto["mask"],
+        v["mask"]
     );
 }
 

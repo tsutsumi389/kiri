@@ -195,6 +195,134 @@ pub const FIELD_LONG_SIDE: u32 = 256;
 /// 1 画素で足りるとすると商品の隙間から漏れた 1 点がセル全体の色を名乗る。
 const MIN_CELL_SAMPLE_DIVISOR: usize = 4;
 
+/// 場の材料に掛ける色の門の下限(ΔE)。
+///
+/// **場は「物体を表せてしまう」。** 材料の第一は外周の帯なので、商品が下端で
+/// 見切れていれば帯の 1 辺がまるごと商品の内部になり、場はそこで商品の色を
+/// 背景として学ぶ。学んだ場の上では商品は背景と一致し、**見切れた部分が
+/// まるごと消える**（実測で前景比率 0.315 → 0.172）。消えた結果
+/// `SUBJECT_TOUCHES_EDGE` も出なくなるので、エージェントからは成功に見える。
+///
+/// 外周の統計量で `auto` のゲートを切っても解けない——「照明勾配 + 見切れ」
+/// （uniformity 0.333 / 外周 ΔE p50 7.8）と R7（0.335 / 6.7）は区別がつかない。
+/// **場の構成そのものに門を掛ける**しかない。1 色の中央値から遠い画素は、
+/// どの源から来ていても材料にしない。物体は 1 色の中央値から遠く、照明ムラは
+/// 近い、という差だけを使う。
+///
+/// 門は `max(FLOOR, FACTOR * 外周 ΔE p50)` に置く。下限が要るのは、白背景に
+/// 見切れた商品という構図では p50 が 0.0 になるためで、倍率だけでは門が
+/// 閉じきってしまう。
+///
+/// # 下限は両側から挟んである
+///
+/// 上側は**同じ ΔE の影と物体**である。合成の「下端に境界すれすれの帯」
+/// （背景に落ちた影、ΔE 17.67）と `woven_poisoned_scene` の灰色の物体
+/// （ΔE 17.74）は **0.07 しか違わない**。門を 18 まで広げると帯は吸えるが、
+/// 同時に画面の 35% を占める灰色の物体を背景として学び、前景比率が
+/// 0.4461 → 0.1068 になる。**色差だけでは両者を分けられない**ので、
+/// 物体を消さない側へ倒してある——帯が前景に残るのは矩形ひとつで解けるが、
+/// 消えた物体は誰にも気づかれない。
+///
+/// 下側は背景自身のざらつきである。1 色に対する p50 がほぼ 0 の素材でも、
+/// JPEG の滲みやセンサーノイズは ΔE 5〜10 まで振れる（[`UNIFORM_DELTA_E`] が
+/// 「同じ色と言える」上限を 5 に置いている）。門をそこまで下げると背景自身が
+/// 材料から外れ、場が痩せる。15 はその 3 倍にあたる。
+///
+/// 掃引の実測は README の「場の材料に掛ける色の門」を参照。
+pub const FIELD_GATE_FLOOR: f64 = 15.0;
+
+/// 門を外周 ΔE p50 の何倍のところへ置くか。[`FIELD_GATE_FLOOR`] の対。
+///
+/// **2 倍は「背景自身の p90 あたり」を意味する。** 実素材の帯は p90 が p50 の
+/// 2.2〜2.5 倍に来る（実写リモコン 26.75 / 11.93 = 2.24、R7 16.7 / 6.73 = 2.48）。
+/// つまりこの倍率は「背景が自分で見せているばらつきまでは材料に入れ、
+/// その外は物体とみなす」と言っている。
+///
+/// ここも両側から挟んである。
+///
+/// | 倍率 | 実写リモコン（p50 11.9、bbox 無し tol 20） | 織り目の上の汚染（p50 7.04） |
+/// |---|---|---|
+/// | 1.85 未満 | **外周接触が残る**（門 22 未満で fg 0.221 / touches_edge） | 灰色の物体は残る |
+/// | 2.0 | fg 0.2187 / 外周接触なし | 物体は残る（fg 0.4461） |
+/// | 2.52 以上 | 外周接触なし | **灰色の物体が消える**（fg 0.1068） |
+pub const FIELD_GATE_FACTOR: f64 = 2.0;
+
+/// 門を通った帯の画素がこの割合を切ったら、場を諦めて 1 色へ落ちる。
+///
+/// 帯の大半が商品なら、残った材料から作る場は「商品の隙間から覗いた背景」の
+/// 外挿でしかない。**当てずっぽうの場より 1 色のほうが読める。**
+pub const MIN_BAND_MATERIAL: f64 = 0.30;
+
+/// 場の材料に掛ける色の門(ΔE)。
+pub fn field_gate(background: &BackgroundEstimate) -> f64 {
+    (background.delta_e.p50 * FIELD_GATE_FACTOR).max(FIELD_GATE_FLOOR)
+}
+
+/// 色の門を、量子化した表で速く引く。
+///
+/// 門は画素ごとに掛かる。20MP の帯は 200 万画素あり、素直に `delta_e_rgb` を
+/// 呼ぶと 1 画素あたり 3 回の `cbrt` で場の推定が桁で重くなる（予算 30ms に
+/// 対して 100ms 級）。
+///
+/// **量子化しても答えは変わらない。** 6bit x 3 に丸めた代表色で 1 度だけ測り、
+/// 門から `GATE_MARGIN` 以上離れていればその区画の判定を使い回す。境目付近の
+/// 色だけは正確に測り直すので、**素直に全画素を測ったのと同じ答え**になる
+/// （`the_quantised_gate_answers_exactly_like_the_naive_one` が固定している）。
+struct ColourGate {
+    base: [u8; 3],
+    limit: f64,
+    /// 6bit x 3 の区画ごとの判定。0=未測定 / 1=通す / 2=弾く / 3=境目（毎回測る）
+    table: Vec<u8>,
+}
+
+/// 区画の代表色からの ΔE がこれ以上離れていれば、区画の中のどの色でも
+/// 判定は変わらない。
+///
+/// 1 区画は各チャンネル 4 段（代表色から ±2）ぶんの広がりを持つ。暗部では
+/// L\* が 1 段あたり 0.3 ほど動き、中間調では a\* が 1 段あたり 1.3 ほど動くので、
+/// 区画の中の ΔE の振れ幅は最大でも 4 前後にしかならない。倍の余裕を取る。
+const GATE_MARGIN: f64 = 8.0;
+
+impl ColourGate {
+    fn new(base: [u8; 3], limit: f64) -> Self {
+        Self {
+            base,
+            limit,
+            // 6bit x 3 = 262144 区画。1 区画 1 バイトで 256KB
+            table: vec![0u8; 1 << 18],
+        }
+    }
+
+    #[inline]
+    fn passes(&mut self, rgb: [u8; 3]) -> bool {
+        let key = (usize::from(rgb[0] >> 2) << 12)
+            | (usize::from(rgb[1] >> 2) << 6)
+            | usize::from(rgb[2] >> 2);
+        let verdict = match self.table[key] {
+            0 => {
+                // 区画の代表色（各チャンネルの中央）で 1 度だけ測る
+                let rep = rgb.map(|c| (c & !3) | 2);
+                let d = delta_e_rgb(rep, self.base);
+                let v = if d + GATE_MARGIN < self.limit {
+                    1
+                } else if d - GATE_MARGIN > self.limit {
+                    2
+                } else {
+                    3
+                };
+                self.table[key] = v;
+                v
+            }
+            v => v,
+        };
+        match verdict {
+            1 => true,
+            2 => false,
+            _ => delta_e_rgb(rgb, self.base) <= self.limit,
+        }
+    }
+}
+
 /// 正規化畳み込みの σ を格子の長辺の何分の一に置くか。
 ///
 /// **核は前線を進めるためだけにある。** 未知の領域を橋渡しするのは
@@ -203,28 +331,47 @@ const MIN_CELL_SAMPLE_DIVISOR: usize = 4;
 ///
 /// 2 つの実測で挟んである。
 ///
-/// | σ | R7 defaults の輪郭誤差 | 汚染シーンの信頼度 |
+/// | σ | R7 defaults の輪郭誤差 | 20MP の場の推定 |
 /// |---|---|---|
-/// | 長辺/8 | 1.65 | low |
-/// | 長辺/16 | 0.41 | **high（誤り）** |
-/// | 長辺/32 | 0.41 | low |
-/// | 長辺/64 | 0.41 | low |
-/// | 長辺/128 | 0.41 | low |
+/// | 長辺/8 | **1.99（予算 1.0 超過）** | 25.6 ms |
+/// | 長辺/16 | 0.41 | 25.7 ms |
+/// | 長辺/32 | 0.41 | 27.8 ms |
+/// | 長辺/64 | 0.41 | 29.7 ms |
+/// | 長辺/128 | 0.41 | **34.9 ms（予算 30ms 超過）** |
 ///
-/// 下側は R7（照明勾配のある紙 + 黒商品）で、1/8 では勾配を追いきれない。
-/// 上側は「画面外へ抜ける大きな物体」（左 35% が灰色、残りが白）で、1/16 の
-/// 核は 2 色の段差を幅 0.4 の帯へ塗り広げ、**その帯がまとまった塊に見えて
-/// 誤った矩形が `high` で返る**。1/32 は両側から離れている。
+/// 下側は R7（照明勾配のある紙 + 黒商品）で、1/8 では核が広すぎて勾配を
+/// 追いきれない（輪郭誤差 1.99）。上側は費用である——核が狭いほど前線が
+/// 1 回で進まず、埋め直しの回数が増える。1/128 は 20MP で 34.9ms かかり、
+/// 設計の予算（30ms）を超える。1/32 は両側から離れている。
+///
+/// **上側の根拠は入れ替わった。** Phase 4 の最初の較正では「1/16 の核が
+/// 2 色の段差を塗り広げ、その帯がまとまった塊に見えて `subject` が誤って
+/// `high` を返す」を上限にしていたが、主体の検出は 1 色の背景に対して行うと
+/// 決めた（`cutout/mod.rs` の `analyse_background`）ので、**その測定は
+/// 出荷コードでは再現しない**。費用のほうは誰でも測り直せる。
 const FILL_SIGMA_DIVISOR: f32 = 32.0;
+
+/// 正規化畳み込みで「届いた」と認める重みの下限。
+///
+/// **値 / 重みの割り算なので、重みが小さいほど誤差が拡大する。** 箱ぼかしを
+/// f32 の走る移動平均で回している以上、重みそのものが 1e-7 級の絶対誤差を
+/// 持つ。1e-6 で割れば誤差はそのまま 10% 級になり、既知の値をどう混ぜても
+/// 作れないはずの色（白い背景の下で青が 255 まで振り切れる）が出る。
+///
+/// 1e-3 は「1000 セルに 1 つぶんの重みは届いている」という水準で、ここまで
+/// 来れば比は素直に既知の値の加重平均になる。届かないセルは次の回へ持ち越され、
+/// 1 セルも進まなければ σ が 2 倍になるので、下げても埋まらないままにはならない。
+const MIN_FILL_WEIGHT: f32 = 1e-3;
 
 /// 埋め終わった格子を均す σ(セル)。格子の段差をそのまま場の段差にしないため。
 const SMOOTH_SIGMA: f32 = 1.0;
 
-/// 全セルが埋まった後、さらに何回ぼかし直して緩めるか。
+/// 全セルが埋まってから、**その回を 1 回目と数えて**何回まわすか。
 ///
 /// 埋めた順番（どの回で前線が届いたか）を場の形に残さないために要る。
 /// 既知のセルは毎回もとの値で打ち直されるので、回数を増やしても測れた値が
-/// 鈍ることはない。実測では 3 回で隣接差の跳ねが消えた。
+/// 鈍ることはない。全セルが埋まった回を含めて 4 回、つまり**埋め終わった後の
+/// 余分は 3 回**で隣接差の跳ねが消えた。
 const FILL_SETTLE_ROUNDS: usize = 4;
 
 /// 背景を位置の関数として持つ。
@@ -425,11 +572,18 @@ impl KnownBackground<'_> {
         off_band && inside(self.outside_bbox) && inside(self.outside_subject)
     }
 
+    /// 外周の帯の上か。**場を諦めるかどうかは帯だけで決める。**
+    /// `--bbox` の外や確定背景は利用者が与えたもので、「この素材から場を
+    /// 作れるか」は kiri 自身が見た帯の話である。
+    #[inline]
+    fn on_band(&self, x: u32, y: u32, w: u32, h: u32) -> bool {
+        self.band > 0
+            && (x < self.band || y < self.band || x + self.band >= w || y + self.band >= h)
+    }
+
     #[inline]
     fn holds(&self, x: u32, y: u32, i: usize, w: u32, h: u32) -> bool {
-        if self.band > 0
-            && (x < self.band || y < self.band || x + self.band >= w || y + self.band >= h)
-        {
+        if self.on_band(x, y, w, h) {
             return true;
         }
         if let Some((x1, y1, x2, y2)) = self.outside_bbox {
@@ -456,6 +610,19 @@ impl KnownBackground<'_> {
     }
 }
 
+/// 場の推定の結果。
+///
+/// 場そのものと、**門を通った帯の画素の割合**を返す。割合が
+/// [`MIN_BAND_MATERIAL`] を切ったときは場を諦めて 1 色（`field.is_flat()`）で
+/// 返す。呼び出し側はそれを見て `settings.background_model` を `flat` に戻し、
+/// `BACKGROUND_FIELD_SKIPPED` を出す。
+pub struct FieldEstimate {
+    pub field: BackgroundField,
+    /// 外周の帯の不透明な画素のうち、色の門を通った割合。帯を使わない
+    /// 呼び出し（単体テスト）では 0.0
+    pub band_material: f64,
+}
+
 /// 照明場 B(x, y) を推定する。
 ///
 /// 手順は決定的で、乱択を使わない。
@@ -467,17 +634,28 @@ impl KnownBackground<'_> {
 ///    埋める。σ は格子の長辺の 1/8 から始め、全セルが埋まるまで 2 倍ずつ広げる
 /// 3. 既知のセルを自分の中央値で上書きし、最後に σ = 1 セルで全体を均す
 ///
+/// **どの源から来た画素にも同じ色の門が掛かる**（[`FIELD_GATE_FLOOR`]）。
+/// 帯・`--bbox` の外・確定背景・2 回目のパスの背景のどれであっても、
+/// 1 色の中央値から遠い画素は材料にしない。
+///
 /// 既知の画素が 1 つも無ければ 1 色の場を返す。場を名乗りながら中身が
 /// 空の格子になるより、素直に 1 色へ落ちるほうが挙動を読める。
 pub fn estimate_field(
     image: &RgbaImage,
-    rgb: [u8; 3],
+    background: &BackgroundEstimate,
     known: &KnownBackground<'_>,
-) -> BackgroundField {
+) -> FieldEstimate {
+    let rgb = background.rgb;
     let (w, h) = (image.width(), image.height());
+    let flat = |band_material: f64| FieldEstimate {
+        field: BackgroundField::flat(rgb),
+        band_material,
+    };
     if w == 0 || h == 0 {
-        return BackgroundField::flat(rgb);
+        return flat(0.0);
     }
+    let mut gate = ColourGate::new(rgb, field_gate(background));
+    let (mut band_seen, mut band_kept) = (0u64, 0u64);
     let side = FIELD_LONG_SIDE;
     let long = w.max(h);
     let (cols, rows) = if long <= side {
@@ -527,6 +705,14 @@ pub fn estimate_field(
                     if p[3] < 250 || !known.holds(x, y, i, w, h) {
                         continue;
                     }
+                    // 帯の画素がどれだけ門を通ったかを数える。**帯の大半が商品なら
+                    // 場そのものを諦める**ための材料で、門より先に数える
+                    let on_band = known.on_band(x, y, w, h);
+                    band_seen += u64::from(on_band);
+                    if !gate.passes([p[0], p[1], p[2]]) {
+                        continue;
+                    }
+                    band_kept += u64::from(on_band);
                     samples.push([p[0], p[1], p[2]]);
                 }
             }
@@ -548,11 +734,27 @@ pub fn estimate_field(
         }
     }
 
+    let band_material = if band_seen == 0 {
+        0.0
+    } else {
+        band_kept as f64 / band_seen as f64
+    };
+    // **帯の大半が門に弾かれたなら、場は当てずっぽうにしかならない。**
+    // 残った材料は「商品の隙間から覗いた背景」でしかなく、そこから外挿した
+    // 場は商品の真上で何を言うか分からない。1 色へ落ちるほうが読める
+    if band_seen > 0 && band_material < MIN_BAND_MATERIAL {
+        return flat(band_material);
+    }
     if weight.iter().all(|&v| v == 0.0) {
-        return BackgroundField::flat(rgb);
+        return flat(band_material);
     }
 
-    let filled = fill_unknown(cols, rows, &value, &weight);
+    let fallback = [
+        lut[rgb[0] as usize],
+        lut[rgb[1] as usize],
+        lut[rgb[2] as usize],
+    ];
+    let filled = fill_unknown(cols, rows, &value, &weight, fallback);
     let mut linear = filled;
     // 既知のセルは自分の中央値へ戻す。畳み込みは未知を埋めるためのもので、
     // 測れた値を平らにならすためのものではない
@@ -566,16 +768,19 @@ pub fn estimate_field(
     gaussian3(cols, rows, &mut linear, SMOOTH_SIGMA);
 
     let lab = linear.iter().map(|&c| linear_to_lab(c)).collect();
-    BackgroundField {
-        rgb,
-        grid: Some(FieldGrid {
-            cols,
-            rows,
-            sx: cols as f32 / w as f32,
-            sy: rows as f32 / h as f32,
-            linear,
-            lab,
-        }),
+    FieldEstimate {
+        field: BackgroundField {
+            rgb,
+            grid: Some(FieldGrid {
+                cols,
+                rows,
+                sx: cols as f32 / w as f32,
+                sy: rows as f32 / h as f32,
+                linear,
+                lab,
+            }),
+        },
+        band_material,
     }
 }
 
@@ -597,7 +802,18 @@ pub fn estimate_field(
 ///
 /// σ を 2 倍にするのは「1 回で 1 セルも埋まらなかった」ときだけにする。
 /// 商品に囲まれて核がどこにも届かない領域のための逃げ道である。
-fn fill_unknown(cols: usize, rows: usize, value: &[[f32; 3]], weight: &[f32]) -> Vec<[f32; 3]> {
+///
+/// それでも届かなかったセルは `fallback`（大域の 1 色）で埋める。回数の上限に
+/// 当たって抜けた場合の受け皿で、**最悪でも 1 色に落ちる**ことを保証する。
+/// 0 のまま残すと、そのセルだけ黒い場になって画像のその一角が丸ごと
+/// 「背景から遠い」と判定される。
+fn fill_unknown(
+    cols: usize,
+    rows: usize,
+    value: &[[f32; 3]],
+    weight: &[f32],
+    fallback: [f32; 3],
+) -> Vec<[f32; 3]> {
     let known: Vec<bool> = weight.iter().map(|&w| w > 0.0).collect();
     let mut out = value.to_vec();
     if known.iter().all(|&k| k) {
@@ -629,7 +845,7 @@ fn fill_unknown(cols: usize, rows: usize, value: &[[f32; 3]], weight: &[f32]) ->
                 continue;
             }
             let d = den[cell][0];
-            if d > 1e-6 {
+            if d > MIN_FILL_WEIGHT {
                 out[cell] = [num[cell][0] / d, num[cell][1] / d, num[cell][2] / d];
                 if !covered[cell] {
                     covered[cell] = true;
@@ -648,6 +864,13 @@ fn fill_unknown(cols: usize, rows: usize, value: &[[f32; 3]], weight: &[f32]) ->
         settled += 1;
         if settled >= FILL_SETTLE_ROUNDS {
             break;
+        }
+    }
+    // 覆いきれずに抜けたセルを 1 色で埋める。ここへ来るのは回数の上限に
+    // 当たった場合だけで、通常は 1 セルも残らない
+    for (cell, slot) in out.iter_mut().enumerate() {
+        if !covered[cell] {
+            *slot = fallback;
         }
     }
     out
@@ -970,12 +1193,27 @@ mod tests {
         let est = estimate_background(img, DEFAULT_BORDER);
         estimate_field(
             img,
-            est.rgb,
+            &est,
             &KnownBackground {
                 band: field_band(img, DEFAULT_BORDER),
                 ..Default::default()
             },
         )
+        .field
+    }
+
+    /// 1 色と、それに対する分布が完全に均一な背景の見立て。
+    ///
+    /// 門は `max(FLOOR, FACTOR * p50)` なので、p50 を 0 に置けば門は下限
+    /// （ΔE 15）に座る。材料に何が入るかを直接書けるようにするための道具。
+    fn uniform_estimate(rgb: [u8; 3]) -> BackgroundEstimate {
+        BackgroundEstimate {
+            rgb,
+            uniformity: 1.0,
+            samples: 100,
+            delta_e: quantiles(&[]),
+            texture: GradientQuantiles::default(),
+        }
     }
 
     /// 左から右へ明度が変わる背景。照明の勾配を最小構成で作る。
@@ -1121,9 +1359,13 @@ mod tests {
     #[test]
     fn a_field_without_any_known_pixel_falls_back_to_one_colour() {
         let img = solid(64, 64, [200, 200, 200, 255]);
-        let field = estimate_field(&img, [200, 200, 200], &KnownBackground::default());
-        assert!(field.is_flat(), "材料が無いのに場を名乗っている");
-        assert_eq!(field.rgb_at(10, 10), [200, 200, 200]);
+        let built = estimate_field(
+            &img,
+            &uniform_estimate([200, 200, 200]),
+            &KnownBackground::default(),
+        );
+        assert!(built.field.is_flat(), "材料が無いのに場を名乗っている");
+        assert_eq!(built.field.rgb_at(10, 10), [200, 200, 200]);
     }
 
     /// 場の推定は決定的である。乱択を使っていないことを直接押さえる。
@@ -1174,17 +1416,141 @@ mod tests {
         // 商品の矩形の外だけを既知にする
         let field = estimate_field(
             &img,
-            [240, 240, 238],
+            &uniform_estimate([240, 240, 238]),
             &KnownBackground {
                 outside_subject: Some((55, 55, 185, 185)),
                 ..Default::default()
             },
-        );
+        )
+        .field;
         assert!(
             field.rgb_at(120, 120)[0] > 200,
             "商品の色が場に混ざった: {:?}",
             field.rgb_at(120, 120)
         );
+    }
+
+    /// **量子化した門は、素直に全画素を測ったのと同じ答えを返す。**
+    ///
+    /// 表は 6bit x 3 の区画ごとに 1 度だけ測るが、門から `GATE_MARGIN` 以内の
+    /// 区画は毎回測り直す。速いだけで答えが変わるなら、それは別の実装である。
+    #[test]
+    fn the_quantised_gate_answers_exactly_like_the_naive_one() {
+        for base in [[250u8, 250, 248], [178, 174, 167], [85, 78, 70], [0, 0, 0]] {
+            for limit in [5.0, 15.0, 23.9, 47.7, 86.5] {
+                let mut gate = ColourGate::new(base, limit);
+                // 8bit の全域を隈なく踏む。素数刻みにするのは、区画の境目
+                // （4 の倍数）にだけ当たって通り過ぎないようにするため
+                for r in (0..256).step_by(7) {
+                    for g in (0..256).step_by(11) {
+                        for b in (0..256).step_by(13) {
+                            let rgb = [r as u8, g as u8, b as u8];
+                            let naive = delta_e_rgb(rgb, base) <= limit;
+                            assert_eq!(
+                                gate.passes(rgb),
+                                naive,
+                                "{rgb:?} を base={base:?} limit={limit} で取り違えた"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// **門が商品を場の材料から外す。** C1 そのものの単体版である。
+    ///
+    /// 白背景の下端に黒い商品が掛かっている。門が無ければ下端のセルは商品の
+    /// 色を学び、そこだけ場が真っ黒になる。
+    #[test]
+    fn the_colour_gate_keeps_a_cropped_product_out_of_the_field() {
+        let mut img = solid(240, 240, [250, 250, 248, 255]);
+        for y in 160..240 {
+            for x in 40..200 {
+                img.put_pixel(x, y, Rgba([40, 40, 44, 255]));
+            }
+        }
+        let field = field_from_border(&img);
+        // 商品の真上でも場は白のまま。1 色から ΔE 1 も離れない
+        let at = field.rgb_at(120, 200);
+        assert!(
+            delta_e_rgb(at, [250, 250, 248]) < 1.0,
+            "商品の色を背景として学んでいる: {at:?}"
+        );
+        assert!(
+            field.range()[1] < 1.0,
+            "場が振れている: {:?}",
+            field.range()
+        );
+    }
+
+    /// 帯の大半が門に弾かれたら、場を名乗らずに 1 色へ落ちる。
+    ///
+    /// 商品が画面をほぼ埋め、背景が髪の毛ほどの縁にしか写っていない構図。
+    /// 色の推定に使う外周（`--border` 1px）はきれいな白なので背景色は正しく
+    /// 求まるが、**場の材料に使う 3% の帯は 85% が商品**である。そこから
+    /// 作る場は「商品の隙間から覗いた背景」の外挿でしかない。
+    #[test]
+    fn a_band_that_is_mostly_not_background_gives_up_on_the_field() {
+        let mut img = solid(240, 240, [250, 250, 248, 255]);
+        for y in 1..239 {
+            for x in 1..239 {
+                img.put_pixel(x, y, Rgba([40, 40, 44, 255]));
+            }
+        }
+        let est = estimate_background(&img, 1);
+        assert_eq!(est.rgb, [250, 250, 248], "背景色は正しく求まっている");
+        let built = estimate_field(
+            &img,
+            &est,
+            &KnownBackground {
+                band: field_band(&img, 1),
+                ..Default::default()
+            },
+        );
+        assert!(
+            built.band_material < MIN_BAND_MATERIAL,
+            "材料の割合が下限を超えている: {}",
+            built.band_material
+        );
+        assert!(
+            built.field.is_flat(),
+            "材料が痩せているのに場を名乗っている（材料 {:.2}）",
+            built.band_material
+        );
+        assert_eq!(built.field.rgb_at(120, 120), [250, 250, 248]);
+    }
+
+    /// 均一な背景では帯がまるごと材料になる。上の対照。
+    #[test]
+    fn a_clean_band_is_almost_entirely_material() {
+        let img = solid(240, 240, [248, 248, 247, 255]);
+        let est = estimate_background(&img, DEFAULT_BORDER);
+        let built = estimate_field(
+            &img,
+            &est,
+            &KnownBackground {
+                band: field_band(&img, DEFAULT_BORDER),
+                ..Default::default()
+            },
+        );
+        assert_eq!(built.band_material, 1.0);
+        assert!(!built.field.is_flat());
+    }
+
+    /// **覆いきれなかったセルは 1 色で埋める。** 0 のまま残すと、そのセルだけ
+    /// 黒い場になって画像のその一角が丸ごと「背景から遠い」と判定される。
+    #[test]
+    fn cells_the_convolution_never_reached_fall_back_to_the_one_colour() {
+        // 既知のセルが 1 つも無い格子を直接渡す。`estimate_field` は手前で
+        // 1 色へ落とすので、ここは `fill_unknown` そのものを問う
+        let (cols, rows) = (4, 3);
+        let value = vec![[0f32; 3]; cols * rows];
+        let weight = vec![0f32; cols * rows];
+        let out = fill_unknown(cols, rows, &value, &weight, [0.5, 0.25, 0.125]);
+        for cell in out {
+            assert_eq!(cell, [0.5, 0.25, 0.125], "1 色へ落ちていない");
+        }
     }
 
     #[test]

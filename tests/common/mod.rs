@@ -1864,6 +1864,73 @@ pub fn split_background_scene(width: u32, height: u32) -> RgbaImage {
     img
 }
 
+/// 画面の下端で見切れた商品。**照明場が商品を学んでしまう構図**である。
+///
+/// 商品は横 15%〜85%、縦は下端から `depth`% を占める。下辺の 70% がまるごと
+/// 商品の内部になるので、外周の帯（短辺の 3%）の **17.5% が商品**になる。
+/// 場の材料の第一は帯なので、門を掛けなければ場はそこで商品の色を背景として
+/// 学び、見切れた部分がまるごと消える。
+///
+/// **EC でいちばん多い構図である。** 正解の前景比率は `0.70 * depth / 100`
+/// ちょうどで、1 色モデル（`flat`）はこれを正しく返す。
+///
+/// `gradient` は背景に掛ける照明の傾き（左上と右下の明度係数）。`None` なら
+/// 真っ平らな白背景で、外周 ΔE の p50 は 0.0 になる——**倍率だけの門では
+/// 閉じきってしまう**ので、門に下限が要ることの根拠になるシーンである。
+pub fn cropped_product_scene(
+    width: u32,
+    height: u32,
+    depth: u32,
+    gradient: Option<(f32, f32)>,
+) -> RgbaImage {
+    let mut img = RgbaImage::new(width, height);
+    for y in 0..height {
+        for x in 0..width {
+            let k = match gradient {
+                None => 1.0,
+                Some((from, to)) => {
+                    let t = (x as f32 / width as f32 + y as f32 / height as f32) / 2.0;
+                    from + (to - from) * t
+                }
+            };
+            let v = |c: f32| (c * k).round().clamp(0.0, 255.0) as u8;
+            img.put_pixel(x, y, Rgba([v(250.0), v(250.0), v(248.0), 255]));
+        }
+    }
+    let (x1, x2) = (width * 15 / 100, width * 85 / 100);
+    let y1 = height - height * depth / 100;
+    for y in y1..height {
+        for x in x1..x2 {
+            img.put_pixel(x, y, Rgba([40, 40, 44, 255]));
+        }
+    }
+    img
+}
+
+/// 4 辺すべてへ抜ける大きな商品。
+///
+/// 画像より一回り大きい円（半径は短辺の 0.525 倍）を中央に置く。各辺の
+/// 3 割ほどが商品になるので外周の中央値は背景のままだが、**帯の材料の
+/// 大半は商品**になる。門を通った材料が痩せきったときに場を諦める規則
+/// （`MIN_BAND_MATERIAL`）が効く唯一のシーンである。
+///
+/// 正解の前景比率は円と矩形の交わりで 0.846。
+pub fn oversized_product_scene(width: u32, height: u32) -> RgbaImage {
+    let mut img = RgbaImage::from_pixel(width, height, Rgba([250, 250, 248, 255]));
+    let (cx, cy) = (width as f64 / 2.0, height as f64 / 2.0);
+    let r = f64::from(width.min(height)) * 0.525;
+    for y in 0..height {
+        for x in 0..width {
+            let dx = f64::from(x) + 0.5 - cx;
+            let dy = f64::from(y) + 0.5 - cy;
+            if dx * dx + dy * dy <= r * r {
+                img.put_pixel(x, y, Rgba([40, 40, 44, 255]));
+            }
+        }
+    }
+    img
+}
+
 /// 白背景に「ほぼ白い商品」を置いた、切り抜きの最難ケース。
 ///
 /// 商品本体と背景の色差はごくわずかで、両者を分ける手がかりは商品の輪郭に

@@ -382,20 +382,27 @@ impl Protected<'_> {
 /// 動かさない**。
 enum FieldLab<'a> {
     Flat(LabQ),
-    Grid(&'a BackgroundField),
+    Grid {
+        field: &'a BackgroundField,
+        /// 格子を引けなかったときに返す大域の 1 色。**黒を返さない**——
+        /// 場を引けない画素が現れた日に、その一角が丸ごと「背景から遠い」と
+        /// 判定されて商品として残るより、1 色モデルと同じ答えへ落ちるほうがよい
+        flat: LabQ,
+    },
 }
 
 impl<'a> FieldLab<'a> {
     fn of(field: &'a BackgroundField, lut: &[f32; 256]) -> Self {
+        let rgb = field.rgb();
+        let flat = quantize(linear_to_lab([
+            lut[rgb[0] as usize],
+            lut[rgb[1] as usize],
+            lut[rgb[2] as usize],
+        ]));
         if field.is_flat() {
-            let rgb = field.rgb();
-            FieldLab::Flat(quantize(linear_to_lab([
-                lut[rgb[0] as usize],
-                lut[rgb[1] as usize],
-                lut[rgb[2] as usize],
-            ])))
+            FieldLab::Flat(flat)
         } else {
-            FieldLab::Grid(field)
+            FieldLab::Grid { field, flat }
         }
     }
 
@@ -404,10 +411,10 @@ impl<'a> FieldLab<'a> {
         match self {
             FieldLab::Flat(lab) => *lab,
             // 場を持つときだけ格子を引く。`lab_at` が `None` を返すのは
-            // 1 色のときだけなので、ここへは届かない
-            FieldLab::Grid(field) => match field.lab_at(x, y) {
+            // 1 色のときだけなので、通常ここへは届かない
+            FieldLab::Grid { field, flat } => match field.lab_at(x, y) {
                 Some(lab) => quantize(lab),
-                None => quantize([0.0; 3]),
+                None => *flat,
             },
         }
     }

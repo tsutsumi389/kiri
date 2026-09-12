@@ -24,6 +24,7 @@ use kiri::cutout::diagnostics::{CONTOUR_ROUGH_WARN, RIM_CONTAMINATION_WARN};
 use kiri::cutout::{CutoutOptions, Diagnostics, cutout};
 
 /// ベンチの 1 点。シーンと設定の組。
+#[derive(Clone)]
 struct Point {
     label: String,
     metrics: EdgeMetrics,
@@ -64,6 +65,63 @@ fn bench() -> Vec<Point> {
         }
     }
     points
+}
+
+/// 較正の母集団をどちら側に置くか。**正解だけで決める。**
+///
+/// クリーン側を「受け入れ基準が名指しするシーン」に限ると、較正がテストを見て
+/// テストが較正を見ることになる。指標そのものの値は一切見ずに、正解由来の
+/// `contour_error` / `rim_truth` だけで分ける。間に挟まる点はどちらにも
+/// 使わない——正解が「欠陥がある」とも「無い」とも言っていないのだから、
+/// しきい値を縛る資格が無い。
+#[derive(PartialEq, Debug, Clone, Copy)]
+enum Side {
+    Clean,
+    Defective,
+    /// 正解がどちらとも言っていない
+    Between,
+}
+
+/// 輪郭の粗さの母集団。境目は「長辺 1000px 換算で何 px ずれているか」。
+///
+/// 1.0 未満は納品寸法で 1px を切るので見えない。3.0 以上は design.md が
+/// 「1000px の素材で 3px なら見える」と書いた、その 3px である。
+fn roughness_side(m: &EdgeMetrics) -> Side {
+    match m.contour_error {
+        e if e < 1.0 => Side::Clean,
+        e if e >= 3.0 => Side::Defective,
+        _ => Side::Between,
+    }
+}
+
+/// 縁の汚染の母集団。境目は「帯の何割が真の背景か」。
+///
+/// 1% は点々としか残らない。10% は、帯（換算 3px）の 1 割が純粋な背景と
+/// いうことで、輪郭ぐるりに 0.3px の縁が乗っているのと同じになる。
+fn contamination_side(m: &EdgeMetrics) -> Side {
+    match m.rim_truth {
+        r if r < 0.01 => Side::Clean,
+        r if r >= 0.10 => Side::Defective,
+        _ => Side::Between,
+    }
+}
+
+/// 母集団の両端。(クリーン側の最大, 欠陥側の最小)。
+fn window(
+    points: &[Point],
+    side: fn(&EdgeMetrics) -> Side,
+    value: fn(&Point) -> Option<f64>,
+) -> (f64, f64) {
+    let pick = |want: Side| -> Vec<f64> {
+        points
+            .iter()
+            .filter(|p| side(&p.metrics) == want)
+            .filter_map(value)
+            .collect()
+    };
+    let clean = pick(Side::Clean).into_iter().fold(f64::MIN, f64::max);
+    let defective = pick(Side::Defective).into_iter().fold(f64::MAX, f64::min);
+    (clean, defective)
 }
 
 fn point<'a>(points: &'a [Point], label: &str) -> &'a Point {
@@ -262,6 +320,12 @@ fn a_three_pixel_strap_is_not_called_a_rough_contour() {
 /// 順位で見るのは、両者の単位も分布も違うためである（輪郭誤差は px、粗さも px
 /// だが基準が違い、実写背景の既定値では 100px を超える）。
 ///
+/// **`defaults` を除いた部分集合でも見る。** R シーンの既定値は切り抜きその
+/// ものが失敗している壊滅ケースで、そこだけで順位が付いてしまうと「実用域で
+/// 正解と同じ向きに動くか」を確かめたことにならない。全点は 0.7、壊滅ケースを
+/// 抜いた 20 点は 0.5 を下限にする——標本が 3 分の 2 に減り、値の幅も桁で
+/// 狭まるので、同着が増えて ρ は原理的に下がる。
+///
 /// Spearman は自前で書く。依存を足すほどの計算ではない。
 #[test]
 fn the_diagnostics_track_the_truth() {
@@ -275,8 +339,98 @@ fn the_diagnostics_track_the_truth() {
         let rho = spearman(&samples);
         assert!(
             rho >= 0.7,
-            "{name}: 正解と相関していない: ρ={rho:.3} ({} 点)",
-            samples.len()
+            "{name}: 正解と相関していない: ρ={rho:.3} ({} 点)\n{}",
+            samples.len(),
+            listing(&points, name)
+        );
+    }
+    for (name, samples) in correlated(&without_broken_cuts(&points)) {
+        let rho = spearman(&samples);
+        assert!(
+            rho >= 0.5,
+            "{name}: 壊滅ケースを除くと正解と相関していない: ρ={rho:.3} ({} 点)\n{}",
+            samples.len(),
+            listing(&points, name)
+        );
+    }
+}
+
+/// R シーンの `defaults`——切り抜きそのものが失敗している点——を除いた部分集合。
+fn without_broken_cuts(points: &[Point]) -> Vec<Point> {
+    points
+        .iter()
+        .filter(|p| !p.label.ends_with("/ defaults"))
+        .cloned()
+        .collect()
+}
+
+/// 失敗したときに、ρ だけでなく各点の値を出す。
+///
+/// **ρ が下がったことより、どの点が順位を崩したかが知りたい。** 27 点を
+/// 目で追えるだけの量しかないのだから、出さない理由が無い。
+fn listing(points: &[Point], metric: &str) -> String {
+    let mut out = String::new();
+    for p in points {
+        let (value, truth) = if metric == "contour_roughness" {
+            (
+                p.diagnostics.contour_roughness,
+                f64::from(p.metrics.contour_error),
+            )
+        } else {
+            (
+                p.diagnostics.rim_contamination,
+                f64::from(p.metrics.rim_truth),
+            )
+        };
+        let shown = value.map_or("null".to_string(), |v| format!("{v:.3}"));
+        out.push_str(&format!(
+            "  {:<44} {:>8} / 正解 {:.3}\n",
+            p.label, shown, truth
+        ));
+    }
+    out
+}
+
+/// しきい値が、正解で分けた 2 つの群のあいだに入っていること。
+///
+/// **これは較正そのものの回帰テストである。** 母集団は正解だけで決まる
+/// （`roughness_side` / `contamination_side`）ので、しきい値を動かしても
+/// 母集団は動かない。クリーン側の最大としきい値のあいだ、しきい値と欠陥側の
+/// 最小のあいだに、それぞれ余裕があることを固定する。
+///
+/// 規則は「クリーン最大の 2 倍以上、かつ欠陥最小の 1/2 以下」だが、粗さの側は
+/// 窓が 4% だけ空かない（S5、幅 3px のストラップ）。**1.9 倍で固定するのは
+/// その事実を含めて動かさないためである**——ここが 1.9 を割ったら、それは
+/// 較正が壊れたということである。
+#[test]
+fn the_thresholds_sit_between_the_clean_and_the_defective() {
+    let points = bench();
+    for (name, threshold, margin, side, value) in [
+        (
+            "contour_roughness",
+            CONTOUR_ROUGH_WARN,
+            1.9,
+            roughness_side as fn(&EdgeMetrics) -> Side,
+            (|p: &Point| p.diagnostics.contour_roughness) as fn(&Point) -> Option<f64>,
+        ),
+        (
+            "rim_contamination",
+            RIM_CONTAMINATION_WARN,
+            2.0,
+            contamination_side as fn(&EdgeMetrics) -> Side,
+            (|p: &Point| p.diagnostics.rim_contamination) as fn(&Point) -> Option<f64>,
+        ),
+    ] {
+        let (clean, defective) = window(&points, side, value);
+        assert!(
+            clean * margin <= threshold,
+            "{name}: クリーン側の最大 {clean:.3} がしきい値 {threshold} に近すぎる\n{}",
+            listing(&points, name)
+        );
+        assert!(
+            defective >= threshold * margin,
+            "{name}: 欠陥側の最小 {defective:.3} がしきい値 {threshold} に近すぎる\n{}",
+            listing(&points, name)
         );
     }
 }
@@ -303,10 +457,17 @@ fn a_real_background_scene_is_deterministic() {
 
 /// 診断の追加コストが切り抜き全体を圧迫しないこと。
 ///
-/// 絶対時間は機械によって何倍も違うので、同じ画像の `cutout()` 全体との比で見る
+/// 絶対時間は機械によって何倍も違うので、同じ画像の `cutout()` との比で見る
 /// （`refine_does_not_scale_with_the_area_of_the_window` と同じ流儀）。
-/// 診断は距離変換 2 本と箱ぼかし 6 パス、格子の箱和 2 面を回すので、
-/// 面積に比例はするが係数が小さい。
+///
+/// **分母から診断を引く。** `cutout()` は中で `diagnose()` を呼ぶので、
+/// そのまま割ると「全体のうち何割か」になり、診断が重くなるほど分母も
+/// 太って比が鈍る（診断が全体の 100% を占めても比は 1.0 にしかならない）。
+/// 知りたいのは「診断を足したことで何割増えたか」なので、分母は診断を
+/// 除いた切り抜きの時間にする。
+///
+/// 診断は距離変換 2 本と箱ぼかし 6 パス、格子の箱和 2 面を回すので、面積に
+/// 比例はするが係数が小さい。0.35 は実測（0.29）の上に置いた緩い上限である。
 #[test]
 fn the_diagnostics_are_a_small_part_of_the_cutout() {
     let scene = edge_scenes()
@@ -333,10 +494,11 @@ fn the_diagnostics_are_a_small_part_of_the_cutout() {
         std::hint::black_box(d.contour_roughness);
         diagnose = diagnose.min(started.elapsed().as_secs_f64() * 1000.0);
     }
-    let share = diagnose / whole;
+    let share = diagnose / (whole - diagnose);
     assert!(
-        share <= 0.25,
-        "診断が切り抜き全体を圧迫している: {diagnose:.1} ms / {whole:.1} ms (比 {share:.2})"
+        share <= 0.35,
+        "診断の追加コストが膨らんでいる: {diagnose:.1} ms / 切り抜き {:.1} ms (比 {share:.2})",
+        whole - diagnose
     );
 }
 
@@ -425,21 +587,39 @@ fn ranks(values: &[f64]) -> Vec<f64> {
 #[ignore = "計測用。判定はせず表を出すだけ"]
 fn print_the_calibration_table() {
     println!(
-        "\n{:<44} {:>10} {:>10} {:>10} {:>10}  警告",
-        "シーン / 設定", "粗さ", "正解", "縁の汚染", "正解"
+        "\n{:<44} {:>8} {:>8} {:>3} {:>8} {:>8} {:>3} {:>7}  警告",
+        "シーン / 設定", "粗さ", "正解", "群", "縁の汚染", "正解", "群", "strap"
     );
-    for p in bench() {
+    let points = bench();
+    for p in &points {
         let show = |v: Option<f64>| match v {
             Some(v) => format!("{v:.3}"),
             None => "null".to_string(),
         };
+        // 母集団のどちら側かを表に出す。**しきい値を動かす人が、窓の両端が
+        // どの点から来ているかを目で確かめられなければ較正できない**
+        let mark = |side: Side| match side {
+            Side::Clean => "C",
+            Side::Defective => "D",
+            Side::Between => "-",
+        };
+        // 幅 3px のストラップがどれだけ残ったか。粗さの较正で S5 / R5 が
+        // 効いてくるので、細部が生きているかどうかを同じ表で見る
+        let strap = if p.metrics.strap_kept.is_finite() {
+            format!("{:.0}%", p.metrics.strap_kept * 100.0)
+        } else {
+            "-".to_string()
+        };
         println!(
-            "{:<44} {:>10} {:>10.2} {:>10} {:>10.3}  {}",
+            "{:<44} {:>8} {:>8.2} {:>3} {:>8} {:>8.3} {:>3} {:>7}  {}",
             p.label,
             show(p.diagnostics.contour_roughness),
             p.metrics.contour_error,
+            mark(roughness_side(&p.metrics)),
             show(p.diagnostics.rim_contamination),
             p.metrics.rim_truth,
+            mark(contamination_side(&p.metrics)),
+            strap,
             p.warnings
                 .iter()
                 .filter(|c| c.as_str() == "CONTOUR_ROUGH" || c.as_str() == "RIM_CONTAMINATED")
@@ -451,15 +631,46 @@ fn print_the_calibration_table() {
     println!(
         "\nしきい値: CONTOUR_ROUGH_WARN={CONTOUR_ROUGH_WARN} RIM_CONTAMINATION_WARN={RIM_CONTAMINATION_WARN}"
     );
+    // **窓（群間の分離）も表の一部である。** 群 C の最大と群 D の最小の比は、
+    // 同着が多くて ρ が伸びない指標でも「2 つの群が離れているか」を語る
+    for (name, threshold, side, value) in [
+        (
+            "contour_roughness",
+            CONTOUR_ROUGH_WARN,
+            roughness_side as fn(&EdgeMetrics) -> Side,
+            (|p: &Point| p.diagnostics.contour_roughness) as fn(&Point) -> Option<f64>,
+        ),
+        (
+            "rim_contamination",
+            RIM_CONTAMINATION_WARN,
+            contamination_side as fn(&EdgeMetrics) -> Side,
+            (|p: &Point| p.diagnostics.rim_contamination) as fn(&Point) -> Option<f64>,
+        ),
+    ] {
+        let (clean, defective) = window(&points, side, value);
+        println!(
+            "{name}: クリーン最大 {clean:.3} / 欠陥最小 {defective:.3} (群間比 {:.1} 倍) \
+             → 窓 [{:.3}, {:.3}]、採用 {threshold}（余裕 {:.2} 倍 / {:.2} 倍）",
+            defective / clean,
+            clean * 2.0,
+            defective / 2.0,
+            threshold / clean,
+            defective / threshold,
+        );
+    }
     // **相関も表の一部である。** しきい値を動かすときに窓だけを見て、
     // 「そもそも正解と同じ向きに動いているか」を見落とさないために並べて出す
-    let points = bench();
-    for (name, samples) in correlated(&points) {
-        println!(
-            "Spearman {name} vs 正解: ρ={:.3} ({} 点)",
-            spearman(&samples),
-            samples.len()
-        );
+    for (label, set) in [
+        ("全点", points.clone()),
+        ("defaults 除外", without_broken_cuts(&points)),
+    ] {
+        for (name, samples) in correlated(&set) {
+            println!(
+                "Spearman {name} vs 正解（{label}）: ρ={:.3} ({} 点)",
+                spearman(&samples),
+                samples.len()
+            );
+        }
     }
 }
 
@@ -475,21 +686,35 @@ fn print_the_calibration_table() {
 ///
 /// `<name>.jpg|png` と `<name>.alpha.png`（8bit グレー、255 = 商品）の対を置く。
 /// `<name>.json` があれば `{"bbox":[x1,y1,x2,y2],"normalized":true,"tolerance":60}`
-/// として設定に使う（キーは `cutout` のオプション名と同じ）。
+/// として設定に使う（キーは `cutout` のオプション名と同じ）。読めない JSON や
+/// 解釈できない bbox は**素材ごと飛ばす**——既定の設定で回した数字を指定した
+/// 設定の数字として表に出すのが、いちばん質の悪い嘘になる。
+///
+/// `輪郭誤差` の床は合成シーンの表と違う。あちらは解析的な距離場なので完璧に
+/// 解けても 0.4〜0.5 から下がらないが、こちらは正解アルファの二値輪郭からの
+/// 距離変換なので 0 まで下がる。**2 つの表の数字を直接比べないこと。**
 #[test]
 #[ignore = "計測用。KIRI_BENCH_DIR が無ければ何もしない"]
 fn print_the_external_bench() {
     let Ok(dir) = std::env::var(common::KIRI_BENCH_DIR) else {
         return;
     };
-    let pairs = common::external_bench_pairs(std::path::Path::new(&dir));
+    let path = std::path::Path::new(&dir);
+    if !path.is_dir() {
+        // **「ディレクトリが無い」と「対が無い」を同じ文面で報せない。**
+        // 前者は綴り間違いか置き場所の取り違えで、後者は素材の並べ方の問題。
+        // 打つ手がまったく違う
+        println!("{dir}: ディレクトリが無い（KIRI_BENCH_DIR の綴りを確認する）");
+        return;
+    }
+    let pairs = common::external_bench_pairs(path);
     if pairs.is_empty() {
-        println!("{dir} に <name>.jpg|png と <name>.alpha.png の対が無い");
+        println!("{dir}: <name>.jpg|png と <name>.alpha.png の対が 1 つも無い");
         return;
     }
     println!(
-        "\n{:<24} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>8}",
-        "素材", "帯MAE", "輪郭誤差", "rim正解", "粗さ", "縁の汚染", "halo", "ms"
+        "\n{:<24} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>8} {:>5} {:>22}",
+        "素材", "帯MAE", "輪郭誤差", "rim正解", "粗さ", "縁の汚染", "halo", "ms", "tol", "bbox"
     );
     for pair in pairs {
         let started = std::time::Instant::now();
@@ -501,8 +726,14 @@ fn print_the_external_bench() {
             Some(v) => format!("{v:.3}"),
             None => "null".to_string(),
         };
+        // **どの設定で回した数字かを表に出す。** `<name>.json` を置いたのに
+        // 読めていない、という状態が数字の上では見分けられない
+        let bbox = match pair.options.bbox {
+            Some((x1, y1, x2, y2)) => format!("{x1},{y1},{x2},{y2}"),
+            None => "なし".to_string(),
+        };
         println!(
-            "{:<24} {:>9.3} {:>9.2} {:>9.3} {:>9} {:>9} {:>9} {:>8}",
+            "{:<24} {:>9.3} {:>9.2} {:>9.3} {:>9} {:>9} {:>9} {:>8} {:>5.0} {:>22}",
             pair.name,
             m.alpha_mae,
             m.contour_error,
@@ -511,6 +742,8 @@ fn print_the_external_bench() {
             show(result.diagnostics.rim_contamination),
             show(result.diagnostics.halo_ratio),
             elapsed,
+            pair.options.tolerance,
+            bbox,
         );
     }
 }

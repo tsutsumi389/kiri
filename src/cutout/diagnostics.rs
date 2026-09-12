@@ -150,18 +150,18 @@ const MIN_RIM_SEPARATION_SIGMA: f64 = 2.0;
 ///
 /// クリーン側 13 点の最大は **S5（幅 3px のストラップ）の 0.082**、欠陥側
 /// 14 点の最小は **R7 既定の 0.316**。規則「クリーン最大の 2 倍以上、かつ
-/// 欠陥最小の 1/2 以下」が要求する窓は [0.164, 0.158] で、**4% だけ空かない**。
+/// 欠陥最小の 1/2 以下」が要求する窓は [0.163, 0.158] で、**3% だけ空かない**。
 /// 両側の比を最大にする値（幾何平均）の 0.16 を採る。
 ///
 /// | | 値 | 0.16 との比 |
 /// |---|---|---|
-/// | クリーン最大 S5（3px ストラップ） | 0.082 | 1.95 倍 |
+/// | クリーン最大 S5（3px ストラップ） | 0.082 | 1.96 倍 |
 /// | クリーン 2 番目 S3（淡色商品） | 0.062 | 2.58 倍 |
-/// | 欠陥最小 R7 既定 | 0.316 | 1.98 倍 |
+/// | 欠陥最小 R7 既定 | 0.316 | 1.97 倍 |
 /// | 欠陥 2 番目 R2 assisted | 0.373 | 2.33 倍 |
 /// | 20MP 実写リモコン（最良設定） | 0.391 | 2.44 倍 |
 ///
-/// **規則を 2% 割ってもこの値を残す。** 27 点のどれ 1 つも誤分類しない
+/// **規則を 3% 割ってもこの値を残す。** 27 点のどれ 1 つも誤分類しない
 /// （クリーン側の最大 0.082 と欠陥側の最小 0.316 の間に、値を持つ点は無い）。
 /// 2 倍という要求は分離そのものではなく余裕の要求であり、届かない原因も
 /// 1 点に特定できている——S5 は幅 3px、平滑化参照の σ = 2px より細い構造で、
@@ -180,14 +180,14 @@ pub const CONTOUR_ROUGH_WARN: f64 = 0.16;
 ///   輪郭ぐるりに 0.3px の縁が乗っているのと同じで、納品寸法で見える
 /// - 間に挟まる R4 assisted（0.031）はどちらにも使わない
 ///
-/// クリーン側 12 点の最大は **S10（高解像度・無彩色商品・落ち影）の 0.005**、
-/// 欠陥側 13 点の最小は **R7 既定の 0.091**。窓は [0.010, 0.046]。
+/// クリーン側 13 点の最大は **S10（高解像度・無彩色商品・落ち影）の 0.005**、
+/// 欠陥側 13 点の最小は **R7 既定の 0.091**。窓は [0.011, 0.045]。
 ///
 /// | | 値 | 0.02 との比 |
 /// |---|---|---|
-/// | クリーン最大 S10 | 0.005 | 4.0 倍 |
+/// | クリーン最大 S10 | 0.005 | 3.76 倍 |
 /// | 実写の照明を持つクリーン点 R7 assisted | 0.003 | 6.7 倍 |
-/// | 欠陥最小 R7 既定 | 0.091 | 4.6 倍 |
+/// | 欠陥最小 R7 既定 | 0.091 | 4.53 倍 |
 /// | 20MP 実写リモコン（最良設定） | 0.096 | 4.8 倍 |
 ///
 /// # 見えない欠陥がある
@@ -1497,6 +1497,184 @@ mod tests {
             }
         }
         assert_eq!(rim_contamination(&image, &mask, None), None);
+    }
+
+    /// 枠を切らずに全面で計算した粗さ。**ROI 版と一致することを確かめるため
+    /// だけに存在する。**
+    ///
+    /// `roughness_of` は輪郭の外接矩形を `3r + 2` だけ広げた枠の中でしか
+    /// ぼかしも距離変換もしない。速いが、**枠の取り方を間違えると値が静かに
+    /// 変わる**種類の最適化である（枠の縁で箱ぼかしの窓が切れる、枠の外の
+    /// 輪郭画素が種から漏れる、など）。
+    fn roughness_over_the_whole_image(
+        mask: &Mask,
+        bbox: Option<(u32, u32, u32, u32)>,
+    ) -> Option<f64> {
+        let contour = contour_pixels(mask, bbox);
+        if contour.is_empty() {
+            return None;
+        }
+        let (w, h) = (mask.width(), mask.height());
+        let scale = scale_at_1000(w, h);
+        let radius = smoothing_radius(scale);
+        let whole = (0, 0, w - 1, h - 1);
+        let reference = smoothed(mask, radius, whole);
+        let smooth_contour = contour_pixels_in(&reference, bbox, whole);
+        if smooth_contour.is_empty() {
+            return None;
+        }
+        let distance = chamfer_distance(&smooth_contour, whole);
+        let cap = (3 * radius * u32::from(CHAMFER_STEP)).min(u32::from(u8::MAX));
+        let total: u64 = contour
+            .iter()
+            .map(|&(x, y)| u64::from(u32::from(distance.at(x, y)).min(cap)))
+            .sum();
+        Some(total as f64 / contour.len() as f64 / f64::from(CHAMFER_STEP) / scale)
+    }
+
+    /// 枠の中だけで計算した粗さが、全面で計算したものと一致すること。
+    ///
+    /// **端に接する形を並べてある。** 枠は輪郭の外接矩形から作るので、輪郭が
+    /// 画像の端や bbox の辺に触れていると枠が切り詰められる。塊が 2 つある
+    /// 場合は枠が両方を含む大きな矩形になり、あいだの背景まで舐めることになる。
+    #[test]
+    fn the_roi_and_the_whole_image_agree_on_roughness() {
+        let block = |mask: &mut Mask, x0: u32, y0: u32, x1: u32, y1: u32| {
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    mask.set(x, y, 255);
+                }
+            }
+        };
+
+        // 画像の端に接する商品
+        let mut touching = Mask::new(80, 80, 0);
+        block(&mut touching, 0, 0, 40, 40);
+        // bbox の辺に接する商品
+        let mut boxed = Mask::new(80, 80, 0);
+        block(&mut boxed, 20, 20, 60, 60);
+        // 2 つの塊
+        let mut two = Mask::new(80, 80, 0);
+        block(&mut two, 5, 5, 25, 25);
+        block(&mut two, 50, 50, 74, 74);
+        // ギザギザした円盤。値が 0 でないことを確かめるための点
+        let jagged = jagged_disc(200, 2.0, 4.0);
+
+        for (name, mask, bbox) in [
+            ("画像の端に接する", &touching, None),
+            ("bbox の辺に接する", &boxed, Some((20, 20, 60, 60))),
+            ("bbox の内側", &boxed, Some((10, 10, 70, 70))),
+            ("2 つの塊", &two, None),
+            ("ギザギザした円盤", &jagged, None),
+        ] {
+            let roi = contour_roughness(mask, bbox);
+            let whole = roughness_over_the_whole_image(mask, bbox);
+            assert_eq!(roi, whole, "{name}: 枠の中と全面で値が違う");
+        }
+        assert!(
+            contour_roughness(&jagged, None).unwrap() > 0.0,
+            "そもそも 0 どうしを比べていた"
+        );
+    }
+
+    /// bbox を渡した経路でも縁の汚染が測れること。
+    ///
+    /// 矩形の辺は輪郭ではないので帯もそこには立たない。**bbox を渡すと
+    /// 輪郭が減る**ぶん、帯も枠も格子も別物になる経路である。
+    #[test]
+    fn the_rim_is_measured_inside_an_explicit_bbox() {
+        let (w, h) = (80u32, 60u32);
+        let bg = [250u8, 250, 249];
+        let mut image = RgbaImage::from_pixel(w, h, Rgba([bg[0], bg[1], bg[2], 255]));
+        let mut mask = Mask::new(w, h, 0);
+        // 左端から bbox の辺までまたがる濃色の商品。マスクは商品より 4px 外まで
+        // 広げてあるので、縁は背景色のまま不透明になる
+        for y in 0..h {
+            for x in 0..w {
+                if x < 30 {
+                    image.put_pixel(x, y, Rgba([40, 40, 45, 255]));
+                }
+                if x < 34 {
+                    mask.set(x, y, 255);
+                }
+            }
+        }
+        let bbox = Some((0, 0, 60, h - 1));
+        let dirty = rim_contamination(&image, &mask, bbox).expect("帯があるので測れる");
+        assert!(dirty > 0.9, "bbox 経路で縁の汚染を数えていない: {dirty:.3}");
+        // 縁を付けなければ汚染は出ない。**同じ経路で 0 も出せることを見る**
+        let mut clean_mask = Mask::new(w, h, 0);
+        for y in 0..h {
+            for x in 0..30 {
+                clean_mask.set(x, y, 255);
+            }
+        }
+        let clean = rim_contamination(&image, &clean_mask, bbox).expect("帯があるので測れる");
+        assert!(clean < 0.05, "縁が無いのに汚染と出た: {clean:.3}");
+    }
+
+    /// 窓に確定前景が無くても、近くから借りて判定すること。
+    ///
+    /// 局所前景は「窓の中の、帯より深い完全不透明画素」なので、**帯より薄い
+    /// 舌のような領域には定義上 1 つも無い**。そこを judge できないままにすると、
+    /// 背景をどれだけ飲み込んでも値が 0 のままになる（R4 既定がそれだった）。
+    #[test]
+    fn a_thin_tongue_of_background_is_judged_by_borrowing_a_foreground() {
+        let (w, h) = (120u32, 60u32);
+        let bg = [250u8, 250, 249];
+        let mut image = RgbaImage::from_pixel(w, h, Rgba([bg[0], bg[1], bg[2], 255]));
+        let mut mask = Mask::new(w, h, 0);
+        for y in 0..h {
+            for x in 0..30 {
+                image.put_pixel(x, y, Rgba([40, 40, 45, 255]));
+                mask.set(x, y, 255);
+            }
+        }
+        // 商品から右へ伸びる、背景色のままの 4px の舌。帯（3px）より薄いので
+        // この中に「帯より深い完全不透明画素」は無い
+        for y in 28..32 {
+            for x in 30..110 {
+                mask.set(x, y, 255);
+            }
+        }
+        let value = rim_contamination(&image, &mask, None).expect("帯があるので測れる");
+        assert!(
+            value > 0.5,
+            "借りた前景で舌を汚染として数えていない: {value:.3}"
+        );
+    }
+
+    /// 帯の半分以上で判定できなければ、割合ではなく None を返すこと。
+    ///
+    /// **分母は判定できた画素である。** 判定不能が大半を占めたまま割合を
+    /// 返すと、残りについて「汚染されていない」と言ったことになる。
+    #[test]
+    fn a_ratio_is_reported_only_when_most_of_the_band_could_be_judged() {
+        // 上側は背景と見分けの付かない淡色（判定不能）、下側は濃色（判定可能）。
+        // 窓（半径 8px）が混ざらないよう、境目から十分離して読む
+        let judged = |pale_rows: u32| -> Option<f64> {
+            let (w, h) = (60u32, 100u32);
+            let bg = [250u8, 250, 249];
+            let mut image = RgbaImage::from_pixel(w, h, Rgba([bg[0], bg[1], bg[2], 255]));
+            let mut mask = Mask::new(w, h, 0);
+            for y in 0..h {
+                let product = if y < pale_rows {
+                    [248u8, 248, 247]
+                } else {
+                    [40, 40, 45]
+                };
+                for x in 0..30 {
+                    image.put_pixel(x, y, Rgba([product[0], product[1], product[2], 255]));
+                    mask.set(x, y, 255);
+                }
+            }
+            rim_contamination(&image, &mask, None)
+        };
+        assert_eq!(judged(70), None, "帯の 3 割しか判定できないのに値を返した");
+        assert!(
+            judged(30).is_some(),
+            "帯の 7 割を判定できているのに値を返さない"
+        );
     }
 
     /// bbox の辺は輪郭ではない。`boundary_separability` と同じ規約。

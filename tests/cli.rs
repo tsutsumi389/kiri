@@ -3285,10 +3285,17 @@ fn separability_is_reported_as_null_rather_than_omitted() {
 
     let json = json_stdout(&out);
     let mask = json["mask"].as_object().unwrap();
-    // 同じ理由で halo_ratio と edge_width もキーを消さない。0 と報告すると
-    // 「縁が残っていない」「輪郭がギザギザ」に見えてしまい、
-    // 「そもそも測れていない」と区別できなくなる
-    for key in ["separability", "halo_ratio", "edge_width"] {
+    // 同じ理由で halo_ratio / edge_width / contour_roughness /
+    // rim_contamination もキーを消さない。0 と報告すると「縁が残っていない」
+    // 「輪郭は滑らか」「縁は汚れていない」に見えてしまい、「そもそも測れて
+    // いない」と区別できなくなる
+    for key in [
+        "separability",
+        "halo_ratio",
+        "edge_width",
+        "contour_roughness",
+        "rim_contamination",
+    ] {
         assert!(mask.contains_key(key), "{key} のキーは常に存在すべき");
     }
 }
@@ -4302,6 +4309,29 @@ fn every_documented_code_is_actually_reachable() {
     );
 }
 
+/// `tests` 配下から `pub const X: &str = ...` の宣言だけを拾う。
+///
+/// 文書が名指しできるのは、テスト側では「契約として公開された綴り」だけで
+/// ある（`KIRI_BENCH_DIR`）。それ以外の大文字の語がテストのどこかに現れたか
+/// どうかは、文書の正しさと何の関係も無い。
+fn collect_public_string_constants(dir: &Path, out: &mut String) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            collect_public_string_constants(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            let text = std::fs::read_to_string(&path).unwrap();
+            for line in text.lines() {
+                let line = line.trim();
+                if line.starts_with("pub const ") && line.contains(": &str") {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+}
+
 /// `src` 配下の Rust ソースを、各ファイルのテストモジュールの手前まで連結する。
 fn collect_source(dir: &Path, out: &mut String) {
     for entry in std::fs::read_dir(dir).unwrap() {
@@ -4390,10 +4420,13 @@ fn every_code_named_in_the_docs_exists() {
     //
     // `tests` も見るのは、**ベンチの入口が環境変数だから**である
     // （`KIRI_BENCH_DIR`）。本体の挙動ではないので `src` には置き場所が無いが、
-    // README が名指しする以上、実在することは確かめたい
+    // README が名指しする以上、実在することは確かめたい。**ただし拾うのは
+    // `pub const X: &str` の宣言だけにする。** テストのソース全文を許すと、
+    // 表明の文字列やコメントに大文字の語が 1 度でも出てきた時点で「実在する」
+    // ことになってしまい、この検査は何も守らなくなる
     let mut source = String::new();
     collect_source(&root.join("src"), &mut source);
-    collect_source(&root.join("tests"), &mut source);
+    collect_public_string_constants(&root.join("tests"), &mut source);
 
     for doc in ["README.md", "docs/design.md", "docs/implementation-plan.md"] {
         let text = std::fs::read_to_string(root.join(doc)).unwrap();

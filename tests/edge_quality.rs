@@ -671,21 +671,24 @@ fn print_the_refine_cost_on_large_inputs() {
     // **判定はしない。** 絶対時間は機械によって何倍も違い、書き写した数値は
     // 必ず嘘になる。その場で回して読むためのものである
     let result = cutout(&cases[0].1, &CutoutOptions::default());
+
+    // **RSS を先に、1 回だけ測る。** サンプラーでピークを追っていた頃は 0MB と
+    // しか出なかった——アロケータは解放したページを OS へ返さないので、同じ
+    // 関数を 2 回目に回したときは「確保済みの空き」を使い回し、RSS がまったく
+    // 動かない。知りたいのは診断が要求する常駐量なので、**まだ一度も回して
+    // いない状態から 1 回だけ回して前後の差を見る**。時間の計測（最短を採るには
+    // 何回か回す必要がある）と同じパスではできない
+    let before = resident_kb();
+    let d =
+        kiri::cutout::diagnostics::diagnose(&cases[0].1, &result.mask, result.background.rgb, None);
+    let after = resident_kb();
+    std::hint::black_box((d.contour_roughness, d.rim_contamination));
+
+    // 時間は最短を採る。他プロセスに邪魔された回を混ぜない。
+    // **判定はしない。** 絶対時間は機械によって何倍も違い、書き写した数値は
+    // 必ず嘘になる。その場で回して読むためのものである
     let mut best = f64::MAX;
-    let mut peak = 0i64;
-    for _ in 0..3 {
-        let base = resident_kb();
-        let watching = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let high = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(base));
-        let sampler = {
-            let (watching, high) = (watching.clone(), high.clone());
-            std::thread::spawn(move || {
-                while watching.load(std::sync::atomic::Ordering::Relaxed) {
-                    high.fetch_max(resident_kb(), std::sync::atomic::Ordering::Relaxed);
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
-            })
-        };
+    for _ in 0..5 {
         let started = std::time::Instant::now();
         let d = kiri::cutout::diagnostics::diagnose(
             &cases[0].1,
@@ -695,14 +698,36 @@ fn print_the_refine_cost_on_large_inputs() {
         );
         std::hint::black_box((d.contour_roughness, d.rim_contamination));
         best = best.min(started.elapsed().as_secs_f64() * 1000.0);
-        watching.store(false, std::sync::atomic::Ordering::Relaxed);
-        sampler.join().unwrap();
-        peak = peak.max(high.load(std::sync::atomic::Ordering::Relaxed) - base);
+    }
+    // 内訳。**新しい 2 つがいくら足したかは、古い 2 つと分けないと分からない**
+    let mut halo = f64::MAX;
+    let mut width = f64::MAX;
+    for _ in 0..5 {
+        let started = std::time::Instant::now();
+        std::hint::black_box(kiri::cutout::diagnostics::halo_ratio(
+            &cases[0].1,
+            &result.mask,
+            result.background.rgb,
+        ));
+        halo = halo.min(started.elapsed().as_secs_f64() * 1000.0);
+        let started = std::time::Instant::now();
+        std::hint::black_box(kiri::cutout::diagnostics::edge_width(&result.mask));
+        width = width.min(started.elapsed().as_secs_f64() * 1000.0);
     }
     println!(
-        "診断           diagnose() {best:>7.0} ms / ピーク RSS 増分 {:>5} MB",
-        peak / 1024
+        "診断           diagnose() {best:>7.1} ms（halo_ratio {halo:.1} / edge_width {width:.1} / \
+         新しい 2 つ {:.1}）/ RSS {:+} MB",
+        best - halo - width,
+        (after - before) / 1024,
     );
+    // **0 は「増えなかった」ではなく「切り抜きが確保して解放したページを
+    // 使い回した」の意味である。** アロケータは解放したページを OS へ
+    // 返さないので、`cutout()` の後に測るかぎりこれ以上のことは分からない。
+    // 診断が確保する量そのものは design.md 4.8 の表にある（12MP で
+    // チェビシェフ距離 12MB + 二値マスク 12MB + 枠ぶんの距離場と格子）
+    if after - before == 0 {
+        println!("               （RSS 0 は cutout() の解放済みページを使い回したという意味）");
+    }
     drop(result);
 
     for (name, image) in cases {

@@ -979,7 +979,7 @@ refine 済みの鮮鋭な輪郭はちょうど 1.00 になり、**1〜3 なら�
 | `FOREGROUND_TOO_LARGE` | 前景比率が大きすぎる。背景が残っている可能性がある |
 | `HALO_REMAINS` | 境界に背景色のままの縁が残っている。`--tolerance` を上げると減る |
 | `CONTOUR_ROUGH` | 輪郭がギザギザに蛇行している。背景のテクスチャが輪郭に乗っている |
-| `RIM_CONTAMINATED` | 縁の色が商品より背景に近い。`--tolerance` を上げると減る |
+| `RIM_CONTAMINATED` | 縁の色が商品より背景に近い（`HALO_REMAINS` も出ていれば `--tolerance` で減る） |
 | `EDGE_THRESHOLD_RAISED` | 背景のテクスチャに合わせて堤防を引き上げた |
 | `CANVAS_UPSCALED` | キャンバス配置で商品を拡大した |
 | `DRY_RUN_OUTPUT_EXISTS` | `--dry-run` の出力先が既にある。本番実行には `--force` が要る |

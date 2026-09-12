@@ -66,7 +66,7 @@ warning_catalog! {
     ContourRough = "CONTOUR_ROUGH"
         => "輪郭がギザギザに蛇行している。背景のテクスチャが輪郭に乗っている",
     RimContaminated = "RIM_CONTAMINATED"
-        => "縁の色が商品より背景に近い。--tolerance を上げると減る",
+        => "縁の色が商品より背景に近い（HALO_REMAINS も出ていれば --tolerance で減る）",
     EdgeThresholdRaised = "EDGE_THRESHOLD_RAISED"
         => "背景のテクスチャに合わせて輪郭の堤防を引き上げた",
     CanvasUpscaled = "CANVAS_UPSCALED"

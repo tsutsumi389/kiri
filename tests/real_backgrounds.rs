@@ -190,19 +190,26 @@ fn the_new_diagnostics_see_the_defect_that_the_old_ones_missed() {
     );
 }
 
-/// 空間的な指示が、bbox と tolerance で救った状態（assisted）より悪くならないこと。
+/// 空間的な指示が**守られ**、bbox と tolerance で救った状態（assisted）の
+/// 輪郭を悪くしないこと。
 ///
-/// **トライマップで悪くなるなら実装が間違っている。** R1 に渡すのは正解から
-/// 作った粗いトライマップ（長辺の 2% で収縮したものが確定前景、膨張したものの
-/// 外が確定背景）で、輪郭そのものは教えていない——不明の帯は長辺の 4% ある。
-/// それでも輪郭の位置を大きく絞り込むので、`contour_error` は下がるはずである。
+/// **判定の中心は `forced_kept` である。** 「assisted より悪くなっていない」
+/// だけを見ていた頃は、`eaten` が全設定で 0 だったので `0 <= 0` しか検査して
+/// おらず、指示が届いているかどうかを何も言っていなかった。確定前景が残った
+/// 割合を 1.0 で固定すれば、芯の判定が指示を握りつぶす経路（C1）も、面積
+/// フィルタが小さな指示を消す経路（H1）も、ここで必ず赤になる。
 ///
-/// ポリゴンの側は `eaten` だけを見る。商品の中央半分と、余白 5% だけ離した
-/// 外側の帯 4 枚しか教えていないので、**指示は輪郭について何も言っていない**。
-/// 言えるのは「商品を余計に削っていないこと」までで、そこへ勝手な期待を
-/// 置くと、較正が動いたときに理由の無い赤になる。
+/// R1 に渡すのは正解から作った粗いトライマップ（長辺の 2% で収縮したものが
+/// 確定前景、膨張したものの外が確定背景）で、輪郭そのものは教えていない——
+/// 不明の帯は長辺の 4% ある。それでも輪郭の位置を大きく絞り込むので、
+/// `contour_error` は assisted 以下になる。
+///
+/// **ポリゴンには輪郭の改善を求めない。** 商品の中央半分と、余白 5% だけ
+/// 離した外側の帯 4 枚しか教えていないので、指示は輪郭について何も言って
+/// いない。実測でも assisted より僅かに悪い（19.76 vs 18.42）。求めるのは
+/// 「指示のせいで輪郭が崩れていないこと」までで、1 割の余裕を窓に取る。
 #[test]
-fn spatial_instructions_never_do_worse_than_the_bbox() {
+fn spatial_instructions_are_kept_and_do_not_worsen_the_contour() {
     let points = bench();
     let assisted = point(&points, "R1 不織布 + 黒商品 / assisted");
     let trimap = point(&points, "R1 不織布 + 黒商品 / trimap");
@@ -222,10 +229,25 @@ fn spatial_instructions_never_do_worse_than_the_bbox() {
         );
     }
 
+    // **確定前景は 1 画素も落ちない。** 指示は色より強いという約束そのもの
+    for p in [trimap, polygon] {
+        assert_eq!(
+            p.metrics.forced_kept, 1.0,
+            "{}: 確定前景が前景として残っていない: {:.4}",
+            p.label, p.metrics.forced_kept
+        );
+    }
+
     assert!(
         trimap.metrics.contour_error <= assisted.metrics.contour_error,
         "トライマップで輪郭誤差が悪化した: {:.2} vs assisted {:.2}",
         trimap.metrics.contour_error,
+        assisted.metrics.contour_error
+    );
+    assert!(
+        polygon.metrics.contour_error <= assisted.metrics.contour_error * 1.1,
+        "粗いポリゴンで輪郭誤差が 1 割を超えて悪化した: {:.2} vs assisted {:.2}",
+        polygon.metrics.contour_error,
         assisted.metrics.contour_error
     );
     for p in [trimap, polygon] {
@@ -640,8 +662,17 @@ fn ranks(values: &[f64]) -> Vec<f64> {
 #[ignore = "計測用。判定はせず表を出すだけ"]
 fn print_the_calibration_table() {
     println!(
-        "\n{:<44} {:>8} {:>8} {:>3} {:>8} {:>8} {:>3} {:>7}  警告",
-        "シーン / 設定", "粗さ", "正解", "群", "縁の汚染", "正解", "群", "strap"
+        "\n{:<44} {:>8} {:>8} {:>3} {:>8} {:>8} {:>3} {:>7} {:>7} {:>7}  警告",
+        "シーン / 設定",
+        "粗さ",
+        "正解",
+        "群",
+        "縁の汚染",
+        "正解",
+        "群",
+        "strap",
+        "eaten",
+        "指示保持"
     );
     let points = bench();
     for p in &points {
@@ -669,8 +700,15 @@ fn print_the_calibration_table() {
             Some((fg, bg)) => format!("  制約 fg={fg:.3}/bg={bg:.3}"),
             None => String::new(),
         };
+        // 渡した確定前景がどれだけ残ったか。**「悪くなっていない」だけを見る
+        // 判定は空振りする**ので、指示が届いたかどうかを同じ表に並べて出す
+        let kept = if p.metrics.forced_kept.is_finite() {
+            format!("{:.1}%", p.metrics.forced_kept * 100.0)
+        } else {
+            "-".to_string()
+        };
         println!(
-            "{:<44} {:>8} {:>8.2} {:>3} {:>8} {:>8.3} {:>3} {:>7}  {}{constraints}",
+            "{:<44} {:>8} {:>8.2} {:>3} {:>8} {:>8.3} {:>3} {:>7} {:>7} {:>7}  {}{constraints}",
             p.label,
             show(p.diagnostics.contour_roughness),
             p.metrics.contour_error,
@@ -679,6 +717,8 @@ fn print_the_calibration_table() {
             p.metrics.rim_truth,
             mark(contamination_side(&p.metrics)),
             strap,
+            format!("{:.4}", p.metrics.eaten),
+            kept,
             p.warnings
                 .iter()
                 .filter(|c| c.as_str() == "CONTOUR_ROUGH" || c.as_str() == "RIM_CONTAMINATED")
@@ -799,8 +839,13 @@ fn print_the_external_bench() {
         let started = std::time::Instant::now();
         let result = cutout(&pair.truth.image, &pair.options);
         let elapsed = started.elapsed().as_millis();
-        let m =
-            common::measure_edges_with(&pair.truth, &result.image, &result.mask, pair.options.bbox);
+        let m = common::measure_edges_with(
+            &pair.truth,
+            &result.image,
+            &result.mask,
+            pair.options.bbox,
+            pair.options.constraints.as_ref(),
+        );
         let show = |v: Option<f64>| match v {
             Some(v) => format!("{v:.3}"),
             None => "null".to_string(),

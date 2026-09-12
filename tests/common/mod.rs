@@ -794,7 +794,13 @@ pub fn run_real(scene: &RealScene) -> (EdgeTruth, Vec<RealRun>) {
                     let (fg, bg, _) = c.ratios();
                     (fg, bg)
                 }),
-                metrics: measure_edges_with(&truth, &result.image, &result.mask, opts.bbox),
+                metrics: measure_edges_with(
+                    &truth,
+                    &result.image,
+                    &result.mask,
+                    opts.bbox,
+                    opts.constraints.as_ref(),
+                ),
                 diagnostics: result.diagnostics.clone(),
                 separability: result.separability,
                 foreground_ratio: result.stats.foreground_ratio,
@@ -1395,6 +1401,14 @@ pub struct EdgeMetrics {
     /// まま不透明」を色で見ているが、こちらは正解の被覆率で見るので、
     /// 背景と見分けのつかない色でも取りこぼさない
     pub rim_truth: f32,
+    /// 確定前景と指示された画素のうち、最終マスクで前景として残った割合
+    /// (0.0-1.0)。指示が無ければ NaN。
+    ///
+    /// **「悪くなっていない」だけを見る判定は空振りする。** `eaten` が全設定で
+    /// 0 なら `0 <= 0` しか検査しておらず、指示が届いているかどうかを何も
+    /// 言っていない。ここは「渡した指示が守られたか」を直接問うので、
+    /// 芯の判定（C1）や面積フィルタ（H1）が指示を握りつぶせば必ず 1.0 を割る
+    pub forced_kept: f32,
 }
 
 fn luma(p: [u8; 4]) -> f32 {
@@ -1407,18 +1421,22 @@ pub fn measure_edges(
     output: &RgbaImage,
     mask: &kiri::cutout::Mask,
 ) -> EdgeMetrics {
-    measure_edges_with(truth, output, mask, None)
+    measure_edges_with(truth, output, mask, None, None)
 }
 
-/// `--bbox` を与えて回した結果を突き合わせる。
+/// `--bbox` や空間的な指示を与えて回した結果を突き合わせる。
 ///
 /// 矩形の辺は輪郭として数えない。**`contour_roughness` / `rim_contamination` が
 /// 同じ規約で数えているので、正解側だけ数えると比べる相手が違う。**
+///
+/// `constraints` は `forced_kept` を測るためだけに要る。指示そのものを
+/// 正解として扱うわけではない——粗い指示は輪郭について何も言っていない。
 pub fn measure_edges_with(
     truth: &EdgeTruth,
     output: &RgbaImage,
     mask: &kiri::cutout::Mask,
     bbox: Option<(u32, u32, u32, u32)>,
+    constraints: Option<&kiri::cutout::Constraints>,
 ) -> EdgeMetrics {
     let (w, h) = (truth.image.width(), truth.image.height());
 
@@ -1455,6 +1473,7 @@ pub fn measure_edges_with(
     let (mut white, mut white_n) = (0f32, 0u32);
     let (mut strap_kept, mut strap_n) = (0u32, 0u32);
     let (mut shadow_kept, mut shadow_n) = (0u32, 0u32);
+    let (mut forced_kept, mut forced_n) = (0u32, 0u32);
     let (mut speckles, mut speckles_n) = (0u32, 0u32);
     let mut casts: Vec<f32> = Vec::new();
 
@@ -1540,6 +1559,14 @@ pub fn measure_edges_with(
                     speckles += 1;
                 }
             }
+            // 指示そのものが守られたか。正解とは無関係に、**渡した画素が
+            // 前景として残っているか**だけを問う
+            if constraints.is_some_and(|k| k.at(x, y) == kiri::cutout::Constraint::ForcedFg) {
+                forced_n += 1;
+                if fg {
+                    forced_kept += 1;
+                }
+            }
         }
     }
 
@@ -1595,6 +1622,7 @@ pub fn measure_edges_with(
         cast: percentile(&mut casts, 0.9),
         contour_error,
         rim_truth,
+        forced_kept: ratio(forced_kept, forced_n),
     }
 }
 

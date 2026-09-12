@@ -84,12 +84,30 @@ pub struct PerimeterTexture {
 
 #[derive(Debug, Serialize)]
 pub struct BackgroundReport {
+    /// 外周の中央値 1 色。**照明場を使った場合もこの値は 1 色のまま**で、
+    /// 場そのものは `field_range` が「どれだけ振れたか」として語る
     pub rgb: [u8; 3],
     /// 外周サンプルのうち、推定背景色から ΔE<=5 に収まる割合。
     /// 1.0 に近いほど単色背景で、切り抜きの成功率が高い。
     pub uniformity: f64,
     pub perimeter_delta_e: PerimeterDeltaE,
     pub texture: PerimeterTexture,
+    /// 実際に効いた背景のモデル（"flat" / "field"）。
+    ///
+    /// `info` は「この画像なら `cutout` がどちらを使うか」を先に答える。
+    /// `--background-model` を明示していなければ、`uniformity` が
+    /// 下限を切ったときに `"field"` になる
+    pub model: &'static str,
+    /// 照明場が大域の 1 色からどれだけ離れているかの [最小, 最大] ΔE。
+    /// **場が何を吸ったか**を 1 行で言う。`"flat"` なら [0, 0]
+    pub field_range: [f64; 2],
+    /// 外周サンプルの、**場に対する** ΔE 分布。
+    ///
+    /// `perimeter_delta_e` は 1 色に対する分布で意味を変えない。両者の差が
+    /// そのまま「場が吸った量」である。`residual.p50` が小さいのに
+    /// `perimeter_delta_e.p50` が大きい画像は、単色でないのではなく
+    /// **単色に照明が乗っている**ので、照明場モデルで救える
+    pub residual: PerimeterDeltaE,
 }
 
 /// 主体（商品）と思われる塊の位置。
@@ -317,6 +335,9 @@ pub struct SettingsReport {
     pub smooth_radius_px: Option<u32>,
     /// 帯の中の二値画素を局所の色で塗り直したか
     pub reclassify: bool,
+    /// 実際に効いた背景のモデル（"flat" / "field"）。**指定値ではない**——
+    /// 既定の `auto` は背景の均一度を見てどちらかを選ぶ
+    pub background_model: &'static str,
     /// 実際に効いた帯幅の下限(px)。**指定値からは読めない**——輪郭が粗ければ
     /// 粗さぶんだけ持ち上がる。`--no-refine` では帯そのものが無いので現れない
     #[serde(skip_serializing_if = "Option::is_none")]

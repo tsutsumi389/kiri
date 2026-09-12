@@ -2738,8 +2738,18 @@ fn a_frame_filling_object_never_earns_high_confidence() {
     let input = write_png(dir.path(), "bleed.png", &bleeding_product_scene(600, 600));
     let output = dir.path().join("cut.png");
 
+    // **1 色モデルで固定する。** この構図が危ないのは「外周 ΔE の p90 が
+    // 汚染されて、面積も捕捉率も通ってしまう」からで、その状態を作れるのは
+    // 1 色で測ったときだけである。照明場は外周に掛かった灰色を背景として
+    // 吸うので、同じ穴がそもそも開かない
     let out = kiri()
-        .args(["info", input.to_str().unwrap(), "--json"])
+        .args([
+            "info",
+            input.to_str().unwrap(),
+            "--background-model",
+            "flat",
+            "--json",
+        ])
         .output()
         .unwrap();
     let v = json_stdout(&out);
@@ -2762,6 +2772,20 @@ fn a_frame_filling_object_never_earns_high_confidence() {
     assert_eq!(
         s["confidence"], "low",
         "主体を取りこぼした矩形を信用している: {s}"
+    );
+
+    // 既定（照明場）でも信用しない。**弾く仕組みは変わってよいが、
+    // 結論が裏返ってはいけない**——ここでは捕捉率が落ちて Low になる
+    let auto = json_stdout(
+        &kiri()
+            .args(["info", input.to_str().unwrap(), "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        auto["subject"]["confidence"], "low",
+        "照明場で信頼度が裏返っている: {}",
+        auto["subject"]
     );
 
     // 信頼度が high でない以上、bbox を勧めてはならない
@@ -2796,9 +2820,16 @@ fn the_same_poison_on_the_repositorys_own_texture_is_caught_too() {
     let input = write_png(dir.path(), "woven.png", &woven_poisoned_scene(600, 600));
     let output = dir.path().join("cut.png");
 
+    // 上と同じ理由で 1 色モデルで固定する（この穴は 1 色でしか開かない）
     let v = json_stdout(
         &kiri()
-            .args(["info", input.to_str().unwrap(), "--json"])
+            .args([
+                "info",
+                input.to_str().unwrap(),
+                "--background-model",
+                "flat",
+                "--json",
+            ])
             .output()
             .unwrap(),
     );
@@ -2819,6 +2850,19 @@ fn the_same_poison_on_the_repositorys_own_texture_is_caught_too() {
     assert_eq!(
         s["confidence"], "low",
         "織り目の上では汚染を見逃している: {s}"
+    );
+
+    // 既定（照明場）でも結論は裏返らない
+    let auto = json_stdout(
+        &kiri()
+            .args(["info", input.to_str().unwrap(), "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        auto["subject"]["confidence"], "low",
+        "照明場で信頼度が裏返っている: {}",
+        auto["subject"]
     );
 
     let v = json_stdout(
@@ -2873,7 +2917,11 @@ fn a_band_on_the_edge_does_not_cost_the_subject_its_confidence() {
     );
 
     // **`SUBJECT_TOUCHES_EDGE` へ戻っていないこと。** 商品は中央にあり、
-    // 見切れてはいない
+    // 見切れてはいない。
+    //
+    // 1 色モデルで問う。帯は背景色から離れているので 1 色では前景として残り、
+    // それが端に達する——「外周接触をどう読むか」の分岐が働くのはこの状態で
+    // ある。照明場は帯ごと背景として吸ってしまい、分岐そのものに届かない
     let v = json_stdout(
         &kiri()
             .args([
@@ -2881,6 +2929,8 @@ fn a_band_on_the_edge_does_not_cost_the_subject_its_confidence() {
                 input.to_str().unwrap(),
                 "-o",
                 output.to_str().unwrap(),
+                "--background-model",
+                "flat",
                 "--json",
             ])
             .output()
@@ -2896,6 +2946,36 @@ fn a_band_on_the_edge_does_not_cost_the_subject_its_confidence() {
         has_warning(&v, "BBOX_RECOMMENDED"),
         "解ける画像で助言が出ていない: {:?}",
         warning_codes(&v)
+    );
+
+    // **既定（照明場）では助言そのものが要らなくなる。** 帯は背景として
+    // 吸われ、残るのは中央の商品だけになる。「残っています」と言われないこと
+    // までを対で押さえないと、場が効いたのか助言が壊れたのかを分けられない
+    let auto = json_stdout(
+        &kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                dir.path().join("auto.png").to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        auto["settings"]["background_model"], "field",
+        "既定で照明場が効いていない: {auto}"
+    );
+    assert_eq!(
+        auto["mask"]["touches_edge"], false,
+        "帯が前景として残っている: {auto}"
+    );
+    let codes = warning_codes(&auto);
+    assert!(
+        !codes.contains(&"BBOX_RECOMMENDED".to_string())
+            && !codes.contains(&"SUBJECT_TOUCHES_EDGE".to_string()),
+        "何も残っていないのに残っていると言っている: {codes:?}"
     );
 }
 
@@ -2960,12 +3040,18 @@ fn a_non_uniform_background_recommends_a_bbox_instead_of_crying_crop() {
     let input = write_png(dir.path(), "split.png", &split_background_scene(300, 300));
     let output = dir.path().join("cut.png");
 
+    // **1 色モデルで問う。** 「背景側が前景として残って端に達する」状態を
+    // 作れるのは 1 色で測ったときだけで、照明場は上下 2 色の段差ごと吸って
+    // しまう（吸えることは下で対にして押さえる）。分岐そのものを測るには、
+    // 分岐が働く状態を作らなければならない
     let out = kiri()
         .args([
             "cutout",
             input.to_str().unwrap(),
             "-o",
             output.to_str().unwrap(),
+            "--background-model",
+            "flat",
             "--json",
         ])
         .output()
@@ -3007,6 +3093,8 @@ fn a_non_uniform_background_recommends_a_bbox_instead_of_crying_crop() {
             input.to_str().unwrap(),
             "-o",
             fixed.to_str().unwrap(),
+            "--background-model",
+            "flat",
             "--bbox",
             bbox,
             "--normalized",
@@ -3030,6 +3118,45 @@ fn a_non_uniform_background_recommends_a_bbox_instead_of_crying_crop() {
         !warning_codes(&fixed).contains(&"BBOX_RECOMMENDED".to_string()),
         "bbox を指定したのに勧め続けている: {:?}",
         warning_codes(&fixed)
+    );
+
+    // **既定（照明場）は bbox なしでここを解く。** 上下 2 色の背景は
+    // 照明場が持てる形そのもので、1 色で測ったときに残っていた背景側が
+    // 丸ごと消える。助言が要らなくなることまでを対で押さえる
+    let auto = json_stdout(
+        &kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                dir.path().join("auto.png").to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        auto["settings"]["background_model"], "field",
+        "既定で照明場が効いていない: {auto}"
+    );
+    assert_eq!(
+        auto["mask"]["touches_edge"], false,
+        "背景側が前景として残っている: {auto}"
+    );
+    let after = auto["mask"]["foreground_ratio"].as_f64().unwrap();
+    assert!(
+        (0.15..0.25).contains(&after),
+        "商品だけが残っていない: {after}"
+    );
+    let codes = warning_codes(&auto);
+    assert!(
+        !codes.contains(&"BBOX_RECOMMENDED".to_string())
+            && !codes.contains(&"SUBJECT_TOUCHES_EDGE".to_string()),
+        "何も残っていないのに残っていると言っている: {codes:?}"
+    );
+    assert!(
+        codes.contains(&"BACKGROUND_FIELD_USED".to_string()),
+        "場を使ったことを黙っている: {codes:?}"
     );
 }
 
@@ -6086,6 +6213,92 @@ fn the_published_thresholds_agree_with_the_warnings_that_fire() {
                     );
                 }
             }
+        }
+    }
+}
+
+/// **`subject` の較正表。`--ignored` を付けたときだけ走る。**
+///
+/// README と `subject.rs` の表はここから取り直す。表の数値がどの画像から
+/// 出たのかを、コミットの外に置かないためである。
+///
+/// 1 色と場の 2 列を並べる。**主体は 1 色の背景に対して測る**ので 2 列は
+/// 一致するはずで、一致しなくなったら背景のモデルが主体検出へ漏れている。
+///
+/// ```text
+/// cargo test --release --test cli -- --ignored --nocapture print_the_subject_calibration
+/// ```
+#[test]
+#[ignore = "計測用。較正表を出すだけ"]
+fn print_the_subject_calibration() {
+    println!(
+        "\n{:<34} {:>7} {:>8} {:>9}  {:<5} {:>7} {:>8} {:>9}  {:<5}  正解",
+        "シーン", "area", "capture", "leftover", "1色", "area", "capture", "leftover", "場"
+    );
+    for (name, image, want_high) in common::subject_scenes() {
+        let dir = fixture_dir();
+        let input = write_png(dir.path(), "s.png", &image);
+        let mut row = format!("{name:<34}");
+        for model in ["flat", "auto"] {
+            let v = json_stdout(
+                &kiri()
+                    .args([
+                        "info",
+                        input.to_str().unwrap(),
+                        "--background-model",
+                        model,
+                        "--json",
+                    ])
+                    .output()
+                    .unwrap(),
+            );
+            let s = &v["subject"];
+            row.push_str(&format!(
+                " {:>7.3} {:>8.3} {:>9.3}  {:<5}",
+                s["area_ratio"].as_f64().unwrap_or(f64::NAN),
+                s["capture_ratio"].as_f64().unwrap_or(f64::NAN),
+                s["leftover_ratio"].as_f64().unwrap_or(f64::NAN),
+                s["confidence"].as_str().unwrap_or("null")
+            ));
+        }
+        println!("{row}  {}", if want_high { "high" } else { "low" });
+    }
+}
+
+/// **較正表の判定が 1 件も裏返らないこと。**
+///
+/// `high` は「この矩形に従って切り抜いてよい」という助言そのものである。
+/// 裏返れば、誤った矩形へ誘導するか、助言を出し損ねる。
+///
+/// **背景のモデルを変えても判定は動かない。** 主体は 1 色の背景に対して
+/// 測るからで（`cutout::analyse_background` の表を参照）、場に対して測る案は
+/// この 11 行と実写 2 枚で 2 件を裏返したので採らなかった。2 列を並べて
+/// 問うのは、その約束が黙って破れないようにするためである。
+#[test]
+fn the_subject_verdicts_do_not_flip_between_the_two_background_models() {
+    for (name, image, want_high) in common::subject_scenes() {
+        let dir = fixture_dir();
+        let input = write_png(dir.path(), "s.png", &image);
+        for model in ["flat", "auto"] {
+            let v = json_stdout(
+                &kiri()
+                    .args([
+                        "info",
+                        input.to_str().unwrap(),
+                        "--background-model",
+                        model,
+                        "--json",
+                    ])
+                    .output()
+                    .unwrap(),
+            );
+            let s = &v["subject"];
+            let got = s["confidence"].as_str().unwrap_or("null");
+            assert_eq!(
+                got,
+                if want_high { "high" } else { "low" },
+                "{name} / {model}: 判定が裏返った: {s}"
+            );
         }
     }
 }

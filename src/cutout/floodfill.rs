@@ -35,6 +35,7 @@ use std::collections::VecDeque;
 use image::RgbaImage;
 
 use crate::color::lab::{linear_to_lab, srgb_linear_lut};
+use crate::cutout::background::BackgroundField;
 use crate::cutout::constraints::{Constraints, disc_pixels};
 use crate::cutout::edges::edge_ridges;
 use crate::cutout::mask::Mask;
@@ -81,9 +82,15 @@ pub struct FloodOptions<'a> {
 
 /// 第1段の許容量（芯に入れてよい ΔE）を決める。
 ///
-/// 背景自身のばらつき（外周 ΔE の p90）の 2 倍を基準にする。芯は「背景と
-/// 言い切れる画素」でなければならないのでばらつきを跨げる幅は要るが、それ以上
-/// 広げると淡い商品が芯に入り込み、そこから第2段が商品の内部へ流れ出してしまう。
+/// 背景自身のばらつき（**場に対する外周残差**の p90）の 2 倍を基準にする。
+/// 芯は「背景と言い切れる画素」でなければならないのでばらつきを跨げる幅は
+/// 要るが、それ以上広げると淡い商品が芯に入り込み、そこから第2段が商品の
+/// 内部へ流れ出してしまう。
+///
+/// 基準を 1 色に対する分布ではなく残差に置くのは、**場が吸った後に残る散らばりが
+/// 「どこまでを背景と言い切れるか」を表す**からである。照明勾配のある背景では
+/// 1 色に対する p90 が勾配の幅そのものを指し、芯の許容量が不当に広がっていた。
+/// 1 色モデルでは残差＝1 色に対する分布なので、値は変わらない。
 ///
 /// 上限を tolerance の 1/3 に置くのは、芯が緩い許容量に近づくと 2 段に分けた
 /// 意味が消えるため。下限 1.0 は、ノイズの無い合成画像（p90 が 0）で芯が
@@ -120,7 +127,15 @@ fn shadow_reach(width: u32, height: u32) -> u32 {
 }
 
 /// 前景マスクを生成する。255 = 前景、0 = 背景。
-pub fn foreground_mask(image: &RgbaImage, background: [u8; 3], opts: &FloodOptions<'_>) -> Mask {
+///
+/// 背景は 1 色ではなく場（[`BackgroundField`]）で受ける。1 色モデルは
+/// 「全画素で同じ値を返す場」として**同じ経路を通る**——分岐を 2 本持てば、
+/// 片方だけ直した日に結果が静かに食い違う。
+pub fn foreground_mask(
+    image: &RgbaImage,
+    field: &BackgroundField,
+    opts: &FloodOptions<'_>,
+) -> Mask {
     let (w, h) = (image.width(), image.height());
     if w == 0 || h == 0 {
         return Mask::new(w, h, 0);
@@ -141,16 +156,13 @@ pub fn foreground_mask(image: &RgbaImage, background: [u8; 3], opts: &FloodOptio
     // 占めるので、生存期間が重なるかどうかだけでピーク RSS が 100MB 単位で変わる
     let dam = (opts.edge_threshold > 0.0).then(|| edge_ridges(image, opts.edge_threshold as f32));
     let lut = srgb_linear_lut();
-    let bg_lab = quantize(linear_to_lab([
-        lut[background[0] as usize],
-        lut[background[1] as usize],
-        lut[background[2] as usize],
-    ]));
+    let bg = FieldLab::of(field, lut);
     let lab = lab_map(image, lut);
     let candidates = classify(
         image,
         &lab,
-        bg_lab,
+        &bg,
+        w,
         opts,
         &protected,
         two_stage,
@@ -359,15 +371,63 @@ impl Protected<'_> {
     }
 }
 
+/// 画素ごとの背景色(Lab)を引く。
+///
+/// 1 色モデルは**ここで 1 度だけ量子化した値を返し続ける**。場を持つときだけ
+/// 格子から双線形で引く。判定側（`classify`）はどちらかを知らずに `at` を呼ぶ。
+///
+/// 1 色のときに `BackgroundField` から線形 RGB を取り直さないのは、`refine` と
+/// ここが別の sRGB→線形の表を持っているからである。ここでは従来どおり
+/// `srgb_linear_lut` から作った値を使い、**1 色モデルの出力を 1 バイトも
+/// 動かさない**。
+enum FieldLab<'a> {
+    Flat(LabQ),
+    Grid(&'a BackgroundField),
+}
+
+impl<'a> FieldLab<'a> {
+    fn of(field: &'a BackgroundField, lut: &[f32; 256]) -> Self {
+        if field.is_flat() {
+            let rgb = field.rgb();
+            FieldLab::Flat(quantize(linear_to_lab([
+                lut[rgb[0] as usize],
+                lut[rgb[1] as usize],
+                lut[rgb[2] as usize],
+            ])))
+        } else {
+            FieldLab::Grid(field)
+        }
+    }
+
+    #[inline]
+    fn at(&self, x: u32, y: u32) -> LabQ {
+        match self {
+            FieldLab::Flat(lab) => *lab,
+            // 場を持つときだけ格子を引く。`lab_at` が `None` を返すのは
+            // 1 色のときだけなので、ここへは届かない
+            FieldLab::Grid(field) => match field.lab_at(x, y) {
+                Some(lab) => quantize(lab),
+                None => quantize([0.0; 3]),
+            },
+        }
+    }
+}
+
 /// 各画素が背景候補かどうかを判定する。既に透明な画素は無条件に背景とする。
 ///
 /// `dam`（勾配の稜線）が与えられたとき、輪郭上の画素は色が背景に近くても
 /// 候補から外す。これがなければ、淡い色の商品は落ち影を消せる許容量の下で
 /// 必ず飲み込まれてしまう。
+///
+/// **影の判定も場に対して行う。** 照明の勾配は「その場の背景より暗い」には
+/// ならないので、勾配を影と取り違えなくなる（1 色で測っていた頃は、画像の
+/// 暗い側が丸ごと影候補だった）。
+#[allow(clippy::too_many_arguments)]
 fn classify(
     image: &RgbaImage,
     lab: &[LabQ],
-    bg_lab: LabQ,
+    bg: &FieldLab<'_>,
+    width: u32,
     opts: &FloodOptions<'_>,
     protected: &Protected<'_>,
     two_stage: bool,
@@ -386,7 +446,16 @@ fn classify(
 
     let mut flags = vec![0u8; lab.len()];
 
+    // 座標は数えながら進める。添字から割り算で戻すと、場を持たない実行でも
+    // 20MP ぶんの除算を払うことになる
+    let (mut x, mut y) = (0u32, 0u32);
     for (i, p) in image.pixels().enumerate() {
+        let (px, py) = (x, y);
+        x += 1;
+        if x == width {
+            x = 0;
+            y += 1;
+        }
         if protected.has(i) {
             continue;
         }
@@ -405,6 +474,7 @@ fn classify(
         // 代わりに、影の吸収は第2段の背景から `shadow_reach` px 以内に
         // 閉じ込める。堤防を外した分の危険は距離で抑える
         let mut f = 0u8;
+        let bg_lab = bg.at(px, py);
         if is_shadow(lab[i], bg_lab, shadow) {
             f |= SHADOW;
         }
@@ -836,6 +906,12 @@ mod tests {
 
     const BG: [u8; 3] = [250, 250, 250];
 
+    /// 1 色の場。既存の試験は「背景 1 色」の性質を測っているので、場としては
+    /// 全画素で同じ値を返すものを渡す
+    fn flat(rgb: [u8; 3]) -> BackgroundField {
+        BackgroundField::flat(rgb)
+    }
+
     /// ASCII で試験画像を組む。
     /// `.` 背景(白) / `o` 商品内部(背景と同色) / `#` 濃い商品 / `-` 淡い輪郭 / ` ` 透明
     ///
@@ -885,7 +961,7 @@ mod tests {
         let img = ascii(&[
             "........", "........", "..####..", "..####..", "........", "........",
         ]);
-        let mask = foreground_mask(&img, BG, &opts(5.0));
+        let mask = foreground_mask(&img, &flat(BG), &opts(5.0));
         assert!(
             mask.is_foreground(3, 2),
             "商品が背景にされている\n{}",
@@ -905,7 +981,7 @@ mod tests {
         let img = ascii(&[
             "........", "..####..", "..#oo#..", "..#oo#..", "..####..", "........",
         ]);
-        let mask = foreground_mask(&img, BG, &opts(5.0));
+        let mask = foreground_mask(&img, &flat(BG), &opts(5.0));
 
         assert!(
             mask.is_foreground(3, 2) && mask.is_foreground(4, 3),
@@ -934,12 +1010,12 @@ mod tests {
             "........", "..####..", "..#oo#..", "..#oo#..", "..####..", "........",
         ]);
         // 対照：指示が無ければ、この白は連結性のおかげで前景として残る
-        assert!(foreground_mask(&img, BG, &opts(5.0)).is_foreground(3, 2));
+        assert!(foreground_mask(&img, &flat(BG), &opts(5.0)).is_foreground(3, 2));
 
         let constraints = constrained(|c| c.mark(3, 2, Constraint::ForcedBg));
         let mask = foreground_mask(
             &img,
-            BG,
+            &flat(BG),
             &FloodOptions {
                 constraints: Some(&constraints),
                 ..opts(5.0)
@@ -975,7 +1051,7 @@ mod tests {
         });
         let mask = foreground_mask(
             &img,
-            BG,
+            &flat(BG),
             &FloodOptions {
                 constraints: Some(&constraints),
                 seal: 1,
@@ -996,7 +1072,10 @@ mod tests {
             "........", "........", "........", "........", "........", "........",
         ]);
         // 対照：指示が無ければ全面が背景になる
-        assert_eq!(foreground_mask(&img, BG, &opts(5.0)).stats().bbox, None);
+        assert_eq!(
+            foreground_mask(&img, &flat(BG), &opts(5.0)).stats().bbox,
+            None
+        );
 
         let constraints = constrained(|c| {
             c.fill_polygon(
@@ -1006,7 +1085,7 @@ mod tests {
         });
         let mask = foreground_mask(
             &img,
-            BG,
+            &flat(BG),
             &FloodOptions {
                 constraints: Some(&constraints),
                 ..opts(5.0)
@@ -1039,7 +1118,7 @@ mod tests {
         });
         let mask = foreground_mask(
             &img,
-            BG,
+            &flat(BG),
             &FloodOptions {
                 bbox: Some((2, 1, 5, 4)),
                 constraints: Some(&constraints),
@@ -1102,7 +1181,11 @@ mod tests {
     #[test]
     fn a_forced_background_never_leaves_more_foreground_than_no_instruction_at_all() {
         let img = two_tone_inside_a_white_frame();
-        let bare = foreground_mask(&img, [255, 255, 255], &framed_opts((25, 25, 175, 175)));
+        let bare = foreground_mask(
+            &img,
+            &flat([255, 255, 255]),
+            &framed_opts((25, 25, 175, 175)),
+        );
         let bare_ratio = bare.stats().foreground_ratio;
 
         // 確定背景は 4x4 の 1 枚だけ。薄いほうのグレーの上に置く
@@ -1113,7 +1196,7 @@ mod tests {
         );
         let hinted = foreground_mask(
             &img,
-            [255, 255, 255],
+            &flat([255, 255, 255]),
             &FloodOptions {
                 constraints: Some(&constraints),
                 ..framed_opts((25, 25, 175, 175))
@@ -1141,7 +1224,7 @@ mod tests {
         constraints.mark(0, 0, Constraint::ForcedFg);
         let mask = foreground_mask(
             &img,
-            BG,
+            &flat(BG),
             &FloodOptions {
                 constraints: Some(&constraints),
                 ..opts(5.0)
@@ -1156,7 +1239,7 @@ mod tests {
         let img = ascii(&[
             "........", "..####..", "..#oo#..", "..#oo#..", "..#..#..", "........",
         ]);
-        let mask = foreground_mask(&img, BG, &opts(5.0));
+        let mask = foreground_mask(&img, &flat(BG), &opts(5.0));
         assert!(
             !mask.is_foreground(3, 2),
             "外周につながった白が残っている\n{}",
@@ -1177,7 +1260,7 @@ mod tests {
         ]);
         // 淡い輪郭(215)と背景(250)の色差は ΔE で 10 程度あるため、
         // tolerance 5 ならフィルはここで止まる
-        let mask = foreground_mask(&img, BG, &opts(5.0));
+        let mask = foreground_mask(&img, &flat(BG), &opts(5.0));
 
         for (x, y) in [(3u32, 2u32), (4, 2), (5, 3), (6, 3)] {
             assert!(
@@ -1193,7 +1276,7 @@ mod tests {
     #[test]
     fn a_product_touching_the_border_is_kept_and_flagged() {
         let img = ascii(&["..####..", "..####..", "..####.."]);
-        let mask = foreground_mask(&img, BG, &opts(5.0));
+        let mask = foreground_mask(&img, &flat(BG), &opts(5.0));
         let stats = mask.stats();
         assert!(mask.is_foreground(3, 0));
         assert!(stats.touches_edge, "見切れが検出されていない");
@@ -1203,13 +1286,13 @@ mod tests {
     fn tolerance_controls_how_much_is_removed() {
         // 淡い輪郭(215)は tolerance を上げると背景として飲まれる
         let img = ascii(&["........", "..----..", "..-##-..", "..----..", "........"]);
-        let tight = foreground_mask(&img, BG, &opts(5.0));
+        let tight = foreground_mask(&img, &flat(BG), &opts(5.0));
         assert!(
             tight.is_foreground(2, 1),
             "tolerance 5 で輪郭まで消えている"
         );
 
-        let loose = foreground_mask(&img, BG, &opts(20.0));
+        let loose = foreground_mask(&img, &flat(BG), &opts(20.0));
         assert!(
             !loose.is_foreground(2, 1),
             "tolerance 20 でも輪郭が残っている"
@@ -1220,7 +1303,7 @@ mod tests {
     #[test]
     fn already_transparent_pixels_count_as_background() {
         let img = ascii(&["        ", "  ####  ", "  ####  ", "        "]);
-        let mask = foreground_mask(&img, BG, &opts(5.0));
+        let mask = foreground_mask(&img, &flat(BG), &opts(5.0));
         assert!(mask.is_foreground(3, 1));
         assert!(!mask.is_foreground(0, 0));
     }
@@ -1231,7 +1314,7 @@ mod tests {
         let mut o = opts(5.0);
         // 商品の左半分だけを囲う
         o.bbox = Some((2, 1, 3, 3));
-        let mask = foreground_mask(&img, BG, &o);
+        let mask = foreground_mask(&img, &flat(BG), &o);
 
         assert!(
             mask.is_foreground(2, 1),
@@ -1273,7 +1356,7 @@ mod tests {
             edge_threshold: 0.0,
             ..Default::default()
         };
-        let mask = foreground_mask(&img, bg, &opts);
+        let mask = foreground_mask(&img, &flat(bg), &opts);
 
         assert!(mask.is_foreground(20, 20), "商品は残る");
         assert!(
@@ -1300,7 +1383,7 @@ mod tests {
         ] {
             let mut o = opts(5.0);
             o.bbox = bbox;
-            let mask = foreground_mask(&img, BG, &o);
+            let mask = foreground_mask(&img, &flat(BG), &o);
             assert_eq!(mask.width(), 30);
             assert_eq!(mask.height(), 30);
         }
@@ -1323,12 +1406,12 @@ mod tests {
             "..............................",
             "..............................",
         ]);
-        let bare = foreground_mask(&img, BG, &opts(5.0));
+        let bare = foreground_mask(&img, &flat(BG), &opts(5.0));
         assert_eq!(bare.stats().foreground_ratio, 0.0);
 
         let mut o = opts(5.0);
         o.fg_seeds = vec![(15, 6)];
-        let seeded = foreground_mask(&img, BG, &o);
+        let seeded = foreground_mask(&img, &flat(BG), &o);
 
         assert!(seeded.is_foreground(15, 6), "種そのものが保護されていない");
         assert!(
@@ -1360,7 +1443,7 @@ mod tests {
         let mut o = opts(5.0);
         o.bbox = Some((0, 0, 2, 2));
         o.fg_seeds = vec![(20, 6)];
-        let mask = foreground_mask(&img, BG, &o);
+        let mask = foreground_mask(&img, &flat(BG), &o);
         assert!(mask.is_foreground(20, 6), "bbox 外でも種は前景であるべき");
     }
 
@@ -1369,7 +1452,7 @@ mod tests {
         let img = ascii(&["....", "....", "...."]);
         let mut o = opts(5.0);
         o.fg_seeds = vec![(100, 100)];
-        let mask = foreground_mask(&img, BG, &o);
+        let mask = foreground_mask(&img, &flat(BG), &o);
         assert_eq!(mask.stats().foreground_ratio, 0.0);
     }
 
@@ -1429,7 +1512,7 @@ mod tests {
         let img = gray_rows(&vec![ramp; 5]);
         let mut o = two_stage(40.0);
         o.edge_threshold = 0.0;
-        let mask = foreground_mask(&img, BG, &o);
+        let mask = foreground_mask(&img, &flat(BG), &o);
         assert!(
             !mask.is_foreground(30, 2),
             "なだらかな傾斜を渡れていない\n{}",
@@ -1442,7 +1525,7 @@ mod tests {
             *v = if x < 20 { 250 } else { 190 };
         }
         let img = gray_rows(&vec![stepped; 5]);
-        let mask = foreground_mask(&img, BG, &o);
+        let mask = foreground_mask(&img, &flat(BG), &o);
         assert!(
             mask.is_foreground(30, 2),
             "段差を越えてしまっている\n{}",
@@ -1461,7 +1544,7 @@ mod tests {
         o.core_tolerance = 1.0;
         o.step_tolerance = 0.05;
         o.edge_threshold = 0.0;
-        let mask = foreground_mask(&img, BG, &o);
+        let mask = foreground_mask(&img, &flat(BG), &o);
         assert_eq!(
             mask.stats().foreground_ratio,
             0.0,
@@ -1477,7 +1560,7 @@ mod tests {
         let img = gray_rows(&vec![vec![240u8; 20]; 8]);
         let mut o = two_stage(30.0);
         o.edge_threshold = 0.0;
-        let mask = foreground_mask(&img, BG, &o);
+        let mask = foreground_mask(&img, &flat(BG), &o);
         assert_eq!(
             mask.stats().foreground_ratio,
             0.0,
@@ -1503,7 +1586,7 @@ mod tests {
         let img = gray_rows(&vec![ramp; 5]);
         let mut o = with_shadow(12.0);
         o.edge_threshold = 0.0;
-        let mask = foreground_mask(&img, BG, &o);
+        let mask = foreground_mask(&img, &flat(BG), &o);
         assert!(
             !mask.is_foreground(24, 2),
             "影として吸収できていない\n{}",
@@ -1512,7 +1595,7 @@ mod tests {
 
         // 影の判定を切れば、tolerance の外なので前景として残るはず
         o.shadow_tolerance = 0.0;
-        let mask = foreground_mask(&img, BG, &o);
+        let mask = foreground_mask(&img, &flat(BG), &o);
         assert!(
             mask.is_foreground(24, 2),
             "対照が成立していない（影判定なしでも消えている）\n{}",
@@ -1528,7 +1611,7 @@ mod tests {
         let img = gray_rows(&vec![ramp; 5]);
         let mut o = with_shadow(12.0);
         o.edge_threshold = 0.0;
-        let mask = foreground_mask(&img, BG, &o);
+        let mask = foreground_mask(&img, &flat(BG), &o);
         // 短辺 5px の画像なので進める距離は下限の 16px。色だけで届く範囲
         // （x=10 前後）から 16px 先まででフィルは止まる
         assert!(
@@ -1559,7 +1642,7 @@ mod tests {
         }
         let mut o = with_shadow(12.0);
         o.edge_threshold = 0.0;
-        let mask = foreground_mask(&img, BG, &o);
+        let mask = foreground_mask(&img, &flat(BG), &o);
         assert!(
             mask.is_foreground(38, 2),
             "彩度が動く傾斜まで影として飲み込んでいる\n{}",
@@ -1575,7 +1658,7 @@ mod tests {
         let img = gray_rows(&vec![ramp; 5]);
         let mut o = with_shadow(12.0);
         o.edge_threshold = 0.0;
-        let mask = foreground_mask(&img, bg, &o);
+        let mask = foreground_mask(&img, &flat(bg), &o);
         assert!(
             mask.is_foreground(38, 2),
             "背景より明るい映り込みを影として消している\n{}",
@@ -1602,7 +1685,7 @@ mod tests {
 
         let mut o = two_stage(12.0);
         o.seal = 0;
-        let leaked = foreground_mask(&img, BG, &o);
+        let leaked = foreground_mask(&img, &flat(BG), &o);
         assert!(
             !leaked.is_foreground(11, 12),
             "前提が崩れている: 穴から浸水するはず\n{}",
@@ -1610,7 +1693,7 @@ mod tests {
         );
 
         o.seal = 1;
-        let sealed = foreground_mask(&img, BG, &o);
+        let sealed = foreground_mask(&img, &flat(BG), &o);
         assert!(
             sealed.is_foreground(11, 12),
             "1px の穴からの浸水を塞げていない\n{}",
@@ -1638,7 +1721,7 @@ mod tests {
         }
         let mut o = two_stage(12.0);
         o.seal = 1;
-        let mask = foreground_mask(&img, BG, &o);
+        let mask = foreground_mask(&img, &flat(BG), &o);
         assert!(
             !mask.is_foreground(11, 12),
             "幅 6px の隙間まで塞いでいる\n{}",
@@ -1682,7 +1765,7 @@ mod tests {
             o.edge_threshold = dam;
             o.seal = 1;
             for (gap, sealed) in [(1u32, true), (2, true), (3, false), (4, false)] {
-                let mask = foreground_mask(&slotted_block(gap), BG, &o);
+                let mask = foreground_mask(&slotted_block(gap), &flat(BG), &o);
                 assert_eq!(
                     mask.is_foreground(16, 14),
                     sealed,
@@ -1703,7 +1786,7 @@ mod tests {
         let mut o = two_stage(12.0);
         o.edge_threshold = 8.0;
         o.seal = 0;
-        let mask = foreground_mask(&slotted_block(2), BG, &o);
+        let mask = foreground_mask(&slotted_block(2), &flat(BG), &o);
         assert!(
             !mask.is_foreground(16, 14),
             "前提が崩れている: 堤防だけで 2px のスリットが塞がっている\n{}",
@@ -1723,7 +1806,7 @@ mod tests {
         }
         let mut o = two_stage(12.0);
         o.seal = 1;
-        let mask = foreground_mask(&img, BG, &o);
+        let mask = foreground_mask(&img, &flat(BG), &o);
         assert!(
             !mask.is_foreground(0, 10),
             "1px の背景の縁まで前景にしている\n{}",

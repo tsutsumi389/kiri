@@ -180,6 +180,17 @@ pub struct EdgeScene {
     /// 縦横の正弦の積にするのは、実素材の織り目が線ではなく点として現れ、
     /// 面積フィルタの対象になるためである
     pub weave: Option<(f32, f32)>,
+    /// 背景に乗せる照明の勾配。(左上での明度係数, 右下での明度係数)。
+    ///
+    /// **紙や布のスタジオ背景で最も頻出する欠陥である。** 単色の紙に照明が
+    /// 斜めに当たれば、外周の帯は 1 色では表せなくなる。1 色 + `--tolerance`
+    /// で飲むには勾配の幅ぶんだけ許容量を広げるしかなく、そこまで広げれば
+    /// 淡い商品もまるごと飲む。照明場モデルはこれを吸うために入れた。
+    ///
+    /// **商品には掛けない。** 商品の明暗は `shading` が別に持っており、
+    /// 両方を同じ係数で動かすと「背景の勾配」と「商品の陰影」のどちらが
+    /// 効いたか分けられなくなる。正解（`coverage`）も動かない
+    pub gradient: Option<(f32, f32)>,
     /// 画面下端で見切れた、柄のある別の商品。(帯の高さ px, 振幅, 周期 px)。
     ///
     /// EC で頻出する「商品が画面の端で切れている」構図を作る。外周の帯の 1 辺が
@@ -208,6 +219,7 @@ impl Default for EdgeScene {
             jpeg: Some(90),
             noise: 1.5,
             weave: None,
+            gradient: None,
             cropped_band: None,
         }
     }
@@ -320,6 +332,21 @@ pub fn edge_scenes() -> Vec<EdgeScene> {
             shading: (1.0, 1.0),
             weave: Some((12.0, 6.0)),
             noise: 1.0,
+            ..Default::default()
+        },
+        // **照明場モデルの対照実験。** S1 に照明の勾配を乗せただけのシーンで、
+        // 外周 ΔE は 1 色から見ると p90 13.9 まで開く（uniformity 0.29）。
+        // 1 色モデルでは既定の tolerance 12 が片側に届かず背景が残り
+        // （前景比率 0.410 / 正解 0.375、輪郭誤差 9.77）、照明場モデルでは
+        // 既定のまま切れる（0.375 / 0.46）。S11 と同じ形の対で、
+        // 「場が無ければ解けない」ことを固定する。
+        //
+        // 係数は**1 色モデルが壊れる最小の勾配**を選んである。0.85→1.10 では
+        // 第 2 段の段差判定がなだらかな傾斜として越えてしまい、1 色でも解ける
+        // ——対照実験にならない。実測した崩れ始めが 0.75→1.15 だった
+        EdgeScene {
+            name: "S13 照明勾配の背景",
+            gradient: Some((0.75, 1.15)),
             ..Default::default()
         },
         // 解けないケース。商品の明度が上から下へ変化する途中で背景色を
@@ -456,6 +483,15 @@ pub fn edge_scene(scene: &EdgeScene) -> EdgeTruth {
                 scene.background[1] as f32 + nz,
                 scene.background[2] as f32 + nz,
             ];
+            // 照明の勾配は左上から右下へ線形に効かせる。**既存のシーンの画素を
+            // 1 ビットも変えない**よう、指定が無ければ何もしない
+            if let Some((g0, g1)) = scene.gradient {
+                let t = (fx / fw + fy / fh) / 2.0;
+                let g = g0 + (g1 - g0) * t;
+                for k in &mut rgb {
+                    *k = (*k * g).clamp(0.0, 255.0);
+                }
+            }
             let mut sh = 0.0;
             if scene.shadow {
                 let sx = (fx - cx) / (rx * 1.1);
@@ -1846,6 +1882,169 @@ pub fn light_product_image(width: u32, height: u32) -> RgbaImage {
             let on_edge = x < x1 + 2 || y < y1 + 2 || x >= x2 - 2 || y >= y2 - 2;
             let c = if on_edge { 236 } else { 242 };
             img.put_pixel(x, y, Rgba([c, c, c - 2, 255]));
+        }
+    }
+    img
+}
+
+/// `subject` の較正に使う 13 シーンのうち、合成で作れる 11 枚。
+///
+/// **README と `subject.rs` の較正表はこの一覧から取り直す。** 表の数値が
+/// どの画像から出たのかを、コミットの外に置かないためである。残り 2 枚は
+/// 実写（不織布の上のリモコン / 暗い机の上のキーボード）で、リポジトリには
+/// 置けないので報告のときに手で回す。
+///
+/// 返すのは (名前, 画像, 正しい判定)。**正しい判定は人が決める**——
+/// 「その矩形に従って切り抜いてよいか」であって、実装が返した値ではない。
+pub fn subject_scenes() -> Vec<(&'static str, RgbaImage, bool)> {
+    vec![
+        (
+            "画面外へ抜ける大きな物体",
+            bleeding_product_scene(600, 600),
+            false,
+        ),
+        (
+            "同じ構図を織り目の上に置いたもの",
+            woven_poisoned_scene(600, 600),
+            false,
+        ),
+        (
+            "画面の 4 割を占める物体だけ",
+            bleeding_slab_scene(800, 800, 40),
+            false,
+        ),
+        ("下端に影の帯", shadow_band_scene(800, 800, 220), true),
+        (
+            "下端に境界すれすれの帯",
+            shadow_band_scene(800, 800, 205),
+            true,
+        ),
+        ("左辺に小道具", prop_scene(800, 800), true),
+        ("なだらかな勾配の背景", ramp_scene(800, 800), true),
+        ("きれいなスタジオ背景", studio_scene(800, 800), true),
+        ("白地に淡色の商品", pale_product_scene(800, 800), true),
+        ("広い落ち影", wide_shadow_scene(800, 800), true),
+        ("商品が 2 つ", two_product_scene(800, 800), false),
+    ]
+}
+
+/// 白背景の中央に置く標準の商品（画面の 31%〜69%）。
+///
+/// 較正の 11 枚のうち 6 枚がこの商品を共有する。**同じ商品を使うことが要点**
+/// ——面積や捕捉率が動いたときに、それが商品のせいか背景のせいかを分けられる。
+fn put_product(img: &mut RgbaImage, colour: [u8; 3]) {
+    let (w, h) = (img.width(), img.height());
+    let (x1, y1) = (w * 31 / 100, h * 31 / 100);
+    let (x2, y2) = (w * 69 / 100, h * 69 / 100);
+    for y in y1..y2 {
+        for x in x1..x2 {
+            img.put_pixel(x, y, Rgba([colour[0], colour[1], colour[2], 255]));
+        }
+    }
+}
+
+/// 左端から画面の `percent`% を占める物体が、上下左の 3 辺へ抜けるシーン。
+///
+/// **外周サンプルの 1 割を軽く超える**ので、外周 ΔE の p90 がその物体の色差を
+/// 指す。物体は自分で作った閾値を越えられず、残るのは縮小のリンギングだけに
+/// なる——`capture_ratio` が 1.0 へ張り付き、誤検出を弾くはずの捕捉率が
+/// 誤検出を後押しする向きに反転する。弾けるのは `leftover_ratio` だけである。
+fn bleeding_slab_scene(width: u32, height: u32, percent: u32) -> RgbaImage {
+    let mut img = RgbaImage::from_pixel(width, height, Rgba([250, 250, 248, 255]));
+    for y in 0..height {
+        for x in 0..width * percent / 100 {
+            img.put_pixel(x, y, Rgba([150, 150, 150, 255]));
+        }
+    }
+    img
+}
+
+/// 白背景に淡色（輪郭 ΔE 9.5）の商品。kiri の看板ケース。
+///
+/// `light_product_image` ではない。あちらは輪郭のコントラストが ΔE 5 しかなく、
+/// 主体検出の閾値の下限（`UNIFORM_DELTA_E`）をそもそも越えないので
+/// `subject` が `null` になる——較正表の行として意味を持たない
+fn pale_product_scene(width: u32, height: u32) -> RgbaImage {
+    let mut img = RgbaImage::from_pixel(width, height, Rgba([250, 250, 248, 255]));
+    put_product(&mut img, [232, 232, 230]);
+    img
+}
+
+/// 中央の商品 + 左辺に写り込んだ小道具。
+fn prop_scene(width: u32, height: u32) -> RgbaImage {
+    let mut img = RgbaImage::from_pixel(width, height, Rgba([250, 250, 248, 255]));
+    for y in height * 20 / 100..height * 45 / 100 {
+        for x in 0..width * 6 / 100 {
+            img.put_pixel(x, y, Rgba([120, 116, 110, 255]));
+        }
+    }
+    put_product(&mut img, [40, 40, 44]);
+    img
+}
+
+/// なだらかな照明の勾配を持つ背景 + 中央の商品。
+fn ramp_scene(width: u32, height: u32) -> RgbaImage {
+    let mut img = RgbaImage::new(width, height);
+    for y in 0..height {
+        for x in 0..width {
+            let t = (x as f32 / width as f32 + y as f32 / height as f32) / 2.0;
+            let v = (215.0 + 40.0 * t).round().clamp(0.0, 255.0) as u8;
+            img.put_pixel(x, y, Rgba([v, v, v.saturating_sub(2), 255]));
+        }
+    }
+    put_product(&mut img, [40, 40, 44]);
+    img
+}
+
+/// きれいな無地背景 + 中央の商品。較正の基準点。
+fn studio_scene(width: u32, height: u32) -> RgbaImage {
+    let mut img = RgbaImage::from_pixel(width, height, Rgba([250, 250, 248, 255]));
+    put_product(&mut img, [40, 40, 44]);
+    img
+}
+
+/// 商品の下に広い落ち影。影は外周には届かない。
+fn wide_shadow_scene(width: u32, height: u32) -> RgbaImage {
+    let mut img = RgbaImage::from_pixel(width, height, Rgba([250, 250, 248, 255]));
+    let (cx, cy) = (width as f32 / 2.0, height as f32 * 0.72);
+    let (rx, ry) = (width as f32 * 0.32, height as f32 * 0.10);
+    for y in 0..height {
+        for x in 0..width {
+            let sx = (x as f32 + 0.5 - cx) / rx;
+            let sy = (y as f32 + 0.5 - cy) / ry;
+            let v = 1.0 - (sx * sx + sy * sy);
+            if v <= 0.0 {
+                continue;
+            }
+            let k = 1.0 - v.min(1.0) * 0.30;
+            let p = img.get_pixel(x, y).0;
+            img.put_pixel(
+                x,
+                y,
+                Rgba([
+                    (f32::from(p[0]) * k) as u8,
+                    (f32::from(p[1]) * k) as u8,
+                    (f32::from(p[2]) * k) as u8,
+                    255,
+                ]),
+            );
+        }
+    }
+    put_product(&mut img, [40, 40, 44]);
+    img
+}
+
+/// 同じ大きさの商品が 2 つ離れて置かれた構図。どちらを囲んでも取りこぼす。
+fn two_product_scene(width: u32, height: u32) -> RgbaImage {
+    let mut img = RgbaImage::from_pixel(width, height, Rgba([250, 250, 248, 255]));
+    for (x1, x2) in [
+        (width * 8 / 100, width * 38 / 100),
+        (width * 62 / 100, width * 92 / 100),
+    ] {
+        for y in height * 35 / 100..height * 65 / 100 {
+            for x in x1..x2 {
+                img.put_pixel(x, y, Rgba([40, 40, 44, 255]));
+            }
         }
     }
     img

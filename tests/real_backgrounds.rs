@@ -21,7 +21,7 @@ use common::{
     EdgeMetrics, EdgeScene, edge_scene, edge_scenes, measure_edges, real_scenes, run_real,
 };
 use kiri::cutout::diagnostics::{CONTOUR_ROUGH_WARN, RIM_CONTAMINATION_WARN};
-use kiri::cutout::{CutoutOptions, Diagnostics, cutout};
+use kiri::cutout::{BackgroundModel, CutoutOptions, Diagnostics, cutout};
 
 /// ベンチの 1 点。シーンと設定の組。
 #[derive(Clone)]
@@ -428,9 +428,13 @@ fn the_matting_stages_halve_the_truth_side_error_on_a_real_background() {
         let result = cutout(&truth.image, opts);
         common::measure_edges_with(&truth, &result.image, &result.mask, opts.bbox, None)
     };
+    // **背景のモデルは 1 色に固定する。** ここで比べたいのは matting の 3 段
+    // だけで、照明場を混ぜると「良くなった（悪くなった）のが 3 段のおかげか」が
+    // 分けられない。上の表の数値も 1 色で測ったものである
     let assisted = CutoutOptions {
         bbox: Some(bbox),
         tolerance: scene.assisted_tolerance,
+        background_model: BackgroundModel::Flat,
         ..Default::default()
     };
     let before = measure(&CutoutOptions {
@@ -497,10 +501,13 @@ fn each_stage_moves_the_metric_it_is_responsible_for() {
         let m = common::measure_edges_with(&truth, &result.image, &result.mask, opts.bbox, None);
         (m, result.diagnostics)
     };
+    // **1 段ずつ足して比べる以上、背景のモデルは動かさない。** 上の表は
+    // 1 色で測った値なので、ここも 1 色に固定する
     let phase2 = || CutoutOptions {
         matting: Matting::Projection,
         smooth_contour: 0.0,
         reclassify: false,
+        background_model: BackgroundModel::Flat,
         ..Default::default()
     };
 
@@ -747,11 +754,17 @@ fn listing(points: &[Point], metric: &str) -> String {
 ///
 /// | 指標 | クリーン最大 | 欠陥最小 | しきい値 |
 /// |---|---|---|---|
-/// | `contour_roughness` | 0.082（S5、幅 3px のストラップ） | 0.194（R6 defaults） | 0.16 |
-/// | `rim_contamination` | 0.007（S6 / S10） | 0.032（R7 defaults） | 0.02 |
+/// | `contour_roughness` | 0.113（R2 assisted） | 0.247（R6 assisted） | 0.16 |
+/// | `rim_contamination` | 0.007（S6 / S10） | 0.052（R2 assisted） | 0.02 |
 ///
-/// **しきい値 0.16 は据え置く。** 0.12 まで下げると R2 assisted（正解の輪郭誤差
-/// 1.12px = 良品、粗さ 0.115）が誤警告の側へ近づく。
+/// **Phase 4（照明場）で母集団が動いた。** 粗さのクリーン側の最大は 0.082
+/// （S5、幅 3px のストラップ）から 0.113（R2 assisted）へ上がったが、これは
+/// 粗さが悪化したのではなく、**R2 assisted の正解の輪郭誤差が 1.12 → 0.80 へ
+/// 改善して「良品」の群に入った**ためである。欠陥側の最小も、R7 defaults
+/// （輪郭誤差 59.1 → 0.41）が壊れた群から抜けたぶん 0.194 → 0.247 へ上がった。
+///
+/// **しきい値 0.16 は据え置く。** クリーン側へ 1.42 倍、欠陥側へ 1.54 倍の
+/// 余裕がある。
 ///
 /// # `CONTOUR_ROUGH` は蛇行だけを見る
 ///
@@ -769,8 +782,8 @@ fn the_thresholds_sit_between_the_clean_and_the_defective() {
         (
             "contour_roughness",
             CONTOUR_ROUGH_WARN,
-            0.09,
-            0.17,
+            0.12,
+            0.24,
             roughness_side as fn(&EdgeMetrics) -> Side,
             (|p: &Point| p.diagnostics.contour_roughness) as fn(&Point) -> Option<f64>,
         ),
@@ -813,11 +826,45 @@ fn the_thresholds_sit_between_the_clean_and_the_defective() {
 #[test]
 fn a_smoothly_wrong_contour_is_caught_by_the_other_warnings() {
     let points = bench();
-    let broken = point(&points, "R7 照明勾配のある紙 + 黒商品 / defaults");
+    // **R7 defaults は既定ではもう壊れていない**（Phase 4 の照明場が輪郭誤差を
+    // 59.1 → 0.41 にした）。壊れた切り抜きを作るには背景を 1 色で測らせる
+    // しかないので、ここだけ `--background-model flat` で回す。捕まえるのが
+    // どの警告かという問いは、モデルが変わっても変わらない
+    let scene = real_scenes()
+        .into_iter()
+        .find(|s| s.name.starts_with("R7"))
+        .expect("R7 がベンチに無い");
+    let truth = common::real_scene(&scene);
+    let result = cutout(
+        &truth.image,
+        &CutoutOptions {
+            background_model: BackgroundModel::Flat,
+            ..Default::default()
+        },
+    );
+    let broken = Point {
+        label: "R7 / defaults(flat)".to_string(),
+        metrics: measure_edges(&truth, &result.image, &result.mask),
+        diagnostics: result.diagnostics.clone(),
+        warnings: result
+            .warnings
+            .iter()
+            .map(|w| w.code.as_str().to_string())
+            .collect(),
+        constraints: None,
+    };
     assert!(
         broken.metrics.contour_error > 10.0,
-        "前提: R7 defaults は壊れた切り抜きである: {:.2}",
+        "前提: 1 色で測った R7 defaults は壊れた切り抜きである: {:.2}",
         broken.metrics.contour_error
+    );
+    // 対照：同じシーンを既定（照明場）で回せば壊れていない。**「1 色なら
+    // 壊れる」を前提に置く以上、既定で直っていることも同じ場所で押さえる**
+    let fixed = point(&points, "R7 照明勾配のある紙 + 黒商品 / defaults");
+    assert!(
+        fixed.metrics.contour_error < 1.0,
+        "既定で R7 が直っていない: {:.2}",
+        fixed.metrics.contour_error
     );
     for code in ["RIM_CONTAMINATED", "CONTOUR_ROUGH"] {
         assert!(
@@ -827,13 +874,16 @@ fn a_smoothly_wrong_contour_is_caught_by_the_other_warnings() {
         );
     }
     // 正解が「良品」と言う実写（R7 assisted）には輪郭の警告を 1 本も出さない。
-    // `LOW_UNIFORMITY` は背景そのものの性質（照明勾配）についての報せで、
-    // 切り抜きの出来を語っていないので数えない
+    //
+    // 数えないものが 2 つある。`LOW_UNIFORMITY` は背景そのものの性質
+    // （照明勾配）についての報せで、切り抜きの出来を語っていない。
+    // `BACKGROUND_FIELD_USED` は**既定で正しく動いた報告**で、直すものが無い
+    // （`EDGE_THRESHOLD_RAISED` と同じ位置づけ）
     let good = point(&points, "R7 照明勾配のある紙 + 黒商品 / assisted");
     let noisy: Vec<_> = good
         .warnings
         .iter()
-        .filter(|w| w.as_str() != "LOW_UNIFORMITY")
+        .filter(|w| !matches!(w.as_str(), "LOW_UNIFORMITY" | "BACKGROUND_FIELD_USED"))
         .collect();
     assert!(noisy.is_empty(), "良品に輪郭の警告が出ている: {noisy:?}");
 }
@@ -1352,6 +1402,136 @@ fn print_the_external_bench() {
             pair.options.tolerance,
             bbox,
             constraints,
+        );
+    }
+}
+
+/// **Phase 4 の本命。照明勾配のある実写背景が、bbox 無しで切れること。**
+///
+/// R7（fabric_b を σ=6 でぼかした「照明勾配のある紙」+ 黒商品）は、
+/// 1 色モデルでは既定値で破綻していた——前景比率 0.463（正解 0.375）、
+/// 輪郭誤差 59.1px、正解の帯の 57% が背景、`HALO_REMAINS` /
+/// `BBOX_RECOMMENDED` / `CONTOUR_ROUGH` / `RIM_CONTAMINATED` の 4 本。
+/// 外周 ΔE p90 16.7 の照明の起伏に既定の `--tolerance 12` が届かない。
+///
+/// **これは照明場モデルが解くべき問題そのものである。** 場が勾配を吸えば、
+/// 残差は圧縮ノイズの振幅だけになり、既定の tolerance で足りる。判定は
+/// 「`assisted`（bbox + tolerance 60）と同じ水準に届くこと」に置く——
+/// 指示を渡したのと同じ結果が既定で出るなら、指示は要らなかったことになる。
+#[test]
+fn a_lit_gradient_on_a_real_background_is_cut_without_a_bbox() {
+    let scene = real_scenes()
+        .into_iter()
+        .find(|s| s.name.starts_with("R7"))
+        .expect("R7 がベンチに無い");
+    let truth = common::real_scene(&scene);
+    let measure = |opts: &CutoutOptions| {
+        let result = cutout(&truth.image, opts);
+        let m = common::measure_edges_with(&truth, &result.image, &result.mask, opts.bbox, None);
+        let codes: Vec<String> = result
+            .warnings
+            .iter()
+            .map(|w| w.code.as_str().to_string())
+            .collect();
+        (m, result.stats.clone(), codes, result.background_model)
+    };
+
+    // 対照：1 色では壊れている。**前提が崩れたらこのテストは何も守っていない**
+    let (flat, _, flat_codes, _) = measure(&CutoutOptions {
+        background_model: BackgroundModel::Flat,
+        ..Default::default()
+    });
+    assert!(
+        flat.contour_error > 10.0,
+        "前提が崩れている: 1 色でも輪郭が合っている ({:.2})",
+        flat.contour_error
+    );
+    assert!(
+        flat_codes.iter().any(|c| c == "BBOX_RECOMMENDED"),
+        "前提が崩れている: 1 色で bbox を勧めていない: {flat_codes:?}"
+    );
+
+    // 本題：既定（auto → field）が assisted と同じ水準に届く
+    let (auto, stats, codes, model) = measure(&CutoutOptions::default());
+    assert_eq!(model.as_str(), "field", "既定で場が効いていない");
+    assert!(
+        auto.contour_error < 1.0,
+        "輪郭が正解から離れている: {:.2}（1 色では {:.2}）",
+        auto.contour_error,
+        flat.contour_error
+    );
+    assert!(
+        auto.rim_truth < 0.01,
+        "縁に背景が残っている: {:.3}（1 色では {:.3}）",
+        auto.rim_truth,
+        flat.rim_truth
+    );
+    assert!(
+        !stats.touches_edge,
+        "背景側が前景として残って端に達している"
+    );
+    assert!(
+        (stats.foreground_ratio - 0.375).abs() < 0.005,
+        "商品だけが残っていない: {:.4}",
+        stats.foreground_ratio
+    );
+
+    // 残る警告は背景の性質についての 2 本だけ。**切り抜きの出来に関する
+    // 警告は 1 本も出ない**
+    let noisy: Vec<&String> = codes
+        .iter()
+        .filter(|c| !matches!(c.as_str(), "LOW_UNIFORMITY" | "BACKGROUND_FIELD_USED"))
+        .collect();
+    assert!(noisy.is_empty(), "解けているのに警告が出ている: {noisy:?}");
+}
+
+/// **場を入れて悪くなった実写シーンが 1 つも無いこと。**
+///
+/// R7 だけを見ていると「1 枚のために全体を動かした」ことに気づけない。
+/// 7 枚すべてを 1 色と場の両方で回し、`defaults`（bbox 無し）で
+///
+/// - 前景比率が正解へ近づいたか
+/// - 正解の帯の汚染（`rim_truth`）が増えていないか
+///
+/// を対で見る。**片方だけでは足りない**——前景比率だけなら、商品を食って
+/// 面積を合わせた結果も「近づいた」になる。
+///
+/// R2 / R1 / R5 / R6（不織布）は場を入れても切れない。残っているのは照明では
+/// なく**織り目**で、これは堤防（`EDGE_THRESHOLD_RAISED`）の担当である。
+/// ここで固定するのは「近づいたこと」までで、「解けたこと」ではない。
+#[test]
+fn the_field_never_makes_a_real_scene_worse() {
+    for scene in real_scenes() {
+        let truth = common::real_scene(&scene);
+        // 正解の前景比率。被覆率 0.5 以上を前景と数える（マスクと同じ規約）
+        let target = truth.coverage.iter().filter(|&&c| c >= 0.5).count() as f64
+            / truth.coverage.len() as f64;
+        let run = |model: BackgroundModel| {
+            let opts = CutoutOptions {
+                background_model: model,
+                ..Default::default()
+            };
+            let result = cutout(&truth.image, &opts);
+            (
+                common::measure_edges_with(&truth, &result.image, &result.mask, None, None),
+                result.stats.foreground_ratio,
+            )
+        };
+        let (flat, flat_fg) = run(BackgroundModel::Flat);
+        let (field, field_fg) = run(BackgroundModel::Field);
+
+        assert!(
+            (field_fg - target).abs() <= (flat_fg - target).abs() + 0.005,
+            "{}: 場で前景比率が正解から遠ざかった: 1 色 {flat_fg:.4} → 場 {field_fg:.4} \
+             (正解 {target:.4})",
+            scene.name
+        );
+        assert!(
+            field.rim_truth <= flat.rim_truth + 0.01,
+            "{}: 場で縁の汚染が増えた: 1 色 {:.3} → 場 {:.3}",
+            scene.name,
+            flat.rim_truth,
+            field.rim_truth
         );
     }
 }

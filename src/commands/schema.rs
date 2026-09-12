@@ -187,6 +187,53 @@ fn fields() -> Vec<FieldEntry> {
             ),
         },
         FieldEntry {
+            path: "background.model",
+            appears_in: both(),
+            unit: "enum",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "実際に効いた背景のモデル（flat / field）",
+            notes: Some(
+                "--background-model の既定は auto で、background.uniformity が下限を切ったときだけ \
+                 field になる。field のときは BACKGROUND_FIELD_USED が 1 行出る——**直すものが\
+                 あるという意味ではない**（既定で正しく動いた報告で、hint も付かない）。\
+                 info が返す値は「この画像なら cutout がどちらを使うか」の予告である",
+            ),
+        },
+        FieldEntry {
+            path: "background.field_range",
+            appears_in: both(),
+            unit: "delta_e",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "照明場が大域の 1 色からどれだけ離れているかの [最小, 最大] ΔE",
+            notes: Some(
+                "**場が何を吸ったか**を 1 行で言う。model が flat なら [0, 0]。大きいほど\
+                 「単色では表せない照明が乗っていた」ことを意味するが、それ自体は欠陥ではない\
+                 ——吸えていれば residual が小さくなる",
+            ),
+        },
+        FieldEntry {
+            path: "background.residual.p50",
+            appears_in: both(),
+            unit: "delta_e",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "外周が**場**からどれだけ離れているかの中位値",
+            notes: Some(
+                "perimeter_delta_e.p50（1 色に対する分布）との差がそのまま「場が吸った量」である。\
+                 residual が小さいのに perimeter_delta_e が大きい画像は、単色でないのではなく\
+                 **単色に照明が乗っている**ので、照明場モデルで救える。芯の許容量と主体検出の\
+                 しきい値は、1 色に対する分布ではなくこちらから導く",
+            ),
+        },
+        FieldEntry {
             path: "background.texture.p50",
             appears_in: both(),
             unit: "gradient",

@@ -33,7 +33,10 @@ use image::RgbaImage;
 
 use crate::warning::{Warning, WarningCode};
 
-pub use background::{BackgroundEstimate, DEFAULT_BORDER, DeltaEQuantiles, estimate_background};
+pub use background::{
+    BackgroundEstimate, BackgroundField, BackgroundModel, DEFAULT_BORDER, DeltaEQuantiles,
+    ResolvedModel, estimate_background,
+};
 pub use constraints::{Conflict, Constraint, ConstraintSource, Constraints};
 pub use diagnostics::Diagnostics;
 pub use edges::GradientQuantiles;
@@ -137,6 +140,8 @@ pub struct CutoutOptions {
     pub smooth_contour: f64,
     /// 帯の中の二値画素を局所の色で塗り直すか
     pub reclassify: bool,
+    /// 背景を 1 色で持つか、照明場として持つか
+    pub background_model: BackgroundModel,
 }
 
 impl Default for CutoutOptions {
@@ -178,8 +183,127 @@ impl Default for CutoutOptions {
             matting: Matting::Guided,
             smooth_contour: DEFAULT_SMOOTH_CONTOUR,
             reclassify: true,
+            // 均一な背景では 1 色のまま。場を常に使うと、解けている画像の数値が
+            // 微妙に動いて「何が原因の差か」が分からなくなる
+            background_model: BackgroundModel::Auto,
         }
     }
+}
+
+/// 背景の見立て一式。
+///
+/// **`info` と `cutout` は同じ経路でこれを作る。** 片方だけがモデルを切り替え
+/// たり主体の測り方が違ったりすると、`info` の助言に従って `cutout` を呼んだ
+/// エージェントが、自分が見た数値と違う世界で切り抜かれることになる。
+pub struct BackgroundAnalysis {
+    /// 外周の中央値 1 色と、それに対する分布。**場を入れても意味を変えない**
+    pub estimate: BackgroundEstimate,
+    /// 実際に使う背景。1 色モデルでは「全画素で同じ値を返す場」
+    pub field: BackgroundField,
+    /// 実際に効いたモデル
+    pub model: ResolvedModel,
+    /// 外周サンプルの**場に対する** ΔE 分布。1 色モデルでは
+    /// `estimate.delta_e` と同じ値になる
+    pub residual: DeltaEQuantiles,
+    /// 主体候補。**1 色の背景に対して測る**（上の `analyse_background` を参照）
+    pub subject: Option<SubjectHint>,
+    /// `auto` が場を選んだことの報告。明示指定には付かない
+    pub field_warning: Option<Warning>,
+}
+
+/// 背景色・照明場・主体を 1 度に見立てる。
+///
+/// 場の推定は「ここは背景だ」と言い切れる画素だけから作る。商品の画素が混ざると、
+/// 商品の真上の背景色が商品の色へ寄り、そこだけ商品が背景と判定されてしまう。
+/// 材料は 4 つ——外周の帯、`--bbox` の外側、確定背景、そして**信頼度 High の
+/// 主体の矩形の外側**である。
+///
+/// # 主体は 1 色の背景に対して測る
+///
+/// 設計では「背景から遠い」も場に対して測るつもりだった。照明の暗い側を主体と
+/// 取り違える誤検出が減るはずだったが、**較正表（13 シーン）で 2 件が裏返った。**
+///
+/// | シーン | 1 色 | 場 | 正しい判定 |
+/// |---|---|---|---|
+/// | 画面の 4 割を占める物体だけ | low | **high** | low |
+/// | 暗い机の上のキーボード（実写） | low | **high** | low |
+///
+/// どちらも**商品が外周の帯を大きく占める**画像である。場は帯から作るので、
+/// そこで商品の色を「背景」として学んでしまう。すると商品は背景と一致し、
+/// 残った別のもの（2 色の境目の帯、机の映り込み）が「まとまった主体」に見えて
+/// `high` で返る。`leftover_ratio` はこれを弾けない——取りこぼした物体は
+/// 場の上では背景なので、外に何も残らないからである。
+///
+/// **1 色モデルの p90 が汚染される問題と同じ形だが、防ぎ方が効かなくなる。**
+/// 閾値だけを 1 色の分布に戻す案も試したが、今度は織り目の上の汚染シーンが
+/// 裏返った（low → high）。場の側に手を入れて両方を通す形は見つからなかったので、
+/// **主体の検出は 1 色の背景に対して行う**ことにした。場は切り抜き
+/// （フィルと境界処理）にだけ効かせる。
+pub fn analyse_background(
+    image: &RgbaImage,
+    border: u32,
+    model: BackgroundModel,
+    bbox: Option<(u32, u32, u32, u32)>,
+    constraints: Option<&Constraints>,
+) -> BackgroundAnalysis {
+    let estimate = estimate_background(image, border);
+    let resolved = model.resolve(&estimate);
+    let subject = detect_subject(image, &estimate);
+
+    if resolved == ResolvedModel::Flat {
+        let field = BackgroundField::flat(estimate.rgb);
+        return BackgroundAnalysis {
+            residual: estimate.delta_e,
+            estimate,
+            field,
+            model: resolved,
+            subject,
+            field_warning: None,
+        };
+    }
+
+    let (w, h) = (image.width(), image.height());
+    let known = background::KnownBackground {
+        band: background::field_band(image, border),
+        outside_bbox: bbox,
+        outside_subject: subject
+            .as_ref()
+            .filter(|s| s.confidence.is_high())
+            .map(|s| background::widen_subject(s.bbox, w, h)),
+        constraints,
+        filled: None,
+    };
+    let field = background::estimate_field(image, estimate.rgb, &known);
+    let residual = background::perimeter_residual(image, border, &estimate, &field);
+    let field_warning = (model == BackgroundModel::Auto).then(|| field_used(&field, &residual));
+
+    BackgroundAnalysis {
+        estimate,
+        field,
+        model: resolved,
+        residual,
+        subject,
+        field_warning,
+    }
+}
+
+/// 場を使ったことを知らせる。**hint は無い。**
+///
+/// 既定で正しく動いた報告であって、直すものは無い。`EDGE_THRESHOLD_RAISED` と
+/// 同じ位置づけで、`--background-model flat` へ戻す道は `--help` にある。
+fn field_used(field: &BackgroundField, residual: &DeltaEQuantiles) -> Warning {
+    let range = field.range();
+    Warning::new(
+        WarningCode::BackgroundFieldUsed,
+        format!(
+            "背景が均一でないため、背景を 1 色ではなく照明場として推定しました\
+             （場の振れ幅 ΔE {:.1}〜{:.1}、場に対する外周残差 p50 = {:.1} / p90 = {:.1}）",
+            range[0], range[1], residual.p50, residual.p90
+        ),
+    )
+    .with_data("field_range", range.map(round1).to_vec())
+    .with_data("residual_p50", round1(residual.p50))
+    .with_data("residual_p90", round1(residual.p90))
 }
 
 pub struct CutoutResult {
@@ -187,6 +311,12 @@ pub struct CutoutResult {
     pub image: RgbaImage,
     pub mask: Mask,
     pub background: BackgroundEstimate,
+    /// 実際に効いた背景のモデル
+    pub background_model: ResolvedModel,
+    /// 場が大域の 1 色からどれだけ離れているかの [最小, 最大] ΔE
+    pub field_range: [f64; 2],
+    /// 外周サンプルの場に対する ΔE 分布
+    pub residual: DeltaEQuantiles,
     /// 実際に効いた堤防のしきい値。自動調整が入ると指定値と食い違うため、
     /// 呼び出し側が「何が効いたか」を報告できるように返す
     pub edge_threshold: f64,
@@ -290,10 +420,23 @@ fn resolve_edge_threshold(
 }
 
 pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
-    let background = estimate_background(image, opts.border);
     // 元画像から測る。アルファを適用した後の画像を渡すと、透明になった背景が
     // 「背景色から遠い」に化けて主体が画像全体へ広がる
-    let subject = detect_subject(image, &background);
+    let analysis = analyse_background(
+        image,
+        opts.border,
+        opts.background_model,
+        opts.bbox,
+        opts.constraints.as_ref(),
+    );
+    let BackgroundAnalysis {
+        estimate: background,
+        mut field,
+        model,
+        mut residual,
+        subject,
+        field_warning,
+    } = analysis;
     let (edge_threshold, texture_warning) =
         resolve_edge_threshold(opts.edge_threshold, &background.texture);
 
@@ -304,14 +447,28 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
         constraints: opts.constraints.as_ref(),
         edge_threshold,
         // 芯の許容量は利用者に決めさせず、背景自身のばらつきから導く。
-        // 「どこまでを背景と言い切れるか」は画像ごとに違い、外周の ΔE 分布が
-        // その答えを持っているためである
-        core_tolerance: floodfill::core_tolerance(opts.tolerance, background.delta_e.p90),
+        // 「どこまでを背景と言い切れるか」は画像ごとに違い、場に対する
+        // 外周残差の分布がその答えを持っているためである
+        core_tolerance: floodfill::core_tolerance(opts.tolerance, residual.p90),
         step_tolerance: opts.step_tolerance,
         shadow_tolerance: opts.shadow_tolerance,
         seal: opts.seal,
     };
-    let mut mask = foreground_mask(image, background.rgb, &flood);
+    let mut mask = foreground_mask(image, &field, &flood);
+
+    // **2 回目のパス。** 1 回目のフィルが背景と判定した画素をすべて「既知の
+    // 背景」に加えて場を作り直し、もう一度フィルする。外周の帯と矩形の外側
+    // だけでは、商品が中央を大きく占める画像で場の内側がほとんど外挿になる。
+    // 1 回目の背景はその外挿を実測で置き換える材料そのものである。
+    //
+    // 1 色モデルでは走らせない。場が無いのだから作り直すものも無い
+    if model == ResolvedModel::Field {
+        let (again, next_field, next_residual) =
+            second_pass(image, &background, &mask, opts, &flood);
+        mask = again;
+        field = next_field;
+        residual = next_residual;
+    }
 
     // 孤立ノイズは面積で落とす。オープニングは幅で落とすため、ストラップや
     // ケーブルのような細い商品の一部まで巻き添えにしていた。
@@ -327,7 +484,7 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
         let refined = refine::refine(
             image,
             &mask,
-            background.rgb,
+            &field,
             &RefineOptions {
                 feather: opts.feather,
                 despill: opts.despill,
@@ -386,6 +543,7 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
     // 設定の調整はいちばん先に伝える。結果への警告は、その設定で走った結果に
     // ついてのものなので、順序が逆だと読み手が原因を後から知ることになる
     let mut warnings = Vec::from_iter(texture_warning);
+    warnings.extend(field_warning);
     warnings.extend(collect_warnings(
         &background,
         &stats,
@@ -399,6 +557,9 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
         image: out,
         mask,
         background,
+        background_model: model,
+        field_range: field.range(),
+        residual,
         edge_threshold,
         band_min_radius,
         smooth_radius_px,
@@ -408,6 +569,43 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
         subject,
         warnings,
     }
+}
+
+/// 1 回目のフィルの結果を材料に場を作り直し、もう一度フィルする。
+///
+/// 戻すのは新しいマスクと、新しい場、そして新しい残差である。芯の許容量は
+/// 残差から導くので、場を作り直したら許容量も引き直さなければ辻褄が合わない。
+///
+/// **1 回目の結果を「背景」として信じてよい理由**は、フィルが外周からの連結性で
+/// しか背景を広げないことにある。商品の内部が背景と判定されることは（輪郭が
+/// 破れていない限り）ない。破れた場合でも、その画素は商品の色をしているので
+/// セルの中央値までは動かせない。
+fn second_pass(
+    image: &RgbaImage,
+    background: &BackgroundEstimate,
+    mask: &Mask,
+    opts: &CutoutOptions,
+    flood: &FloodOptions<'_>,
+) -> (Mask, BackgroundField, DeltaEQuantiles) {
+    let field = {
+        // 1 画素 1 バイトの表は 20MP で 20MB ある。場を作り終えたら手放す
+        let filled: Vec<bool> = mask.as_slice().iter().map(|&v| v < 128).collect();
+        let known = background::KnownBackground {
+            band: background::field_band(image, opts.border),
+            outside_bbox: opts.bbox,
+            // 主体の矩形はもう要らない。1 回目のフィルが「どこが背景か」を
+            // 矩形よりはるかに細かく答えている
+            outside_subject: None,
+            constraints: opts.constraints.as_ref(),
+            filled: Some(&filled),
+        };
+        background::estimate_field(image, background.rgb, &known)
+    };
+    let residual = background::perimeter_residual(image, opts.border, background, &field);
+    let mut flood = flood.clone();
+    flood.core_tolerance = floodfill::core_tolerance(opts.tolerance, residual.p90);
+    let mask = foreground_mask(image, &field, &flood);
+    (mask, field, residual)
 }
 
 /// 確定前景（`--fg-seed` の円を含む）を不透明へ塗り戻す。

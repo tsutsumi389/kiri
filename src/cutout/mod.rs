@@ -292,6 +292,7 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
     //
     // ここで一度掛けるのは、境界帯の推定をノイズの一つ一つに走らせないため
     mask = morphology::remove_specks(&mask, opts.cleanup);
+    restore_forced_foreground(&mut mask, opts);
 
     let mut out = if opts.refine {
         let refined = refine::refine(
@@ -320,6 +321,7 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
     // 面積の下限をちょうど超えて生き残ってしまう。帯の推定で縁が透明へ
     // 戻った後こそが、成分の大きさを正しく測れる唯一のタイミングである
     mask = morphology::remove_specks(&mask, opts.cleanup);
+    restore_forced_foreground(&mut mask, opts);
     apply_alpha(&mut out, &mask);
 
     let stats = mask.stats();
@@ -364,6 +366,47 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
         diagnostics,
         subject,
         warnings,
+    }
+}
+
+/// 確定前景（`--fg-seed` の円を含む）を不透明へ塗り戻す。
+///
+/// **面積フィルタは確定前景を知らない。** 下限は解像度に比例するので、
+/// 5712x4284 では 20x20 の `--fg-polygon` が丸ごと消える——しかも
+/// `constraints.sources` には入口の名前が出たままなので、エージェントからは
+/// 「指示は効いた」と読める。「確定前景は色によらず守られる」という約束が
+/// そこで静かに破れていた。
+///
+/// `remove_specks` を掛けるたびに呼ぶ。refine は二値境界の周りに帯を張り直す
+/// ので、1 回目の塗り戻しは 2 回目の入力にしか効かない。
+///
+/// **確定前景は不透明で残る。** 指した面が商品の輪郭に重なっていれば、そこは
+/// 階調の無い硬い縁になる。指示は色より強いという規約からの当然の帰結で、
+/// `--help` と README にもそう書いてある。
+fn restore_forced_foreground(mask: &mut Mask, opts: &CutoutOptions) {
+    let (w, h) = (mask.width(), mask.height());
+    // 寸法の合わない指示は無かったことにする（`foreground_mask` と同じ規約）
+    let forced = opts
+        .constraints
+        .as_ref()
+        .filter(|c| c.width() == w && c.height() == h && c.any_fg());
+    if forced.is_none() && opts.fg_seeds.is_empty() {
+        return;
+    }
+    if let Some(c) = forced {
+        for (i, slot) in mask.as_mut_slice().iter_mut().enumerate() {
+            if c.has_fg(i) {
+                *slot = 255;
+            }
+        }
+    }
+    // 種の円は `Constraints` にも畳まれている（`resolve_constraints`）が、
+    // `cutout()` はライブラリの公開関数なので、種だけを渡した呼び出しが届く。
+    // 円の描き方を 2 箇所に持たないよう、同じ `disc_pixels` を引く
+    for &(x, y) in &opts.fg_seeds {
+        constraints::disc_pixels(w, h, x, y, FG_SEED_RADIUS, |i| {
+            mask.as_mut_slice()[i] = 255;
+        });
     }
 }
 

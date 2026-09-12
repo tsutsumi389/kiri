@@ -1987,6 +1987,84 @@ fn a_polygon_is_accepted_in_normalized_coordinates() {
     assert_eq!(cut.get_pixel(60, 10)[3], 0, "面の外まで守っている");
 }
 
+/// **小さい確定前景が面積フィルタに黙って消えないこと。**
+///
+/// `--cleanup` の下限は解像度に比例するので、高解像度ほど大きな指示が消える
+/// （5712x4284 では 20x20 の `--fg-polygon` が丸ごと落ちた）。しかも
+/// `constraints.sources` には入口の名前が出たままなので、結果の JSON からは
+/// 「指示は効いた」としか読めない。ここでは 200x200 と `--cleanup 12`
+/// （下限 625px²）で同じ大きさ関係を作る。
+///
+/// **同じ実行の中に対照を置く。** 指示の無い 20x20 の塊は消えるので、
+/// しきい値が本当に指示より大きいことがその場で確かめられる。対照を商品から
+/// 離して置くのは、堤防が残す 1px の縁どうしが 8 近傍でつながると、
+/// 成分が商品と合体して面積フィルタに掛からなくなるためである。
+#[test]
+fn a_small_forced_foreground_survives_the_speck_filter() {
+    let dir = fixture_dir();
+    let mut img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    // 対照：指示を伴わない 20x20 の濃い塊（商品は x 44-156 / y 32-168）
+    paint(&mut img, (10, 160, 29, 179), 30);
+    let input = write_png(dir.path(), "speck.png", &img);
+    let output = dir.path().join("cut.png");
+
+    // 20x20 = 400px² は下限 625px² を下回る
+    let out = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--cleanup",
+        "12",
+        "--fg-polygon",
+        "10,10,30,10,30,30,10,30",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(json_stdout(&out)["constraints"]["sources"][0], "fg_polygon");
+
+    let cut = image::open(&output).unwrap().to_rgba8();
+    assert_eq!(
+        cut.get_pixel(20, 170)[3],
+        0,
+        "対照が消えていない。--cleanup 12 の下限が 400px² を超えていない"
+    );
+    assert_eq!(
+        cut.get_pixel(20, 20)[3],
+        255,
+        "確定前景が面積フィルタに消された"
+    );
+
+    // 種の円（半径 5px = 81px²）も同じ約束の下にある
+    let seeded = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--force",
+        "--cleanup",
+        "12",
+        "--fg-seed",
+        "20,20",
+    ]);
+    assert!(
+        seeded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seeded.stderr)
+    );
+    let cut = image::open(&output).unwrap().to_rgba8();
+    assert_eq!(
+        cut.get_pixel(20, 20)[3],
+        255,
+        "--fg-seed の円が面積フィルタに消された"
+    );
+}
+
 /// 画素座標を `--normalized` で渡す取り違えを断ること。
 #[test]
 fn a_pixel_polygon_passed_as_normalized_is_rejected() {

@@ -43,8 +43,9 @@ use std::collections::VecDeque;
 use image::RgbaImage;
 
 use crate::color::lab::{delta_e76, srgb_to_lab};
-use crate::cutout::feather;
+use crate::cutout::local_colour::{self, Lean, LocalColours, Role};
 use crate::cutout::mask::Mask;
+use crate::cutout::{diagnostics, feather, guided};
 
 /// 帯幅の下限(px)。くっきりした輪郭でも、堤防が残す 1px の縁と JPEG の滲みを
 /// 跨げるだけの幅が要る。
@@ -84,6 +85,65 @@ const MIN_RECOVER_ALPHA: f32 = 0.05;
 /// 一様に前景色へ寄って平板になる。
 const FEASIBLE_MARGIN: f32 = 0.15;
 
+/// 輪郭の平滑化半径の既定(px, 長辺 1000px 換算)。0 で無効。
+///
+/// `diagnostics::SMOOTHING_SIGMA` と同じ 2.0 にしてある。粗さの指標は
+/// 「σ = 2px（換算）でぼかした自分自身」を参照にして蛇行を測るので、**均す
+/// 半径をそれと同じに取れば、指標が「見える」と言う蛇行がちょうど均される**。
+/// 大きくすると商品の角（曲率半径 20px 級）まで丸まる。
+pub const DEFAULT_SMOOTH_CONTOUR: f64 = 2.0;
+
+/// 帯幅の下限を輪郭の粗さから持ち上げるときの倍率。
+///
+/// 蛇行の振幅が r px なら、暴れた輪郭の外側に取り残された粒は真の輪郭から
+/// 最大 2r 離れる（内側へ r、外側へ r）。それを覆えない帯では、再分類が
+/// 届かないところに粒が残る。
+const BAND_ROUGHNESS_GAIN: f64 = 2.0;
+
+/// guided filter の窓を帯の下限より何 px 広く取るか。
+///
+/// 帯の下限そのものだと、窓が帯の片側しか含まない画素が出る。そこでは案内
+/// 画像の段差（＝輪郭）が窓の端に来るので、係数 a が輪郭を説明せず、matte が
+/// 均されない。
+///
+/// **+1 は較正表が選んだ底である。** +0 では R5 assisted の rim 正解が 0.301 と
+/// 合格条件（0.30）を割り、+2 では R1〜R5 の alpha_mae がさらに 0.003 増える。
+/// +1 は正解由来の指標を全部基準内へ入れたまま、alpha_mae の増分を
+/// 0.007（R1 assisted 0.082 → 0.089）に留める。
+const GUIDED_MARGIN: u32 = 1;
+
+/// 二値マスクの塗り直しを繰り返す回数。
+///
+/// **1 回では届かない。** 塗り直せるのは帯の中だけなので、1 パスで剥がせる
+/// のは帯幅ぶん（既定で最大 10px）に留まる。ところが実写の不織布では、
+/// マスクが真の輪郭より 20px 級はみ出す場所がある。しかもその状態では
+/// 「帯の外の前景」＝局所前景 F そのものが繊維なので、分離が足りず判定不能に
+/// 落ちる画素が多い。1 パス剥がすと F が商品に近づき、次のパスで判定できる
+/// 画素が増える——**欠陥が大きいほど効きが悪い**という逆立ちが、繰り返しで
+/// ほどける。
+///
+/// 商品の側は削れない。色の門が真の輪郭で止めるので、合成 S3（淡色商品）の
+/// `eaten` はパス数を 1 → 8 と振っても 2.5% 前後で動かない。伸びるのは
+/// 背景側だけである。
+///
+/// **上限を決めるのは診断の側である。** パスを重ねるほど壊れた切り抜きの
+/// 輪郭まで滑らかになり、`contour_roughness` が欠陥を見なくなる。較正表
+/// （29 点）で R7 既定（輪郭誤差 57〜59px の壊れた切り抜き）の粗さは
+/// 4 パスで 0.172、7 パスで 0.162、8 パスで 0.158 と下がり、**8 パスで
+/// `CONTOUR_ROUGH_WARN`（0.16）を割って警告が消える**。4 は、正解由来の
+/// 合格条件（R1/R5/R6 の rim 正解）をすべて満たす最小のパス数であり、
+/// かつ誤分類が 1 点も出ない範囲の内側にある。
+const RESHAPE_PASSES: u32 = 4;
+
+/// 境界のアルファの解き方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Matting {
+    /// 近傍の F と B を各 1 色とみなし、F–B 直線への射影だけで決める
+    Projection,
+    /// 射影のアルファを、線形 RGB の元画像を案内にした guided filter で均す
+    Guided,
+}
+
 #[derive(Debug, Clone)]
 pub struct RefineOptions {
     pub min_radius: u32,
@@ -93,6 +153,17 @@ pub struct RefineOptions {
     pub feather: u32,
     /// 境界画素の色から背景色の寄与を取り除くか
     pub despill: bool,
+    /// 境界のアルファの解き方
+    pub matting: Matting,
+    /// 帯の中の二値マスクに掛けるメディアンの半径(px, 長辺 1000px 換算)。0 で無効
+    pub smooth_contour: f64,
+    /// 帯の中の二値画素を、局所の F/B に対する色の 2 択で塗り直すか
+    pub reclassify: bool,
+    /// 測地的オープニングの半径(px)。**`CutoutOptions::seal` と同じ値を渡すこと。**
+    ///
+    /// フィルが「幅 2N px 以下の隙間は前景へ戻す」と約束した以上、色の塗り直しが
+    /// それを取り消してはいけない（`close_new_gaps`）
+    pub seal: u32,
 }
 
 impl Default for RefineOptions {
@@ -103,7 +174,35 @@ impl Default for RefineOptions {
             min_separation: DEFAULT_MIN_SEPARATION,
             feather: 1,
             despill: true,
+            matting: Matting::Guided,
+            smooth_contour: DEFAULT_SMOOTH_CONTOUR,
+            reclassify: true,
+            seal: 1,
         }
+    }
+}
+
+/// Phase 2 までの境界処理。**対照のためにだけ存在する。**
+///
+/// 新しい 3 段（再分類・平滑化・guided feathering）をすべて切った設定で、
+/// ここから出る画素は Phase 2 のものと 1 バイトも変わらない。
+impl RefineOptions {
+    pub fn projection_only(self) -> Self {
+        Self {
+            matting: Matting::Projection,
+            smooth_contour: 0.0,
+            reclassify: false,
+            ..self
+        }
+    }
+
+    /// 新しい 3 段のどれかが効いているか。
+    ///
+    /// 帯幅の下限の持ち上げはこれで決める。**3 段とも切れば帯も Phase 2 の
+    /// ものに戻る**——持ち上げた帯は新しい 3 段に働く場所を与えるためのもので、
+    /// 射影アルファだけを回す経路には何の用も無い。
+    fn staged(&self) -> bool {
+        self.reclassify || self.smooth_contour > 0.0 || self.matting == Matting::Guided
     }
 }
 
@@ -111,6 +210,8 @@ pub struct Refined {
     /// 境界画素の色を復元した画像。アルファは書き換えていない
     pub image: RgbaImage,
     pub mask: Mask,
+    /// 実際に効いた帯幅の下限(px)。輪郭の粗さで持ち上がることがある
+    pub band_min_radius: u32,
 }
 
 /// sRGB 8bit → 線形 RGB の変換表。境界帯では同じ変換を何十回も引くため。
@@ -148,6 +249,15 @@ fn window_for(radius: u8) -> u32 {
 }
 
 /// 境界帯のアルファを画像の色から推定し直す。
+///
+/// ```text
+/// binary ──(a) 帯 ──(b) 縁の再分類 ──(c) 色の門つき平滑化 ──(d) 射影アルファ
+///        ──(e) guided feathering ──(f) 色の復元
+/// ```
+///
+/// (b)(c) は**二値マスクそのもの**を書き換える段で、(d)(e) はそこへ階調を
+/// 与える段である。順序を逆にすると、階調を付けた後で形を動かすことになり、
+/// アルファと復元色が食い違う。
 pub fn refine(
     image: &RgbaImage,
     binary: &Mask,
@@ -156,22 +266,44 @@ pub fn refine(
 ) -> Refined {
     let (w, h) = (image.width(), image.height());
     let mut out = image.clone();
-    let mut mask = binary.clone();
     if w == 0 || h == 0 || w != binary.width() || h != binary.height() {
-        return Refined { image: out, mask };
+        return Refined {
+            image: out,
+            mask: binary.clone(),
+            band_min_radius: 0,
+        };
     }
 
-    let band = band_map(image, binary, background, opts);
+    let scale = diagnostics::scale_at_1000(w, h);
+    let min_radius = if opts.staged() {
+        band_floor(binary, scale, opts)
+    } else {
+        opts.min_radius
+    };
+
+    // (a)〜(c)。二値マスクを書き換えるので、アルファを載せる前に済ませる
+    let mut shape = binary.clone();
+    let mut band = band_map(image, &shape, background, min_radius, opts.max_radius);
+    reshape(
+        image, &mut shape, binary, &mut band, background, opts, scale, min_radius,
+    );
+
+    let mut mask = shape.clone();
     // 帯幅の最大は代役前景の近傍半径を決めるのに要る。0 なら帯そのものが無い
     let band_max = band.iter().copied().max().unwrap_or(0);
     if band_max == 0 {
-        return Refined { image: out, mask };
+        return Refined {
+            image: out,
+            mask,
+            band_min_radius: min_radius,
+        };
     }
 
     let lut = srgb_lut();
+    let guided_matting = opts.matting == Matting::Guided;
     let ctx = Context {
         image,
-        binary,
+        binary: &shape,
         band: &band,
         bg_linear: [
             lut[background[0] as usize],
@@ -180,7 +312,9 @@ pub fn refine(
         ],
         lut,
         separation_sq: opts.min_separation * opts.min_separation,
-        despill: opts.despill,
+        // guided では色の復元を最終アルファまで待つ。射影のアルファで復元すると、
+        // 均した後のアルファと復元色が食い違って縁が色づく
+        despill: opts.despill && !guided_matting,
         feather_radius: opts.feather,
         core_window: window_for(band_max),
     };
@@ -188,18 +322,470 @@ pub fn refine(
     // 1 画素も落ちない素材のほうが多いので、実際に必要になるまで作らない
     let fallback: OnceCell<Mask> = OnceCell::new();
     let mut ws = Workspace::default();
+    // 色から決まった画素の印。guided のときだけ持つ
+    let mut solved = if guided_matting {
+        guided::Solved::new((w as usize) * (h as usize))
+    } else {
+        guided::Solved::default()
+    };
 
+    for_each_tile(w, h, |tile| {
+        refine_tile(
+            &ctx,
+            &mut ws,
+            &fallback,
+            tile,
+            Pass::Project,
+            &mut solved,
+            &mut out,
+            &mut mask,
+        );
+    });
+
+    if guided_matting {
+        // (e) 射影アルファを入力、線形 RGB の元画像を案内画像として均す
+        mask = guided::feather(
+            image,
+            &ctx.lut,
+            &shape,
+            &band,
+            &mask,
+            &solved,
+            (min_radius + GUIDED_MARGIN).min(u32::from(band_max)),
+        );
+        // (f) 最終アルファで色を復元する
+        if opts.despill {
+            let ctx = Context {
+                despill: true,
+                ..ctx
+            };
+            for_each_tile(w, h, |tile| {
+                refine_tile(
+                    &ctx,
+                    &mut ws,
+                    &fallback,
+                    tile,
+                    Pass::Recover,
+                    &mut solved,
+                    &mut out,
+                    &mut mask,
+                );
+            });
+        }
+    }
+
+    Refined {
+        image: out,
+        mask,
+        band_min_radius: min_radius,
+    }
+}
+
+/// タイルの左上を順に渡す。走査順は結果に影響しないが、**順序が決まって
+/// いること**は決定性の前提である。
+fn for_each_tile(w: u32, h: u32, mut body: impl FnMut((u32, u32))) {
     let mut ty = 0;
     while ty < h {
         let mut tx = 0;
         while tx < w {
-            refine_tile(&ctx, &mut ws, &fallback, (tx, ty), &mut out, &mut mask);
+            body((tx, ty));
             tx += TILE;
         }
         ty += TILE;
     }
+}
 
-    Refined { image: out, mask }
+/// (a) 帯幅の下限を輪郭の粗さで持ち上げる。
+///
+/// **ギザギザの振幅より狭い帯では、暴れた輪郭の外側に取り残された粒を帯が
+/// 覆えない。** 帯の中しか塗り直さないと決めた以上、帯が粒に届かなければ
+/// 再分類は何もできない。粗さは refine の**前**に二値マスクで測り、
+/// `scale_at_1000` を掛け戻して原寸 px にする。
+///
+/// **上限は `max_radius`（既定 10）に留める。** 設計書は `RADIUS_CEILING`
+/// （32）と書いているが、帯幅は窓の大きさとタイルの積分画像の大きさを決める
+/// ので、櫛状・メッシュのように輪郭画素が数百万ある素材で 32 まで開くと
+/// 費用が桁で変わる。既存の帯幅の上限を越えない範囲に収める。
+fn band_floor(binary: &Mask, scale: f64, opts: &RefineOptions) -> u32 {
+    let ceiling = opts.max_radius.clamp(1, RADIUS_CEILING);
+    let roughness = diagnostics::contour_roughness(binary, None).unwrap_or(0.0) * scale;
+    let wanted = (BAND_ROUGHNESS_GAIN * roughness).ceil();
+    let wanted = if wanted.is_finite() && wanted > 0.0 {
+        wanted as u32
+    } else {
+        0
+    };
+    opts.min_radius.max(wanted).clamp(1, ceiling)
+}
+
+/// (b)(c) 二値マスクを色の裏付けをもって塗り直し、帯を引き直す。
+#[allow(clippy::too_many_arguments)]
+fn reshape(
+    image: &RgbaImage,
+    shape: &mut Mask,
+    original: &Mask,
+    band: &mut Vec<u8>,
+    background: [u8; 3],
+    opts: &RefineOptions,
+    scale: f64,
+    min_radius: u32,
+) {
+    let smooth_radius = (opts.smooth_contour * scale).ceil();
+    let smooth_radius = if smooth_radius.is_finite() && smooth_radius > 0.0 {
+        (smooth_radius as u32).min(RADIUS_CEILING)
+    } else {
+        0
+    };
+    if !opts.reclassify && smooth_radius == 0 {
+        return;
+    }
+    let (w, h) = (shape.width(), shape.height());
+    let window = (local_colour::RIM_WINDOW * scale).ceil() as u32;
+    let stride = w as usize;
+    for _ in 0..RESHAPE_PASSES {
+        let Some(bounds) = band_bounds(band, w, h) else {
+            return;
+        };
+        let grid = local_colour::build(image, grow(bounds, window, w, h), scale, |x, y| {
+            if band[(y as usize) * stride + (x as usize)] != 0 {
+                Role::Skip
+            } else if shape.is_foreground(x, y) {
+                Role::Foreground
+            } else {
+                Role::Background
+            }
+        });
+        let mut changed = 0usize;
+        if opts.reclassify {
+            changed += reclassify_rim(image, shape, band, &grid, bounds);
+        }
+        if smooth_radius > 0 {
+            changed += smooth_in_band(shape, original, band, &grid, image, smooth_radius, bounds);
+        }
+        if changed == 0 {
+            return;
+        }
+        close_new_gaps(shape, original, band, bounds, opts.seal);
+        *band = band_map(image, shape, background, min_radius, opts.max_radius);
+    }
+}
+
+/// 帯画素の外接矩形。帯が 1 画素も無ければ None。
+fn band_bounds(band: &[u8], w: u32, h: u32) -> Option<(u32, u32, u32, u32)> {
+    let stride = w as usize;
+    let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+    for y in 0..h {
+        let row = (y as usize) * stride;
+        for x in 0..w {
+            if band[row + (x as usize)] == 0 {
+                continue;
+            }
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x);
+            y1 = y1.max(y);
+        }
+    }
+    (x0 != u32::MAX).then_some((x0, y0, x1, y1))
+}
+
+/// 矩形を `margin` px 広げ、画像の中へ収める。
+fn grow(rect: (u32, u32, u32, u32), margin: u32, w: u32, h: u32) -> (u32, u32, u32, u32) {
+    (
+        rect.0.saturating_sub(margin),
+        rect.1.saturating_sub(margin),
+        (rect.2 + margin).min(w - 1),
+        (rect.3 + margin).min(h - 1),
+    )
+}
+
+/// (b) 帯の中の二値画素を、局所の F/B に対する散らばり正規化の 2 択で塗り直す。
+///
+/// 定義は `diagnostics::rim_contamination` と同じ（`local_colour`）。
+///
+/// - 前景なのに B 寄り → 背景へ（張り付いた粒・繊維の影を落とす）
+/// - 背景なのに F 寄り → 前景へ（削れた縁を戻す）
+/// - 判定不能、どちらとも言えない → 触らない
+///
+/// **塗り直すのは帯の中だけである。** 帯の外は「色を問う前に決まっている」
+/// 領域で、そこまで色で覆すと、連結性と指示（確定前景・確定背景）で組み立てた
+/// 結果を境界処理が黙って作り直すことになる。
+fn reclassify_rim(
+    image: &RgbaImage,
+    shape: &mut Mask,
+    band: &[u8],
+    grid: &LocalColours,
+    bounds: (u32, u32, u32, u32),
+) -> usize {
+    let w = image.width() as usize;
+    let pixels = image.as_raw();
+    let (x0, y0, x1, y1) = bounds;
+    let mut changed = 0usize;
+    for y in y0..=y1 {
+        let row = (y as usize) * w;
+        for x in x0..=x1 {
+            let i = row + (x as usize);
+            if band[i] == 0 {
+                continue;
+            }
+            let Some(lean) = grid.classify(grid.cell(x, y), &pixels[i * 4..i * 4 + 3]) else {
+                continue;
+            };
+            match (shape.is_foreground(x, y), lean) {
+                (true, Lean::Background) => {
+                    shape.set(x, y, 0);
+                    changed += 1;
+                }
+                (false, Lean::Foreground) => {
+                    shape.set(x, y, u8::MAX);
+                    changed += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    changed
+}
+
+/// (c) 帯の中の二値マスクにメディアン（多数決）を掛け、**色が変化に矛盾する
+/// 画素だけ元へ戻す**。
+///
+/// 形だけを見た平滑化は `morphology::open` の失敗を繰り返す——幅 3px の
+/// ストラップはメディアンで消える。そこで色の門を通す。
+///
+/// - 前景 → 背景に変わった画素: 色が F 寄りなら戻す
+/// - 背景 → 前景に変わった画素: 色が B 寄りなら戻す
+///
+/// (b) の後では、帯の画素のうち B 寄り・F 寄りのものは既にその側へ塗られて
+/// いる。したがって (c) が動かせるのは**色が何も言っていない画素だけ**になる。
+/// これは狙いどおりで、色で決まるものは色が決め、決まらないものだけを形が
+/// 決める、という順序になっている。
+#[allow(clippy::too_many_arguments)]
+fn smooth_in_band(
+    shape: &mut Mask,
+    original: &Mask,
+    band: &[u8],
+    grid: &LocalColours,
+    image: &RgbaImage,
+    radius: u32,
+    bounds: (u32, u32, u32, u32),
+) -> usize {
+    let (w, h) = (shape.width(), shape.height());
+    let stride = w as usize;
+    let pixels = image.as_raw();
+    // 多数決はマスクの**写し**から取る。書きながら読むと、走査順が答えを変える
+    let (ex0, ey0, ex1, ey1) = grow(bounds, radius, w, h);
+    let (pw, ph) = ((ex1 - ex0 + 1) as usize, (ey1 - ey0 + 1) as usize);
+    let span = pw + 1;
+    let mut integral = vec![0u32; span * (ph + 1)];
+    for y in 0..ph {
+        let (row, prev) = ((y + 1) * span, y * span);
+        let mut acc = 0u32;
+        for x in 0..pw {
+            acc += u32::from(shape.is_foreground(ex0 + x as u32, ey0 + y as u32));
+            integral[row + x + 1] = integral[prev + x + 1] + acc;
+        }
+    }
+    let count = |x0: usize, y0: usize, x1: usize, y1: usize| -> u32 {
+        let (a, b) = (y0 * span + x0, y0 * span + x1 + 1);
+        let (c, d) = ((y1 + 1) * span + x0, (y1 + 1) * span + x1 + 1);
+        integral[d] + integral[a] - integral[b] - integral[c]
+    };
+
+    let (x0, y0, x1, y1) = bounds;
+    let mut changed = 0usize;
+    for y in y0..=y1 {
+        let row = (y as usize) * stride;
+        for x in x0..=x1 {
+            let i = row + (x as usize);
+            if band[i] == 0 {
+                continue;
+            }
+            let qx0 = (x.saturating_sub(radius).max(ex0) - ex0) as usize;
+            let qy0 = (y.saturating_sub(radius).max(ey0) - ey0) as usize;
+            let qx1 = ((x + radius).min(ex1) - ex0) as usize;
+            let qy1 = ((y + radius).min(ey1) - ey0) as usize;
+            let inside = count(qx0, qy0, qx1, qy1);
+            let total = ((qx1 - qx0 + 1) * (qy1 - qy0 + 1)) as u32;
+            // 同数なら動かさない。どちらへ倒しても根拠が無い
+            if inside * 2 == total {
+                continue;
+            }
+            let want = inside * 2 > total;
+            let (lx, ly) = ((x - ex0) as usize, (y - ey0) as usize);
+            if want == (count(lx, ly, lx, ly) == 1) {
+                continue;
+            }
+            // **形だけの多数決で、フィルが背景と決めた画素を前景へ戻さない。**
+            // フィルの決定は連結性・堤防・`--seal`・空間的な指示という、色より
+            // 多くの情報を使っている。ここで戻してよいのは、同じ refine の中で
+            // (b) や前のパスが動かした画素だけである。これが無いと、櫛の
+            // 幅 3px の隙間（`--seal 1` が「塞がない」と約束した幅）が
+            // メディアンで塞がる——堤防が隙間の両側 1px を背景候補から外すので、
+            // 二値マスクの上では 1px にしか見えないためである
+            if want && !original.is_foreground(x, y) {
+                continue;
+            }
+            // 色の門。変化に矛盾する色なら形の言い分を採らない
+            let lean = grid.classify(grid.cell(x, y), &pixels[i * 4..i * 4 + 3]);
+            let contradicts = if want {
+                lean == Some(Lean::Background)
+            } else {
+                lean == Some(Lean::Foreground)
+            };
+            if contradicts {
+                continue;
+            }
+            shape.set(x, y, if want { u8::MAX } else { 0 });
+            changed += 1;
+        }
+    }
+    changed
+}
+
+/// 塗り直しが前景の中に開けた穴と、`--seal` が塞いだはずの隙間を前景へ戻す。
+///
+/// **クロージングではなく測地的オープニングで判断する。** 4.6 の「外周から
+/// 到達できない穴はそもそも前景」という定義に、`--seal` の「幅 2N px 以下の
+/// 隙間を通ってしか外周につながらない背景は前景」という約束を重ねたものが
+/// これである。`seal` が 0 なら半径 0 の収縮／膨張は恒等なので、素の連結性に
+/// 戻る。
+///
+/// **この段が無いと、色の塗り直しが `--seal` を黙って取り消す。** 商品に
+/// 彫られた幅 1px の背景色のスリットは、色だけを見れば紛れもなく背景なので
+/// (b) が背景へ塗る。しかしフィルの側は `--seal` でそれを前景へ戻したはずで、
+/// 「指定したのに効かない」が境界処理の中で起きることになる。
+///
+/// 戻すのは**元の二値マスクで前景だった画素だけ**にする。もともと背景だった
+/// 画素まで戻すと、商品に囲まれた確定背景（`--bg-polygon` で中央を指した
+/// 指示）を境界処理が黙って埋めてしまう。
+fn close_new_gaps(
+    shape: &mut Mask,
+    original: &Mask,
+    band: &[u8],
+    bounds: (u32, u32, u32, u32),
+    seal: u32,
+) -> usize {
+    let (w, h) = (shape.width(), shape.height());
+    let stride = w as usize;
+    let (rx0, ry0, rx1, ry1) = grow(bounds, seal + 1, w, h);
+    let (pw, ph) = ((rx1 - rx0 + 1) as usize, (ry1 - ry0 + 1) as usize);
+    let local = |x: u32, y: u32| ((y - ry0) as usize) * pw + (x - rx0) as usize;
+
+    let mut background = vec![false; pw * ph];
+    for y in ry0..=ry1 {
+        for x in rx0..=rx1 {
+            background[local(x, y)] = !shape.is_foreground(x, y);
+        }
+    }
+    // 収縮で残った芯と、「帯の外の背景」「画像の外周の背景」を信用する。帯の外の
+    // 背景はフィルが外周から到達した画素なので、隙間を通って入ってきたもので
+    // はありえない（`floodfill::seal_narrow_gaps` と同じ扱い）
+    let mut trusted = separable(pw, ph, &background, seal, false);
+    for y in ry0..=ry1 {
+        for x in rx0..=rx1 {
+            let i = local(x, y);
+            if !background[i] {
+                continue;
+            }
+            trusted[i] |= band[(y as usize) * stride + (x as usize)] == 0
+                || x == 0
+                || y == 0
+                || x + 1 == w
+                || y + 1 == h;
+        }
+    }
+
+    // **芯の上だけを辿る。** 背景の上を辿ると、細い通路がそのまま外周へ
+    // つながってしまい、収縮した意味が消える
+    let mut seen = vec![false; pw * ph];
+    let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
+    for y in ry0..=ry1 {
+        for x in rx0..=rx1 {
+            let i = local(x, y);
+            let seed = trusted[i]
+                && (band[(y as usize) * stride + (x as usize)] == 0
+                    || x == 0
+                    || y == 0
+                    || x + 1 == w
+                    || y + 1 == h);
+            if seed && !seen[i] {
+                seen[i] = true;
+                queue.push_back((x, y));
+            }
+        }
+    }
+    while let Some((cx, cy)) = queue.pop_front() {
+        for (dx, dy) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
+            let (nx, ny) = (cx as i64 + dx, cy as i64 + dy);
+            if nx < i64::from(rx0) || ny < i64::from(ry0) {
+                continue;
+            }
+            let (nx, ny) = (nx as u32, ny as u32);
+            if nx > rx1 || ny > ry1 {
+                continue;
+            }
+            let j = local(nx, ny);
+            if seen[j] || !trusted[j] {
+                continue;
+            }
+            seen[j] = true;
+            queue.push_back((nx, ny));
+        }
+    }
+    let grown = separable(pw, ph, &seen, seal, true);
+
+    let mut changed = 0usize;
+    for y in ry0..=ry1 {
+        for x in rx0..=rx1 {
+            let i = local(x, y);
+            if band[(y as usize) * stride + (x as usize)] == 0
+                || !background[i]
+                || grown[i]
+                || !original.is_foreground(x, y)
+            {
+                continue;
+            }
+            shape.set(x, y, u8::MAX);
+            changed += 1;
+        }
+    }
+    changed
+}
+
+/// 正方形の構造要素による収縮（`take_max` が false）／膨張（true）。
+///
+/// 横と縦に分けて O(n * radius) に収める。**枠の外は窓に含めない**——
+/// `floodfill::separable` と同じ規約で、枠の縁で背景が削れないようにする。
+fn separable(w: usize, h: usize, src: &[bool], radius: u32, take_max: bool) -> Vec<bool> {
+    if radius == 0 {
+        return src.to_vec();
+    }
+    let r = radius as usize;
+    let combine = |acc: bool, v: bool| if take_max { acc || v } else { acc && v };
+    let mut horizontal = vec![false; src.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let (from, to) = (x.saturating_sub(r), (x + r).min(w - 1));
+            let mut acc = !take_max;
+            for k in from..=to {
+                acc = combine(acc, src[y * w + k]);
+            }
+            horizontal[y * w + x] = acc;
+        }
+    }
+    let mut out = vec![false; src.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let (from, to) = (y.saturating_sub(r), (y + r).min(h - 1));
+            let mut acc = !take_max;
+            for k in from..=to {
+                acc = combine(acc, horizontal[k * w + x]);
+            }
+            out[y * w + x] = acc;
+        }
+    }
+    out
 }
 
 /// タイルをまたいで変わらない入力。
@@ -322,12 +908,29 @@ struct Tile {
     ph: usize,
 }
 
+/// 帯画素に対して何をするか。
+///
+/// **F と B を求める経路は 1 つしかない。** guided feathering を掛ける場合、
+/// 色の復元は最終アルファで行う必要があるので、射影アルファを決める周と
+/// 色を復元する周の 2 周に分かれる。どちらも同じ窓・同じ F・同じ B を使うので、
+/// 枝を分けずに同じ関数の中で切り替える。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    /// (d) 射影アルファを書き込む（`despill` が立っていれば色も復元する）
+    Project,
+    /// (f) マスクに入っている最終アルファで色だけを復元する
+    Recover,
+}
+
 /// タイル1枚を処理する。
+#[allow(clippy::too_many_arguments)]
 fn refine_tile(
     ctx: &Context<'_>,
     ws: &mut Workspace,
     fallback: &OnceCell<Mask>,
     tile: (u32, u32),
+    pass: Pass,
+    solved: &mut guided::Solved,
     out: &mut RgbaImage,
     mask: &mut Mask,
 ) {
@@ -335,7 +938,7 @@ fn refine_tile(
         return;
     };
     prepare_tile(ctx, ws, &tile);
-    estimate_alpha(ctx, ws, fallback, &tile, out, mask);
+    estimate_alpha(ctx, ws, fallback, &tile, pass, solved, out, mask);
 }
 
 /// タイルに帯があるかを調べ、あれば積分画像を張る領域を決める。
@@ -440,11 +1043,14 @@ fn prepare_tile(ctx: &Context<'_>, ws: &mut Workspace, tile: &Tile) {
 }
 
 /// タイルに入る帯画素のアルファを決め、必要なら色を復元する。
+#[allow(clippy::too_many_arguments)]
 fn estimate_alpha(
     ctx: &Context<'_>,
     ws: &mut Workspace,
     fallback: &OnceCell<Mask>,
     tile: &Tile,
+    pass: Pass,
+    solved: &mut guided::Solved,
     out: &mut RgbaImage,
     mask: &mut Mask,
 ) {
@@ -531,7 +1137,9 @@ fn estimate_alpha(
             };
 
             let Some(f) = f else {
-                mask.set(x, y, feather_at(fallback, ctx, x, y));
+                if pass == Pass::Project {
+                    mask.set(x, y, feather_at(fallback, ctx, x, y));
+                }
                 continue;
             };
 
@@ -539,19 +1147,29 @@ fn estimate_alpha(
             let dd = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
             if dd < ctx.separation_sq {
                 // 色では決められない。幾何的フェザーへ落とす
-                mask.set(x, y, feather_at(fallback, ctx, x, y));
+                if pass == Pass::Project {
+                    mask.set(x, y, feather_at(fallback, ctx, x, y));
+                }
                 continue;
             }
 
-            let projected = ((observed[0] - b[0]) * d[0]
-                + (observed[1] - b[1]) * d[1]
-                + (observed[2] - b[2]) * d[2])
-                / dd;
-            let alpha = projected.clamp(0.0, 1.0);
-            let alpha8 = (alpha * 255.0).round() as u8;
-            mask.set(x, y, alpha8);
+            let alpha = match pass {
+                Pass::Project => {
+                    solved.set((y as usize) * stride + (x as usize));
+                    let projected = ((observed[0] - b[0]) * d[0]
+                        + (observed[1] - b[1]) * d[1]
+                        + (observed[2] - b[2]) * d[2])
+                        / dd;
+                    let alpha = projected.clamp(0.0, 1.0);
+                    mask.set(x, y, (alpha * 255.0).round() as u8);
+                    alpha
+                }
+                // 均した後のアルファをそのまま使う。射影の値で復元すると、
+                // 出力のアルファと復元色が食い違って縁が色づく
+                Pass::Recover => f32::from(mask.get(x, y)) / 255.0,
+            };
 
-            if !ctx.despill || alpha8 == 0 {
+            if !ctx.despill || (alpha * 255.0).round() as u8 == 0 {
                 continue;
             }
             let recovered = recover_foreground(observed, b, f, alpha);
@@ -815,13 +1433,14 @@ fn band_map(
     image: &RgbaImage,
     binary: &Mask,
     background: [u8; 3],
-    opts: &RefineOptions,
+    min_radius: u32,
+    max_radius: u32,
 ) -> Vec<u8> {
     let (w, h) = (binary.width(), binary.height());
     let stride = w as usize;
     let mut band = vec![0u8; stride * (h as usize)];
-    let min_r = opts.min_radius.clamp(1, RADIUS_CEILING);
-    let max_r = opts.max_radius.clamp(min_r, RADIUS_CEILING);
+    let min_r = min_radius.clamp(1, RADIUS_CEILING);
+    let max_r = max_radius.clamp(min_r, RADIUS_CEILING);
 
     for y in 0..h {
         for x in 0..w {
@@ -1171,7 +1790,13 @@ mod tests {
                     mask.set(x, y, if (x as f32) < 30.0 + softness { 255 } else { 0 });
                 }
             }
-            band_map(&img, &mask, [250, 250, 250], &RefineOptions::default())
+            band_map(
+                &img,
+                &mask,
+                [250, 250, 250],
+                DEFAULT_MIN_RADIUS,
+                DEFAULT_MAX_RADIUS,
+            )
         };
         let hard = make(1.0).iter().filter(|&&r| r > 0).count();
         let soft = make(8.0).iter().filter(|&&r| r > 0).count();
@@ -1291,10 +1916,207 @@ mod tests {
             mask.set(20, y, 255);
         }
         assert_eq!(mask.outward_normal(20, 6), None, "前提: 法線は決まらない");
-        let band = band_map(&img, &mask, bg, &RefineOptions::default());
+        let band = band_map(&img, &mask, bg, DEFAULT_MIN_RADIUS, DEFAULT_MAX_RADIUS);
         assert!(
             band[6 * (w as usize) + 20] > 0,
             "幅 1px の構造に帯が張られていない"
+        );
+    }
+
+    /// 帯の中で「マスクは前景だが色は背景」の画素が背景へ落ちること。(b)
+    ///
+    /// 堤防が残す縁と、不織布の粒がこれに当たる。**帯の外は触らない**ことも
+    /// 同時に見る——色で覆してよいのは、境界処理が受け持つ帯の中だけである。
+    #[test]
+    fn a_background_coloured_pixel_in_the_band_is_repainted_as_background() {
+        let (w, h) = (60u32, 40u32);
+        let bg = [250u8, 250, 249];
+        let product = [40u8, 40, 45];
+        let mut img = RgbaImage::from_pixel(w, h, Rgba([bg[0], bg[1], bg[2], 255]));
+        let mut shape = Mask::new(w, h, 0);
+        for y in 0..h {
+            for x in 0..w {
+                if x < 30 {
+                    img.put_pixel(x, y, Rgba([product[0], product[1], product[2], 255]));
+                }
+                // マスクは商品より 3px 右まで広がっている（背景色のまま不透明な縁）
+                if x < 33 {
+                    shape.set(x, y, u8::MAX);
+                }
+            }
+        }
+        let original = shape.clone();
+        let band = band_map(&img, &shape, bg, DEFAULT_MIN_RADIUS, DEFAULT_MAX_RADIUS);
+        let bounds = band_bounds(&band, w, h).expect("帯がある");
+        let grid = local_colour::build(&img, grow(bounds, 8, w, h), 1.0, |x, y| {
+            if band[(y as usize) * (w as usize) + (x as usize)] != 0 {
+                Role::Skip
+            } else if shape.is_foreground(x, y) {
+                Role::Foreground
+            } else {
+                Role::Background
+            }
+        });
+        let changed = reclassify_rim(&img, &mut shape, &band, &grid, bounds);
+        assert!(changed > 0, "縁が 1 画素も塗り直されていない");
+        assert!(
+            !shape.is_foreground(32, 20),
+            "背景色のままの縁が前景で残っている"
+        );
+        assert!(shape.is_foreground(10, 20), "商品の内部まで背景にしている");
+        // 帯の外は触らない。ここは (b) の契約そのもの
+        for y in 0..h {
+            for x in 0..w {
+                if band[(y as usize) * (w as usize) + (x as usize)] == 0 {
+                    assert_eq!(
+                        shape.is_foreground(x, y),
+                        original.is_foreground(x, y),
+                        "帯の外を書き換えている: {x},{y}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 色が決められない素材では (b) が何もしないこと。
+    ///
+    /// 淡色商品 × 白背景では局所 F と局所 B が散らばりの中で重なるので、
+    /// 2 択は答えを持たない。**決められないものを 0 か 1 かに丸めない。**
+    #[test]
+    fn a_pale_product_is_left_alone_by_the_reclassification() {
+        let (w, h) = (60u32, 40u32);
+        let bg = [250u8, 250, 249];
+        let mut img = RgbaImage::from_pixel(w, h, Rgba([bg[0], bg[1], bg[2], 255]));
+        let mut shape = Mask::new(w, h, 0);
+        for y in 0..h {
+            for x in 0..33 {
+                if x < 30 {
+                    img.put_pixel(x, y, Rgba([248, 248, 247, 255]));
+                }
+                shape.set(x, y, u8::MAX);
+            }
+        }
+        let band = band_map(&img, &shape, bg, DEFAULT_MIN_RADIUS, DEFAULT_MAX_RADIUS);
+        let bounds = band_bounds(&band, w, h).expect("帯がある");
+        let grid = local_colour::build(&img, grow(bounds, 8, w, h), 1.0, |x, y| {
+            if band[(y as usize) * (w as usize) + (x as usize)] != 0 {
+                Role::Skip
+            } else if shape.is_foreground(x, y) {
+                Role::Foreground
+            } else {
+                Role::Background
+            }
+        });
+        assert_eq!(
+            reclassify_rim(&img, &mut shape, &band, &grid, bounds),
+            0,
+            "色で決められないのにマスクを書き換えている"
+        );
+    }
+
+    /// 色の門つきメディアンが、幅 3px のストラップを消さないこと。(c)
+    ///
+    /// `morphology::open` が細部を巻き添えにした失敗を繰り返さないための
+    /// 歯止めである。形だけの多数決なら 5x5 の窓で 3px の棒は消える。
+    #[test]
+    fn the_colour_gate_keeps_a_three_pixel_strap_through_the_median() {
+        let (w, h) = (60u32, 40u32);
+        let bg = [250u8, 250, 249];
+        let product = [40u8, 40, 45];
+        let mut img = RgbaImage::from_pixel(w, h, Rgba([bg[0], bg[1], bg[2], 255]));
+        let mut shape = Mask::new(w, h, 0);
+        for y in 0..h {
+            for x in 28..31 {
+                img.put_pixel(x, y, Rgba([product[0], product[1], product[2], 255]));
+                shape.set(x, y, u8::MAX);
+            }
+        }
+        let original = shape.clone();
+        let band = band_map(&img, &shape, bg, DEFAULT_MIN_RADIUS, DEFAULT_MAX_RADIUS);
+        let bounds = band_bounds(&band, w, h).expect("帯がある");
+        let grid = local_colour::build(&img, grow(bounds, 8, w, h), 1.0, |x, y| {
+            if band[(y as usize) * (w as usize) + (x as usize)] != 0 {
+                Role::Skip
+            } else if shape.is_foreground(x, y) {
+                Role::Foreground
+            } else {
+                Role::Background
+            }
+        });
+        smooth_in_band(&mut shape, &original, &band, &grid, &img, 2, bounds);
+        assert!(
+            shape.is_foreground(29, 20),
+            "色の門を通さないメディアンが 3px のストラップを消している"
+        );
+    }
+
+    /// `--seal` が塞いだ隙間を、色の塗り直しが取り消さないこと。
+    ///
+    /// **幅 1px のスリットは戻り、幅 5px の隙間は開いたまま**——`--seal 1` が
+    /// 「幅 2N px 以下だけを塞ぐ」と約束したとおりに振る舞う。
+    #[test]
+    fn the_seal_survives_the_repaint() {
+        let opened = |gap: u32| -> bool {
+            let (w, h) = (60u32, 40u32);
+            let mut shape = Mask::new(w, h, 0);
+            let original = {
+                let mut m = Mask::new(w, h, 0);
+                for y in 0..h {
+                    for x in 10..50 {
+                        m.set(x, y, u8::MAX);
+                    }
+                }
+                m
+            };
+            // 塗り直しの結果を模す: 上端から伸びる幅 gap の切れ込みが背景になった
+            for y in 0..h {
+                for x in 10..50 {
+                    shape.set(x, y, u8::MAX);
+                }
+            }
+            for y in 0..25 {
+                for x in 28..(28 + gap) {
+                    shape.set(x, y, 0);
+                }
+            }
+            let band = vec![1u8; (w as usize) * (h as usize)];
+            close_new_gaps(&mut shape, &original, &band, (0, 0, w - 1, h - 1), 1);
+            !shape.is_foreground(28, 20)
+        };
+        assert!(!opened(1), "幅 1px の切れ込みが塞がっていない");
+        assert!(opened(5), "幅 5px の隙間まで塞いでいる");
+    }
+
+    /// 3 つのスイッチを明示した経路が、Phase 2 の帯そのものを使うこと。
+    ///
+    /// **帯幅の下限の持ち上げは、新しい 3 段に働く場所を与えるためのもの**で、
+    /// 射影アルファだけを回す経路には用が無い。ここが崩れると、
+    /// 「`--matting projection --smooth-contour 0 --no-reclassify` は Phase 2 と
+    /// 1 バイトも変わらない」という約束が黙って破れる。
+    #[test]
+    fn the_three_switches_put_the_band_back_where_phase_two_had_it() {
+        // わざとギザギザにした輪郭。粗さが効けば下限が持ち上がる
+        let (w, h) = (80u32, 80u32);
+        let bg = [250u8, 250, 249];
+        let mut img = RgbaImage::from_pixel(w, h, Rgba([bg[0], bg[1], bg[2], 255]));
+        let mut mask = Mask::new(w, h, 0);
+        for y in 20..60 {
+            let wobble = if (y / 2) % 2 == 0 { 0 } else { 6 };
+            for x in (20 + wobble)..60 {
+                img.put_pixel(x, y, Rgba([40, 40, 45, 255]));
+                mask.set(x, y, u8::MAX);
+            }
+        }
+        let staged = refine(&img, &mask, bg, &RefineOptions::default());
+        let plain = refine(&img, &mask, bg, &RefineOptions::default().projection_only());
+        assert_eq!(
+            plain.band_min_radius, DEFAULT_MIN_RADIUS,
+            "3 つ切った経路で帯幅の下限が動いている"
+        );
+        assert!(
+            staged.band_min_radius > DEFAULT_MIN_RADIUS,
+            "ギザギザな輪郭で帯幅の下限が持ち上がっていない: {}",
+            staged.band_min_radius
         );
     }
 

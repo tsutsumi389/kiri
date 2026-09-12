@@ -7,128 +7,12 @@
 
 mod common;
 
-use common::{EdgeScene, EdgeTruth, edge_scene, measure_edges};
+use common::{EdgeScene, EdgeTruth, edge_scene, edge_scenes, measure_edges};
 use image::{Rgba, RgbaImage};
 use kiri::cutout::{CutoutOptions, cutout};
 
-fn scenes() -> Vec<EdgeScene> {
-    vec![
-        EdgeScene {
-            name: "S1 濃色商品/白背景/JPEG q90",
-            ..Default::default()
-        },
-        EdgeScene {
-            name: "S2 同上 PNG(非圧縮)",
-            jpeg: None,
-            ..Default::default()
-        },
-        // 白背景に置いた淡色商品。上端のハイライトで商品は 221 まで明るくなり、
-        // 背景 248 との輪郭のコントラストは ΔE 9.5 まで落ちる。既定の
-        // tolerance 12 より小さいので、**色だけを見れば商品はまるごと背景**
-        // である。連結性と段差の検査だけがこれを商品として残している
-        EdgeScene {
-            name: "S3 淡色商品(輪郭 ΔE 9.5)",
-            product: [232, 232, 230],
-            shading: (0.98, 0.80),
-            ..Default::default()
-        },
-        EdgeScene {
-            name: "S4 柔らかい輪郭(8px)",
-            softness: 8.0,
-            ..Default::default()
-        },
-        EdgeScene {
-            name: "S5 3px のストラップ",
-            strap: Some(3),
-            ..Default::default()
-        },
-        EdgeScene {
-            name: "S5b 5px のストラップ",
-            strap: Some(5),
-            ..Default::default()
-        },
-        EdgeScene {
-            name: "S6 落ち影あり",
-            shadow: true,
-            ..Default::default()
-        },
-        EdgeScene {
-            name: "S7 中間グレー商品+影",
-            product: [150, 150, 150],
-            shadow: true,
-            ..Default::default()
-        },
-        EdgeScene {
-            name: "S8 黒商品+影",
-            product: [20, 20, 20],
-            shadow: true,
-            ..Default::default()
-        },
-        // 高解像度での影の暴走を捕まえるシーン。無彩色の商品・落ち影・柔らかい
-        // 輪郭という、影の判定にとって最悪の 3 つを重ねてある。影の段だけは
-        // 堤防を無視するので、柔らかい輪郭は通り抜けられてしまう。進める距離が
-        // 解像度に比例して伸びると、そこから商品の内部まで届く。
-        // 他のシーンは 600px なので、解像度に依存する崩れはここでしか出ない
-        EdgeScene {
-            name: "S10 高解像度/無彩色商品+影+柔輪郭",
-            width: 1600,
-            height: 1600,
-            product: [150, 150, 150],
-            softness: 4.0,
-            shadow: true,
-            ..Default::default()
-        },
-        // 織り目のある背景。不織布・キャンバス地のように 1px あたりの変化が
-        // 大きい素材を敷き、その上に濃色の商品を置く。既定の堤防（勾配 8）は
-        // 布の織り目そのものに反応して**背景の中で**壁になり、フィルが商品まで
-        // 届かない（堤防を 8 に固定した実測で前景比率 0.85、縁の残り 100%）。
-        //
-        // 周期 6px・振幅 12 は実写（不織布、外周の勾配 p90 27.9）の性質を
-        // 縮めたもので、外周の勾配 p90 は 14 になる。周期を 8px に広げると
-        // 稜線が疎になって壁にならず、この崩れは再現しない
-        EdgeScene {
-            name: "S11 織り目のある背景",
-            width: 1200,
-            height: 1200,
-            background: [177, 174, 168],
-            product: [35, 35, 38],
-            shading: (1.0, 1.0),
-            weave: Some((12.0, 6.0)),
-            noise: 1.0,
-            ..Default::default()
-        },
-        // S11 の織り目の上に**淡色**の商品を置く。テクスチャ検知が「無効化」では
-        // なく「引き上げ」でなければならない理由がここに出る。S11 は濃色商品
-        // なので堤防を切っても崩れず、引き上げ幅が何倍でも同じ結果になってしまう。
-        //
-        // 商品の輪郭は 1px あたり 28 の段差を持ち、織り目（p90 14.0）より大きい。
-        // 堤防を 21 に置けば織り目は越えられて輪郭では止まる、という
-        // 「引き上げ」の狙いがそのまま成立する唯一のシーンである
-        EdgeScene {
-            name: "S12 織り目のある背景 + 淡色商品",
-            width: 1200,
-            height: 1200,
-            background: [177, 174, 168],
-            product: [205, 202, 196],
-            shading: (1.0, 1.0),
-            weave: Some((12.0, 6.0)),
-            noise: 1.0,
-            ..Default::default()
-        },
-        // 解けないケース。商品の明度が上から下へ変化する途中で背景色を
-        // **横切る**ため、輪郭のコントラストが 0 になる行が存在する。そこでは
-        // 色による分離が原理的に不可能で、いったん入られると商品の内部は
-        // 一様なのでフィルが広がる。判定はせず、表に出して限界を可視化する
-        EdgeScene {
-            name: "S9 淡色商品(明度が背景を横切る)",
-            product: [232, 232, 230],
-            ..Default::default()
-        },
-    ]
-}
-
 fn find(name: &str) -> EdgeTruth {
-    let scene = scenes()
+    let scene = edge_scenes()
         .into_iter()
         .find(|s| s.name.starts_with(name))
         .unwrap_or_else(|| panic!("シーン {name} が無い"));
@@ -782,6 +666,45 @@ fn print_the_refine_cost_on_large_inputs() {
         cases.push((format!("櫛 {period}px 周期"), comb_image(w, h, period)));
     }
 
+    // **診断値の計測を先に置く。** 後ろへ回すと、refine の計測で確保された
+    // 空きをアロケータが使い回してしまい、RSS の増分が 0 としか出ない。
+    // **判定はしない。** 絶対時間は機械によって何倍も違い、書き写した数値は
+    // 必ず嘘になる。その場で回して読むためのものである
+    let result = cutout(&cases[0].1, &CutoutOptions::default());
+    let mut best = f64::MAX;
+    let mut peak = 0i64;
+    for _ in 0..3 {
+        let base = resident_kb();
+        let watching = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let high = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(base));
+        let sampler = {
+            let (watching, high) = (watching.clone(), high.clone());
+            std::thread::spawn(move || {
+                while watching.load(std::sync::atomic::Ordering::Relaxed) {
+                    high.fetch_max(resident_kb(), std::sync::atomic::Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        };
+        let started = std::time::Instant::now();
+        let d = kiri::cutout::diagnostics::diagnose(
+            &cases[0].1,
+            &result.mask,
+            result.background.rgb,
+            None,
+        );
+        std::hint::black_box((d.contour_roughness, d.rim_contamination));
+        best = best.min(started.elapsed().as_secs_f64() * 1000.0);
+        watching.store(false, std::sync::atomic::Ordering::Relaxed);
+        sampler.join().unwrap();
+        peak = peak.max(high.load(std::sync::atomic::Ordering::Relaxed) - base);
+    }
+    println!(
+        "診断           diagnose() {best:>7.0} ms / ピーク RSS 増分 {:>5} MB",
+        peak / 1024
+    );
+    drop(result);
+
     for (name, image) in cases {
         let with = fastest(&image, true);
         let without = fastest(&image, false);
@@ -796,7 +719,22 @@ fn print_the_refine_cost_on_large_inputs() {
     }
 }
 
+/// 自プロセスの常駐メモリ(KB)。依存を足さずに済ませるため `ps` を呼ぶ。
+fn resident_kb() -> i64 {
+    std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
 /// 実装前後の比較に使う一覧表。`--ignored` を付けたときだけ走る。
+///
+/// **合成背景（S）と実写背景（R）を同じ表に並べる。** 診断値のしきい値は
+/// 「クリーンなシーンの最大値」と「欠陥シーンの最小値」の窓で決まるので、
+/// 両方を同じ物差しで見られなければ較正できない。
 ///
 /// ```text
 /// cargo test --release --test edge_quality -- --ignored --nocapture
@@ -805,7 +743,7 @@ fn print_the_refine_cost_on_large_inputs() {
 #[ignore = "計測用。判定はせず表を出すだけ"]
 fn print_the_metrics_table() {
     println!(
-        "\n{:<28} {:<20} {:>8} {:>7} {:>7} {:>9} {:>7} {:>7} {:>8} {:>8} {:>8} {:>7}",
+        "\n{:<28} {:<10} {:>8} {:>7} {:>7} {:>9} {:>7} {:>7} {:>8} {:>8} {:>8} {:>7}",
         "シーン",
         "設定",
         "境界ずれ",
@@ -819,7 +757,25 @@ fn print_the_metrics_table() {
         "織り目残",
         "色ずれ"
     );
-    for scene in scenes() {
+
+    let round1 = |v: f64| (v * 10.0).round() / 10.0;
+    let round3 = |v: f64| (v * 1000.0).round() / 1000.0;
+    // 新しい 4 指標は 2 行目にまとめて出す。粗さは「正解版」と並べないと、
+    // 値が大きいことが欠陥なのか測り方なのか読み手には分からない
+    let second_line = |m: &common::EdgeMetrics, d: &kiri::cutout::Diagnostics| {
+        println!(
+            "{:<39} roughness={:?} / 正解 {:.2}   rim_contam={:?} / 正解 {:.3}   halo_ratio={:?} edge_width={:?}",
+            "",
+            d.contour_roughness.map(round3),
+            m.contour_error,
+            d.rim_contamination.map(round3),
+            m.rim_truth,
+            d.halo_ratio.map(round3),
+            d.edge_width.map(round1),
+        );
+    };
+
+    for scene in edge_scenes() {
         let truth = edge_scene(&scene);
         for (label, opts) in [
             ("既定", CutoutOptions::default()),
@@ -833,30 +789,11 @@ fn print_the_metrics_table() {
         ] {
             let result = cutout(&truth.image, &opts);
             let m = measure_edges(&truth, &result.image, &result.mask);
+            print_row(scene.name, label, &m);
+            second_line(&m, &result.diagnostics);
             println!(
-                "{:<28} {:<20} {:>+8.3} {:>6.1}% {:>6.1}% {:>9.3} {:>7.1} {:>8.1} {:>7.1}% {:>7.1}% {:>7.2}% {:>7.1}",
-                scene.name,
-                label,
-                m.offset,
-                m.rim * 100.0,
-                m.eaten * 100.0,
-                m.alpha_mae,
-                m.halo,
-                m.white_error,
-                m.strap_kept * 100.0,
-                m.shadow_kept * 100.0,
-                m.speckles * 100.0,
-                m.cast,
-            );
-            let round1 = |v: f64| (v * 10.0).round() / 10.0;
-            println!(
-                "{:<49} halo_ratio={:?} edge_width={:?} separability={:?} 外周勾配 p50={:.1}/p90={:.1} 効いた堤防={:.1}",
+                "{:<39} separability={:?} 外周勾配 p50={:.1}/p90={:.1} 効いた堤防={:.1}",
                 "",
-                result
-                    .diagnostics
-                    .halo_ratio
-                    .map(|v| (v * 1000.0).round() / 1000.0),
-                result.diagnostics.edge_width.map(round1),
                 result.separability.map(round1),
                 result.background.texture.p50,
                 result.background.texture.p90,
@@ -865,6 +802,39 @@ fn print_the_metrics_table() {
         }
         println!();
     }
+
+    for scene in common::real_scenes() {
+        let (_, runs) = common::run_real(&scene);
+        for run in &runs {
+            print_row(scene.name, run.setting, &run.metrics);
+            second_line(&run.metrics, &run.diagnostics);
+            println!(
+                "{:<39} tolerance={:.0} fg={:.3} separability={:?} warnings={:?}",
+                "",
+                run.tolerance,
+                run.foreground_ratio,
+                run.separability.map(round1),
+                run.warnings,
+            );
+        }
+        println!();
+    }
+}
+
+fn print_row(scene: &str, setting: &str, m: &common::EdgeMetrics) {
+    println!(
+        "{scene:<28} {setting:<10} {:>+8.3} {:>6.1}% {:>6.1}% {:>9.3} {:>7.1} {:>8.1} {:>7.1}% {:>7.1}% {:>7.2}% {:>7.1}",
+        m.offset,
+        m.rim * 100.0,
+        m.eaten * 100.0,
+        m.alpha_mae,
+        m.halo,
+        m.white_error,
+        m.strap_kept * 100.0,
+        m.shadow_kept * 100.0,
+        m.speckles * 100.0,
+        m.cast,
+    );
 }
 
 /// 櫛状の素材で、正当な隙間が最終アルファまで抜けること。

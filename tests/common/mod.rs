@@ -554,6 +554,12 @@ pub struct RealScene {
     pub blur: Option<f32>,
     /// `assisted`（kiri 自身の hint に従って到達する設定）で使う tolerance
     pub assisted_tolerance: f64,
+    /// 空間的な指示（トライマップ / ポリゴン）を渡した設定も回すか。
+    ///
+    /// **全シーンで回さない。** 点が倍になるうえ、較正の母集団が「指示の有無」で
+    /// 薄まる。指示が効くかどうかは 1 つのシーンで見れば足りるので、実写の
+    /// リモコンをそのまま縮めた R1 だけに付ける
+    pub spatial: bool,
 }
 
 impl Default for RealScene {
@@ -572,6 +578,7 @@ impl Default for RealScene {
             jpeg: Some(90),
             blur: None,
             assisted_tolerance: 60.0,
+            spatial: false,
         }
     }
 }
@@ -584,6 +591,7 @@ pub fn real_scenes() -> Vec<RealScene> {
         // 到達した値で、そこが最良だった
         RealScene {
             name: "R1 不織布 + 黒商品",
+            spatial: true,
             ..Default::default()
         },
         // 同じ不織布の別の場所。上が明るく下が暗い大域の照明勾配を持つ
@@ -713,6 +721,12 @@ pub struct RealRun {
     pub setting: &'static str,
     pub tolerance: f64,
     pub bbox: Option<(u32, u32, u32, u32)>,
+    /// 空間的な指示が占めた割合 (確定前景, 確定背景)。指示が無ければ None。
+    ///
+    /// **表に出す。** 指標が良くなったのが「指示が良かった」からなのか
+    /// 「画像の 7 割を確定背景だと言い切った」からなのかは、占有率を見なければ
+    /// 分けられない
+    pub constraints: Option<(f64, f64)>,
     pub metrics: EdgeMetrics,
     pub diagnostics: kiri::cutout::Diagnostics,
     pub separability: Option<f64>,
@@ -721,19 +735,24 @@ pub struct RealRun {
     pub warnings: Vec<String>,
 }
 
-/// R シーンを `defaults` と `assisted` の 2 通りで回す。
+/// R シーンを `defaults` と `assisted`、指示つきのシーンではさらに
+/// `trimap` と `polygon` で回す。
 ///
 /// `assisted` は「**AI エージェントが kiri 自身の hint に従って到達する設定**」である。
 /// `BBOX_RECOMMENDED` が示す矩形（ベンチでは正解の矩形 + 余白 5%）と、
 /// `HALO_REMAINS` の hint に従って上げた `--tolerance` の 2 つで、実写
 /// （不織布の上のリモコン）ではこの 2 手で最良に到達した。**既定値だけを測ると、
 /// 「エージェントが実際に受け取る結果」を測っていないことになる。**
+///
+/// `trimap` / `polygon` は空間的な指示を渡した設定で、`assisted` と同じ
+/// tolerance で回す。**変えるのは「どう指すか」だけにする。** 数値ノブも一緒に
+/// 動かすと、良くなった（悪くなった）のが指示のおかげかが分けられない。
 pub fn run_real(scene: &RealScene) -> (EdgeTruth, Vec<RealRun>) {
     use kiri::cutout::{CutoutOptions, cutout};
 
     let truth = real_scene(scene);
     let bbox = assisted_bbox(&truth);
-    let settings = [
+    let mut settings = vec![
         ("defaults", CutoutOptions::default()),
         (
             "assisted",
@@ -744,6 +763,24 @@ pub fn run_real(scene: &RealScene) -> (EdgeTruth, Vec<RealRun>) {
             },
         ),
     ];
+    if scene.spatial {
+        settings.push((
+            "trimap",
+            CutoutOptions {
+                constraints: Some(truth_trimap(&truth)),
+                tolerance: scene.assisted_tolerance,
+                ..Default::default()
+            },
+        ));
+        settings.push((
+            "polygon",
+            CutoutOptions {
+                constraints: Some(truth_polygons(&truth)),
+                tolerance: scene.assisted_tolerance,
+                ..Default::default()
+            },
+        ));
+    }
 
     let runs = settings
         .into_iter()
@@ -753,6 +790,10 @@ pub fn run_real(scene: &RealScene) -> (EdgeTruth, Vec<RealRun>) {
                 setting,
                 tolerance: opts.tolerance,
                 bbox: opts.bbox,
+                constraints: opts.constraints.as_ref().map(|c| {
+                    let (fg, bg, _) = c.ratios();
+                    (fg, bg)
+                }),
                 metrics: measure_edges_with(&truth, &result.image, &result.mask, opts.bbox),
                 diagnostics: result.diagnostics.clone(),
                 separability: result.separability,
@@ -766,6 +807,134 @@ pub fn run_real(scene: &RealScene) -> (EdgeTruth, Vec<RealRun>) {
         })
         .collect();
     (truth, runs)
+}
+
+/// 正解から作った**粗い**トライマップ。
+///
+/// 真の二値を長辺の 2% で収縮したものを確定前景、同じだけ膨張したものの外を
+/// 確定背景にする。あいだの帯（長辺の 4% 幅）が不明である。
+///
+/// **エージェントが渡すトライマップはこの粗さである。** ビジョンモデルの
+/// 出力も人の手描きも、輪郭そのものをなぞりはしない。ここで細い帯を渡すと
+/// 「正解を渡したのだから当たり前」になり、指示が効くかどうかを測れない。
+pub fn truth_trimap(truth: &EdgeTruth) -> kiri::cutout::Constraints {
+    use kiri::cutout::{Constraint, Constraints};
+
+    let (w, h) = (truth.image.width(), truth.image.height());
+    let radius = (f64::from(w.max(h)) * 0.02).round() as u32;
+    let inside: Vec<bool> = truth.coverage.iter().map(|&c| c >= 0.5).collect();
+    let core = box_morph(w, h, &inside, radius, false);
+    let grown = box_morph(w, h, &inside, radius, true);
+
+    let mut constraints = Constraints::new(w, h);
+    for i in 0..core.len() {
+        if core[i] {
+            constraints.mark_index(i, Constraint::ForcedFg);
+        } else if !grown[i] {
+            constraints.mark_index(i, Constraint::ForcedBg);
+        }
+    }
+    constraints
+}
+
+/// 商品の内側の矩形を確定前景、商品の外側の矩形を確定背景にした指示。
+///
+/// **エージェントが目で見て置ける程度のものしか渡さない。** 商品の中央半分を
+/// 囲む矩形 1 つと、商品から余白 5% だけ離した外側の背景の矩形 4 つである。
+/// 輪郭はどこにも教えていない（余白 5% の帯は不明のまま残る）ので、
+/// 境界は今までどおり色と連結性が決める。
+///
+/// 外側を 4 つに分けるのは、**偶奇規則の多角形 1 つでは「矩形の外」を
+/// 表せない**ためである。穴あきの面を 1 本の閉曲線で描くには縫い目が要り、
+/// その縫い目自身が指示として画素を巻き込む。
+pub fn truth_polygons(truth: &EdgeTruth) -> kiri::cutout::Constraints {
+    use kiri::cutout::{Constraint, Constraints};
+
+    let (w, h) = (truth.image.width(), truth.image.height());
+    let (x1, y1, x2, y2) = truth_bbox(truth);
+    let mut constraints = Constraints::new(w, h);
+
+    // 商品の中央半分。角丸の内側に確実に収まる
+    let (cx, cy) = (f64::from(x1 + x2) / 2.0, f64::from(y1 + y2) / 2.0);
+    let (hx, hy) = (f64::from(x2 - x1) / 4.0, f64::from(y2 - y1) / 4.0);
+    constraints.fill_polygon(
+        &[
+            [cx - hx, cy - hy],
+            [cx + hx, cy - hy],
+            [cx + hx, cy + hy],
+            [cx - hx, cy + hy],
+        ],
+        Constraint::ForcedFg,
+    );
+
+    // 商品の外側。余白 5% ぶん離した矩形の外を 4 枚の帯で覆う
+    let (mx, my) = (f64::from(w) * 0.05, f64::from(h) * 0.05);
+    let (fw, fh) = (f64::from(w), f64::from(h));
+    let (left, top) = (f64::from(x1) - mx, f64::from(y1) - my);
+    let (right, bottom) = (f64::from(x2) + mx, f64::from(y2) + my);
+    let rect = |x1: f64, y1: f64, x2: f64, y2: f64| [[x1, y1], [x2, y1], [x2, y2], [x1, y2]];
+    for band in [
+        rect(0.0, 0.0, fw, top),
+        rect(0.0, bottom, fw, fh),
+        rect(0.0, top, left, bottom),
+        rect(right, top, fw, bottom),
+    ] {
+        constraints.fill_polygon(&band, Constraint::ForcedBg);
+    }
+    constraints
+}
+
+/// 正解の被覆率から求めた商品の外接矩形（余白なし）。
+fn truth_bbox(truth: &EdgeTruth) -> (u32, u32, u32, u32) {
+    let (w, h) = (truth.image.width(), truth.image.height());
+    let (mut x1, mut y1, mut x2, mut y2) = (w, h, 0u32, 0u32);
+    for y in 0..h {
+        for x in 0..w {
+            if truth.coverage[truth.index(x, y)] > 0.0 {
+                x1 = x1.min(x);
+                y1 = y1.min(y);
+                x2 = x2.max(x);
+                y2 = y2.max(y);
+            }
+        }
+    }
+    (x1, y1, x2, y2)
+}
+
+/// 正方形の構造要素による収縮／膨張。横と縦に分けて O(n * radius) に収める。
+///
+/// `floodfill::separable` と同じ規約（画像の外は窓に含めない）だが、あちらは
+/// 非公開なのでベンチ側にも置く。**トライマップを作るためだけの道具**であり、
+/// 本体の挙動を測る場所ではない。
+fn box_morph(w: u32, h: u32, src: &[bool], radius: u32, dilate: bool) -> Vec<bool> {
+    let stride = w as usize;
+    let r = radius as i64;
+    let combine = |acc: bool, v: bool| if dilate { acc || v } else { acc && v };
+    let mut horizontal = vec![false; src.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let from = (i64::from(x) - r).max(0) as u32;
+            let to = ((i64::from(x) + r) as u32).min(w - 1);
+            let mut acc = !dilate;
+            for k in from..=to {
+                acc = combine(acc, src[(y as usize) * stride + (k as usize)]);
+            }
+            horizontal[(y as usize) * stride + (x as usize)] = acc;
+        }
+    }
+    let mut out = vec![false; src.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let from = (i64::from(y) - r).max(0) as u32;
+            let to = ((i64::from(y) + r) as u32).min(h - 1);
+            let mut acc = !dilate;
+            for k in from..=to {
+                acc = combine(acc, horizontal[(k as usize) * stride + (x as usize)]);
+            }
+            out[(y as usize) * stride + (x as usize)] = acc;
+        }
+    }
+    out
 }
 
 /// 実写背景のフィクスチャを中央から切り出して読む。
@@ -983,13 +1152,13 @@ fn external_options(path: &Path, image: &RgbaImage) -> Option<kiri::cutout::Cuto
     if let Some(tolerance) = value["tolerance"].as_f64() {
         options.tolerance = tolerance;
     }
+    let normalized = value["normalized"].as_bool().unwrap_or(false);
     if let Some(bbox) = value["bbox"].as_array() {
         let v: Vec<f64> = bbox.iter().filter_map(serde_json::Value::as_f64).collect();
         if v.len() != 4 {
             eprintln!("{}: bbox は数値 4 つで書く", path.display());
             return None;
         }
-        let normalized = value["normalized"].as_bool().unwrap_or(false);
         match kiri::commands::cutout::resolve_bbox(
             [v[0], v[1], v[2], v[3]],
             normalized,
@@ -1003,7 +1172,121 @@ fn external_options(path: &Path, image: &RgbaImage) -> Option<kiri::cutout::Cuto
             }
         }
     }
+    options.constraints = external_constraints(path, &value, normalized, image)?;
     Some(options)
+}
+
+/// `<name>.json` から空間的な指示を読む。キー名は `batch` の spec と同じ。
+///
+/// **手持ちの実写で指示を試せなければ、Phase 2 は合成でしか測れない。** 画像の
+/// パスは JSON の隣を基準に解決する（spec と同じ規則）。読めない・寸法が違う・
+/// 衝突している素材は、bbox と同じく**素材ごと飛ばす**——指示が効いていない
+/// 数字を効いた数字として表に出すのが、いちばん質の悪い嘘になる。
+///
+/// 外側の `Option` は「この素材を飛ばすか」、内側は「指示があるか」である。
+fn external_constraints(
+    path: &Path,
+    value: &serde_json::Value,
+    normalized: bool,
+    image: &RgbaImage,
+) -> Option<Option<kiri::cutout::Constraints>> {
+    use kiri::cutout::constraints::{TRIMAP_BACKGROUND, TRIMAP_FOREGROUND};
+    use kiri::cutout::{Constraint, Constraints};
+
+    let (w, h) = (image.width(), image.height());
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut constraints = Constraints::new(w, h);
+    let mut given = false;
+
+    for (key, kind) in [
+        ("trimap", None),
+        ("fg_mask", Some(Constraint::ForcedFg)),
+        ("bg_mask", Some(Constraint::ForcedBg)),
+    ] {
+        let Some(name) = value[key].as_str() else {
+            continue;
+        };
+        let file = dir.join(name);
+        let Ok(mask) = image::open(&file) else {
+            eprintln!("{}: {key} を読めない", file.display());
+            return None;
+        };
+        let mask = mask.to_rgba8();
+        if mask.width() != w || mask.height() != h {
+            eprintln!(
+                "{}: {key} が {}x{} で、画像 {w}x{h} と寸法が違う",
+                file.display(),
+                mask.width(),
+                mask.height()
+            );
+            return None;
+        }
+        match kind {
+            Some(kind) => constraints.mark_by_luma(&mask, |l| (l != 0).then_some(kind)),
+            None => constraints.mark_by_luma(&mask, |l| {
+                if l >= TRIMAP_FOREGROUND {
+                    Some(Constraint::ForcedFg)
+                } else if l <= TRIMAP_BACKGROUND {
+                    Some(Constraint::ForcedBg)
+                } else {
+                    None
+                }
+            }),
+        };
+        given = true;
+    }
+
+    for (key, kind) in [
+        ("fg_polygons", Constraint::ForcedFg),
+        ("bg_polygons", Constraint::ForcedBg),
+    ] {
+        let Some(list) = value[key].as_array() else {
+            continue;
+        };
+        for polygon in list {
+            let flat: Vec<f64> = polygon
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_f64)
+                .collect();
+            // CLI と同じ関門を通す。テスト側だけ緩いと、通らない指示で
+            // 測った数字を表に出すことになる
+            let points = match kiri::cli::Polygon::from_values(&flat) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("{}: {key} を解釈できない ({e})", path.display());
+                    return None;
+                }
+            };
+            let scaled: Vec<[f64; 2]> = points
+                .points()
+                .iter()
+                .map(|p| {
+                    if normalized {
+                        [p[0] * f64::from(w), p[1] * f64::from(h)]
+                    } else {
+                        *p
+                    }
+                })
+                .collect();
+            constraints.fill_polygon(&scaled, kind);
+            given = true;
+        }
+    }
+
+    if !given {
+        return Some(None);
+    }
+    if let Some(conflict) = constraints.conflict() {
+        eprintln!(
+            "{}: 確定前景と確定背景が {} 画素で重なっている",
+            path.display(),
+            conflict.count
+        );
+        return None;
+    }
+    Some(Some(constraints))
 }
 
 /// 正解アルファ（8bit グレー、255 = 商品）から `EdgeTruth` を組み立てる。

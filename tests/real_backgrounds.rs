@@ -30,6 +30,8 @@ struct Point {
     metrics: EdgeMetrics,
     diagnostics: Diagnostics,
     warnings: Vec<String>,
+    /// 空間的な指示が占めた割合 (確定前景, 確定背景)。指示が無ければ None
+    constraints: Option<(f64, f64)>,
 }
 
 /// S シーンを既定値で、R シーンを defaults / assisted で回した全点。
@@ -51,6 +53,7 @@ fn bench() -> Vec<Point> {
                 .iter()
                 .map(|w| w.code.as_str().to_string())
                 .collect(),
+            constraints: None,
         });
     }
     for scene in real_scenes() {
@@ -61,6 +64,7 @@ fn bench() -> Vec<Point> {
                 metrics: run.metrics,
                 diagnostics: run.diagnostics,
                 warnings: run.warnings,
+                constraints: run.constraints,
             });
         }
     }
@@ -184,6 +188,55 @@ fn the_new_diagnostics_see_the_defect_that_the_old_ones_missed() {
         "警告が出ていない: {:?}",
         defect.warnings
     );
+}
+
+/// 空間的な指示が、bbox と tolerance で救った状態（assisted）より悪くならないこと。
+///
+/// **トライマップで悪くなるなら実装が間違っている。** R1 に渡すのは正解から
+/// 作った粗いトライマップ（長辺の 2% で収縮したものが確定前景、膨張したものの
+/// 外が確定背景）で、輪郭そのものは教えていない——不明の帯は長辺の 4% ある。
+/// それでも輪郭の位置を大きく絞り込むので、`contour_error` は下がるはずである。
+///
+/// ポリゴンの側は `eaten` だけを見る。商品の中央半分と、余白 5% だけ離した
+/// 外側の帯 4 枚しか教えていないので、**指示は輪郭について何も言っていない**。
+/// 言えるのは「商品を余計に削っていないこと」までで、そこへ勝手な期待を
+/// 置くと、較正が動いたときに理由の無い赤になる。
+#[test]
+fn spatial_instructions_never_do_worse_than_the_bbox() {
+    let points = bench();
+    let assisted = point(&points, "R1 不織布 + 黒商品 / assisted");
+    let trimap = point(&points, "R1 不織布 + 黒商品 / trimap");
+    let polygon = point(&points, "R1 不織布 + 黒商品 / polygon");
+
+    // 指示が空のまま回っていないことを先に確かめる。**空のトライマップでも
+    // 「悪くなっていない」は成立してしまう**ので、ここが抜けると以降の
+    // 判定は何も守らない
+    for p in [trimap, polygon] {
+        let (fg, bg) = p
+            .constraints
+            .unwrap_or_else(|| panic!("{}: 指示が無い", p.label));
+        assert!(
+            fg > 0.0 && bg > 0.0,
+            "{}: 指示が画素を 1 つも占めていない (fg={fg:.3} bg={bg:.3})",
+            p.label
+        );
+    }
+
+    assert!(
+        trimap.metrics.contour_error <= assisted.metrics.contour_error,
+        "トライマップで輪郭誤差が悪化した: {:.2} vs assisted {:.2}",
+        trimap.metrics.contour_error,
+        assisted.metrics.contour_error
+    );
+    for p in [trimap, polygon] {
+        assert!(
+            p.metrics.eaten <= assisted.metrics.eaten,
+            "{}: 商品を assisted より削っている: {:.4} vs {:.4}",
+            p.label,
+            p.metrics.eaten,
+            assisted.metrics.eaten
+        );
+    }
 }
 
 /// 輪郭の粗さが実写背景でだけ跳ねること。
@@ -610,8 +663,14 @@ fn print_the_calibration_table() {
         } else {
             "-".to_string()
         };
+        // 指示の占有率も出す。値が動いたときに「指示が変わった」のか
+        // 「切り抜きが変わった」のかを、同じ表の上で切り分けられる
+        let constraints = match p.constraints {
+            Some((fg, bg)) => format!("  制約 fg={fg:.3}/bg={bg:.3}"),
+            None => String::new(),
+        };
         println!(
-            "{:<44} {:>8} {:>8.2} {:>3} {:>8} {:>8.3} {:>3} {:>7}  {}",
+            "{:<44} {:>8} {:>8.2} {:>3} {:>8} {:>8.3} {:>3} {:>7}  {}{constraints}",
             p.label,
             show(p.diagnostics.contour_roughness),
             p.metrics.contour_error,
@@ -690,6 +749,16 @@ fn print_the_calibration_table() {
 /// 解釈できない bbox は**素材ごと飛ばす**——既定の設定で回した数字を指定した
 /// 設定の数字として表に出すのが、いちばん質の悪い嘘になる。
 ///
+/// 空間的な指示も同じ JSON から受ける（キーは `batch` の spec と同じ）。
+///
+/// ```json
+/// { "trimap": "remote.trimap.png", "tolerance": 60,
+///   "fg_polygons": [[0.2,0.4,0.8,0.4,0.8,0.6,0.2,0.6]], "normalized": true }
+/// ```
+///
+/// 画像のパスは JSON の隣を基準に解決する。`normalized` は bbox と多角形の
+/// 両方に効く。
+///
 /// `輪郭誤差` の床は合成シーンの表と違う。あちらは解析的な距離場なので完璧に
 /// 解けても 0.4〜0.5 から下がらないが、こちらは正解アルファの二値輪郭からの
 /// 距離変換なので 0 まで下がる。**2 つの表の数字を直接比べないこと。**
@@ -713,8 +782,18 @@ fn print_the_external_bench() {
         return;
     }
     println!(
-        "\n{:<24} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>8} {:>5} {:>22}",
-        "素材", "帯MAE", "輪郭誤差", "rim正解", "粗さ", "縁の汚染", "halo", "ms", "tol", "bbox"
+        "\n{:<24} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>8} {:>5} {:>22} {:>17}",
+        "素材",
+        "帯MAE",
+        "輪郭誤差",
+        "rim正解",
+        "粗さ",
+        "縁の汚染",
+        "halo",
+        "ms",
+        "tol",
+        "bbox",
+        "制約"
     );
     for pair in pairs {
         let started = std::time::Instant::now();
@@ -732,8 +811,17 @@ fn print_the_external_bench() {
             Some((x1, y1, x2, y2)) => format!("{x1},{y1},{x2},{y2}"),
             None => "なし".to_string(),
         };
+        // 指示も同じ理由で出す。`<name>.json` に書いたのに読めていない、
+        // という状態が数字の上では見分けられない
+        let constraints = match pair.options.constraints.as_ref() {
+            Some(c) => {
+                let (fg, bg, _) = c.ratios();
+                format!("fg={fg:.3}/bg={bg:.3}")
+            }
+            None => "なし".to_string(),
+        };
         println!(
-            "{:<24} {:>9.3} {:>9.2} {:>9.3} {:>9} {:>9} {:>9} {:>8} {:>5.0} {:>22}",
+            "{:<24} {:>9.3} {:>9.2} {:>9.3} {:>9} {:>9} {:>9} {:>8} {:>5.0} {:>22} {:>17}",
             pair.name,
             m.alpha_mae,
             m.contour_error,
@@ -744,6 +832,7 @@ fn print_the_external_bench() {
             elapsed,
             pair.options.tolerance,
             bbox,
+            constraints,
         );
     }
 }

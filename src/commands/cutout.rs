@@ -60,6 +60,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         matting: args.matting,
         smooth_contour: args.smooth_contour,
         reclassify: !args.no_reclassify,
+        background_model: args.background_model,
     };
     let result = cutout(&loaded.image, &opts);
 
@@ -108,7 +109,12 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         color_profile: loaded.color_profile.clone(),
         color_converted: loaded.color_converted,
         dry_run: args.out.dry_run,
-        background: output::background_report(&result.background),
+        background: output::background_report(
+            &result.background,
+            result.background_model,
+            result.field_range,
+            &result.residual,
+        ),
         subject: result.subject.as_ref().map(output::subject_report),
         settings: SettingsReport {
             tolerance: opts.tolerance,
@@ -131,6 +137,9 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             // 「実寸で何 px 均したか」を語らない
             smooth_radius_px: result.smooth_radius_px,
             reclassify: opts.reclassify,
+            // 実際に効いた値。`auto` は背景の均一度を見てどちらかを選ぶので、
+            // 指定値からは読めない
+            background_model: result.background_model.as_str(),
             // 実際に効いた値。指定値ではなく、輪郭の粗さで持ち上がった後の値
             band_min_radius: result.band_min_radius,
         },

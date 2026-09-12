@@ -9,7 +9,7 @@ mod common;
 
 use common::{EdgeScene, EdgeTruth, edge_scene, edge_scenes, measure_edges};
 use image::{Rgba, RgbaImage};
-use kiri::cutout::{CutoutOptions, cutout};
+use kiri::cutout::{BackgroundModel, CutoutOptions, cutout};
 
 fn find(name: &str) -> EdgeTruth {
     let scene = edge_scenes()
@@ -335,16 +335,25 @@ fn a_patterned_product_cropped_at_the_bottom_does_not_raise_the_dam() {
         "帯の 1 辺が商品でも堤防が引き上がっている: {texture:?}"
     );
 
-    // 堤防 8 を明示した場合と、見切れの無い同じシーンと、3 つが揃うこと
+    // 堤防 8 を明示した場合と、見切れの無い同じシーンと、3 つが揃うこと。
+    //
+    // **背景のモデルは 1 色に固定して比べる。** 見切れた柄は外周の均一度を
+    // 落とすので、既定の `auto` では帯のあるシーンだけが照明場になり、
+    // 帯の有無で「堤防が動いたか」ではなく「モデルが変わったか」を測って
+    // しまう。堤防を問うテストなので、堤防以外は揃える
+    let flat = || CutoutOptions {
+        background_model: BackgroundModel::Flat,
+        ..Default::default()
+    };
     let pinned = run(
         &truth,
         &CutoutOptions {
             edge_threshold: Some(kiri::cutout::DEFAULT_EDGE_THRESHOLD),
-            ..Default::default()
+            ..flat()
         },
     );
-    let m = measure_edges(&truth, &auto.image, &auto.mask);
-    let without = run(&clean, &CutoutOptions::default());
+    let m = run(&truth, &flat());
+    let without = run(&clean, &flat());
     assert!(
         (m.eaten - pinned.eaten).abs() < 0.005,
         "既定と「堤防 8 を明示」で結果が違う: {:.1}% と {:.1}%",
@@ -355,6 +364,17 @@ fn a_patterned_product_cropped_at_the_bottom_does_not_raise_the_dam() {
         (m.eaten - without.eaten).abs() < 0.005,
         "見切れの有無で淡色商品の削れ方が変わっている: {:.1}% と {:.1}%",
         m.eaten * 100.0,
+        without.eaten * 100.0
+    );
+
+    // **既定の経路で悪くなっていないこと。** 上を 1 色に固定した以上、
+    // 既定（照明場へ切り替わる側）を誰も見ていない状態を作らない。
+    // 見切れた柄があるからといって、淡色商品が余計に削れてはいけない
+    let default_run = measure_edges(&truth, &auto.image, &auto.mask);
+    assert!(
+        default_run.eaten <= without.eaten + 0.005,
+        "既定の経路で淡色商品が余計に削れている: {:.1}% (1 色の同シーンは {:.1}%)",
+        default_run.eaten * 100.0,
         without.eaten * 100.0
     );
 }
@@ -1037,4 +1057,360 @@ fn dump_scenes() {
         let name = scene.name.split(' ').next().unwrap();
         truth.image.save(dir.join(format!("{name}.png"))).unwrap();
     }
+}
+
+/// **照明場モデルの対照実験。** 1 色では解けず、場なら既定のまま解ける。
+///
+/// S13 は S1 に照明の勾配（左上 0.75 倍 → 右下 1.15 倍）を乗せただけで、
+/// 商品も輪郭も S1 と同じものである。にもかかわらず 1 色モデルでは外周
+/// ΔE の p90 が 13.9 まで開き、既定の `--tolerance 12` が勾配の片側に
+/// 届かない。**tolerance で解こうとすれば勾配の幅ぶんだけ広げるしかなく、
+/// そこまで広げれば淡い商品もまるごと飲む**（S3 が固定している）。
+///
+/// 対で置くことが要点である。「場で解ける」だけを固定すると、1 色でも
+/// 解けるようになった日にこのシーンは何も語らなくなる。
+#[test]
+fn a_lit_gradient_is_absorbed_by_the_field_but_not_by_one_colour() {
+    let truth = find("S13");
+    let run = |model: BackgroundModel| {
+        let opts = CutoutOptions {
+            background_model: model,
+            ..Default::default()
+        };
+        let result = cutout(&truth.image, &opts);
+        let codes: Vec<&str> = result.warnings.iter().map(|w| w.code.as_str()).collect();
+        (
+            measure_edges(&truth, &result.image, &result.mask),
+            result.stats.foreground_ratio,
+            result.background_model,
+            codes.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
+        )
+    };
+
+    // 1 色では背景が残る。**前提であり、これが崩れたら対照実験は死んでいる**
+    let (flat, flat_fg, flat_model, flat_codes) = run(BackgroundModel::Flat);
+    assert_eq!(flat_model.as_str(), "flat");
+    assert!(
+        flat_fg > 0.40,
+        "前提が崩れている: 1 色でも背景が残らない (fg={flat_fg:.4})"
+    );
+    assert!(
+        flat.contour_error > 3.0,
+        "前提が崩れている: 1 色でも輪郭が合っている ({:.2})",
+        flat.contour_error
+    );
+    assert!(
+        flat_codes.iter().any(|c| c == "HALO_REMAINS"),
+        "縁が残っているのに黙っている: {flat_codes:?}"
+    );
+
+    // 既定（auto）は場へ切り替わり、商品だけが残る
+    let (field, field_fg, field_model, field_codes) = run(BackgroundModel::Auto);
+    assert_eq!(field_model.as_str(), "field", "既定で場が効いていない");
+    assert!(
+        (field_fg - 0.375).abs() < 0.005,
+        "商品だけが残っていない (fg={field_fg:.4} / 正解 0.375)"
+    );
+    assert!(
+        field.contour_error < 1.0,
+        "輪郭が正解から離れている ({:.2})",
+        field.contour_error
+    );
+    assert!(field.eaten < 0.005, "商品が削れている ({:.4})", field.eaten);
+    // 場を使ったことは黙らない。ただし直すものは無いので hint は付かない
+    assert!(
+        field_codes.iter().any(|c| c == "BACKGROUND_FIELD_USED"),
+        "場を使ったことを黙っている: {field_codes:?}"
+    );
+    assert!(
+        !field_codes.iter().any(|c| c == "HALO_REMAINS"),
+        "解けているのに縁が残っていると言っている: {field_codes:?}"
+    );
+}
+
+/// **照明場の追加コスト。** `--ignored` を付けたときだけ走る。
+///
+/// 測るものを 2 つに分ける。
+///
+/// 1. **場の推定そのもの**（縮小 → セルごとの中央値 → 正規化畳み込み）。
+///    設計の予算は 20MP で 30ms / 5MB である
+/// 2. **2 回目のパスを含めた `cutout()` 全体**。1 回目のフィルが背景と
+///    判定した画素を材料に場を作り直し、もう一度フィルするので、場の推定
+///    そのものより桁の大きい費用がここに乗る。**予算はこちらには掛かって
+///    いない**が、黙って払う額ではないので毎回出す
+///
+/// ```text
+/// cargo test --release --test edge_quality -- --ignored --nocapture print_the_field_cost
+/// ```
+#[test]
+#[ignore = "計測用。12MP と 20MP を数回ずつ回す"]
+fn print_the_field_cost() {
+    use kiri::cutout::background::{KnownBackground, estimate_field, field_band};
+    use kiri::cutout::estimate_background;
+
+    for (label, w, h) in [("12MP", 3000u32, 4000u32), ("20MP", 3900, 5200)] {
+        // 照明の勾配を持つ背景（場が仕事をする素材）で測る
+        let truth = edge_scene(&EdgeScene {
+            name: "計測",
+            width: w,
+            height: h,
+            gradient: Some((0.75, 1.15)),
+            ..Default::default()
+        });
+        let image = &truth.image;
+        let estimate = estimate_background(image, kiri::cutout::DEFAULT_BORDER);
+        let known = KnownBackground {
+            band: field_band(image, kiri::cutout::DEFAULT_BORDER),
+            ..Default::default()
+        };
+
+        // 場の推定そのもの。最短を採るのは `fastest` と同じ理由
+        let before = resident_kb();
+        let mut field_ms = f64::MAX;
+        let mut peak = before;
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let field = estimate_field(image, &estimate, &known);
+            field_ms = field_ms.min(started.elapsed().as_secs_f64() * 1000.0);
+            peak = peak.max(resident_kb());
+            std::hint::black_box(field.field.range());
+        }
+        let field_mb = (peak - before) as f64 / 1024.0;
+
+        // 全体。`--background-model` で 1 色と場を切り替えて差を見る
+        let run = |model: BackgroundModel| -> f64 {
+            let opts = CutoutOptions {
+                background_model: model,
+                ..Default::default()
+            };
+            let mut best = f64::MAX;
+            for _ in 0..2 {
+                let started = std::time::Instant::now();
+                let result = cutout(image, &opts);
+                std::hint::black_box(result.stats.foreground_ratio);
+                best = best.min(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            best
+        };
+        let flat = run(BackgroundModel::Flat);
+        let field_total = run(BackgroundModel::Field);
+
+        println!(
+            "{label} ({w}x{h})  場の推定 {field_ms:>6.1} ms / +{field_mb:>5.1} MB   \
+             cutout 全体 1 色 {flat:>7.0} ms → 場 {field_total:>7.0} ms（2 回目のパス込みで \
+             {:+.0} ms）",
+            field_total - flat
+        );
+
+        // **予算は場の推定に掛かっている。** 20MP で 30ms / 5MB（実測 27.2ms /
+        // 約 2MB）。色の門を入れる前は 13.8ms だった——門は帯の 200 万画素に
+        // 掛かるので、量子化した表で引いてもここが倍になる。上限は予算の
+        // 2 倍に置く——機械が違えば絶対時間は何倍も変わるので、ここで見るのは
+        // 「桁が変わっていないか」だけである。
+        // RSS が 0 と出るのは、直前の確保で広げたページを使い回したという意味で、
+        // 格子そのものは 256x192 セル x (線形 RGB + Lab) = 約 1.2MB である
+        if label == "20MP" {
+            assert!(
+                field_ms < 60.0,
+                "場の推定が予算 30ms から桁で外れている: {field_ms:.1} ms"
+            );
+            assert!(
+                field_mb < 10.0,
+                "場の格子が予算 5MB から桁で外れている: {field_mb:.1} MB"
+            );
+        }
+    }
+}
+
+/// **場が商品を学ばないこと。C1 の回帰テスト。**
+///
+/// 場の材料の第一は外周の帯なので、帯に商品が掛かっていれば場はそこで商品の
+/// 色を背景として学ぶ。学んだ場の上では商品は背景と一致し、**見切れた部分が
+/// まるごと消える**。消えた結果 `SUBJECT_TOUCHES_EDGE` も出なくなるので、
+/// エージェントからは成功に見える——いちばん筋の悪い壊れ方である。
+///
+/// 門を入れる前の実測（既定 `auto` がすべて `field` を選ぶ）:
+///
+/// | シーン | `flat` | 門なしの既定 |
+/// |---|---|---|
+/// | 白背景・下端で見切れ（商品が外周の 17.5%） | 0.3150 | **0.1713** |
+/// | 同上・見切れが浅い版 | 0.1750 | **0.1000** |
+/// | `bleeding_product_scene` | 0.4461 | **0.1226** |
+/// | 画面の 4 割を占める物体だけ | 0.4000 | **0.0202** |
+/// | 4 辺へ抜ける大きな商品 | 0.8445 | **0.2917** |
+/// | 照明勾配 + 下端で見切れ | 0.3150 | **0.1673** |
+///
+/// 判定は「既定の前景比率が `flat` の ±0.01 以内」と「外周接触の読み方
+/// （`SUBJECT_TOUCHES_EDGE` / `BBOX_RECOMMENDED`）が `flat` と同じ」。
+/// **`flat` を正解の代わりに使う**のは、この 6 枚がどれも 1 色で正しく
+/// 解けるシーンだからで、場は「解けているものを壊さない」ことだけを問われる。
+#[test]
+fn the_field_never_learns_a_product_that_runs_off_the_frame() {
+    let slab = common::subject_scenes()
+        .into_iter()
+        .find(|(name, _, _)| *name == "画面の 4 割を占める物体だけ")
+        .map(|(_, image, _)| image)
+        .expect("較正シーンに「画面の 4 割を占める物体だけ」が無い");
+    let scenes: Vec<(&str, RgbaImage)> = vec![
+        (
+            "白背景・下端で見切れ",
+            common::cropped_product_scene(600, 600, 45, None),
+        ),
+        (
+            "同上・見切れが浅い版",
+            common::cropped_product_scene(600, 600, 25, None),
+        ),
+        (
+            "bleeding_product_scene",
+            common::bleeding_product_scene(600, 600),
+        ),
+        ("画面の 4 割を占める物体だけ", slab),
+        (
+            "4 辺へ抜ける大きな商品",
+            common::oversized_product_scene(600, 600),
+        ),
+        (
+            "照明勾配 + 下端で見切れ",
+            common::cropped_product_scene(600, 600, 45, Some((0.80, 1.10))),
+        ),
+    ];
+
+    for (name, image) in scenes {
+        let run = |model: BackgroundModel| {
+            let result = cutout(
+                &image,
+                &CutoutOptions {
+                    background_model: model,
+                    ..Default::default()
+                },
+            );
+            // 外周接触をどう読んだかだけを取り出す。場を使ったこと
+            // （`BACKGROUND_FIELD_USED`）は `flat` には出ないので数えない
+            let edge: Vec<String> = result
+                .warnings
+                .iter()
+                .map(|w| w.code.as_str())
+                .filter(|c| matches!(*c, "SUBJECT_TOUCHES_EDGE" | "BBOX_RECOMMENDED"))
+                .map(str::to_string)
+                .collect();
+            (
+                result.stats.foreground_ratio,
+                edge,
+                result.background_model.as_str(),
+            )
+        };
+        let (flat_fg, flat_edge, _) = run(BackgroundModel::Flat);
+        let (auto_fg, auto_edge, model) = run(BackgroundModel::Auto);
+
+        // **前提：既定はこの 6 枚で場を選ぶ。** `flat` へ落ちていたら
+        // 「壊れていない」のは当たり前で、このテストは何も守っていない
+        assert_eq!(model, "field", "{name}: 既定で場が効いていない");
+        assert!(
+            (auto_fg - flat_fg).abs() <= 0.01,
+            "{name}: 場が商品を学んでいる（1 色 {flat_fg:.4} / 既定 {auto_fg:.4}）"
+        );
+        assert_eq!(
+            auto_edge, flat_edge,
+            "{name}: 外周接触の読み方が 1 色と食い違う（1 色 {flat_edge:?} / 既定 {auto_edge:?}）"
+        );
+        // 消えた結果として警告まで静かになる壊れ方を直接塞ぐ
+        assert!(
+            !auto_edge.is_empty(),
+            "{name}: どの枚も外周に何かが接しているはずなのに黙っている"
+        );
+    }
+}
+
+/// **`--bbox` の外に別の物体があっても、場はそれを学ばない。**
+///
+/// 矩形の外は無条件に背景として扱うので、そこに写り込んだものは場の材料に
+/// 入る。門が無ければ場はその色を背景として持ち、**矩形の中の商品が同じ色なら
+/// まるごと背景と判定される**。門はどの源にも同じように掛かるので、
+/// 帯の外でも 1 色の中央値から遠い画素は材料にならない。
+#[test]
+fn something_outside_the_bbox_does_not_poison_the_field() {
+    let product = Rgba([150, 150, 150, 255]);
+    let mut image = RgbaImage::from_pixel(600, 600, Rgba([250, 250, 248, 255]));
+    // 外周 20px は白のまま（背景色の推定はここから）。その内側から矩形の
+    // 手前までを、商品と**同じ色**の別の物体が占める
+    for y in 20..580 {
+        for x in 20..580 {
+            image.put_pixel(x, y, product);
+        }
+    }
+    let bbox = (200u32, 150u32, 450u32, 450u32);
+    for y in 150..=450 {
+        for x in 200..=450 {
+            image.put_pixel(x, y, Rgba([250, 250, 248, 255]));
+        }
+    }
+    // 矩形の中の商品。正解は 210x240 / 600x600 = 0.14
+    for y in 180..420 {
+        for x in 220..430 {
+            image.put_pixel(x, y, product);
+        }
+    }
+    // **場を明示する。** 外周の 2px は真っ白なので `auto` はここで 1 色を
+    // 選ぶ（`uniformity` 1.0）。問うているのは「場を作るとき、矩形の外から
+    // 来た画素にも門が掛かるか」なので、場を必ず作らせる
+    let result = cutout(
+        &image,
+        &CutoutOptions {
+            bbox: Some(bbox),
+            background_model: BackgroundModel::Field,
+            ..Default::default()
+        },
+    );
+    assert!(
+        (result.stats.foreground_ratio - 0.14).abs() < 0.01,
+        "矩形の外の物体を背景として学んでいる: {:.4}",
+        result.stats.foreground_ratio
+    );
+}
+
+/// **均一な背景では 1 バイトも変わらない。**
+///
+/// 場を入れた回帰の基準そのものがこれである。合成の S シーンは kiri の数値の
+/// 拠りどころなので、ここが 1 バイトでも動けば「何が原因の差か」が分からなく
+/// なる。`auto` が `flat` を選ぶことと、選んだ結果の画素が `--background-model
+/// flat` と完全に一致することを、**同じテストで両方**押さえる——モデルの
+/// 選び方だけを見ていると、`flat` の経路が別物になった日に気づけない。
+#[test]
+fn a_uniform_background_gives_the_very_same_pixels_whichever_model_is_asked_for() {
+    let mut checked = 0;
+    for scene in edge_scenes() {
+        let truth = edge_scene(&scene);
+        let run = |model: BackgroundModel| {
+            cutout(
+                &truth.image,
+                &CutoutOptions {
+                    background_model: model,
+                    ..Default::default()
+                },
+            )
+        };
+        let auto = run(BackgroundModel::Auto);
+        // 均一でないシーン（S13 など）はここでは問わない。場が効くのだから
+        // 1 色と違って当たり前で、違いは別のテストが測っている
+        if auto.background_model.as_str() != "flat" {
+            continue;
+        }
+        let flat = run(BackgroundModel::Flat);
+        assert_eq!(
+            auto.image.as_raw(),
+            flat.image.as_raw(),
+            "{}: 均一な背景で auto と flat の画素が違う",
+            scene.name
+        );
+        assert_eq!(
+            auto.stats.foreground_ratio, flat.stats.foreground_ratio,
+            "{}: 前景比率が違う",
+            scene.name
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 10,
+        "均一なシーンが {checked} 枚しか無い。一覧が入れ替わっている"
+    );
 }

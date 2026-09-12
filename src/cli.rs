@@ -9,7 +9,7 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::cutout::background::DEFAULT_BORDER;
 use crate::cutout::constraints::{MASK_THRESHOLD, TRIMAP_BACKGROUND, TRIMAP_FOREGROUND};
-use crate::cutout::{DEFAULT_EDGE_THRESHOLD, Matting};
+use crate::cutout::{BackgroundModel, DEFAULT_EDGE_THRESHOLD, Matting};
 use crate::image_io::OutputFormat;
 use crate::preview::DEFAULT_PANEL;
 use crate::transform::FitMode;
@@ -68,6 +68,14 @@ pub struct InfoArgs {
     /// 背景色推定に使う外周の幅(px)
     #[arg(long, default_value_t = DEFAULT_BORDER)]
     pub border: u32,
+
+    /// 背景を 1 色で持つか、照明場 B(x, y) として持つか
+    ///
+    /// auto は background.uniformity が下限を切ったときだけ field を使う。flat は常に外周の中央値 1 色で測る。field は常に照明場で測る。
+    ///
+    /// info では「この画像なら cutout がどちらを使うか」を先に答えるために効く。指定したモデルは background.model と、cutout では settings.background_model にも出る。
+    #[arg(long, value_enum, default_value_t = BackgroundModel::Auto)]
+    pub background_model: BackgroundModel,
 
     #[command(flatten)]
     pub color: ColorOpts,
@@ -601,6 +609,16 @@ pub struct CutoutArgs {
     /// 塗り直しは mask.rim_contamination とまったく同じ 2 択で、前景なのに背景寄りの画素を背景へ、背景なのに前景寄りの画素を前景へ移す。切り分けのために切れるようにしてある。
     #[arg(long)]
     pub no_reclassify: bool,
+
+    /// 背景を 1 色で持つか、照明場 B(x, y) として持つか
+    ///
+    /// auto は background.uniformity が下限を切ったときだけ field を使う。均一な背景では 1 色のままで、出力は 1 バイトも変わらない。
+    ///
+    /// flat は常に外周の中央値 1 色で測る。紙や布に照明の勾配が乗った素材では、その勾配を飲むために --tolerance を大きく上げる必要があり、そこまで上げると淡い商品もまるごと飲む。
+    ///
+    /// field は常に照明場で測る。低周波の照明変動は場が吸うので、--tolerance は織り目や圧縮ノイズの振幅だけを受け持てばよくなる。実際に効いたモデルは settings.background_model に出る。
+    #[arg(long, value_enum, default_value_t = BackgroundModel::Auto)]
+    pub background_model: BackgroundModel,
 
     /// 境界帯のアルファを画像の色から推定し直さず、マスクの形から作る旧方式に戻す
     ///

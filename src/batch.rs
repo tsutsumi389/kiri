@@ -56,6 +56,8 @@ pub struct ItemSettings {
     /// 帯の中の二値輪郭に掛けるメディアンの半径(px, 長辺 1000px 換算)
     pub smooth_contour: Option<f64>,
     pub reclassify: Option<bool>,
+    /// 背景のモデル（"auto" / "flat" / "field"）
+    pub background_model: Option<String>,
     /// 埋め込み ICC を sRGB へ変換するか（既定 true）
     pub color_convert: Option<bool>,
     pub edge_threshold: Option<f64>,
@@ -99,6 +101,7 @@ impl ItemSettings {
             matting,
             smooth_contour,
             reclassify,
+            background_model,
             color_convert,
             edge_threshold,
             step_tolerance,
@@ -134,6 +137,7 @@ const SETTING_KEYS: &[&str] = &[
     "matting",
     "smooth_contour",
     "reclassify",
+    "background_model",
     "color_convert",
     "edge_threshold",
     "step_tolerance",

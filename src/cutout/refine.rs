@@ -43,6 +43,7 @@ use std::collections::VecDeque;
 use image::RgbaImage;
 
 use crate::color::lab::{delta_e76, srgb_to_lab};
+use crate::cutout::background::BackgroundField;
 use crate::cutout::constraints::Constraints;
 use crate::cutout::integral::Integral;
 use crate::cutout::mask::Mask;
@@ -258,7 +259,7 @@ fn window_for(radius: u8) -> u32 {
 pub fn refine(
     image: &RgbaImage,
     binary: &Mask,
-    background: [u8; 3],
+    field: &BackgroundField,
     opts: &RefineOptions<'_>,
 ) -> Refined {
     let (w, h) = (image.width(), image.height());
@@ -285,7 +286,7 @@ pub fn refine(
     band_map_into(
         image,
         binary,
-        background,
+        field,
         min_radius,
         max_radius,
         opts.constraints,
@@ -297,7 +298,7 @@ pub fn refine(
         reshape::Reshape {
             image,
             original: binary,
-            background,
+            field,
             opts,
             scale,
             min_radius,
@@ -322,11 +323,13 @@ pub fn refine(
 
     let lut = srgb_lut();
     let guided_matting = opts.matting == Matting::Guided;
+    let background = field.rgb();
     let ctx = Context {
         image,
         binary: shape,
         band: &band,
         sealed: &sealed,
+        field,
         bg_linear: [
             lut[background[0] as usize],
             lut[background[1] as usize],
@@ -447,7 +450,14 @@ struct Context<'a> {
     /// 確定前景に数えると局所前景色 F が背景側へ引きずられ、(b) の 2 択が
     /// 効かなくなる
     sealed: &'a BitPlane,
+    /// 背景の場。確定背景が窓に 1 つも無いときの受け皿を、大域の 1 色ではなく
+    /// **その位置の背景色**から取るために持つ。帯の外側の局所背景として自然で、
+    /// 照明勾配のある素材では 1 色の受け皿がそのまま系統誤差になっていた
+    field: &'a BackgroundField,
     lut: [f32; 256],
+    /// `field` が 1 色のときの線形 RGB。**ここで作った値をそのまま使う**——
+    /// `BackgroundField` に作らせると、`floodfill` と別の変換表を持つ現状で
+    /// 1 ビットの差が出て、1 色モデルの出力バイト列が動く
     bg_linear: [f32; 3],
     separation_sq: f32,
     despill: bool,
@@ -460,6 +470,14 @@ struct Context<'a> {
     /// 帯幅の最大から一度だけ導けば、タイル非依存のまま余白は実際の帯幅ぶん
     /// （既定なら 23px）で済む。
     core_window: u32,
+}
+
+impl Context<'_> {
+    /// その位置の背景色(線形 RGB)。1 色の場では `bg_linear` をそのまま返す。
+    #[inline]
+    fn bg_at(&self, x: u32, y: u32) -> [f32; 3] {
+        self.field.linear_at(x, y).unwrap_or(self.bg_linear)
+    }
 }
 
 /// タイル1枚分の作業領域。タイルをまたいで使い回し、確保を繰り返さない。
@@ -736,7 +754,7 @@ fn estimate_alpha(
             let observed = linear[(y - py0) as usize * pw + (x - px0) as usize];
             let b = confirmed_bg
                 .mean(qx0, qy0, qx1, qy1)
-                .unwrap_or(ctx.bg_linear);
+                .unwrap_or_else(|| ctx.bg_at(x, y));
 
             let f = match confirmed_fg.mean(qx0, qy0, qx1, qy1) {
                 Some(f) => Some(f),
@@ -744,12 +762,14 @@ fn estimate_alpha(
                     if !core_ready {
                         build_core(
                             Padded {
+                                px0,
+                                py0,
                                 pw,
                                 ph,
                                 linear,
                                 is_fg,
                             },
-                            ctx.bg_linear,
+                            ctx,
                             ctx.core_window as usize,
                             CoreBuffers {
                                 take,
@@ -904,6 +924,9 @@ fn feather_at(fallback: &OnceCell<Mask>, ctx: &Context<'_>, x: u32, y: u32) -> u
 
 /// 積分画像を張る領域の中身。
 struct Padded<'a> {
+    /// 領域の左上の画像座標。場を画素ごとに引くのに要る
+    px0: u32,
+    py0: u32,
     pw: usize,
     ph: usize,
     linear: &'a [[f32; 3]],
@@ -937,8 +960,10 @@ struct CoreBuffers<'a> {
 /// 近傍半径 `radius` と順位付けの基準色は、どちらもタイルに依存しない値を
 /// 渡すこと。ここにタイル局所の値を入れると、同じ素材でもタイルの切れ目で
 /// 芯の選ばれ方が変わり、128px ごとにアルファの段差になる。
-fn build_core(region: Padded<'_>, bg_linear: [f32; 3], radius: usize, buf: CoreBuffers<'_>) {
+fn build_core(region: Padded<'_>, ctx: &Context<'_>, radius: usize, buf: CoreBuffers<'_>) {
     let Padded {
+        px0,
+        py0,
         pw,
         ph,
         linear,
@@ -953,24 +978,29 @@ fn build_core(region: Padded<'_>, bg_linear: [f32; 3], radius: usize, buf: CoreB
         core,
     } = buf;
     let cells = pw * ph;
-    // 順位付けの基準は大域の背景色。領域内の確定背景の平均にすると、
-    // グラデーションや照明ムラのある背景でタイルごとに基準がずれ、
-    // 「背景から最も遠い画素」の順位そのものが入れ替わる
-    let reference = bg_linear;
+    // 順位付けの基準は**その位置の背景色**。領域内の確定背景の平均にすると、
+    // タイルごとに基準がずれて「背景から最も遠い画素」の順位そのものが
+    // 入れ替わる。場はタイルに依存しないので、その心配が無いまま
+    // 照明ムラのある背景でも基準が正しい位置に来る（1 色の場では従来どおり
+    // 大域の背景色になる）
 
     distance.clear();
     distance.resize(cells, -1.0);
-    for (i, slot) in distance.iter_mut().enumerate() {
-        if !is_fg[i] {
-            continue;
+    for y in 0..ph {
+        for x in 0..pw {
+            let i = y * pw + x;
+            if !is_fg[i] {
+                continue;
+            }
+            let c = linear[i];
+            let reference = ctx.bg_at(px0 + x as u32, py0 + y as u32);
+            let d = [
+                c[0] - reference[0],
+                c[1] - reference[1],
+                c[2] - reference[2],
+            ];
+            distance[i] = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
         }
-        let c = linear[i];
-        let d = [
-            c[0] - reference[0],
-            c[1] - reference[1],
-            c[2] - reference[2],
-        ];
-        *slot = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
     }
 
     // 近傍最大を横・縦の2パスで求める。単調デックなので窓の大きさに依らない
@@ -1076,7 +1106,13 @@ pub(crate) fn band_map(
 ) -> Vec<u8> {
     let mut band = vec![0u8; (binary.width() as usize) * (binary.height() as usize)];
     band_map_into(
-        image, binary, background, min_radius, max_radius, None, &mut band,
+        image,
+        binary,
+        &BackgroundField::flat(background),
+        min_radius,
+        max_radius,
+        None,
+        &mut band,
     );
     band
 }
@@ -1090,7 +1126,7 @@ pub(crate) fn band_map(
 pub(crate) fn band_map_into(
     image: &RgbaImage,
     binary: &Mask,
-    background: [u8; 3],
+    field: &BackgroundField,
     min_radius: u32,
     max_radius: u32,
     constraints: Option<&Constraints>,
@@ -1107,9 +1143,7 @@ pub(crate) fn band_map_into(
                 continue;
             }
             let width = match binary.outward_normal(x, y) {
-                Some(normal) => {
-                    transition_width(image, binary, background, x, y, normal, min_r, max_r)
-                }
+                Some(normal) => transition_width(image, binary, field, x, y, normal, min_r, max_r),
                 // 幅 1px の構造では背景が両側にあって法線が打ち消し合う。
                 // 遷移幅は測れないが、帯を張らないとその画素だけ二値のまま
                 // 取り残され、色が背景寄りでも不透明で残ってしまう
@@ -1181,7 +1215,7 @@ fn paint_disc(band: &mut [u8], w: u32, h: u32, cx: u32, cy: u32, width: u32) {
 fn transition_width(
     image: &RgbaImage,
     binary: &Mask,
-    background: [u8; 3],
+    field: &BackgroundField,
     x: u32,
     y: u32,
     normal: [f32; 2],
@@ -1202,8 +1236,9 @@ fn transition_width(
         [p[0], p[1], p[2]]
     };
 
-    // 外側: 背景の参照色を最外から拾い、そこへ収束する距離を測る
-    let mut outer_ref = background;
+    // 外側: 背景の参照色を最外から拾い、そこへ収束する距離を測る。
+    // 1 つも拾えなかったときの受け皿は**その位置の背景色**にする
+    let mut outer_ref = field.rgb_at(x, y);
     for t in (1..=max_r).rev() {
         if let Some(q) = at(t as f32) {
             if !binary.is_foreground(q.0, q.1) {
@@ -1258,6 +1293,12 @@ mod tests {
     use super::*;
     use image::Rgba;
 
+    /// 1 色の場。既存の試験は「背景 1 色」の性質を測っているので、場としては
+    /// 全画素で同じ値を返すものを渡す
+    fn flat(rgb: [u8; 3]) -> BackgroundField {
+        BackgroundField::flat(rgb)
+    }
+
     /// 光の量で混色する。撮像素子が画素の面積で光を積分した結果を作るので、
     /// ガンマの掛かった sRGB 値のまま線形補間してはいけない。
     fn mix(product: [u8; 3], background: [u8; 3], coverage: f32) -> [u8; 4] {
@@ -1298,7 +1339,12 @@ mod tests {
     #[test]
     fn a_half_covered_pixel_gets_about_half_alpha() {
         let (img, mask) = ramp([40, 40, 45], [250, 250, 249], 0.5);
-        let out = refine(&img, &mask, [250, 250, 249], &RefineOptions::default());
+        let out = refine(
+            &img,
+            &mask,
+            &flat([250, 250, 249]),
+            &RefineOptions::default(),
+        );
         let a = out.mask.get(20, 6);
         assert!(
             (100..=155).contains(&a),
@@ -1311,7 +1357,12 @@ mod tests {
         // 堤防が前景に含めてしまった、色が完全に背景の縁。ここが不透明で残ると
         // 白以外の下地でハローになる
         let (img, mask) = ramp([40, 40, 45], [250, 250, 249], 0.0);
-        let out = refine(&img, &mask, [250, 250, 249], &RefineOptions::default());
+        let out = refine(
+            &img,
+            &mask,
+            &flat([250, 250, 249]),
+            &RefineOptions::default(),
+        );
         assert_eq!(
             out.mask.get(20, 6),
             0,
@@ -1322,7 +1373,12 @@ mod tests {
     #[test]
     fn the_interior_and_the_exterior_are_left_alone() {
         let (img, mask) = ramp([40, 40, 45], [250, 250, 249], 0.5);
-        let out = refine(&img, &mask, [250, 250, 249], &RefineOptions::default());
+        let out = refine(
+            &img,
+            &mask,
+            &flat([250, 250, 249]),
+            &RefineOptions::default(),
+        );
         assert_eq!(out.mask.get(2, 6), 255, "内部が薄くなっている");
         assert_eq!(out.mask.get(38, 6), 0, "外部に色が漏れている");
     }
@@ -1330,7 +1386,12 @@ mod tests {
     #[test]
     fn the_recovered_colour_drops_the_background_tint() {
         let (img, mask) = ramp([40, 40, 45], [250, 250, 249], 0.5);
-        let out = refine(&img, &mask, [250, 250, 249], &RefineOptions::default());
+        let out = refine(
+            &img,
+            &mask,
+            &flat([250, 250, 249]),
+            &RefineOptions::default(),
+        );
         let p = out.image.get_pixel(20, 6).0;
         assert!(
             p[0] < 120,
@@ -1350,7 +1411,7 @@ mod tests {
         let background = [178u8, 174, 167];
         for coverage in [0.2, 0.35, 0.5, 0.75] {
             let (img, mask) = ramp(product, background, coverage);
-            let out = refine(&img, &mask, background, &RefineOptions::default());
+            let out = refine(&img, &mask, &flat(background), &RefineOptions::default());
             let p = out.image.get_pixel(20, 6).0;
             assert!(
                 p[0] >= p[1] && p[1] >= p[2],
@@ -1381,7 +1442,7 @@ mod tests {
                 ]),
             );
         }
-        let out = refine(&img, &mask, background, &RefineOptions::default());
+        let out = refine(&img, &mask, &flat(background), &RefineOptions::default());
         let p = out.image.get_pixel(20, 6).0;
         let chroma = p[..3].iter().max().unwrap() - p[..3].iter().min().unwrap();
         assert!(
@@ -1403,7 +1464,7 @@ mod tests {
             despill: false,
             ..Default::default()
         };
-        let out = refine(&img, &mask, [250, 250, 249], &opts);
+        let out = refine(&img, &mask, &flat([250, 250, 249]), &opts);
         assert_eq!(
             out.image.get_pixel(20, 6).0,
             img.get_pixel(20, 6).0,
@@ -1416,7 +1477,12 @@ mod tests {
         // F と B が近すぎて射影が雑音を拾うだけの場合。従来の幾何的フェザーの
         // 値がそのまま出ることを確かめる
         let (img, mask) = ramp([249, 249, 248], [250, 250, 249], 0.5);
-        let out = refine(&img, &mask, [250, 250, 249], &RefineOptions::default());
+        let out = refine(
+            &img,
+            &mask,
+            &flat([250, 250, 249]),
+            &RefineOptions::default(),
+        );
         let expected = feather::feather(&mask, 1);
         assert_eq!(out.mask.get(20, 6), expected.get(20, 6));
     }
@@ -1425,7 +1491,12 @@ mod tests {
     fn an_empty_mask_is_untouched() {
         let img = RgbaImage::from_pixel(8, 8, Rgba([250, 250, 249, 255]));
         let mask = Mask::new(8, 8, 0);
-        let out = refine(&img, &mask, [250, 250, 249], &RefineOptions::default());
+        let out = refine(
+            &img,
+            &mask,
+            &flat([250, 250, 249]),
+            &RefineOptions::default(),
+        );
         assert_eq!(out.mask, mask);
         assert_eq!(out.image.as_raw(), img.as_raw());
     }
@@ -1435,7 +1506,12 @@ mod tests {
         // 見切れて画像いっぱいに広がった商品。境界が無いので帯も立たない
         let img = RgbaImage::from_pixel(8, 8, Rgba([40, 40, 45, 255]));
         let mask = Mask::new(8, 8, 255);
-        let out = refine(&img, &mask, [250, 250, 249], &RefineOptions::default());
+        let out = refine(
+            &img,
+            &mask,
+            &flat([250, 250, 249]),
+            &RefineOptions::default(),
+        );
         assert_eq!(out.mask, mask);
     }
 
@@ -1443,7 +1519,7 @@ mod tests {
     fn mismatched_dimensions_are_refused_rather_than_panicking() {
         let img = RgbaImage::from_pixel(8, 8, Rgba([0, 0, 0, 255]));
         let mask = Mask::new(10, 10, 255);
-        let out = refine(&img, &mask, [0; 3], &RefineOptions::default());
+        let out = refine(&img, &mask, &flat([0; 3]), &RefineOptions::default());
         assert_eq!(out.mask, mask);
     }
 
@@ -1493,7 +1569,12 @@ mod tests {
                 mask.set(x, y, 255);
             }
         }
-        let out = refine(&img, &mask, [250, 250, 249], &RefineOptions::default());
+        let out = refine(
+            &img,
+            &mask,
+            &flat([250, 250, 249]),
+            &RefineOptions::default(),
+        );
         let reference = out.mask.get(5, 10);
         for x in 0..w {
             assert_eq!(
@@ -1544,7 +1625,7 @@ mod tests {
                     }
                 }
             }
-            refine(&img, &mask, bg, &RefineOptions::default()).mask
+            refine(&img, &mask, &flat(bg), &RefineOptions::default()).mask
         };
         let base = build(0);
         let shifted = build(SHIFT);
@@ -1621,7 +1702,7 @@ mod tests {
         for y in 8..20 {
             img.put_pixel(16, y, Rgba([bg[0], bg[1], bg[2], 255]));
         }
-        let sealed = refine(&img, &mask, bg, &RefineOptions::default());
+        let sealed = refine(&img, &mask, &flat(bg), &RefineOptions::default());
         assert!(
             sealed.mask.get(16, 14) >= 128,
             "--seal が塞いだスリットを色の解き直しが透明に戻している: {}",
@@ -1630,7 +1711,7 @@ mod tests {
         let opened = refine(
             &img,
             &mask,
-            bg,
+            &flat(bg),
             &RefineOptions {
                 seal: 0,
                 ..Default::default()
@@ -1663,8 +1744,13 @@ mod tests {
                 mask.set(x, y, u8::MAX);
             }
         }
-        let staged = refine(&img, &mask, bg, &RefineOptions::default());
-        let plain = refine(&img, &mask, bg, &RefineOptions::default().projection_only());
+        let staged = refine(&img, &mask, &flat(bg), &RefineOptions::default());
+        let plain = refine(
+            &img,
+            &mask,
+            &flat(bg),
+            &RefineOptions::default().projection_only(),
+        );
         assert_eq!(
             plain.band_min_radius, DEFAULT_MIN_RADIUS,
             "3 つ切った経路で帯幅の下限が動いている"
@@ -1691,7 +1777,7 @@ mod tests {
                 mask.set(x, y, 255);
             }
         }
-        let out = refine(&img, &mask, bg, &RefineOptions::default());
+        let out = refine(&img, &mask, &flat(bg), &RefineOptions::default());
         assert_eq!(
             out.mask.get(29, 20),
             255,

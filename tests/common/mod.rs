@@ -539,6 +539,19 @@ pub struct RealScene {
     pub shading: (f32, f32),
     pub strap: Option<u32>,
     pub jpeg: Option<u8>,
+    /// 背景をこの σ(px) でぼかしてから使う。ぼかした後に振幅 1.5 の
+    /// センサーノイズを乗せ直す。
+    ///
+    /// **「きれいなスタジオ背景の実写」を手持ちの素材から作るための細工である。**
+    /// 誤警報側の較正がすべて合成の S シーンに依っていると、「実写の照明と
+    /// ノイズを持ちながら欠陥が無い」点が 1 つも無いまま、しきい値を実写に
+    /// 寄せることになる。繊維をぼかしで消せば、照明勾配と実写のノイズ床だけが
+    /// 残る——これは紙やアクリルのスタジオ背景そのものの性質である。
+    ///
+    /// ノイズを乗せ直すのは、ぼかしが画素間のばらつきを消してしまうためである。
+    /// σ が 0 の背景は実写ではありえないし、`rim_contamination` の σ0 が
+    /// まさにその床を当てにしている
+    pub blur: Option<f32>,
     /// `assisted`（kiri 自身の hint に従って到達する設定）で使う tolerance
     pub assisted_tolerance: f64,
 }
@@ -557,6 +570,7 @@ impl Default for RealScene {
             shading: (1.0, 1.0),
             strap: None,
             jpeg: Some(90),
+            blur: None,
             assisted_tolerance: 60.0,
         }
     }
@@ -613,6 +627,19 @@ pub fn real_scenes() -> Vec<RealScene> {
             softness: 8.0,
             ..Default::default()
         },
+        // **クリーン側の対照である。** 他の R シーンはすべて欠陥側にあり、
+        // 誤警報の較正が合成の S シーンだけに依っていた。繊維をぼかしで消すと、
+        // 照明勾配と実写のノイズ床を持ったまま欠陥だけが無い背景になる
+        // ——紙やアクリルのスタジオ背景がまさにこれである。
+        //
+        // **既定値でも assisted でも両方の警告が出ないこと**をテストで固定する。
+        // ここが落ちれば、しきい値は「実写である」ことに反応していることになる
+        RealScene {
+            name: "R7 照明勾配のある紙 + 黒商品",
+            background: "fabric_b.jpg",
+            blur: Some(6.0),
+            ..Default::default()
+        },
     ]
 }
 
@@ -629,7 +656,10 @@ pub fn real_scenes() -> Vec<RealScene> {
 pub fn real_scene(scene: &RealScene) -> EdgeTruth {
     let (w, h) = (scene.width, scene.height);
     let fh = h as f32;
-    let backdrop = load_background(scene.background, w, h);
+    let mut backdrop = load_background(scene.background, w, h);
+    if let Some(sigma) = scene.blur {
+        backdrop = blurred_with_noise(&backdrop, sigma);
+    }
     let shape = ProductShape::new(w, h, scene.strap, scene.softness);
     let n = (w as usize) * (h as usize);
 
@@ -754,6 +784,68 @@ fn load_background(name: &str, width: u32, height: u32) -> RgbaImage {
     );
     let (ox, oy) = ((img.width() - width) / 2, (img.height() - height) / 2);
     image::imageops::crop_imm(&img, ox, oy, width, height).to_image()
+}
+
+/// 背景を σ px 相当でぼかし、振幅 1.5 のセンサーノイズを乗せ直す。
+///
+/// **繊維だけを消して、照明勾配とノイズ床を残すための処理である。** 箱ぼかしを
+/// 3 回重ねるとガウスによく近づき、分散は `r² + r` になる（`diagnostics.rs` の
+/// `smoothing_radius` と同じ式）。σ = 6 なら半径 5.52 で、整数へ丸めて 6 を使う
+/// （実効 σ = √42 ≒ 6.48）。
+///
+/// ノイズは `Rng` の固定シードで乗せるので、同じ σ からは必ず同じ背景が出る。
+fn blurred_with_noise(image: &RgbaImage, sigma: f32) -> RgbaImage {
+    let (w, h) = (image.width() as usize, image.height() as usize);
+    let radius = (((1.0 + 4.0 * sigma * sigma).sqrt() - 1.0) / 2.0)
+        .round()
+        .max(1.0) as usize;
+    // チャンネルごとに f32 の面へ移してから行・列を舐める。u8 のまま 3 回
+    // 重ねると、丸めが 3 回入って勾配が段になる
+    let mut planes: Vec<Vec<f32>> = (0..3)
+        .map(|k| image.pixels().map(|p| f32::from(p.0[k])).collect())
+        .collect();
+    for plane in &mut planes {
+        for _ in 0..3 {
+            box_blur_rows(plane, w, h, radius);
+            transpose(plane, w, h);
+            box_blur_rows(plane, h, w, radius);
+            transpose(plane, h, w);
+        }
+    }
+
+    let mut rng = Rng::new();
+    let mut out = RgbaImage::new(image.width(), image.height());
+    for (i, pixel) in out.pixels_mut().enumerate() {
+        let nz = rng.jitter(1.5);
+        let v = |k: usize| (planes[k][i] + nz).round().clamp(0.0, 255.0) as u8;
+        *pixel = Rgba([v(0), v(1), v(2), 255]);
+    }
+    out
+}
+
+/// 行方向の箱ぼかし。窓は端ではみ出した分を数えない（`diagnostics.rs` と同じ規約）。
+fn box_blur_rows(plane: &mut [f32], w: usize, h: usize, radius: usize) {
+    let mut line = vec![0f32; w];
+    for y in 0..h {
+        line.copy_from_slice(&plane[y * w..(y + 1) * w]);
+        for x in 0..w {
+            let x0 = x.saturating_sub(radius);
+            let x1 = (x + radius).min(w - 1);
+            let sum: f32 = line[x0..=x1].iter().sum();
+            plane[y * w + x] = sum / (x1 - x0 + 1) as f32;
+        }
+    }
+}
+
+/// `w × h` の面を転置して `h × w` にする。列方向のぼかしを行方向で済ませるため。
+fn transpose(plane: &mut [f32], w: usize, h: usize) {
+    let mut out = vec![0f32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            out[x * h + y] = plane[y * w + x];
+        }
+    }
+    plane.copy_from_slice(&out);
 }
 
 fn srgb_to_linear(c: f32) -> f32 {
@@ -967,13 +1059,18 @@ pub struct EdgeMetrics {
     /// 彩度の大きさしか見ないので、緑寄りとマゼンタ寄りは区別しない。
     /// 「商品には無い色が輪郭にだけ乗った」ことを捉えるための粗い網である
     pub cast: f32,
-    /// 予測した二値輪郭の各画素が、**真の輪郭**からどれだけ離れているかの中央値
+    /// 予測した二値輪郭の各画素が、**真の輪郭**からどれだけ離れているかの平均
     /// (px, 長辺 1000px 換算)。
     ///
     /// **`mask.contour_roughness` の正解版である。** あちらは正解を持たないので
     /// 「自分自身を滑らかにしたもの」を参照にするが、こちらは解析的な距離場
     /// （`EdgeTruth::distance`）を直接引く。両者が相関しなければ、
-    /// `contour_roughness` は欠陥ではない何かを測っていることになる
+    /// `contour_roughness` は欠陥ではない何かを測っていることになる。
+    ///
+    /// **統計量は診断値とそろえる。** `contour_roughness` を中央値から平均へ
+    /// 変えたとき、ここだけ中央値のままにすると「輪郭の 1 割が大きく外れている」
+    /// 状態が正解側では見えず、診断側にだけ出る。実測でも順位相関は
+    /// ρ=0.72（中央値のまま）から ρ=0.83（平均にそろえた）へ上がった
     pub contour_error: f32,
     /// 境界から帯幅以内の予測前景画素のうち、**真の被覆率が 0** のものの割合。
     ///
@@ -1134,11 +1231,11 @@ pub fn measure_edges_with(
     let contour = kiri::cutout::diagnostics::contour_pixels(mask, bbox);
     let (mut contour_error, mut rim_truth) = (f32::NAN, f32::NAN);
     if !contour.is_empty() {
-        let mut errors: Vec<f32> = contour
+        let errors: Vec<f32> = contour
             .iter()
             .map(|&(x, y)| truth.distance[truth.index(x, y)].abs())
             .collect();
-        contour_error = percentile(&mut errors, 0.5) / scale;
+        contour_error = errors.iter().sum::<f32>() / errors.len() as f32 / scale;
 
         let band = kiri::cutout::diagnostics::rim_band(f64::from(scale)) as f32;
         let distance = kiri::cutout::diagnostics::contour_distance_px(w, h, &contour);

@@ -130,10 +130,10 @@ fn the_new_diagnostics_see_the_defect_that_the_old_ones_missed() {
 
 /// 輪郭の粗さが実写背景でだけ跳ねること。
 ///
-/// **`contour_roughness` は R1 の assisted では 0 になる。** bbox と tolerance で
-/// 救った後の輪郭は 1200px の合成では滑らかで、蛇行が出るのは既定値のまま
-/// 布が前景として残っている状態のほうである。ここを R1 assisted で固定すると
-/// 「0 ≥ 0 × 3」という無意味な合格になるので、既定値の側で見る。
+/// **既定値の側で見る。** bbox と tolerance で救った後（assisted）でも実写背景の
+/// 輪郭は蛇行しているが（R1 assisted 1.00）、蛇行が桁で出るのは既定値のまま
+/// 布が前景として残っている状態のほう（R1 defaults 1.80、R4 defaults 14.00）で、
+/// 「合成のきれいなシーンとの比」で語るならそちらが素直である。
 #[test]
 fn the_contour_roughness_rises_only_on_a_real_background() {
     let points = bench();
@@ -190,6 +190,51 @@ fn a_clean_scene_never_raises_either_warning() {
     }
 }
 
+/// 実写の照明とノイズを持ちながら欠陥の無いシーンで、どちらの警告も出ないこと。
+///
+/// **誤警報側の較正が合成の S シーンだけに依っていると、しきい値が
+/// 「実写であること」に反応していても気づけない。** R7 は手持ちの不織布を
+/// ぼかして繊維だけを消したもので、照明勾配と実写のノイズ床はそのまま残る。
+/// bbox と tolerance を与えた `assisted` では正解側も `contour_error` 0.41 /
+/// `rim_truth` 0.000 と完全に解けており、ここで警告が出れば**それは
+/// 誤警報以外の何物でもない**。
+///
+/// **`defaults` は対象にしない。** 手持ちの実写背景はどれも照明の起伏が
+/// 大きく（R7 の外周 ΔE は p90 16.7 / max 33.2）、既定の tolerance 12 は
+/// 推定背景色からの絶対的な色差の上限なので、背景の隅まで届かない。実測でも
+/// 前景比率 0.469（正解 0.375）、`contour_error` 65.1、`rim_truth` 0.655 で、
+/// **切り抜きそのものが失敗している**。そこで出る警告は誤警報ではなく正しい。
+/// ぼかしを σ 24 まで強めても、低周波の照明むらは残るので結論は変わらなかった。
+#[test]
+fn a_clean_real_lit_scene_raises_neither_warning() {
+    let points = bench();
+    let p = point(&points, "R7 照明勾配のある紙 + 黒商品 / assisted");
+    let rough = p.diagnostics.contour_roughness.expect("輪郭がある");
+    let rim = p.diagnostics.rim_contamination.expect("帯がある");
+    // 正解側が「欠陥が無い」と言っていることを先に確かめる。ここが崩れたら
+    // 警告が出ないことを固定しても意味が無い
+    assert!(
+        p.metrics.contour_error < 1.0 && p.metrics.rim_truth < 0.01,
+        "R7 assisted が clean な点ではなくなっている: 輪郭誤差 {:.2} / rim 正解 {:.3}",
+        p.metrics.contour_error,
+        p.metrics.rim_truth
+    );
+    assert!(
+        rough <= CONTOUR_ROUGH_WARN / 2.0,
+        "実写の照明で粗さがしきい値に近い: {rough:.3} (警告 {CONTOUR_ROUGH_WARN})"
+    );
+    assert!(
+        rim <= RIM_CONTAMINATION_WARN / 2.0,
+        "実写の照明で縁の汚染がしきい値に近い: {rim:.4} (警告 {RIM_CONTAMINATION_WARN})"
+    );
+    assert!(
+        !p.warnings.contains(&"CONTOUR_ROUGH".to_string())
+            && !p.warnings.contains(&"RIM_CONTAMINATED".to_string()),
+        "clean な実写照明のシーンで警告が出た: {:?}",
+        p.warnings
+    );
+}
+
 /// 幅 3px のストラップを「粗い輪郭」と言わないこと。
 ///
 /// 平滑化参照は σ = 2 × scale px でぼかすので、**3px の細部は参照から消える**。
@@ -221,36 +266,7 @@ fn a_three_pixel_strap_is_not_called_a_rough_contour() {
 #[test]
 fn the_diagnostics_track_the_truth() {
     let points = bench();
-    let pairs = [
-        (
-            "contour_roughness",
-            points
-                .iter()
-                .filter_map(|p| {
-                    let d = p.diagnostics.contour_roughness?;
-                    p.metrics
-                        .contour_error
-                        .is_finite()
-                        .then_some((d, f64::from(p.metrics.contour_error)))
-                })
-                .collect::<Vec<_>>(),
-        ),
-        (
-            "rim_contamination",
-            points
-                .iter()
-                .filter_map(|p| {
-                    let d = p.diagnostics.rim_contamination?;
-                    p.metrics
-                        .rim_truth
-                        .is_finite()
-                        .then_some((d, f64::from(p.metrics.rim_truth)))
-                })
-                .collect::<Vec<_>>(),
-        ),
-    ];
-
-    for (name, samples) in pairs {
+    for (name, samples) in correlated(&points) {
         assert!(
             samples.len() >= 20,
             "{name}: 標本が足りない: {}",
@@ -322,6 +338,41 @@ fn the_diagnostics_are_a_small_part_of_the_cutout() {
         share <= 0.25,
         "診断が切り抜き全体を圧迫している: {diagnose:.1} ms / {whole:.1} ms (比 {share:.2})"
     );
+}
+
+/// 診断値と、それに対応する正解側の指標の対。None と NaN は落とす。
+///
+/// **判定するテストと表が同じ関数を呼ぶ。** 別々に組み立てると、表に出ている
+/// ρ と `the_diagnostics_track_the_truth` が見ている ρ が静かに離れる。
+fn correlated(points: &[Point]) -> Vec<(&'static str, Vec<(f64, f64)>)> {
+    vec![
+        (
+            "contour_roughness",
+            points
+                .iter()
+                .filter_map(|p| {
+                    let d = p.diagnostics.contour_roughness?;
+                    p.metrics
+                        .contour_error
+                        .is_finite()
+                        .then_some((d, f64::from(p.metrics.contour_error)))
+                })
+                .collect(),
+        ),
+        (
+            "rim_contamination",
+            points
+                .iter()
+                .filter_map(|p| {
+                    let d = p.diagnostics.rim_contamination?;
+                    p.metrics
+                        .rim_truth
+                        .is_finite()
+                        .then_some((d, f64::from(p.metrics.rim_truth)))
+                })
+                .collect(),
+        ),
+    ]
 }
 
 /// 順位相関（Spearman）。同順位は平均順位で扱う。
@@ -400,6 +451,16 @@ fn print_the_calibration_table() {
     println!(
         "\nしきい値: CONTOUR_ROUGH_WARN={CONTOUR_ROUGH_WARN} RIM_CONTAMINATION_WARN={RIM_CONTAMINATION_WARN}"
     );
+    // **相関も表の一部である。** しきい値を動かすときに窓だけを見て、
+    // 「そもそも正解と同じ向きに動いているか」を見落とさないために並べて出す
+    let points = bench();
+    for (name, samples) in correlated(&points) {
+        println!(
+            "Spearman {name} vs 正解: ρ={:.3} ({} 点)",
+            spearman(&samples),
+            samples.len()
+        );
+    }
 }
 
 /// 手持ちの正解つき実写を回す入口。`KIRI_BENCH_DIR` が指す場所を読む。

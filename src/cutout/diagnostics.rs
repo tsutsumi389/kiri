@@ -655,6 +655,9 @@ fn around(contour: &[(u32, u32)], w: u32, h: u32, margin: u32) -> (u32, u32, u32
 /// 1 本なら 2.5MB で済む。
 #[derive(Debug, Clone, Copy, Default)]
 struct Sums {
+    /// 窓いっぱいまで足した合計。1 画素あたり高々 `RIM_LINEAR_ONE` で、窓は
+    /// (17 × scale)² px 程度にしかならないので、u32 が尽きるのは長辺 80 万 px
+    /// （RGBA だけで 2.5TB）を超えてからになる
     rgb: [u32; 3],
     /// Σ(r² + g² + b²)。窓いっぱいまで足すと 20MP で 7×10⁸ に達するので u64
     squares: u64,

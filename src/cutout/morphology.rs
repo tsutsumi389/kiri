@@ -244,6 +244,16 @@ impl BitPlane {
         (self.words[index / 64] >> (index % 64)) & 1 == 1
     }
 
+    /// 空の面には何も入っていない、として問う。
+    ///
+    /// 印が要らない経路（`--matting projection` など）に 24.5MP で 3MB を
+    /// 確保させないための窓口である。`get` と分けてあるのは、**空かどうかを
+    /// 気にしない呼び出し側が黙って添字を外す**のを防ぐため。
+    #[inline]
+    pub fn contains(&self, index: usize) -> bool {
+        !self.words.is_empty() && self.get(index)
+    }
+
     #[inline]
     pub fn insert(&mut self, index: usize) {
         self.words[index / 64] |= 1u64 << (index % 64);

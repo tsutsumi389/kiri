@@ -293,10 +293,20 @@ pub fn refine(
     // (a)〜(c)。二値マスクを書き換えるので、アルファを載せる前に済ませる
     let mut shape = binary.clone();
     let mut band = band_map(image, &shape, background, min_radius, opts.max_radius);
+    // `--seal` が塞いだ隙間。帯からも参照色からも外す（`close_new_gaps`）
+    let mut sealed = BitPlane::default();
     reshape(
-        image, &mut shape, binary, &mut band, background, opts, scale, min_radius,
+        image,
+        &mut shape,
+        binary,
+        &mut band,
+        &mut sealed,
+        background,
+        opts,
+        scale,
+        min_radius,
     );
-    let band = band;
+    let (band, sealed) = (band, sealed);
 
     let mut mask = shape.clone();
     // 帯幅の最大は代役前景の近傍半径を決めるのに要る。0 なら帯そのものが無い
@@ -315,6 +325,7 @@ pub fn refine(
         image,
         binary: &shape,
         band: &band,
+        sealed: &sealed,
         bg_linear: [
             lut[background[0] as usize],
             lut[background[1] as usize],
@@ -435,6 +446,7 @@ fn reshape(
     shape: &mut Mask,
     original: &Mask,
     band: &mut [u8],
+    sealed: &mut BitPlane,
     background: [u8; 3],
     opts: &RefineOptions,
     scale: f64,
@@ -452,16 +464,18 @@ fn reshape(
     let (w, h) = (shape.width(), shape.height());
     let window = (local_colour::RIM_WINDOW * scale).ceil() as u32;
     let stride = w as usize;
+    *sealed = BitPlane::new(stride * (h as usize));
     for _ in 0..RESHAPE_PASSES {
         let Some(bounds) = band_bounds(band, w, h) else {
-            return;
+            break;
         };
         // 局所色の格子は 24.5MP で 38MB になる。**隙間の閉じ直しへ入る前に
         // 手放す**——両方を同時に生かすと、削ったはずのピークがそこで戻る
         let mut changed = 0usize;
         {
             let grid = local_colour::build(image, grow(bounds, window, w, h), scale, |x, y| {
-                if band[(y as usize) * stride + (x as usize)] != 0 {
+                let at = (y as usize) * stride + (x as usize);
+                if band[at] != 0 || sealed.get(at) {
                     Role::Skip
                 } else if shape.is_foreground(x, y) {
                     Role::Foreground
@@ -478,13 +492,19 @@ fn reshape(
             }
         }
         if changed == 0 {
-            return;
+            break;
         }
         // 戻り値（塞いだ画素数）は捨てる。ここで数えたいのは「色が動かした画素」
         // であって、連結性が戻した画素ではない
-        let _ = close_new_gaps(shape, original, band, bounds, opts.seal);
+        let _ = close_new_gaps(shape, original, band, sealed, bounds, opts.seal);
         band_map_into(image, shape, background, min_radius, opts.max_radius, band);
     }
+    // 塞いだ隙間を帯から外す。**パスの途中では外さない**——途中で外すとその
+    // 画素が次のパスの局所色から消え、塗り直しの答えが連鎖して変わる
+    // （実写 R1 で輪郭誤差 5.93 → 7.97、rim 正解 0.237 → 0.276）。ここで
+    // やりたいのは「決まった答えを色に覆させない」ことだけで、途中の判断を
+    // 変えることではない
+    sealed.for_each_set(|i| band[i] = 0);
 }
 
 /// 帯画素の外接矩形。帯が 1 画素も無ければ None。
@@ -722,10 +742,20 @@ fn smooth_in_band(
 /// 戻すのは**元の二値マスクで前景だった画素だけ**にする。もともと背景だった
 /// 画素まで戻すと、商品に囲まれた確定背景（`--bg-polygon` で中央を指した
 /// 指示）を境界処理が黙って埋めてしまう。
+///
+/// # 戻した画素は帯から外す
+///
+/// **戻すだけでは約束は守られない。** 戻した画素はまだ帯の中にいるので、
+/// 続く射影アルファが同じ色を見て「純粋な背景」と答え、アルファ 0 で塗り潰す。
+/// 利用者から見れば `--seal` はやはり効いていない。帯から外せば (b)(c)(d)(e)
+/// のどれも触らず、二値のまま不透明で残る——`--seal` は「ここは色を問う前に
+/// 前景と決めた」という宣言なのだから、色に決め直させるほうが筋違いである。
+/// 外す印は `sealed` に積み、`reshape` が**全パスを終えてから**帯へ反映する。
 fn close_new_gaps(
     shape: &mut Mask,
     original: &Mask,
     band: &[u8],
+    sealed: &mut BitPlane,
     bounds: (u32, u32, u32, u32),
     seal: u32,
 ) -> usize {
@@ -748,7 +778,15 @@ fn close_new_gaps(
     // 収縮で残った芯と、「帯の外の背景」「画像の外周の背景」を信用する。帯の外の
     // 背景はフィルが外周から到達した画素なので、隙間を通って入ってきたもので
     // はありえない（`floodfill::seal_narrow_gaps` と同じ扱い）
-    let mut trusted = morphology::separable(pw, ph, &background, seal, false);
+    let eroded = morphology::separable(pw, ph, &background, seal, false);
+    let outside = |x: u32, y: u32| {
+        band[(y as usize) * stride + (x as usize)] == 0
+            || x == 0
+            || y == 0
+            || x + 1 == w
+            || y + 1 == h
+    };
+    let trusted = |i: usize, x: u32, y: u32| eroded.get(i) || (background.get(i) && outside(x, y));
 
     // **芯の上だけを辿る。** 背景の上を辿ると、細い通路がそのまま外周へ
     // つながってしまい、収縮した意味が消える。
@@ -761,16 +799,7 @@ fn close_new_gaps(
     for y in ry0..=ry1 {
         for x in rx0..=rx1 {
             let i = local(x, y);
-            if !background.get(i) {
-                continue;
-            }
-            if band[(y as usize) * stride + (x as usize)] == 0
-                || x == 0
-                || y == 0
-                || x + 1 == w
-                || y + 1 == h
-            {
-                trusted.insert(i);
+            if background.get(i) && outside(x, y) {
                 seen.insert(i);
             }
         }
@@ -779,7 +808,7 @@ fn close_new_gaps(
     for y in ry0..=ry1 {
         for x in rx0..=rx1 {
             let i = local(x, y);
-            if seen.get(i) || !trusted.get(i) {
+            if seen.get(i) || !trusted(i, x, y) {
                 continue;
             }
             let touches = (x > rx0 && seen.get(i - 1))
@@ -803,14 +832,21 @@ fn close_new_gaps(
                 continue;
             }
             let j = local(nx, ny);
-            if seen.get(j) || !trusted.get(j) {
+            if seen.get(j) || !trusted(j, nx, ny) {
                 continue;
             }
             seen.insert(j);
             queue.push_back((nx, ny));
         }
     }
-    drop(trusted);
+    // 膨張させるのは**収縮で取れた芯**だけにする。起点として信用しただけの
+    // 「帯の外の背景」まで膨らませると、帯に接した通路が幅によらず seal px ぶん
+    // 開いてしまい、`--seal` を大きくするほど隙間が塞がらなくなる
+    for i in 0..pw * ph {
+        if !eroded.get(i) {
+            seen.set(i, false);
+        }
+    }
     let grown = morphology::separable(pw, ph, &seen, seal, true);
     drop(seen);
 
@@ -824,6 +860,7 @@ fn close_new_gaps(
                 continue;
             }
             shape.set(x, y, u8::MAX);
+            sealed.insert(at);
             changed += 1;
         }
     }
@@ -835,6 +872,12 @@ struct Context<'a> {
     image: &'a RgbaImage,
     binary: &'a Mask,
     band: &'a [u8],
+    /// `--seal` が塞いだ隙間。帯と同じく**参照色の材料にしない**。
+    ///
+    /// ここは背景色をした前景である（だからこそ色ではなく連結性で決めた）。
+    /// 確定前景に数えると局所前景色 F が背景側へ引きずられ、(b) の 2 択が
+    /// 効かなくなる
+    sealed: &'a BitPlane,
     lut: [f32; 256],
     bg_linear: [f32; 3],
     separation_sq: f32,
@@ -1066,9 +1109,10 @@ fn prepare_tile(ctx: &Context<'_>, ws: &mut Workspace, tile: &Tile) {
     in_band.reserve(cells);
     for y in py0..=py1 {
         for x in px0..=px1 {
+            let at = (y as usize) * stride + (x as usize);
             linear.push(pixel_linear(ctx.image, &ctx.lut, x, y));
             is_fg.push(ctx.binary.is_foreground(x, y));
-            in_band.push(ctx.band[(y as usize) * stride + (x as usize)] != 0);
+            in_band.push(ctx.band[at] != 0 || ctx.sealed.contains(at));
         }
     }
 
@@ -2138,11 +2182,65 @@ mod tests {
                 }
             }
             let band = vec![1u8; (w as usize) * (h as usize)];
-            close_new_gaps(&mut shape, &original, &band, (0, 0, w - 1, h - 1), 1);
+            let mut sealed = BitPlane::new(band.len());
+            close_new_gaps(
+                &mut shape,
+                &original,
+                &band,
+                &mut sealed,
+                (0, 0, w - 1, h - 1),
+                1,
+            );
             !shape.is_foreground(28, 20)
         };
         assert!(!opened(1), "幅 1px の切れ込みが塞がっていない");
         assert!(opened(5), "幅 5px の隙間まで塞いでいる");
+    }
+
+    /// `--seal` が塞いだ隙間を、色から解き直したアルファが取り消さないこと。
+    ///
+    /// **戻すだけでは足りない。** 戻した画素は帯の中にいるので、射影アルファが
+    /// 同じ色を見て「純粋な背景」と答え、0 で塗り潰す。帯から外して初めて
+    /// 「幅 2N px 以下の隙間を前景へ戻す」が利用者の受け取る出力まで届く。
+    ///
+    /// 対に `seal = 0`（塞がない）を置く。片方だけを固定すると、`close_new_gaps`
+    /// が何でも不透明で塗り固めるようになっても気づけない。
+    #[test]
+    fn the_seal_keeps_a_one_pixel_slit_opaque_through_the_matting() {
+        let (w, h) = (32u32, 32u32);
+        let bg = [250u8, 250, 249];
+        let mut img = RgbaImage::from_pixel(w, h, Rgba([bg[0], bg[1], bg[2], 255]));
+        let mut mask = Mask::new(w, h, 0);
+        for y in 8..24 {
+            for x in 8..24 {
+                img.put_pixel(x, y, Rgba([40, 40, 40, 255]));
+                // 堤防が 1px の通路で止めた状態を模す。スリットも前景に入っている
+                mask.set(x, y, u8::MAX);
+            }
+        }
+        for y in 8..20 {
+            img.put_pixel(16, y, Rgba([bg[0], bg[1], bg[2], 255]));
+        }
+        let sealed = refine(&img, &mask, bg, &RefineOptions::default());
+        assert!(
+            sealed.mask.get(16, 14) >= 128,
+            "--seal が塞いだスリットを色の解き直しが透明に戻している: {}",
+            sealed.mask.get(16, 14)
+        );
+        let opened = refine(
+            &img,
+            &mask,
+            bg,
+            &RefineOptions {
+                seal: 0,
+                ..Default::default()
+            },
+        );
+        assert!(
+            opened.mask.get(16, 14) < 128,
+            "seal 0（塞がない）なのにスリットが不透明で残っている: {}",
+            opened.mask.get(16, 14)
+        );
     }
 
     /// 3 つのスイッチを明示した経路が、Phase 2 の帯そのものを使うこと。

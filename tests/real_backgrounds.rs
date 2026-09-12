@@ -754,17 +754,20 @@ fn listing(points: &[Point], metric: &str) -> String {
 ///
 /// | 指標 | クリーン最大 | 欠陥最小 | しきい値 |
 /// |---|---|---|---|
-/// | `contour_roughness` | 0.113（R2 assisted） | 0.247（R6 assisted） | 0.16 |
-/// | `rim_contamination` | 0.007（S6 / S10） | 0.052（R2 assisted） | 0.02 |
+/// | `contour_roughness` | 0.082（S5、幅 3px のストラップ） | 0.267（R6 assisted） | 0.16 |
+/// | `rim_contamination` | 0.007（S6 / S10） | 0.091（R1 trimap） | 0.02 |
 ///
-/// **Phase 4（照明場）で母集団が動いた。** 粗さのクリーン側の最大は 0.082
-/// （S5、幅 3px のストラップ）から 0.113（R2 assisted）へ上がったが、これは
-/// 粗さが悪化したのではなく、**R2 assisted の正解の輪郭誤差が 1.12 → 0.80 へ
-/// 改善して「良品」の群に入った**ためである。欠陥側の最小も、R7 defaults
-/// （輪郭誤差 59.1 → 0.41）が壊れた群から抜けたぶん 0.194 → 0.247 へ上がった。
+/// **Phase 4（照明場）で母集団が動いた。** 欠陥側の最小は、R7 defaults
+/// （輪郭誤差 59.1 → 0.41）が壊れた群から抜けたぶん 0.194 → 0.267 へ上がった。
 ///
-/// **しきい値 0.16 は据え置く。** クリーン側へ 1.42 倍、欠陥側へ 1.54 倍の
-/// 余裕がある。
+/// **クリーン側の最大は R2 assisted に振り回される。** この 1 点は正解の
+/// 輪郭誤差が 1.0 の両側を行き来し（場を入れて 1.12 → 0.80、色の門を入れて
+/// 0.80 → 1.11）、そのたびに「良品」の群に入ったり出たりする。入っているときの
+/// クリーン最大は 0.113、出ているときは 0.082（S5）になる。**下限の見張りを
+/// 0.09 に置くと、この 1 点が入った日に落ちる**ので 0.12 に置いてある。
+///
+/// **しきい値 0.16 は据え置く。** 現状ではクリーン側へ 1.96 倍、欠陥側へ
+/// 1.67 倍の余裕がある（R2 assisted が良品側に入っても 1.42 倍 / 1.67 倍）。
 ///
 /// # `CONTOUR_ROUGH` は蛇行だけを見る
 ///
@@ -1533,5 +1536,62 @@ fn the_field_never_makes_a_real_scene_worse() {
             flat.rim_truth,
             field.rim_truth
         );
+    }
+}
+
+/// **`assisted` の tolerance を掃引する。** `--ignored` を付けたときだけ走る。
+///
+/// `assisted` は「kiri 自身の hint に従って到達する設定」であり、`HALO_REMAINS`
+/// の hint（`--tolerance` を上げる）を素直に辿った先の値を置いてある。設計では
+/// 「照明場を入れたら 60 から下げられるはず」と見込んでいた——場が背景の変動を
+/// 吸うぶん、tolerance は織り目の振幅だけを受け持てばよくなるからである。
+///
+/// **見込みは外れた。** 場を入れた後の実測でも、織り目のある R1 / R2 / R5 / R6 は
+/// tolerance 60 が最良のままで、下げるほど輪郭誤差も縁の汚染も単調に悪化する
+/// （R1: 60 で 4.23 / 0.176 → 12 で 19.48 / 0.579）。場が吸うのは**低周波の
+/// 照明変動**であって、織り目そのもの（1px あたり十数の振幅）ではないからで、
+/// 繊維を飲むにはやはり幅の広い tolerance が要る。R3 だけは 12 のままが最良で、
+/// 上げると商品がまるごと飲まれる（eaten 76% → 100%）。
+///
+/// したがって `assisted_tolerance` は動かさない。**この表は「下げられなかった」
+/// ことの記録である**——設計の見込みと実測が食い違ったまま何も残さないと、
+/// 次に同じ期待をした誰かが同じ掃引をやり直すことになる。
+///
+/// ```text
+/// cargo test --release --test real_backgrounds -- --ignored --nocapture print_the_assisted_tolerance_sweep
+/// ```
+#[test]
+#[ignore = "計測用。判定はせず表を出すだけ"]
+fn print_the_assisted_tolerance_sweep() {
+    println!(
+        "\nシーン                          tol  輪郭誤差   rim正解    eaten  前景比率  モデル"
+    );
+    for scene in real_scenes() {
+        let truth = common::real_scene(&scene);
+        let bbox = common::assisted_bbox(&truth);
+        for tolerance in [12.0, 20.0, 30.0, 40.0, 60.0] {
+            let opts = CutoutOptions {
+                bbox: Some(bbox),
+                tolerance,
+                ..Default::default()
+            };
+            let result = cutout(&truth.image, &opts);
+            let m =
+                common::measure_edges_with(&truth, &result.image, &result.mask, opts.bbox, None);
+            println!(
+                "{:<30} {tolerance:>4.0} {:>9.2} {:>9.4} {:>8.4} {:>9.4}  {}{}",
+                scene.name,
+                m.contour_error,
+                m.rim_truth,
+                m.eaten,
+                result.stats.foreground_ratio,
+                result.background_model.as_str(),
+                if tolerance == scene.assisted_tolerance {
+                    "  <- 現行"
+                } else {
+                    ""
+                }
+            );
+        }
     }
 }

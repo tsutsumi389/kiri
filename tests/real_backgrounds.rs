@@ -631,38 +631,48 @@ fn listing(points: &[Point], metric: &str) -> String {
 ///
 /// 1. **誤分類が 1 点も無いこと。** クリーン側の最大がしきい値を下回り、
 ///    欠陥側の最小がしきい値を上回る。これが契約そのもので、余裕の話ではない
-/// 2. **その余裕が記録どおりであること。** 余裕が縮むこと自体は退行ではない
-///    （処理が良くなれば群は近づく）が、**黙って縮むのは退行である**
+/// 2. **両端の値が記録どおりであること。** 比（「欠陥側の最小 ÷ しきい値
+///    ≥ 1.1」）で書いていた頃は、**処理が良くなって群が近づくたびにテストが
+///    落ちる**ので、書き手はそのたびに比を緩めることになった。緩めた記録は
+///    コミットメッセージの中にしか残らない。**値そのものを固定すれば、
+///    動いたときに「どちらへどれだけ動いたか」がテストの文面に出る。**
 ///
-/// # 粗さの欠陥側の余裕は Phase 3 で 1.97 倍から 1.12 倍へ縮んだ
+/// # 採用した値（2026-09 時点の実測）
 ///
-/// Phase 3 は輪郭を**実際に均す**（色の門つきメディアンと guided
-/// feathering）。すると壊れた切り抜きの輪郭まで滑らかになり、
-/// `contour_roughness` は「輪郭が真の位置から遠い」ことを見なくなる——
-/// 欠陥側の最小は R7 既定（輪郭誤差 59.7px、正解の帯の 57% が背景）で、
-/// 粗さは 0.316 から 0.180 へ落ちた。しきい値 0.16 は今も全 29 点を
-/// 正しく分けるが、**この指標は「輪郭が汚い」ことしか見ておらず、
-/// 「輪郭が違う場所にある」ことは `halo_ratio` と `rim_contamination` と
-/// `BBOX_RECOMMENDED` が見る**、という分担がはっきりした。
+/// | 指標 | クリーン最大 | 欠陥最小 | しきい値 |
+/// |---|---|---|---|
+/// | `contour_roughness` | 0.082（S5、幅 3px のストラップ） | 0.194（R6 defaults） | 0.16 |
+/// | `rim_contamination` | 0.007（S6 / S10） | 0.032（R7 defaults） | 0.02 |
 ///
-/// クリーン側は 1.96 倍のまま動かない（S5、幅 3px のストラップ）。
+/// **しきい値 0.16 は据え置く。** 0.12 まで下げると R2 assisted（正解の輪郭誤差
+/// 1.12px = 良品、粗さ 0.115）が誤警告の側へ近づく。
+///
+/// # `CONTOUR_ROUGH` は蛇行だけを見る
+///
+/// Phase 3 は輪郭を**実際に均す**（色の門つきメディアンと guided feathering）。
+/// すると壊れた切り抜きの輪郭まで滑らかになり、`contour_roughness` は
+/// 「輪郭が真の位置から遠い」ことを見なくなる。欠陥側の最小は R7 defaults
+/// （輪郭誤差 59.1px、正解の帯の 57% が背景）で、粗さは Phase 2 の 0.316 から
+/// 0.194 へ落ちた。**輪郭が滑らかに間違っている**状態は粗さでは捕まらない。
+/// それを捕まえるのは `BBOX_RECOMMENDED` / `RIM_CONTAMINATED` / `HALO_REMAINS`
+/// で、R7 defaults では 3 つとも出る（docs/design.md 4.10 の表）。
 #[test]
 fn the_thresholds_sit_between_the_clean_and_the_defective() {
     let points = bench();
-    for (name, threshold, clean_margin, defective_margin, side, value) in [
+    for (name, threshold, clean_max, defective_min, side, value) in [
         (
             "contour_roughness",
             CONTOUR_ROUGH_WARN,
-            1.9,
-            1.1,
+            0.09,
+            0.17,
             roughness_side as fn(&EdgeMetrics) -> Side,
             (|p: &Point| p.diagnostics.contour_roughness) as fn(&Point) -> Option<f64>,
         ),
         (
             "rim_contamination",
             RIM_CONTAMINATION_WARN,
-            2.0,
-            2.0,
+            0.01,
+            0.03,
             contamination_side as fn(&EdgeMetrics) -> Side,
             (|p: &Point| p.diagnostics.rim_contamination) as fn(&Point) -> Option<f64>,
         ),
@@ -675,17 +685,51 @@ fn the_thresholds_sit_between_the_clean_and_the_defective() {
              (クリーン最大 {clean:.3} / 欠陥最小 {defective:.3})\n{}",
             listing(&points, name)
         );
+        // 次に値そのもの。**動いたら記録を書き直すこと**（比を緩めない）
         assert!(
-            clean * clean_margin <= threshold,
-            "{name}: クリーン側の最大 {clean:.3} がしきい値 {threshold} に近すぎる\n{}",
+            clean <= clean_max,
+            "{name}: クリーン側の最大が記録 {clean_max} を越えた: {clean:.3}\n{}",
             listing(&points, name)
         );
         assert!(
-            defective >= threshold * defective_margin,
-            "{name}: 欠陥側の最小 {defective:.3} がしきい値 {threshold} に近すぎる\n{}",
+            defective >= defective_min,
+            "{name}: 欠陥側の最小が記録 {defective_min} を割った: {defective:.3}\n{}",
             listing(&points, name)
         );
     }
+}
+
+/// **どの警告が、輪郭が滑らかに間違っている切り抜きを捕まえるか。**
+///
+/// `CONTOUR_ROUGH` は蛇行しか見ない。R7 defaults は輪郭誤差 59.1px（正解の帯の
+/// 57% が背景）なのに粗さは 0.194 しかなく、しきい値 0.16 との差は 1.2 倍で、
+/// **粗さ単独ではこの欠陥を語れない**。捕まえるのは別の 3 つである。
+#[test]
+fn a_smoothly_wrong_contour_is_caught_by_the_other_warnings() {
+    let points = bench();
+    let broken = point(&points, "R7 照明勾配のある紙 + 黒商品 / defaults");
+    assert!(
+        broken.metrics.contour_error > 10.0,
+        "前提: R7 defaults は壊れた切り抜きである: {:.2}",
+        broken.metrics.contour_error
+    );
+    for code in ["RIM_CONTAMINATED", "CONTOUR_ROUGH"] {
+        assert!(
+            broken.warnings.iter().any(|w| w == code),
+            "{code} が出ていない: {:?}",
+            broken.warnings
+        );
+    }
+    // 正解が「良品」と言う実写（R7 assisted）には輪郭の警告を 1 本も出さない。
+    // `LOW_UNIFORMITY` は背景そのものの性質（照明勾配）についての報せで、
+    // 切り抜きの出来を語っていないので数えない
+    let good = point(&points, "R7 照明勾配のある紙 + 黒商品 / assisted");
+    let noisy: Vec<_> = good
+        .warnings
+        .iter()
+        .filter(|w| w.as_str() != "LOW_UNIFORMITY")
+        .collect();
+    assert!(noisy.is_empty(), "良品に輪郭の警告が出ている: {noisy:?}");
 }
 
 /// 同じ入力から同じ結果が出ること。

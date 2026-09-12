@@ -60,7 +60,15 @@ pub const DEFAULT_MIN_SEPARATION: f32 = 0.06;
 /// 帯幅の絶対上限(px)。`RefineOptions` は公開されているので、呼び出し側が
 /// 青天井の `max_radius` を渡してもここで止める。帯幅は窓の大きさを決め、
 /// 窓の大きさはタイルに確保する積分画像の大きさを決めるため。
-const RADIUS_CEILING: u32 = 32;
+///
+/// **48 は解像度に追従させるために上げた値である。** 帯幅の既定（2〜10px）は
+/// 長辺 1000px の素材で決めた絶対値で、24.5MP（長辺 5712px）では換算 0.35〜1.8px
+/// にしかならない。実写リモコンの `rim_contamination` が 0.066〜0.074 から下がら
+/// なかったのはこれで、帯が繊維の粒に届いていなかった。`DEFAULT_MAX_RADIUS`
+/// （10）× `scale_at_1000`（5.712）= 58 を丸ごと許すと、`paint_disc` が輪郭画素
+/// ごとに 10000px 級の円を塗り、タイルの積分画像も (128+4r)² で膨らむ。48 は
+/// 20MP 級（scale 4.5〜5.7）を覆えて、費用がまだ測れる範囲に収まる上限である。
+const RADIUS_CEILING: u32 = 48;
 
 /// 積分画像を作り直す単位(px)。大きくすると窓の余白ぶんの作り直しが減り、
 /// 小さくすると帯から離れた画素まで積分する無駄が減る。
@@ -302,15 +310,11 @@ pub fn refine(
     }
 
     let scale = diagnostics::scale_at_1000(w, h);
-    let min_radius = if opts.staged() {
-        band_floor(binary, scale, opts)
-    } else {
-        opts.min_radius
-    };
+    let (min_radius, max_radius) = band_radii(binary, scale, opts);
 
     // (a)〜(c)。二値マスクを書き換えるので、アルファを載せる前に済ませる
     let mut shape = binary.clone();
-    let mut band = band_map(image, &shape, background, min_radius, opts.max_radius);
+    let mut band = band_map(image, &shape, background, min_radius, max_radius);
     // `--seal` が塞いだ隙間。帯からも参照色からも外す（`close_new_gaps`）
     let mut sealed = BitPlane::default();
     reshape(
@@ -323,6 +327,7 @@ pub fn refine(
         opts,
         scale,
         min_radius,
+        max_radius,
     );
     let (band, sealed) = (band, sealed);
 
@@ -434,19 +439,40 @@ fn for_each_tile(w: u32, h: u32, mut body: impl FnMut((u32, u32))) {
     }
 }
 
-/// (a) 帯幅の下限を輪郭の粗さで持ち上げる。
+/// (a) 帯幅を決める。新しい 3 段が効く経路だけ、解像度と輪郭の粗さで持ち上げる。
 ///
-/// **ギザギザの振幅より狭い帯では、暴れた輪郭の外側に取り残された粒を帯が
-/// 覆えない。** 帯の中しか塗り直さないと決めた以上、帯が粒に届かなければ
-/// 再分類は何もできない。粗さは refine の**前**に二値マスクで測り、
-/// `scale_at_1000` を掛け戻して原寸 px にする。
+/// **既定の 2〜10px は長辺 1000px の素材で決めた絶対値である。** 24.5MP の実写
+/// （長辺 5712px）では換算 0.35〜1.8px にしかならず、繊維の粒（実寸で 10px 級）を
+/// 帯が覆えない。帯の中しか塗り直さないと決めた以上、帯が粒に届かなければ
+/// 再分類は何もできない。そこで `scale_at_1000` を掛けて実寸へ戻す。
 ///
-/// **上限は `max_radius`（既定 10）に留める。** 設計書は `RADIUS_CEILING`
-/// （32）と書いているが、帯幅は窓の大きさとタイルの積分画像の大きさを決める
-/// ので、櫛状・メッシュのように輪郭画素が数百万ある素材で 32 まで開くと
-/// 費用が桁で変わる。既存の帯幅の上限を越えない範囲に収める。
-fn band_floor(binary: &Mask, scale: f64, opts: &RefineOptions) -> u32 {
-    let ceiling = opts.max_radius.clamp(1, RADIUS_CEILING);
+/// 下限はさらに**輪郭の粗さで持ち上げる**。蛇行の振幅が r px なら、暴れた輪郭の
+/// 外側に取り残された粒は真の輪郭から最大 2r 離れる（内側へ r、外側へ r）。
+/// 粗さは refine の**前**に二値マスクで測り、`scale_at_1000` を掛け戻して原寸 px
+/// にする。
+///
+/// **旧経路（`projection_only`）は絶対 px のまま。** 持ち上げた帯は新しい 3 段に
+/// 働く場所を与えるためのもので、射影アルファだけを回す経路には何の用も無い。
+/// ここを共有すると Phase 2 のバイト列が黙って変わる。
+fn band_radii(binary: &Mask, scale: f64, opts: &RefineOptions) -> (u32, u32) {
+    if !opts.staged() {
+        return (opts.min_radius, opts.max_radius);
+    }
+    let up = |v: u32| -> u32 {
+        let scaled = (f64::from(v) * scale).ceil();
+        if scaled.is_finite() && scaled > 0.0 {
+            scaled as u32
+        } else {
+            v
+        }
+    };
+    // **上限は原寸 px のまま置く。** 帯幅の上限は「柔らかい輪郭にどこまで
+    // 追従するか」を決める値で、広げると遷移そのものより広い帯が張られて
+    // 確定 F/B が窓から消える。実測でも、解像度で掛け戻すと実写リモコンの
+    // `rim_contamination` が 0.061 → 0.133、R1 assisted の輪郭誤差が
+    // 6.03 → 8.75 と、高解像度でも合成でも悪くなった（10 / 14 / 20 / 30 px と
+    // 振っても単調に悪い）。下限だけを掛け戻す
+    let max_r = opts.max_radius.clamp(1, RADIUS_CEILING);
     let roughness = diagnostics::contour_roughness(binary, None).unwrap_or(0.0) * scale;
     let wanted = (BAND_ROUGHNESS_GAIN * roughness).ceil();
     let wanted = if wanted.is_finite() && wanted > 0.0 {
@@ -454,7 +480,7 @@ fn band_floor(binary: &Mask, scale: f64, opts: &RefineOptions) -> u32 {
     } else {
         0
     };
-    opts.min_radius.max(wanted).clamp(1, ceiling)
+    (up(opts.min_radius).max(wanted).clamp(1, max_r), max_r)
 }
 
 /// (b)(c) 二値マスクを色の裏付けをもって塗り直し、帯を引き直す。
@@ -469,6 +495,7 @@ fn reshape(
     opts: &RefineOptions,
     scale: f64,
     min_radius: u32,
+    max_radius: u32,
 ) {
     let smooth_radius = (opts.smooth_contour * scale).ceil();
     let smooth_radius = if smooth_radius.is_finite() && smooth_radius > 0.0 {
@@ -485,7 +512,7 @@ fn reshape(
     *sealed = BitPlane::new(stride * (h as usize));
     // 元の輪郭から離れすぎた画素には触らない（累積の上限）。距離そのものは
     // 持たず、「越えたか」の 1 ビットに畳んでから手放す
-    let reach = REACH_PASSES * opts.max_radius.clamp(1, RADIUS_CEILING);
+    let reach = REACH_PASSES * max_radius;
     let out_of_reach =
         diagnostics::farther_than(w, h, &diagnostics::contour_pixels(original, None), reach);
     for _ in 0..RESHAPE_PASSES {
@@ -528,7 +555,7 @@ fn reshape(
         // 戻り値（塞いだ画素数）は捨てる。ここで数えたいのは「色が動かした画素」
         // であって、連結性が戻した画素ではない
         let _ = close_new_gaps(shape, original, band, sealed, bounds, opts.seal);
-        band_map_into(image, shape, background, min_radius, opts.max_radius, band);
+        band_map_into(image, shape, background, min_radius, max_radius, band);
     }
     // 塞いだ隙間を帯から外す。**パスの途中では外さない**——途中で外すとその
     // 画素が次のパスの局所色から消え、塗り直しの答えが連鎖して変わる

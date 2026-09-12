@@ -89,6 +89,23 @@ const RIM_NEARER: f64 = 2.0;
 /// ノイズ床——q90 で往復した平坦部が持つ画素間のばらつき——に合わせてある。
 const RIM_SIGMA_FLOOR: f64 = 4.0;
 
+/// 局所前景を窓の外から借りてよい距離の上限。単位は窓（`RIM_WINDOW`）の何倍か。
+///
+/// **窓の中に確定前景が無い帯画素は珍しくない。** 局所前景 F は「窓の中の、帯より
+/// 深い完全不透明画素」なので、細い構造や、背景を薄く飲み込んだ舌のような領域では
+/// 1 つも無い。そこで判定を諦めると、**欠陥が大きいほど判定不能が増えて値が
+/// 下がる**という逆立ちが起きる。R4（暗い机 + 白商品）の既定値がまさにそれで、
+/// 帯の 22.4% が真の背景なのに、その画素が全部「局所前景が無い」で捨てられ、
+/// 0.000（＝合格）を返していた。そこで**いちばん近い、前景を持つ格子セルから
+/// 借りる**。R4 既定は 0.221（正解 0.224）を返すようになった。
+///
+/// 借りた F は「その場所の前景色」ではないので、遠くまで借りに行かせない。
+/// 16 窓＝長辺 1000px 換算で 128px は、照明とシェーディングが「同じ前景」と
+/// 言える範囲の上限として置いた値である。S9（明度が背景を横切る淡色商品）は
+/// 300px 先の——真逆の明るさを持つ——商品の裾から借りようとするので、ここで
+/// 止まって判定不能になる（帯の 44% しか判定できず、値は `None` になる）。
+const RIM_BORROW_WINDOWS: f64 = 16.0;
+
 /// 局所前景色と局所背景色がこれだけ離れていなければ「判定不能」とする。
 /// 単位は「両側の散らばり（`σ_B + σ_F + 2σ0`）の何倍か」。
 ///
@@ -166,7 +183,7 @@ pub const RIM_CONTAMINATION_WARN: f64 = 0.025;
 /// 遠く届かない。精度より決定性と O(N) を採る。
 const CHAMFER_STEP: u8 = 3;
 const CHAMFER_DIAGONAL: u8 = 4;
-/// チャンファー距離が飽和する距離(px)。u8 に畳んだ都合であって、意味のある
+/// チャンファー距離が飽和する距離(px)。u8 に畳んだ結果であって、意味のある
 /// 上限ではない。**飽和した値を平均に混ぜてはいけない**（`roughness_of`）。
 const CHAMFER_MAX_PX: u32 = (u8::MAX / CHAMFER_STEP) as u32;
 
@@ -198,7 +215,9 @@ pub struct Diagnostics {
     /// 影は「背景の散らばりの範囲内」に収まるが、平均色からの距離では
     /// 正しい混色と見分けがつかないためである
     ///
-    /// 判定できる画素が 1 つも無ければ None
+    /// **帯の半分以上で判定できなければ None。** 分母は判定できた画素なので、
+    /// 判定不能が大半を占めたまま割合を返すと、残りについて「汚染されて
+    /// いない」と言ったことになってしまう
     pub rim_contamination: Option<f64>,
 }
 
@@ -374,11 +393,11 @@ fn roughness_of(
     //
     // **ただし平均には罠がある。** 平滑化で参照輪郭がまるごと消えた場所
     // （細いストラップ、背景を飲み込んで崩れたマスク）では、距離は近傍に
-    // 参照が無いまま伸び続け、チャンファーの飽和値（`CHAMFER_MAX_PX`）まで
-    // 行ってそのまま平均に入る。S9（明度が背景を横切る淡色商品）が 35.026 と
+    // 参照が無いまま伸び続け、チャンファーの飽和値（85px）まで行って
+    // そのまま平均に入る。S9（明度が背景を横切る淡色商品）が 35.026 と
     // 出ていたのがこれで、**輪郭の粗さではなく u8 の上限を報告していた**。
-    // 平滑化が届く距離は箱ぼかし 3 回ぶんの `3r` しかないのだから、それより
-    // 遠い距離に情報は無い。**画素ごとに 3r で clamp してから平均する**
+    // 平滑化が届く距離は箱ぼかし 3 回ぶんの `3r` しかないのだから、
+    // それより遠い距離に情報は無い。**画素ごとに 3r で clamp してから平均する**
     let cap = (3 * radius * u32::from(CHAMFER_STEP)).min(u32::from(u8::MAX));
     let total: u64 = contour
         .iter()
@@ -418,6 +437,23 @@ fn roughness_of(
 /// で分類する。繊維の影は σ_B の中に収まるので d_B が小さくなり、正しい混色は
 /// どちらの分布からも離れているので比が 1 の近くで割れる。
 ///
+/// # 判定できなかった画素を、黙って分母から外さない
+///
+/// 分母は「判定できた画素」である。それ自体は正しい——F と B が重なっていれば
+/// どちらに近いかは答えようがない——が、**判定不能が帯の大半を占めたまま
+/// 割合を返すと、残りについて「汚染されていない」と言ったことになる。**
+/// R4（暗い机 + 白商品）の既定値がそれで、帯 14,160 画素のうち真に背景の
+/// 3,172 画素が**全部**判定不能に落ち、残りから 0.000（＝合格）を返していた。
+///
+/// 2 つで直す。
+///
+/// 1. 窓に確定前景が無ければ、`RIM_BORROW_WINDOWS` の範囲でいちばん近い
+///    「前景を持つセル」から借りる。借りた F でも `MIN_RIM_SEPARATION_SIGMA`
+///    は変わらず掛かるので、F と B が見分けられない場所では判定不能のままになる
+/// 2. それでも判定できた画素が**帯の半分に満たなければ `None`** を返す。
+///    S9（明度が背景を横切る淡色商品）がこれに当たる——借りられる範囲に
+///    前景が無く、44% しか判定できないので、値を出さない
+///
 /// # 局所平均は縮めた格子で取る
 ///
 /// 帯画素ごとに窓を全走査すると 20MP で 10⁹ に達する。局所平均は低周波なので、
@@ -434,14 +470,88 @@ fn contamination_of(image: &RgbaImage, mask: &Mask, contour: &[(u32, u32)]) -> O
     // 帯の判定はチャンファーの単位(1px = 3)のまま行う。px へ戻すと
     // 画素ごとに割り算が入るだけで、境目は何も変わらない
     let band = rim_band(scale).min(CHAMFER_MAX_PX) * u32::from(CHAMFER_STEP);
-    let window = (RIM_WINDOW * scale).ceil() as u32;
     // 帯の判定にしか使わないので、輪郭から帯幅ぶん離れた外までで足りる
     let distance = chamfer_distance(contour, around(contour, w, h, rim_band(scale) + 1));
+    let grid = local_colours(image, mask, &distance, contour, scale, band);
 
+    let pixels = image.as_raw();
+    let alpha = mask.as_slice();
+    let (x0, y0, x1, y1) = around(contour, w, h, rim_band(scale));
+    let (mut contaminated, mut decided, mut in_band) = (0u64, 0u64, 0u64);
+    for y in y0..=y1 {
+        let row = (y as usize) * (w as usize);
+        for x in x0..=x1 {
+            let i = row + (x as usize);
+            if alpha[i] < FOREGROUND_THRESHOLD || u32::from(distance.at(x, y)) > band {
+                continue;
+            }
+            in_band += 1;
+            let cell = grid.cell(x, y);
+            let (Some((b, sb)), Some((f, sf))) = (grid.behind[cell].stats(), grid.front[cell].stats())
+            else {
+                // 窓に確定背景が無い、あるいは確定前景を借りられる範囲に
+                // 見つからない。どちらに近いかを問う相手がいない
+                continue;
+            };
+            // 2 つの分布が散らばりの中で重なっていれば、どちらに近いかは
+            // 答えようがない。淡色商品 × 白背景がここで落ちる
+            let spread = sb + sf + 2.0 * RIM_SIGMA_FLOOR;
+            if distance3(f, b) < MIN_RIM_SEPARATION_SIGMA * spread {
+                continue;
+            }
+            let p = &pixels[i * 4..i * 4 + 3];
+            let c = sample(p);
+            let to_background = distance3(c, b) / (sb + RIM_SIGMA_FLOOR);
+            let to_foreground = distance3(c, f) / (sf + RIM_SIGMA_FLOOR);
+            decided += 1;
+            if to_background * RIM_NEARER < to_foreground {
+                contaminated += 1;
+            }
+        }
+    }
+    // **判定できた画素が帯の半分に満たなければ、何も言わない。** 残りの
+    // 画素について「汚染されていない」と言った覚えは無いのに、割合を返すと
+    // そう読まれる。0 と null を混同させないという約束はここにも掛かる
+    (decided * 2 >= in_band && decided > 0).then(|| contaminated as f64 / decided as f64)
+}
+
+/// 局所前景・局所背景の色を、`scale` px 四方の格子の上に集めたもの。
+///
+/// 帯画素ごとに窓を全走査すると 20MP で 10⁹ に達する。局所平均は低周波なので、
+/// 縮めた格子の上で箱和を取り、帯画素からは最近傍で引けばよい。
+struct LocalColours {
+    /// 確定背景（alpha == 0）の窓内統計
+    behind: Vec<Sums>,
+    /// 確定前景（alpha == 255 かつ帯より深い）の窓内統計
+    front: Vec<Sums>,
+    gw: usize,
+    step: usize,
+    cy: usize,
+    /// `x / step - cx` の表。12MP で 2400 万回の割り算を省く
+    column: Vec<usize>,
+}
+
+impl LocalColours {
+    #[inline]
+    fn cell(&self, x: u32, y: u32) -> usize {
+        ((y as usize / self.step) - self.cy) * self.gw + self.column[x as usize]
+    }
+}
+
+/// 輪郭の周りだけで局所色の格子を作る。
+fn local_colours(
+    image: &RgbaImage,
+    mask: &Mask,
+    distance: &Field,
+    contour: &[(u32, u32)],
+    scale: f64,
+    band: u32,
+) -> LocalColours {
+    let (w, h) = (mask.width(), mask.height());
+    let window = (RIM_WINDOW * scale).ceil() as u32;
     // 参照色を集める範囲は「帯 + 窓」までで足りる。輪郭から遠い画素は
     // どの帯画素の窓にも入らないので、全面を舐める理由が無い
-    let reach = rim_band(scale) + window;
-    let (x0, y0, x1, y1) = around(contour, w, h, reach);
+    let (x0, y0, x1, y1) = around(contour, w, h, rim_band(scale) + window);
 
     // 格子の 1 セルは scale px 四方。窓の半径はセル単位へ丸め上げる。
     // 格子も枠のぶんしか持たない——12MP の全面で 2 面持つと 24MB になる
@@ -450,7 +560,6 @@ fn contamination_of(image: &RgbaImage, mask: &Mask, contour: &[(u32, u32)]) -> O
     let (cx, cy) = (x0 as usize / step, y0 as usize / step);
     let gw = (x1 as usize / step) - cx + 1;
     let gh = (y1 as usize / step) - cy + 1;
-    // x / step は 12MP で 2400 万回の割り算になる。表で引いて掛け算すら省く
     let column: Vec<usize> = (0..w as usize)
         .map(|x| x / step - cx.min(x / step))
         .collect();
@@ -481,39 +590,17 @@ fn contamination_of(image: &RgbaImage, mask: &Mask, contour: &[(u32, u32)]) -> O
     }
     box_sum(&mut behind, gw, gh, radius);
     box_sum(&mut front, gw, gh, radius);
-
-    let (x0, y0, x1, y1) = around(contour, w, h, rim_band(scale));
-    let (mut contaminated, mut decided) = (0u64, 0u64);
-    for y in y0..=y1 {
-        let row = (y as usize) * (w as usize);
-        let cells = ((y as usize / step) - cy) * gw;
-        for x in x0..=x1 {
-            let i = row + (x as usize);
-            if alpha[i] < FOREGROUND_THRESHOLD || u32::from(distance.at(x, y)) > band {
-                continue;
-            }
-            let cell = cells + column[x as usize];
-            let (Some((b, sb)), Some((f, sf))) = (behind[cell].stats(), front[cell].stats()) else {
-                // 窓に確定背景か確定前景が無ければ、どちらに近いかを問えない
-                continue;
-            };
-            // 2 つの分布が散らばりの中で重なっていれば、どちらに近いかは
-            // 答えようがない。淡色商品 × 白背景がここで落ちる
-            let spread = sb + sf + 2.0 * RIM_SIGMA_FLOOR;
-            if distance3(f, b) < MIN_RIM_SEPARATION_SIGMA * spread {
-                continue;
-            }
-            let p = &pixels[i * 4..i * 4 + 3];
-            let c = [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])];
-            let to_background = distance3(c, b) / (sb + RIM_SIGMA_FLOOR);
-            let to_foreground = distance3(c, f) / (sf + RIM_SIGMA_FLOOR);
-            decided += 1;
-            if to_background * RIM_NEARER < to_foreground {
-                contaminated += 1;
-            }
-        }
+    // 窓に確定前景が無いセルへ、借りられる範囲のいちばん近い統計を配る
+    let borrow = (RIM_BORROW_WINDOWS * RIM_WINDOW * scale / step as f64).round() as u32;
+    fill_from_nearest(&mut front, gw, gh, borrow * u32::from(CHAMFER_STEP));
+    LocalColours {
+        behind,
+        front,
+        gw,
+        step,
+        cy,
+        column,
     }
-    (decided > 0).then(|| contaminated as f64 / decided as f64)
 }
 
 /// 輪郭画素の外接矩形を `margin` px だけ広げ、画像の中へ収めたもの。
@@ -552,8 +639,9 @@ struct Sums {
 impl Sums {
     fn add(&mut self, p: &[u8]) {
         for (k, slot) in self.rgb.iter_mut().enumerate() {
-            *slot += u32::from(p[k]);
-            self.squares += u64::from(p[k]) * u64::from(p[k]);
+            let v = channel(p[k]);
+            *slot += v;
+            self.squares += u64::from(v) * u64::from(v);
         }
         self.n += 1;
     }
@@ -566,7 +654,9 @@ impl Sums {
         self.n += other.n;
     }
 
-    fn drop(&mut self, other: &Sums) {
+    /// 箱和の窓から 1 セルぶんを外す。**`Drop::drop` とは無関係である**
+    /// （`join` の対であって、資源の解放ではない）。
+    fn subtract(&mut self, other: &Sums) {
         for (k, slot) in self.rgb.iter_mut().enumerate() {
             *slot -= other.rgb[k];
         }
@@ -574,7 +664,7 @@ impl Sums {
         self.n -= other.n;
     }
 
-    /// 平均色(sRGB)と、3 チャンネルの分散の平均の平方根。画素が無ければ None。
+    /// 平均色と、3 チャンネルの分散の平均の平方根。画素が無ければ None。
     fn stats(&self) -> Option<([f64; 3], f64)> {
         (self.n > 0).then(|| {
             let n = f64::from(self.n);
@@ -591,13 +681,100 @@ impl Sums {
     }
 }
 
-/// sRGB 3 チャンネルのユークリッド距離。
+/// 1 チャンネルを比べる空間へ写す。**ここが色空間を決める唯一の場所である。**
+#[inline]
+fn channel(v: u8) -> u32 {
+    u32::from(v)
+}
+
+/// 1 画素を比べる空間へ写す。
+#[inline]
+fn sample(p: &[u8]) -> [f64; 3] {
+    [
+        f64::from(channel(p[0])),
+        f64::from(channel(p[1])),
+        f64::from(channel(p[2])),
+    ]
+}
+
+/// 比べる空間での 3 チャンネルのユークリッド距離。
 fn distance3(a: [f64; 3], b: [f64; 3]) -> f64 {
     a.iter()
         .zip(&b)
         .map(|(x, y)| (x - y) * (x - y))
         .sum::<f64>()
         .sqrt()
+}
+
+/// 空のセルへ、いちばん近い「中身のあるセル」の統計を配る。
+///
+/// **窓の外まで探しに行くための道具である。** 局所前景 F は「窓の中の、帯より
+/// 深い完全不透明画素」なので、細い構造や、背景を薄く飲み込んだ舌のような
+/// 領域では窓の中に 1 つも無い。そこで判定を諦めると、**欠陥が大きいほど
+/// 判定不能が増えて値が下がる**という逆立ちが起きる。
+///
+/// 遠くの F は「その場所の前景色」ではないが、F と B が近すぎれば
+/// `MIN_RIM_SEPARATION_SIGMA` が判定を止めるので、嘘を断定することにはならない。
+/// 3-4 チャンファーと同じ 2 パスで最近セルの添字を伝播させる。
+fn fill_from_nearest(cells: &mut [Sums], gw: usize, gh: usize, limit: u32) {
+    let n = gw * gh;
+    let mut from: Vec<u32> = (0..n)
+        .map(|i| if cells[i].n > 0 { i as u32 } else { u32::MAX })
+        .collect();
+    let mut dist: Vec<u32> = (0..n)
+        .map(|i| if cells[i].n > 0 { 0 } else { u32::MAX })
+        .collect();
+    let relax = |dist: &mut Vec<u32>, from: &mut Vec<u32>, i: usize, j: usize, w: u32| {
+        if dist[j] == u32::MAX {
+            return;
+        }
+        let d = dist[j] + w;
+        if d < dist[i] {
+            dist[i] = d;
+            from[i] = from[j];
+        }
+    };
+    for y in 0..gh {
+        for x in 0..gw {
+            let i = y * gw + x;
+            if y > 0 {
+                relax(&mut dist, &mut from, i, i - gw, 3);
+                if x > 0 {
+                    relax(&mut dist, &mut from, i, i - gw - 1, 4);
+                }
+                if x + 1 < gw {
+                    relax(&mut dist, &mut from, i, i - gw + 1, 4);
+                }
+            }
+            if x > 0 {
+                relax(&mut dist, &mut from, i, i - 1, 3);
+            }
+        }
+    }
+    for y in (0..gh).rev() {
+        for x in (0..gw).rev() {
+            let i = y * gw + x;
+            if y + 1 < gh {
+                relax(&mut dist, &mut from, i, i + gw, 3);
+                if x > 0 {
+                    relax(&mut dist, &mut from, i, i + gw - 1, 4);
+                }
+                if x + 1 < gw {
+                    relax(&mut dist, &mut from, i, i + gw + 1, 4);
+                }
+            }
+            if x + 1 < gw {
+                relax(&mut dist, &mut from, i, i + 1, 3);
+            }
+        }
+    }
+    // 伝播が終わってから配る。走査の途中で書き換えると、配った値がさらに
+    // 先へ配られて「近さ」が壊れる
+    for i in 0..n {
+        if cells[i].n == 0 && dist[i] <= limit {
+            cells[i] = cells[from[i] as usize];
+        }
+    }
 }
 
 /// 半径 `radius` セルの箱和を格子へ書き戻す。行と列に分けて running sum で回すので
@@ -614,7 +791,7 @@ fn box_sum(cells: &mut [Sums], gw: usize, gh: usize, radius: usize) {
         for x in 0..gw {
             cells[y * gw + x] = acc;
             if x >= radius {
-                acc.drop(&line[x - radius]);
+                acc.subtract(&line[x - radius]);
             }
             if x + radius + 1 < gw {
                 acc.join(&line[x + radius + 1]);
@@ -632,7 +809,7 @@ fn box_sum(cells: &mut [Sums], gw: usize, gh: usize, radius: usize) {
         for y in 0..gh {
             cells[y * gw + x] = acc;
             if y >= radius {
-                acc.drop(&line[y - radius]);
+                acc.subtract(&line[y - radius]);
             }
             if y + radius + 1 < gh {
                 acc.join(&line[y + radius + 1]);
@@ -781,7 +958,7 @@ fn window_step(line: &[u8], radius: usize, at: usize, sum: &mut u32, n: &mut u32
 /// **全面の Vec を確保しない。** 12MP の全面は 12MB だが、輪郭の外接矩形を
 /// 必要なだけ広げた枠は商品の大きさでしか増えない。読む側から見た値は
 /// 全面版とまったく同じである——枠の外は計算していない（＝255）のだから、
-/// 全面の配列に 255 が入っていたのと区別がつかない。
+/// 全面の配列で 255 が入っていたのと区別がつかない。
 struct Field {
     data: Vec<u8>,
     x0: usize,

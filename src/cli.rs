@@ -322,8 +322,8 @@ fn image_constraint_notes() -> String {
      画像を渡すと MASK_ORIENTATION_IGNORED で報せるので、向きを適用済みの\
      マスクを渡すこと。\n\
      アルファは見ない。1 チャンネルのグレーとして読み、RGB なら輝度を使う。\n\
-     可逆形式（PNG）で渡すこと。JPEG のリンギングは黒く塗ったはずの場所に\
-     1 桁の値を散らす。\n"
+     可逆形式（PNG）で渡すこと。JPEG のリンギングは、黒く塗ったはずの場所へ\
+     小さな値を散らす。\n"
         .to_string()
         + shared_constraint_notes()
 }

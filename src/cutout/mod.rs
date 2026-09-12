@@ -14,6 +14,7 @@
 //! あるため、コードとしても残っている。
 
 pub mod background;
+pub mod constraints;
 pub mod despill;
 pub mod diagnostics;
 pub mod edges;
@@ -29,6 +30,7 @@ use image::RgbaImage;
 use crate::warning::{Warning, WarningCode};
 
 pub use background::{BackgroundEstimate, DEFAULT_BORDER, DeltaEQuantiles, estimate_background};
+pub use constraints::{Conflict, Constraint, ConstraintSource, Constraints};
 pub use diagnostics::Diagnostics;
 pub use edges::GradientQuantiles;
 pub use floodfill::{FG_SEED_RADIUS, FloodOptions, foreground_mask};
@@ -96,6 +98,12 @@ pub struct CutoutOptions {
     pub bbox: Option<(u32, u32, u32, u32)>,
     /// 「ここは必ず前景」と指定された座標
     pub fg_seeds: Vec<(u32, u32)>,
+    /// 画素ごとの確定前景／確定背景（トライマップ・マスク画像・ポリゴン）。
+    ///
+    /// 何も強制しないなら `None`。入口が何であれ、ここへ来るまでに 1 つの
+    /// 表現へ畳まれている（`constraints.rs`）。パスの解決と衝突の検査は
+    /// `commands/cutout.rs` の仕事で、`cutout/` はファイルを知らない
+    pub constraints: Option<Constraints>,
     /// 孤立ノイズ除去の半径。**長辺 1000px 換算**で指定し、面積
     /// `(2*cleanup+1)^2 * (長辺/1000)^2` 未満の連結成分を消す
     pub cleanup: u32,
@@ -131,6 +139,7 @@ impl Default for CutoutOptions {
             border: DEFAULT_BORDER,
             bbox: None,
             fg_seeds: Vec::new(),
+            constraints: None,
             cleanup: 2,
             feather: 1,
             despill: true,
@@ -265,6 +274,7 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
         tolerance: opts.tolerance,
         bbox: opts.bbox,
         fg_seeds: opts.fg_seeds.clone(),
+        constraints: opts.constraints.as_ref(),
         edge_threshold,
         // 芯の許容量は利用者に決めさせず、背景自身のばらつきから導く。
         // 「どこまでを背景と言い切れるか」は画像ごとに違い、外周の ΔE 分布が
@@ -323,7 +333,14 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
     // 高解像度ほど縁を跨げなくなっていた。面積の下限から実効半径を逆算する
     let inset =
         morphology::speck_radius(opts.cleanup, image.width(), image.height()) + opts.feather + 4;
-    let separability = boundary_separability(image, &mask, background.rgb, inset, opts.bbox);
+    let separability = boundary_separability(
+        image,
+        &mask,
+        background.rgb,
+        inset,
+        opts.bbox,
+        opts.constraints.as_ref(),
+    );
     let diagnostics = diagnostics::diagnose(image, &mask, background.rgb, opts.bbox);
     // 設定の調整はいちばん先に伝える。結果への警告は、その設定で走った結果に
     // ついてのものなので、順序が逆だと読み手が原因を後から知ることになる
@@ -369,12 +386,17 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
 /// 確定させた領域なので、その境目は「利用者が矩形をどこに置いたか」でしかなく、
 /// 輪郭の妥当性を何も語らないためである。実素材では bbox 指定時の境界画素の
 /// 6 割が矩形の辺そのものになり、除外しないと値が置き場所に支配される。
+///
+/// **確定前景と確定背景が直接接している境界も同じ理由で数えない。** そこは
+/// 利用者が引いた線そのもので、色の判断が 1 つも入っていない。それ以外
+/// （確定前景とフィルが決めた背景の境目など）は色の判断を経ているので数える。
 pub fn boundary_separability(
     image: &RgbaImage,
     mask: &Mask,
     bg: [u8; 3],
     inset: u32,
     bbox: Option<(u32, u32, u32, u32)>,
+    constraints: Option<&Constraints>,
 ) -> Option<f64> {
     let (w, h) = (mask.width(), mask.height());
     // 公開 API なので、対応しない組み合わせで panic させない
@@ -395,6 +417,16 @@ pub fn boundary_separability(
             None => true,
         }
     };
+    // 寸法の合わない指示は無かったことにする。`foreground_mask` と同じ規約で、
+    // 公開 API に届いた食い違いで panic させない
+    let forced = constraints.filter(|c| c.width() == w && c.height() == h);
+    // 利用者が引いた線そのものか。両側とも指示で塗られていれば、その境目に
+    // 色の判断は入っていない
+    let drawn = |x: u32, y: u32, nx: u32, ny: u32| -> bool {
+        forced.is_some_and(|c| {
+            c.at(x, y) == Constraint::ForcedFg && c.at(nx, ny) == Constraint::ForcedBg
+        })
+    };
     let delta_at = |x: u32, y: u32| -> f64 {
         let p = image.get_pixel(x, y).0;
         crate::color::lab::delta_e76(crate::color::lab::srgb_to_lab([p[0], p[1], p[2]]), bg_lab)
@@ -412,7 +444,9 @@ pub fn boundary_separability(
                 .into_iter()
                 .find(|(dx, dy)| {
                     let (nx, ny) = (x as i64 + dx, y as i64 + dy);
-                    inside(nx, ny) && !mask.is_foreground(nx as u32, ny as u32)
+                    inside(nx, ny)
+                        && !mask.is_foreground(nx as u32, ny as u32)
+                        && !drawn(x, y, nx as u32, ny as u32)
                 })
                 .map(|(dx, dy)| (-dx, -dy));
             let Some((ix, iy)) = inward else {
@@ -728,7 +762,7 @@ mod tests {
     #[test]
     fn a_dark_product_on_a_light_background_separates_clearly() {
         let (image, mask) = scene([250, 250, 250], [40, 40, 40]);
-        let sep = boundary_separability(&image, &mask, [250, 250, 250], 7, None).unwrap();
+        let sep = boundary_separability(&image, &mask, [250, 250, 250], 7, None, None).unwrap();
         assert!(sep > 60.0, "明暗が離れていれば大きな値になる: {sep}");
     }
 
@@ -736,7 +770,7 @@ mod tests {
     fn a_product_the_same_colour_as_the_background_does_not_separate() {
         // 今回の実写がこれ。輪郭は色の違いではなくフィルの停止位置で決まっている
         let (image, mask) = scene([84, 78, 70], [86, 80, 72]);
-        let sep = boundary_separability(&image, &mask, [84, 78, 70], 7, None).unwrap();
+        let sep = boundary_separability(&image, &mask, [84, 78, 70], 7, None, None).unwrap();
         assert!(sep < 5.0, "ほぼ同色なら小さな値になる: {sep}");
     }
 
@@ -760,7 +794,7 @@ mod tests {
                     mask.set(x, y, 255);
                 }
             }
-            let sep = boundary_separability(&image, &mask, bg, 7, None).unwrap();
+            let sep = boundary_separability(&image, &mask, bg, 7, None, None).unwrap();
             assert!(sep > 60.0, "縁 {rim}px でも商品との色差を捉えるべき: {sep}");
         }
     }
@@ -781,10 +815,10 @@ mod tests {
         }
 
         // bbox を伝えなければ、矩形の辺を色の輪郭と誤認して値を返す
-        assert!(boundary_separability(&image, &mask, bg, 7, None).is_some());
+        assert!(boundary_separability(&image, &mask, bg, 7, None, None).is_some());
         // 伝えれば、色から引かれた輪郭が1つも無いと分かる
         assert_eq!(
-            boundary_separability(&image, &mask, bg, 7, Some((10, 10, 30, 30))),
+            boundary_separability(&image, &mask, bg, 7, Some((10, 10, 30, 30)), None),
             None
         );
     }
@@ -795,14 +829,17 @@ mod tests {
         let image = RgbaImage::from_pixel(8, 8, Rgba([0, 0, 0, 255]));
         let mut mask = Mask::new(10, 10, 0);
         mask.set(5, 5, 255);
-        assert_eq!(boundary_separability(&image, &mask, [0; 3], 7, None), None);
+        assert_eq!(
+            boundary_separability(&image, &mask, [0; 3], 7, None, None),
+            None
+        );
     }
 
     #[test]
     fn separability_is_none_without_a_boundary() {
         let image = RgbaImage::from_pixel(10, 10, Rgba([0, 0, 0, 255]));
         assert_eq!(
-            boundary_separability(&image, &Mask::new(10, 10, 0), [0; 3], 7, None),
+            boundary_separability(&image, &Mask::new(10, 10, 0), [0; 3], 7, None, None),
             None
         );
     }
@@ -814,7 +851,7 @@ mod tests {
         let image = RgbaImage::from_pixel(10, 10, Rgba([255, 255, 255, 255]));
         let mask = Mask::new(10, 10, 255);
         assert_eq!(
-            boundary_separability(&image, &mask, [255, 255, 255], 7, None),
+            boundary_separability(&image, &mask, [255, 255, 255], 7, None, None),
             None
         );
     }

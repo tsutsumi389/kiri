@@ -29,6 +29,7 @@ use image::RgbaImage;
 use crate::color::lab::{delta_e76, srgb_to_lab};
 use crate::cutout::local_colour::{self, Lean, Role};
 use crate::cutout::mask::{FOREGROUND_THRESHOLD, Mask};
+use crate::cutout::morphology::BitPlane;
 
 /// 境界近傍とみなす距離(px)。
 const NEAR_BOUNDARY: i64 = 3;
@@ -284,6 +285,31 @@ pub fn contour_distance_px(width: u32, height: u32, seeds: &[(u32, u32)]) -> Opt
             .map(|d| f32::from(d) / f32::from(CHAMFER_STEP))
             .collect(),
     )
+}
+
+/// 種から `limit` px より遠い画素に印を付ける。
+///
+/// **距離そのものは返さない。** 24.5MP の実写では f32 の距離場が 98MB、u8 でも
+/// 24.5MB になるが、要るのは「上限を越えたか」の 1 ビットだけなので、
+/// チャンファーを畳んでから手放せば 3MB で済む。
+///
+/// 種が無ければ「どこからも遠い」——空の印（何も立っていない面）を返す。
+/// 輪郭が 1 本も無いマスクで全画素を「遠い」と言うと、塗り直しが丸ごと
+/// 止まってしまう。
+pub fn farther_than(width: u32, height: u32, seeds: &[(u32, u32)], limit: u32) -> BitPlane {
+    let cells = (width as usize) * (height as usize);
+    let mut out = BitPlane::new(cells);
+    if seeds.is_empty() {
+        return out;
+    }
+    let cap = (limit * u32::from(CHAMFER_STEP)).min(u32::from(u8::MAX)) as u8;
+    let field = chamfer_distance(seeds, (0, 0, width - 1, height - 1));
+    for (i, &d) in field.data.iter().enumerate() {
+        if d > cap {
+            out.insert(i);
+        }
+    }
+    out
 }
 
 /// 二値輪郭が、平滑化した参照輪郭からどれだけ離れているかの平均

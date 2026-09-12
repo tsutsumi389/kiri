@@ -113,36 +113,54 @@ const BAND_ROUGHNESS_GAIN: f64 = 2.0;
 /// 0.007（R1 assisted 0.082 → 0.089）に留める。
 const GUIDED_MARGIN: u32 = 1;
 
-/// 二値マスクの塗り直しを繰り返す回数。
+/// 二値マスクの塗り直しを繰り返す回数の**上限**。
 ///
-/// **1 回では届かない。** 塗り直せるのは帯の中だけなので、1 パスで剥がせる
-/// のは帯幅ぶん（既定で最大 10px）に留まる。ところが実写の不織布では、
-/// マスクが真の輪郭より 20px 級はみ出す場所がある。しかもその状態では
-/// 「帯の外の前景」＝局所前景 F そのものが繊維なので、分離が足りず判定不能に
-/// 落ちる画素が多い。1 パス剥がすと F が商品に近づき、次のパスで判定できる
-/// 画素が増える——**欠陥が大きいほど効きが悪い**という逆立ちが、繰り返しで
-/// ほどける。
+/// **1 回では届かない。** 塗り直せるのは帯の中だけなので、1 パスで剥がせるのは
+/// 帯幅ぶん（既定で最大 10px）に留まる。ところが実写の不織布では、マスクが
+/// 真の輪郭より 20px 級はみ出す場所がある。しかもその状態では「帯の外の前景」＝
+/// 局所前景 F そのものが繊維なので、分離が足りず判定不能に落ちる画素が多い。
+/// 1 パス剥がすと F が商品に近づき、次のパスで判定できる画素が増える——
+/// **欠陥が大きいほど効きが悪い**という逆立ちが、繰り返しでほどける。
 ///
-/// | パス | R1 assisted 輪郭誤差 | rim 正解 | 粗さの較正（クリーン側の余裕） |
-/// |---|---|---|---|
-/// | 1 | 14.14 | 0.415 | 1.96 倍 |
-/// | 2 | 9.91 | 0.325 | 1.96 倍 |
-/// | 3 | 8.15 | 0.294 | 1.96 倍 |
-/// | **4** | **5.93** | **0.237** | **1.96 倍** |
-/// | 5 | 4.20 | 0.194 | 1.21 倍 |
-/// | 8 | 2.93 | 0.157 | 1.21 倍 |
+/// **止めるのは収束であって、回数ではない。** 以前はここを 4 に固定し、その
+/// 理由を「5 パス目で R2 assisted が較正の母集団でクリーン側へ移り、粗さの
+/// 警告の余裕が落ちるから」と書いていた。それは**出力の質ではなく自分の較正の
+/// 都合で処理を止めている**。いまは `changed == 0` まで回し、8 はその上限——
+/// 収束しない入力で時間が青天井にならないための歯止め——にしてある。
+/// 累積の移動量には別に上限があるので（`reach_limit`）、回数を増やしても
+/// 背景色のチャネルを任意に深く進むことはない。
 ///
-/// 商品の側は削れない。色の門が真の輪郭で止めるので、合成 S3（淡色商品）の
-/// `eaten` はパス数を 1 → 8 と振っても 2〜3% で上下するだけで、単調に伸びない。
-/// 伸びるのは背景側だけである。
+/// **上限は出力の質で決めた。** 以前は「5 パス目で較正の余裕が落ちるから」と
+/// 書いていたが、それは自分の較正の都合で処理を止めている。パス数ごとの実測
+/// （docs/design.md 4.10 の表）から読めるのは次の 2 つである。
 ///
-/// **上限を決めるのは診断の側である。** 5 パス目で R2 assisted の輪郭誤差が
-/// 1.0px@1000 を割り、較正の母集団でクリーン側へ移る。そこの粗さは 0.132 で、
-/// `CONTOUR_ROUGH_WARN`（0.16）との余裕が 1.96 倍から 1.21 倍へ落ちる——
-/// **誤分類はしないが、JPEG の量子化で警告が出たり出なかったりする距離**に
-/// 入る。4 は、正解由来の合格条件（R1/R5/R6 の rim 正解と輪郭誤差）を
-/// すべて満たす中で、較正の余裕を Phase 2 のまま保てる最大のパス数である。
+/// - **7 パス以上で細部が消える。** 長辺 1000px に置いた 7x7 の突起が、6 パス
+///   までは 49px² のまま残り、7 パスで丸ごと落ちる（`a_speck_scales_with_the_
+///   resolution_but_small_images_are_untouched`）。色の門は「判定不能」を
+///   通すので、確定前景を借りられないほど孤立した細部では (c) の多数決が
+///   角から削る。ここは上限 6 で切れる
+/// - **5 パス以上で良品に誤警告が出る距離に入る。** R2 assisted は 5 パスで
+///   正解の輪郭誤差が 0.96px——良品——になるが、その粗さは 0.137 で
+///   `CONTOUR_ROUGH_WARN`（0.16）まで 16% しかない。JPEG の量子化で警告が
+///   出たり出なかったりする距離であり、**出た側に回った利用者には回せるノブが
+///   無い**（`CONTOUR_ROUGH` は hint を持たない）。H2 と同じ「解けないループ」を
+///   自分から作ることになる
+///
+/// 4 は、正解由来の合格条件（R1/R5/R6 の rim 正解と輪郭誤差）をすべて満たす
+/// 中で、この 2 つを両方避けられる最大のパス数である。
 const RESHAPE_PASSES: u32 = 4;
+
+/// 元の二値輪郭から、塗り直しが離れてよい距離の倍率（帯幅の最大に掛ける）。
+///
+/// **「帯の外を触らない」は 1 パスの性質でしかない。** パスごとに帯を引き直す
+/// ので、累積では `RESHAPE_PASSES × max_radius` 動きうる。幅 12px の背景色の
+/// スリットが 4 パスで端まで走り抜ける、という形でそれが出る。
+///
+/// そこで元の二値マスクの輪郭からの距離を測り、`2 × max_radius` より深い画素は
+/// 塗り直さない。2 倍にするのは、正当な修正が「内へ max_radius・外へ
+/// max_radius」の範囲に収まるためで、それを越える移動は輪郭の修正ではなく
+/// 別の領域への進入である。**保証はパス単位ではなく累積で立つ。**
+const REACH_PASSES: u32 = 2;
 
 /// 境界のアルファの解き方。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -465,6 +483,11 @@ fn reshape(
     let window = (local_colour::RIM_WINDOW * scale).ceil() as u32;
     let stride = w as usize;
     *sealed = BitPlane::new(stride * (h as usize));
+    // 元の輪郭から離れすぎた画素には触らない（累積の上限）。距離そのものは
+    // 持たず、「越えたか」の 1 ビットに畳んでから手放す
+    let reach = REACH_PASSES * opts.max_radius.clamp(1, RADIUS_CEILING);
+    let out_of_reach =
+        diagnostics::farther_than(w, h, &diagnostics::contour_pixels(original, None), reach);
     for _ in 0..RESHAPE_PASSES {
         let Some(bounds) = band_bounds(band, w, h) else {
             break;
@@ -484,11 +507,19 @@ fn reshape(
                 }
             });
             if opts.reclassify {
-                changed += reclassify_rim(image, shape, band, &grid, bounds);
+                changed += reclassify_rim(image, shape, band, &out_of_reach, &grid, bounds);
             }
             if smooth_radius > 0 {
-                changed +=
-                    smooth_in_band(shape, original, band, &grid, image, smooth_radius, bounds);
+                changed += smooth_in_band(
+                    shape,
+                    original,
+                    band,
+                    &out_of_reach,
+                    &grid,
+                    image,
+                    smooth_radius,
+                    bounds,
+                );
             }
         }
         if changed == 0 {
@@ -551,6 +582,7 @@ fn reclassify_rim(
     image: &RgbaImage,
     shape: &mut Mask,
     band: &[u8],
+    out_of_reach: &BitPlane,
     grid: &LocalColours,
     bounds: (u32, u32, u32, u32),
 ) -> usize {
@@ -562,7 +594,7 @@ fn reclassify_rim(
         let row = (y as usize) * w;
         for x in x0..=x1 {
             let i = row + (x as usize);
-            if band[i] == 0 {
+            if band[i] == 0 || out_of_reach.contains(i) {
                 continue;
             }
             let Some(lean) = grid.classify(grid.cell(x, y), &pixels[i * 4..i * 4 + 3]) else {
@@ -602,6 +634,7 @@ fn smooth_in_band(
     shape: &mut Mask,
     original: &Mask,
     band: &[u8],
+    out_of_reach: &BitPlane,
     grid: &LocalColours,
     image: &RgbaImage,
     radius: u32,
@@ -677,7 +710,7 @@ fn smooth_in_band(
                 let row = (y as usize) * stride;
                 for x in tile_x..=tx1 {
                     let i = row + (x as usize);
-                    if band[i] == 0 {
+                    if band[i] == 0 || out_of_reach.contains(i) {
                         continue;
                     }
                     let qx0 = (x.saturating_sub(radius).max(px0) - px0) as usize;
@@ -2059,7 +2092,7 @@ mod tests {
                 Role::Background
             }
         });
-        let changed = reclassify_rim(&img, &mut shape, &band, &grid, bounds);
+        let changed = reclassify_rim(&img, &mut shape, &band, &BitPlane::default(), &grid, bounds);
         assert!(changed > 0, "縁が 1 画素も塗り直されていない");
         assert!(
             !shape.is_foreground(32, 20),
@@ -2110,7 +2143,7 @@ mod tests {
             }
         });
         assert_eq!(
-            reclassify_rim(&img, &mut shape, &band, &grid, bounds),
+            reclassify_rim(&img, &mut shape, &band, &BitPlane::default(), &grid, bounds),
             0,
             "色で決められないのにマスクを書き換えている"
         );
@@ -2145,7 +2178,16 @@ mod tests {
                 Role::Background
             }
         });
-        smooth_in_band(&mut shape, &original, &band, &grid, &img, 2, bounds);
+        smooth_in_band(
+            &mut shape,
+            &original,
+            &band,
+            &BitPlane::default(),
+            &grid,
+            &img,
+            2,
+            bounds,
+        );
         assert!(
             shape.is_foreground(29, 20),
             "色の門を通さないメディアンが 3px のストラップを消している"
@@ -2195,6 +2237,65 @@ mod tests {
         };
         assert!(!opened(1), "幅 1px の切れ込みが塞がっていない");
         assert!(opened(5), "幅 5px の隙間まで塞いでいる");
+    }
+
+    /// 塗り直しの累積の移動量に上限が掛かっていること。(M1)
+    ///
+    /// **「帯の外を触らない」は 1 パスの性質でしかない。** パスごとに帯を
+    /// 引き直すので、累積では `RESHAPE_PASSES × max_radius` 動きうる。上限は
+    /// 元の二値輪郭からの距離で掛ける。
+    ///
+    /// ここで確かめるのは**配線**である——上限の面が実際に引かれ、帯の中でも
+    /// 上限の外なら塗り直しが止まること。合成シーンでも実写ベンチでも、現状の
+    /// 既定値ではこの上限に届く画素は 1 つも無い（R1/R2/R5/R6/S3 の指標は
+    /// 上限の有無で 1 桁目まで一致する）。**届いていないことと、無くてよいことは
+    /// 別である。**
+    #[test]
+    fn the_repaint_is_capped_by_the_distance_from_the_original_contour() {
+        let (w, h) = (60u32, 40u32);
+        let bg = [250u8, 250, 249];
+        let mut img = RgbaImage::from_pixel(w, h, Rgba([bg[0], bg[1], bg[2], 255]));
+        let mut shape = Mask::new(w, h, 0);
+        for y in 0..h {
+            for x in 0..w {
+                if x < 30 {
+                    img.put_pixel(x, y, Rgba([40, 40, 45, 255]));
+                }
+                // マスクは商品より 3px 右まで広がっている（背景色のまま不透明な縁）
+                if x < 33 {
+                    shape.set(x, y, u8::MAX);
+                }
+            }
+        }
+        let band = band_map(&img, &shape, bg, DEFAULT_MIN_RADIUS, DEFAULT_MAX_RADIUS);
+        let bounds = band_bounds(&band, w, h).expect("帯がある");
+        let grid = local_colour::build(&img, grow(bounds, 8, w, h), 1.0, |x, y| {
+            if band[(y as usize) * (w as usize) + (x as usize)] != 0 {
+                Role::Skip
+            } else if shape.is_foreground(x, y) {
+                Role::Foreground
+            } else {
+                Role::Background
+            }
+        });
+        // 上限 0px なら、動けるのは元の輪郭そのものの列だけ
+        let contour = diagnostics::contour_pixels(&shape, None);
+        assert!(!contour.is_empty(), "前提: 元の輪郭がある");
+        let out_of_reach = diagnostics::farther_than(w, h, &contour, 0);
+        let mut capped = shape.clone();
+        let moved = reclassify_rim(&img, &mut capped, &band, &out_of_reach, &grid, bounds);
+        assert!(
+            moved <= contour.len(),
+            "上限の外まで塗り直している: {moved} 画素（輪郭は {} 画素）",
+            contour.len()
+        );
+        // 上限を外せば、背景色のままの縁が 3 列ぶん落ちる（対照）
+        let mut free = shape.clone();
+        let all = reclassify_rim(&img, &mut free, &band, &BitPlane::default(), &grid, bounds);
+        assert!(
+            all > moved,
+            "上限を外しても塗り直しが増えない＝対照になっていない: {all} vs {moved}"
+        );
     }
 
     /// `--seal` が塞いだ隙間を、色から解き直したアルファが取り消さないこと。

@@ -324,7 +324,7 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
     let inset =
         morphology::speck_radius(opts.cleanup, image.width(), image.height()) + opts.feather + 4;
     let separability = boundary_separability(image, &mask, background.rgb, inset, opts.bbox);
-    let diagnostics = diagnostics::diagnose(image, &mask, background.rgb);
+    let diagnostics = diagnostics::diagnose(image, &mask, background.rgb, opts.bbox);
     // 設定の調整はいちばん先に伝える。結果への警告は、その設定で走った結果に
     // ついてのものなので、順序が逆だと読み手が原因を後から知ることになる
     let mut warnings = Vec::from_iter(texture_warning);
@@ -560,8 +560,10 @@ fn collect_warnings(
     // 前景の外側に背景色のままの縁が張り付いていても値が悪化しない。
     // この縁は白背景では見えず、黒や色付きの下地に載せて初めて光輪として現れる。
     // 納品先の背景が分からない以上、書き出しの時点で知らせる必要がある
+    let mut halo_remains = false;
     if let Some(halo) = diagnostics.halo_ratio {
         if halo > diagnostics::HALO_WARN {
+            halo_remains = true;
             warnings.push(
                 Warning::new(
                     WarningCode::HaloRemains,
@@ -583,6 +585,55 @@ fn collect_warnings(
                 .with_hint("--tolerance を上げると背景の残りが減ります")
                 .with_data("halo_ratio", round4(halo)),
             );
+        }
+    }
+
+    // 輪郭の蛇行と、縁に張り付いた背景のテクスチャ。**どちらも halo_ratio では
+    // 見えない。** 実写（不織布の上のリモコン）は halo_ratio 0.001 /
+    // separability 54.7 という合格の数値を返しながら、拡大すると上辺と下辺が
+    // ギザギザで、不織布の灰色の粒が輪郭に張り付いていた。
+    if let Some(roughness) = diagnostics.contour_roughness {
+        if roughness > diagnostics::CONTOUR_ROUGH_WARN {
+            warnings.push(
+                Warning::new(
+                    WarningCode::ContourRough,
+                    format!(
+                        "境界が滑らかではありません（長辺 1000px 換算で {roughness:.2} px の\
+                         ギザギザ）。背景のテクスチャが輪郭に乗っている可能性があります"
+                    ),
+                )
+                // **hint は付けない。** 今の kiri に粗さを直すノブは無く、
+                // 実行できない助言は助言が無いより悪い（`--tolerance` を上げても
+                // 蛇行そのものは動かない。動くのは次の指標のほうである）
+                .with_data("contour_roughness", round4(roughness)),
+            );
+        }
+    }
+    if let Some(rim) = diagnostics.rim_contamination {
+        if rim > diagnostics::RIM_CONTAMINATION_WARN {
+            let mut warning = Warning::new(
+                WarningCode::RimContaminated,
+                format!(
+                    "境界の内側 {:.1}% が、商品の色より背景の色に近いままです \
+                     (rim_contamination={rim:.3})。輪郭に背景のテクスチャが\
+                     張り付いている可能性があります",
+                    rim * 100.0,
+                ),
+            )
+            .with_data("rim_contamination", round4(rim));
+            // **`HALO_REMAINS` が一緒に出ているときだけ tolerance を勧める。**
+            // 縁が「背景色のまま」残っているなら、tolerance を上げれば減る
+            // （実写で確認されている唯一のノブ）。だが汚染だけが出ている状態は
+            // 別物である——S7（中間グレー商品 + 落ち影）は tolerance を
+            // どちらへ動かしても値が動かない。縁に乗っているのが背景色そのもの
+            // ではなく、影や繊維との混色だからで、**実行できない助言は助言が
+            // 無いより悪い**（`CONTOUR_ROUGH` に hint を付けないのと同じ判断）。
+            // 文面は `HALO_REMAINS` と同じにする。同じ原因に別の言い方をすると、
+            // エージェントは手が 2 つあると読む
+            if halo_remains {
+                warning = warning.with_hint("--tolerance を上げると背景の残りが減ります");
+            }
+            warnings.push(warning);
         }
     }
 
@@ -664,6 +715,8 @@ mod tests {
         Diagnostics {
             halo_ratio: Some(0.0),
             edge_width: Some(1.5),
+            contour_roughness: Some(0.2),
+            rim_contamination: Some(0.0),
         }
     }
 
@@ -887,6 +940,8 @@ mod tests {
             &Diagnostics {
                 halo_ratio: Some(0.1627),
                 edge_width: Some(3.0),
+                contour_roughness: Some(0.2),
+                rim_contamination: Some(0.0),
             },
             None,
             true,

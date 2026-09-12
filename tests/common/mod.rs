@@ -213,6 +213,127 @@ impl Default for EdgeScene {
     }
 }
 
+/// 合成背景のシーン一覧。
+///
+/// **`tests/` の 2 つのテストが同じ一覧を見る。** `edge_quality.rs` は個々の
+/// シーンで境界の質を固定し、`real_backgrounds.rs` は同じ一覧を実写背景の
+/// シーンと並べて診断値の相関を見る。別々に持てば必ず離れる。
+pub fn edge_scenes() -> Vec<EdgeScene> {
+    vec![
+        EdgeScene {
+            name: "S1 濃色商品/白背景/JPEG q90",
+            ..Default::default()
+        },
+        EdgeScene {
+            name: "S2 同上 PNG(非圧縮)",
+            jpeg: None,
+            ..Default::default()
+        },
+        // 白背景に置いた淡色商品。上端のハイライトで商品は 221 まで明るくなり、
+        // 背景 248 との輪郭のコントラストは ΔE 9.5 まで落ちる。既定の
+        // tolerance 12 より小さいので、**色だけを見れば商品はまるごと背景**
+        // である。連結性と段差の検査だけがこれを商品として残している
+        EdgeScene {
+            name: "S3 淡色商品(輪郭 ΔE 9.5)",
+            product: [232, 232, 230],
+            shading: (0.98, 0.80),
+            ..Default::default()
+        },
+        EdgeScene {
+            name: "S4 柔らかい輪郭(8px)",
+            softness: 8.0,
+            ..Default::default()
+        },
+        EdgeScene {
+            name: "S5 3px のストラップ",
+            strap: Some(3),
+            ..Default::default()
+        },
+        EdgeScene {
+            name: "S5b 5px のストラップ",
+            strap: Some(5),
+            ..Default::default()
+        },
+        EdgeScene {
+            name: "S6 落ち影あり",
+            shadow: true,
+            ..Default::default()
+        },
+        EdgeScene {
+            name: "S7 中間グレー商品+影",
+            product: [150, 150, 150],
+            shadow: true,
+            ..Default::default()
+        },
+        EdgeScene {
+            name: "S8 黒商品+影",
+            product: [20, 20, 20],
+            shadow: true,
+            ..Default::default()
+        },
+        // 高解像度での影の暴走を捕まえるシーン。無彩色の商品・落ち影・柔らかい
+        // 輪郭という、影の判定にとって最悪の 3 つを重ねてある。影の段だけは
+        // 堤防を無視するので、柔らかい輪郭は通り抜けられてしまう。進める距離が
+        // 解像度に比例して伸びると、そこから商品の内部まで届く。
+        // 他のシーンは 600px なので、解像度に依存する崩れはここでしか出ない
+        EdgeScene {
+            name: "S10 高解像度/無彩色商品+影+柔輪郭",
+            width: 1600,
+            height: 1600,
+            product: [150, 150, 150],
+            softness: 4.0,
+            shadow: true,
+            ..Default::default()
+        },
+        // 織り目のある背景。不織布・キャンバス地のように 1px あたりの変化が
+        // 大きい素材を敷き、その上に濃色の商品を置く。既定の堤防（勾配 8）は
+        // 布の織り目そのものに反応して**背景の中で**壁になり、フィルが商品まで
+        // 届かない（堤防を 8 に固定した実測で前景比率 0.85、縁の残り 100%）。
+        //
+        // 周期 6px・振幅 12 は実写（不織布、外周の勾配 p90 27.9）の性質を
+        // 縮めたもので、外周の勾配 p90 は 14 になる。周期を 8px に広げると
+        // 稜線が疎になって壁にならず、この崩れは再現しない
+        EdgeScene {
+            name: "S11 織り目のある背景",
+            width: 1200,
+            height: 1200,
+            background: [177, 174, 168],
+            product: [35, 35, 38],
+            shading: (1.0, 1.0),
+            weave: Some((12.0, 6.0)),
+            noise: 1.0,
+            ..Default::default()
+        },
+        // S11 の織り目の上に**淡色**の商品を置く。テクスチャ検知が「無効化」では
+        // なく「引き上げ」でなければならない理由がここに出る。S11 は濃色商品
+        // なので堤防を切っても崩れず、引き上げ幅が何倍でも同じ結果になってしまう。
+        //
+        // 商品の輪郭は 1px あたり 28 の段差を持ち、織り目（p90 14.0）より大きい。
+        // 堤防を 21 に置けば織り目は越えられて輪郭では止まる、という
+        // 「引き上げ」の狙いがそのまま成立する唯一のシーンである
+        EdgeScene {
+            name: "S12 織り目のある背景 + 淡色商品",
+            width: 1200,
+            height: 1200,
+            background: [177, 174, 168],
+            product: [205, 202, 196],
+            shading: (1.0, 1.0),
+            weave: Some((12.0, 6.0)),
+            noise: 1.0,
+            ..Default::default()
+        },
+        // 解けないケース。商品の明度が上から下へ変化する途中で背景色を
+        // **横切る**ため、輪郭のコントラストが 0 になる行が存在する。そこでは
+        // 色による分離が原理的に不可能で、いったん入られると商品の内部は
+        // 一様なのでフィルが広がる。判定はせず、表に出して限界を可視化する
+        EdgeScene {
+            name: "S9 淡色商品(明度が背景を横切る)",
+            product: [232, 232, 230],
+            ..Default::default()
+        },
+    ]
+}
+
 /// 合成した画像と、その画素ごとの正解。
 pub struct EdgeTruth {
     pub image: RgbaImage,
@@ -239,13 +360,73 @@ fn rect_sdf(px: f32, py: f32, cx: f32, cy: f32, hx: f32, hy: f32, corner: f32) -
     qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - corner
 }
 
+/// 商品の形（角丸矩形と、任意で上へ伸びるストラップ）。
+///
+/// **`edge_scene` と `real_scene` が同じ形を作るために切り出してある。**
+/// 片方だけ寸法や被覆率の規則が動くと、合成背景のシーンと実写背景のシーンを
+/// 同じ物差しで並べられなくなる。既存の S シーンの画素を 1 ビットも変えない
+/// ため、計算の順序も元のままにしてある。
+struct ProductShape {
+    cx: f32,
+    cy: f32,
+    rx: f32,
+    ry: f32,
+    corner: f32,
+    /// 画像の高さ。ストラップの上端を決めるのに要る
+    height: f32,
+    strap: Option<u32>,
+    softness: f32,
+}
+
+impl ProductShape {
+    fn new(width: u32, height: u32, strap: Option<u32>, softness: f32) -> Self {
+        let (fw, fh) = (width as f32, height as f32);
+        let (rx, ry) = (fw * 0.28, fh * 0.34);
+        Self {
+            cx: fw / 2.0,
+            cy: fh / 2.0,
+            rx,
+            ry,
+            corner: rx.min(ry) * 0.3,
+            height: fh,
+            strap,
+            softness,
+        }
+    }
+
+    /// 画素中心での (符号付き距離, 被覆率, ストラップの芯か)。
+    fn at(&self, fx: f32, fy: f32) -> (f32, f32, bool) {
+        let mut d = rect_sdf(fx, fy, self.cx, self.cy, self.rx, self.ry, self.corner);
+        let mut core = false;
+        if let Some(sw) = self.strap {
+            let top = self.height * 0.08;
+            let bottom = self.cy - self.ry + self.corner;
+            let ds = rect_sdf(
+                fx,
+                fy,
+                self.cx,
+                (top + bottom) / 2.0,
+                sw as f32 / 2.0,
+                (bottom - top) / 2.0,
+                0.0,
+            );
+            if ds < d {
+                d = ds;
+                core = ds <= -0.5;
+            }
+        }
+        let c = (0.5 - d / self.softness).clamp(0.0, 1.0);
+        (d, c, core)
+    }
+}
+
 /// シーンから画像と正解を生成する。
 pub fn edge_scene(scene: &EdgeScene) -> EdgeTruth {
     let (w, h) = (scene.width, scene.height);
     let (fw, fh) = (w as f32, h as f32);
     let (cx, cy) = (fw / 2.0, fh / 2.0);
     let (rx, ry) = (fw * 0.28, fh * 0.34);
-    let corner = rx.min(ry) * 0.3;
+    let shape = ProductShape::new(w, h, scene.strap, scene.softness);
     let n = (w as usize) * (h as usize);
 
     let mut rng = Rng::new();
@@ -259,27 +440,8 @@ pub fn edge_scene(scene: &EdgeScene) -> EdgeTruth {
         for x in 0..w {
             let i = (y as usize) * (w as usize) + (x as usize);
             let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-            let mut d = rect_sdf(fx, fy, cx, cy, rx, ry, corner);
-            if let Some(sw) = scene.strap {
-                let top = fh * 0.08;
-                let bottom = cy - ry + corner;
-                let ds = rect_sdf(
-                    fx,
-                    fy,
-                    cx,
-                    (top + bottom) / 2.0,
-                    sw as f32 / 2.0,
-                    (bottom - top) / 2.0,
-                    0.0,
-                );
-                if ds < d {
-                    d = ds;
-                    if ds <= -0.5 {
-                        strap[i] = true;
-                    }
-                }
-            }
-            let c = (0.5 - d / scene.softness).clamp(0.0, 1.0);
+            let (d, c, core) = shape.at(fx, fy);
+            strap[i] = core;
             let mut nz = rng.jitter(scene.noise);
             // 織り目は商品の下には回り込まない。布の上に商品が載っている状況を
             // 模すので、被覆率が 0 の画素にだけ乗せる
@@ -357,6 +519,527 @@ pub fn edge_scene(scene: &EdgeScene) -> EdgeTruth {
     }
 }
 
+/// 実写の背景写真の上に、正解の被覆率が解析的に分かる商品を載せたシーン。
+///
+/// **合成背景では実写の不織布を再現できない。** `EdgeScene` の `weave`（正弦の積）は
+/// 周期も振幅も一定で、照明ムラ・しわ・繊維の向きを持たない。design.md も
+/// 「周期 8px では再現しない」と認めているとおり、崩れが出るかどうかが周期の
+/// 選び方に依存してしまう。背景だけを実写にすれば、テクスチャは本物のまま、
+/// 商品の輪郭には解析的な正解が残る。
+#[derive(Clone)]
+pub struct RealScene {
+    pub name: &'static str,
+    /// `tests/fixtures/backgrounds/` のファイル名
+    pub background: &'static str,
+    /// フィクスチャより大きくしないこと。中央から切り出す
+    pub width: u32,
+    pub height: u32,
+    pub product: [u8; 3],
+    pub softness: f32,
+    pub shading: (f32, f32),
+    pub strap: Option<u32>,
+    pub jpeg: Option<u8>,
+    /// 背景をこの σ(px) でぼかしてから使う。ぼかした後に振幅 1.5 の
+    /// センサーノイズを乗せ直す。
+    ///
+    /// **「きれいなスタジオ背景の実写」を手持ちの素材から作るための細工である。**
+    /// 誤警報側の較正がすべて合成の S シーンに依っていると、「実写の照明と
+    /// ノイズを持ちながら欠陥が無い」点が 1 つも無いまま、しきい値を実写に
+    /// 寄せることになる。繊維をぼかしで消せば、照明勾配と実写のノイズ床だけが
+    /// 残る——これは紙やアクリルのスタジオ背景そのものの性質である。
+    ///
+    /// ノイズを乗せ直すのは、ぼかしが画素間のばらつきを消してしまうためである。
+    /// σ が 0 の背景は実写ではありえないし、`rim_contamination` の σ0 が
+    /// まさにその床を当てにしている
+    pub blur: Option<f32>,
+    /// `assisted`（kiri 自身の hint に従って到達する設定）で使う tolerance
+    pub assisted_tolerance: f64,
+}
+
+impl Default for RealScene {
+    fn default() -> Self {
+        Self {
+            name: "",
+            background: "fabric_a.jpg",
+            width: 1200,
+            height: 1200,
+            product: [35, 35, 38],
+            softness: 1.0,
+            // 実写の背景は自前の照明ムラを持っている。合成側でさらに傾けると、
+            // 「背景のムラ」と「商品のムラ」のどちらが効いたか分けられなくなる
+            shading: (1.0, 1.0),
+            strap: None,
+            jpeg: Some(90),
+            blur: None,
+            assisted_tolerance: 60.0,
+        }
+    }
+}
+
+/// 実写背景のシーン一覧。
+pub fn real_scenes() -> Vec<RealScene> {
+    vec![
+        // 実写（白い不織布の上の黒いリモコン）の再現。ギザギザと繊維の融合が
+        // ここに出る。tolerance 60 は実写で HALO_REMAINS の hint に従って
+        // 到達した値で、そこが最良だった
+        RealScene {
+            name: "R1 不織布 + 黒商品",
+            ..Default::default()
+        },
+        // 同じ不織布の別の場所。上が明るく下が暗い大域の照明勾配を持つ
+        RealScene {
+            name: "R2 照明勾配の不織布 + 黒商品",
+            background: "fabric_b.jpg",
+            ..Default::default()
+        },
+        // 色差が小さい側。布（180,173,162）との ΔE は 12 前後しかない。
+        //
+        // **ここだけ tolerance を上げない。** 既定値で回しても `HALO_REMAINS` は
+        // 出ないので、hint に従うエージェントは bbox を足すところで止まる。
+        // 実際に 60 まで上げると商品がまるごと背景として飲まれ（実測 eaten 100%、
+        // 前景比率 0.011）、「hint に従って到達する設定」ではなくなる
+        RealScene {
+            name: "R3 不織布 + 淡色商品",
+            product: [205, 202, 196],
+            assisted_tolerance: 12.0,
+            ..Default::default()
+        },
+        // 暗背景 × 明商品。机は不織布よりなめらかだが、埃と照明ムラを持つ
+        RealScene {
+            name: "R4 暗い机 + 白商品",
+            background: "desk_a.jpg",
+            width: 600,
+            height: 1200,
+            product: [235, 235, 232],
+            ..Default::default()
+        },
+        // 細部が粗さとして誤検出されないかを見る。3px のストラップは平滑化で
+        // 消えるので、原理的に粗さとして数えられる側にある
+        RealScene {
+            name: "R5 不織布 + 3px ストラップ",
+            strap: Some(3),
+            ..Default::default()
+        },
+        // 遷移幅と粗さの分離。8px かけて溶ける輪郭は edge_width を押し上げるが、
+        // 蛇行しているわけではない
+        RealScene {
+            name: "R6 不織布 + 柔らかい輪郭 8px",
+            softness: 8.0,
+            ..Default::default()
+        },
+        // **クリーン側の対照である。** 他の R シーンはすべて欠陥側にあり、
+        // 誤警報の較正が合成の S シーンだけに依っていた。繊維をぼかしで消すと、
+        // 照明勾配と実写のノイズ床を持ったまま欠陥だけが無い背景になる
+        // ——紙やアクリルのスタジオ背景がまさにこれである。
+        //
+        // **既定値でも assisted でも両方の警告が出ないこと**をテストで固定する。
+        // ここが落ちれば、しきい値は「実写である」ことに反応していることになる
+        RealScene {
+            name: "R7 照明勾配のある紙 + 黒商品",
+            background: "fabric_b.jpg",
+            blur: Some(6.0),
+            ..Default::default()
+        },
+    ]
+}
+
+/// 実写背景のシーンから画像と正解を生成する。
+///
+/// **合成は線形 RGB で行う。** 合成は光の量の足し算であり、`refine` もその前提で
+/// アルファを解く（`refine.rs` の冒頭）。正解側が sRGB のまま混ぜると、中間
+/// アルファに系統誤差が乗って「実装が正しくても正解とずれる」ことになる。
+///
+/// **既存の S シーン（`edge_scene`）が sRGB で混ぜているのは承知のうえで変えない。**
+/// あちらは回帰の基準であり、画素を動かせば固定してきた数値が全部動く。
+///
+/// 影は合成しない。実写の背景に合成の影を落としても本物にはならない。
+pub fn real_scene(scene: &RealScene) -> EdgeTruth {
+    let (w, h) = (scene.width, scene.height);
+    let fh = h as f32;
+    let mut backdrop = load_background(scene.background, w, h);
+    if let Some(sigma) = scene.blur {
+        backdrop = blurred_with_noise(&backdrop, sigma);
+    }
+    let shape = ProductShape::new(w, h, scene.strap, scene.softness);
+    let n = (w as usize) * (h as usize);
+
+    let mut image = RgbaImage::new(w, h);
+    let mut coverage = vec![0f32; n];
+    let mut distance = vec![0f32; n];
+    let mut strap = vec![false; n];
+
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y as usize) * (w as usize) + (x as usize);
+            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+            let (d, c, core) = shape.at(fx, fy);
+            strap[i] = core;
+
+            let b = backdrop.get_pixel(x, y).0;
+            let (top, bottom) = scene.shading;
+            let shade = top + (bottom - top) * (fy / fh);
+            let mut rgb = [0u8; 3];
+            for (k, slot) in rgb.iter_mut().enumerate() {
+                let back = srgb_to_linear(f32::from(b[k]) / 255.0);
+                let front =
+                    srgb_to_linear((f32::from(scene.product[k]) * shade).clamp(0.0, 255.0) / 255.0);
+                let mixed = back * (1.0 - c) + front * c;
+                *slot = (linear_to_srgb(mixed) * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
+            image.put_pixel(x, y, Rgba([rgb[0], rgb[1], rgb[2], 255]));
+            coverage[i] = c;
+            distance[i] = d;
+        }
+    }
+
+    if let Some(q) = scene.jpeg {
+        image = jpeg_roundtrip(&image, q);
+    }
+
+    EdgeTruth {
+        image,
+        coverage,
+        distance,
+        shadow: vec![0f32; n],
+        strap,
+    }
+}
+
+/// R シーンを 1 通りの設定で回した結果。
+///
+/// `CutoutResult` をそのまま持たない。1200x1200 の RGBA が 1 点あたり 5.7MB あり、
+/// 20 点の表を作るだけでメモリが跳ねる。表と判定に要るものだけを残す。
+pub struct RealRun {
+    pub setting: &'static str,
+    pub tolerance: f64,
+    pub bbox: Option<(u32, u32, u32, u32)>,
+    pub metrics: EdgeMetrics,
+    pub diagnostics: kiri::cutout::Diagnostics,
+    pub separability: Option<f64>,
+    pub foreground_ratio: f64,
+    /// 出た警告の code。文言ではなく code で拾うのは本体と同じ規約
+    pub warnings: Vec<String>,
+}
+
+/// R シーンを `defaults` と `assisted` の 2 通りで回す。
+///
+/// `assisted` は「**AI エージェントが kiri 自身の hint に従って到達する設定**」である。
+/// `BBOX_RECOMMENDED` が示す矩形（ベンチでは正解の矩形 + 余白 5%）と、
+/// `HALO_REMAINS` の hint に従って上げた `--tolerance` の 2 つで、実写
+/// （不織布の上のリモコン）ではこの 2 手で最良に到達した。**既定値だけを測ると、
+/// 「エージェントが実際に受け取る結果」を測っていないことになる。**
+pub fn run_real(scene: &RealScene) -> (EdgeTruth, Vec<RealRun>) {
+    use kiri::cutout::{CutoutOptions, cutout};
+
+    let truth = real_scene(scene);
+    let bbox = assisted_bbox(&truth);
+    let settings = [
+        ("defaults", CutoutOptions::default()),
+        (
+            "assisted",
+            CutoutOptions {
+                bbox: Some(bbox),
+                tolerance: scene.assisted_tolerance,
+                ..Default::default()
+            },
+        ),
+    ];
+
+    let runs = settings
+        .into_iter()
+        .map(|(setting, opts)| {
+            let result = cutout(&truth.image, &opts);
+            RealRun {
+                setting,
+                tolerance: opts.tolerance,
+                bbox: opts.bbox,
+                metrics: measure_edges_with(&truth, &result.image, &result.mask, opts.bbox),
+                diagnostics: result.diagnostics.clone(),
+                separability: result.separability,
+                foreground_ratio: result.stats.foreground_ratio,
+                warnings: result
+                    .warnings
+                    .iter()
+                    .map(|w| w.code.as_str().to_string())
+                    .collect(),
+            }
+        })
+        .collect();
+    (truth, runs)
+}
+
+/// 実写背景のフィクスチャを中央から切り出して読む。
+fn load_background(name: &str, width: u32, height: u32) -> RgbaImage {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/backgrounds")
+        .join(name);
+    let img = image::open(&path)
+        .unwrap_or_else(|e| panic!("{} を読めない: {e}", path.display()))
+        .to_rgba8();
+    assert!(
+        img.width() >= width && img.height() >= height,
+        "{name} は {}x{} しかない（{width}x{height} が要る）",
+        img.width(),
+        img.height()
+    );
+    let (ox, oy) = ((img.width() - width) / 2, (img.height() - height) / 2);
+    image::imageops::crop_imm(&img, ox, oy, width, height).to_image()
+}
+
+/// 背景を σ px 相当でぼかし、振幅 1.5 のセンサーノイズを乗せ直す。
+///
+/// **繊維だけを消して、照明勾配とノイズ床を残すための処理である。** 箱ぼかしを
+/// 3 回重ねるとガウスによく近づき、分散は `r² + r` になる（`diagnostics.rs` の
+/// `smoothing_radius` と同じ式）。σ = 6 なら半径 5.52 で、整数へ丸めて 6 を使う
+/// （実効 σ = √42 ≒ 6.48）。
+///
+/// ノイズは `Rng` の固定シードで乗せるので、同じ σ からは必ず同じ背景が出る。
+fn blurred_with_noise(image: &RgbaImage, sigma: f32) -> RgbaImage {
+    let (w, h) = (image.width() as usize, image.height() as usize);
+    let radius = (((1.0 + 4.0 * sigma * sigma).sqrt() - 1.0) / 2.0)
+        .round()
+        .max(1.0) as usize;
+    // チャンネルごとに f32 の面へ移してから行・列を舐める。u8 のまま 3 回
+    // 重ねると、丸めが 3 回入って勾配が段になる
+    let mut planes: Vec<Vec<f32>> = (0..3)
+        .map(|k| image.pixels().map(|p| f32::from(p.0[k])).collect())
+        .collect();
+    for plane in &mut planes {
+        for _ in 0..3 {
+            box_blur_rows(plane, w, h, radius);
+            transpose(plane, w, h);
+            box_blur_rows(plane, h, w, radius);
+            transpose(plane, h, w);
+        }
+    }
+
+    let mut rng = Rng::new();
+    let mut out = RgbaImage::new(image.width(), image.height());
+    for (i, pixel) in out.pixels_mut().enumerate() {
+        let nz = rng.jitter(1.5);
+        let v = |k: usize| (planes[k][i] + nz).round().clamp(0.0, 255.0) as u8;
+        *pixel = Rgba([v(0), v(1), v(2), 255]);
+    }
+    out
+}
+
+/// 行方向の箱ぼかし。窓は端ではみ出した分を数えない（`diagnostics.rs` と同じ規約）。
+fn box_blur_rows(plane: &mut [f32], w: usize, h: usize, radius: usize) {
+    let mut line = vec![0f32; w];
+    for y in 0..h {
+        line.copy_from_slice(&plane[y * w..(y + 1) * w]);
+        for x in 0..w {
+            let x0 = x.saturating_sub(radius);
+            let x1 = (x + radius).min(w - 1);
+            let sum: f32 = line[x0..=x1].iter().sum();
+            plane[y * w + x] = sum / (x1 - x0 + 1) as f32;
+        }
+    }
+}
+
+/// `w × h` の面を転置して `h × w` にする。列方向のぼかしを行方向で済ませるため。
+fn transpose(plane: &mut [f32], w: usize, h: usize) {
+    let mut out = vec![0f32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            out[x * h + y] = plane[y * w + x];
+        }
+    }
+    plane.copy_from_slice(&out);
+}
+
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.040_45 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn linear_to_srgb(v: f32) -> f32 {
+    let c = v.clamp(0.0, 1.0);
+    if c <= 0.003_130_8 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// 正解の被覆率から求めた商品の外接矩形に、余白 5% を足したもの。
+///
+/// `assisted` の `--bbox` に使う。エージェントは `subject.normalized_bbox` を
+/// そのまま渡すが、ベンチでは推定ではなく**正解**の矩形を渡す。bbox の推定精度と
+/// 境界の質を同じ数字に混ぜないためである。
+pub fn assisted_bbox(truth: &EdgeTruth) -> (u32, u32, u32, u32) {
+    let (w, h) = (truth.image.width(), truth.image.height());
+    let (mut x1, mut y1, mut x2, mut y2) = (w, h, 0u32, 0u32);
+    for y in 0..h {
+        for x in 0..w {
+            if truth.coverage[truth.index(x, y)] > 0.0 {
+                x1 = x1.min(x);
+                y1 = y1.min(y);
+                x2 = x2.max(x);
+                y2 = y2.max(y);
+            }
+        }
+    }
+    let (mx, my) = ((w as f32 * 0.05) as u32, (h as f32 * 0.05) as u32);
+    (
+        x1.saturating_sub(mx),
+        y1.saturating_sub(my),
+        (x2 + mx).min(w - 1),
+        (y2 + my).min(h - 1),
+    )
+}
+
+/// 手持ちの正解つき実写を差し込む入口となる環境変数の名前。
+///
+/// 定数にしてあるのは、README がこの綴りを名指ししており、**文書が名指しする
+/// 大文字の語は実在するか検査される**（`every_code_named_in_the_docs_exists`）
+/// ためである。綴りを 1 箇所に閉じ込めておけば、文書と実装が離れない。
+pub const KIRI_BENCH_DIR: &str = "KIRI_BENCH_DIR";
+
+/// `KIRI_BENCH_DIR` に置かれた「実写 + 正解アルファ」の 1 組。
+pub struct ExternalPair {
+    pub name: String,
+    pub truth: EdgeTruth,
+    pub options: kiri::cutout::CutoutOptions,
+}
+
+/// `<name>.jpg|png` と `<name>.alpha.png` の対を集める。
+///
+/// **合成の正解はどこまで行っても合成である。** 実写に正解アルファを付けるのは
+/// 人にしかできない作業なので、リポジトリには置かず、環境変数で差し込めるように
+/// しておく。対が揃っていないファイルは黙って飛ばす——素材の置き場所に
+/// 別のものが混ざっているのは普通のことで、そこで落ちても誰も得をしない。
+/// **ただし、対として認識したものの読めない・設定を解釈できない素材は
+/// 黙って飛ばさない。** 既定の設定で回した数字を指定した設定の数字として
+/// 表に出すのが、いちばん質の悪い嘘になる。
+pub fn external_bench_pairs(dir: &Path) -> Vec<ExternalPair> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("{}: 読めない ({e})", dir.display());
+            return Vec::new();
+        }
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let path = e.path();
+            let file = path.file_name()?.to_str()?.to_string();
+            file.strip_suffix(".alpha.png").map(|n| n.to_string())
+        })
+        .collect();
+    // 読む順を決める。同じディレクトリでも OS が返す順は保証されない
+    names.sort();
+
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let alpha = image::open(dir.join(format!("{name}.alpha.png")))
+                .ok()?
+                .to_luma8();
+            let image = ["jpg", "jpeg", "png"]
+                .iter()
+                .find_map(|ext| image::open(dir.join(format!("{name}.{ext}"))).ok())?
+                .to_rgba8();
+            if image.width() != alpha.width() || image.height() != alpha.height() {
+                eprintln!("{name}: 画像と正解アルファの寸法が違う");
+                return None;
+            }
+            let options = external_options(&dir.join(format!("{name}.json")), &image)?;
+            let Some(truth) = truth_from_alpha(image, &alpha) else {
+                eprintln!("{name}: 正解アルファに輪郭が無い（全面が商品か背景）");
+                return None;
+            };
+            Some(ExternalPair {
+                name,
+                truth,
+                options,
+            })
+        })
+        .collect()
+}
+
+/// `<name>.json` から切り抜きの設定を読む。ファイルが無ければ既定値。
+///
+/// **書いてあるのに読めなかったら素材ごと飛ばす。** `--bbox` を指定した
+/// つもりの素材を既定値で回し、その数字を表に出すと、読み手には区別がつかない。
+/// 「設定が効いていない」は黙って起きてはいけない種類の失敗である。
+fn external_options(path: &Path, image: &RgbaImage) -> Option<kiri::cutout::CutoutOptions> {
+    use kiri::cutout::CutoutOptions;
+    let mut options = CutoutOptions::default();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Some(options);
+    };
+    let value = match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("{}: JSON として読めない ({e})", path.display());
+            return None;
+        }
+    };
+    if let Some(tolerance) = value["tolerance"].as_f64() {
+        options.tolerance = tolerance;
+    }
+    if let Some(bbox) = value["bbox"].as_array() {
+        let v: Vec<f64> = bbox.iter().filter_map(serde_json::Value::as_f64).collect();
+        if v.len() != 4 {
+            eprintln!("{}: bbox は数値 4 つで書く", path.display());
+            return None;
+        }
+        let normalized = value["normalized"].as_bool().unwrap_or(false);
+        match kiri::commands::cutout::resolve_bbox(
+            [v[0], v[1], v[2], v[3]],
+            normalized,
+            image.width(),
+            image.height(),
+        ) {
+            Ok(bbox) => options.bbox = Some(bbox),
+            Err(e) => {
+                eprintln!("{}: bbox を解釈できない ({e})", path.display());
+                return None;
+            }
+        }
+    }
+    Some(options)
+}
+
+/// 正解アルファ（8bit グレー、255 = 商品）から `EdgeTruth` を組み立てる。
+///
+/// `distance` は正解の二値輪郭からの符号付き距離（外が正）。合成シーンでは
+/// 解析的な距離場を持てるが、実写では正解アルファからの距離変換で代用する。
+/// `shadow` と `strap` は空——実写では「どこが影か」を人が塗り分けていない。
+///
+/// 正解アルファに輪郭が無ければ（全面が商品、あるいは全面が背景）None。
+/// 距離場の基準そのものが無いので、組み立てても意味のある正解にならない。
+pub fn truth_from_alpha(image: RgbaImage, alpha: &image::GrayImage) -> Option<EdgeTruth> {
+    use kiri::cutout::Mask;
+    use kiri::cutout::diagnostics::{contour_distance_px, contour_pixels};
+
+    let (w, h) = (image.width(), image.height());
+    let n = (w as usize) * (h as usize);
+    let mask = Mask::from_bools(
+        w,
+        h,
+        &alpha.pixels().map(|p| p[0] >= 128).collect::<Vec<_>>(),
+    );
+    let distance = contour_distance_px(w, h, &contour_pixels(&mask, None))?;
+    Some(EdgeTruth {
+        coverage: alpha.pixels().map(|p| f32::from(p[0]) / 255.0).collect(),
+        distance: (0..n)
+            .map(|i| {
+                let inside = alpha.as_raw()[i] >= 128;
+                if inside { -distance[i] } else { distance[i] }
+            })
+            .collect(),
+        shadow: vec![0f32; n],
+        strap: vec![false; n],
+        image,
+    })
+}
+
 /// JPEG で往復させる。実素材の境界には必ず圧縮由来の滲みが乗るため。
 pub fn jpeg_roundtrip(image: &RgbaImage, quality: u8) -> RgbaImage {
     use image::codecs::jpeg::JpegEncoder;
@@ -404,6 +1087,31 @@ pub struct EdgeMetrics {
     /// 彩度の大きさしか見ないので、緑寄りとマゼンタ寄りは区別しない。
     /// 「商品には無い色が輪郭にだけ乗った」ことを捉えるための粗い網である
     pub cast: f32,
+    /// 予測した二値輪郭の各画素が、**真の輪郭**からどれだけ離れているかの平均
+    /// (px, 長辺 1000px 換算)。
+    ///
+    /// **`mask.contour_roughness` の正解版である。** あちらは正解を持たないので
+    /// 「自分自身を滑らかにしたもの」を参照にするが、こちらは解析的な距離場
+    /// （`EdgeTruth::distance`）を直接引く。両者が相関しなければ、
+    /// `contour_roughness` は欠陥ではない何かを測っていることになる。
+    ///
+    /// **統計量は診断値とそろえる。** `contour_roughness` を中央値から平均へ
+    /// 変えたとき、ここだけ中央値のままにすると「輪郭の 1 割が大きく外れている」
+    /// 状態が正解側では見えず、診断側にだけ出る。実測でも順位相関は
+    /// ρ=0.72（中央値のまま）から ρ=0.83（平均にそろえた）へ上がった
+    ///
+    /// **床が合成シーンと外部素材で違う。** 合成シーンの `distance` は角丸矩形の
+    /// 解析的な符号付き距離なので、輪郭のすぐ内側の画素でも 0.5px 前後の値を
+    /// 持つ——完璧に解けても 0.4〜0.5 から下がらない。外部素材
+    /// （`truth_from_alpha`）は正解アルファの二値輪郭からの距離変換なので、
+    /// 輪郭画素そのものは 0 になる。**2 つの表の数字を直接比べないこと。**
+    pub contour_error: f32,
+    /// 境界から帯幅以内の予測前景画素のうち、**真の被覆率が 0** のものの割合。
+    ///
+    /// **`mask.rim_contamination` の正解版である。** 既存の `rim` は「背景色の
+    /// まま不透明」を色で見ているが、こちらは正解の被覆率で見るので、
+    /// 背景と見分けのつかない色でも取りこぼさない
+    pub rim_truth: f32,
 }
 
 fn luma(p: [u8; 4]) -> f32 {
@@ -415,6 +1123,19 @@ pub fn measure_edges(
     truth: &EdgeTruth,
     output: &RgbaImage,
     mask: &kiri::cutout::Mask,
+) -> EdgeMetrics {
+    measure_edges_with(truth, output, mask, None)
+}
+
+/// `--bbox` を与えて回した結果を突き合わせる。
+///
+/// 矩形の辺は輪郭として数えない。**`contour_roughness` / `rim_contamination` が
+/// 同じ規約で数えているので、正解側だけ数えると比べる相手が違う。**
+pub fn measure_edges_with(
+    truth: &EdgeTruth,
+    output: &RgbaImage,
+    mask: &kiri::cutout::Mask,
+    bbox: Option<(u32, u32, u32, u32)>,
 ) -> EdgeMetrics {
     let (w, h) = (truth.image.width(), truth.image.height());
 
@@ -429,7 +1150,16 @@ pub fn measure_edges(
         if let (Some(tx), Some(mx)) = (true_x, mask_x) {
             let d = truth.distance[truth.index(tx, y)];
             let dp = truth.distance[truth.index(tx - 1, y)];
-            let edge = (tx as f32 - 1.0) + dp / (dp - d) + 0.5;
+            // 隣り合う 2 画素の距離が等しいと 0 で割る。合成シーンの距離場は
+            // 解析的なので隣どうしが同じ値になることは無いが、**正解アルファ
+            // から距離変換で組み立てた `EdgeTruth`（`truth_from_alpha`）は
+            // 1px 刻みに量子化されている**ので、平らな段が普通に現れる。
+            // そこは亜画素の補間をあきらめて画素の中心を採る
+            let edge = if dp == d {
+                tx as f32
+            } else {
+                (tx as f32 - 1.0) + dp / (dp - d) + 0.5
+            };
             offsets.push(edge - mx as f32);
         }
     }
@@ -537,6 +1267,38 @@ pub fn measure_edges(
             num as f32 / den as f32
         }
     };
+
+    // 正解由来の 2 指標。**診断値と同じ輪郭画素・同じ帯**の上で測る。
+    // 集合が違えば、相関しないのが実装の問題なのか測り方の問題なのか分からない
+    let scale = kiri::cutout::diagnostics::scale_at_1000(w, h) as f32;
+    let contour = kiri::cutout::diagnostics::contour_pixels(mask, bbox);
+    let (mut contour_error, mut rim_truth) = (f32::NAN, f32::NAN);
+    if !contour.is_empty() {
+        let errors: Vec<f32> = contour
+            .iter()
+            .map(|&(x, y)| truth.distance[truth.index(x, y)].abs())
+            .collect();
+        contour_error = errors.iter().sum::<f32>() / errors.len() as f32 / scale;
+
+        let band = kiri::cutout::diagnostics::rim_band(f64::from(scale)) as f32;
+        let distance = kiri::cutout::diagnostics::contour_distance_px(w, h, &contour)
+            .expect("輪郭画素があるので距離場は作れる");
+        let (mut background_in_band, mut band_n) = (0u32, 0u32);
+        for y in 0..h {
+            for x in 0..w {
+                let i = truth.index(x, y);
+                if mask.get(x, y) < 128 || distance[i] > band {
+                    continue;
+                }
+                band_n += 1;
+                if truth.coverage[i] == 0.0 {
+                    background_in_band += 1;
+                }
+            }
+        }
+        rim_truth = ratio(background_in_band, band_n);
+    }
+
     EdgeMetrics {
         offset,
         rim: ratio(rim, rim_n.max(1)),
@@ -548,6 +1310,8 @@ pub fn measure_edges(
         shadow_kept: ratio(shadow_kept, shadow_n),
         speckles: ratio(speckles, speckles_n),
         cast: percentile(&mut casts, 0.9),
+        contour_error,
+        rim_truth,
     }
 }
 

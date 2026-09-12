@@ -339,6 +339,55 @@ fn fields() -> Vec<FieldEntry> {
             ),
         },
         FieldEntry {
+            path: "mask.contour_roughness",
+            appears_in: vec!["cutout"],
+            unit: "px_at_1000",
+            nullable: true,
+            null_means: Some("測れる輪郭が無かった。0（完全に滑らか）ではない"),
+            warns: vec![FieldThreshold {
+                code: WarningCode::ContourRough,
+                operator: "gt",
+                threshold: diagnostics::CONTOUR_ROUGH_WARN,
+            }],
+            gates: None,
+            summary: "二値輪郭が、それを滑らかにした参照輪郭からどれだけ離れているかの平均",
+            notes: Some(
+                "長辺 1000px へ縮めたときの px で報告する。納品先がその寸法だからで、20MP の \
+                 1px は縮めると 0.18px になって見えない。参照は自分自身を σ = 2px（換算）で\
+                 ぼかして 0.5 で再二値化したもので、距離は 1px 刻みのチャンファー。画素ごとの\
+                 距離は平滑化が届く距離（箱ぼかし 3 回ぶんの 3r、換算 6px 相当）で頭打ちに\
+                 してから平均するので、値の上限もそこで決まる。幅 3px 級の細部（ストラップ、\
+                 ひも）は平滑化参照から消えるため、粗さとして数える側に入る",
+            ),
+        },
+        FieldEntry {
+            path: "mask.rim_contamination",
+            appears_in: vec!["cutout"],
+            unit: "ratio",
+            nullable: true,
+            null_means: Some(
+                "帯が無かったか、帯の半分以上で判定できなかった。0（汚染が無い）ではない",
+            ),
+            warns: vec![FieldThreshold {
+                code: WarningCode::RimContaminated,
+                operator: "gt",
+                threshold: diagnostics::RIM_CONTAMINATION_WARN,
+            }],
+            gates: None,
+            summary: "境界の内側の帯で、元の色が局所前景より局所背景に近い画素の割合",
+            notes: Some(
+                "halo_ratio が見落とすものを見る。あちらは「局所背景と ΔE≤3」という絶対的な\
+                 基準なので、繊維のばらつきが ΔE 5〜10 ある不織布では張り付いた繊維が数から\
+                 漏れる。こちらは線形 RGB で、局所前景・局所背景それぞれの散らばり（σ）で\
+                 正規化した距離を比べるので、背景のばらつきが大きくても「その色は背景\
+                 テクスチャの範囲内か」を問える。分母は判定できた画素である——2 つの分布が\
+                 散らばりの中で重なる画素（淡色商品 × 白背景）は判定しないので、帯の\
+                 半分以上が判定できなければ値ではなく null を返す。マスクが背景を大きく\
+                 飲み込んでいるときは局所前景そのものが背景になるので、値は正解より小さく\
+                 出る（BBOX_RECOMMENDED や HALO_REMAINS が同時に出ていたらそちらを先に読む）",
+            ),
+        },
+        FieldEntry {
             path: "mask.touches_edge",
             appears_in: vec!["cutout"],
             unit: "bool",

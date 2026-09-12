@@ -13,7 +13,11 @@ pub struct Mask {
 }
 
 /// 前景とみなす下限。フェザリングされた境界を前景に数えないための閾値。
-const FOREGROUND_THRESHOLD: u8 = 128;
+///
+/// `pub(crate)` なのは、全画素を生のスライスで舐める処理（診断値）が
+/// `is_foreground` の添字計算を挟まずに同じ判定をしたいからである。
+/// **しきい値の定義はここ 1 箇所にしかない。**
+pub(crate) const FOREGROUND_THRESHOLD: u8 = 128;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct MaskStats {
@@ -44,6 +48,37 @@ impl Mask {
 
     pub fn as_slice(&self) -> &[u8] {
         &self.data
+    }
+
+    /// 走査順を自分で決めたい呼び出し側のための可変ビュー。
+    ///
+    /// `set` は画素ごとに添字を計算し直すので、全画素を舐める処理
+    /// （診断値の箱ぼかしなど）では桁が変わるほど遅い。
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+
+    /// 前景判定(128以上)だけを残した 0/255 のマスク。
+    ///
+    /// 階調を落として**形だけ**を見たいときに使う。しきい値をここに閉じ込めて
+    /// おくのは、呼び出し側が 128 を書き写すと `is_foreground` を動かしたときに
+    /// 黙って食い違うためである。
+    pub fn binarized(&self) -> Mask {
+        Mask {
+            width: self.width,
+            height: self.height,
+            data: self
+                .data
+                .iter()
+                .map(|&v| {
+                    if v >= FOREGROUND_THRESHOLD {
+                        u8::MAX
+                    } else {
+                        0
+                    }
+                })
+                .collect(),
+        }
     }
 
     #[inline]

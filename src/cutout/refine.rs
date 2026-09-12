@@ -276,12 +276,15 @@ pub fn refine(
     let (min_radius, max_radius) = reshape::band_radii(binary, scale, opts);
     let smooth_radius = smooth_radius_px(opts.smooth_contour, scale);
 
-    // (a)〜(c)。二値マスクを書き換えるので、アルファを載せる前に済ませる
-    let mut shape = binary.clone();
+    // (a)〜(c)。二値マスクを書き換えるので、アルファを載せる前に済ませる。
+    //
+    // **写しを取るのは塗り直しが走る経路だけ**にする。旧経路（3 段とも切る）は
+    // 元のマスクをそのまま読むので、24.5MP で 24MB を確保する理由が無い
+    let mut reshaped = opts.staged().then(|| binary.clone());
     let mut band = vec![0u8; (w as usize) * (h as usize)];
     band_map_into(
         image,
-        &shape,
+        binary,
         background,
         min_radius,
         max_radius,
@@ -290,17 +293,20 @@ pub fn refine(
     );
     // `--seal` が塞いだ隙間。帯からも参照色からも外す（`close_new_gaps`）
     let mut sealed = BitPlane::default();
-    reshape::Reshape {
-        image,
-        original: binary,
-        background,
-        opts,
-        scale,
-        min_radius,
-        max_radius,
+    if let Some(shape) = reshaped.as_mut() {
+        reshape::Reshape {
+            image,
+            original: binary,
+            background,
+            opts,
+            scale,
+            min_radius,
+            max_radius,
+        }
+        .run(shape, &mut band, &mut sealed);
     }
-    .run(&mut shape, &mut band, &mut sealed);
     let (band, sealed) = (band, sealed);
+    let shape = reshaped.as_ref().unwrap_or(binary);
 
     let mut mask = shape.clone();
     // 帯幅の最大は代役前景の近傍半径を決めるのに要る。0 なら帯そのものが無い
@@ -318,7 +324,7 @@ pub fn refine(
     let guided_matting = opts.matting == Matting::Guided;
     let ctx = Context {
         image,
-        binary: &shape,
+        binary: shape,
         band: &band,
         sealed: &sealed,
         bg_linear: [
@@ -365,7 +371,7 @@ pub fn refine(
         mask = guided::feather(
             image,
             &ctx.lut,
-            &shape,
+            shape,
             &band,
             &mask,
             &solved,

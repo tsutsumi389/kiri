@@ -4,17 +4,21 @@
 //! 成立するため、AI エージェントは「全件の座標を出す」のではなく「結果の JSON を
 //! 見て、失敗した数枚だけを救済する」役割を担える。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::cli::CutoutArgs;
+use crate::cli::{CutoutArgs, Polygon};
 use crate::commands::output::{self, round4};
-use crate::cutout::{CutoutOptions, cutout};
+use crate::cutout::constraints::{TRIMAP_BACKGROUND, TRIMAP_FOREGROUND};
+use crate::cutout::{
+    Constraint, ConstraintSource, Constraints, CutoutOptions, FG_SEED_RADIUS, cutout,
+};
 use crate::error::{Error, ErrorCode, Result};
-use crate::image_io::{OutputFormat, SaveOptions, load, save};
+use crate::image_io::{LoadOptions, OutputFormat, SaveOptions, load, save};
 use crate::preview::{PreviewSpec, contact_sheet};
 use crate::report::{
-    CanvasReport, CutoutReport, Dimensions, MaskReport, SCHEMA_VERSION, SettingsReport,
+    CanvasReport, ConstraintsReport, CutoutReport, Dimensions, MaskReport, SCHEMA_VERSION,
+    SettingsReport,
 };
 use crate::transform::canvas::{CanvasSpec, apply as canvas_apply, plan as canvas_plan};
 use crate::warning::{Warning, WarningCode};
@@ -37,12 +41,14 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         .iter()
         .map(|p| resolve_point(*p, args.normalized, w, h))
         .collect::<Result<Vec<_>>>()?;
+    let constraints = resolve_constraints(args, &fg_seeds, w, h)?;
 
     let opts = CutoutOptions {
         tolerance: args.tolerance,
         border: args.border,
         bbox,
         fg_seeds,
+        constraints,
         cleanup: args.cleanup,
         feather: args.feather,
         despill: !args.no_despill,
@@ -80,6 +86,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         &loaded.image,
         &result.mask,
         final_image,
+        opts.constraints.as_ref(),
         &mut warnings,
     );
 
@@ -111,6 +118,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             refine: opts.refine,
         },
         applied_bbox: bbox.map(|(x1, y1, x2, y2)| [x1, y1, x2, y2]),
+        constraints: opts.constraints.as_ref().map(constraints_report),
         mask: MaskReport {
             foreground_ratio: round4(result.stats.foreground_ratio),
             bbox: result.stats.bbox.map(|(x1, y1, x2, y2)| [x1, y1, x2, y2]),
@@ -250,6 +258,7 @@ fn write_preview(
     original: &image::RgbaImage,
     mask: &crate::cutout::Mask,
     final_image: &image::RgbaImage,
+    constraints: Option<&Constraints>,
     warnings: &mut Vec<Warning>,
 ) -> Option<String> {
     let path = args.preview.as_ref()?;
@@ -267,7 +276,7 @@ fn write_preview(
         flatten: false,
     };
 
-    let written = contact_sheet(original, mask, final_image, &spec)
+    let written = contact_sheet(original, mask, final_image, constraints, &spec)
         .and_then(|sheet| save(path, &sheet, &opts));
 
     match written {
@@ -303,6 +312,200 @@ fn write_debug_mask(path: Option<&PathBuf>, mask: &crate::cutout::Mask) -> Resul
         )
     })?;
     Ok(Some(path.display().to_string()))
+}
+
+/// 空間的な指示（トライマップ・マスク画像・多角形・種）を 1 つの表現へ畳む。
+///
+/// **入口が何であれ、内部は画素ごとの `Constraint` 1 つにする。** ここが
+/// ファイルとポリゴンを知る唯一の層で、`cutout/` は畳まれた結果しか受け取らない
+/// （`--bbox` の `resolve_bbox` と同じ分担）。
+///
+/// 何も指示が無ければ `None` を返す。12MP で 12MB の表を、1 画素も強制しない
+/// まま下流へ配る理由が無い。
+fn resolve_constraints(
+    args: &CutoutArgs,
+    fg_seeds: &[(u32, u32)],
+    width: u32,
+    height: u32,
+) -> Result<Option<Constraints>> {
+    let mut constraints = Constraints::new(width, height);
+
+    if let Some(path) = args.trimap.as_ref() {
+        let image = load_constraint_image(path, "--trimap", width, height)?;
+        let marked = constraints.mark_by_luma(&image, |luma| {
+            if luma >= TRIMAP_FOREGROUND {
+                Some(Constraint::ForcedFg)
+            } else if luma <= TRIMAP_BACKGROUND {
+                Some(Constraint::ForcedBg)
+            } else {
+                None
+            }
+        });
+        if marked > 0 {
+            constraints.note(ConstraintSource::Trimap);
+        }
+    }
+
+    for (path, flag, kind, source) in [
+        (
+            args.fg_mask.as_ref(),
+            "--fg-mask",
+            Constraint::ForcedFg,
+            ConstraintSource::FgMask,
+        ),
+        (
+            args.bg_mask.as_ref(),
+            "--bg-mask",
+            Constraint::ForcedBg,
+            ConstraintSource::BgMask,
+        ),
+    ] {
+        let Some(path) = path else { continue };
+        let image = load_constraint_image(path, flag, width, height)?;
+        let marked = constraints.mark_by_luma(&image, |luma| (luma != 0).then_some(kind));
+        if marked > 0 {
+            constraints.note(source);
+        }
+    }
+
+    for (polygons, flag, kind, source) in [
+        (
+            &args.fg_polygon,
+            "--fg-polygon",
+            Constraint::ForcedFg,
+            ConstraintSource::FgPolygon,
+        ),
+        (
+            &args.bg_polygon,
+            "--bg-polygon",
+            Constraint::ForcedBg,
+            ConstraintSource::BgPolygon,
+        ),
+    ] {
+        for polygon in polygons {
+            let points = resolve_polygon(polygon, args.normalized, width, height, flag)?;
+            if constraints.fill_polygon(&points, kind) > 0 {
+                constraints.note(source);
+            }
+        }
+    }
+
+    // **`--fg-seed` も指示の 1 つとして数える。** 守る画素の集合は floodfill 側の
+    // 保護円と同じ（`disc_pixels` を共有している）ので挙動は変わらないが、
+    // これを入れておかないと「種だけを渡した実行」で constraints が現れず、
+    // エージェントは自分の指示が画像のどこを占めたのかを知る手段を持たない
+    for &(x, y) in fg_seeds {
+        if constraints.mark_disc(x, y, FG_SEED_RADIUS, Constraint::ForcedFg) > 0 {
+            constraints.note(ConstraintSource::FgSeed);
+        }
+    }
+
+    if constraints.is_empty() {
+        return Ok(None);
+    }
+    if let Some(conflict) = constraints.conflict() {
+        let (x1, y1, x2, y2) = conflict.bbox;
+        return Err(Error::new(
+            ErrorCode::ConstraintConflict,
+            format!(
+                "確定前景と確定背景が {} 画素で重なっています（重なりの範囲 {x1},{y1} - {x2},{y2}）",
+                conflict.count
+            ),
+        )
+        .with_hint("fg と bg の指定が重なっています。片方を削ってください"));
+    }
+    Ok(Some(constraints))
+}
+
+/// 指示として渡された画像を読む。
+///
+/// **ICC 変換も EXIF も適用しない。マスクは生の画素である。** 向きを直せば
+/// 「EXIF 適用後の入力画像と同じ寸法」という約束のほうが崩れるし、色を
+/// 変換すれば輝度のしきい値が黙って動く。
+///
+/// 寸法が違えば拡縮せずに断る。伸ばして合わせると、指示した境界が実際の
+/// 商品の輪郭から半画素ずつずれたまま、結果だけがそれらしく返る。
+fn load_constraint_image(
+    path: &Path,
+    flag: &str,
+    width: u32,
+    height: u32,
+) -> Result<image::RgbaImage> {
+    let loaded = load::load_with(
+        path,
+        &LoadOptions {
+            convert_color: false,
+            apply_orientation: false,
+        },
+    )
+    // 読めなかった理由（code）はそのまま残し、どの指示のどのファイルかだけを足す。
+    // 入力画像の失敗と見分けがつかないと、エージェントは入力のほうを疑い始める
+    .map_err(|e| Error {
+        code: e.code,
+        message: format!("{flag} {}: {}", path.display(), e.message),
+        hint: e.hint,
+    })?;
+
+    if loaded.width() != width || loaded.height() != height {
+        return Err(Error::new(
+            ErrorCode::MaskSizeMismatch,
+            format!(
+                "{flag} {} は {}x{} で、入力画像 {width}x{height} と寸法が違います",
+                path.display(),
+                loaded.width(),
+                loaded.height()
+            ),
+        )
+        .with_hint(
+            "kiri info が返す width/height（EXIF 適用後）に合わせてください。自動では拡縮しません",
+        ));
+    }
+    Ok(loaded.image)
+}
+
+/// 多角形の頂点を画素座標に落とす。
+///
+/// 画像の外へ出る点は捨てない（充填の側で画像内へ切り詰める）。**頂点 1 つが
+/// 1px はみ出しただけで面ごと無視するのは筋が悪い。** `--fg-seed` の
+/// 「範囲外は無視」と違う扱いにしているのは、点と面で失う量が違うためである。
+fn resolve_polygon(
+    polygon: &Polygon,
+    normalized: bool,
+    width: u32,
+    height: u32,
+    flag: &str,
+) -> Result<Vec<[f64; 2]>> {
+    if !normalized {
+        return Ok(polygon.points().to_vec());
+    }
+    // 画素座標を --normalized で渡す取り違えを検出する（resolve_bbox と同じ関門）
+    if polygon.points().iter().any(|p| p[0] > 1.0 || p[1] > 1.0) {
+        return Err(Error::new(
+            ErrorCode::InvalidPolygon,
+            format!("--normalized 指定時、{flag} の各値は 0.0-1.0 である必要があります"),
+        )
+        .with_hint("画素座標で指定する場合は --normalized を外してください"));
+    }
+    Ok(polygon
+        .points()
+        .iter()
+        .map(|p| [p[0] * f64::from(width), p[1] * f64::from(height)])
+        .collect())
+}
+
+/// 効いた指示を結果 JSON へ落とす。
+fn constraints_report(constraints: &Constraints) -> ConstraintsReport {
+    let (fg, bg, unknown) = constraints.ratios();
+    ConstraintsReport {
+        sources: constraints
+            .sources()
+            .iter()
+            .map(|s| s.as_str().to_string())
+            .collect(),
+        fg_ratio: round4(fg),
+        bg_ratio: round4(bg),
+        unknown_ratio: round4(unknown),
+    }
 }
 
 /// 指定された bbox を画素座標に落とす。
@@ -427,5 +630,49 @@ mod tests {
     fn a_point_outside_the_image_is_an_error() {
         let err = resolve_point([200.0, 10.0], false, 100, 100).unwrap_err();
         assert_eq!(err.code.as_str(), "INVALID_SEED");
+    }
+
+    fn polygon(values: &[f64]) -> Polygon {
+        Polygon::from_values(values).unwrap()
+    }
+
+    #[test]
+    fn polygon_coordinates_resolve_in_both_systems() {
+        let square = polygon(&[10.0, 20.0, 30.0, 20.0, 30.0, 40.0]);
+        assert_eq!(
+            resolve_polygon(&square, false, 100, 100, "--fg-polygon").unwrap(),
+            [[10.0, 20.0], [30.0, 20.0], [30.0, 40.0]]
+        );
+        let normalized = polygon(&[0.1, 0.25, 0.5, 0.25, 0.5, 0.75]);
+        assert_eq!(
+            resolve_polygon(&normalized, true, 1000, 800, "--fg-polygon").unwrap(),
+            [[100.0, 200.0], [500.0, 200.0], [500.0, 600.0]]
+        );
+    }
+
+    /// 画素座標を `--normalized` で渡す取り違えを検出する。
+    #[test]
+    fn normalized_polygon_values_above_one_are_rejected() {
+        let err = resolve_polygon(
+            &polygon(&[120.0, 80.0, 900.0, 80.0, 900.0, 1400.0]),
+            true,
+            1600,
+            2000,
+            "--fg-polygon",
+        )
+        .unwrap_err();
+        assert_eq!(err.code.as_str(), "INVALID_POLYGON");
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.hint.unwrap().contains("--normalized"));
+    }
+
+    /// 画像の外へ出る頂点は、点と違って**面ごと捨てない**。
+    ///
+    /// `--fg-seed` は範囲外を無視するが、頂点 1 つが 1px はみ出しただけで
+    /// 面が消えるのは失うものが大きすぎる。切り詰めは充填の側が行う。
+    #[test]
+    fn a_polygon_reaching_outside_the_image_is_not_refused() {
+        let outside = polygon(&[-0.0, 0.0, 9999.0, 0.0, 9999.0, 9999.0]);
+        assert!(resolve_polygon(&outside, false, 100, 50, "--bg-polygon").is_ok());
     }
 }

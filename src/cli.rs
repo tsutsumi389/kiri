@@ -9,6 +9,7 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::cutout::DEFAULT_EDGE_THRESHOLD;
 use crate::cutout::background::DEFAULT_BORDER;
+use crate::cutout::constraints::{TRIMAP_BACKGROUND, TRIMAP_FOREGROUND};
 use crate::image_io::OutputFormat;
 use crate::preview::DEFAULT_PANEL;
 use crate::transform::FitMode;
@@ -43,7 +44,10 @@ pub enum Command {
     /// 画像を回転する
     Rotate(RotateArgs),
     /// 背景を透過して商品を切り抜く
-    Cutout(CutoutArgs),
+    ///
+    /// **箱に入れているのは大きさのためである。** `CutoutArgs` は他の
+    /// サブコマンドの 4 倍あり、直に持つと enum 全体がその大きさになる
+    Cutout(Box<CutoutArgs>),
     /// 仕様ファイルに従って複数の画像を一括処理する
     Batch(BatchArgs),
 
@@ -81,6 +85,7 @@ impl ColorOpts {
     pub fn to_load_options(&self) -> crate::image_io::LoadOptions {
         crate::image_io::LoadOptions {
             convert_color: !self.no_color_convert,
+            ..Default::default()
         }
     }
 }
@@ -267,6 +272,120 @@ fn edge_threshold_long_help() -> String {
     )
 }
 
+/// `--trimap` のヘルプ。しきい値は `constraints.rs` の定数から組む。
+///
+/// `edge_threshold_help` と同じ理由で直書きしない。**AI エージェントは
+/// `--help` を読んで判断する**ので、しきい値を動かしたときにヘルプだけが
+/// 古い値を語ると、渡されるトライマップがそのまま古い規則で塗られる。
+fn trimap_help() -> String {
+    format!(
+        "確定前景(輝度 {TRIMAP_FOREGROUND} 以上)と確定背景(輝度 {TRIMAP_BACKGROUND} 以下)を\
+         表すグレー画像。その間は不明で何も強制しない"
+    )
+}
+
+fn trimap_long_help() -> String {
+    format!(
+        "{}\n{}",
+        trimap_help(),
+        "不明の帯（その間の輝度）には何の指示も無いものとして、いつもどおり色と\
+         連結性で決める。",
+    ) + &image_constraint_notes()
+}
+
+/// `--fg-mask` / `--bg-mask` の長いヘルプ。
+fn mask_long_help(role: &str) -> String {
+    format!(
+        "輝度が 0 でない画素を{role}にするマスク画像。白く塗った領域が指示になる。\n\
+         トライマップと違って「不明」を表せないので、部分的に教えたいときはこちらを使う。"
+    ) + &image_constraint_notes()
+}
+
+/// 画像で渡す指示（トライマップ・マスク）に共通の注意書き。
+///
+/// **指定の前に知っていないと選びようがないことだけを書く。** 寸法・アルファ・
+/// 衝突のどれも、渡してから結果を見て気づくのでは遅い。同じ文面を 3 つの入口へ
+/// 配るのは、どれか 1 つしか読まなかったエージェントが取り違えないためである。
+fn image_constraint_notes() -> String {
+    "\n寸法は EXIF を適用した後の入力画像と一致していなければならない\
+     （kiri info が返す width/height）。違えば MASK_SIZE_MISMATCH で断る。\
+     自動では拡縮しない——黙って伸ばせば境界がずれる。\n\
+     アルファは見ない。1 チャンネルのグレーとして読み、RGB なら輝度を使う。\n"
+        .to_string()
+        + shared_constraint_notes()
+}
+
+/// `--fg-polygon` / `--bg-polygon` の長いヘルプ。
+fn polygon_long_help(role: &str) -> String {
+    format!(
+        "内部を{role}にする多角形。x1,y1,x2,y2,... とカンマ区切りで並べる\
+         （3 点以上、値は偶数個）。複数回指定すればいくつでも置ける。\n\
+         内部の判定は偶奇規則。自己交差した部分は穴になる。\n\
+         --normalized を付けると各値を 0.0-1.0 として解釈する。\n\
+         画像の外へ出た部分は捨てるが、面ごと捨てはしない。頂点が 1px はみ出した\
+         だけで指示が消えるほうが害が大きいためである。\n"
+    ) + shared_constraint_notes()
+}
+
+/// すべての空間的な指示に共通の注意書き。
+fn shared_constraint_notes() -> &'static str {
+    "トライマップ・マスク・多角形・--fg-seed は併用できる（和を取る）。\
+     同じ画素が確定前景と確定背景の両方になったら CONSTRAINT_CONFLICT で断る。\
+     黙ってどちらかを選ぶと、指示が効いていないことに気づけないためである。\n\
+     確定前景は bbox と確定背景より優先する。確定背景はフィルの種にもなるので、\
+     商品に囲まれて外周から届かない背景もここで消せる"
+}
+
+/// 多角形の頂点列。
+///
+/// **clap の `Vec<Vec<f64>>` は「1 回の指定で複数の値を取る」の意味になる**ので、
+/// 新しい型にして「1 回の指定 = 1 つの多角形」であることを型でも示す。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Polygon(Vec<[f64; 2]>);
+
+impl Polygon {
+    /// `[x1, y1, x2, y2, ...]` の並びから作る。
+    ///
+    /// CLI（文字列）と batch（JSON の配列）が同じ関門を通るように、検証を
+    /// ここ 1 箇所に置く。片方だけ緩いと、spec 経由でだけ 2 点の「多角形」が
+    /// 通って、指示が黙って無視される。
+    pub fn from_values(values: &[f64]) -> Result<Self, String> {
+        if values.len() % 2 != 0 {
+            return Err(format!(
+                "多角形の座標は x,y の対で並べます（{} 個の数値が指定されました）",
+                values.len()
+            ));
+        }
+        if values.len() < 6 {
+            return Err(format!(
+                "多角形には 3 点以上が必要です（{} 点が指定されました）",
+                values.len() / 2
+            ));
+        }
+        if values.iter().any(|v| !v.is_finite() || *v < 0.0) {
+            return Err("多角形の座標に負数または不正な値が含まれています".to_string());
+        }
+        Ok(Polygon(values.chunks(2).map(|p| [p[0], p[1]]).collect()))
+    }
+
+    pub fn points(&self) -> &[[f64; 2]] {
+        &self.0
+    }
+}
+
+/// `x1,y1,x2,y2,...` を受け付ける。
+pub fn parse_polygon(s: &str) -> Result<Polygon, String> {
+    let values = s
+        .split(',')
+        .map(str::trim)
+        .map(|p| {
+            p.parse::<f64>()
+                .map_err(|_| format!("'{p}' を数値として解釈できません"))
+        })
+        .collect::<Result<Vec<f64>, String>>()?;
+    Polygon::from_values(&values)
+}
+
 /// 0 以上の有限な実数だけを受け付ける。
 ///
 /// 許容量やしきい値に負値や nan が入ると、比較が常に偽になってその機能が
@@ -308,13 +427,48 @@ pub struct CutoutArgs {
     #[arg(long, value_parser = parse_bbox, allow_hyphen_values = false)]
     pub bbox: Option<[f64; 4]>,
 
-    /// --bbox と --fg-seed の座標を 0.0-1.0 の正規化座標として解釈する
+    /// --bbox / --fg-seed / --fg-polygon / --bg-polygon の座標を 0.0-1.0 の正規化座標として解釈する
     #[arg(long)]
     pub normalized: bool,
 
     /// 「ここは必ず前景」と指定する座標 x,y。複数回指定できる
     #[arg(long = "fg-seed", value_parser = parse_point)]
     pub fg_seed: Vec<[f64; 2]>,
+
+    /// 確定前景・確定背景・不明を輝度で表したグレー画像
+    ///
+    /// ヘルプの文言は `trimap_help` がしきい値の定数から組む
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = trimap_help(),
+        long_help = trimap_long_help()
+    )]
+    pub trimap: Option<PathBuf>,
+
+    /// 輝度が 0 でない画素を確定前景にするマスク画像
+    #[arg(long, value_name = "PATH", long_help = mask_long_help("確定前景"))]
+    pub fg_mask: Option<PathBuf>,
+
+    /// 輝度が 0 でない画素を確定背景にするマスク画像
+    #[arg(long, value_name = "PATH", long_help = mask_long_help("確定背景"))]
+    pub bg_mask: Option<PathBuf>,
+
+    /// 内部を確定前景にする多角形 x1,y1,x2,y2,...（3 点以上）。複数回指定できる
+    #[arg(
+        long = "fg-polygon",
+        value_parser = parse_polygon,
+        long_help = polygon_long_help("確定前景")
+    )]
+    pub fg_polygon: Vec<Polygon>,
+
+    /// 内部を確定背景にする多角形 x1,y1,x2,y2,...（3 点以上）。複数回指定できる
+    #[arg(
+        long = "bg-polygon",
+        value_parser = parse_polygon,
+        long_help = polygon_long_help("確定背景")
+    )]
+    pub bg_polygon: Vec<Polygon>,
 
     /// 背景色との色差(ΔE)の許容量。大きいほど広く背景として飲み込む
     #[arg(long, default_value_t = 12.0, value_parser = non_negative)]
@@ -607,6 +761,63 @@ mod tests {
         assert_eq!(parse_point("120,80"), Ok([120.0, 80.0]));
         assert_eq!(parse_point("0.5,0.5"), Ok([0.5, 0.5]));
         assert!(parse_point("1,2,3").is_err());
+    }
+
+    #[test]
+    fn parses_a_polygon() {
+        let p = parse_polygon("10,20,300,20,300,400").unwrap();
+        assert_eq!(
+            p.points(),
+            [[10.0, 20.0], [300.0, 20.0], [300.0, 400.0]],
+            "x,y の対に畳めていない"
+        );
+        assert_eq!(
+            parse_polygon("0.1, 0.2, 0.8, 0.2, 0.8, 0.9")
+                .unwrap()
+                .points()
+                .len(),
+            3,
+            "空白を挟んでも読めるべき"
+        );
+        assert_eq!(parse_polygon("0,0,1,0,1,1,0,1").unwrap().points().len(), 4);
+    }
+
+    #[test]
+    fn rejects_a_malformed_polygon() {
+        assert!(
+            parse_polygon("10,20,300,20,300").is_err(),
+            "奇数個を許してはいけない"
+        );
+        assert!(
+            parse_polygon("10,20,300,400").is_err(),
+            "2 点は面にならない"
+        );
+        assert!(
+            parse_polygon("-1,0,10,0,10,10").is_err(),
+            "負数を許してはいけない"
+        );
+        assert!(parse_polygon("a,b,c,d,e,f").is_err());
+        assert!(parse_polygon("").is_err());
+        assert!(
+            parse_polygon("nan,0,10,0,10,10").is_err(),
+            "nan を許してはいけない"
+        );
+    }
+
+    /// CLI と batch が同じ関門を通ること。
+    ///
+    /// **片方だけ緩いと、spec 経由でだけ 2 点の「多角形」が通る。** その項目の
+    /// 指示だけが黙って無視され、気づけるのは仕上がりを目で見たときになる。
+    #[test]
+    fn the_same_gate_applies_to_values_from_a_spec_file() {
+        assert!(Polygon::from_values(&[0.0, 0.0, 1.0, 0.0, 1.0, 1.0]).is_ok());
+        assert!(Polygon::from_values(&[0.0, 0.0, 1.0, 0.0]).is_err());
+        assert!(Polygon::from_values(&[0.0, 0.0, 1.0, 0.0, 1.0]).is_err());
+        assert_eq!(
+            Polygon::from_values(&[0.0, 0.0, 1.0, 0.0, 1.0, 1.0]),
+            parse_polygon("0,0,1,0,1,1"),
+            "同じ値から違う多角形が出てはいけない"
+        );
     }
 
     #[test]

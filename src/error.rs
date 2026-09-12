@@ -118,6 +118,12 @@ error_catalog! {
         => "bbox の座標が 0.0-1.0 または画像の範囲に収まらない",
     InvalidSeed = "INVALID_SEED", Argument
         => "--fg-seed の座標が 0.0-1.0 または画像の範囲に収まらない",
+    InvalidPolygon = "INVALID_POLYGON", Argument
+        => "--fg-polygon / --bg-polygon の点数か座標が不正（3 点未満、奇数個、0.0-1.0 の外）",
+    ConstraintConflict = "CONSTRAINT_CONFLICT", Argument
+        => "同じ画素が確定前景と確定背景の両方に指定されている",
+    MaskSizeMismatch = "MASK_SIZE_MISMATCH", Argument
+        => "トライマップやマスク画像の寸法が入力画像と違う",
     InvalidCanvas = "INVALID_CANVAS", Argument
         => "--canvas の書式か寸法が不正",
     InvalidColor = "INVALID_COLOR", Argument

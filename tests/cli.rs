@@ -4386,9 +4386,14 @@ fn every_code_named_in_the_docs_exists() {
     known.extend(codes_of(&v, "warnings"));
 
     // ドキュメントは Rust の定数名にも触れる（`MAX_CLEANUP` など）。
-    // 実装に存在する定数は code ではないので、幽霊と区別して通す
+    // 実装に存在する定数は code ではないので、幽霊と区別して通す。
+    //
+    // `tests` も見るのは、**ベンチの入口が環境変数だから**である
+    // （`KIRI_BENCH_DIR`）。本体の挙動ではないので `src` には置き場所が無いが、
+    // README が名指しする以上、実在することは確かめたい
     let mut source = String::new();
     collect_source(&root.join("src"), &mut source);
+    collect_source(&root.join("tests"), &mut source);
 
     for doc in ["README.md", "docs/design.md", "docs/implementation-plan.md"] {
         let text = std::fs::read_to_string(root.join(doc)).unwrap();

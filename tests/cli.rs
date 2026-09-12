@@ -2065,6 +2065,65 @@ fn a_small_forced_foreground_survives_the_speck_filter() {
     );
 }
 
+/// 指示が決めた境界しか無ければ `separability` は `null` になること。
+///
+/// **契約が禁じているのは 0.0 のほうである。** `null_means` は「測れる境界が
+/// 無かった。0（色差が無い）ではない」と言っている。確定前景と確定背景を
+/// 隙間なく接して置けば、そこに色の判断は 1 つも入っていないので、
+/// 返すべきものは「測れなかった」でしかない。
+///
+/// 除外を「前景側が確定前景 **かつ** 背景側が確定背景」の厳密一致で問うと、
+/// 境界が 1px でもずれた瞬間に素通りして 0.0 が出る。refine と feather が
+/// 動かす場合もあれば、ここのように**不明の帯を挟んだだけ**でもそうなる
+/// （フィルが指示にぶつかって止まった線は、やはり色の判断ではない）。
+#[test]
+fn a_boundary_drawn_entirely_by_the_instructions_is_not_measurable() {
+    let dir = fixture_dir();
+    // 一様な背景。色の手がかりはどこにも無い
+    let img = image::RgbaImage::from_pixel(200, 200, image::Rgba([248, 248, 247, 255]));
+    let input = write_png(dir.path(), "flat.png", &img);
+    let output = dir.path().join("cut.png");
+
+    // 中央の 40x40 を確定前景、その外側を 4 枚の帯で確定背景にする
+    // （多角形 1 つでは「矩形の外」を表せない）。帯と確定前景の隙間 `gap` を
+    // 広げて、隙間なく接する場合と 2px の不明帯を挟む場合の両方を見る
+    let run = |name: &str, gap: u32| -> Value {
+        let (a, b) = (80 - gap, 120 + gap);
+        let out = run_cutout(&[
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--force",
+            "--fg-polygon",
+            "80,80,120,80,120,120,80,120",
+            &format!("--bg-polygon=40,40,160,40,160,{a},40,{a}"),
+            &format!("--bg-polygon=40,{b},160,{b},160,160,40,160"),
+            &format!("--bg-polygon=40,{a},{a},{a},{a},{b},40,{b}"),
+            &format!("--bg-polygon={b},{a},160,{a},160,{b},{b},{b}"),
+        ]);
+        assert!(
+            out.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        json_stdout(&out)
+    };
+
+    for (name, gap) in [("隙間なく接する", 0), ("2px の不明帯を挟む", 2)] {
+        let v = run(name, gap);
+        assert!(
+            v["constraints"]["fg_ratio"].as_f64().unwrap() > 0.0
+                && v["constraints"]["bg_ratio"].as_f64().unwrap() > 0.0,
+            "{name}: 指示が置かれていない: {v}"
+        );
+        assert!(
+            v["mask"]["separability"].is_null(),
+            "{name}: 指示が引いた線を色の境界として数えている: {}",
+            v["mask"]["separability"]
+        );
+    }
+}
+
 /// 画素座標を `--normalized` で渡す取り違えを断ること。
 #[test]
 fn a_pixel_polygon_passed_as_normalized_is_rejected() {

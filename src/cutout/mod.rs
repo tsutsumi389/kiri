@@ -430,9 +430,13 @@ fn restore_forced_foreground(mask: &mut Mask, opts: &CutoutOptions) {
 /// 輪郭の妥当性を何も語らないためである。実素材では bbox 指定時の境界画素の
 /// 6 割が矩形の辺そのものになり、除外しないと値が置き場所に支配される。
 ///
-/// **確定前景と確定背景が直接接している境界も同じ理由で数えない。** そこは
-/// 利用者が引いた線そのもので、色の判断が 1 つも入っていない。それ以外
-/// （確定前景とフィルが決めた背景の境目など）は色の判断を経ているので数える。
+/// **指示が決めた境界も同じ理由で数えない。** 前景側が確定前景であるか、
+/// 背景側が確定背景であるかの**どちらか**で除く。利用者が引いた線そのものと、
+/// フィルが指示にぶつかって止まった線は、どちらも色の判断ではないからである。
+///
+/// 厳密一致（両側とも指示）にしていた頃は、refine と feather で境界が 1px
+/// 動くだけで除外が素通りし、契約が禁じた 0.0 を返していた——`null_means` は
+/// 「測れる境界が無かった。0 ではない」と言っているのに、である。
 pub fn boundary_separability(
     image: &RgbaImage,
     mask: &Mask,
@@ -463,11 +467,11 @@ pub fn boundary_separability(
     // 寸法の合わない指示は無かったことにする。`foreground_mask` と同じ規約で、
     // 公開 API に届いた食い違いで panic させない
     let forced = constraints.filter(|c| c.width() == w && c.height() == h);
-    // 利用者が引いた線そのものか。両側とも指示で塗られていれば、その境目に
-    // 色の判断は入っていない
+    // 指示が決めた境界か。**片側だけでも指示なら除く。** 両側の厳密一致で
+    // 問うと、refine と feather が境界を 1px 動かした瞬間に除外が素通りする
     let drawn = |x: u32, y: u32, nx: u32, ny: u32| -> bool {
         forced.is_some_and(|c| {
-            c.at(x, y) == Constraint::ForcedFg && c.at(nx, ny) == Constraint::ForcedBg
+            c.at(x, y) == Constraint::ForcedFg || c.at(nx, ny) == Constraint::ForcedBg
         })
     };
     let delta_at = |x: u32, y: u32| -> f64 {

@@ -35,6 +35,16 @@ pub const TRIMAP_FOREGROUND: u8 = 192;
 /// この帯を作業領域にする。
 pub const TRIMAP_BACKGROUND: u8 = 63;
 
+/// `--fg-mask` / `--bg-mask` で指示とみなす輝度の下限。
+///
+/// **「0 でない」では JPEG のリンギングを拾う。** 白く塗った矩形を q85 で
+/// 保存しただけで、黒いはずの周囲に 1〜数の値が散り、指示された面積が実測で
+/// 2.4 倍になった。中点で切れば、可逆でない形式を経由しても指示は動かない。
+///
+/// トライマップの `TRIMAP_FOREGROUND` / `TRIMAP_BACKGROUND` と同じ向きで
+/// 「中間は指示ではない」を表す値でもある。
+pub const MASK_THRESHOLD: u8 = 128;
+
 const FG: u8 = 1 << 0;
 const BG: u8 = 1 << 1;
 
@@ -186,7 +196,12 @@ impl Constraints {
     }
 
     /// (確定前景の画素数, 確定背景の画素数)。衝突している画素は両方に数える。
-    fn counts(&self) -> (u64, u64) {
+    ///
+    /// **比率だけでは足りない。** `round4` は 12MP の 1000 画素を 0.0001 に
+    /// 落とし、5712x4284 の 20x20 に至っては 0.0000 になる。`sources` に名前が
+    /// 出ているのに `fg_ratio` が 0.0 という結果を、エージェントは「効かなかった」
+    /// としか読めない。画素数は桁落ちしない。
+    pub fn counts(&self) -> (u64, u64) {
         let mut fg = 0u64;
         let mut bg = 0u64;
         for &f in &self.flags {

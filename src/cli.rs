@@ -9,7 +9,7 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::cutout::DEFAULT_EDGE_THRESHOLD;
 use crate::cutout::background::DEFAULT_BORDER;
-use crate::cutout::constraints::{TRIMAP_BACKGROUND, TRIMAP_FOREGROUND};
+use crate::cutout::constraints::{MASK_THRESHOLD, TRIMAP_BACKGROUND, TRIMAP_FOREGROUND};
 use crate::image_io::OutputFormat;
 use crate::preview::DEFAULT_PANEL;
 use crate::transform::FitMode;
@@ -295,11 +295,17 @@ fn trimap_long_help() -> String {
     ) + &image_constraint_notes()
 }
 
+/// `--fg-mask` / `--bg-mask` の短いヘルプ。しきい値は定数から組む。
+fn mask_help(role: &str) -> String {
+    format!("輝度 {MASK_THRESHOLD} 以上の画素を{role}にするマスク画像")
+}
+
 /// `--fg-mask` / `--bg-mask` の長いヘルプ。
 fn mask_long_help(role: &str) -> String {
     format!(
-        "輝度が 0 でない画素を{role}にするマスク画像。白く塗った領域が指示になる。\n\
-         トライマップと違って「不明」を表せないので、部分的に教えたいときはこちらを使う。"
+        "{}。白く塗った領域が指示になる。\n\
+         トライマップと違って「不明」を表せないので、部分的に教えたいときはこちらを使う。",
+        mask_help(role)
     ) + &image_constraint_notes()
 }
 
@@ -312,7 +318,12 @@ fn image_constraint_notes() -> String {
     "\n寸法は EXIF を適用した後の入力画像と一致していなければならない\
      （kiri info が返す width/height）。違えば MASK_SIZE_MISMATCH で断る。\
      自動では拡縮しない——黙って伸ばせば境界がずれる。\n\
-     アルファは見ない。1 チャンネルのグレーとして読み、RGB なら輝度を使う。\n"
+     EXIF Orientation は適用しない。マスクは生の画素として読む。回転を持つ\
+     画像を渡すと MASK_ORIENTATION_IGNORED で報せるので、向きを適用済みの\
+     マスクを渡すこと。\n\
+     アルファは見ない。1 チャンネルのグレーとして読み、RGB なら輝度を使う。\n\
+     可逆形式（PNG）で渡すこと。JPEG のリンギングは黒く塗ったはずの場所に\
+     1 桁の値を散らす。\n"
         .to_string()
         + shared_constraint_notes()
 }
@@ -325,7 +336,10 @@ fn polygon_long_help(role: &str) -> String {
          内部の判定は偶奇規則。自己交差した部分は穴になる。\n\
          --normalized を付けると各値を 0.0-1.0 として解釈する。\n\
          画像の外へ出た部分は捨てるが、面ごと捨てはしない。頂点が 1px はみ出した\
-         だけで指示が消えるほうが害が大きいためである。\n"
+         だけで指示が消えるほうが害が大きいためである。負の座標も範囲外の座標も\
+         書ける（bbox の外側を帯で囲む指示が端でも書けるようにするため）。\n\
+         --normalized のときだけ、|値| が 2.0 を超えたら画素座標を渡した誤りと\
+         みなして INVALID_POLYGON で断る。\n"
     ) + shared_constraint_notes()
 }
 
@@ -334,8 +348,11 @@ fn shared_constraint_notes() -> &'static str {
     "トライマップ・マスク・多角形・--fg-seed は併用できる（和を取る）。\
      同じ画素が確定前景と確定背景の両方になったら CONSTRAINT_CONFLICT で断る。\
      黙ってどちらかを選ぶと、指示が効いていないことに気づけないためである。\n\
-     確定前景は bbox と確定背景より優先する。確定背景はフィルの種にもなるので、\
-     商品に囲まれて外周から届かない背景もここで消せる"
+     確定前景は bbox の外側に勝ち、面積フィルタにも消されずに不透明で残る\
+     （商品の輪郭と重ねればそこは硬い縁になる）。確定背景とは重ねられない\
+     （CONSTRAINT_CONFLICT）。確定背景はフィルの種にもなるので、商品に\
+     囲まれて外周から届かない背景もここで消せる。\n\
+     渡した指示が 1 画素も塗らなければ CONSTRAINT_EMPTY で報せる"
 }
 
 /// 多角形の頂点列。
@@ -364,8 +381,13 @@ impl Polygon {
                 values.len() / 2
             ));
         }
-        if values.iter().any(|v| !v.is_finite() || *v < 0.0) {
-            return Err("多角形の座標に負数または不正な値が含まれています".to_string());
+        // **負の座標も画像より大きい座標も通す。** 走査線充填が画像の中へ
+        // 切り詰めるので、範囲外の頂点は「その部分が写っていない」だけで
+        // 済む。ここで弾くと、bbox の外側を帯で囲む指示が画像の端で書けなく
+        // なる（帯の外周は必ず画像の縁に接するか、その外へ出る）。
+        // `--normalized` のときだけ `resolve_polygon` が桁違いの値を断る
+        if values.iter().any(|v| !v.is_finite()) {
+            return Err("多角形の座標に有限でない値が含まれています".to_string());
         }
         Ok(Polygon(values.chunks(2).map(|p| [p[0], p[1]]).collect()))
     }
@@ -448,12 +470,24 @@ pub struct CutoutArgs {
     )]
     pub trimap: Option<PathBuf>,
 
-    /// 輝度が 0 でない画素を確定前景にするマスク画像
-    #[arg(long, value_name = "PATH", long_help = mask_long_help("確定前景"))]
+    /// 明るい画素を確定前景にするマスク画像
+    ///
+    /// ヘルプの文言は `mask_help` がしきい値の定数から組む
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = mask_help("確定前景"),
+        long_help = mask_long_help("確定前景")
+    )]
     pub fg_mask: Option<PathBuf>,
 
-    /// 輝度が 0 でない画素を確定背景にするマスク画像
-    #[arg(long, value_name = "PATH", long_help = mask_long_help("確定背景"))]
+    /// 明るい画素を確定背景にするマスク画像
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = mask_help("確定背景"),
+        long_help = mask_long_help("確定背景")
+    )]
     pub bg_mask: Option<PathBuf>,
 
     /// 内部を確定前景にする多角形 x1,y1,x2,y2,...（3 点以上）。複数回指定できる
@@ -794,16 +828,22 @@ mod tests {
             parse_polygon("10,20,300,400").is_err(),
             "2 点は面にならない"
         );
-        assert!(
-            parse_polygon("-1,0,10,0,10,10").is_err(),
-            "負数を許してはいけない"
-        );
         assert!(parse_polygon("a,b,c,d,e,f").is_err());
         assert!(parse_polygon("").is_err());
         assert!(
             parse_polygon("nan,0,10,0,10,10").is_err(),
             "nan を許してはいけない"
         );
+    }
+
+    /// **範囲外の座標は通す。** 「bbox の外側を帯で囲む」という最も素直な
+    /// 指示は、帯の外周が必ず画像の縁に接するか、その外へ出る。1px の
+    /// はみ出しで面ごと消えるより、充填の側で切り詰めるほうが失うものが少ない。
+    #[test]
+    fn coordinates_outside_the_image_are_accepted() {
+        assert!(parse_polygon("-1,0,10,0,10,10").is_ok(), "負数は通す");
+        assert!(parse_polygon("-0.05,-0.05,1.05,-0.05,1.05,1.05").is_ok());
+        assert!(Polygon::from_values(&[-5.0, -5.0, 9999.0, -5.0, 9999.0, 9999.0]).is_ok());
     }
 
     /// CLI と batch が同じ関門を通ること。

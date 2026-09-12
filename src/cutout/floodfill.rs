@@ -767,7 +767,10 @@ fn fill_from_border(
     // キューが数百万要素になる（12MP の実測でピーク RSS が 160MB 増えた）。
     // 隣がすべて埋まっている画素を取り出しても何も起きないので、結果は
     // 変わらない（`expand` が同じ理由で同じことをしている）。
-    if let Some(c) = forced {
+    //
+    // 確定背景が 1 画素も無ければ走査そのものを省く。`--fg-polygon` だけを
+    // 渡した実行や、渡したのに空だった指示で、12MP の表を 2 度舐める理由が無い
+    if let Some(c) = forced.filter(|c| c.any_bg()) {
         for (i, slot) in filled.iter_mut().enumerate() {
             *slot = c.has_bg(i);
         }

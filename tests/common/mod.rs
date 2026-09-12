@@ -876,8 +876,12 @@ pub fn truth_polygons(truth: &EdgeTruth) -> kiri::cutout::Constraints {
     // 商品の外側。余白 5% ぶん離した矩形の外を 4 枚の帯で覆う
     let (mx, my) = (f64::from(w) * 0.05, f64::from(h) * 0.05);
     let (fw, fh) = (f64::from(w), f64::from(h));
-    let (left, top) = (f64::from(x1) - mx, f64::from(y1) - my);
-    let (right, bottom) = (f64::from(x2) + mx, f64::from(y2) + my);
+    // **画像の中へ丸めてから帯を組む。** 商品が端に寄っていると `left` が
+    // 負になり、`rect(0.0, top, left, bottom)` の走査線が逆向きの区間になって
+    // 帯が丸ごと消える。消えた帯は「そこは背景だと教えていない」と同じなので、
+    // 指示の効き方ではなく指示の作り方で結果が変わってしまう
+    let (left, top) = ((f64::from(x1) - mx).max(0.0), (f64::from(y1) - my).max(0.0));
+    let (right, bottom) = ((f64::from(x2) + mx).min(fw), (f64::from(y2) + my).min(fh));
     let rect = |x1: f64, y1: f64, x2: f64, y2: f64| [[x1, y1], [x2, y1], [x2, y2], [x1, y2]];
     for band in [
         rect(0.0, 0.0, fw, top),

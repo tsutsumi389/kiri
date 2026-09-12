@@ -1842,6 +1842,56 @@ fn write_gray(dir: &Path, name: &str, width: u32, height: u32, value: u8) -> Pat
     write_png(dir, name, &img)
 }
 
+/// EXIF Orientation を持つ JPEG を書く。
+///
+/// APP1 セグメントを SOI の直後へ差し込むだけ。**画素は回さない**ので、
+/// 「向きの申告だけがある画像」になる——`--trimap` / `--fg-mask` が寸法の
+/// 検査を素通りしてしまう状況そのものである。
+fn write_jpeg_with_orientation(
+    dir: &Path,
+    name: &str,
+    img: &image::RgbaImage,
+    orientation: u16,
+) -> PathBuf {
+    use image::ImageEncoder;
+
+    let rgb = image::DynamicImage::ImageRgba8(img.clone()).to_rgb8();
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90)
+        .write_image(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            image::ExtendedColorType::Rgb8,
+        )
+        .unwrap();
+
+    // TIFF ヘッダ（リトルエンディアン）+ IFD0 に Orientation ただ 1 つ
+    let [lo, hi] = orientation.to_le_bytes();
+    let mut tiff: Vec<u8> = vec![0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00];
+    tiff.extend_from_slice(&[0x01, 0x00]); // エントリ数
+    tiff.extend_from_slice(&[0x12, 0x01]); // タグ 0x0112 = Orientation
+    tiff.extend_from_slice(&[0x03, 0x00]); // 型 3 = SHORT
+    tiff.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // 個数 1
+    tiff.extend_from_slice(&[lo, hi, 0x00, 0x00]); // 値（4 バイト枠の先頭 2 バイト）
+    tiff.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // 次の IFD は無し
+
+    let mut app1: Vec<u8> = vec![0xFF, 0xE1];
+    let length = u16::try_from(tiff.len() + 8).unwrap();
+    app1.extend_from_slice(&length.to_be_bytes());
+    app1.extend_from_slice(b"Exif\0\0");
+    app1.extend_from_slice(&tiff);
+
+    let mut out = Vec::with_capacity(jpeg.len() + app1.len());
+    out.extend_from_slice(&jpeg[..2]); // SOI
+    out.extend_from_slice(&app1);
+    out.extend_from_slice(&jpeg[2..]);
+
+    let path = dir.join(name);
+    std::fs::write(&path, out).unwrap();
+    path
+}
+
 fn paint(img: &mut image::RgbaImage, rect: (u32, u32, u32, u32), value: u8) {
     let (x1, y1, x2, y2) = rect;
     for y in y1..=y2 {
@@ -2221,6 +2271,133 @@ fn an_unreadable_mask_names_the_flag_and_the_path() {
         message.contains("nope.png"),
         "どのファイルかが分からない: {message}"
     );
+}
+
+/// JPEG で渡したマスクでも、指示された面積が膨らまないこと。
+///
+/// **「輝度が 0 でない」ではリンギングを拾う。** 黒く塗ったはずの周囲に
+/// 1 桁の値が散り、実測で指示面積が 2.4 倍になっていた。中点（128）で
+/// 切れば、可逆でない形式を経由しても指示は動かない。
+#[test]
+fn a_lossy_mask_does_not_inflate_the_instructed_area() {
+    let dir = fixture_dir();
+    let input = constraint_fixture(dir.path());
+    let output = dir.path().join("cut.png");
+
+    // 黒地に 60x60 の白い矩形。境目の周りに JPEG のリンギングが出る
+    let mut mask = image::RgbaImage::from_pixel(200, 200, image::Rgba([0, 0, 0, 255]));
+    paint(&mut mask, (70, 70, 129, 129), 255);
+    let path = write_jpeg(dir.path(), "mask.jpg", &mask);
+
+    let out = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--bg-mask",
+        path.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    let pixels = v["constraints"]["bg_pixels"].as_u64().unwrap();
+    assert!(
+        (3400..=3800).contains(&pixels),
+        "指示された面積が 60x60=3600 から離れている: {pixels}"
+    );
+}
+
+/// EXIF Orientation を持つ指示画像は、黙って向き違いのまま使わないこと。
+///
+/// **180 度（3）や鏡像（2/4）は寸法が変わらない。** `MASK_SIZE_MISMATCH` を
+/// 素通りして、上下逆さまの指示がそのまま効く。結果の数値からは
+/// 「切り抜きが下手」としか読めない失敗である。
+#[test]
+fn a_mask_carrying_an_exif_orientation_is_reported() {
+    let dir = fixture_dir();
+    let input = constraint_fixture(dir.path());
+    let output = dir.path().join("cut.png");
+
+    let mut mask = image::RgbaImage::from_pixel(200, 200, image::Rgba([0, 0, 0, 255]));
+    paint(&mut mask, (10, 10, 60, 60), 255);
+    let path = write_jpeg_with_orientation(dir.path(), "rotated.jpg", &mask, 3);
+
+    let out = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--bg-mask",
+        path.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    assert!(
+        has_warning(&v, "MASK_ORIENTATION_IGNORED"),
+        "向きを無視したことを報せていない: {:?}",
+        warning_codes(&v)
+    );
+    let w = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "MASK_ORIENTATION_IGNORED")
+        .unwrap();
+    assert_eq!(w["data"]["orientation"], 3);
+    assert!(
+        w["message"].as_str().unwrap().contains("rotated.jpg"),
+        "どのファイルかが分からない: {w}"
+    );
+    assert!(w["hint"].as_str().unwrap().contains("向き"), "{w}");
+}
+
+/// 渡したのに 1 画素も塗らなかった指示は、黙って無かったことにしないこと。
+///
+/// **`sources` に無いことを「空だった」と読ませるのは無理がある。**
+/// 渡し忘れと空振りは打つ手が違うので、code で分ける。ブロックそのものは
+/// 出す（比率 0、`sources` は空配列）。
+#[test]
+fn an_instruction_that_marked_nothing_is_reported() {
+    let dir = fixture_dir();
+    let input = constraint_fixture(dir.path());
+    let output = dir.path().join("cut.png");
+
+    let out = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--fg-polygon",
+        "500,500,600,500,600,600",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    assert!(
+        has_warning(&v, "CONSTRAINT_EMPTY"),
+        "空振りを報せていない: {:?}",
+        warning_codes(&v)
+    );
+    let w = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "CONSTRAINT_EMPTY")
+        .unwrap();
+    assert_eq!(w["data"]["source"], "fg_polygon");
+
+    let c = &v["constraints"];
+    assert!(!c.is_null(), "constraints ごと消えている: {v}");
+    assert_eq!(c["sources"].as_array().unwrap().len(), 0);
+    assert_eq!(c["fg_ratio"], 0.0);
+    assert_eq!(c["fg_pixels"], 0);
 }
 
 /// 確定前景と確定背景が重なったら断ること。

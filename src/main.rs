@@ -282,11 +282,17 @@ fn print_cutout(report: &CutoutReport) {
     print_perimeter(&report.background);
     // 指示を渡したときだけ 1 行増やす。**どの入口が効いたかまで出す**のは、
     // 渡したはずの入口が並びに無いことが「その指示は空だった」を意味するため
+    // （そのときは CONSTRAINT_EMPTY も出る）。
+    //
+    // 画素数を添えるのは、比率が桁落ちするためである。20MP の 400 画素は
+    // 0.0% と表示されるが、指示としては確かに置かれている
     if let Some(c) = &report.constraints {
         println!(
-            "  制約      前景 {:.1}%  背景 {:.1}%  ({})",
+            "  制約      前景 {:.1}% ({} px)  背景 {:.1}% ({} px)  ({})",
             c.fg_ratio * 100.0,
+            c.fg_pixels,
             c.bg_ratio * 100.0,
+            c.bg_pixels,
             c.sources.join(", ")
         );
     }

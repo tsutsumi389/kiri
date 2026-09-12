@@ -388,6 +388,48 @@ fn fields() -> Vec<FieldEntry> {
             ),
         },
         FieldEntry {
+            path: "constraints.sources",
+            appears_in: vec!["cutout"],
+            unit: "list",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "画素を 1 つ以上塗った入口の名前（trimap / fg_mask / bg_mask / fg_polygon / \
+                      bg_polygon / fg_seed）",
+            notes: Some(
+                "渡した入口のうち 1 画素以上塗ったものだけが並ぶ。渡したのにここへ無ければ、\
+                 その指示は空だった（空のマスク、画像の外だけを指す多角形）——そのときは \
+                 CONSTRAINT_EMPTY が data.source にその名前を載せて出る。--bbox はここに\
+                 入らない（settings と applied_bbox が言う）",
+            ),
+        },
+        FieldEntry {
+            path: "constraints.fg_pixels",
+            appears_in: vec!["cutout"],
+            unit: "px",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "確定前景として指示された画素数",
+            notes: Some(
+                "比率（constraints.fg_ratio）は小数第 4 位までなので、20MP の数百画素は 0.0 に\
+                 落ちる。sources に名前があるのに比率が 0.0 のときは、こちらを読む",
+            ),
+        },
+        FieldEntry {
+            path: "constraints.bg_pixels",
+            appears_in: vec!["cutout"],
+            unit: "px",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "確定背景として指示された画素数",
+            notes: Some("constraints.fg_pixels と同じ理由で持つ"),
+        },
+        FieldEntry {
             path: "constraints.fg_ratio",
             appears_in: vec!["cutout"],
             unit: "ratio",

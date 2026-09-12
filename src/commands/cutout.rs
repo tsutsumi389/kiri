@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use crate::cli::{CutoutArgs, Polygon};
 use crate::commands::output::{self, round4};
-use crate::cutout::constraints::{TRIMAP_BACKGROUND, TRIMAP_FOREGROUND};
+use crate::cutout::constraints::{MASK_THRESHOLD, TRIMAP_BACKGROUND, TRIMAP_FOREGROUND};
 use crate::cutout::{
     Constraint, ConstraintSource, Constraints, CutoutOptions, FG_SEED_RADIUS, cutout,
 };
@@ -41,7 +41,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         .iter()
         .map(|p| resolve_point(*p, args.normalized, w, h))
         .collect::<Result<Vec<_>>>()?;
-    let constraints = resolve_constraints(args, &fg_seeds, w, h)?;
+    let (constraints, constraint_warnings) = resolve_constraints(args, &fg_seeds, w, h)?;
 
     let opts = CutoutOptions {
         tolerance: args.tolerance,
@@ -64,6 +64,9 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
 
     let mut warnings = loaded.warnings();
     warnings.extend(overwrite_warning);
+    // 指示についての警告は結果の警告より先に出す。渡したものがそのまま
+    // 効いていないなら、その後の数値をどう読むかが変わる
+    warnings.extend(constraint_warnings);
     warnings.extend(result.warnings.clone());
 
     // キャンバスを使わないときは切り抜き結果をそのまま書き出す。複製すると
@@ -320,18 +323,45 @@ fn write_debug_mask(path: Option<&PathBuf>, mask: &crate::cutout::Mask) -> Resul
 /// ファイルとポリゴンを知る唯一の層で、`cutout/` は畳まれた結果しか受け取らない
 /// （`--bbox` の `resolve_bbox` と同じ分担）。
 ///
-/// 何も指示が無ければ `None` を返す。12MP で 12MB の表を、1 画素も強制しない
-/// まま下流へ配る理由が無い。
+/// 入口が 1 つも渡されていなければ `None` を返す。12MP で 12MB の表を、
+/// 1 画素も強制しないまま下流へ配る理由が無い。
+///
+/// **「渡していない」と「渡したが空だった」は別である。** 後者では表を返し、
+/// `constraints` ブロックを比率 0・`sources` 空配列で出したうえ、入口ごとに
+/// `CONSTRAINT_EMPTY` を添える。ブロックごと消すと、エージェントには
+/// 「指示を渡し忘れた」のか「指示が空だった」のかが区別できない。
 fn resolve_constraints(
     args: &CutoutArgs,
     fg_seeds: &[(u32, u32)],
     width: u32,
     height: u32,
-) -> Result<Option<Constraints>> {
+) -> Result<(Option<Constraints>, Vec<Warning>)> {
+    let nothing_given = args.trimap.is_none()
+        && args.fg_mask.is_none()
+        && args.bg_mask.is_none()
+        && args.fg_polygon.is_empty()
+        && args.bg_polygon.is_empty()
+        && fg_seeds.is_empty();
+    if nothing_given {
+        return Ok((None, Vec::new()));
+    }
+
     let mut constraints = Constraints::new(width, height);
+    let mut warnings = Vec::new();
+    // 入口ごとに「何画素塗ったか」を覚える。0 なら渡したのに空だったので、
+    // `sources` には載せず `CONSTRAINT_EMPTY` で報せる
+    let mut empty: Vec<(&str, ConstraintSource)> = Vec::new();
+    let mut note = |c: &mut Constraints, marked: u64, flag: &'static str, source| {
+        if marked > 0 {
+            c.note(source);
+        } else {
+            empty.push((flag, source));
+        }
+    };
 
     if let Some(path) = args.trimap.as_ref() {
-        let image = load_constraint_image(path, "--trimap", width, height)?;
+        let (image, warning) = load_constraint_image(path, "--trimap", width, height)?;
+        warnings.extend(warning);
         let marked = constraints.mark_by_luma(&image, |luma| {
             if luma >= TRIMAP_FOREGROUND {
                 Some(Constraint::ForcedFg)
@@ -341,9 +371,12 @@ fn resolve_constraints(
                 None
             }
         });
-        if marked > 0 {
-            constraints.note(ConstraintSource::Trimap);
-        }
+        note(
+            &mut constraints,
+            marked,
+            "--trimap",
+            ConstraintSource::Trimap,
+        );
     }
 
     for (path, flag, kind, source) in [
@@ -361,11 +394,11 @@ fn resolve_constraints(
         ),
     ] {
         let Some(path) = path else { continue };
-        let image = load_constraint_image(path, flag, width, height)?;
-        let marked = constraints.mark_by_luma(&image, |luma| (luma != 0).then_some(kind));
-        if marked > 0 {
-            constraints.note(source);
-        }
+        let (image, warning) = load_constraint_image(path, flag, width, height)?;
+        warnings.extend(warning);
+        let marked =
+            constraints.mark_by_luma(&image, |luma| (luma >= MASK_THRESHOLD).then_some(kind));
+        note(&mut constraints, marked, flag, source);
     }
 
     for (polygons, flag, kind, source) in [
@@ -382,27 +415,47 @@ fn resolve_constraints(
             ConstraintSource::BgPolygon,
         ),
     ] {
+        if polygons.is_empty() {
+            continue;
+        }
+        // 入口ごとに合算する。3 枚渡して 1 枚だけ画像の外だった場合は、
+        // その入口は効いている
+        let mut marked = 0u64;
         for polygon in polygons {
             let points = resolve_polygon(polygon, args.normalized, width, height, flag)?;
-            if constraints.fill_polygon(&points, kind) > 0 {
-                constraints.note(source);
-            }
+            marked += constraints.fill_polygon(&points, kind);
         }
+        note(&mut constraints, marked, flag, source);
     }
 
     // **`--fg-seed` も指示の 1 つとして数える。** 守る画素の集合は floodfill 側の
     // 保護円と同じ（`disc_pixels` を共有している）ので挙動は変わらないが、
     // これを入れておかないと「種だけを渡した実行」で constraints が現れず、
     // エージェントは自分の指示が画像のどこを占めたのかを知る手段を持たない
-    for &(x, y) in fg_seeds {
-        if constraints.mark_disc(x, y, FG_SEED_RADIUS, Constraint::ForcedFg) > 0 {
-            constraints.note(ConstraintSource::FgSeed);
+    if !fg_seeds.is_empty() {
+        let mut marked = 0u64;
+        for &(x, y) in fg_seeds {
+            marked += constraints.mark_disc(x, y, FG_SEED_RADIUS, Constraint::ForcedFg);
         }
+        note(
+            &mut constraints,
+            marked,
+            "--fg-seed",
+            ConstraintSource::FgSeed,
+        );
     }
 
-    if constraints.is_empty() {
-        return Ok(None);
+    for (flag, source) in empty {
+        warnings.push(
+            Warning::new(
+                WarningCode::ConstraintEmpty,
+                format!("{flag} は 1 画素も塗りませんでした"),
+            )
+            .with_hint("指した領域が画像の外にあるか、マスクが空です")
+            .with_data("source", source.as_str()),
+        );
     }
+
     if let Some(conflict) = constraints.conflict() {
         let (x1, y1, x2, y2) = conflict.bbox;
         return Err(Error::new(
@@ -414,7 +467,7 @@ fn resolve_constraints(
         )
         .with_hint("fg と bg の指定が重なっています。片方を削ってください"));
     }
-    Ok(Some(constraints))
+    Ok((Some(constraints), warnings))
 }
 
 /// 指示として渡された画像を読む。
@@ -425,12 +478,17 @@ fn resolve_constraints(
 ///
 /// 寸法が違えば拡縮せずに断る。伸ばして合わせると、指示した境界が実際の
 /// 商品の輪郭から半画素ずつずれたまま、結果だけがそれらしく返る。
+///
+/// **EXIF Orientation を持つ画像は警告する。** 180 度（3）や鏡像（2/4）は
+/// 寸法が変わらないので `MASK_SIZE_MISMATCH` を素通りし、指示が上下逆さまの
+/// まま効く。結果の数値からは「切り抜きが下手」としか読めない失敗なので、
+/// 黙って進めない。
 fn load_constraint_image(
     path: &Path,
     flag: &str,
     width: u32,
     height: u32,
-) -> Result<image::RgbaImage> {
+) -> Result<(image::RgbaImage, Option<Warning>)> {
     let loaded = load::load_with(
         path,
         &LoadOptions {
@@ -460,8 +518,34 @@ fn load_constraint_image(
             "kiri info が返す width/height（EXIF 適用後）に合わせてください。自動では拡縮しません",
         ));
     }
-    Ok(loaded.image)
+
+    let warning = (loaded.exif_orientation != 1).then(|| {
+        Warning::new(
+            WarningCode::MaskOrientationIgnored,
+            format!(
+                "{flag} {} は EXIF Orientation {} を持ちますが、マスクは生の画素として読みます",
+                path.display(),
+                loaded.exif_orientation
+            ),
+        )
+        .with_hint("向きを適用済みのマスクを渡してください")
+        .with_data("path", path.display().to_string())
+        .with_data("orientation", loaded.exif_orientation)
+    });
+    Ok((loaded.image, warning))
 }
+
+/// 画素座標を `--normalized` で渡す取り違えとみなす絶対値の下限。
+///
+/// **0.0-1.0 の外を一律に断ってはいけない。** 「bbox の外側を帯で囲む」という
+/// 最も素直な指示は、帯の外周が必ず画像の縁に接するか、その外へ出る
+/// （`-0.05` や `1.05` になる）。1px の丸めで指示が消えるくらいなら、
+/// 範囲外はそのまま受けて充填の側で切り詰めるほうがよい。
+///
+/// 一方で `900` のような値は、画素座標を渡した取り違え以外にありえない。
+/// 2.0 は「画像 1 枚ぶんはみ出す」までを許す線で、帯の余白としては広すぎる
+/// ほどだが、桁違いの取り違えとは明らかに離れている。
+const NORMALIZED_LIMIT: f64 = 2.0;
 
 /// 多角形の頂点を画素座標に落とす。
 ///
@@ -478,11 +562,18 @@ fn resolve_polygon(
     if !normalized {
         return Ok(polygon.points().to_vec());
     }
-    // 画素座標を --normalized で渡す取り違えを検出する（resolve_bbox と同じ関門）
-    if polygon.points().iter().any(|p| p[0] > 1.0 || p[1] > 1.0) {
+    // 画素座標を --normalized で渡す取り違えを検出する（resolve_bbox と同じ関門）。
+    // ただし範囲外そのものは許す（上の NORMALIZED_LIMIT を参照）
+    if polygon
+        .points()
+        .iter()
+        .any(|p| p[0].abs() > NORMALIZED_LIMIT || p[1].abs() > NORMALIZED_LIMIT)
+    {
         return Err(Error::new(
             ErrorCode::InvalidPolygon,
-            format!("--normalized 指定時、{flag} の各値は 0.0-1.0 である必要があります"),
+            format!(
+                "--normalized 指定時、{flag} の各値は絶対値 {NORMALIZED_LIMIT:.1} 以内である必要があります"
+            ),
         )
         .with_hint("画素座標で指定する場合は --normalized を外してください"));
     }
@@ -496,6 +587,7 @@ fn resolve_polygon(
 /// 効いた指示を結果 JSON へ落とす。
 fn constraints_report(constraints: &Constraints) -> ConstraintsReport {
     let (fg, bg, unknown) = constraints.ratios();
+    let (fg_pixels, bg_pixels) = constraints.counts();
     ConstraintsReport {
         sources: constraints
             .sources()
@@ -505,6 +597,8 @@ fn constraints_report(constraints: &Constraints) -> ConstraintsReport {
         fg_ratio: round4(fg),
         bg_ratio: round4(bg),
         unknown_ratio: round4(unknown),
+        fg_pixels,
+        bg_pixels,
     }
 }
 
@@ -652,7 +746,7 @@ mod tests {
 
     /// 画素座標を `--normalized` で渡す取り違えを検出する。
     #[test]
-    fn normalized_polygon_values_above_one_are_rejected() {
+    fn normalized_polygon_values_far_outside_the_range_are_rejected() {
         let err = resolve_polygon(
             &polygon(&[120.0, 80.0, 900.0, 80.0, 900.0, 1400.0]),
             true,
@@ -664,6 +758,17 @@ mod tests {
         assert_eq!(err.code.as_str(), "INVALID_POLYGON");
         assert_eq!(err.exit_code(), 2);
         assert!(err.hint.unwrap().contains("--normalized"));
+    }
+
+    /// **正規化座標でも 0.0-1.0 の外は通す。** bbox の外側を帯で囲む指示は、
+    /// 帯の外周が画像の縁に接するか、その外へ出る（`-0.05` / `1.05`）。
+    /// そこを断ると、いちばん素直な書き方が端で使えなくなる。
+    #[test]
+    fn a_normalized_polygon_may_reach_just_outside_the_image() {
+        let band = polygon(&[-0.05, -0.05, 1.05, -0.05, 1.05, 0.30, -0.05, 0.30]);
+        let points = resolve_polygon(&band, true, 1000, 800, "--bg-polygon").unwrap();
+        assert_eq!(points[0], [-50.0, -40.0]);
+        assert_eq!(points[2], [1050.0, 240.0]);
     }
 
     /// 画像の外へ出る頂点は、点と違って**面ごと捨てない**。

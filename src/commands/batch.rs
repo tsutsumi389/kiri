@@ -6,6 +6,7 @@
 use std::path::Path;
 use std::time::Instant;
 
+use clap::ValueEnum;
 use rayon::prelude::*;
 
 use crate::batch::{self, BatchItem, ItemSettings};
@@ -13,7 +14,7 @@ use crate::cli::{
     BatchArgs, ColorOpts, CutoutArgs, OutputOpts, Polygon, parse_hex_color, parse_size,
 };
 use crate::commands::cutout;
-use crate::cutout::DEFAULT_BORDER;
+use crate::cutout::{CutoutOptions, DEFAULT_BORDER, Matting};
 use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::OutputFormat;
 use crate::report::{BatchItemReport, BatchReport, ErrorBody, SCHEMA_VERSION};
@@ -143,6 +144,14 @@ fn to_cutout_args(
         feather: settings.feather.unwrap_or(1),
         no_despill: !settings.despill.unwrap_or(true),
         no_refine: !settings.refine.unwrap_or(true),
+        matting: matting(settings.matting.as_deref())?,
+        smooth_contour: capped_f64(
+            settings.smooth_contour,
+            crate::cutout::DEFAULT_SMOOTH_CONTOUR,
+            crate::cli::MAX_SMOOTH_CONTOUR,
+            "smooth_contour",
+        )?,
+        no_reclassify: !settings.reclassify.unwrap_or(true),
         color: ColorOpts {
             no_color_convert: !settings.color_convert.unwrap_or(true),
         },
@@ -170,6 +179,43 @@ fn to_cutout_args(
             dry_run,
         },
     })
+}
+
+/// spec の `matting` を解き方へ落とす。
+///
+/// **綴りを外したら断る。** 未知の値を既定へ落とすと、その項目だけ黙って
+/// 別の解き方で処理され、数百点を回した後に仕上がりを見るまで気づけない。
+///
+/// **候補は `clap::ValueEnum` から引く。** 手書きの `match` に catch-all を
+/// 置くと、`Matting` に枝を足したときに spec 側だけが取りこぼす——しかも
+/// コンパイラは何も言わない。CLI と spec が同じ 1 つの列挙を見る。
+fn matting(name: Option<&str>) -> Result<Matting> {
+    let Some(name) = name else {
+        return Ok(CutoutOptions::default().matting);
+    };
+    let known = || -> Vec<String> {
+        Matting::value_variants()
+            .iter()
+            .filter_map(|v| v.to_possible_value().map(|p| p.get_name().to_string()))
+            .collect()
+    };
+    Matting::value_variants()
+        .iter()
+        .find(|v| {
+            v.to_possible_value()
+                .is_some_and(|p| p.matches(name, false))
+        })
+        .copied()
+        .ok_or_else(|| {
+            Error::new(
+                ErrorCode::SpecInvalid,
+                format!("'{name}' は未対応の matting です"),
+            )
+            .with_hint(format!(
+                "{} のいずれかを指定してください",
+                known().join(" / ")
+            ))
+        })
 }
 
 /// spec の `[[x,y,x,y,...], ...]` を多角形へ落とす。
@@ -207,6 +253,21 @@ fn checked(value: Option<f64>, default: f64, key: &str) -> Result<f64> {
 /// 形で表れるが、どちらも「数百点を回し終えてから気づく」種類の失敗になる。
 fn capped(value: Option<u32>, default: u32, max: u32, key: &str) -> Result<u32> {
     let value = value.unwrap_or(default);
+    if value > max {
+        return Err(Error::new(
+            ErrorCode::InvalidSetting,
+            format!("{key} は 0 から {max} の範囲で指定してください（{value} が指定されました）"),
+        ));
+    }
+    Ok(value)
+}
+
+/// 上限のある実数の設定に CLI と同じ関門を掛ける。
+///
+/// `capped` の実数版。上限を超えた `smooth_contour` は `RADIUS_CEILING` で
+/// 頭打ちになるだけなので、spec に書いた値と効いた値が黙って食い違う。
+fn capped_f64(value: Option<f64>, default: f64, max: f64, key: &str) -> Result<f64> {
+    let value = validate(value.unwrap_or(default), key)?;
     if value > max {
         return Err(Error::new(
             ErrorCode::InvalidSetting,

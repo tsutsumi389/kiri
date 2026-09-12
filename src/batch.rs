@@ -51,6 +51,11 @@ pub struct ItemSettings {
     pub feather: Option<u32>,
     pub despill: Option<bool>,
     pub refine: Option<bool>,
+    /// 境界のアルファの解き方（"projection" / "guided"）
+    pub matting: Option<String>,
+    /// 帯の中の二値輪郭に掛けるメディアンの半径(px, 長辺 1000px 換算)
+    pub smooth_contour: Option<f64>,
+    pub reclassify: Option<bool>,
     /// 埋め込み ICC を sRGB へ変換するか（既定 true）
     pub color_convert: Option<bool>,
     pub edge_threshold: Option<f64>,
@@ -91,6 +96,9 @@ impl ItemSettings {
             feather,
             despill,
             refine,
+            matting,
+            smooth_contour,
+            reclassify,
             color_convert,
             edge_threshold,
             step_tolerance,
@@ -123,6 +131,9 @@ const SETTING_KEYS: &[&str] = &[
     "feather",
     "despill",
     "refine",
+    "matting",
+    "smooth_contour",
+    "reclassify",
     "color_convert",
     "edge_threshold",
     "step_tolerance",

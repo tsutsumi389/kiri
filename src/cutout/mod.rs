@@ -20,9 +20,13 @@ pub mod diagnostics;
 pub mod edges;
 pub mod feather;
 pub mod floodfill;
+pub mod guided;
+pub mod integral;
+pub mod local_colour;
 pub mod mask;
 pub mod morphology;
 pub mod refine;
+pub mod reshape;
 pub mod subject;
 
 use image::RgbaImage;
@@ -35,7 +39,7 @@ pub use diagnostics::Diagnostics;
 pub use edges::GradientQuantiles;
 pub use floodfill::{FG_SEED_RADIUS, FloodOptions, foreground_mask};
 pub use mask::{Mask, MaskStats};
-pub use refine::RefineOptions;
+pub use refine::{DEFAULT_SMOOTH_CONTOUR, Matting, RefineOptions};
 pub use subject::{Confidence, LowReason, SubjectHint, detect_subject};
 
 /// 堤防の既定のしきい値。1px あたりの輝度変化量。
@@ -127,6 +131,12 @@ pub struct CutoutOptions {
     /// 境界帯のアルファを画像の色から推定し直すか。false で旧来の
     /// 幾何的フェザリング + 大域背景色でのデスピルに戻す
     pub refine: bool,
+    /// 境界のアルファの解き方（射影だけか、guided filter で均すか）
+    pub matting: Matting,
+    /// 帯の中の二値輪郭に掛けるメディアンの半径。**長辺 1000px 換算**。0 で無効
+    pub smooth_contour: f64,
+    /// 帯の中の二値画素を局所の色で塗り直すか
+    pub reclassify: bool,
 }
 
 impl Default for CutoutOptions {
@@ -157,6 +167,17 @@ impl Default for CutoutOptions {
             // 正当な隙間は塞がない幅
             seal: 1,
             refine: true,
+            // 既定をベンチで決めた根拠は docs/design.md 4.10 を参照。
+            //
+            // **3 段（再分類・平滑化・guided）は実写背景の正解由来の指標を
+            // 半分にするが、合成では払うものがある。** 実測（Phase 2 → 既定）:
+            // S3（淡色商品）の `eaten` 1.86% → 3.00%、S7 の `shadow_kept`
+            // 23.9% → 20.4%、S11 / S12 の `alpha_mae` +0.007 / +0.031、
+            // R1 / R2 / R5 の `alpha_mae` +0.009 前後。得るほうは R1 の
+            // 輪郭誤差 18.42 → 6.03、rim 正解 0.512 → 0.224 で、桁が違う
+            matting: Matting::Guided,
+            smooth_contour: DEFAULT_SMOOTH_CONTOUR,
+            reclassify: true,
         }
     }
 }
@@ -169,6 +190,12 @@ pub struct CutoutResult {
     /// 実際に効いた堤防のしきい値。自動調整が入ると指定値と食い違うため、
     /// 呼び出し側が「何が効いたか」を報告できるように返す
     pub edge_threshold: f64,
+    /// 実際に効いた帯幅の下限(px)。輪郭の粗さで持ち上がることがあるので、
+    /// 指定値からは読めない。`--no-refine` では帯そのものが無いので None
+    pub band_min_radius: Option<u32>,
+    /// 実際に効いた輪郭の平滑化半径(px)。`--smooth-contour` は長辺 1000px 換算
+    /// なので、指定値からは読めない。`--no-refine` では None
+    pub smooth_radius_px: Option<u32>,
     pub stats: MaskStats,
     /// 切り抜き境界での商品と背景の色差(ΔE)の中央値。前景が無ければ None
     pub separability: Option<f64>,
@@ -294,6 +321,8 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
     mask = morphology::remove_specks(&mask, opts.cleanup);
     restore_forced_foreground(&mut mask, opts);
 
+    let mut band_min_radius = None;
+    let mut smooth_radius_px = None;
     let mut out = if opts.refine {
         let refined = refine::refine(
             image,
@@ -302,10 +331,20 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
             &RefineOptions {
                 feather: opts.feather,
                 despill: opts.despill,
+                matting: opts.matting,
+                smooth_contour: opts.smooth_contour,
+                reclassify: opts.reclassify,
+                seal: opts.seal,
+                // 指示と矩形を境界処理まで通す。確定した画素は帯から外れ、
+                // 輪郭の粗さは診断と同じ規約（矩形の辺を数えない）で測られる
+                constraints: opts.constraints.as_ref(),
+                bbox: opts.bbox,
                 ..Default::default()
             },
         );
         mask = refined.mask;
+        band_min_radius = Some(refined.band_min_radius);
+        smooth_radius_px = Some(refined.smooth_radius_px);
         refined.image
     } else {
         mask = feather::feather(&mask, opts.feather);
@@ -361,6 +400,8 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
         mask,
         background,
         edge_threshold,
+        band_min_radius,
+        smooth_radius_px,
         stats,
         separability,
         diagnostics,

@@ -211,6 +211,149 @@ fn pass(mask: &Mask, radius: u32, take_max: bool, horizontal: bool) -> Mask {
     out
 }
 
+/// 画素ごとの真偽値をビットで持つ面。
+///
+/// **`Vec<bool>` は 1 画素 1 バイトである。** 測地的オープニングは元の面・芯・
+/// 到達済み・膨張の 4 枚を同時に生かすので、24.5MP の実写では 98MB になる。
+/// 形態素処理も連結性の探索も「立っているか」しか問わないのだから、ビットで
+/// 持てば同じ答えを 1/8 の常駐量で出せる。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BitPlane {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl BitPlane {
+    pub fn new(len: usize) -> Self {
+        Self {
+            words: vec![0u64; len.div_ceil(64)],
+            len,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    pub fn get(&self, index: usize) -> bool {
+        (self.words[index / 64] >> (index % 64)) & 1 == 1
+    }
+
+    /// 空の面には何も入っていない、として問う。
+    ///
+    /// 印が要らない経路（`--matting projection` など）に 24.5MP で 3MB を
+    /// 確保させないための窓口である。`get` と分けてあるのは、**空かどうかを
+    /// 気にしない呼び出し側が黙って添字を外す**のを防ぐため。
+    #[inline]
+    pub fn contains(&self, index: usize) -> bool {
+        !self.words.is_empty() && self.get(index)
+    }
+
+    #[inline]
+    pub fn insert(&mut self, index: usize) {
+        self.words[index / 64] |= 1u64 << (index % 64);
+    }
+
+    /// 立っている添字だけを昇順に渡す。0 のワードをまとめて飛ばすので、
+    /// **ほとんど立っていない面**を全画素走査するより桁で安い。
+    pub fn for_each_set(&self, mut body: impl FnMut(usize)) {
+        for (w, &word) in self.words.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                body(w * 64 + bit);
+                bits &= bits - 1;
+            }
+        }
+    }
+
+    #[inline]
+    pub fn set(&mut self, index: usize, value: bool) {
+        let bit = 1u64 << (index % 64);
+        let word = &mut self.words[index / 64];
+        if value {
+            *word |= bit;
+        } else {
+            *word &= !bit;
+        }
+    }
+}
+
+/// 形態素処理に渡せる真偽値の面。
+///
+/// `Vec<bool>` とビットセットを **同じ 1 本の実装**へ通すためだけに存在する。
+/// 2 つの表現に 2 つの収縮／膨張を持つと、片方だけ直したときに黙って食い違う。
+pub trait Plane {
+    fn at(&self, index: usize) -> bool;
+}
+
+impl Plane for [bool] {
+    #[inline]
+    fn at(&self, index: usize) -> bool {
+        self[index]
+    }
+}
+
+impl Plane for BitPlane {
+    #[inline]
+    fn at(&self, index: usize) -> bool {
+        self.get(index)
+    }
+}
+
+/// 正方形の構造要素による収縮（`take_max` が false）／膨張（true）。
+///
+/// 横と縦に分けて O(n * radius) に収める。**枠の外は窓に含めない**——外を
+/// 前景とみなすと、画面の端で切れている背景まで削れてしまう。
+///
+/// `floodfill` の測地的オープニングと `refine` の隙間の閉じ直しが、同じ規約を
+/// 別々に書き写していた。規約（枠の外の扱い）を 2 箇所に持つと必ず離れる。
+pub fn separable<P: Plane + ?Sized>(
+    w: usize,
+    h: usize,
+    src: &P,
+    radius: u32,
+    take_max: bool,
+) -> BitPlane {
+    let mut out = BitPlane::new(w * h);
+    if radius == 0 {
+        for i in 0..w * h {
+            out.set(i, src.at(i));
+        }
+        return out;
+    }
+    let r = radius as usize;
+    let combine = |acc: bool, v: bool| if take_max { acc || v } else { acc && v };
+
+    let mut horizontal = BitPlane::new(w * h);
+    for y in 0..h {
+        for x in 0..w {
+            let (from, to) = (x.saturating_sub(r), (x + r).min(w - 1));
+            let mut acc = !take_max;
+            for k in from..=to {
+                acc = combine(acc, src.at(y * w + k));
+            }
+            horizontal.set(y * w + x, acc);
+        }
+    }
+    for y in 0..h {
+        for x in 0..w {
+            let (from, to) = (y.saturating_sub(r), (y + r).min(h - 1));
+            let mut acc = !take_max;
+            for k in from..=to {
+                acc = combine(acc, horizontal.get(k * w + x));
+            }
+            out.set(y * w + x, acc);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

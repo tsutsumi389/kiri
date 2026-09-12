@@ -1413,6 +1413,14 @@ pub struct EdgeMetrics {
     /// 言っていない。ここは「渡した指示が守られたか」を直接問うので、
     /// 芯の判定（C1）や面積フィルタ（H1）が指示を握りつぶせば必ず 1.0 を割る
     pub forced_kept: f32,
+    /// 確定背景と指示された画素のうち、最終マスクで背景のまま残った割合
+    /// (0.0-1.0)。指示が無ければ NaN。
+    ///
+    /// **`forced_kept` の対である。** 片側だけを見ていると、境界処理が確定背景を
+    /// 前景へ塗り替えても気づけない。境界帯は色だけを見て塗り直すので、
+    /// 商品に囲まれた確定背景（`--bg-polygon` で中央を指した指示）や、
+    /// トライマップの確定背景の縁がここで黙って埋まりうる。
+    pub forced_bg_kept: f32,
 }
 
 fn luma(p: [u8; 4]) -> f32 {
@@ -1478,6 +1486,7 @@ pub fn measure_edges_with(
     let (mut strap_kept, mut strap_n) = (0u32, 0u32);
     let (mut shadow_kept, mut shadow_n) = (0u32, 0u32);
     let (mut forced_kept, mut forced_n) = (0u32, 0u32);
+    let (mut forced_bg_kept, mut forced_bg_n) = (0u32, 0u32);
     let (mut speckles, mut speckles_n) = (0u32, 0u32);
     let mut casts: Vec<f32> = Vec::new();
 
@@ -1564,12 +1573,22 @@ pub fn measure_edges_with(
                 }
             }
             // 指示そのものが守られたか。正解とは無関係に、**渡した画素が
-            // 前景として残っているか**だけを問う
-            if constraints.is_some_and(|k| k.at(x, y) == kiri::cutout::Constraint::ForcedFg) {
-                forced_n += 1;
-                if fg {
-                    forced_kept += 1;
+            // 指示どおりに残っているか**だけを問う。**両側を測る**——確定前景
+            // だけを見ていると、境界処理が確定背景を前景へ塗り替えても気づけない
+            match constraints.map(|k| k.at(x, y)) {
+                Some(kiri::cutout::Constraint::ForcedFg) => {
+                    forced_n += 1;
+                    if fg {
+                        forced_kept += 1;
+                    }
                 }
+                Some(kiri::cutout::Constraint::ForcedBg) => {
+                    forced_bg_n += 1;
+                    if !fg {
+                        forced_bg_kept += 1;
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -1627,6 +1646,7 @@ pub fn measure_edges_with(
         contour_error,
         rim_truth,
         forced_kept: ratio(forced_kept, forced_n),
+        forced_bg_kept: ratio(forced_bg_kept, forced_bg_n),
     }
 }
 

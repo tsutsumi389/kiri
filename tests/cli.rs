@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 use common::{
-    ProductSpec, bleeding_product_scene, product_image, shadow_band_scene, split_background_scene,
-    transparent_product, woven_background_image, woven_poisoned_scene, write_jpeg, write_png,
+    ProductSpec, bleeding_product_scene, dense_key_grid, product_image, shadow_band_scene,
+    split_background_scene, transparent_product, woven_background_image, woven_poisoned_scene,
+    write_jpeg, write_png,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -6222,6 +6223,14 @@ fn every_published_field_exists_in_the_result() {
 /// 1.00 と 0.50 しかない）。そちらは
 /// `schema_publishes_the_thresholds_behind_the_warnings` が定数との照合で守る。
 /// 2 つで「書き写しの誤り」と「向きの誤り」を分担している。
+///
+/// # `--segment` の実行も材料に入れる
+///
+/// `segment.*` は**走らせないと 1 つも現れない**ので、指示なしの実行だけを
+/// 並べていると契約のその一角がまるごと素通りする。実際 `info` は
+/// `segment.uncertain_ratio` を返しながら `SEGMENT_UNCERTAIN` を出し忘れて
+/// いた——`cutout` だけが出していたので、コマンドを 1 つしか回さない検査では
+/// 見えなかった。モデルが無ければその 2 本だけを飛ばす。
 #[test]
 fn the_published_thresholds_agree_with_the_warnings_that_fire() {
     let v = schema_json();
@@ -6268,6 +6277,45 @@ fn the_published_thresholds_agree_with_the_warnings_that_fire() {
                 reports.push((format!("{name}/{command}"), json_stdout(&out)));
             }
         }
+    }
+    // **モデルが迷う材料を 1 枚だけ通す。** 単色背景の合成商品ではモデルが
+    // 素直に言い切ってしまい、不明の帯は 5% 程度にしかならない（しきい値は
+    // 0.3）。暗いキーの格子なら実写キーボードと同じ形で迷う
+    if segment_ready() {
+        let keys = write_png(dir.path(), "keys.png", &dense_key_grid(256, 256));
+        let output = dir.path().join("keys-cutout.png");
+        for args in [
+            vec![
+                "info".to_string(),
+                keys.display().to_string(),
+                "--segment".into(),
+                "isnet".into(),
+                "--json".into(),
+            ],
+            vec![
+                "cutout".to_string(),
+                keys.display().to_string(),
+                "-o".into(),
+                output.display().to_string(),
+                "--dry-run".into(),
+                "--json".into(),
+                "--segment".into(),
+                "isnet".into(),
+            ],
+        ] {
+            let out = kiri().args(&args).output().unwrap();
+            if out.status.success() {
+                reports.push((format!("keys/{}", args[0]), json_stdout(&out)));
+            }
+        }
+    } else {
+        eprintln!(
+            "モデルが無いので飛ばす: {}",
+            kiri::segment::model::ISNET
+                .expected_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(置き場所を決められません)".to_string())
+        );
     }
     assert!(reports.len() >= 4, "比べられる結果が足りない");
 

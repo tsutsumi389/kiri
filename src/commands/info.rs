@@ -45,13 +45,17 @@ pub fn run(args: &InfoArgs) -> Result<InfoReport> {
         ),
         None => (analysis.subject.clone(), SUBJECT_FROM_COLOUR),
     };
+    let mut warnings = loaded.warnings();
+    // **`cutout` と同じ警告を出す。** `schema` は `segment.uncertain_ratio` を
+    // `info` にも配ったうえで「0.3 を超えたら SEGMENT_UNCERTAIN」と言っている。
+    // ここで黙ると、配った値を読んで自分で比べたエージェントだけが気づく——
+    // **しきい値を配る意味は、越えたときに kiri の側から言うこと**にある
     let segment_report = decision.run.as_ref().map(|run| {
         let (_, stats) =
             crate::segment::to_constraints(&run.probability, loaded.width(), loaded.height());
+        warnings.extend(segment::uncertain_warning(&stats));
         segment::report(run, &stats)
     });
-
-    let mut warnings = loaded.warnings();
     if !background.is_uniform() {
         warnings.extend(low_uniformity_warnings(
             background,

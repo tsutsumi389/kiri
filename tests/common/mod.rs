@@ -1870,6 +1870,38 @@ pub fn split_background_scene(width: u32, height: u32) -> RgbaImage {
     img
 }
 
+/// **セグメンテーションモデルが対象を掴めない構図**を合成で作る。
+///
+/// 実写キーボード（暗い机の上の黒いキーボード）で起きたことの縮小版である。
+/// ISNet は暗く平坦なキーキャップを確率ほぼ 0 で返すが、それは商品の枠に
+/// 囲まれているので確定背景にはできない（`segment::reachable_from_the_border`）。
+/// 結果として画像の大半が**不明のまま**残り、`SEGMENT_UNCERTAIN` が出る。
+///
+/// **しきい値（`SEG_UNCERTAIN_WARN` = 0.3）を越える材料がこれしかない。**
+/// 単色背景の合成商品ではモデルが素直に言い切ってしまい、不明の帯は 5% 程度
+/// にしかならない。警告が出る側の挙動を確かめるには、モデルが迷う画像が要る。
+///
+/// 実測（256x256、ISNet）: 確定前景 0.0% / 確定背景 17.3% / 不明 82.7%。
+pub fn dense_key_grid(width: u32, height: u32) -> RgbaImage {
+    let mut img = RgbaImage::from_pixel(width, height, Rgba([70, 66, 60, 255]));
+    let (x0, x1) = (width / 24, width - width / 24);
+    let (y0, y1) = (height / 10, height - height / 10);
+    let pitch = (width / 16).max(2);
+    let cap = pitch - pitch / 5;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let key = (x - x0) % pitch < cap && (y - y0) % pitch < cap;
+            let v = if key {
+                Rgba([24, 24, 26, 255])
+            } else {
+                Rgba([48, 48, 52, 255])
+            };
+            img.put_pixel(x, y, v);
+        }
+    }
+    img
+}
+
 /// 画面の下端で見切れた商品。**照明場が商品を学んでしまう構図**である。
 ///
 /// 商品は横 15%〜85%、縦は下端から `depth`% を占める。下辺の 70% がまるごと

@@ -565,6 +565,82 @@ fn info_reports_a_subject_measured_by_the_model() {
     assert!(plain.get("segment").is_none());
 }
 
+/// **モデルが迷ったことは `info` でも黙らない。**
+///
+/// `schema` は `segment.uncertain_ratio` を `info` と `cutout` の両方に配り、
+/// 「0.3 を超えたら `SEGMENT_UNCERTAIN`」と書いている。それなのに `info` は
+/// 値だけを返して警告を出し忘れていた——**配った値を自分で比べたエージェント
+/// だけが気づける**状態で、しきい値を配る意味が半分になる。
+///
+/// 材料は暗いキーの格子。単色背景の合成商品ではモデルが素直に言い切って
+/// しまい（不明の帯 5% 程度）、しきい値を越える側を確かめられない。
+#[test]
+fn info_does_not_stay_silent_when_the_model_is_lost() {
+    if skip_without_model() {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let input = write_png(dir.path(), "keys.png", &common::dense_key_grid(256, 256));
+    let out = dir.path().join("a.png");
+
+    let info = json_stdout(
+        &kiri()
+            .args([
+                "info",
+                input.to_str().unwrap(),
+                "--segment",
+                "isnet",
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+    let cutout = json_stdout(
+        &kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+                "--dry-run",
+                "--segment",
+                "isnet",
+                "--json",
+            ])
+            .output()
+            .unwrap(),
+    );
+
+    let ratio = |v: &Value| v["segment"]["uncertain_ratio"].as_f64().unwrap();
+    let warned = |v: &Value| {
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == "SEGMENT_UNCERTAIN")
+    };
+    assert!(
+        ratio(&info) > kiri::segment::SEG_UNCERTAIN_WARN,
+        "材料がしきい値を越えていない。警告が出る側を確かめられない: {}",
+        ratio(&info)
+    );
+    assert!(
+        warned(&info),
+        "info が SEGMENT_UNCERTAIN を出していない: {info}"
+    );
+    assert!(
+        warned(&cutout),
+        "cutout が SEGMENT_UNCERTAIN を出していない"
+    );
+    // 同じ画像・同じモデルなので、迷い方も同じでなければならない
+    assert!(
+        (ratio(&info) - ratio(&cutout)).abs() < 1e-9,
+        "info と cutout で不明の帯が違う: {} vs {}",
+        ratio(&info),
+        ratio(&cutout)
+    );
+}
+
 /// モデルを走らせても、`--segment off` の出力は影響を受けない。
 ///
 /// 同じ入力を 2 回走らせて、片方だけモデルを使う。**`off` 側のバイト列が

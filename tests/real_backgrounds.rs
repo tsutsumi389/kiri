@@ -229,12 +229,19 @@ fn spatial_instructions_are_kept_and_do_not_worsen_the_contour() {
         );
     }
 
-    // **確定前景は 1 画素も落ちない。** 指示は色より強いという約束そのもの
+    // **確定前景は 1 画素も落ちず、確定背景は 1 画素も埋まらない。** 指示は
+    // 色より強いという約束そのもので、**両側を見る**——片側だけを固定すると、
+    // 境界処理が確定背景を前景へ塗り替えても気づけない
     for p in [trimap, polygon] {
         assert_eq!(
             p.metrics.forced_kept, 1.0,
             "{}: 確定前景が前景として残っていない: {:.4}",
             p.label, p.metrics.forced_kept
+        );
+        assert_eq!(
+            p.metrics.forced_bg_kept, 1.0,
+            "{}: 確定背景が前景へ塗り替えられている: {:.4}",
+            p.label, p.metrics.forced_bg_kept
         );
     }
 
@@ -264,9 +271,16 @@ fn spatial_instructions_are_kept_and_do_not_worsen_the_contour() {
 /// 輪郭の粗さが実写背景でだけ跳ねること。
 ///
 /// **既定値の側で見る。** bbox と tolerance で救った後（assisted）でも実写背景の
-/// 輪郭は蛇行しているが（R1 assisted 1.00）、蛇行が桁で出るのは既定値のまま
-/// 布が前景として残っている状態のほう（R1 defaults 1.80、R4 defaults 14.00）で、
-/// 「合成のきれいなシーンとの比」で語るならそちらが素直である。
+/// 輪郭は蛇行しているが、蛇行が桁で出るのは既定値のまま布が前景として残って
+/// いる状態のほう（R1 defaults 0.98、R2 defaults 0.69）で、「合成のきれいな
+/// シーンとの比」で語るならそちらが素直である。
+///
+/// **R4 既定はこの一覧から外した。** Phase 3 の縁の再分類が、暗い机の上の
+/// 白い商品を既定値のまま解けるようにしたためである（輪郭誤差 36.23 → 0.41、
+/// 粗さ 2.44 → 0.002、警告なし）。**壊れていないシーンに「壊れている」ことを
+/// 求め続けるのは、改善を退行として報告するのと同じである。** 代わりに、
+/// 同じく既定値では解けない R2 既定を置いた——背景が別の不織布なので、
+/// 「1 枚の素材でだけ成り立つ話」にならない。
 #[test]
 fn the_contour_roughness_rises_only_on_a_real_background() {
     let points = bench();
@@ -276,7 +290,7 @@ fn the_contour_roughness_rises_only_on_a_real_background() {
         .expect("輪郭がある");
     for label in [
         "R1 不織布 + 黒商品 / defaults",
-        "R4 暗い机 + 白商品 / defaults",
+        "R2 照明勾配の不織布 + 黒商品 / defaults",
     ] {
         let p = point(&points, label);
         let rough = p.diagnostics.contour_roughness.expect("輪郭がある");
@@ -389,6 +403,157 @@ fn a_three_pixel_strap_is_not_called_a_rough_contour() {
     );
 }
 
+/// Phase 3 の 3 段が、実写背景の**正解由来の**指標を実際に下げること。
+///
+/// **これが Phase 3 の目的そのものである。** 診断値（`contour_roughness` /
+/// `rim_contamination`）は処理が自分で均せる量なので、良くなったことの証拠に
+/// ならない。正解の輪郭からの距離（`contour_error`）と、帯のうち真に背景だった
+/// 割合（`rim_truth`）だけが、外から見て嘘をつけない。
+///
+/// 基準は「Phase 2 までの経路（3 つのスイッチを明示）の半分以下」。設計書の
+/// 合格条件（R1 assisted で 18.4 → 9.2、rim 正解 0.512 → 0.26）と同じ −50% で、
+/// **絶対値ではなく比で書く**のは、シーンの生成や較正が動いても意味が変わらない
+/// ようにするためである。
+#[test]
+fn the_matting_stages_halve_the_truth_side_error_on_a_real_background() {
+    use kiri::cutout::Matting;
+
+    let scene = real_scenes()
+        .into_iter()
+        .find(|s| s.name.starts_with("R1"))
+        .unwrap();
+    let truth = common::real_scene(&scene);
+    let bbox = common::assisted_bbox(&truth);
+    let measure = |opts: &CutoutOptions| {
+        let result = cutout(&truth.image, opts);
+        common::measure_edges_with(&truth, &result.image, &result.mask, opts.bbox, None)
+    };
+    let assisted = CutoutOptions {
+        bbox: Some(bbox),
+        tolerance: scene.assisted_tolerance,
+        ..Default::default()
+    };
+    let before = measure(&CutoutOptions {
+        matting: Matting::Projection,
+        smooth_contour: 0.0,
+        reclassify: false,
+        ..assisted.clone()
+    });
+    let after = measure(&assisted);
+
+    assert!(
+        after.contour_error <= before.contour_error * 0.5,
+        "輪郭誤差が半分になっていない: {:.2} → {:.2}",
+        before.contour_error,
+        after.contour_error
+    );
+    assert!(
+        after.rim_truth <= before.rim_truth * 0.5,
+        "帯の正解側の汚染が半分になっていない: {:.3} → {:.3}",
+        before.rim_truth,
+        after.rim_truth
+    );
+    // **代わりに何を払ったかも固定する。** 帯を均すぶんアルファ誤差は増える。
+    // 増分に上限が無ければ、輪郭の位置を稼ぐために matte を潰し放題になる
+    assert!(
+        after.alpha_mae <= before.alpha_mae + 0.01,
+        "輪郭を稼ぐためにアルファ誤差を払いすぎている: {:.3} → {:.3}",
+        before.alpha_mae,
+        after.alpha_mae
+    );
+}
+
+/// **段ごとに、その段が主に下げる指標を固定する。**
+///
+/// 3 段まとめてしか見ない判定では、1 段が死んでも他の 2 段が埋め合わせれば
+/// 通ってしまう。そこで (b) / (c) / (e) を**単独で**足した経路を Phase 2 の
+/// 経路と比べ、担当の指標が下がっていることを比で押さえる。
+///
+/// | 段 | シーン | 指標 | Phase 2 | その段だけ | 比 | 上限 |
+/// |---|---|---|---|---|---|---|
+/// | (b) 再分類 | R1 assisted | `rim_truth` | 0.512 | 0.422 | 0.82 | 0.90 |
+/// | (c) 平滑化 | R5 assisted | `contour_error` | 33.39 | 23.96 | 0.72 | 0.85 |
+/// | (e) guided | R1 assisted | `contour_roughness` | 0.851 | 0.466 | 0.55 | 0.70 |
+///
+/// **担当が違う。** (b) は帯の中の粒を色で落とすので正解側の汚染に、(c) は
+/// 形の多数決なので輪郭の位置に、(e) は matte を均すので蛇行に効く。上限は
+/// 実測の比から 1 割ほど緩めた値で、**どれか 1 段を切れば必ず赤になる**。
+#[test]
+fn each_stage_moves_the_metric_it_is_responsible_for() {
+    use kiri::cutout::Matting;
+
+    let run = |name: &str, opts: CutoutOptions| -> (EdgeMetrics, Diagnostics) {
+        let scene = real_scenes()
+            .into_iter()
+            .find(|s| s.name.starts_with(name))
+            .unwrap_or_else(|| panic!("{name} がベンチに無い"));
+        let truth = common::real_scene(&scene);
+        let opts = CutoutOptions {
+            bbox: Some(common::assisted_bbox(&truth)),
+            tolerance: scene.assisted_tolerance,
+            ..opts
+        };
+        let result = cutout(&truth.image, &opts);
+        let m = common::measure_edges_with(&truth, &result.image, &result.mask, opts.bbox, None);
+        (m, result.diagnostics)
+    };
+    let phase2 = || CutoutOptions {
+        matting: Matting::Projection,
+        smooth_contour: 0.0,
+        reclassify: false,
+        ..Default::default()
+    };
+
+    // (b) だけ足す → 正解側の縁の汚染
+    let before = run("R1", phase2()).0.rim_truth;
+    let after = run(
+        "R1",
+        CutoutOptions {
+            reclassify: true,
+            ..phase2()
+        },
+    )
+    .0
+    .rim_truth;
+    assert!(
+        after <= before * 0.90,
+        "(b) 再分類が R1 の帯の汚染を下げていない: {before:.3} → {after:.3}"
+    );
+
+    // (c) だけ足す → 輪郭の位置
+    let before = run("R5", phase2()).0.contour_error;
+    let after = run(
+        "R5",
+        CutoutOptions {
+            smooth_contour: CutoutOptions::default().smooth_contour,
+            ..phase2()
+        },
+    )
+    .0
+    .contour_error;
+    assert!(
+        after <= before * 0.85,
+        "(c) 平滑化が R5 の輪郭誤差を下げていない: {before:.2} → {after:.2}"
+    );
+
+    // (e) だけ足す → 輪郭の蛇行
+    let before = run("R1", phase2()).1.contour_roughness.expect("帯がある");
+    let after = run(
+        "R1",
+        CutoutOptions {
+            matting: Matting::Guided,
+            ..phase2()
+        },
+    )
+    .1
+    .contour_roughness
+    .expect("帯がある");
+    assert!(
+        after <= before * 0.70,
+        "(e) guided が R1 の粗さを下げていない: {before:.3} → {after:.3}"
+    );
+}
+
 /// 診断値が正解由来の誤差と同じ向きに動くこと。
 ///
 /// **相関しなければ、指標は欠陥ではない何かを測っている。** 値そのものではなく
@@ -428,6 +593,102 @@ fn the_diagnostics_track_the_truth() {
             listing(&points, name)
         );
     }
+}
+
+/// **新しい 3 段が警告を増やさないこと。**
+///
+/// 指標が良くなったのに警告が増えるのは、利用者にとっては後退である。
+/// エージェントは警告を見て次の一手を決めるので、**解けない警告が 1 本出るだけで
+/// 直すものが無いまま 2 周目を回す**。しかも `HALO_REMAINS` の hint
+/// （「`--tolerance` を上げると減る」）は、原因が tolerance でない場合には
+/// 何周回しても値を動かさない。
+///
+/// 合成 S1〜S12 と、実写 R7 の assisted（正解が「欠陥なし」と言う唯一の実写点）
+/// を、Phase 2 の経路（3 スイッチ明示）と突き合わせる。**減るのは歓迎、増える
+/// のは不可**という非対称な検査である。
+#[test]
+fn the_matting_stages_never_add_a_warning() {
+    use std::collections::BTreeSet;
+
+    let phase2 = |opts: &CutoutOptions| CutoutOptions {
+        matting: kiri::cutout::Matting::Projection,
+        smooth_contour: 0.0,
+        reclassify: false,
+        ..opts.clone()
+    };
+    let codes = |opts: &CutoutOptions, image: &image::RgbaImage| -> BTreeSet<String> {
+        cutout(image, opts)
+            .warnings
+            .iter()
+            .map(|w| w.code.as_str().to_string())
+            .collect()
+    };
+    // **既知の未達を 1 つだけ許す。** 緩めた事実を隠さないために、消えたら
+    // **テストのほうが落ちる**書き方にしてある。
+    //
+    // 合成 S3（淡色商品、輪郭 ΔE 9.5）の `HALO_REMAINS` がそれで、機構は
+    // `docs/design.md` 4.10 の「S3 の HALO_REMAINS」に書いた。要点だけ再掲する。
+    //
+    // - 増えた 180 画素は**すべて真の被覆率 1.0**、つまり純粋な商品である。
+    //   `halo_ratio` が「背景色」と言っているのは、その画素の**局所背景の参照色**
+    //   が大域の背景から ΔE 10.4 ずれて商品色そのもの（sRGB 219、大域は 248）に
+    //   なっているからで、参照は matting が削り込んだ跡から測られている
+    // - 削り込みの側は、塗り直しが輪郭を鋭くした場所で帯幅が 10 → 3 に落ち、
+    //   F/B を集める窓が 23px → 9px に縮んで局所背景 B が商品側へ寄る
+    //   （線形 0.893 → 0.828）ことで起きる
+    //
+    // 8 通りの直し方を実測した。**S3 を直すものはすべて別のシーンを壊す**——
+    // 帯を単調にすると R1 の輪郭誤差が 6.2 → 16.5、窓に下限を置くと S6 の
+    // 落ち影の残りが 0.1% → 5.5%、`halo_ratio` の局所背景に分離を要求すると
+    // 実写リモコン tol 12 の halo が 0.163 → 0.053 になって `--tolerance` を
+    // 上げる導線が切れる。`HALO_WARN` は動かしていない。
+    //
+    // 8 つ目——(b) の fg → bg に `d_B ≤ 1〜2` を要求する——だけは**機構を
+    // 裏取りできた**。実写の halo_ratio は 0.030 → 0.003 と Phase 2 の水準へ
+    // 戻るので、halo の増加は塗り替えが局所背景の参照色をずらすことから来て
+    // いる。だが S3 の `eaten` は 3.00% → 2.96% と動かない（削られる画素の
+    // 87% は d_B ≤ 1.0、つまり**背景の散らばりのど真ん中**にいる）一方で、
+    // R1 の rim 正解が 0.224 → 0.345 に戻る。**指標の偽陽性 1 本と引き換えに
+    // 正解由来の欠陥を倍にする取引**なので採らなかった。
+    let known_gap = |name: &str, code: &str| name.starts_with("S3") && code == "HALO_REMAINS";
+    let check = |name: &str, image: &image::RgbaImage, opts: &CutoutOptions| {
+        let before = codes(&phase2(opts), image);
+        let after = codes(opts, image);
+        let added: Vec<_> = after.difference(&before).cloned().collect();
+        let unexpected: Vec<_> = added
+            .iter()
+            .filter(|c| !known_gap(name, c))
+            .cloned()
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "{name}: 新しい 3 段が警告を増やしている: {unexpected:?}\n  Phase 2 {before:?}\n  既定   {after:?}"
+        );
+        let stale: Vec<_> = added.iter().filter(|c| known_gap(name, c)).collect();
+        if name.starts_with("S3") {
+            assert!(
+                !stale.is_empty(),
+                "S3 の HALO_REMAINS が消えた。**この免除を消すこと**（テストと \
+                 design.md 4.10 の節を両方）"
+            );
+        }
+    };
+
+    for scene in edge_scenes() {
+        let truth = edge_scene(&scene);
+        check(scene.name, &truth.image, &CutoutOptions::default());
+    }
+    let scene = real_scenes()
+        .into_iter()
+        .find(|s| s.name.starts_with("R7"))
+        .expect("R7 がベンチに無い");
+    let truth = common::real_scene(&scene);
+    let opts = CutoutOptions {
+        bbox: Some(common::assisted_bbox(&truth)),
+        tolerance: scene.assisted_tolerance,
+        ..Default::default()
+    };
+    check("R7 assisted", &truth.image, &opts);
 }
 
 /// R シーンの `defaults`——切り抜きそのものが失敗している点——を除いた部分集合。
@@ -470,44 +731,111 @@ fn listing(points: &[Point], metric: &str) -> String {
 ///
 /// **これは較正そのものの回帰テストである。** 母集団は正解だけで決まる
 /// （`roughness_side` / `contamination_side`）ので、しきい値を動かしても
-/// 母集団は動かない。クリーン側の最大としきい値のあいだ、しきい値と欠陥側の
-/// 最小のあいだに、それぞれ余裕があることを固定する。
+/// 母集団は動かない。
 ///
-/// 規則は「クリーン最大の 2 倍以上、かつ欠陥最小の 1/2 以下」だが、粗さの側は
-/// 窓が 4% だけ空かない（S5、幅 3px のストラップ）。**1.9 倍で固定するのは
-/// その事実を含めて動かさないためである**——ここが 1.9 を割ったら、それは
-/// 較正が壊れたということである。
+/// 問うことは 2 つある。
+///
+/// 1. **誤分類が 1 点も無いこと。** クリーン側の最大がしきい値を下回り、
+///    欠陥側の最小がしきい値を上回る。これが契約そのもので、余裕の話ではない
+/// 2. **両端の値が記録どおりであること。** 比（「欠陥側の最小 ÷ しきい値
+///    ≥ 1.1」）で書いていた頃は、**処理が良くなって群が近づくたびにテストが
+///    落ちる**ので、書き手はそのたびに比を緩めることになった。緩めた記録は
+///    コミットメッセージの中にしか残らない。**値そのものを固定すれば、
+///    動いたときに「どちらへどれだけ動いたか」がテストの文面に出る。**
+///
+/// # 採用した値（2026-09 時点の実測）
+///
+/// | 指標 | クリーン最大 | 欠陥最小 | しきい値 |
+/// |---|---|---|---|
+/// | `contour_roughness` | 0.082（S5、幅 3px のストラップ） | 0.194（R6 defaults） | 0.16 |
+/// | `rim_contamination` | 0.007（S6 / S10） | 0.032（R7 defaults） | 0.02 |
+///
+/// **しきい値 0.16 は据え置く。** 0.12 まで下げると R2 assisted（正解の輪郭誤差
+/// 1.12px = 良品、粗さ 0.115）が誤警告の側へ近づく。
+///
+/// # `CONTOUR_ROUGH` は蛇行だけを見る
+///
+/// Phase 3 は輪郭を**実際に均す**（色の門つきメディアンと guided feathering）。
+/// すると壊れた切り抜きの輪郭まで滑らかになり、`contour_roughness` は
+/// 「輪郭が真の位置から遠い」ことを見なくなる。欠陥側の最小は R7 defaults
+/// （輪郭誤差 59.1px、正解の帯の 57% が背景）で、粗さは Phase 2 の 0.316 から
+/// 0.194 へ落ちた。**輪郭が滑らかに間違っている**状態は粗さでは捕まらない。
+/// それを捕まえるのは `BBOX_RECOMMENDED` / `RIM_CONTAMINATED` / `HALO_REMAINS`
+/// で、R7 defaults では 3 つとも出る（docs/design.md 4.10 の表）。
 #[test]
 fn the_thresholds_sit_between_the_clean_and_the_defective() {
     let points = bench();
-    for (name, threshold, margin, side, value) in [
+    for (name, threshold, clean_max, defective_min, side, value) in [
         (
             "contour_roughness",
             CONTOUR_ROUGH_WARN,
-            1.9,
+            0.09,
+            0.17,
             roughness_side as fn(&EdgeMetrics) -> Side,
             (|p: &Point| p.diagnostics.contour_roughness) as fn(&Point) -> Option<f64>,
         ),
         (
             "rim_contamination",
             RIM_CONTAMINATION_WARN,
-            2.0,
+            0.01,
+            0.03,
             contamination_side as fn(&EdgeMetrics) -> Side,
             (|p: &Point| p.diagnostics.rim_contamination) as fn(&Point) -> Option<f64>,
         ),
     ] {
         let (clean, defective) = window(&points, side, value);
+        // まず誤分類。**ここは余裕ではなく契約である**
         assert!(
-            clean * margin <= threshold,
-            "{name}: クリーン側の最大 {clean:.3} がしきい値 {threshold} に近すぎる\n{}",
+            clean < threshold && defective > threshold,
+            "{name}: しきい値 {threshold} が 2 つの群を分けていない \
+             (クリーン最大 {clean:.3} / 欠陥最小 {defective:.3})\n{}",
+            listing(&points, name)
+        );
+        // 次に値そのもの。**動いたら記録を書き直すこと**（比を緩めない）
+        assert!(
+            clean <= clean_max,
+            "{name}: クリーン側の最大が記録 {clean_max} を越えた: {clean:.3}\n{}",
             listing(&points, name)
         );
         assert!(
-            defective >= threshold * margin,
-            "{name}: 欠陥側の最小 {defective:.3} がしきい値 {threshold} に近すぎる\n{}",
+            defective >= defective_min,
+            "{name}: 欠陥側の最小が記録 {defective_min} を割った: {defective:.3}\n{}",
             listing(&points, name)
         );
     }
+}
+
+/// **どの警告が、輪郭が滑らかに間違っている切り抜きを捕まえるか。**
+///
+/// `CONTOUR_ROUGH` は蛇行しか見ない。R7 defaults は輪郭誤差 59.1px（正解の帯の
+/// 57% が背景）なのに粗さは 0.194 しかなく、しきい値 0.16 との差は 1.2 倍で、
+/// **粗さ単独ではこの欠陥を語れない**。捕まえるのは別の 3 つである。
+#[test]
+fn a_smoothly_wrong_contour_is_caught_by_the_other_warnings() {
+    let points = bench();
+    let broken = point(&points, "R7 照明勾配のある紙 + 黒商品 / defaults");
+    assert!(
+        broken.metrics.contour_error > 10.0,
+        "前提: R7 defaults は壊れた切り抜きである: {:.2}",
+        broken.metrics.contour_error
+    );
+    for code in ["RIM_CONTAMINATED", "CONTOUR_ROUGH"] {
+        assert!(
+            broken.warnings.iter().any(|w| w == code),
+            "{code} が出ていない: {:?}",
+            broken.warnings
+        );
+    }
+    // 正解が「良品」と言う実写（R7 assisted）には輪郭の警告を 1 本も出さない。
+    // `LOW_UNIFORMITY` は背景そのものの性質（照明勾配）についての報せで、
+    // 切り抜きの出来を語っていないので数えない
+    let good = point(&points, "R7 照明勾配のある紙 + 黒商品 / assisted");
+    let noisy: Vec<_> = good
+        .warnings
+        .iter()
+        .filter(|w| w.as_str() != "LOW_UNIFORMITY")
+        .collect();
+    assert!(noisy.is_empty(), "良品に輪郭の警告が出ている: {noisy:?}");
 }
 
 /// 同じ入力から同じ結果が出ること。
@@ -703,7 +1031,11 @@ fn print_the_calibration_table() {
         // 渡した確定前景がどれだけ残ったか。**「悪くなっていない」だけを見る
         // 判定は空振りする**ので、指示が届いたかどうかを同じ表に並べて出す
         let kept = if p.metrics.forced_kept.is_finite() {
-            format!("{:.1}%", p.metrics.forced_kept * 100.0)
+            format!(
+                "{:.1}/{:.1}%",
+                p.metrics.forced_kept * 100.0,
+                p.metrics.forced_bg_kept * 100.0
+            )
         } else {
             "-".to_string()
         };
@@ -770,6 +1102,148 @@ fn print_the_calibration_table() {
                 samples.len()
             );
         }
+    }
+}
+
+/// 段ごとの対照表。`--ignored` を付けたときだけ走る。
+///
+/// **全部入りだけを固定すると、1 段が死んでも気づけない。** 再分類 (b) /
+/// 色の門つき平滑化 (c) / guided feathering (e) を個別に切って、どの段が
+/// どの指標を動かしたかを並べる。
+///
+/// ```text
+/// cargo test --release --test real_backgrounds -- --ignored --nocapture print_the_stage_table
+/// ```
+#[test]
+#[ignore = "計測用。判定はせず表を出すだけ"]
+fn print_the_stage_table() {
+    use kiri::cutout::Matting;
+
+    let base = CutoutOptions::default();
+    let stages: Vec<(&str, CutoutOptions)> = vec![
+        (
+            "phase2",
+            CutoutOptions {
+                matting: Matting::Projection,
+                smooth_contour: 0.0,
+                reclassify: false,
+                ..base.clone()
+            },
+        ),
+        (
+            "+b 再分類",
+            CutoutOptions {
+                matting: Matting::Projection,
+                smooth_contour: 0.0,
+                reclassify: true,
+                ..base.clone()
+            },
+        ),
+        (
+            "+c 平滑化",
+            CutoutOptions {
+                matting: Matting::Projection,
+                smooth_contour: base.smooth_contour,
+                reclassify: false,
+                ..base.clone()
+            },
+        ),
+        (
+            "+e guided",
+            CutoutOptions {
+                matting: Matting::Guided,
+                smooth_contour: 0.0,
+                reclassify: false,
+                ..base.clone()
+            },
+        ),
+        ("既定(b+c+e)", base.clone()),
+        (
+            "-b",
+            CutoutOptions {
+                reclassify: false,
+                ..base.clone()
+            },
+        ),
+        (
+            "-c",
+            CutoutOptions {
+                smooth_contour: 0.0,
+                ..base.clone()
+            },
+        ),
+        (
+            "-e",
+            CutoutOptions {
+                matting: Matting::Projection,
+                ..base.clone()
+            },
+        ),
+    ];
+
+    println!(
+        "\n{:<34} {:<12} {:>9} {:>8} {:>9} {:>8} {:>7} {:>8} {:>8} {:>9}",
+        "シーン",
+        "段",
+        "輪郭誤差",
+        "rim正解",
+        "alphaMAE",
+        "eaten",
+        "strap",
+        "shadow残",
+        "粗さ",
+        "縁の汚染"
+    );
+    // 帯幅の下限も並べる。値が動いたときに「段が効いた」のか「帯が変わった」
+    // のかを、同じ表の上で切り分けられる
+    let show = |v: Option<f64>| match v {
+        Some(v) => format!("{v:.3}"),
+        None => "null".to_string(),
+    };
+    let percent = |v: f32| {
+        if v.is_finite() {
+            format!("{:.1}%", v * 100.0)
+        } else {
+            "-".to_string()
+        }
+    };
+
+    let row = |label: &str, truth: &common::EdgeTruth, opts: &CutoutOptions, stage: &str| {
+        let result = cutout(&truth.image, opts);
+        let m = common::measure_edges_with(truth, &result.image, &result.mask, opts.bbox, None);
+        println!(
+            "{label:<34} {stage:<12} {:>9.2} {:>8.3} {:>9.3} {:>8.4} {:>7} {:>8} {:>8} {:>9} r={:?}",
+            m.contour_error,
+            m.rim_truth,
+            m.alpha_mae,
+            m.eaten,
+            percent(m.strap_kept),
+            percent(m.shadow_kept),
+            show(result.diagnostics.contour_roughness),
+            show(result.diagnostics.rim_contamination),
+            result.band_min_radius,
+        );
+    };
+
+    for scene in edge_scenes() {
+        let truth = edge_scene(&scene);
+        for (stage, opts) in &stages {
+            row(scene.name, &truth, opts, stage);
+        }
+        println!();
+    }
+    for scene in real_scenes() {
+        let truth = common::real_scene(&scene);
+        let bbox = common::assisted_bbox(&truth);
+        for (stage, opts) in &stages {
+            let opts = CutoutOptions {
+                bbox: Some(bbox),
+                tolerance: scene.assisted_tolerance,
+                ..opts.clone()
+            };
+            row(scene.name, &truth, &opts, stage);
+        }
+        println!();
     }
 }
 

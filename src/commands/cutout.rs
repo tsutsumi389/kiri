@@ -11,7 +11,7 @@ use crate::cli::{CutoutArgs, Polygon};
 use crate::commands::output::{self, round4};
 use crate::cutout::constraints::{MASK_THRESHOLD, TRIMAP_BACKGROUND, TRIMAP_FOREGROUND};
 use crate::cutout::{
-    Constraint, ConstraintSource, Constraints, CutoutOptions, FG_SEED_RADIUS, cutout,
+    Constraint, ConstraintSource, Constraints, CutoutOptions, FG_SEED_RADIUS, Matting, cutout,
 };
 use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::{LoadOptions, OutputFormat, SaveOptions, load, save};
@@ -57,6 +57,9 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         shadow_tolerance: args.shadow_tolerance,
         seal: args.seal,
         refine: !args.no_refine,
+        matting: args.matting,
+        smooth_contour: args.smooth_contour,
+        reclassify: !args.no_reclassify,
     };
     let result = cutout(&loaded.image, &opts);
 
@@ -119,6 +122,17 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             feather: opts.feather,
             despill: opts.despill,
             refine: opts.refine,
+            matting: match opts.matting {
+                Matting::Projection => "projection",
+                Matting::Guided => "guided",
+            },
+            smooth_contour: opts.smooth_contour,
+            // 実際に効いた値。指定値は長辺 1000px 換算なので、そのままでは
+            // 「実寸で何 px 均したか」を語らない
+            smooth_radius_px: result.smooth_radius_px,
+            reclassify: opts.reclassify,
+            // 実際に効いた値。指定値ではなく、輪郭の粗さで持ち上がった後の値
+            band_min_radius: result.band_min_radius,
         },
         applied_bbox: bbox.map(|(x1, y1, x2, y2)| [x1, y1, x2, y2]),
         constraints: opts.constraints.as_ref().map(constraints_report),

@@ -305,6 +305,22 @@ pub struct SettingsReport {
     pub despill: bool,
     /// 境界帯のアルファを色から推定し直したか
     pub refine: bool,
+    /// 境界のアルファの解き方（"projection" / "guided"）
+    pub matting: &'static str,
+    /// 帯の中の二値輪郭に掛けたメディアンの半径(px, 長辺 1000px 換算)。0 で無効。
+    /// **要求値である**（上限 16）。実際に効いた実寸の半径は `smooth_radius_px`
+    pub smooth_contour: f64,
+    /// 実際に効いた平滑化の半径(px)。**指定値からは読めない**——長辺 1000px
+    /// 換算の値が解像度で掛け戻され、48px で頭打ちになる。`--no-refine` では
+    /// 平滑化そのものが無いので現れない
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smooth_radius_px: Option<u32>,
+    /// 帯の中の二値画素を局所の色で塗り直したか
+    pub reclassify: bool,
+    /// 実際に効いた帯幅の下限(px)。**指定値からは読めない**——輪郭が粗ければ
+    /// 粗さぶんだけ持ち上がる。`--no-refine` では帯そのものが無いので現れない
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub band_min_radius: Option<u32>,
 }
 
 /// 空間的な指示（トライマップ・マスク画像・多角形・種）が何を占めたか。

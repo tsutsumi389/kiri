@@ -571,6 +571,78 @@ fn the_edge_width_diagnostic_tracks_the_softness_of_the_contour() {
     );
 }
 
+/// guided feathering が、きれいな合成シーンのアルファを動かさないこと。
+///
+/// **ここが動いたら ε の決め方が壊れている。** ε は窓の中の確定背景の分散から
+/// 決まるので、スタジオ背景では `EPS_FLOOR`（σ0² = 0.015²）に落ちて guided
+/// filter はほぼ恒等になる。均すのは背景がざらついている場所だけである。
+///
+/// S1（濃色 × 白 × JPEG）/ S2（非圧縮）/ S4（8px で溶ける輪郭）で、Phase 2
+/// までの経路（`--matting projection --smooth-contour 0 --no-reclassify`）との
+/// アルファ誤差の差を ±0.005 に収める。
+#[test]
+fn the_matting_stages_leave_a_clean_synthetic_edge_alone() {
+    let plain = CutoutOptions {
+        matting: kiri::cutout::Matting::Projection,
+        smooth_contour: 0.0,
+        reclassify: false,
+        ..Default::default()
+    };
+    for name in ["S1", "S2", "S4", "S5", "S5b"] {
+        let truth = find(name);
+        let before = run(&truth, &plain);
+        let after = run(&truth, &CutoutOptions::default());
+        assert!(
+            (after.alpha_mae - before.alpha_mae).abs() <= 0.005,
+            "{name}: アルファ誤差が動いた {:.4} → {:.4}",
+            before.alpha_mae,
+            after.alpha_mae
+        );
+        assert!(
+            (after.offset - before.offset).abs() <= 0.25,
+            "{name}: 境界位置が動いた {:+.3} → {:+.3}",
+            before.offset,
+            after.offset
+        );
+        if before.strap_kept.is_finite() {
+            assert!(
+                after.strap_kept >= before.strap_kept,
+                "{name}: ストラップの残存が落ちた {:.3} → {:.3}",
+                before.strap_kept,
+                after.strap_kept
+            );
+        }
+    }
+}
+
+/// 3 つのスイッチを明示した経路と既定の経路が、**織り目の上では本当に違う**こと。
+///
+/// 上のテストは「動かないこと」しか見ない。対照が無いと、3 段がまるごと死んで
+/// いても両方通ってしまう。
+#[test]
+fn the_three_switches_actually_change_something() {
+    let truth = find("S11");
+    let plain = cutout(
+        &truth.image,
+        &CutoutOptions {
+            matting: kiri::cutout::Matting::Projection,
+            smooth_contour: 0.0,
+            reclassify: false,
+            ..Default::default()
+        },
+    );
+    let staged = cutout(&truth.image, &CutoutOptions::default());
+    assert_ne!(
+        plain.mask, staged.mask,
+        "3 段を切っても切らなくても同じマスクが出ている＝段が効いていない"
+    );
+    assert_eq!(
+        plain.band_min_radius,
+        Some(kiri::cutout::refine::DEFAULT_MIN_RADIUS),
+        "3 つ切った経路で帯幅の下限が動いている"
+    );
+}
+
 /// 櫛状の商品画像。周期 `period` px（歯と隙間が半分ずつ）の細かい構造を作る。
 ///
 /// メッシュ・レース・ニット・ワイヤーラック・文字のように、境界帯が構造そのもの
@@ -737,8 +809,12 @@ fn print_the_refine_cost_on_large_inputs() {
         println!(
             "{name:<14} refine {with:>7.0} ms / refine なし {without:>7.0} ms / 追加 {overhead:>+7.0} ms"
         );
+        // **上限は「桁が変わっていないか」だけを見る。** 帯が面ごと埋まる
+        // 素材（櫛 6px 周期）では 12MP で +2.1 秒かかる——(b)(c) を 4 パス
+        // 回すので、帯の面積ぶんの局所色の格子と多数決が 4 回積み上がる。
+        // 崩れていた頃（帯画素ごとに窓を全走査）は同じ形で +9.4 秒だった
         assert!(
-            overhead < 2000.0,
+            overhead < 4000.0,
             "{name} で refine の追加コストが膨らんでいる: {overhead:+.0} ms"
         );
     }
@@ -922,5 +998,43 @@ fn the_gaps_of_a_comb_are_transparent_in_the_result() {
                 ratio * 100.0
             );
         }
+    }
+}
+
+/// ベンチのシーンを PNG として書き出す。`--ignored` を付けたときだけ走る。
+///
+/// **「前の Phase と 1 バイトも変わらない」を確かめるための足場である。**
+/// 過去の実装はリポジトリの中に無いので、同じ入力を両方のバイナリへ通して
+/// md5 を突き合わせるしかない。シーンの生成器（`tests/common`）は共有なので、
+/// どちらの worktree から書き出しても画素は同じになる。
+///
+/// ```text
+/// git worktree add /tmp/prev <前の Phase のブランチ>
+/// (cd /tmp/prev && cargo build --release)
+/// KIRI_DUMP_DIR=/tmp/scenes cargo test --release --test edge_quality -- --ignored dump_scenes
+/// for f in /tmp/scenes/*.png; do
+///   /tmp/prev/target/release/kiri cutout "$f" -o /tmp/a.png --force
+///   ./target/release/kiri cutout "$f" -o /tmp/b.png --force \
+///     --matting projection --smooth-contour 0 --no-reclassify
+///   md5 -q /tmp/a.png /tmp/b.png
+/// done
+/// ```
+#[test]
+#[ignore = "計測用。KIRI_DUMP_DIR が無ければ何もしない"]
+fn dump_scenes() {
+    let Ok(dir) = std::env::var("KIRI_DUMP_DIR") else {
+        return;
+    };
+    let dir = std::path::Path::new(&dir);
+    std::fs::create_dir_all(dir).unwrap();
+    for scene in edge_scenes() {
+        let truth = edge_scene(&scene);
+        let name = scene.name.split(' ').next().unwrap();
+        truth.image.save(dir.join(format!("{name}.png"))).unwrap();
+    }
+    for scene in common::real_scenes() {
+        let truth = common::real_scene(&scene);
+        let name = scene.name.split(' ').next().unwrap();
+        truth.image.save(dir.join(format!("{name}.png"))).unwrap();
     }
 }

@@ -12,6 +12,7 @@ use crate::cutout::constraints::{MASK_THRESHOLD, TRIMAP_BACKGROUND, TRIMAP_FOREG
 use crate::cutout::{BackgroundModel, DEFAULT_EDGE_THRESHOLD, Matting};
 use crate::image_io::OutputFormat;
 use crate::preview::DEFAULT_PANEL;
+use crate::segment::SegmentMode;
 use crate::transform::FitMode;
 
 #[derive(Parser, Debug)]
@@ -53,11 +54,34 @@ pub enum Command {
     /// 仕様ファイルに従って複数の画像を一括処理する
     Batch(BatchArgs),
 
+    /// セグメンテーションモデルの素性と置き場所を扱う
+    ///
+    /// **kiri はネットワークを触らない。** 取得は利用者の操作で、ここは
+    /// 「どこに何を置けばよいか」と「置いたものは正しいか」だけを答える
+    #[command(subcommand_required = true, arg_required_else_help = true)]
+    Model(ModelArgs),
+
     /// オプションと code の一覧（契約）を出力する
     ///
     /// **エージェントはまずこれを読む。** README を読み込まずに、呼び方と
     /// 返ってきた code の意味を引ける
     Schema,
+}
+
+#[derive(Args, Debug)]
+pub struct ModelArgs {
+    #[command(subcommand)]
+    pub command: ModelCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ModelCommand {
+    /// 既知のモデルの名前・URL・ダイジェスト・想定パス・ライセンスを出す
+    ///
+    /// 置いてあれば present: true になり、ダイジェストを突き合わせた結果が
+    /// verified に出る（176MB を舐めるので数百 ms かかる）。置いていなければ
+    /// hint が curl の 1 行を返す
+    List,
 }
 
 #[derive(Args, Debug)]
@@ -76,6 +100,9 @@ pub struct InfoArgs {
     /// info では「この画像なら cutout がどちらを使うか」を先に答えるために効く。指定したモデルは background.model と、cutout では settings.background_model にも出る。
     #[arg(long, value_enum, default_value_t = BackgroundModel::Auto)]
     pub background_model: BackgroundModel,
+
+    #[command(flatten)]
+    pub segment: SegmentOpts,
 
     #[command(flatten)]
     pub color: ColorOpts,
@@ -98,6 +125,59 @@ impl ColorOpts {
             ..Default::default()
         }
     }
+}
+
+/// セグメンテーションモデルの使い方。`info` と `cutout` で同じものを使う。
+///
+/// **片方にしか無いと、`info` の助言と `cutout` の挙動が食い違う。**
+/// `info --segment isnet` が返す矩形はモデルが見たものなので、同じモデルを
+/// 使わない `cutout` に渡しても前提が揃わない。
+#[derive(Args, Debug, Default)]
+pub struct SegmentOpts {
+    /// セグメンテーションモデルを粗マスクの供給源として使うか
+    ///
+    /// ヘルプの本文は `segment_long_help` に置く。既定が off であることと
+    /// 時間が桁で変わることは、指定の前に知っていないと選びようがない
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = SegmentMode::Off,
+        long_help = segment_long_help()
+    )]
+    pub segment: SegmentMode,
+
+    /// モデルの ONNX ファイルを直接指す
+    ///
+    /// 未指定なら $KIRI_MODEL_DIR > $XDG_CACHE_HOME/kiri/models >
+    /// OS 既定のキャッシュの順に探す。置き場所と取得手順は kiri model list が返す
+    #[arg(long, value_name = "PATH")]
+    pub model_path: Option<PathBuf>,
+}
+
+/// `--segment` の長いヘルプ。
+///
+/// **AI エージェントは `--help` を読んで判断する**ので、「既定では走らない」
+/// 「走らせると桁で遅くなる」「モデルは別途取得する」の 3 つをここで言う。
+/// どれも指定の前に知っていないと選びようがない。
+fn segment_long_help() -> String {
+    format!(
+        "セグメンテーションモデルを粗マスクの供給源として使う（既定 off）。\n\
+         off  … モデルを触らない。出力は 1 バイトも変わらない。\n\
+         auto … 色では解けないと kiri 自身が判断したときだけ走らせる\
+         （NOT_SEPARABLE になるか subject.confidence が low のとき）。\
+         走ったかどうかは settings.segment_ran に出る。\n\
+         isnet… 常に走らせる。\n\
+         モデルの出力は原寸の確率マップに伸ばしてからトライマップに落とし、\
+         Phase 2 の確定前景／確定背景として既存の経路へ流す。**輪郭の位置は\
+         モデルではなく今までどおり色とマッティングが決める。**\n\
+         --trimap などの空間的な指示と重なったら、利用者の指示が勝つ\
+         （CONSTRAINT_CONFLICT にはならない）。\n\
+         1024x1024 の推論は M4 Pro で 1.2 秒、ピーク RSS は 1.5GB 増える。\
+         既定の切り抜きとは桁が違うので、必要な画像にだけ付けること。\n\
+         モデルのファイルは同梱していない。取得手順は kiri model list が返す。\
+         この build に segment 機能が無ければ {} で断る。",
+        crate::error::ErrorCode::SegmentUnavailable.as_str()
+    )
 }
 
 /// 出力に関する共通オプション。convert と resize で同じものを使う。
@@ -661,6 +741,9 @@ pub struct CutoutArgs {
     /// グリッドは --bbox --normalized の値を読み取るためにある
     #[arg(long)]
     pub no_preview_grid: bool,
+
+    #[command(flatten)]
+    pub segment: SegmentOpts,
 
     #[command(flatten)]
     pub color: ColorOpts,

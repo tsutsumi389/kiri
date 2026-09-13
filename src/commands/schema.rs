@@ -75,24 +75,46 @@ fn exit_codes() -> Vec<ExitCodeEntry> {
     codes
 }
 
+/// 実際に呼べるコマンドだけを並べる。
+///
+/// **入れ子のサブコマンドを持つものは、それ自身では呼べない。** `kiri model`
+/// は `list` を要求するので、ここに `model` という行を出すと「引数を取らない
+/// コマンドがある」と読めてしまう。葉だけを `"model list"` の形で並べる——
+/// 綴りをそのまま繋げば実行できる並びである。
 fn commands() -> Vec<CommandEntry> {
-    Cli::command()
-        .get_subcommands()
-        .map(|sub| {
-            let (arguments, options): (Vec<_>, Vec<_>) = sub
-                .get_arguments()
-                .filter(|arg| !is_clap_builtin(arg))
-                .map(arg_entry)
-                .partition(|entry| !entry.name.starts_with("--"));
+    let mut out = Vec::new();
+    for sub in Cli::command().get_subcommands() {
+        collect_command(sub, "", &mut out);
+    }
+    out
+}
 
-            CommandEntry {
-                name: sub.get_name().to_string(),
-                about: sub.get_about().map(|a| a.to_string()),
-                arguments,
-                options,
-            }
-        })
-        .collect()
+fn collect_command(command: &clap::Command, prefix: &str, out: &mut Vec<CommandEntry>) {
+    let name = if prefix.is_empty() {
+        command.get_name().to_string()
+    } else {
+        format!("{prefix} {}", command.get_name())
+    };
+    let mut children = command.get_subcommands().peekable();
+    if children.peek().is_some() {
+        for child in command.get_subcommands() {
+            collect_command(child, &name, out);
+        }
+        return;
+    }
+
+    let (arguments, options): (Vec<_>, Vec<_>) = command
+        .get_arguments()
+        .filter(|arg| !is_clap_builtin(arg))
+        .map(arg_entry)
+        .partition(|entry| !entry.name.starts_with("--"));
+
+    out.push(CommandEntry {
+        name,
+        about: command.get_about().map(|a| a.to_string()),
+        arguments,
+        options,
+    });
 }
 
 fn arg_entry(arg: &clap::Arg) -> ArgEntry {
@@ -323,6 +345,155 @@ fn fields() -> Vec<FieldEntry> {
             gates: None,
             summary: "主体の外接矩形を 0.0-1.0 で表したもの [x1, y1, x2, y2]",
             notes: Some("--bbox <値> --normalized へそのまま渡せる並びになっている"),
+        },
+        FieldEntry {
+            path: "subject.source",
+            appears_in: both(),
+            unit: "enum",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "この矩形が何から出たか（colour / segment）",
+            notes: Some(
+                "既定は colour（背景色から遠い画素の最大の塊）。info --segment でモデルが走った\
+                 ときだけ segment になる。**判定（area_ratio / capture_ratio / leftover_ratio と \
+                 confidence）はどちらでも同じもの**を通るので、2 つの high は同じ意味を持つ。\
+                 cutout の subject は --segment を渡しても colour のまま——あちらは\
+                 「切り抜きとは別に、色で見たらどこが商品か」を言う参考値である",
+            ),
+        },
+        FieldEntry {
+            path: "segment.model",
+            appears_in: both(),
+            unit: "enum",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "実際に走ったモデルの名前（isnet）",
+            notes: Some(
+                "**モデルが走ったときだけ segment ブロックごと現れる。** 走ったかどうかは \
+                 settings.segment_ran が真偽で言う（--segment auto は色で解けると判断すれば\
+                 走らない）。この build に segment 機能が無ければ --segment off 以外は \
+                 SEGMENT_UNAVAILABLE で断られる",
+            ),
+        },
+        FieldEntry {
+            path: "segment.input_size",
+            appears_in: both(),
+            unit: "px",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "モデルが受け取った正方形の一辺",
+            notes: Some(
+                "**利用者は選べない。** ISNet の ONNX は 1024 を graph に焼き込んでいるので、\
+                 別の寸法を渡すとグラフの解析そのものが通らない。kiri model list の \
+                 input_size が同じ値を返す",
+            ),
+        },
+        FieldEntry {
+            path: "segment.elapsed_ms",
+            appears_in: both(),
+            unit: "ms",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "モデルの読み込みから確率マップまでの時間",
+            notes: Some(
+                "結果全体の elapsed_ms の内数である。1024x1024 は M4 Pro で 1.3 秒前後\
+                 （読み込み 0.1 秒 + 推論 1.2 秒）で、既定の切り抜きとは桁が違う",
+            ),
+        },
+        FieldEntry {
+            path: "segment.fg_ratio",
+            appears_in: both(),
+            unit: "ratio",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "モデルが確定前景として置いた画素の割合",
+            notes: Some(
+                "確率が 0.9 以上の領域を、長辺 1000px 換算で 8px 収縮したもの。**輪郭の\
+                 位置はモデルが決めない**——確定領域のあいだの帯は今までどおり色と\
+                 連結性とマッティングが決める。利用者の空間的な指示と重なれば\
+                 指示のほうが勝つので、constraints.fg_ratio とは一致しないことがある",
+            ),
+        },
+        FieldEntry {
+            path: "segment.bg_ratio",
+            appears_in: both(),
+            unit: "ratio",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "モデルが確定背景として置いた画素の割合",
+            notes: Some("確率が 0.1 以下の領域を同じだけ収縮したもの"),
+        },
+        FieldEntry {
+            path: "segment.uncertain_ratio",
+            appears_in: both(),
+            unit: "ratio",
+            nullable: false,
+            null_means: None,
+            warns: vec![FieldThreshold {
+                code: WarningCode::SegmentUncertain,
+                operator: "gt",
+                threshold: crate::segment::SEG_UNCERTAIN_WARN,
+            }],
+            gates: None,
+            summary: "モデルがどちらとも言わなかった帯の割合",
+            notes: Some(
+                "3 つの比率の和は 1 になる。大きいほどモデルが対象を掴めておらず、結果は \
+                 --segment off に近づく。しきい値を超えたら、同じモデルを回し直すより \
+                 --trimap で直接教えるほうが早い",
+            ),
+        },
+        FieldEntry {
+            path: "segment.model_path",
+            appears_in: both(),
+            unit: "path",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "実際に読んだ ONNX のパス",
+            notes: Some(
+                "--model-path を渡していなければ $KIRI_MODEL_DIR > $XDG_CACHE_HOME/kiri/models > \
+                 OS 既定のキャッシュの順に探した結果である。置き場所と取得手順は \
+                 kiri model list が返す",
+            ),
+        },
+        FieldEntry {
+            path: "settings.segment",
+            appears_in: vec!["cutout"],
+            unit: "enum",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "--segment の指定値（off / auto / isnet）",
+            notes: Some("**実際に走ったかは settings.segment_ran のほう**を読むこと"),
+        },
+        FieldEntry {
+            path: "settings.segment_ran",
+            appears_in: vec!["cutout"],
+            unit: "bool",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "実際にモデルが走ったか",
+            notes: Some(
+                "auto では指定値から読めない——background.uniformity が下限を切っていて、かつ \
+                 NOT_SEPARABLE になるか subject.confidence が low のときだけ走る。off なら\
+                 必ず false で、そのときの出力は --segment を足す前と 1 バイトも変わらない",
+            ),
         },
         FieldEntry {
             path: "mask.foreground_ratio",

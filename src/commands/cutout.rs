@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use crate::cli::{CutoutArgs, Polygon};
 use crate::commands::output::{self, round4};
+use crate::commands::segment;
 use crate::cutout::constraints::{MASK_THRESHOLD, TRIMAP_BACKGROUND, TRIMAP_FOREGROUND};
 use crate::cutout::{
     Constraint, ConstraintSource, Constraints, CutoutOptions, FG_SEED_RADIUS, Matting, cutout,
@@ -41,7 +42,26 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         .iter()
         .map(|p| resolve_point(*p, args.normalized, w, h))
         .collect::<Result<Vec<_>>>()?;
-    let (constraints, constraint_warnings) = resolve_constraints(args, &fg_seeds, w, h)?;
+    let (user_constraints, constraint_warnings) = resolve_constraints(args, &fg_seeds, w, h)?;
+
+    // **モデルは提案、利用者は決定。** 先にモデルの提案を敷いてから、利用者の
+    // 指示を上から重ねる（`Constraints::overlay`）。重なった画素は利用者の
+    // ものになり、`CONSTRAINT_CONFLICT` にはしない
+    let decision = segment::decide(&loaded.image, &args.segment, args.border)?;
+    let mut segment_report = None;
+    let mut segment_warnings = Vec::new();
+    let constraints = match decision.run.as_ref() {
+        Some(run) => {
+            let (mut from_model, stats) = crate::segment::to_constraints(&run.probability, w, h);
+            segment_report = Some(segment::report(run, &stats));
+            segment_warnings.extend(segment::uncertain_warning(&stats));
+            if let Some(user) = user_constraints.as_ref() {
+                from_model.overlay(user);
+            }
+            Some(from_model)
+        }
+        None => user_constraints,
+    };
 
     let opts = CutoutOptions {
         tolerance: args.tolerance,
@@ -71,6 +91,9 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     // 指示についての警告は結果の警告より先に出す。渡したものがそのまま
     // 効いていないなら、その後の数値をどう読むかが変わる
     warnings.extend(constraint_warnings);
+    // モデルが迷っていることも同じ理由で先に言う。確定領域が痩せていれば、
+    // 以降の数値は `--segment off` のそれに近い
+    warnings.extend(segment_warnings);
     warnings.extend(result.warnings.clone());
 
     // キャンバスを使わないときは切り抜き結果をそのまま書き出す。複製すると
@@ -115,7 +138,14 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             result.field_range,
             &result.residual,
         ),
-        subject: result.subject.as_ref().map(output::subject_report),
+        // **`--segment` を渡しても、ここはいつもどおり色から測った矩形である。**
+        // モデルから測った矩形が欲しければ `info --segment` を使う——`cutout`
+        // の `subject` は「切り抜きとは別に、色で見たらどこが商品か」を言う
+        // 参考値であり、モデルを使ったかどうかで意味を変えない
+        subject: result
+            .subject
+            .as_ref()
+            .map(|s| output::subject_report(s, output::SUBJECT_FROM_COLOUR)),
         settings: SettingsReport {
             tolerance: opts.tolerance,
             // 指定値ではなく実際に効いた値。背景のテクスチャで自動調整が
@@ -142,9 +172,13 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             background_model: result.background_model.as_str(),
             // 実際に効いた値。指定値ではなく、輪郭の粗さで持ち上がった後の値
             band_min_radius: result.band_min_radius,
+            // 指定値。`auto` が走らせたかどうかは次の行が言う
+            segment: decision.mode.as_str(),
+            segment_ran: decision.ran(),
         },
         applied_bbox: bbox.map(|(x1, y1, x2, y2)| [x1, y1, x2, y2]),
         constraints: opts.constraints.as_ref().map(constraints_report),
+        segment: segment_report,
         mask: MaskReport {
             foreground_ratio: round4(result.stats.foreground_ratio),
             bbox: result.stats.bbox.map(|(x1, y1, x2, y2)| [x1, y1, x2, y2]),

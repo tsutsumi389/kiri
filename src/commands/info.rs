@@ -6,10 +6,13 @@
 use image::ImageFormat;
 
 use crate::cli::InfoArgs;
-use crate::commands::output::{background_report, round4, subject_report};
+use crate::commands::output::{
+    SUBJECT_FROM_COLOUR, SUBJECT_FROM_SEGMENT, background_report, round4, subject_report,
+};
+use crate::commands::segment;
 use crate::cutout::{
     BackgroundEstimate, DeltaEQuantiles, LowReason, ResolvedModel, SubjectHint, analyse_background,
-    bbox_argument,
+    bbox_argument, detect_subject_from_probability,
 };
 use crate::error::Result;
 use crate::image_io::load;
@@ -29,7 +32,24 @@ pub fn run(args: &InfoArgs) -> Result<InfoReport> {
         None,
     );
     let background = &analysis.estimate;
-    let subject = analysis.subject.clone();
+
+    // **モデルを走らせたときは主体をモデルから出す。** 色で測った矩形と
+    // 差し替えるのは、`--segment` を渡した利用者が知りたいのが
+    // 「モデルはどこを商品と見たか」だからである。何から出たかは
+    // `subject.source` が必ず名乗るので、取り違えようがない
+    let decision = segment::decide(&loaded.image, &args.segment, args.border)?;
+    let (subject, subject_source) = match decision.run.as_ref() {
+        Some(run) => (
+            detect_subject_from_probability(&loaded.image, background, &run.probability),
+            SUBJECT_FROM_SEGMENT,
+        ),
+        None => (analysis.subject.clone(), SUBJECT_FROM_COLOUR),
+    };
+    let segment_report = decision.run.as_ref().map(|run| {
+        let (_, stats) =
+            crate::segment::to_constraints(&run.probability, loaded.width(), loaded.height());
+        segment::report(run, &stats)
+    });
 
     let mut warnings = loaded.warnings();
     if !background.is_uniform() {
@@ -38,6 +58,7 @@ pub fn run(args: &InfoArgs) -> Result<InfoReport> {
             &analysis.residual,
             analysis.model,
             subject.as_ref(),
+            subject_source,
         ));
     }
     // 場を諦めたことは `info` でも黙らない。`background.model` が `field` を
@@ -63,7 +84,8 @@ pub fn run(args: &InfoArgs) -> Result<InfoReport> {
             analysis.field.range(),
             &analysis.residual,
         ),
-        subject: subject.as_ref().map(subject_report),
+        subject: subject.as_ref().map(|s| subject_report(s, subject_source)),
+        segment: segment_report,
         warnings,
     })
 }
@@ -80,11 +102,24 @@ pub fn run(args: &InfoArgs) -> Result<InfoReport> {
 /// High のときだけ**である。Low で bbox を勧めると、誤検出した矩形
 /// （キーボードでは右端の 0.4% の領域）へ誘導してしまう。数値そのものは
 /// `subject` として返してよいが、hint で矩形を勧めてはならない。
+///
+/// # モデルが主体を見つけたときは、助言もそこへ合わせる
+///
+/// `NOT_SEPARABLE` は「**色では**分けられない」と言っている。それはモデルが
+/// 走った後でも事実のままだが、hint の「単色背景で撮り直してください」は
+/// 途端に誤りになる——モデルは今まさに主体を見つけているのだから、打つ手は
+/// 撮り直しではなく `cutout --segment isnet` である。実写キーボードがこれで、
+/// モデルは信頼度 High の矩形を返しながら、主体の平均色と背景の色差は 6.6 しか
+/// 無い（背景自身のばらつき 21.6 を下回る）。
+///
+/// **code は変えない。** 状態は同じで、次の一手だけが増えたのだから、
+/// 別名を付ければエージェントは二つの失敗があると誤解する。
 fn low_uniformity_warnings(
     background: &BackgroundEstimate,
     residual: &DeltaEQuantiles,
     model: ResolvedModel,
     subject: Option<&SubjectHint>,
+    subject_source: &str,
 ) -> Vec<Warning> {
     let base = Warning::new(
         WarningCode::LowUniformity,
@@ -138,7 +173,17 @@ fn low_uniformity_warnings(
                     s.delta_e
                 ),
             )
-            .with_hint("単色背景で撮り直してください")
+            // **モデルが見つけた主体なら、撮り直しではなくモデルを勧める。**
+            // 色で分けられないことは変わらないが、分けなくてよい道が今そこにある
+            .with_hint(if subject_source == SUBJECT_FROM_SEGMENT {
+                format!(
+                    "色では分けられません。cutout に --segment isnet を渡すか、\
+                     --bbox {} --normalized を指定してください",
+                    bbox_argument(s.normalized_bbox)
+                )
+            } else {
+                "単色背景で撮り直してください".to_string()
+            })
             // cutout 側は切り抜き後の境界で測った `separability` を載せる。
             // ここはまだ切り抜いていないので、主体候補の色差であることが
             // キー名から分かるようにしておく
@@ -262,6 +307,7 @@ mod tests {
             &residual(11.9),
             ResolvedModel::Field,
             Some(&subject(Confidence::High, 49.6)),
+            SUBJECT_FROM_COLOUR,
         );
         assert_eq!(codes(&w), ["LOW_UNIFORMITY"]);
 
@@ -281,12 +327,50 @@ mod tests {
             &residual(30.0),
             ResolvedModel::Field,
             Some(&subject(Confidence::High, 12.1)),
+            SUBJECT_FROM_COLOUR,
         );
         assert!(codes(&w).contains(&"NOT_SEPARABLE"), "{:?}", codes(&w));
         assert!(
             !hint_of(&w, "LOW_UNIFORMITY").contains("--bbox"),
             "解けない画像で bbox を勧めている"
         );
+    }
+
+    /// モデルが見つけた主体なら、`NOT_SEPARABLE` の hint は撮り直しではなく
+    /// モデルを勧める。
+    ///
+    /// **状態は同じで、打てる手だけが増えている。** code を変えずに hint だけを
+    /// 差し替えるのはそのためで、別名を付ければ「二つの失敗がある」と読める。
+    #[test]
+    fn a_subject_found_by_the_model_is_pointed_at_the_model_not_at_a_reshoot() {
+        let w = low_uniformity_warnings(
+            &background(0.155, 21.6),
+            &residual(21.6),
+            ResolvedModel::Field,
+            Some(&subject(Confidence::High, 6.6)),
+            SUBJECT_FROM_SEGMENT,
+        );
+        assert!(codes(&w).contains(&"NOT_SEPARABLE"), "{:?}", codes(&w));
+        let hint = hint_of(&w, "NOT_SEPARABLE");
+        assert!(hint.contains("--segment isnet"), "{hint}");
+        assert!(hint.contains("--bbox"), "{hint}");
+        assert!(
+            !hint.contains("撮り直"),
+            "モデルがあるのに撮り直しを勧めている: {hint}"
+        );
+    }
+
+    /// モデルを使っていなければ、文面は 1 文字も変わらない。
+    #[test]
+    fn without_the_model_the_wording_is_unchanged() {
+        let w = low_uniformity_warnings(
+            &background(0.20, 30.0),
+            &residual(30.0),
+            ResolvedModel::Field,
+            Some(&subject(Confidence::High, 12.1)),
+            SUBJECT_FROM_COLOUR,
+        );
+        assert_eq!(hint_of(&w, "NOT_SEPARABLE"), "単色背景で撮り直してください");
     }
 
     /// **信頼度 Low では絶対に bbox を勧めない。**
@@ -305,6 +389,7 @@ mod tests {
             &residual(21.6),
             ResolvedModel::Field,
             Some(&s),
+            SUBJECT_FROM_COLOUR,
         );
 
         assert_eq!(codes(&w), ["LOW_UNIFORMITY"], "断定はしない");
@@ -369,6 +454,7 @@ mod tests {
             &residual(8.0),
             ResolvedModel::Field,
             None,
+            SUBJECT_FROM_COLOUR,
         );
         assert_eq!(codes(&w), ["LOW_UNIFORMITY"]);
         assert!(!hint_of(&w, "LOW_UNIFORMITY").contains("--bbox"));
@@ -382,6 +468,7 @@ mod tests {
             &residual(2.0),
             ResolvedModel::Field,
             None,
+            SUBJECT_FROM_COLOUR,
         );
         let hint = hint_of(&w, "LOW_UNIFORMITY");
         assert!(hint.contains("照明場として推定します"), "{hint}");
@@ -399,6 +486,7 @@ mod tests {
             &residual(12.0),
             ResolvedModel::Flat,
             None,
+            SUBJECT_FROM_COLOUR,
         );
         let hint = hint_of(&w, "LOW_UNIFORMITY");
         assert!(hint.contains("既定"), "{hint}");

@@ -10,7 +10,7 @@ use rayon::prelude::*;
 
 use crate::batch::{self, BatchItem, ItemSettings};
 use crate::cli::{
-    BatchArgs, ColorOpts, CutoutArgs, OutputOpts, Polygon, parse_hex_color, parse_size,
+    BatchArgs, ColorOpts, CutoutArgs, OutputOpts, Polygon, SegmentOpts, parse_hex_color, parse_size,
 };
 use crate::commands::cutout;
 use crate::cutout::{BackgroundModel, CutoutOptions, DEFAULT_BORDER, Matting};
@@ -159,6 +159,11 @@ fn to_cutout_args(
         color: ColorOpts {
             no_color_convert: !settings.color_convert.unwrap_or(true),
         },
+        // **spec からは segment を受けない。** 数百点を 1 件 1.2 秒・
+        // ピーク RSS 1.5GB で回すのは、並列度ぶんだけメモリが倍になる
+        // `batch` でいちばん割に合わない使い方である。モデルが要る数枚は
+        // `cutout` で個別に救う（README「意味の事前知識」を参照）
+        segment: SegmentOpts::default(),
         // 未指定は未指定のまま渡す。既定値で埋めてしまうと、テクスチャに応じた
         // 自動調整が spec を書いた人の「8 を指定した」と区別できなくなる
         edge_threshold: checked_opt(settings.edge_threshold, "edge_threshold")?,

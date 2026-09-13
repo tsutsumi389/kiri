@@ -14,8 +14,8 @@ use kiri::commands;
 use kiri::cutout::{Confidence, bbox_argument};
 use kiri::error::{Error, ErrorCode, ErrorKind, Result};
 use kiri::report::{
-    BackgroundReport, BatchReport, CutoutReport, ErrorReport, InfoReport, ProcessReport,
-    SchemaReport, SubjectReport,
+    BackgroundReport, BatchReport, CutoutReport, ErrorReport, InfoReport, ModelReport,
+    ProcessReport, SchemaReport, SegmentReport, SubjectReport,
 };
 use kiri::warning::Warning;
 
@@ -72,6 +72,14 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                 print_json(&report)?;
             } else {
                 print_cutout(&report);
+            }
+        }
+        Command::Model(args) => {
+            let report = commands::model::run(&args.command)?;
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                print_models(&report);
             }
         }
         Command::Schema => {
@@ -152,6 +160,57 @@ fn print_schema(report: &SchemaReport) {
     println!("\nオプションの既定値と綴りは --json が返す（kiri schema --json）");
 }
 
+/// モデルの一覧を人間向けに出す。
+///
+/// **置いていないときこそ役に立つ出力である。** そのまま貼れる `curl` の
+/// 1 行を出すのが主目的で、置いてある場合は突き合わせた結果を 1 行で言う。
+fn print_models(report: &ModelReport) {
+    if !report.segment_available {
+        println!(
+            "この build には segment 機能がありません（--features segment で入れ直してください）"
+        );
+    }
+    for m in &report.models {
+        println!("{}  {}  {}", m.name, human_bytes(m.bytes), m.license);
+        println!("  URL       {}", m.url);
+        println!("  入力寸法  {}x{}", m.input_size, m.input_size);
+        println!("  MD5       {}  (配布元の名乗り)", m.md5);
+        println!("  SHA-256   {}  (kiri が検証に使う)", m.sha256);
+        println!(
+            "  想定パス  {}",
+            m.path.as_deref().unwrap_or("(決められません)")
+        );
+        match m.verified {
+            Some(true) => println!("  状態      あり・検証済み"),
+            Some(false) => println!(
+                "  状態      あり・**ダイジェストが合いません**（実際 {}）",
+                m.actual_sha256.as_deref().unwrap_or("?")
+            ),
+            None => println!("  状態      なし"),
+        }
+        if m.verified != Some(true) {
+            println!("  取得      {}", m.hint);
+        }
+    }
+}
+
+/// 推論そのものの報告。**走ったときしか出ない。**
+fn print_segment(segment: Option<&SegmentReport>) {
+    let Some(s) = segment else {
+        return;
+    };
+    println!(
+        "  モデル    {} {}x{}  確定 前景 {:.1}% / 背景 {:.1}%  不明 {:.1}%  ({} ms)",
+        s.model,
+        s.input_size,
+        s.input_size,
+        s.fg_ratio * 100.0,
+        s.bg_ratio * 100.0,
+        s.uncertain_ratio * 100.0,
+        s.elapsed_ms
+    );
+}
+
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
     let text = serde_json::to_string_pretty(value)
         .map_err(|e| Error::new(ErrorCode::JsonEncodeFailed, e.to_string()))?;
@@ -211,6 +270,7 @@ fn print_info(report: &InfoReport) {
         report.background.uniformity
     );
     print_perimeter(&report.background);
+    print_segment(report.segment.as_ref());
     print_subject(report.subject.as_ref());
     print_warnings(&report.warnings);
 }
@@ -280,6 +340,7 @@ fn print_cutout(report: &CutoutReport) {
         report.background.uniformity, report.settings.tolerance
     );
     print_perimeter(&report.background);
+    print_segment(report.segment.as_ref());
     // 指示を渡したときだけ 1 行増やす。**どの入口が効いたかまで出す**のは、
     // 渡したはずの入口が並びに無いことが「その指示は空だった」を意味するため
     // （そのときは CONSTRAINT_EMPTY も出る）。
@@ -415,13 +476,14 @@ fn print_subject(subject: Option<&SubjectReport>) {
         return;
     };
     println!(
-        "  主体候補  {}  (面積 {:.1}%, 信頼度 {})",
+        "  主体候補  {}  (面積 {:.1}%, 信頼度 {}, {} 由来)",
         bbox_argument(s.normalized_bbox),
         s.area_ratio * 100.0,
         match s.confidence {
             Confidence::High => "high",
             Confidence::Low => "low",
-        }
+        },
+        s.source
     );
 }
 

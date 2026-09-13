@@ -147,6 +147,76 @@ pub struct SubjectReport {
     pub touches_edge: bool,
     /// "high" のときだけ、この矩形を根拠にした助言を出してよい
     pub confidence: Confidence,
+    /// この矩形が何から出たか（"colour" / "segment"）。
+    ///
+    /// **キーを足すだけで、既存の値の意味は変えない。** `--segment` を
+    /// 渡さなければ今までどおり `"colour"`（背景色から遠い画素の最大の塊）で、
+    /// 渡してモデルが走ったときだけ `"segment"` になる。`area_ratio` や
+    /// `confidence` の判定は**どちらでも同じもの**を通るので、2 つの
+    /// `high` は同じ意味を持つ
+    pub source: &'static str,
+}
+
+/// モデルが走ったときだけ出る、推論そのものの報告。
+///
+/// **走らなかった実行ではキーごと現れない**（`constraints` と同じ規約）。
+/// `null` を出すと「走ったが何も出なかった」と読めてしまう。走ったかどうかは
+/// `settings.segment_ran` が真偽で言う。
+#[derive(Debug, Serialize)]
+pub struct SegmentReport {
+    /// 実際に使ったモデルの名前（"isnet"）
+    pub model: &'static str,
+    /// モデルが受け取った正方形の一辺(px)。**モデルが決める値**で、
+    /// 利用者は選べない（ISNet の ONNX は 1024 を graph に焼き込んでいる）
+    pub input_size: u32,
+    /// モデルの読み込みから確率マップまでの時間
+    pub elapsed_ms: u128,
+    /// 確定前景として置かれた画素の割合
+    pub fg_ratio: f64,
+    /// 確定背景として置かれた画素の割合
+    pub bg_ratio: f64,
+    /// どちらでもない帯の割合。**大きいほどモデルが迷っている**。
+    /// 0.3 を超えると `SEGMENT_UNCERTAIN` が出る
+    pub uncertain_ratio: f64,
+    /// 実際に読んだファイル
+    pub model_path: String,
+}
+
+/// `kiri model list` が返す、既知のモデルの素性。
+#[derive(Debug, Serialize)]
+pub struct ModelReport {
+    pub schema_version: u32,
+    /// この build が推論できるか。false なら `--segment` は
+    /// `SEGMENT_UNAVAILABLE` で断られる（一覧そのものは返る）
+    pub segment_available: bool,
+    pub models: Vec<ModelEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModelEntry {
+    /// `--segment <これ>` の綴り
+    pub name: String,
+    pub url: String,
+    /// 配布元が名乗る MD5。**kiri は検証に使わない**（`md5` コマンドで
+    /// 取得直後に確かめるために配る）
+    pub md5: String,
+    /// kiri が検証に使う SHA-256
+    pub sha256: String,
+    pub bytes: u64,
+    pub license: String,
+    /// モデルが受け取る正方形の一辺(px)
+    pub input_size: u32,
+    /// 探しに行く場所。`--model-path` を渡せばここは無視される
+    pub path: Option<String>,
+    pub present: bool,
+    /// ダイジェストを突き合わせた結果。**置いていなければ `null`** で、
+    /// 「検証していない」と「検証して駄目だった」を同じ形にしない
+    pub verified: Option<bool>,
+    /// 置いてある場合の実際のダイジェスト。合わなかったときに何が来たのかを示す
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual_sha256: Option<String>,
+    /// そのまま貼れる取得の 1 行
+    pub hint: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -171,6 +241,9 @@ pub struct InfoReport {
     pub background: BackgroundReport,
     /// 主体候補。検出できなければ null（キーは常に出す）
     pub subject: Option<SubjectReport>,
+    /// モデルが走ったときだけ出る。`--segment off`（既定）ではキーごと無い
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment: Option<SegmentReport>,
     pub warnings: Vec<Warning>,
 }
 
@@ -342,6 +415,11 @@ pub struct SettingsReport {
     /// 粗さぶんだけ持ち上がる。`--no-refine` では帯そのものが無いので現れない
     #[serde(skip_serializing_if = "Option::is_none")]
     pub band_min_radius: Option<u32>,
+    /// `--segment` の**指定値**（"off" / "auto" / "isnet"）
+    pub segment: &'static str,
+    /// 実際にモデルが走ったか。**`auto` では指定値から読めない**——
+    /// 色で解けると判断すれば走らない。`off` なら必ず false
+    pub segment_ran: bool,
 }
 
 /// 空間的な指示（トライマップ・マスク画像・多角形・種）が何を占めたか。
@@ -405,6 +483,9 @@ pub struct CutoutReport {
     /// 空間的な指示が何を占めたか。指示が無ければキーごと現れない
     #[serde(skip_serializing_if = "Option::is_none")]
     pub constraints: Option<ConstraintsReport>,
+    /// モデルが走ったときだけ出る。`--segment off`（既定）ではキーごと無い
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment: Option<SegmentReport>,
     pub mask: MaskReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canvas: Option<CanvasReport>,

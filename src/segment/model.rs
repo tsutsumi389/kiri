@@ -93,16 +93,34 @@ pub const XDG_CACHE_HOME: &str = "XDG_CACHE_HOME";
 /// 置いていない両方の状態を、利用者のキャッシュを壊さずに作れないと、
 /// 「モデルが無くても全テストが通る」を検査する術が無い。
 pub fn default_dir() -> Option<PathBuf> {
+    let var = |name: &str| std::env::var_os(name).map(PathBuf::from);
+    dir_from(var(KIRI_MODEL_DIR), var(XDG_CACHE_HOME), var("HOME"))
+}
+
+/// 3 つの値から置き場所を決める。**環境変数はここまで持ち込まない。**
+///
+/// 順序の規則そのものは環境と関係が無い。それでも `std::env::set_var` で
+/// 確かめようとすると、**同じバイナリの他のテストと並列に走った瞬間に
+/// 未定義動作になる**（Rust 2024 で `set_var` が `unsafe` になったのはこれが
+/// 理由である）。読む側を 1 本でも持っていれば、直列化したつもりでも壊れる。
+///
+/// 決め方を純関数にしておけば、環境を触らずに全ての枝を確かめられる。
+/// `default_dir` に残るのは「どの変数を読むか」だけになる。
+pub fn dir_from(
+    model_dir: Option<PathBuf>,
+    xdg_cache: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
     // 空文字は「指定されていない」として扱う。`KIRI_MODEL_DIR=` と書いて
     // しまった環境で、カレントディレクトリを指したことにしないため
-    let set = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
-    if let Some(dir) = set(KIRI_MODEL_DIR) {
-        return Some(PathBuf::from(dir));
+    let set = |p: Option<PathBuf>| p.filter(|p| !p.as_os_str().is_empty());
+    if let Some(dir) = set(model_dir) {
+        return Some(dir);
     }
-    if let Some(cache) = set(XDG_CACHE_HOME) {
-        return Some(PathBuf::from(cache).join("kiri").join("models"));
+    if let Some(cache) = set(xdg_cache) {
+        return Some(cache.join("kiri").join("models"));
     }
-    let home = PathBuf::from(set("HOME")?);
+    let home = set(home)?;
     if cfg!(target_os = "macos") {
         Some(
             home.join("Library")
@@ -258,17 +276,54 @@ mod tests {
         }
     }
 
-    /// `KIRI_MODEL_DIR` が最優先されること。
-    ///
-    /// 環境変数を触るので直列に 1 本だけ持つ。ここが効かないと、
+    fn dir(s: &str) -> Option<PathBuf> {
+        Some(PathBuf::from(s))
+    }
+
+    /// `KIRI_MODEL_DIR` が最優先されること。ここが効かないと、
     /// 「モデルが無い状態」をテストから作れない。
+    ///
+    /// **環境変数は触らない。** `set_var` は同じバイナリの他のテストと
+    /// 並列に走った瞬間に未定義動作になる（実際に `default_dir` を読む
+    /// テストが同居している）。規則そのものは `dir_from` が純関数で持つ。
     #[test]
-    fn the_environment_override_wins() {
-        // SAFETY: このテストだけが環境変数を触る。他のテストは
-        // `default_dir` を呼ばない
-        unsafe { std::env::set_var(KIRI_MODEL_DIR, "/tmp/kiri-models-test") };
-        assert_eq!(default_dir(), Some(PathBuf::from("/tmp/kiri-models-test")));
-        unsafe { std::env::remove_var(KIRI_MODEL_DIR) };
+    fn the_explicit_directory_wins_over_every_cache() {
+        assert_eq!(
+            dir_from(dir("/m"), dir("/xdg"), dir("/home/u")),
+            dir("/m"),
+            "KIRI_MODEL_DIR が最優先されていない"
+        );
+        assert_eq!(
+            dir_from(None, dir("/xdg"), dir("/home/u")),
+            dir("/xdg/kiri/models"),
+            "XDG_CACHE_HOME の下に kiri/models を掘っていない"
+        );
+    }
+
+    /// `HOME` しか無ければ OS 既定のキャッシュへ落ちる。
+    #[test]
+    fn the_last_resort_is_the_os_cache_under_home() {
+        let expected = if cfg!(target_os = "macos") {
+            "/home/u/Library/Caches/kiri/models"
+        } else {
+            "/home/u/.cache/kiri/models"
+        };
+        assert_eq!(dir_from(None, None, dir("/home/u")), dir(expected));
+        // どれも無ければ決められない。`--model-path` を勧める側へ回る
+        assert_eq!(dir_from(None, None, None), None);
+    }
+
+    /// **空文字は「指定されていない」。**
+    ///
+    /// `KIRI_MODEL_DIR=` と書いた環境でカレントディレクトリを指したことに
+    /// すると、モデルを探す場所が呼び出し位置で変わる。
+    #[test]
+    fn an_empty_value_is_the_same_as_unset() {
+        assert_eq!(
+            dir_from(dir(""), dir(""), dir("/home/u")),
+            dir_from(None, None, dir("/home/u"))
+        );
+        assert_eq!(dir_from(dir(""), dir(""), dir("")), None);
     }
 
     /// hint はそのまま貼れる 1 行であること。

@@ -54,6 +54,12 @@ const BG: u8 = 1 << 1;
 /// 同じことを既に言っており、2 箇所で名乗ると「別の指定が 2 つある」と読める。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConstraintSource {
+    /// セグメンテーションモデルが出した提案（`--segment`）。
+    ///
+    /// **他の入口と違って、これは利用者が引いた線ではない。** 同じ画素で
+    /// 衝突したら利用者の指示が勝つ（`overlay`）ので、`CONSTRAINT_CONFLICT`
+    /// にはならない
+    Segment,
     Trimap,
     FgMask,
     BgMask,
@@ -65,6 +71,7 @@ pub enum ConstraintSource {
 impl ConstraintSource {
     pub fn as_str(self) -> &'static str {
         match self {
+            ConstraintSource::Segment => "segment",
             ConstraintSource::Trimap => "trimap",
             ConstraintSource::FgMask => "fg_mask",
             ConstraintSource::BgMask => "bg_mask",
@@ -248,6 +255,35 @@ impl Constraints {
             count,
             bbox: (x1, y1, x2, y2),
         })
+    }
+
+    /// 別の指示を**上から**重ねる。重なった画素では上書き側だけが残る。
+    ///
+    /// **衝突をエラーにしない唯一の合成である。** `--trimap` どうしのように
+    /// 対等な指示が重なれば `CONSTRAINT_CONFLICT` で断るが、片方が
+    /// セグメンテーションモデルの**提案**で、もう片方が利用者の**決定**である
+    /// 場合は話が違う。「モデルが背景だと言った画素を、利用者が前景だと指した」
+    /// のは矛盾ではなく訂正であり、そこでエラーを返すのは
+    /// 「モデルを使うと指示が出せなくなる」という筋の悪い規約になる。
+    ///
+    /// 上書きは**画素ごとに全部**である。利用者が前景と言った画素から、
+    /// モデルが置いた背景の印も消える（ビットを OR すると衝突として残り、
+    /// 後段の `conflict()` が拾ってしまう）。
+    ///
+    /// 入口の名前は自分のものの後ろへ、指定された順で並べる。寸法が違えば
+    /// 何もしない（`mark_by_luma` と同じ規約）。
+    pub fn overlay(&mut self, other: &Constraints) {
+        if other.width != self.width || other.height != self.height {
+            return;
+        }
+        for (slot, &top) in self.flags.iter_mut().zip(other.flags.iter()) {
+            if top != 0 {
+                *slot = top;
+            }
+        }
+        for &source in &other.sources {
+            self.note(source);
+        }
     }
 
     /// 画素ごとの輝度から印を付ける。`decide` が `None` を返した画素は触らない。
@@ -579,6 +615,55 @@ mod tests {
         c.note(ConstraintSource::Trimap);
         let names: Vec<&str> = c.sources().iter().map(|s| s.as_str()).collect();
         assert_eq!(names, ["trimap", "fg_polygon"]);
+    }
+
+    /// **利用者の指示はモデルの提案に勝つ。** 衝突はエラーにならない。
+    #[test]
+    fn an_overlay_lets_the_later_instruction_win() {
+        let mut model = Constraints::new(4, 1);
+        model.note(ConstraintSource::Segment);
+        for x in 0..4 {
+            model.mark(x, 0, Constraint::ForcedBg);
+        }
+        let mut user = Constraints::new(4, 1);
+        user.note(ConstraintSource::FgPolygon);
+        user.mark(1, 0, Constraint::ForcedFg);
+
+        model.overlay(&user);
+        assert_eq!(
+            model.at(0, 0),
+            Constraint::ForcedBg,
+            "触っていない画素が動いた"
+        );
+        assert_eq!(
+            model.at(1, 0),
+            Constraint::ForcedFg,
+            "利用者の指示が勝っていない"
+        );
+        assert_eq!(
+            model.conflict(),
+            None,
+            "上書きしたのに衝突として残っている（ビットを OR している）"
+        );
+        assert_eq!(
+            model
+                .sources()
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>(),
+            ["segment", "fg_polygon"]
+        );
+    }
+
+    /// 寸法が違う指示は重ねない（`mark_by_luma` と同じ規約）。
+    #[test]
+    fn an_overlay_of_the_wrong_size_changes_nothing() {
+        let mut base = Constraints::new(4, 4);
+        base.mark(0, 0, Constraint::ForcedFg);
+        let mut other = Constraints::new(2, 2);
+        other.mark(0, 0, Constraint::ForcedBg);
+        base.overlay(&other);
+        assert_eq!(base.at(0, 0), Constraint::ForcedFg);
     }
 
     #[test]

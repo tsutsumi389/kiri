@@ -544,3 +544,12 @@ MSRV の検査を CI に入れるのは、**宣言だけ置いても検査しな
   - [ ] BiRefNet は重みの学習データ（DIS5K）に商用制限があり、candle 経路も
         パッチ依存を抱えている。解消されれば次の候補（design.md 3.6）。
         **条件が揃ったかを確かめるところから**始める
+  - [ ] `--model-path` を `--segment off` と一緒に渡すと黙って無視される。「効いた値
+        だけを報告する」規約に照らすと、警告か `settings` への露出が要る
+  - [ ] `segment::to_probability` と `Probability::new` は `pub` なのに `raw` の長さを
+        `assert_eq!` でしか検査しない。ライブラリ API としては `Result` で断るべき
+  - [ ] `segment::nearest` は 0 寸法の画像で `get_pixel` が panic しうる（実運用では
+        復号側が弾くので到達しないが、`pub` である以上は早期 return が要る）
+  - [ ] `kiri schema --json` からは、この build が推論できるかを読めない
+        （`model list` の `segment_available` にしか無い）。schema にも 1 キー置くと、
+        エージェントが 1 回の問い合わせで判断できる

@@ -215,6 +215,13 @@ pub struct ModelEntry {
     /// 置いてある場合の実際のダイジェスト。合わなかったときに何が来たのかを示す
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actual_sha256: Option<String>,
+    /// 想定と違う大きさだったときの実際のバイト数。
+    ///
+    /// **大きさが違う時点でダイジェストは計算しない。** 想定パスに巨大な
+    /// 別ファイルが置かれていると、`kiri model list` がそれを際限なく舐める
+    /// ことになる。違うと分かっているものを最後まで読む理由が無い
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual_bytes: Option<u64>,
     /// そのまま貼れる取得の 1 行
     pub hint: String,
 }

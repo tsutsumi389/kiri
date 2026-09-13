@@ -30,8 +30,18 @@ fn list() -> ModelReport {
             let present = path.as_ref().is_some_and(|p| p.is_file());
             // **置いてあるときだけ舐める。** 176MB の SHA-256 は実測 0.4 秒で、
             // 「このファイルは正しいか」を問う専用のコマンドがその費用を負う
-            // べき場所である（切り抜きの経路では大きさだけを見る）
-            let actual = present
+            // べき場所である（切り抜きの経路では大きさだけを見る）。
+            //
+            // **ただし舐める前に大きさを見る。** `present` だけを門にすると、
+            // 想定パスに何 GB の別ファイルが置かれていても最後まで読む。
+            // 大きさが違えば結果は分かっている（不一致）のだから、そこで
+            // 止めて実際のバイト数を返すほうが、待たせずに同じことを言える
+            let size = present
+                .then(|| path.as_ref().and_then(|p| std::fs::metadata(p).ok()))
+                .flatten()
+                .map(|md| md.len());
+            let size_matches = size == Some(m.bytes);
+            let actual = size_matches
                 .then(|| segment::model::digest(path.as_ref().unwrap()).ok())
                 .flatten();
             ModelEntry {
@@ -44,8 +54,15 @@ fn list() -> ModelReport {
                 input_size: m.input_size,
                 path: path.map(|p| p.display().to_string()),
                 present,
-                verified: actual.as_ref().map(|a| a == m.sha256),
+                // 「置いていない」は `null`、「大きさが違う」は `false`。
+                // 後者はダイジェストを計算せずに言い切れる
+                verified: match (present, size_matches) {
+                    (false, _) => None,
+                    (true, false) => Some(false),
+                    (true, true) => actual.as_ref().map(|a| a == m.sha256),
+                },
                 actual_sha256: actual.filter(|a| a != m.sha256),
+                actual_bytes: size.filter(|_| !size_matches),
                 hint: m.download_hint(),
             }
         })

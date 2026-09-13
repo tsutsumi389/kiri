@@ -365,6 +365,54 @@ fn verifying_a_176mb_model_finishes_instead_of_spinning_forever() {
     assert!(status.success(), "kiri model list が失敗した: {status}");
 }
 
+/// **大きさが違うファイルは舐めない。**
+///
+/// `present` だけを門にすると、想定パスに置かれた何 GB の別ファイルを
+/// `kiri model list` が最後まで読むことになる。大きさが違えば答えは
+/// 分かっている（不一致）ので、そこで止めて実際のバイト数を返す——
+/// **同じことを、待たせずに言える。**
+///
+/// 置き場所は子プロセスの環境として渡す。`std::env::set_var` は同じ
+/// バイナリの他のテストと並列に走ると未定義動作になるので、
+/// **テスト側のプロセスの環境は触らない。**
+///
+/// 推論できない build でも走る（一覧はどの build でも返す約束である）。
+#[test]
+fn a_file_of_the_wrong_size_is_refused_without_computing_a_digest() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join(kiri::segment::model::ISNET.file_name),
+        b"not an onnx file",
+    )
+    .unwrap();
+    let v = json_stdout(
+        &kiri()
+            .args(["model", "list", "--json"])
+            .env(kiri::segment::model::KIRI_MODEL_DIR, dir.path())
+            .output()
+            .unwrap(),
+    );
+    let isnet = v["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == "isnet")
+        .unwrap_or_else(|| panic!("isnet が無い: {v}"));
+    assert_eq!(isnet["present"], true, "{isnet}");
+    assert_eq!(isnet["verified"], false, "{isnet}");
+    assert_eq!(isnet["actual_bytes"], 16, "{isnet}");
+    // **ダイジェストを計算していないことが、これで分かる。** 計算していれば
+    // 不一致の中身として `actual_sha256` が付く
+    assert!(
+        isnet["actual_sha256"].is_null(),
+        "大きさで弾いたのにダイジェストを計算している: {isnet}"
+    );
+    assert!(
+        isnet["hint"].as_str().unwrap().contains("curl -L"),
+        "取り直し方を言っていない: {isnet}"
+    );
+}
+
 /// 入れ子のサブコマンドも契約に載る。
 ///
 /// **`kiri model` は単体では呼べない。** 葉だけを `"model list"` の形で

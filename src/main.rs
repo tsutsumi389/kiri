@@ -180,13 +180,20 @@ fn print_models(report: &ModelReport) {
             "  想定パス  {}",
             m.path.as_deref().unwrap_or("(決められません)")
         );
-        match m.verified {
-            Some(true) => println!("  状態      あり・検証済み"),
-            Some(false) => println!(
+        match (m.verified, m.actual_bytes) {
+            (Some(true), _) => println!("  状態      あり・検証済み"),
+            // 大きさで弾いた側はダイジェストを持たない。**「合いません」と
+            // だけ言うと、利用者は 176MB を舐めた結果だと読む**
+            (Some(false), Some(actual)) => println!(
+                "  状態      あり・**大きさが違います**（実際 {} / 想定 {}）",
+                human_bytes(actual),
+                human_bytes(m.bytes)
+            ),
+            (Some(false), None) => println!(
                 "  状態      あり・**ダイジェストが合いません**（実際 {}）",
                 m.actual_sha256.as_deref().unwrap_or("?")
             ),
-            None => println!("  状態      なし"),
+            (None, _) => println!("  状態      なし"),
         }
         if m.verified != Some(true) {
             println!("  取得      {}", m.hint);

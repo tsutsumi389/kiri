@@ -492,7 +492,9 @@ fn fields() -> Vec<FieldEntry> {
             notes: Some(
                 "auto では指定値から読めない——background.uniformity が下限を切っていて、かつ \
                  NOT_SEPARABLE になるか subject.confidence が low のときだけ走る。off なら\
-                 必ず false で、そのときの出力は --segment を足す前と 1 バイトも変わらない",
+                 必ず false で、そのときの成果物の画素は --segment を足す前と 1 バイトも\
+                 変わらない（報告 JSON には subject.source / settings.segment / \
+                 settings.segment_ran の 3 つが増える。schema_version は据え置き）",
             ),
         },
         FieldEntry {

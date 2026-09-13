@@ -162,7 +162,9 @@ pub struct SegmentOpts {
 fn segment_long_help() -> String {
     format!(
         "セグメンテーションモデルを粗マスクの供給源として使う（既定 off）。\n\
-         off  … モデルを触らない。出力は 1 バイトも変わらない。\n\
+         off  … モデルを触らない。成果物の画素は 1 バイトも変わらない\
+         （報告 JSON には subject.source / settings.segment / settings.segment_ran の\
+         3 つが増える。schema_version は据え置き）。\n\
          auto … 色では解けないと kiri 自身が判断したときだけ走らせる\
          （NOT_SEPARABLE になるか subject.confidence が low のとき）。\
          走ったかどうかは settings.segment_ran に出る。\n\

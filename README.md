@@ -1231,9 +1231,13 @@ $ kiri cutout keyboard.jpg -o out.png --segment isnet
 
 | 値 | 動き |
 |---|---|
-| `off`（既定） | モデルを触らない。**出力は 1 バイトも変わらない** |
+| `off`（既定） | モデルを触らない。**成果物の画素は 1 バイトも変わらない** |
 | `auto` | 色では解けないと kiri 自身が判断したときだけ走らせる |
 | `isnet` | 常に走らせる |
+
+`off` で変わるのは `--json` の報告だけで、**キーが 3 つ増える**
+（`subject.source` / `settings.segment` / `settings.segment_ran`）。既存のキーは
+1 つも消えず、意味も変わらないので `schema_version` は据え置きである。
 
 `auto` の判定は `info` と同じである——`background.uniformity` が下限を切っていて、
 かつ `NOT_SEPARABLE` になるか `subject.confidence` が `low` のとき。走ったか
@@ -1259,6 +1263,11 @@ $ cargo install --path . --features segment
 1. **MSRV。** `tract-onnx` 0.23.7 は rustc 1.91 を要求し、kiri の 1.85 を超える
 2. **費用。** clean build が 50 秒 → 200 秒、バイナリが 3.26MB → 19.26MB になる
    （依存クレートは 97 → 175）。切り抜きの大半はモデルを要しない
+
+依存クレートの数え方は
+`cargo tree -e normal --prefix none | sed 's/ (\*)$//' | sort -u | wc -l`
+（kiri 自身を含み、2 つの版が同居するクレートは 2 つと数える）。`sed` を
+省くと同じ木が 110 → 211 と出るので、方法を書かない数字は照合できない。
 
 ##### モデルの取得
 
@@ -1289,6 +1298,12 @@ isnet  170.4 MB  Apache-2.0 (code and weights)
 | モデル | ライセンス | 大きさ | 入力 |
 |---|---|---|---|
 | ISNet（DIS general-use） | Apache-2.0（コード・重みとも） | 170.4 MB | 1024x1024 固定 |
+
+**推論の依存に `dyn-eq` 0.1.3（MPL-2.0）が 1 つ入る**（`tract-core` 経由）。
+MPL-2.0 はファイル単位のコピーレフトで、そのファイルを改変しなければ MIT の
+成果物に静的リンクしてよい（kiri は改変しない）。`--features segment` で建てた
+バイナリを再配布するときの注意で、素の kiri には入らない。他の依存は
+MIT / Apache-2.0 / BSD で、copyleft はこれ 1 つだけである。
 
 **入力寸法は選べない。** ISNet の ONNX は 1024 を graph に焼き込んでおり、
 512 を渡すとグラフの解析そのものが通らない。`segment.input_size` と

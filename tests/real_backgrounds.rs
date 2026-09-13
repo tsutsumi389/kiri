@@ -1607,18 +1607,42 @@ fn segment_ready() -> bool {
             .is_some_and(|p| p.is_file())
 }
 
+/// 飛ばすなら、**どこを見て飛ばしたのかを 1 行だけ言う。**
+///
+/// 黙って通ると、置いてある機械でしか回っていないことに誰も気づかない。
+/// 「緑だった」と「確かめた」は別である。
+fn skip_without_model() -> bool {
+    if segment_ready() {
+        return false;
+    }
+    let path = kiri::segment::model::ISNET
+        .expected_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(置き場所を決められません)".to_string());
+    if cfg!(feature = "segment") {
+        eprintln!("モデルが無いので飛ばす: {path}");
+    } else {
+        eprintln!("この build に segment 機能が無いので飛ばす: {path}");
+    }
+    true
+}
+
 /// R シーンをモデルの出したトライマップで回す。
 ///
 /// **正解は一切渡さない。** `truth_trimap` が正解の二値を収縮・膨張して作るのに
 /// 対し、こちらは画像だけをモデルに見せて得た確率マップを落とす。両者を同じ
 /// 指標で並べたときに初めて、「モデルの提案は手で描いたトライマップの代わりに
 /// なるか」が言える。
-fn run_segment(
-    scene: &common::RealScene,
-) -> Option<(common::EdgeTruth, EdgeMetrics, Diagnostics, f64)> {
+///
+/// **失敗したら本文ごと落ちる。** 呼ぶ側は既に `segment_ready` を通しているので、
+/// ここで失敗するのは「モデルが無い」以外の理由——壊れたファイル、graph の
+/// 解析失敗——であり、それを `None` に潰すと「モデルが無い機械」と同じ顔で
+/// 黙って飛ぶ。**何が起きたのかは、その本文にしか書かれていない。**
+fn run_segment(scene: &common::RealScene) -> (common::EdgeTruth, EdgeMetrics, Diagnostics, f64) {
     let truth = common::real_scene(scene);
     let (w, h) = (truth.image.width(), truth.image.height());
-    let run = kiri::segment::run(&truth.image, &kiri::segment::SegmentOptions::isnet()).ok()?;
+    let run = kiri::segment::run(&truth.image, &kiri::segment::SegmentOptions::isnet())
+        .unwrap_or_else(|e| panic!("{}: モデルの推論に失敗した: {e}", scene.name));
     let (constraints, _) = kiri::segment::to_constraints(&run.probability, w, h);
     let opts = CutoutOptions {
         constraints: Some(constraints),
@@ -1633,12 +1657,12 @@ fn run_segment(
         None,
         opts.constraints.as_ref(),
     );
-    Some((
+    (
         truth,
         metrics,
         result.diagnostics.clone(),
         result.stats.foreground_ratio,
-    ))
+    )
 }
 
 /// **モデルのトライマップは、手で描いたトライマップの代わりになるか。**
@@ -1653,8 +1677,7 @@ fn run_segment(
 #[test]
 #[ignore = "計測用。モデルが無ければ何もしない"]
 fn print_the_segment_comparison() {
-    if !segment_ready() {
-        println!("モデルが無いので何もしない");
+    if skip_without_model() {
         return;
     }
     println!(
@@ -1697,9 +1720,8 @@ fn print_the_segment_comparison() {
                     .collect(),
             ));
         }
-        if let Some((_, m, _, fg)) = run_segment(&scene) {
-            rows.push(("segment", m, fg, Vec::new()));
-        }
+        let (_, m, _, fg) = run_segment(&scene);
+        rows.push(("segment", m, fg, Vec::new()));
 
         for (label, m, fg, warnings) in rows {
             println!(
@@ -1734,7 +1756,7 @@ fn print_the_segment_comparison() {
 /// モデルが無ければ黙って飛ばす。
 #[test]
 fn the_model_trimap_is_not_worse_than_one_made_from_the_truth() {
-    if !segment_ready() {
+    if skip_without_model() {
         return;
     }
     for scene in real_scenes() {
@@ -1754,8 +1776,7 @@ fn the_model_trimap_is_not_worse_than_one_made_from_the_truth() {
                 opts.constraints.as_ref(),
             )
         };
-        let (_, from_model, _, _) =
-            run_segment(&scene).unwrap_or_else(|| panic!("{}: 推論に失敗した", scene.name));
+        let (_, from_model, _, _) = run_segment(&scene);
 
         assert!(
             from_model.contour_error <= with_trimap.contour_error * 1.05 + 0.01,

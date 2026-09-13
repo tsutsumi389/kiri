@@ -42,6 +42,34 @@ fn segment_ready() -> bool {
     cfg!(feature = "segment") && model_present()
 }
 
+/// モデルの想定パス。飛ばした理由を言うときに添える。
+fn expected_model_path() -> String {
+    kiri::segment::model::ISNET
+        .expected_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(置き場所を決められません)".to_string())
+}
+
+/// 飛ばすなら、**どこを見て飛ばしたのかを 1 行だけ言う。**
+///
+/// 黙って `return` すると、モデルを要する検査が 1 本も走っていない機械でも
+/// 出力は「全部緑」と区別が付かない。**「緑だった」と「確かめた」は別**で、
+/// その差は飛ばした側にしか書けない。
+fn skip_without_model() -> bool {
+    if segment_ready() {
+        return false;
+    }
+    if cfg!(feature = "segment") {
+        eprintln!("モデルが無いので飛ばす: {}", expected_model_path());
+    } else {
+        eprintln!(
+            "この build に segment 機能が無いので飛ばす: {}",
+            expected_model_path()
+        );
+    }
+    true
+}
+
 fn fixture() -> (TempDir, std::path::PathBuf) {
     let dir = TempDir::new().unwrap();
     let input = write_png(
@@ -296,6 +324,7 @@ fn verifying_a_176mb_model_finishes_instead_of_spinning_forever() {
     use std::time::{Duration, Instant};
 
     if !model_present() {
+        eprintln!("モデルが無いので飛ばす: {}", expected_model_path());
         return;
     }
     const LIMIT: Duration = Duration::from_secs(30);
@@ -306,19 +335,30 @@ fn verifying_a_176mb_model_finishes_instead_of_spinning_forever() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
+    // **どの枝から抜けても子を残さない。** `try_wait` 自身が失敗したときに
+    // そのまま panic すると、回り続けているかもしれないプロセスを置き去りに
+    // する——この検査が防ごうとしている孤児を、この検査が作ることになる
+    fn reap(child: &mut std::process::Child, reason: String) -> ! {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("{reason}");
+    }
     let status = loop {
-        match child.try_wait().unwrap() {
+        let polled = match child.try_wait() {
+            Ok(polled) => polled,
+            Err(e) => reap(&mut child, format!("子プロセスを見張れなくなった: {e}")),
+        };
+        match polled {
             Some(status) => break status,
-            None if started.elapsed() > LIMIT => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!(
+            None if started.elapsed() > LIMIT => reap(
+                &mut child,
+                format!(
                     "kiri model list が {} 秒で終わらなかった（殺した）。\
                      176MB のダイジェストは 1 秒ほどで出るはずで、\
                      終わらないのは sha256 が回り続けているということ",
                     LIMIT.as_secs()
-                );
-            }
+                ),
+            ),
             None => std::thread::sleep(Duration::from_millis(20)),
         }
     };
@@ -381,7 +421,7 @@ fn the_schema_lists_the_segment_values() {
 /// 同じ画素で重なっている（衝突を数え落としている）。
 #[test]
 fn the_model_places_a_trimap_and_reports_what_it_placed() {
-    if !segment_ready() {
+    if skip_without_model() {
         return;
     }
     let (dir, input) = fixture();
@@ -443,7 +483,7 @@ fn the_model_places_a_trimap_and_reports_what_it_placed() {
 /// という筋の悪い規約になる。
 #[test]
 fn a_user_instruction_beats_the_model_without_an_error() {
-    if !segment_ready() {
+    if skip_without_model() {
         return;
     }
     let (dir, input) = fixture();
@@ -495,7 +535,7 @@ fn a_user_instruction_beats_the_model_without_an_error() {
 /// `info --segment` は主体をモデルから出し、何由来かを名乗る。
 #[test]
 fn info_reports_a_subject_measured_by_the_model() {
-    if !segment_ready() {
+    if skip_without_model() {
         return;
     }
     let (_dir, input) = fixture();
@@ -531,7 +571,7 @@ fn info_reports_a_subject_measured_by_the_model() {
 /// 動いていないこと**を同じ実行の中で確かめる。
 #[test]
 fn running_the_model_does_not_disturb_the_off_path() {
-    if !segment_ready() {
+    if skip_without_model() {
         return;
     }
     let (dir, input) = fixture();
@@ -565,7 +605,7 @@ fn running_the_model_does_not_disturb_the_off_path() {
 /// 同じ入力・同じモデルからは同じバイト列が出る。
 #[test]
 fn the_model_path_is_deterministic() {
-    if !segment_ready() {
+    if skip_without_model() {
         return;
     }
     let (dir, input) = fixture();
@@ -593,7 +633,7 @@ fn the_model_path_is_deterministic() {
 /// `kiri model list` は正しいファイルを「壊れている」と報告し続ける。
 #[test]
 fn the_published_digest_matches_the_file_on_disk() {
-    if !segment_ready() {
+    if skip_without_model() {
         return;
     }
     let v = json_stdout(&kiri().args(["model", "list", "--json"]).output().unwrap());
@@ -621,7 +661,7 @@ fn the_published_digest_matches_the_file_on_disk() {
 #[test]
 #[cfg(feature = "segment")]
 fn the_input_size_is_the_models_to_choose_not_ours() {
-    if !segment_ready() {
+    if skip_without_model() {
         return;
     }
     let halved = kiri::segment::model::KnownModel {
@@ -657,8 +697,7 @@ fn the_input_size_is_the_models_to_choose_not_ours() {
 #[test]
 #[ignore = "計測用。KIRI_SEGMENT_DIR とモデルが無ければ何もしない"]
 fn print_the_preprocessing_comparison() {
-    if !segment_ready() {
-        println!("モデルが無いので何もしない");
+    if skip_without_model() {
         return;
     }
     let Ok(dir) = std::env::var(common::KIRI_SEGMENT_DIR) else {

@@ -292,8 +292,67 @@ pub fn detect_subject(image: &RgbaImage, background: &BackgroundEstimate) -> Opt
     if far_count == 0 {
         return None;
     }
+    hint_from(&small, (full_w, full_h), background, &far, far_count)
+}
 
-    let largest = largest_component(&small, &far, w, h)?;
+/// セグメンテーションモデルの確率マップから主体を求める。
+///
+/// **色の代わりにモデルの確率で「背景でない画素」を決めるだけ**で、面積・
+/// 捕捉率・取りこぼし・信頼度の判定は `detect_subject` とまったく同じものを
+/// 通る。別の物差しで別の `confidence` を作ると、`info --segment` と
+/// `info` の返す `high` が別の意味になり、エージェントは両者を比べられない。
+///
+/// しきい値は 0.5 である。`SEG_FG` / `SEG_BG`（0.9 / 0.1）は「言い切っている
+/// 芯」を採るための値で、**矩形はモデルが前景寄りだと言った範囲まで含めないと
+/// 商品を削る**。bbox は切り抜きの外枠であって確定領域ではない。
+///
+/// `delta_e` と `leftover_ratio` は色から測る（`detect_subject` と同じ）。
+/// 前者は「この矩形の中身は背景と色で見分けられるか」を、後者は「矩形の外に
+/// 何を置き去りにしたか」を問うており、どちらもモデルの自己申告ではなく
+/// 画像そのものに聞くべきものである。
+pub fn detect_subject_from_probability(
+    image: &RgbaImage,
+    background: &BackgroundEstimate,
+    probability: &crate::segment::Probability,
+) -> Option<SubjectHint> {
+    let (full_w, full_h) = (image.width(), image.height());
+    if full_w == 0 || full_h == 0 {
+        return None;
+    }
+    let small = downscale(image)?;
+    let (w, h) = (small.width(), small.height());
+
+    let mut far = vec![false; (w as usize) * (h as usize)];
+    let mut far_count = 0usize;
+    for y in 0..h {
+        for x in 0..w {
+            if probability.at(x, y, w, h) >= 0.5 {
+                far[(y as usize) * (w as usize) + (x as usize)] = true;
+                far_count += 1;
+            }
+        }
+    }
+    if far_count == 0 {
+        return None;
+    }
+    hint_from(&small, (full_w, full_h), background, &far, far_count)
+}
+
+/// 「背景でない画素」の集合から主体候補を組み立てる。
+///
+/// **色で決めたかモデルで決めたかに関わらず、ここから先は同じ。** 判定の
+/// しきい値（面積・捕捉率・取りこぼし）を 2 箇所に置くと、片方だけ較正した
+/// ときに同じ `confidence` が二つの意味を持つ。
+fn hint_from(
+    small: &RgbaImage,
+    full: (u32, u32),
+    background: &BackgroundEstimate,
+    far: &[bool],
+    far_count: usize,
+) -> Option<SubjectHint> {
+    let (full_w, full_h) = full;
+    let (w, h) = (small.width(), small.height());
+    let largest = largest_component(small, far, w, h)?;
 
     let area_ratio = largest.area as f64 / (w as f64 * h as f64);
     let capture_ratio = largest.area as f64 / far_count as f64;
@@ -324,7 +383,7 @@ pub fn detect_subject(image: &RgbaImage, background: &BackgroundEstimate) -> Opt
     // 測定誤差の吸収であって「主体と認めた範囲」ではないため。広げた矩形で
     // 測ると、外に残った塊のふちを 1% ぶん削って小さく見せることになる
     let leftover_ratio = leftover_outside(
-        &small,
+        small,
         background,
         (largest.x1, largest.y1, largest.x2, largest.y2),
     );

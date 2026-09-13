@@ -30,6 +30,22 @@ fn fixture_dir() -> TempDir {
     TempDir::new().unwrap()
 }
 
+/// この build が推論でき、かつモデルのファイルが置いてあるか。
+///
+/// **モデルはリポジトリにも CI にも置かない。** 176MB あり、`--segment` を
+/// 使う利用者だけが取ればよいものである。無ければモデルを要する検査は黙って
+/// 飛ばす——`#[ignore]` を付けて回らない検査にすると、置いてある機械でも
+/// 走らなくなる。
+///
+/// 存在だけを見る（ダイジェストは突き合わせない）。176MB を舐めるのは
+/// `kiri model list` の仕事で、検査の前段で毎回払う費用ではない。
+fn segment_ready() -> bool {
+    cfg!(feature = "segment")
+        && kiri::segment::model::ISNET
+            .expected_path()
+            .is_some_and(|p| p.is_file())
+}
+
 /// 警告に指定の `code` が含まれるか。
 ///
 /// 文言ではなく code で照合する。`warnings` は機械可読な契約であり、
@@ -6131,6 +6147,31 @@ fn every_published_field_exists_in_the_result() {
         "--fg-seed",
         "100,100",
     ]);
+    // **`segment` もモデルが走ったときだけ現れる。** モデルは 176MB あって
+    // リポジトリにも CI にも置かないので、無ければその path だけを飛ばす。
+    // 「配ったが確かめられなかった」と「配ったのに無い」は別で、後者だけを
+    // 落とす
+    let segmented = segment_ready().then(|| {
+        (
+            run(&[
+                "info",
+                input.to_str().unwrap(),
+                "--segment",
+                "isnet",
+                "--json",
+            ]),
+            run(&[
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--dry-run",
+                "--json",
+                "--segment",
+                "isnet",
+            ]),
+        )
+    });
 
     for f in fields_of(&schema_json()) {
         let path = f["path"].as_str().unwrap();
@@ -6141,9 +6182,16 @@ fn every_published_field_exists_in_the_result() {
             .map(|c| c.as_str().unwrap())
             .collect();
         assert!(!commands.is_empty(), "{path} の appears_in が空");
+        if path.starts_with("segment.") && segmented.is_none() {
+            continue;
+        }
 
         for command in commands {
             let report = match command {
+                _ if path.starts_with("segment.") => {
+                    let (info, cutout) = segmented.as_ref().unwrap();
+                    if command == "info" { info } else { cutout }
+                }
                 "info" => &info,
                 "cutout" if path.starts_with("constraints.") => &constrained,
                 "cutout" => &cutout,

@@ -1114,6 +1114,12 @@ pub fn assisted_bbox(truth: &EdgeTruth) -> (u32, u32, u32, u32) {
 /// ためである。綴りを 1 箇所に閉じ込めておけば、文書と実装が離れない。
 pub const KIRI_BENCH_DIR: &str = "KIRI_BENCH_DIR";
 
+/// 前処理の比べもの用に実写を置く場所（`tests/segment.rs`）。
+///
+/// **正解アルファは要らない。** 比べるのは「モデルがどれだけ言い切ったか」で
+/// あって切り抜きの精度ではないので、素の写真だけあればよい。
+pub const KIRI_SEGMENT_DIR: &str = "KIRI_SEGMENT_DIR";
+
 /// `KIRI_BENCH_DIR` に置かれた「実写 + 正解アルファ」の 1 組。
 pub struct ExternalPair {
     pub name: String,

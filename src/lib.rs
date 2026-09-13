@@ -12,6 +12,7 @@ pub mod error;
 pub mod image_io;
 pub mod preview;
 pub mod report;
+pub mod segment;
 pub mod transform;
 pub mod warning;
 

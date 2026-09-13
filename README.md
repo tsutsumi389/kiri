@@ -1310,7 +1310,14 @@ CC BY-NC 4.0 なので採らない。
 | 輪郭の粗さ | 0.8132 | **0.3883** |
 | 境界色差 | 24.57 | 16.63 |
 | 所要時間 | 2.9 秒 | 4.0 秒（うち推論 1.3 秒） |
-| 警告 | `SUBJECT_TOUCHES_EDGE` / `HALO_REMAINS` / `CONTOUR_ROUGH` | `CONTOUR_ROUGH` / `SEGMENT_UNCERTAIN` |
+| 警告 | `BACKGROUND_FIELD_USED` / `LOW_UNIFORMITY` / `SUBJECT_TOUCHES_EDGE` / `HALO_REMAINS` / `CONTOUR_ROUGH` | `BACKGROUND_FIELD_USED` / `LOW_UNIFORMITY` / `CONTOUR_ROUGH` / `SEGMENT_UNCERTAIN` |
+
+**この数値は素材のバイト列に紐づく。** 実写はリポジトリに置かないので、
+どう作ったかを書いておかないと突き合わせられない——**同じ写真でも JPEG の
+品質を変えると輪郭の粗さは 0.3883 と 0.5499 のあいだで動く**。上の表は
+`sips -s format jpeg -s formatOptions 95 IMG_0238.HEIC --out keyboard.jpg`
+（3,808,626 バイト、SHA-256 `f6dd5873…4619`）で作ったファイルの実測である。
+作り方と digest は [docs/design.md 4.12](docs/design.md) に全部書いてある。
 
 **境界色差だけが下がるが、これは悪化ではない。** `off` の側は机を大きく飲んだ
 まま止まっており、その境界は机の中の別の色の切れ目に乗っている。モデルを使うと

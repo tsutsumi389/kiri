@@ -8,7 +8,8 @@ use image::ImageFormat;
 use crate::cli::InfoArgs;
 use crate::commands::output::{background_report, round4, subject_report};
 use crate::cutout::{
-    BackgroundEstimate, LowReason, SubjectHint, bbox_argument, detect_subject, estimate_background,
+    BackgroundEstimate, DeltaEQuantiles, LowReason, ResolvedModel, SubjectHint, analyse_background,
+    bbox_argument,
 };
 use crate::error::Result;
 use crate::image_io::load;
@@ -17,13 +18,31 @@ use crate::warning::{Warning, WarningCode};
 
 pub fn run(args: &InfoArgs) -> Result<InfoReport> {
     let loaded = load::load_with(&args.input, &args.color.to_load_options())?;
-    let background = estimate_background(&loaded.image, args.border);
-    let subject = detect_subject(&loaded.image, &background);
+    // **`cutout` と同じ経路で見立てる。** `info` だけが 1 色で測っていると、
+    // ここで見た数値と切り抜きが使う数値が別物になり、助言に従ったエージェントが
+    // 自分が読んだ世界と違う結果を受け取る
+    let analysis = analyse_background(
+        &loaded.image,
+        args.border,
+        args.background_model,
+        None,
+        None,
+    );
+    let background = &analysis.estimate;
+    let subject = analysis.subject.clone();
 
     let mut warnings = loaded.warnings();
     if !background.is_uniform() {
-        warnings.extend(low_uniformity_warnings(&background, subject.as_ref()));
+        warnings.extend(low_uniformity_warnings(
+            background,
+            &analysis.residual,
+            analysis.model,
+            subject.as_ref(),
+        ));
     }
+    // 場を諦めたことは `info` でも黙らない。`background.model` が `field` を
+    // 求めたのに `flat` と出ている理由は、この 1 行にしか書いていない
+    warnings.extend(analysis.field_skipped.clone());
 
     Ok(InfoReport {
         schema_version: SCHEMA_VERSION,
@@ -38,7 +57,12 @@ pub fn run(args: &InfoArgs) -> Result<InfoReport> {
         color_converted: loaded.color_converted,
         icc_profile: loaded.icc_profile,
         has_alpha: loaded.has_alpha,
-        background: background_report(&background),
+        background: background_report(
+            background,
+            analysis.model,
+            analysis.field.range(),
+            &analysis.residual,
+        ),
         subject: subject.as_ref().map(subject_report),
         warnings,
     })
@@ -58,21 +82,45 @@ pub fn run(args: &InfoArgs) -> Result<InfoReport> {
 /// `subject` として返してよいが、hint で矩形を勧めてはならない。
 fn low_uniformity_warnings(
     background: &BackgroundEstimate,
+    residual: &DeltaEQuantiles,
+    model: ResolvedModel,
     subject: Option<&SubjectHint>,
 ) -> Vec<Warning> {
     let base = Warning::new(
         WarningCode::LowUniformity,
         format!(
-            "背景の均一度が {:.2} と低く、単色背景ではない可能性があります",
-            background.uniformity
+            "背景の均一度が {:.2} と低く、単色背景ではない可能性があります\
+             （1 色に対する外周 ΔE p50 = {:.1}、照明場に対する残差 p50 = {:.1}）",
+            background.uniformity, background.delta_e.p50, residual.p50
         ),
     )
-    .with_data("uniformity", round4(background.uniformity));
+    .with_data("uniformity", round4(background.uniformity))
+    // **低い均一度には 2 つの原因がある。** 単色でないのか、単色に照明が
+    // 乗っているのか。残差が小さければ後者で、照明場モデルが吸える
+    .with_data("residual_p50", round4(residual.p50));
+    // 場が吸える画像であることを、どの枝でも同じ一文で添える。**直す手では
+    // なく、既定で何が起きるかの説明である**——`cutout` は同じ判定で
+    // 照明場モデルへ切り替える。
+    //
+    // **`--background-model flat` を指定されても、既定で何が起きるかを言う。**
+    // ここで測った残差は 1 色に対する分布そのものなので「残差が小さい」は
+    // 成立しないが、`cutout` を既定で呼べば場が効く。指定に引きずられて黙ると、
+    // `info --background-model flat` の助言だけが `cutout` の既定と食い違う
+    let field_note = match model {
+        ResolvedModel::Field if residual.p50 < background.delta_e.p50 => {
+            "。residual.p50 が小さいので、cutout は背景を照明場として推定します"
+        }
+        ResolvedModel::Field => "",
+        // 均一でないのに `flat` ということは、利用者が明示したか、帯の材料が
+        // 痩せて場を諦めたかのどちらかである。後者は
+        // `BACKGROUND_FIELD_SKIPPED` が別に出るので、ここは前者だけを言う
+        ResolvedModel::Flat => "。既定（--background-model auto）では照明場を試します",
+    };
 
     let spread = background.delta_e.p50;
     match subject {
         Some(s) if s.confidence.is_high() && s.delta_e > spread => vec![base.with_hint(format!(
-            "主体を検出しました。--bbox {} --normalized を指定すると背景推定が安定します",
+            "主体を検出しました。--bbox {} --normalized を指定すると背景推定が安定します{field_note}",
             bbox_argument(s.normalized_bbox)
         ))],
         // 主体は見つかったが、その色差が背景自身のばらつきを下回っている。
@@ -81,7 +129,7 @@ fn low_uniformity_warnings(
         // 同じ code を使う。同じことに別名を付けると、エージェントは
         // 二つの失敗があると誤解する
         Some(s) if s.confidence.is_high() => vec![
-            base.with_hint("kiri が対象とするのは単色背景の画像です"),
+            base.with_hint(format!("kiri が対象とするのは単色背景の画像です{field_note}")),
             Warning::new(
                 WarningCode::NotSeparable,
                 format!(
@@ -102,9 +150,9 @@ fn low_uniformity_warnings(
         // 「主体を特定できませんでした（面積 14.1%, 捕捉率 98.1%）」と言うと、
         // 自分が並べた数値と文面が矛盾する。エージェントは次に何を試せばよいか
         // 判断できず、数値のほうを疑い始める
-        Some(s) => vec![base.with_hint(low_confidence_hint(s))],
+        Some(s) => vec![base.with_hint(format!("{}{field_note}", low_confidence_hint(s)))],
         // 主体が 1 つも見つからない = 背景しか写っていない。助言の材料が無い
-        None => vec![base.with_hint("kiri が対象とするのは単色背景の画像です")],
+        None => vec![base.with_hint(format!("kiri が対象とするのは単色背景の画像です{field_note}"))],
     }
 }
 
@@ -153,7 +201,17 @@ fn format_name(format: ImageFormat) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cutout::{Confidence, DeltaEQuantiles, GradientQuantiles};
+    use crate::cutout::{Confidence, GradientQuantiles};
+
+    /// 場に対する残差。既定では 1 色に対する分布と同じ値を渡す
+    /// （1 色モデルではそうなる）
+    fn residual(p50: f64) -> DeltaEQuantiles {
+        DeltaEQuantiles {
+            p50,
+            p90: p50 * 2.0,
+            max: p50 * 3.0,
+        }
+    }
 
     fn background(uniformity: f64, p50: f64) -> BackgroundEstimate {
         BackgroundEstimate {
@@ -201,6 +259,8 @@ mod tests {
     fn a_confident_subject_gets_an_actionable_bbox_hint() {
         let w = low_uniformity_warnings(
             &background(0.201, 11.9),
+            &residual(11.9),
+            ResolvedModel::Field,
             Some(&subject(Confidence::High, 49.6)),
         );
         assert_eq!(codes(&w), ["LOW_UNIFORMITY"]);
@@ -218,6 +278,8 @@ mod tests {
     fn a_subject_dimmer_than_the_background_spread_is_called_hopeless_here_too() {
         let w = low_uniformity_warnings(
             &background(0.20, 30.0),
+            &residual(30.0),
+            ResolvedModel::Field,
             Some(&subject(Confidence::High, 12.1)),
         );
         assert!(codes(&w).contains(&"NOT_SEPARABLE"), "{:?}", codes(&w));
@@ -238,7 +300,12 @@ mod tests {
         s.area_ratio = 0.0035;
         s.capture_ratio = 0.5077;
         s.leftover_ratio = 0.2814;
-        let w = low_uniformity_warnings(&background(0.155, 21.6), Some(&s));
+        let w = low_uniformity_warnings(
+            &background(0.155, 21.6),
+            &residual(21.6),
+            ResolvedModel::Field,
+            Some(&s),
+        );
 
         assert_eq!(codes(&w), ["LOW_UNIFORMITY"], "断定はしない");
         let hint = hint_of(&w, "LOW_UNIFORMITY");
@@ -297,8 +364,44 @@ mod tests {
     /// 主体が 1 つも見つからなければ、今までどおりの一般的な説明に留める。
     #[test]
     fn without_a_subject_the_hint_stays_generic() {
-        let w = low_uniformity_warnings(&background(0.3, 8.0), None);
+        let w = low_uniformity_warnings(
+            &background(0.3, 8.0),
+            &residual(8.0),
+            ResolvedModel::Field,
+            None,
+        );
         assert_eq!(codes(&w), ["LOW_UNIFORMITY"]);
         assert!(!hint_of(&w, "LOW_UNIFORMITY").contains("--bbox"));
+    }
+
+    /// 場が勾配を吸えた画像では、既定で何が起きるかを添える。
+    #[test]
+    fn a_field_that_absorbs_the_gradient_says_so() {
+        let w = low_uniformity_warnings(
+            &background(0.3, 12.0),
+            &residual(2.0),
+            ResolvedModel::Field,
+            None,
+        );
+        let hint = hint_of(&w, "LOW_UNIFORMITY");
+        assert!(hint.contains("照明場として推定します"), "{hint}");
+    }
+
+    /// **`--background-model flat` の助言が `cutout` の既定と食い違わないこと。**
+    ///
+    /// 1 色で測れと言われた `info` は残差を 1 色に対する分布として返すので、
+    /// 「残差が小さい」は成立しない。それでも `cutout` を既定で呼べば場が効く。
+    /// 指定に引きずられて黙ると、この 1 本の `info` だけが別の世界を語る。
+    #[test]
+    fn asking_info_for_one_colour_still_describes_what_the_default_would_do() {
+        let w = low_uniformity_warnings(
+            &background(0.3, 12.0),
+            &residual(12.0),
+            ResolvedModel::Flat,
+            None,
+        );
+        let hint = hint_of(&w, "LOW_UNIFORMITY");
+        assert!(hint.contains("既定"), "{hint}");
+        assert!(hint.contains("照明場"), "{hint}");
     }
 }

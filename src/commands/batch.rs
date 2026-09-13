@@ -6,7 +6,6 @@
 use std::path::Path;
 use std::time::Instant;
 
-use clap::ValueEnum;
 use rayon::prelude::*;
 
 use crate::batch::{self, BatchItem, ItemSettings};
@@ -14,7 +13,7 @@ use crate::cli::{
     BatchArgs, ColorOpts, CutoutArgs, OutputOpts, Polygon, parse_hex_color, parse_size,
 };
 use crate::commands::cutout;
-use crate::cutout::{CutoutOptions, DEFAULT_BORDER, Matting};
+use crate::cutout::{BackgroundModel, CutoutOptions, DEFAULT_BORDER, Matting};
 use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::OutputFormat;
 use crate::report::{BatchItemReport, BatchReport, ErrorBody, SCHEMA_VERSION};
@@ -152,6 +151,11 @@ fn to_cutout_args(
             "smooth_contour",
         )?,
         no_reclassify: !settings.reclassify.unwrap_or(true),
+        background_model: value_enum(
+            settings.background_model.as_deref(),
+            BackgroundModel::Auto,
+            "background_model",
+        )?,
         color: ColorOpts {
             no_color_convert: !settings.color_convert.unwrap_or(true),
         },
@@ -182,24 +186,29 @@ fn to_cutout_args(
 }
 
 /// spec の `matting` を解き方へ落とす。
+fn matting(name: Option<&str>) -> Result<Matting> {
+    value_enum(name, CutoutOptions::default().matting, "matting")
+}
+
+/// spec の文字列を `clap::ValueEnum` の枝へ落とす。
 ///
 /// **綴りを外したら断る。** 未知の値を既定へ落とすと、その項目だけ黙って
-/// 別の解き方で処理され、数百点を回した後に仕上がりを見るまで気づけない。
+/// 別の設定で処理され、数百点を回した後に仕上がりを見るまで気づけない。
 ///
 /// **候補は `clap::ValueEnum` から引く。** 手書きの `match` に catch-all を
-/// 置くと、`Matting` に枝を足したときに spec 側だけが取りこぼす——しかも
-/// コンパイラは何も言わない。CLI と spec が同じ 1 つの列挙を見る。
-fn matting(name: Option<&str>) -> Result<Matting> {
+/// 置くと、列挙に枝を足したときに spec 側だけが取りこぼす——しかもコンパイラは
+/// 何も言わない。CLI と spec が同じ 1 つの列挙を見る。
+fn value_enum<T: clap::ValueEnum + Copy>(name: Option<&str>, default: T, key: &str) -> Result<T> {
     let Some(name) = name else {
-        return Ok(CutoutOptions::default().matting);
+        return Ok(default);
     };
     let known = || -> Vec<String> {
-        Matting::value_variants()
+        T::value_variants()
             .iter()
             .filter_map(|v| v.to_possible_value().map(|p| p.get_name().to_string()))
             .collect()
     };
-    Matting::value_variants()
+    T::value_variants()
         .iter()
         .find(|v| {
             v.to_possible_value()
@@ -209,7 +218,7 @@ fn matting(name: Option<&str>) -> Result<Matting> {
         .ok_or_else(|| {
             Error::new(
                 ErrorCode::SpecInvalid,
-                format!("'{name}' は未対応の matting です"),
+                format!("'{name}' は未対応の {key} です"),
             )
             .with_hint(format!(
                 "{} のいずれかを指定してください",

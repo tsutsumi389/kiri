@@ -69,6 +69,10 @@ warning_catalog! {
         => "縁の色が商品より背景に近い（HALO_REMAINS も出ていれば --tolerance で減る）",
     EdgeThresholdRaised = "EDGE_THRESHOLD_RAISED"
         => "背景のテクスチャに合わせて輪郭の堤防を引き上げた",
+    BackgroundFieldUsed = "BACKGROUND_FIELD_USED"
+        => "背景が均一でないため、1 色ではなく照明場として推定した（直すものは無い）",
+    BackgroundFieldSkipped = "BACKGROUND_FIELD_SKIPPED"
+        => "外周の帯の大半が背景でないため、照明場を諦めて 1 色で測った",
     MaskOrientationIgnored = "MASK_ORIENTATION_IGNORED"
         => "指示の画像が EXIF Orientation を持つが、マスクは生の画素として読むので適用していない",
     ConstraintEmpty = "CONSTRAINT_EMPTY"

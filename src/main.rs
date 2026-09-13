@@ -431,6 +431,15 @@ fn print_perimeter(bg: &BackgroundReport) {
         "  外周ΔE    p50 {:.1}  p90 {:.1}  max {:.1}",
         d.p50, d.p90, d.max
     );
+    // 照明場を使ったときだけ 1 行増やす。1 色なら残差は上の行と同じ値になり、
+    // 同じ数を二通りで見せることにしかならない
+    if bg.model == "field" {
+        let r = &bg.residual;
+        println!(
+            "  場の残差  p50 {:.1}  p90 {:.1}  max {:.1}  (場の振れ幅 ΔE {:.1}〜{:.1})",
+            r.p50, r.p90, r.max, bg.field_range[0], bg.field_range[1]
+        );
+    }
     // 色のばらつき（外周ΔE）と別に出す。両者は別の失敗を予告するためで、
     // ざらつきは tolerance ではなく堤防のほうを狂わせる
     let t = &bg.texture;

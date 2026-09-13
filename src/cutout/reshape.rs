@@ -17,6 +17,7 @@ use std::collections::VecDeque;
 
 use image::RgbaImage;
 
+use crate::cutout::background::BackgroundField;
 use crate::cutout::diagnostics;
 use crate::cutout::local_colour::{self, Lean, LocalColours, Role};
 use crate::cutout::mask::Mask;
@@ -129,7 +130,8 @@ pub(crate) struct Reshape<'a> {
     /// 塗り直す前の二値マスク。累積の上限と、(c) の「フィルが背景と決めた
     /// 画素を形だけで戻さない」判定に使う
     pub original: &'a Mask,
-    pub background: [u8; 3],
+    /// 背景の場。帯の引き直し（`band_map_into`）へそのまま渡す
+    pub field: &'a BackgroundField,
     pub opts: &'a RefineOptions<'a>,
     pub scale: f64,
     pub min_radius: u32,
@@ -206,7 +208,7 @@ impl Reshape<'_> {
             band_map_into(
                 self.image,
                 shape,
-                self.background,
+                self.field,
                 self.min_radius,
                 self.max_radius,
                 self.opts.constraints,

@@ -6,7 +6,7 @@ use std::time::Instant;
 use image::RgbaImage;
 
 use crate::cli::OutputOpts;
-use crate::cutout::{BackgroundEstimate, SubjectHint};
+use crate::cutout::{BackgroundEstimate, DeltaEQuantiles, ResolvedModel, SubjectHint};
 use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::{LoadedImage, OutputFormat, SaveOptions, encode, save};
 use crate::report::{
@@ -83,7 +83,12 @@ pub fn round4(v: f64) -> f64 {
 /// `info` と `cutout` の両方が同じ形を返す約束なので、組み立てを 1 箇所に置く。
 /// 片方にだけ項目を足すと、エージェントは「この画像では測れなかった」のか
 /// 「このコマンドは報告しない」のかを区別できない。
-pub fn background_report(background: &BackgroundEstimate) -> BackgroundReport {
+pub fn background_report(
+    background: &BackgroundEstimate,
+    model: ResolvedModel,
+    field_range: [f64; 2],
+    residual: &DeltaEQuantiles,
+) -> BackgroundReport {
     BackgroundReport {
         rgb: background.rgb,
         uniformity: round4(background.uniformity),
@@ -95,6 +100,13 @@ pub fn background_report(background: &BackgroundEstimate) -> BackgroundReport {
         texture: PerimeterTexture {
             p50: round4(background.texture.p50),
             p90: round4(background.texture.p90),
+        },
+        model: model.as_str(),
+        field_range: field_range.map(round4),
+        residual: PerimeterDeltaE {
+            p50: round4(residual.p50),
+            p90: round4(residual.p90),
+            max: round4(residual.max),
         },
     }
 }

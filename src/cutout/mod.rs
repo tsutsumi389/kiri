@@ -33,7 +33,10 @@ use image::RgbaImage;
 
 use crate::warning::{Warning, WarningCode};
 
-pub use background::{BackgroundEstimate, DEFAULT_BORDER, DeltaEQuantiles, estimate_background};
+pub use background::{
+    BackgroundEstimate, BackgroundField, BackgroundModel, DEFAULT_BORDER, DeltaEQuantiles,
+    ResolvedModel, estimate_background,
+};
 pub use constraints::{Conflict, Constraint, ConstraintSource, Constraints};
 pub use diagnostics::Diagnostics;
 pub use edges::GradientQuantiles;
@@ -137,6 +140,8 @@ pub struct CutoutOptions {
     pub smooth_contour: f64,
     /// 帯の中の二値画素を局所の色で塗り直すか
     pub reclassify: bool,
+    /// 背景を 1 色で持つか、照明場として持つか
+    pub background_model: BackgroundModel,
 }
 
 impl Default for CutoutOptions {
@@ -178,8 +183,167 @@ impl Default for CutoutOptions {
             matting: Matting::Guided,
             smooth_contour: DEFAULT_SMOOTH_CONTOUR,
             reclassify: true,
+            // 均一な背景では 1 色のまま。場を常に使うと、解けている画像の数値が
+            // 微妙に動いて「何が原因の差か」が分からなくなる
+            background_model: BackgroundModel::Auto,
         }
     }
+}
+
+/// 背景の見立て一式。
+///
+/// **`info` と `cutout` は同じ経路でこれを作る。** 片方だけがモデルを切り替え
+/// たり主体の測り方が違ったりすると、`info` の助言に従って `cutout` を呼んだ
+/// エージェントが、自分が見た数値と違う世界で切り抜かれることになる。
+pub struct BackgroundAnalysis {
+    /// 外周の中央値 1 色と、それに対する分布。**場を入れても意味を変えない**
+    pub estimate: BackgroundEstimate,
+    /// 実際に使う背景。1 色モデルでは「全画素で同じ値を返す場」
+    pub field: BackgroundField,
+    /// 実際に効いたモデル
+    pub model: ResolvedModel,
+    /// 外周サンプルの**場に対する** ΔE 分布。1 色モデルでは
+    /// `estimate.delta_e` と同じ値になる
+    pub residual: DeltaEQuantiles,
+    /// 主体候補。**1 色の背景に対して測る**（上の `analyse_background` を参照）
+    pub subject: Option<SubjectHint>,
+    /// `auto` が場を選んだことの報告。**`cutout` だけが出す**——明示指定には
+    /// 付かず、`info` も出さない。切り抜いていない `info` で「場を使いました」と
+    /// 報せても、使った結果がどこにも無い
+    pub field_warning: Option<Warning>,
+    /// 場を作ろうとして諦めたことの報告。**`info` も出す**——`background.model`
+    /// が求めたモデルと違う理由は、この 1 行にしか書いていない
+    pub field_skipped: Option<Warning>,
+}
+
+/// 背景色・照明場・主体を 1 度に見立てる。
+///
+/// 場の推定は「ここは背景だ」と言い切れる画素だけから作る。商品の画素が混ざると、
+/// 商品の真上の背景色が商品の色へ寄り、そこだけ商品が背景と判定されてしまう。
+/// 材料は 4 つ——外周の帯、`--bbox` の外側、確定背景、そして**信頼度 High の
+/// 主体の矩形の外側**である。
+///
+/// # 主体は 1 色の背景に対して測る
+///
+/// 設計では「背景から遠い」も場に対して測るつもりだった。照明の暗い側を主体と
+/// 取り違える誤検出が減るはずだったが、**較正表（13 シーン）で 2 件が裏返った。**
+///
+/// | シーン | 1 色 | 場 | 正しい判定 |
+/// |---|---|---|---|
+/// | 画面の 4 割を占める物体だけ | low | **high** | low |
+/// | 暗い机の上のキーボード（実写） | low | **high** | low |
+///
+/// どちらも**商品が外周の帯を大きく占める**画像である。場は帯から作るので、
+/// そこで商品の色を「背景」として学んでしまう。すると商品は背景と一致し、
+/// 残った別のもの（2 色の境目の帯、机の映り込み）が「まとまった主体」に見えて
+/// `high` で返る。`leftover_ratio` はこれを弾けない——取りこぼした物体は
+/// 場の上では背景なので、外に何も残らないからである。
+///
+/// **1 色モデルの p90 が汚染される問題と同じ形だが、防ぎ方が効かなくなる。**
+/// 閾値だけを 1 色の分布に戻す案も試したが、今度は織り目の上の汚染シーンが
+/// 裏返った（low → high）。場の側に手を入れて両方を通す形は見つからなかったので、
+/// **主体の検出は 1 色の背景に対して行う**ことにした。場は切り抜き
+/// （フィルと境界処理）にだけ効かせる。
+pub fn analyse_background(
+    image: &RgbaImage,
+    border: u32,
+    model: BackgroundModel,
+    bbox: Option<(u32, u32, u32, u32)>,
+    constraints: Option<&Constraints>,
+) -> BackgroundAnalysis {
+    let estimate = estimate_background(image, border);
+    let resolved = model.resolve(&estimate);
+    let subject = detect_subject(image, &estimate);
+
+    if resolved == ResolvedModel::Flat {
+        let field = BackgroundField::flat(estimate.rgb);
+        return BackgroundAnalysis {
+            residual: estimate.delta_e,
+            estimate,
+            field,
+            model: resolved,
+            subject,
+            field_warning: None,
+            field_skipped: None,
+        };
+    }
+
+    let (w, h) = (image.width(), image.height());
+    let known = background::KnownBackground {
+        band: background::field_band(image, border),
+        outside_bbox: bbox,
+        outside_subject: subject
+            .as_ref()
+            .filter(|s| s.confidence.is_high())
+            .map(|s| background::widen_subject(s.bbox, w, h)),
+        constraints,
+        filled: None,
+    };
+    let built = background::estimate_field(image, &estimate, &known);
+    // **場を作れなかったなら、場を名乗らない。** 帯の大半が門に弾かれた
+    // （＝帯のほとんどが商品だった）ときは 1 色へ落ち、明示指定であっても
+    // 効いたモデルは `flat` として報せる——効いた値だけを報告する規約である
+    if built.field.is_flat() {
+        return BackgroundAnalysis {
+            residual: estimate.delta_e,
+            estimate,
+            field: built.field,
+            model: ResolvedModel::Flat,
+            subject,
+            field_warning: None,
+            field_skipped: Some(field_skipped(built.band_material)),
+        };
+    }
+    let field = built.field;
+    let residual = background::perimeter_residual(image, border, &estimate, &field);
+    let field_warning = (model == BackgroundModel::Auto).then(|| field_used(&field, &residual));
+
+    BackgroundAnalysis {
+        estimate,
+        field,
+        model: resolved,
+        residual,
+        subject,
+        field_warning,
+        field_skipped: None,
+    }
+}
+
+/// 場を使ったことを知らせる。**hint は無い。**
+///
+/// 既定で正しく動いた報告であって、直すものは無い。`EDGE_THRESHOLD_RAISED` と
+/// 同じ位置づけで、`--background-model flat` へ戻す道は `--help` にある。
+fn field_used(field: &BackgroundField, residual: &DeltaEQuantiles) -> Warning {
+    let range = field.range();
+    Warning::new(
+        WarningCode::BackgroundFieldUsed,
+        format!(
+            "背景が均一でないため、背景を 1 色ではなく照明場として推定しました\
+             （場の振れ幅 ΔE {:.1}〜{:.1}、場に対する外周残差 p50 = {:.1} / p90 = {:.1}）",
+            range[0], range[1], residual.p50, residual.p90
+        ),
+    )
+    .with_data("field_range", range.map(round1).to_vec())
+    .with_data("residual_p50", round1(residual.p50))
+    .with_data("residual_p90", round1(residual.p90))
+}
+
+/// 場を作ろうとしてやめたことを知らせる。**hint は無い。**
+///
+/// 直す手は無い——帯の大半が商品である構図で場を作れないのは素材の話であり、
+/// 1 色へ落ちたことは失敗ではない。`--bbox` や `--trimap` で「ここから外は
+/// 背景」を教えれば材料は増えるが、それは場のための助言ではなく切り抜き
+/// そのものの助言なので、他の警告（`BBOX_RECOMMENDED`）の仕事である。
+fn field_skipped(band_material: f64) -> Warning {
+    Warning::new(
+        WarningCode::BackgroundFieldSkipped,
+        format!(
+            "外周の帯のうち背景として使えたのが {:.0}% しかないため、照明場を諦めて\
+             背景を 1 色で測りました",
+            band_material * 100.0
+        ),
+    )
+    .with_data("band_material", round4(band_material))
 }
 
 pub struct CutoutResult {
@@ -187,6 +351,12 @@ pub struct CutoutResult {
     pub image: RgbaImage,
     pub mask: Mask,
     pub background: BackgroundEstimate,
+    /// 実際に効いた背景のモデル
+    pub background_model: ResolvedModel,
+    /// 場が大域の 1 色からどれだけ離れているかの [最小, 最大] ΔE
+    pub field_range: [f64; 2],
+    /// 外周サンプルの場に対する ΔE 分布
+    pub residual: DeltaEQuantiles,
     /// 実際に効いた堤防のしきい値。自動調整が入ると指定値と食い違うため、
     /// 呼び出し側が「何が効いたか」を報告できるように返す
     pub edge_threshold: f64,
@@ -290,10 +460,24 @@ fn resolve_edge_threshold(
 }
 
 pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
-    let background = estimate_background(image, opts.border);
     // 元画像から測る。アルファを適用した後の画像を渡すと、透明になった背景が
     // 「背景色から遠い」に化けて主体が画像全体へ広がる
-    let subject = detect_subject(image, &background);
+    let analysis = analyse_background(
+        image,
+        opts.border,
+        opts.background_model,
+        opts.bbox,
+        opts.constraints.as_ref(),
+    );
+    let BackgroundAnalysis {
+        estimate: background,
+        mut field,
+        model,
+        mut residual,
+        subject,
+        field_warning,
+        field_skipped,
+    } = analysis;
     let (edge_threshold, texture_warning) =
         resolve_edge_threshold(opts.edge_threshold, &background.texture);
 
@@ -304,14 +488,30 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
         constraints: opts.constraints.as_ref(),
         edge_threshold,
         // 芯の許容量は利用者に決めさせず、背景自身のばらつきから導く。
-        // 「どこまでを背景と言い切れるか」は画像ごとに違い、外周の ΔE 分布が
-        // その答えを持っているためである
-        core_tolerance: floodfill::core_tolerance(opts.tolerance, background.delta_e.p90),
+        // 「どこまでを背景と言い切れるか」は画像ごとに違い、場に対する
+        // 外周残差の分布がその答えを持っているためである
+        core_tolerance: floodfill::core_tolerance(opts.tolerance, residual.p90),
         step_tolerance: opts.step_tolerance,
         shadow_tolerance: opts.shadow_tolerance,
         seal: opts.seal,
     };
-    let mut mask = foreground_mask(image, background.rgb, &flood);
+    let mut mask = foreground_mask(image, &field, &flood);
+
+    // **2 回目のパス。** 1 回目のフィルが背景と判定した画素をすべて「既知の
+    // 背景」に加えて場を作り直し、もう一度フィルする。外周の帯と矩形の外側
+    // だけでは、商品が中央を大きく占める画像で場の内側がほとんど外挿になる。
+    // 1 回目の背景はその外挿を実測で置き換える材料そのものである。
+    //
+    // 1 色モデルでは走らせない。場が無いのだから作り直すものも無い
+    if model == ResolvedModel::Field {
+        if let Some((again, next_field, next_residual)) =
+            second_pass(image, &background, &mask, opts, &flood)
+        {
+            mask = again;
+            field = next_field;
+            residual = next_residual;
+        }
+    }
 
     // 孤立ノイズは面積で落とす。オープニングは幅で落とすため、ストラップや
     // ケーブルのような細い商品の一部まで巻き添えにしていた。
@@ -327,7 +527,7 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
         let refined = refine::refine(
             image,
             &mask,
-            background.rgb,
+            &field,
             &RefineOptions {
                 feather: opts.feather,
                 despill: opts.despill,
@@ -350,7 +550,7 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
         mask = feather::feather(&mask, opts.feather);
         let mut out = image.clone();
         if opts.despill {
-            despill::despill(&mut out, &mask, background.rgb);
+            despill::despill(&mut out, &mask, &field);
         }
         out
     };
@@ -377,7 +577,7 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
     let separability = boundary_separability(
         image,
         &mask,
-        background.rgb,
+        &field,
         inset,
         opts.bbox,
         opts.constraints.as_ref(),
@@ -386,8 +586,11 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
     // 設定の調整はいちばん先に伝える。結果への警告は、その設定で走った結果に
     // ついてのものなので、順序が逆だと読み手が原因を後から知ることになる
     let mut warnings = Vec::from_iter(texture_warning);
+    warnings.extend(field_warning);
+    warnings.extend(field_skipped);
     warnings.extend(collect_warnings(
         &background,
+        &residual,
         &stats,
         separability,
         &diagnostics,
@@ -399,6 +602,9 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
         image: out,
         mask,
         background,
+        background_model: model,
+        field_range: field.range(),
+        residual,
         edge_threshold,
         band_min_radius,
         smooth_radius_px,
@@ -408,6 +614,49 @@ pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
         subject,
         warnings,
     }
+}
+
+/// 1 回目のフィルの結果を材料に場を作り直し、もう一度フィルする。
+///
+/// 戻すのは新しいマスクと、新しい場、そして新しい残差である。芯の許容量は
+/// 残差から導くので、場を作り直したら許容量も引き直さなければ辻褄が合わない。
+///
+/// **1 回目の結果を「背景」として信じてよい理由**は、フィルが外周からの連結性で
+/// しか背景を広げないことにある。商品の内部が背景と判定されることは（輪郭が
+/// 破れていない限り）ない。破れた場合でも、その画素は商品の色をしているので
+/// セルの中央値までは動かせない。
+fn second_pass(
+    image: &RgbaImage,
+    background: &BackgroundEstimate,
+    mask: &Mask,
+    opts: &CutoutOptions,
+    flood: &FloodOptions<'_>,
+) -> Option<(Mask, BackgroundField, DeltaEQuantiles)> {
+    let field = {
+        // 1 画素 1 バイトの表は 20MP で 20MB ある。場を作り終えたら手放す
+        let filled: Vec<bool> = mask.as_slice().iter().map(|&v| v < 128).collect();
+        let known = background::KnownBackground {
+            band: background::field_band(image, opts.border),
+            outside_bbox: opts.bbox,
+            // 主体の矩形はもう要らない。1 回目のフィルが「どこが背景か」を
+            // 矩形よりはるかに細かく答えている
+            outside_subject: None,
+            constraints: opts.constraints.as_ref(),
+            filled: Some(&filled),
+        };
+        background::estimate_field(image, background, &known).field
+    };
+    // 作り直せなかったなら 1 回目のまま進む。**ここで 1 色へ落とすと、
+    // 効いたモデル（`field`）と実際に使った場が食い違う。** 門は 1 回目と
+    // 同じ帯・同じしきい値なので、通常はここへ来ない
+    if field.is_flat() {
+        return None;
+    }
+    let residual = background::perimeter_residual(image, opts.border, background, &field);
+    let mut flood = flood.clone();
+    flood.core_tolerance = floodfill::core_tolerance(opts.tolerance, residual.p90);
+    let mask = foreground_mask(image, &field, &flood);
+    Some((mask, field, residual))
 }
 
 /// 確定前景（`--fg-seed` の円を含む）を不透明へ塗り戻す。
@@ -478,10 +727,21 @@ fn restore_forced_foreground(mask: &mut Mask, opts: &CutoutOptions) {
 /// 厳密一致（両側とも指示）にしていた頃は、refine と feather で境界が 1px
 /// 動くだけで除外が素通りし、契約が禁じた 0.0 を返していた——`null_means` は
 /// 「測れる境界が無かった。0 ではない」と言っているのに、である。
+///
+/// # 効いたモデルで測る
+///
+/// 色差は**その場の背景色**との差で測る。1 色で測っていた頃は、場でフィルして
+/// 直っていない切り抜き（実写キーボード: 前景比率 0.647、外周接触）の値が
+/// 15.6 → 31.7 へ跳ね、`NOT_SEPARABLE`（「調整では無駄」の信号）が消えていた。
+/// **分子だけを新しいモデルに乗せ替えたのが原因である。** 比較先（`residual`）
+/// も場に対する分布なので、分子もそこへ揃える。
+///
+/// `flat` の場では `rgb_at` が大域の 1 色を返すので、1 色で測っていた頃と
+/// 1 ビットも変わらない。
 pub fn boundary_separability(
     image: &RgbaImage,
     mask: &Mask,
-    bg: [u8; 3],
+    field: &BackgroundField,
     inset: u32,
     bbox: Option<(u32, u32, u32, u32)>,
     constraints: Option<&Constraints>,
@@ -492,7 +752,9 @@ pub fn boundary_separability(
         return None;
     }
 
-    let bg_lab = crate::color::lab::srgb_to_lab(bg);
+    // 1 色の場では毎回同じ値になる。**呼び出しごとに作り直さない**——
+    // 8bit へ戻して測り直すと、1 色で測っていた頃と丸めが 1 つずれる
+    let flat_lab = crate::color::lab::srgb_to_lab(field.rgb());
     let inside = |x: i64, y: i64| -> bool {
         if x < 0 || y < 0 || (x as u32) >= w || (y as u32) >= h {
             return false;
@@ -517,6 +779,10 @@ pub fn boundary_separability(
     };
     let delta_at = |x: u32, y: u32| -> f64 {
         let p = image.get_pixel(x, y).0;
+        let bg_lab = match field.lab_at(x, y) {
+            Some(lab) => lab.map(f64::from),
+            None => flat_lab,
+        };
         crate::color::lab::delta_e76(crate::color::lab::srgb_to_lab([p[0], p[1], p[2]]), bg_lab)
     };
     let depth = i64::from(inset.max(1));
@@ -587,8 +853,10 @@ pub fn bbox_argument(bbox: [f64; 4]) -> String {
 ///
 /// どの警告も機械可読な `code` を持ち、判断に使った数値を `data` に載せる。
 /// 文言は推敲で変わるが、code と data のキーは契約として動かさない。
+#[allow(clippy::too_many_arguments)]
 fn collect_warnings(
     background: &BackgroundEstimate,
+    residual: &DeltaEQuantiles,
     stats: &MaskStats,
     separability: Option<f64>,
     diagnostics: &Diagnostics,
@@ -768,10 +1036,19 @@ fn collect_warnings(
     // 全部消えた）状態では「境界」が切り抜きの輪郭を表しておらず、測っても
     // 意味がないためである。実際、布の上のリモコンで tolerance が低すぎた際に
     // 「tolerance を上げてください」と「調整では改善しません」が同時に出た。
+    //
+    // **分子と分母は同じモデルで測る。** `separability` は効いた背景（1 色なら
+    // 1 色、場なら場）との色差なので、比べる相手も同じ背景に対する分布——
+    // `residual` でなければならない。1 色モデルでは `residual` は
+    // `perimeter_delta_e` と定義から一致するので、ここは何も変わらない。
+    //
+    // 揃えていなかった頃は、場でフィルしても直っていない実写（キーボード:
+    // 前景比率 0.647、外周接触）で分子だけが 15.6 → 31.7 へ跳ね、分母が
+    // 1 色のままだったせいで「調整では無駄」の信号が消えていた。
     let cut_happened = stats.foreground_ratio > MIN_FOREGROUND_RATIO
         && stats.foreground_ratio < MAX_FOREGROUND_RATIO;
     if let Some(sep) = separability {
-        let spread = background.delta_e.p50;
+        let spread = residual.p50;
         if cut_happened && sep < spread {
             warnings.push(
                 Warning::new(
@@ -784,7 +1061,7 @@ fn collect_warnings(
                 )
                 .with_hint("パラメータ調整では解決しません。単色背景で撮り直してください")
                 .with_data("separability", round1(sep))
-                .with_data("perimeter_delta_e_p50", round1(spread)),
+                .with_data("residual_p50", round1(spread)),
             );
         }
     }
@@ -850,7 +1127,15 @@ mod tests {
     #[test]
     fn a_dark_product_on_a_light_background_separates_clearly() {
         let (image, mask) = scene([250, 250, 250], [40, 40, 40]);
-        let sep = boundary_separability(&image, &mask, [250, 250, 250], 7, None, None).unwrap();
+        let sep = boundary_separability(
+            &image,
+            &mask,
+            &BackgroundField::flat([250, 250, 250]),
+            7,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(sep > 60.0, "明暗が離れていれば大きな値になる: {sep}");
     }
 
@@ -858,7 +1143,15 @@ mod tests {
     fn a_product_the_same_colour_as_the_background_does_not_separate() {
         // 今回の実写がこれ。輪郭は色の違いではなくフィルの停止位置で決まっている
         let (image, mask) = scene([84, 78, 70], [86, 80, 72]);
-        let sep = boundary_separability(&image, &mask, [84, 78, 70], 7, None, None).unwrap();
+        let sep = boundary_separability(
+            &image,
+            &mask,
+            &BackgroundField::flat([84, 78, 70]),
+            7,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(sep < 5.0, "ほぼ同色なら小さな値になる: {sep}");
     }
 
@@ -882,7 +1175,9 @@ mod tests {
                     mask.set(x, y, 255);
                 }
             }
-            let sep = boundary_separability(&image, &mask, bg, 7, None, None).unwrap();
+            let sep =
+                boundary_separability(&image, &mask, &BackgroundField::flat(bg), 7, None, None)
+                    .unwrap();
             assert!(sep > 60.0, "縁 {rim}px でも商品との色差を捉えるべき: {sep}");
         }
     }
@@ -903,10 +1198,20 @@ mod tests {
         }
 
         // bbox を伝えなければ、矩形の辺を色の輪郭と誤認して値を返す
-        assert!(boundary_separability(&image, &mask, bg, 7, None, None).is_some());
+        assert!(
+            boundary_separability(&image, &mask, &BackgroundField::flat(bg), 7, None, None)
+                .is_some()
+        );
         // 伝えれば、色から引かれた輪郭が1つも無いと分かる
         assert_eq!(
-            boundary_separability(&image, &mask, bg, 7, Some((10, 10, 30, 30)), None),
+            boundary_separability(
+                &image,
+                &mask,
+                &BackgroundField::flat(bg),
+                7,
+                Some((10, 10, 30, 30)),
+                None
+            ),
             None
         );
     }
@@ -918,7 +1223,7 @@ mod tests {
         let mut mask = Mask::new(10, 10, 0);
         mask.set(5, 5, 255);
         assert_eq!(
-            boundary_separability(&image, &mask, [0; 3], 7, None, None),
+            boundary_separability(&image, &mask, &BackgroundField::flat([0; 3]), 7, None, None),
             None
         );
     }
@@ -927,7 +1232,14 @@ mod tests {
     fn separability_is_none_without_a_boundary() {
         let image = RgbaImage::from_pixel(10, 10, Rgba([0, 0, 0, 255]));
         assert_eq!(
-            boundary_separability(&image, &Mask::new(10, 10, 0), [0; 3], 7, None, None),
+            boundary_separability(
+                &image,
+                &Mask::new(10, 10, 0),
+                &BackgroundField::flat([0; 3]),
+                7,
+                None,
+                None
+            ),
             None
         );
     }
@@ -939,7 +1251,14 @@ mod tests {
         let image = RgbaImage::from_pixel(10, 10, Rgba([255, 255, 255, 255]));
         let mask = Mask::new(10, 10, 255);
         assert_eq!(
-            boundary_separability(&image, &mask, [255, 255, 255], 7, None, None),
+            boundary_separability(
+                &image,
+                &mask,
+                &BackgroundField::flat([255, 255, 255]),
+                7,
+                None,
+                None
+            ),
             None
         );
     }
@@ -1010,6 +1329,28 @@ mod tests {
         }
     }
 
+    /// 1 色モデルでの警告。**残差は 1 色に対する分布と定義から一致する**ので、
+    /// 場を持たない検査はここを通す。分子と分母を揃えたことの検査だけが
+    /// `collect_warnings` を直に呼ぶ
+    fn flat_warnings(
+        background: &BackgroundEstimate,
+        stats: &MaskStats,
+        separability: Option<f64>,
+        diagnostics: &Diagnostics,
+        subject: Option<&SubjectHint>,
+        bbox_given: bool,
+    ) -> Vec<Warning> {
+        collect_warnings(
+            background,
+            &background.delta_e,
+            stats,
+            separability,
+            diagnostics,
+            subject,
+            bbox_given,
+        )
+    }
+
     fn codes(warnings: &[Warning]) -> Vec<&str> {
         warnings.iter().map(|w| w.code.as_str()).collect()
     }
@@ -1022,7 +1363,7 @@ mod tests {
     /// SUBJECT_TOUCHES_EDGE の仕組みが死んでもテストは通り続ける。
     #[test]
     fn a_non_uniform_background_without_a_bbox_recommends_one_instead_of_crying_crop() {
-        let warnings = collect_warnings(
+        let warnings = flat_warnings(
             &estimate(0.20, 11.9),
             &edge_stats(),
             Some(60.0),
@@ -1058,7 +1399,7 @@ mod tests {
     /// エージェントにとって行き止まりと変わらない。
     #[test]
     fn a_remaining_rim_says_which_knob_to_turn() {
-        let warnings = collect_warnings(
+        let warnings = flat_warnings(
             &estimate(0.20, 11.9),
             &stats(),
             Some(60.0),
@@ -1097,7 +1438,7 @@ mod tests {
             bbox: Some((180, 180, 419, 419)),
             touches_edge: false,
         };
-        let warnings = collect_warnings(
+        let warnings = flat_warnings(
             &estimate(0.24, 10.2),
             &clean_cut,
             Some(76.4),
@@ -1116,7 +1457,7 @@ mod tests {
     /// 対照その 1：bbox を与えたうえで外周に接しているなら、本当に見切れている。
     #[test]
     fn a_product_cropped_by_the_frame_is_still_reported_as_such() {
-        let warnings = collect_warnings(
+        let warnings = flat_warnings(
             &estimate(0.20, 11.9),
             &edge_stats(),
             Some(60.0),
@@ -1135,7 +1476,7 @@ mod tests {
     /// 対照その 2：均一な背景で外周に接しているのは、正真正銘の見切れである。
     #[test]
     fn a_uniform_background_touching_the_edge_is_a_real_crop() {
-        let warnings = collect_warnings(
+        let warnings = flat_warnings(
             &estimate(1.0, 0.5),
             &edge_stats(),
             Some(60.0),
@@ -1154,7 +1495,7 @@ mod tests {
     /// 右端の 0.4%」へ誘導してしまう。**誤った助言は助言が無いより悪い。**
     #[test]
     fn a_low_confidence_subject_never_produces_a_bbox_hint() {
-        let warnings = collect_warnings(
+        let warnings = flat_warnings(
             &estimate(0.16, 21.6),
             &edge_stats(),
             Some(60.0),
@@ -1170,7 +1511,7 @@ mod tests {
     #[test]
     fn a_hopeless_image_is_called_out() {
         // 実写のキーボードがこれ。商品が、背景が背景自身と違う量より背景に近い
-        let warnings = collect_warnings(
+        let warnings = flat_warnings(
             &estimate(0.16, 20.0),
             &stats(),
             Some(12.1),
@@ -1194,7 +1535,7 @@ mod tests {
             bbox: Some((0, 0, 10, 10)),
             touches_edge: true,
         };
-        let warnings = collect_warnings(
+        let warnings = flat_warnings(
             &estimate(0.21, 11.9),
             &stats,
             Some(11.5),
@@ -1212,7 +1553,7 @@ mod tests {
     fn a_white_product_on_a_uniform_white_background_is_not_called_out() {
         // README の看板ケース。均一な背景では輪郭検出で正しく解けるため、
         // 境界の色差が小さくても失敗ではない
-        let warnings = collect_warnings(
+        let warnings = flat_warnings(
             &estimate(1.0, 0.8),
             &stats(),
             Some(3.0),
@@ -1229,7 +1570,7 @@ mod tests {
     #[test]
     fn a_patchy_background_with_a_distinct_product_is_not_called_out() {
         // 背景が汚れていても商品がはっきり違うなら、tolerance を上げれば解ける
-        let warnings = collect_warnings(
+        let warnings = flat_warnings(
             &estimate(0.5, 15.0),
             &stats(),
             Some(60.0),

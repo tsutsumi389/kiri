@@ -13,7 +13,7 @@ use crate::cli::{
     BatchArgs, ColorOpts, CutoutArgs, OutputOpts, Polygon, SegmentOpts, parse_hex_color, parse_size,
 };
 use crate::commands::cutout;
-use crate::cutout::{BackgroundModel, CutoutOptions, DEFAULT_BORDER, Matting};
+use crate::cutout::{BackgroundModel, CutoutOptions, DEFAULT_BORDER, Matting, OptimizeFixed};
 use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::OutputFormat;
 use crate::report::{BatchItemReport, BatchReport, ErrorBody, SCHEMA_VERSION};
@@ -156,6 +156,14 @@ fn to_cutout_args(
             BackgroundModel::Auto,
             "background_model",
         )?,
+        optimize: settings.optimize.unwrap_or(false),
+        // spec では `Some` がそのまま「明示した」である。CLI 側が clap の
+        // `ValueSource` を見て解いているのと同じ問いに、JSON では素直に答えられる
+        fixed: OptimizeFixed {
+            tolerance: settings.tolerance.is_some(),
+            bbox: settings.bbox.is_some(),
+            background_model: settings.background_model.is_some(),
+        },
         color: ColorOpts {
             no_color_convert: !settings.color_convert.unwrap_or(true),
         },

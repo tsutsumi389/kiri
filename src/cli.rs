@@ -9,7 +9,7 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::cutout::background::DEFAULT_BORDER;
 use crate::cutout::constraints::{MASK_THRESHOLD, TRIMAP_BACKGROUND, TRIMAP_FOREGROUND};
-use crate::cutout::{BackgroundModel, DEFAULT_EDGE_THRESHOLD, Matting};
+use crate::cutout::{BackgroundModel, DEFAULT_EDGE_THRESHOLD, Matting, OptimizeFixed};
 use crate::image_io::OutputFormat;
 use crate::preview::DEFAULT_PANEL;
 use crate::segment::SegmentMode;
@@ -364,6 +364,41 @@ fn edge_threshold_long_help() -> String {
     )
 }
 
+/// `--optimize` の長いヘルプ。候補の数と縮小の寸法は定数から組む。
+///
+/// **AI エージェントは `--help` を読んで判断する**ので、「何を試すか」「明示した
+/// 値は探索されない」「時間が何倍になるか」の 3 つをここで言う。どれも指定の前に
+/// 知っていないと選びようがない。
+fn optimize_long_help() -> String {
+    use crate::cutout::optimize::{FINALISTS, SEARCH_LONG_EDGE, SEARCH_TOLERANCES};
+    let tolerances: Vec<String> = SEARCH_TOLERANCES
+        .iter()
+        .map(|t| format!("{t:.0}"))
+        .collect();
+    format!(
+        "tolerance / bbox / background-model の組を kiri 自身が総当たりして、指標で選ぶ\
+         （既定 off）。\n\
+         試すのは tolerance {} × bbox「無し / subject.normalized_bbox」× \
+         background-model「auto / flat」の最大 {} 通り。\
+         主体の信頼度が low なら bbox は「無し」だけ、auto が 1 色を選んだ画像では \
+         background-model も 1 通りになる。\n\
+         **明示した値は探索しない。** --tolerance 30 --optimize は「30 に固定して\
+         残りの軸を探す」の意味になる。--cleanup や --feather のような他のノブは\
+         全候補へ同じものを渡す。\n\
+         長辺 {SEARCH_LONG_EDGE}px へ縮めた画像で全候補を境界処理抜きに回し、\
+         上位 {FINALISTS} つだけを原寸で回す。致命的な警告も品質の警告も出ない\
+         候補に当たった時点で打ち切るので、多くの画像では原寸は 1 回で済む\
+         （24.5MP で 10 秒台）。\n\
+         試した全候補とその指標は結果 JSON の optimize.candidates[] に、\
+         選ばれた設定は optimize.chosen と settings に出る。2 位のほうが目的に\
+         合うなら、その候補の値を明示指定へ写せばよい。\n\
+         どの候補にも致命的な警告が残ったら {} で報せる。",
+        tolerances.join(" / "),
+        2 * SEARCH_TOLERANCES.len() * 2,
+        crate::warning::WarningCode::OptimizeNoCleanCandidate.as_str(),
+    )
+}
+
 /// `--trimap` のヘルプ。しきい値は `constraints.rs` の定数から組む。
 ///
 /// `edge_threshold_help` と同じ理由で直書きしない。**AI エージェントは
@@ -707,6 +742,24 @@ pub struct CutoutArgs {
     /// 淡い色の商品で新方式が不安定なときの逃げ道
     #[arg(long)]
     pub no_refine: bool,
+
+    /// tolerance / bbox / background-model の組を kiri 自身が総当たりして指標で選ぶ（既定 off）
+    ///
+    /// ヘルプの本文は `optimize_long_help` が定数から組む。試す数と時間は
+    /// 指定の前に知っていないと選びようがない
+    #[arg(long, long_help = optimize_long_help())]
+    pub optimize: bool,
+
+    /// 利用者が明示した軸。**引数ではない**——`main.rs` が clap の
+    /// `ValueSource` を見て埋める。
+    ///
+    /// `--tolerance` は `default_value_t` を持つので、値だけでは「12 を明示した」と
+    /// 「既定のまま」を区別できない。既定値を `Option` にして区別する手もあるが、
+    /// それをやると `kiri schema` の `default` から 12 が消え、**指定しなくても
+    /// 何が効くのかをエージェントが読めなくなる**。表示は変えずに、明示したか
+    /// どうかだけを別経路で運ぶ
+    #[arg(skip)]
+    pub fixed: OptimizeFixed,
 
     /// 切り抜いた商品を指定サイズのキャンバス中央に配置する
     ///

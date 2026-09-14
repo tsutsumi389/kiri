@@ -6,12 +6,13 @@
 
 use std::process::ExitCode;
 
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{ArgMatches, CommandFactory, Error as ClapError, FromArgMatches};
 use serde::Serialize;
 
 use kiri::cli::{Cli, Command};
 use kiri::commands;
-use kiri::cutout::{Confidence, bbox_argument};
+use kiri::cutout::{Confidence, OptimizeFixed, bbox_argument};
 use kiri::error::{Error, ErrorCode, ErrorKind, Result};
 use kiri::report::{
     BackgroundReport, BatchReport, CutoutReport, ErrorReport, InfoReport, ModelReport,
@@ -20,7 +21,7 @@ use kiri::report::{
 use kiri::warning::Warning;
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = parse();
     match dispatch(&cli) {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
@@ -28,6 +29,42 @@ fn main() -> ExitCode {
             ExitCode::from(e.exit_code() as u8)
         }
     }
+}
+
+/// 引数を解いたうえで、**利用者が明示した項目**を記録する。
+///
+/// `Cli::parse()` では足りない。`--tolerance` は `default_value_t` を持つので、
+/// 解いた後の値からは「12 を明示した」と「既定のまま」を区別できない。
+/// `--optimize` はそこを区別しなければならない——明示した値は探索の軸から外す
+/// という規約があり、区別できなければ「30 に固定して探せ」と書いた指定が
+/// 12〜60 を舐めてしまう。
+///
+/// 既定値を `Option` にして区別する手もあるが、それをやると `kiri schema` の
+/// `commands[].options[].default` から 12 が消える。**指定しなくても何が効くのかを
+/// 読めることは契約そのもの**なので、表示は 1 文字も変えずに、明示したかどうかだけを
+/// `ValueSource` から拾って `CutoutArgs::fixed` へ畳む。
+fn parse() -> Cli {
+    let matches = Cli::command().get_matches();
+    let mut cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        // clap 自身の作法で出して終わる。ここに来るのは derive とパーサの
+        // 食い違いだけなので、kiri の ErrorCode に混ぜる意味が無い
+        Err(e) => ClapError::exit(&e),
+    };
+    if let (Command::Cutout(args), Some(sub)) =
+        (&mut cli.command, matches.subcommand_matches("cutout"))
+    {
+        args.fixed = OptimizeFixed {
+            tolerance: from_command_line(sub, "tolerance"),
+            bbox: from_command_line(sub, "bbox"),
+            background_model: from_command_line(sub, "background_model"),
+        };
+    }
+    cli
+}
+
+fn from_command_line(matches: &ArgMatches, id: &str) -> bool {
+    matches.value_source(id) == Some(ValueSource::CommandLine)
 }
 
 /// 成功時も終了コードを返す。バッチは一部の項目が失敗しても処理を続けるため、
@@ -218,6 +255,36 @@ fn print_segment(segment: Option<&SegmentReport>) {
     );
 }
 
+/// 探索の要約。**走ったときしか出ない。**
+///
+/// 人間向けには「何通り試して、原寸で何回回して、何が選ばれたか」の 1 行で足りる。
+/// 候補の一覧は 20 行になるのでテキストには出さない——比べたい人は `--json` を読む。
+fn print_optimize(optimize: Option<&kiri::report::OptimizeReport>) {
+    let Some(o) = optimize else {
+        return;
+    };
+    let finals = o.candidates.iter().filter(|c| c.stage == "final").count();
+    let c = &o.chosen;
+    println!(
+        "  探索      {} 候補を {}px で試し、原寸で {} 回  ({} ms)",
+        o.candidates.len(),
+        o.searched_at,
+        finals,
+        o.elapsed_ms
+    );
+    println!(
+        "  採用      tolerance {}  bbox {}  background-model {}  (致命 {} / 品質 {:.2})",
+        c.tolerance,
+        match c.bbox {
+            Some([x1, y1, x2, y2]) => format!("{x1},{y1} - {x2},{y2}"),
+            None => "なし".to_string(),
+        },
+        c.background_model,
+        c.score.fatal,
+        c.score.quality
+    );
+}
+
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
     let text = serde_json::to_string_pretty(value)
         .map_err(|e| Error::new(ErrorCode::JsonEncodeFailed, e.to_string()))?;
@@ -348,6 +415,7 @@ fn print_cutout(report: &CutoutReport) {
     );
     print_perimeter(&report.background);
     print_segment(report.segment.as_ref());
+    print_optimize(report.optimize.as_ref());
     // 指示を渡したときだけ 1 行増やす。**どの入口が効いたかまで出す**のは、
     // 渡したはずの入口が並びに無いことが「その指示は空だった」を意味するため
     // （そのときは CONSTRAINT_EMPTY も出る）。

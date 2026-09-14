@@ -11,6 +11,7 @@ use crate::cli::{CutoutArgs, Polygon};
 use crate::commands::output::{self, round4};
 use crate::commands::segment;
 use crate::cutout::constraints::{MASK_THRESHOLD, TRIMAP_BACKGROUND, TRIMAP_FOREGROUND};
+use crate::cutout::optimize;
 use crate::cutout::{
     Constraint, ConstraintSource, Constraints, CutoutOptions, FG_SEED_RADIUS, Matting, cutout,
 };
@@ -18,8 +19,8 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::{LoadOptions, OutputFormat, SaveOptions, load, save};
 use crate::preview::{PreviewSpec, contact_sheet};
 use crate::report::{
-    CanvasReport, ConstraintsReport, CutoutReport, Dimensions, MaskReport, SCHEMA_VERSION,
-    SettingsReport,
+    CanvasReport, ConstraintsReport, CutoutReport, Dimensions, MaskReport, OptimizeCandidate,
+    OptimizeReport, OptimizeScore, SCHEMA_VERSION, SettingsReport,
 };
 use crate::transform::canvas::{CanvasSpec, apply as canvas_apply, plan as canvas_plan};
 use crate::warning::{Warning, WarningCode};
@@ -82,7 +83,18 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         reclassify: !args.no_reclassify,
         background_model: args.background_model,
     };
-    let result = cutout(&loaded.image, &opts);
+    // **探索は 1 つの `CutoutResult` を返す。** 選ばれた候補は原寸で回し切った
+    // ものなので、以降（キャンバス配置・書き出し・preview）はもう 1 回走らせずに
+    // そのまま流す。`opts` も選ばれた候補で置き換える——`settings` と
+    // `applied_bbox` は効いた値を出す規約であり、渡した値では嘘になる
+    let (result, opts, optimize, optimize_warning) = if args.optimize {
+        let found = optimize::optimize(&loaded.image, &opts, &args.fixed)?;
+        let report = optimize_report(&found, w, h);
+        (found.result, found.options, Some(report), found.warning)
+    } else {
+        (cutout(&loaded.image, &opts), opts, None, None)
+    };
+    let bbox = opts.bbox;
 
     let debug_mask = write_debug_mask(args.debug_mask.as_ref(), &result.mask)?;
 
@@ -94,6 +106,10 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     // モデルが迷っていることも同じ理由で先に言う。確定領域が痩せていれば、
     // 以降の数値は `--segment off` のそれに近い
     warnings.extend(segment_warnings);
+    // 探索が「どれも駄目だった」と言うのも結果の警告より先である。以降に並ぶ
+    // 警告はすべて**選ばれた 1 つの候補**についてのもので、それが 20 通りの
+    // 中で最良だったという事実を知らずに読むと、まだ手が残っていると読める
+    warnings.extend(optimize_warning);
     warnings.extend(result.warnings.clone());
 
     // キャンバスを使わないときは切り抜き結果をそのまま書き出す。複製すると
@@ -172,6 +188,9 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             background_model: result.background_model.as_str(),
             // 実際に効いた値。指定値ではなく、輪郭の粗さで持ち上がった後の値
             band_min_radius: result.band_min_radius,
+            // 指定値。**選ばれた候補ではない**——探索したかどうかそのものは
+            // 利用者が決める。何が選ばれたかは上の 3 つと optimize ブロックが言う
+            optimize: args.optimize,
             // 指定値。`auto` が走らせたかどうかは次の行が言う
             segment: decision.mode.as_str(),
             segment_ran: decision.ran(),
@@ -179,6 +198,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         applied_bbox: bbox.map(|(x1, y1, x2, y2)| [x1, y1, x2, y2]),
         constraints: opts.constraints.as_ref().map(constraints_report),
         segment: segment_report,
+        optimize,
         mask: MaskReport {
             foreground_ratio: round4(result.stats.foreground_ratio),
             bbox: result.stats.bbox.map(|(x1, y1, x2, y2)| [x1, y1, x2, y2]),
@@ -195,6 +215,52 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         elapsed_ms: started.elapsed().as_millis(),
         warnings,
     })
+}
+
+/// 探索の記録を結果 JSON へ落とす。
+///
+/// **矩形は原寸の画素で出す。** 探索段は縮小版で回っているが、その座標を
+/// そのまま出しても `--bbox` へ写せない。候補は「どこから来た矩形か」を
+/// 持っているので、原寸へ解き直せばよい。
+fn optimize_report(found: &crate::cutout::Optimized, width: u32, height: u32) -> OptimizeReport {
+    let source = (width, height);
+    let entry = |(i, trial): (usize, &optimize::Trial)| OptimizeCandidate {
+        tolerance: trial.candidate.tolerance,
+        bbox: trial.candidate.bbox.map(|b| {
+            let (x1, y1, x2, y2) = b.resolve(source, source);
+            [x1, y1, x2, y2]
+        }),
+        background_model: match trial.candidate.background_model {
+            crate::cutout::BackgroundModel::Auto => "auto",
+            crate::cutout::BackgroundModel::Flat => "flat",
+            crate::cutout::BackgroundModel::Field => "field",
+        },
+        stage: trial.stage.as_str(),
+        foreground_ratio: round4(trial.foreground_ratio),
+        touches_edge: trial.touches_edge,
+        separability: trial.separability.map(round4),
+        halo_ratio: trial.diagnostics.halo_ratio.map(round4),
+        contour_roughness: trial.diagnostics.contour_roughness.map(round4),
+        rim_contamination: trial.diagnostics.rim_contamination.map(round4),
+        warnings: trial
+            .warnings
+            .iter()
+            .map(|c| c.as_str().to_string())
+            .collect(),
+        score: OptimizeScore {
+            fatal: trial.score.fatal,
+            quality: round4(trial.score.quality),
+            separability: round4(trial.score.separability),
+        },
+        chosen: i == found.chosen,
+    };
+    let candidates: Vec<OptimizeCandidate> = found.trials.iter().enumerate().map(entry).collect();
+    OptimizeReport {
+        searched_at: found.searched_at,
+        chosen: candidates[found.chosen].clone(),
+        candidates,
+        elapsed_ms: found.elapsed_ms,
+    }
 }
 
 /// 切り抜いた商品を余白ごと切り詰め、指定サイズのキャンバス中央へ配置する。

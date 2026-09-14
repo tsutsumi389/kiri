@@ -498,6 +498,105 @@ fn fields() -> Vec<FieldEntry> {
             ),
         },
         FieldEntry {
+            path: "settings.optimize",
+            appears_in: vec!["cutout"],
+            unit: "bool",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "--optimize を渡したか",
+            notes: Some(
+                "true なら settings.tolerance / settings.background_model / applied_bbox は\
+                 kiri が探索して選んだ値である（渡した値ではない）。何を試したかは \
+                 optimize.candidates[]、選ばれた理由は optimize.chosen.score が言う。\
+                 **明示した軸は探索しない**——--tolerance 30 --optimize なら候補の \
+                 tolerance は全部 30 になる",
+            ),
+        },
+        FieldEntry {
+            path: "optimize.candidates",
+            appears_in: vec!["cutout"],
+            unit: "list",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "試した全候補。並びは探索段（縮小版）の順位のまま",
+            notes: Some(
+                "**探索が走ったときだけ optimize ブロックごと現れる。** 各候補の \
+                 tolerance / bbox / background_model はそのまま --tolerance / --bbox / \
+                 --background-model へ写せる（bbox は原寸の画素座標）。2 位のほうが\
+                 目的に合うなら、その値を明示指定して回し直せばよい",
+            ),
+        },
+        FieldEntry {
+            path: "optimize.candidates[].stage",
+            appears_in: vec!["cutout"],
+            unit: "enum",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "その候補をどの寸法で回したか（search / final）",
+            notes: Some(
+                "search は縮小版（optimize.searched_at px）だけで回した候補で、指標も\
+                 その寸法のものである。final は原寸でも回した候補で、指標は原寸の値に\
+                 上書きされている。**2 つの stage の数値を直接比べないこと**——\
+                 輪郭の粗さも縁の汚染も寸法に依る。原寸どうしの比較は final の\
+                 候補どうしでだけ成り立つ",
+            ),
+        },
+        FieldEntry {
+            path: "optimize.chosen.score.fatal",
+            appears_in: vec!["cutout"],
+            unit: "count",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "選ばれた候補に残った致命的な警告の数",
+            notes: Some(
+                "数えるのは NOT_SEPARABLE / FOREGROUND_TOO_SMALL / FOREGROUND_TOO_LARGE / \
+                 SUBJECT_TOUCHES_EDGE の 4 つ。**順位はこれを最初に比べる**（少ないほど良い）。\
+                 0 でなければ、どの候補でも切り抜きが成立しなかったということで、\
+                 OPTIMIZE_NO_CLEAN_CANDIDATE が同時に出る",
+            ),
+        },
+        FieldEntry {
+            path: "optimize.chosen.score.quality",
+            appears_in: vec!["cutout"],
+            unit: "ratio",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "品質の重み和。小さいほど良い（fatal が同数のときに比べる）",
+            notes: Some(
+                "rim_contamination / contour_roughness / halo_ratio を、それぞれの警告\
+                 しきい値で割って足したもの。**3.0 が「3 つとも警告ちょうど」**にあたり、\
+                 0 に近いほど良い。測れなかった項（null）はしきい値ちょうど（1.0）として\
+                 数える——0 と扱うと、測れなかった候補が最良として勝ってしまう。\
+                 同点なら separability（大きいほど良い）、さらに同点なら小さい tolerance、\
+                 bbox 無し、auto の順で選ぶ",
+            ),
+        },
+        FieldEntry {
+            path: "optimize.searched_at",
+            appears_in: vec!["cutout"],
+            unit: "px",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "探索段で使った長辺(px)",
+            notes: Some(
+                "全候補はこの寸法で、境界処理（refine）抜きに回す。元の長辺がこれより\
+                 小さければ元の寸法がそのまま入る。上位の候補だけを原寸で回し直すので、\
+                 stage が final の候補の指標は原寸のものである",
+            ),
+        },
+        FieldEntry {
             path: "mask.foreground_ratio",
             appears_in: vec!["cutout"],
             unit: "ratio",

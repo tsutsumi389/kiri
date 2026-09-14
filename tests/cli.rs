@@ -5874,10 +5874,17 @@ fn fields_of(v: &Value) -> Vec<Value> {
 }
 
 /// ドット区切りの path で JSON を辿る。無ければ None。
+///
+/// `candidates[]` のように `[]` で終わる区間は配列で、その先は要素の中を指す。
+/// **要素は 1 つ目だけを見る。** 契約が言っているのは「どの要素もこの形を
+/// 持つ」であって、空の配列はそもそも path を確かめる材料にならない。
 fn pick<'a>(report: &'a Value, path: &str) -> Option<&'a Value> {
     let mut node = report;
     for segment in path.split('.') {
-        node = node.get(segment)?;
+        match segment.strip_suffix("[]") {
+            Some(name) => node = node.get(name)?.get(0)?,
+            None => node = node.get(segment)?,
+        }
     }
     Some(node)
 }
@@ -6148,6 +6155,17 @@ fn every_published_field_exists_in_the_result() {
         "--fg-seed",
         "100,100",
     ]);
+    // **`optimize` も探索が走ったときだけ現れる。** 指示と同じ理由で、
+    // 走らせた実行を別に 1 つ用意する
+    let optimized = run(&[
+        "cutout",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--dry-run",
+        "--json",
+        "--optimize",
+    ]);
     // **`segment` もモデルが走ったときだけ現れる。** モデルは 176MB あって
     // リポジトリにも CI にも置かないので、無ければその path だけを飛ばす。
     // 「配ったが確かめられなかった」と「配ったのに無い」は別で、後者だけを
@@ -6195,6 +6213,7 @@ fn every_published_field_exists_in_the_result() {
                 }
                 "info" => &info,
                 "cutout" if path.starts_with("constraints.") => &constrained,
+                "cutout" if path.starts_with("optimize.") => &optimized,
                 "cutout" => &cutout,
                 other => panic!("{path} が未知のコマンド {other} を名指ししている"),
             };

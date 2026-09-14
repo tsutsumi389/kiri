@@ -58,6 +58,10 @@ pub struct ItemSettings {
     pub reclassify: Option<bool>,
     /// 背景のモデル（"auto" / "flat" / "field"）
     pub background_model: Option<String>,
+    /// 探索を kiri に任せるか。**書いた設定はその値に固定される**——
+    /// tolerance を書いた項目では tolerance を探索しない（CLI で
+    /// `--tolerance` を明示したときと同じ規約）
+    pub optimize: Option<bool>,
     /// 埋め込み ICC を sRGB へ変換するか（既定 true）
     pub color_convert: Option<bool>,
     pub edge_threshold: Option<f64>,
@@ -102,6 +106,7 @@ impl ItemSettings {
             smooth_contour,
             reclassify,
             background_model,
+            optimize,
             color_convert,
             edge_threshold,
             step_tolerance,
@@ -138,6 +143,7 @@ const SETTING_KEYS: &[&str] = &[
     "smooth_contour",
     "reclassify",
     "background_model",
+    "optimize",
     "color_convert",
     "edge_threshold",
     "step_tolerance",

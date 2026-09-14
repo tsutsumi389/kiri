@@ -644,6 +644,7 @@ product.png  1600x2000  png  841.4 KB  (338 ms)
 | `--no-reclassify` | | 帯の中の二値画素を局所の前景色・背景色で塗り直さない |
 | `--no-refine` | | 境界のアルファを色から推定し直さず、マスクの形から作る旧方式に戻す |
 | `--no-despill` | | 境界画素から背景色の寄与を取り除かない |
+| `--optimize` | | `tolerance` / `bbox` / `background-model` の組を総当たりし、指標で選ぶ（[探索を kiri に任せる](#探索を-kiri-に任せるoptimize)） |
 | `--canvas WxH` | — | 商品をこのサイズのキャンバス中央に配置する。`1000` と書けば正方形 |
 | `--fill-ratio` | 0.85 | 商品がキャンバスの何割を占めるか |
 | `--flatten` | | 透過を残さず `--background` の色で塗り潰す |
@@ -1391,6 +1392,145 @@ tolerance を上げるだけで済んだぶんが混ざる。
 掴めていない状態で、結果は `--segment off` に近づく。同じモデルを回し直しても
 変わらないので、**`--trimap` や `--bg-polygon` で直接教えるほうが早い**。
 
+#### 探索を kiri に任せる（`--optimize`）
+
+ここまでのオプションは、どれも「どの値が良いか」をエージェントに決めさせている。
+実写 1 枚を切るには `info` で主体を見て、`cutout --bbox` で矩形を与えて、
+`HALO_REMAINS` の hint に従って `--tolerance` を上げる——**最低 3 往復**かかる。
+
+kiri は決定的で 1 回が数秒なので、**その 3 手を kiri の中へ畳める**。
+`--optimize` は候補を総当たりして指標で選び、AI には決定の記録だけを渡す。
+
+```
+$ kiri cutout remote.jpg -o out.png --optimize
+out.png  4284x5712  png  41.6 MB  (13955 ms)
+  背景色    #B2AEA7  (均一度 0.20, tolerance 45)
+  外周ΔE    p50 11.9  p90 26.8  max 60.5
+  場の残差  p50 5.5  p90 15.6  max 61.3  (場の振れ幅 ΔE 0.1〜21.5)
+  外周勾配  p50 11.3  p90 27.9
+  探索      20 候補を 1500px で試し、原寸で 2 回  (13647 ms)
+  採用      tolerance 45  bbox 0,2022 - 4213,3828  background-model auto  (致命 0 / 品質 4.95)
+  前景比率  20.4%
+  境界色差  ΔE 53.8  (tolerance 45)
+  輪郭粗さ  0.25 px  (1000px 換算, 警告 0.16 超)
+  縁の汚染  6.1%  (警告 2.0% 超)
+  前景範囲  89,2080 - 4168,3389
+  主体候補  0,0.354,0.9834,0.662  (面積 23.4%, 信頼度 high, colour 由来)
+```
+
+候補の一覧はテキストには出さない（20 行になる）。比べたいときは `--json` を読む。
+
+| オプション | 既定値 | 説明 |
+|---|---|---|
+| `--optimize` | off | `tolerance` / `bbox` / `background-model` の組を総当たりし、指標で選ぶ |
+
+##### 何を試すか
+
+| 軸 | 候補 | 1 通りに畳まれる条件 |
+|---|---|---|
+| `bbox` | 無し / `subject.normalized_bbox` | `--bbox` を明示した／主体の信頼度が `low` |
+| `tolerance` | 12 / 20 / 30 / 45 / 60 | `--tolerance` を明示した |
+| `background-model` | `auto` / `flat` | `--background-model` を明示した／`auto` が `flat` を選んだ |
+
+最大 2 × 5 × 2 = 20 通り。**明示した値は探索しない。**
+`--tolerance 30 --optimize` は「30 に固定して残りの軸を探す」の意味になる。
+`--cleanup` や `--feather`、`--trimap` などの他の指定は全候補へ同じものを渡す。
+
+##### どう選ぶか
+
+辞書式に上から比べる。
+
+1. 致命的な警告の数（`NOT_SEPARABLE` / `FOREGROUND_TOO_SMALL` /
+   `FOREGROUND_TOO_LARGE` / `SUBJECT_TOUCHES_EDGE` / `BBOX_RECOMMENDED`）。少ないほど良い
+2. 品質の重み和（`rim_contamination` / `contour_roughness` / `halo_ratio` を
+   それぞれの警告しきい値で割った和）。**3.0 が「3 つとも警告ちょうど」**にあたる
+3. `separability`（大きいほど良い）
+4. 同点なら小さい `tolerance`、次に bbox 無し、次に `auto`
+
+加えて、**許容量を 1 段上げて前景比率が 3 割を超えて落ちた候補**は「商品を飲んだ」
+とみなして致命に 1 を足す。淡い色の商品では、商品ごと飲まれた結果が
+「縁の残りが減った」という良い数値として現れるためである。
+
+##### どう見せるか
+
+`--json` を付けると `optimize` ブロックが増える（付けなければキーごと現れない）。
+
+```json
+"optimize": {
+  "searched_at": 1500,
+  "candidates": [
+    { "tolerance": 60, "bbox": [0, 2022, 4213, 3828], "background_model": "auto",
+      "stage": "final", "foreground_ratio": 0.0664, "touches_edge": false,
+      "separability": 48.7848, "halo_ratio": 0.0581,
+      "contour_roughness": 0.8123, "rim_contamination": null,
+      "warnings": ["EDGE_THRESHOLD_RAISED", "BACKGROUND_FIELD_USED",
+                   "LOW_UNIFORMITY", "CONTOUR_ROUGH"],
+      "score": { "fatal": 0, "quality": 6.66, "separability": 48.7848 },
+      "chosen": false },
+    { "tolerance": 45, "bbox": [0, 2022, 4213, 3828], "background_model": "auto",
+      "stage": "final", "foreground_ratio": 0.2037, "touches_edge": false,
+      "separability": 53.8151, "halo_ratio": 0.0295,
+      "contour_roughness": 0.2541, "rim_contamination": 0.0613,
+      "warnings": ["EDGE_THRESHOLD_RAISED", "BACKGROUND_FIELD_USED",
+                   "LOW_UNIFORMITY", "CONTOUR_ROUGH", "RIM_CONTAMINATED"],
+      "score": { "fatal": 0, "quality": 4.95, "separability": 53.8151 },
+      "chosen": true }
+  ],
+  "chosen": { "...": "同じ形" },
+  "elapsed_ms": 13599
+}
+```
+
+- `candidates[]` の並びは**探索段（縮小版）の順位**のまま。原寸でも回した候補は
+  `stage` が `"final"` になり、指標は原寸の値で上書きされる
+- `bbox` は `stage` に関わらず**原寸の画素座標**。そのまま `--bbox` へ写せる
+- `settings.tolerance` / `settings.background_model` / `applied_bbox` は選ばれた
+  候補の値になる。`settings.optimize` は**常に**出る（この 1 行が 3 つの出所を変える）
+
+**選ばれなかった候補も見せるのは、2 位のほうが目的に合うことがあるため**である。
+たとえば上の例で「輪郭の滑らかさより境界の色差を優先したい」なら、1 位の
+`tolerance 60` を `--tolerance 60 --bbox 0,2022,4213,3828` として明示指定へ
+切り替えればよい。候補の値はそのまま貼れる形で並んでいる。
+
+##### どの候補も駄目だったとき
+
+選ばれた候補にも致命的な警告が残ったら `OPTIMIZE_NO_CLEAN_CANDIDATE` が出る。
+`data.remaining` に残った code が入り、hint は撮り直しか `--segment isnet` を
+案内する。**20 通り試して駄目だったという事実そのものが情報で**、そこから先に
+パラメータ調整の余地は無い。
+
+暗い机の上の黒いキーボード（色では分離できない既知の限界）がこれで、
+10 候補すべてに `SUBJECT_TOUCHES_EDGE` が残る。
+
+##### 所要時間
+
+長辺 1500px へ縮めた画像で全候補を境界処理抜きに回し、上位 2 つだけを原寸で
+回す。致命的な警告も品質の警告も出ない候補に当たった時点で打ち切るので、
+きれいな素材では原寸は 1 回で済む。
+
+| 素材 | 候補 | 原寸で回した数 | 時間 |
+|---|---|---|---|
+| 実写リモコン 4284x5712（24.5MP、不織布） | 20 | 2 | 13.9 秒 |
+| 実写キーボード 3024x4032（12MP、暗い机） | 10 | 2 | 8.4 秒 |
+
+目安は「3 手ループ 1 往復ぶん（数秒 × 3 + エージェントの往復）」と同じくらいで、
+**往復が無いぶん確実に速い**。
+
+##### 3 手ループとの比較（実写リモコン、24.5MP）
+
+| | 回数 | 時間 | fg | halo | 境界色差 | 輪郭粗さ |
+|---|---|---|---|---|---|---|
+| 既定値のまま | 1 | 8.2 秒 | 0.2492 | 0.1264 | 19.6 | 1.239 |
+| 手で決めた最良（`--bbox` + `--tolerance 60`） | 3 + 往復 | 5.0 秒 | 0.0664 | 0.0581 | 48.8 | 0.812 |
+| **`--optimize`** | **1** | **13.9 秒** | **0.2037** | **0.0295** | **53.8** | **0.254** |
+
+**探索は手で決めた設定より良い。** 手の最良値（`tolerance 60`）は照明場と
+matting が入る前に決めたもので、今では商品を 3 分の 2 まで飲む
+（前景比率 0.0664）。**手で決めた設定はアルゴリズムが変わった瞬間に古くなるが、
+探索は毎回引き直す。**
+
+`--dry-run` と併用できる。`batch` の spec では `"optimize": true` と書く。
+
 #### EC向けの整形
 
 切り抜きからキャンバス配置、形式変換までを1コマンドで完結できる。
@@ -1820,7 +1960,7 @@ x broken.jpg  失敗
 オプションと対応する（`bbox` / `normalized` / `fg_seeds` / `trimap` / `fg_mask` /
 `bg_mask` / `fg_polygons` / `bg_polygons` / `tolerance` / `border` /
 `cleanup` / `feather` / `despill` / `refine` / `matting` / `smooth_contour` /
-`reclassify` / `background_model` / `color_convert` / `edge_threshold` /
+`reclassify` / `background_model` / `optimize` / `color_convert` / `edge_threshold` /
 `step_tolerance` / `shadow_tolerance` / `seal` / `canvas` / `fill_ratio` / `format` /
 `quality` / `effort` / `background` / `flatten`）。
 
@@ -1830,6 +1970,11 @@ x broken.jpg  失敗
 
 `edge_threshold` は CLI と同じく「書かない」と「`8` と書く」を区別する。書かなければ
 背景のテクスチャに応じて自動調整され、書けばその値に従う。
+
+`optimize` を `true` にすると、その項目で探索が走る（[探索を kiri に任せる](#探索を-kiri-に任せるoptimize)）。
+**同じ項目に書いた `tolerance` / `bbox` / `background_model` は探索の軸から外れる**
+——CLI で明示したときと同じ規約で、spec では「書いたかどうか」がそのまま明示に
+あたる。1 件が数秒から十数秒になるので、数百点に一律で付ける値ではない。
 
 `matting` と `background_model` は綴りを検査する。未知の値を既定へ落とすと、その
 項目だけ黙って別の設定で処理され、数百点を回した後に仕上がりを見るまで気づけない。

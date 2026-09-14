@@ -14,6 +14,7 @@ use crate::image_io::OutputFormat;
 use crate::preview::DEFAULT_PANEL;
 use crate::segment::SegmentMode;
 use crate::transform::FitMode;
+use crate::transform::shadow::ShadowMode;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -180,6 +181,33 @@ fn segment_long_help() -> String {
          この build に segment 機能が無ければ {} で断る。",
         crate::error::ErrorCode::SegmentUnavailable.as_str()
     )
+}
+
+/// `--shadow` の長いヘルプ。
+///
+/// **AI エージェントは `--help` を読んで判断する**ので、「消す側のノブと名前が
+/// 並ぶこと」「px@1000 の基準が最終画像の長辺であること」「下地・影・商品の
+/// 順序」の 3 つをここで言う。どれも指定の前に知っていないと出来上がりを
+/// 予想できず、結果を見てから気づくのでは 1 往復を無駄にする。
+fn shadow_long_help() -> String {
+    "切り抜いたアルファから落ち影を合成する（既定 off）。\n\
+     off  … 何も足さない。成果物の画素は --shadow を足す前と 1 バイトも変わらない\
+     （報告 JSON には settings.shadow が増える。schema_version は据え置き）。\n\
+     synth… 商品のアルファを --shadow-offset ぶんずらし、--shadow-blur の σ で\
+     ぼかしたものを --shadow-color で塗り、--shadow-opacity を掛けて商品の下に敷く。\n\
+     **--shadow-tolerance とは向きが逆である。** あちらは実写に写っている影を\
+     背景として消す側で、こちらは消した後のアルファから影を作り直す側になる。\
+     合成なら商品ごとに影の向きと濃さが揃うので、EC の「影つき」の納品に使える。\n\
+     --shadow-offset と --shadow-blur は長辺 1000px 換算で指定する。基準は\
+     **最終画像の長辺**で、--canvas があればキャンバスの長辺、無ければ元画像の\
+     長辺になる。実際に効いた px は結果の shadow.offset / shadow.blur に出る。\n\
+     出力の寸法は変わらない。影が画像（またはキャンバス）の外へ出る分は切り、\
+     切ったことを shadow.clipped が言う。--canvas の配置は影なしと同じで、\
+     影のぶん商品を小さくはしない。\n\
+     --flatten と併せると「下地 → 影 → 商品」の順に重なる。透過を保てる形式\
+     （PNG / AVIF）では影も半透明のアルファとして残る。\n\
+     mask ブロックの統計と診断値は影を足す前の商品だけで測る"
+        .to_string()
 }
 
 /// 出力に関する共通オプション。convert と resize で同じものを使う。
@@ -573,6 +601,19 @@ pub fn smooth_contour_px(s: &str) -> Result<f64, String> {
     Ok(v)
 }
 
+/// 0.0 以上 1.0 以下の有限な実数だけを受け付ける。
+///
+/// 不透明度に 1.5 を渡せば飽和して 1.0 と同じ結果になり、-0.2 は影が消える。
+/// どちらも「指定したのに効かない」という最も追いにくい失敗になるので、
+/// 受け取る前に断る。
+pub fn unit_interval(s: &str) -> Result<f64, String> {
+    let v = non_negative(s)?;
+    if v > 1.0 {
+        return Err(format!("'{s}' は 0.0 から 1.0 の範囲で指定してください"));
+    }
+    Ok(v)
+}
+
 /// 有限な実数だけを受け付ける。符号は問わない。
 ///
 /// `non_negative` と分けているのは、角度だけが負値に意味を持つためである
@@ -692,8 +733,43 @@ pub struct CutoutArgs {
     /// 落ち影として消す明度(L*)の落ち込みの上限。0 で無効
     ///
     /// 彩度が背景とほぼ同じで暗いだけの画素に限って適用される
+    ///
+    /// **実写に写っている影を消す側**であり、影を合成する --shadow とは向きが逆である
     #[arg(long, default_value_t = 35.0, value_parser = non_negative)]
     pub shadow_tolerance: f64,
+
+    /// 切り抜いたアルファから落ち影を合成する（既定 off）。実写の影を消す --shadow-tolerance とは逆で、こちらは足す
+    ///
+    /// ヘルプの本文は `shadow_long_help` に置く。px@1000 の基準と合成順は、
+    /// 指定の前に知っていないと出来上がりを予想できない
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = ShadowMode::Off,
+        long_help = shadow_long_help()
+    )]
+    pub shadow: ShadowMode,
+
+    /// 影をずらす量 dx,dy(px、長辺 1000px 換算)。負値は上・左へ。--shadow synth のときだけ効く
+    #[arg(
+        long,
+        value_parser = parse_offset,
+        default_value = "0,12",
+        allow_hyphen_values = true
+    )]
+    pub shadow_offset: [f64; 2],
+
+    /// 影のぼかしの σ(px、長辺 1000px 換算)。0 でぼかさない。--shadow synth のときだけ効く
+    #[arg(long, default_value_t = 10.0, value_parser = non_negative)]
+    pub shadow_blur: f64,
+
+    /// 影の色 (例 #000000)。--shadow synth のときだけ効く
+    #[arg(long, value_parser = parse_hex_color, default_value = "#000000")]
+    pub shadow_color: [u8; 3],
+
+    /// 影の不透明度 (0.0-1.0)。--shadow synth のときだけ効く
+    #[arg(long, default_value_t = 0.25, value_parser = unit_interval)]
+    pub shadow_opacity: f64,
 
     /// 幅 2N px 以下の隙間を通ってしか外周につながらない背景を前景へ戻す。0 で無効
     ///
@@ -868,6 +944,20 @@ pub fn parse_bbox(s: &str) -> Result<[f64; 4], String> {
 pub fn parse_point(s: &str) -> Result<[f64; 2], String> {
     let v = parse_numbers(s, 2)?;
     Ok([v[0], v[1]])
+}
+
+/// `dx,dy` を受け付ける。**負値を許す**点だけが `parse_point` と違う。
+///
+/// 座標は画像の中を指すので負値は取り違えでしかないが、ずらし量は影を上や
+/// 左へ出す正当な指定になる。同じ関数で両方を受けると、どちらかの関門が緩む。
+pub fn parse_offset(s: &str) -> Result<[f64; 2], String> {
+    let parts: Vec<&str> = s.split(',').map(str::trim).collect();
+    if parts.len() != 2 {
+        return Err(format!(
+            "'{s}' はカンマ区切りの数値 2 個である必要があります"
+        ));
+    }
+    Ok([finite(parts[0])?, finite(parts[1])?])
 }
 
 fn parse_numbers(s: &str, expected: usize) -> Result<Vec<f64>, String> {

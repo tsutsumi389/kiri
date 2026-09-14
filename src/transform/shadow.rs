@@ -190,7 +190,9 @@ fn compose(out: &mut RgbaImage, product: &RgbaImage, alpha: &[u8], color: [u8; 3
 /// 幅は必ず奇数にする。偶数幅の箱型は重心が半画素ずれ、3 回重ねると影が
 /// オフセットの指定から 1.5px ずれる。
 fn box_widths(sigma: f64, n: usize) -> Vec<u32> {
-    if !(sigma > 0.0) {
+    // 幅 1 の箱型は恒等。σ が 0（と nan——clap で弾いてあるが下流で守る）なら
+    // ぼかさない
+    if !sigma.is_finite() || sigma <= 0.0 {
         return vec![1; n];
     }
     let nf = n as f64;
@@ -222,20 +224,22 @@ fn blur_pass(buf: &mut [u8], w: u32, h: u32, width: u32) {
     }
     let r = ((width - 1) / 2) as usize;
     let (w, h) = (w as usize, h as usize);
-    let half = (width / 2) as u32;
+    // width は奇数なので width / 2 は半端の切り上げ位置になり、これを足してから
+    // 割れば四捨五入になる
+    let half = width / 2;
 
     // 横方向。行ごとの累積和から窓の和を引く
     let mut prefix = vec![0u32; w + 1];
     let mut row = vec![0u8; w];
     for y in 0..h {
         let line = &mut buf[y * w..(y + 1) * w];
-        for x in 0..w {
-            prefix[x + 1] = prefix[x] + u32::from(line[x]);
+        for (x, v) in line.iter().enumerate() {
+            prefix[x + 1] = prefix[x] + u32::from(*v);
         }
-        for x in 0..w {
+        for (x, slot) in row.iter_mut().enumerate() {
             let lo = x.saturating_sub(r);
             let hi = (x + r + 1).min(w);
-            row[x] = ((prefix[hi] - prefix[lo] + half) / width) as u8;
+            *slot = ((prefix[hi] - prefix[lo] + half) / width) as u8;
         }
         line.copy_from_slice(&row);
     }
@@ -251,12 +255,11 @@ fn blur_pass(buf: &mut [u8], w: u32, h: u32, width: u32) {
         if y + r < h {
             add_row(&mut sums, &buf[(y + r) * w..(y + r + 1) * w]);
         }
-        for x in 0..w {
-            out[y * w + x] = ((sums[x] + half) / width) as u8;
+        for (slot, s) in out[y * w..(y + 1) * w].iter_mut().zip(&sums) {
+            *slot = ((s + half) / width) as u8;
         }
         if y >= r {
-            let drop = y - r;
-            sub_row(&mut sums, &buf[drop * w..(drop + 1) * w]);
+            sub_row(&mut sums, &buf[(y - r) * w..(y - r + 1) * w]);
         }
     }
     buf.copy_from_slice(&out);

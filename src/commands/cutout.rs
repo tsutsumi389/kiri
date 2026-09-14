@@ -20,9 +20,10 @@ use crate::image_io::{LoadOptions, OutputFormat, SaveOptions, load, save};
 use crate::preview::{PreviewSpec, contact_sheet};
 use crate::report::{
     CanvasReport, ConstraintsReport, CutoutReport, Dimensions, MaskReport, OptimizeCandidate,
-    OptimizeReport, OptimizeScore, SCHEMA_VERSION, SettingsReport,
+    OptimizeReport, OptimizeScore, SCHEMA_VERSION, SettingsReport, ShadowReport,
 };
-use crate::transform::canvas::{CanvasSpec, apply as canvas_apply, plan as canvas_plan};
+use crate::transform::canvas::{CanvasSpec, apply as canvas_apply, composite, plan as canvas_plan};
+use crate::transform::shadow::{self, ShadowMode, ShadowSpec};
 use crate::warning::{Warning, WarningCode};
 
 pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
@@ -116,14 +117,38 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     warnings.extend(optimize_warning);
     warnings.extend(result.warnings.clone());
 
+    // 長辺 1000px 換算を実寸へ掛け戻す。**基準は最終画像の長辺**なので、
+    // キャンバスがあればそちらが基準になる。元画像の長辺で換算すると、
+    // 同じ指定が --canvas の有無で違う見た目を指す
+    let shadow_spec = resolve_shadow(
+        args,
+        match args.canvas {
+            Some((cw, ch)) => cw.max(ch),
+            None => w.max(h),
+        },
+    );
+
     // キャンバスを使わないときは切り抜き結果をそのまま書き出す。複製すると
     // 12MP で 48MB を余分に積み、batch の並列度ぶんだけ倍になる
-    let (placed, canvas) = match args.canvas {
+    let (placed, canvas, shadow) = match args.canvas {
         Some((cw, ch)) => {
-            let (image, report) = place_on_canvas(&result, cw, ch, args, &mut warnings)?;
-            (Some(image), Some(report))
+            let placement =
+                place_on_canvas(&result, cw, ch, args, shadow_spec.as_ref(), &mut warnings)?;
+            (
+                Some(placement.image),
+                Some(placement.report),
+                placement.shadow,
+            )
         }
-        None => (None, None),
+        // 影を敷くときだけは複製が要る。商品の層を書き換えずに下へ 1 枚
+        // 足すので、元の画像を持ったまま作業する場所がいる
+        None => match shadow_spec.as_ref() {
+            Some(spec) => {
+                let (image, bounds) = shadow::synth(&result.image, spec);
+                (Some(image), None, Some(shadow_report(spec, &bounds)))
+            }
+            None => (None, None, None),
+        },
     };
     let final_image = placed.as_ref().unwrap_or(&result.image);
 
@@ -195,6 +220,8 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             // 指定値。**選ばれた候補ではない**——探索したかどうかそのものは
             // 利用者が決める。何が選ばれたかは上の 3 つと optimize ブロックが言う
             optimize: args.optimize,
+            // 指定値。実際に効いたずらし量とぼかしは `shadow` ブロックのほう
+            shadow: args.shadow.as_str(),
             // 指定値。`auto` が走らせたかどうかは次の行が言う
             segment: decision.mode.as_str(),
             segment_ran: decision.ran(),
@@ -215,6 +242,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             debug_mask,
         },
         canvas,
+        shadow,
         preview,
         elapsed_ms: started.elapsed().as_millis(),
         warnings,
@@ -264,14 +292,56 @@ fn optimize_report(found: &crate::cutout::Optimized, width: u32, height: u32) ->
     }
 }
 
+/// 長辺 1000px 換算の指定を、最終画像の実寸へ掛け戻す。
+///
+/// `--shadow off` なら `None`。合成しない実行で仕様を組み立てても使い道が無く、
+/// 「影の設定は解釈された」という事実だけが下流に残ると、どこかで誤って
+/// 効いてしまう余地を作る。
+fn resolve_shadow(args: &CutoutArgs, long_side: u32) -> Option<ShadowSpec> {
+    if args.shadow != ShadowMode::Synth {
+        return None;
+    }
+    let scale = f64::from(long_side) / 1000.0;
+    Some(ShadowSpec {
+        offset: (
+            (args.shadow_offset[0] * scale).round() as i32,
+            (args.shadow_offset[1] * scale).round() as i32,
+        ),
+        sigma: args.shadow_blur * scale,
+        color: args.shadow_color,
+        opacity: args.shadow_opacity,
+    })
+}
+
+/// 効いた影を結果 JSON へ落とす。
+fn shadow_report(spec: &ShadowSpec, bounds: &crate::transform::ShadowBounds) -> ShadowReport {
+    let [r, g, b] = spec.color;
+    ShadowReport {
+        offset: [spec.offset.0, spec.offset.1],
+        blur: round4(spec.sigma),
+        opacity: round4(spec.opacity),
+        color: format!("#{r:02X}{g:02X}{b:02X}"),
+        bounds: bounds.rect,
+        clipped: bounds.clipped,
+    }
+}
+
+/// キャンバス配置の成果。
+struct Placement {
+    image: image::RgbaImage,
+    report: CanvasReport,
+    shadow: Option<ShadowReport>,
+}
+
 /// 切り抜いた商品を余白ごと切り詰め、指定サイズのキャンバス中央へ配置する。
 fn place_on_canvas(
     result: &crate::cutout::CutoutResult,
     width: u32,
     height: u32,
     args: &CutoutArgs,
+    shadow_spec: Option<&ShadowSpec>,
     warnings: &mut Vec<Warning>,
-) -> Result<(image::RgbaImage, CanvasReport)> {
+) -> Result<Placement> {
     // フェザリングされた薄い縁まで含めて切り詰める。前景判定(128以上)で切ると
     // 輪郭の階調が落ちてギザギザに戻ってしまう
     let (x1, y1, x2, y2) = result.mask.bbox_above(0).ok_or_else(|| {
@@ -285,15 +355,34 @@ fn place_on_canvas(
     let trimmed =
         image::imageops::crop_imm(&result.image, x1, y1, x2 - x1 + 1, y2 - y1 + 1).to_image();
 
+    // **影があるときだけ塗る順序を組み替える。** 下地 → 影 → 商品でなければ
+    // 影が下地に隠れる。組み替えを `--shadow off` にも通すと、半透明の縁で
+    // 1 ずつ丸めが変わる（下地の上へ合成するか、後から下地へ落とすかの違い）
+    let flatten_here = args.out.flatten && shadow_spec.is_none();
     let spec = CanvasSpec {
         width,
         height,
         fill_ratio: args.fill_ratio,
         // --flatten が指定されていれば下地を塗る。既定は透明のまま
-        background: args.out.flatten.then_some(args.out.background),
+        background: flatten_here.then_some(args.out.background),
     };
     let plan = canvas_plan((trimmed.width(), trimmed.height()), &spec)?;
-    let placed = canvas_apply(&trimmed, &spec)?;
+    let mut placed = canvas_apply(&trimmed, &spec)?;
+
+    let shadow = shadow_spec.map(|spec| {
+        let (with_shadow, bounds) = shadow::synth(&placed, spec);
+        placed = with_shadow;
+        if args.out.flatten {
+            // 透明のまま置いた影と商品を、改めて下地の上へ載せる。
+            // 書き出し側の --flatten に任せると、影のアルファが 0 の画素まで
+            // 別の丸めを通り、影なしの出力とビット一致しなくなる
+            let [r, g, b] = args.out.background;
+            let mut base = image::RgbaImage::from_pixel(width, height, image::Rgba([r, g, b, 255]));
+            composite(&mut base, &placed, (0, 0));
+            placed = base;
+        }
+        shadow_report(spec, &bounds)
+    });
 
     if plan.scale > 1.0 {
         warnings.push(
@@ -308,9 +397,9 @@ fn place_on_canvas(
         );
     }
 
-    Ok((
-        placed,
-        CanvasReport {
+    Ok(Placement {
+        image: placed,
+        report: CanvasReport {
             width,
             height,
             fill_ratio: args.fill_ratio,
@@ -318,7 +407,8 @@ fn place_on_canvas(
             offset: [plan.offset.0, plan.offset.1],
             scale: round4(plan.scale),
         },
-    ))
+        shadow,
+    })
 }
 
 /// 重い処理に入る前に、付随出力（プレビュー・デバッグマスク）のパスを検証する。

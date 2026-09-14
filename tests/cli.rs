@@ -3649,7 +3649,10 @@ fn a_run_without_a_shadow_reports_no_shadow_block() {
     let input = write_png(dir.path(), "in.png", &img);
 
     let v = cutout_on_canvas(dir.path(), &input, "out.png", &[]);
-    assert!(v.get("shadow").is_none(), "影を頼んでいないのに shadow が出た");
+    assert!(
+        v.get("shadow").is_none(),
+        "影を頼んでいないのに shadow が出た"
+    );
     assert_eq!(
         v["settings"]["shadow"], "off",
         "settings.shadow は常に出すべき"

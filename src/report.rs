@@ -362,6 +362,36 @@ pub struct MaskReport {
     pub debug_mask: Option<String>,
 }
 
+/// 合成した落ち影が実際にどう効いたか。
+///
+/// **`--shadow synth` のときだけ出る**（`constraints` / `segment` と同じ規約）。
+/// `--shadow off` でキーごと消すのは、`null` を出すと「合成したが影が残らなかった」
+/// と読めてしまうためである。頼んだかどうかは `settings.shadow` が常に言う。
+///
+/// 数値はすべて**実際に効いた実寸の px**。指定は長辺 1000px 換算なので、
+/// そのままでは「この画像で何 px ずらしたか」を語らない（`smooth_radius_px`
+/// と同じ理由）。
+#[derive(Debug, Serialize)]
+pub struct ShadowReport {
+    /// 実際にずらした量 [dx, dy]
+    pub offset: [i32; 2],
+    /// 実際に掛けたぼかしの σ
+    pub blur: f64,
+    pub opacity: f64,
+    /// `#RRGGBB`
+    pub color: String,
+    /// 影のアルファが 0 より大きい画素の外接矩形 [x1, y1, x2, y2]。
+    /// 1 画素も無ければ null
+    pub bounds: Option<[u32; 4]>,
+    /// ずらし＋ぼかしの範囲が画像（またはキャンバス）の外へ出たか。
+    ///
+    /// **`bounds` が null でも真になりうる。** ずらし量が画像より大きければ
+    /// 影は 1 画素も残らないが、それは「影を置かなかった」のではなく
+    /// 「全部はみ出した」である。2 つを 1 つのキーに畳むと、指定が効かなかった
+    /// 理由を追う手段が無くなる
+    pub clipped: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CanvasReport {
     pub width: u32,
@@ -428,6 +458,9 @@ pub struct SettingsReport {
     /// `applied_bbox` の出所を変えるからである。true なら 3 つとも kiri が
     /// 探索して選んだ値で、何を試したかは `optimize.candidates[]` にある
     pub optimize: bool,
+    /// 落ち影を合成したか（"off" / "synth"）。**常に出す。**
+    /// 実際に効いたずらし量とぼかしは `shadow` ブロックのほう
+    pub shadow: &'static str,
     /// `--segment` の**指定値**（"off" / "auto" / "isnet"）
     pub segment: &'static str,
     /// 実際にモデルが走ったか。**`auto` では指定値から読めない**——
@@ -570,6 +603,9 @@ pub struct CutoutReport {
     pub mask: MaskReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canvas: Option<CanvasReport>,
+    /// 落ち影を合成したときだけ出る。`--shadow off`（既定）ではキーごと無い
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow: Option<ShadowReport>,
     /// --preview で書き出した検証用画像のパス
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,

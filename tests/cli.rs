@@ -7417,9 +7417,17 @@ fn an_inseparable_scene_says_that_no_candidate_was_clean() {
         .iter()
         .find(|w| w["code"] == "OPTIMIZE_NO_CLEAN_CANDIDATE")
         .unwrap();
+    let remaining = warning["data"]["remaining"].as_array().unwrap();
     assert!(
-        !warning["data"]["remaining"].as_array().unwrap().is_empty(),
+        !remaining.is_empty(),
         "残った code を載せていない: {warning}"
+    );
+    // **矩形の勧めは「手詰まり」に数えない。** BBOX_RECOMMENDED は矩形つきで
+    // 次の一手を言っているので、ここに混ぜると「その矩形を渡せ」と
+    // 「撮り直せ」が同じ結果に並ぶ
+    assert!(
+        !remaining.iter().any(|c| c == "BBOX_RECOMMENDED"),
+        "矩形の勧めを手詰まりの理由に混ぜている: {warning}"
     );
 }
 
@@ -7585,4 +7593,167 @@ fn the_collapse_flag_is_reported_apart_from_the_warning_count() {
             "schema が数える code に {code} が載っていない: {notes}"
         );
     }
+    // **順位の致命と警告の致命は別である。** 0 でなくても
+    // OPTIMIZE_NO_CLEAN_CANDIDATE が出るとは限らないことを notes が言うこと
+    assert!(
+        notes.contains("OPTIMIZE_NO_CLEAN_CANDIDATE が出るとは限らない"),
+        "fatal と警告の関係が誤って読める notes: {notes}"
+    );
+}
+
+/// **綺麗な候補に当たったら原寸で 1 回しか回さない。**
+///
+/// 原寸 1 回が 24.5MP で数秒あるので、早期打ち切りが所要時間の要である。
+/// `stage` が `final` の候補の数がそのまま「原寸で回した回数」なので、
+/// そこを固定すれば打ち切りが効いているかを結果 JSON だけで読める。
+#[test]
+fn a_clean_scene_only_runs_one_candidate_at_full_size() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        noise: false,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--optimize",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    let candidates = v["optimize"]["candidates"].as_array().unwrap();
+    let finals = candidates.iter().filter(|c| c["stage"] == "final").count();
+    assert_eq!(
+        finals, 1,
+        "綺麗な素材なのに原寸で 2 回回している: {}",
+        v["optimize"]
+    );
+    assert_eq!(v["optimize"]["chosen"]["stage"], "final");
+    // 打ち切ったのだから、選ばれた候補には致命も品質の警告も無いはず
+    assert_eq!(v["optimize"]["chosen"]["score"]["fatal"], 0);
+    assert_eq!(v["optimize"]["chosen"]["collapsed"], false);
+}
+
+/// **1 位が原寸で商品を飲んだら打ち切らず、2 位まで回す。**
+///
+/// 商品を飲んだ結果は警告を 1 つも出さずに指標だけ良くなるので、`warnings`
+/// だけを見ていると 1 つ目で止まってしまう。崩れは「同じ候補の探索段の
+/// 前景比率」と比べて初めて分かる。
+///
+/// 背景と商品の色差を小さく取ると、許容量を上げた候補が商品ごと飲む。
+/// 原寸でだけ飲むかどうかは素材次第なので、ここで問うのは
+/// **「綺麗でない候補が 1 位なら 2 つ目も回す」**という打ち切りの条件そのもの。
+#[test]
+fn a_finalist_that_is_not_clean_does_not_stop_the_final_stage() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        background: [200, 198, 196],
+        product: [168, 166, 164],
+        noise: true,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--optimize",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    let candidates = v["optimize"]["candidates"].as_array().unwrap();
+    let finals: Vec<&Value> = candidates
+        .iter()
+        .filter(|c| c["stage"] == "final")
+        .collect();
+    assert_eq!(
+        finals.len(),
+        2,
+        "綺麗でない 1 位で打ち切っている: {}",
+        v["optimize"]
+    );
+    // 上限は `FINALISTS`。ここが増えると 24.5MP で所要時間が目標を超える
+    assert_eq!(finals.len(), kiri::cutout::optimize::FINALISTS);
+    assert!(
+        candidates[0]["stage"] == "final" && candidates[1]["stage"] == "final",
+        "原寸で回すのは探索段の上位から順のはず: {}",
+        v["optimize"]
+    );
+}
+
+/// `--trimap` と `--optimize` を同時に渡せること。
+///
+/// **探索段は縮小版で回るので、画素ごとの指示も縮めて渡さなければならない**
+/// （`Constraints::resampled`）。そこが切れていれば、指示を渡した実行で
+/// 探索だけが指示の無い世界を見ることになる。寸法の食い違いは
+/// `foreground_mask` の規約で黙って無視されるので、**落ちずに静かに間違う。**
+#[test]
+fn a_trimap_survives_the_optimize_search() {
+    let dir = fixture_dir();
+    let input = constraint_fixture(dir.path());
+    let output = dir.path().join("cut.png");
+
+    let mut trimap = image::RgbaImage::from_pixel(200, 200, image::Rgba([128, 128, 128, 255]));
+    paint(&mut trimap, (0, 0, 199, 19), 0);
+    paint(&mut trimap, (0, 180, 199, 199), 0);
+    paint(&mut trimap, (70, 70, 129, 129), 255);
+    let path = write_png(dir.path(), "trimap.png", &trimap);
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--trimap",
+            path.to_str().unwrap(),
+            "--optimize",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    // 指示は原寸のまま報告される（最終段は原寸の指示そのままで回る）
+    assert_eq!(v["constraints"]["sources"][0], "trimap");
+    assert!(v["constraints"]["fg_ratio"].as_f64().unwrap() > 0.0);
+    assert!(v["constraints"]["bg_ratio"].as_f64().unwrap() > 0.0);
+    // 探索も走っている。指示と探索は排他ではない
+    assert!(v["optimize"]["candidates"].as_array().unwrap().len() > 1);
+    assert_eq!(v["settings"]["optimize"], true);
+    // 確定前景は不透明のまま、確定背景は透明
+    let cut = image::open(&output).unwrap().to_rgba8();
+    assert_eq!(cut.get_pixel(100, 100)[3], 255, "確定前景が削られている");
+    assert_eq!(cut.get_pixel(5, 5)[3], 0, "確定背景が残っている");
 }

@@ -198,9 +198,13 @@ impl Constraints {
     ///
     /// 最近傍にするのは、確定領域の意味を変えないためである。補間すると
     /// 「半分だけ確定前景」という中間状態が生まれ、どちらへ丸めても
-    /// 指示が 1px 太るか痩せるかになる。最近傍では細い指示が間引かれうるが、
-    /// 探索段は順位を付けるためのものなので、そこは呑む。**最終段は原寸の
-    /// 指示そのまま**で回るので、書き出される画素には影響しない。
+    /// 指示が 1px 太るか痩せるかになる。
+    ///
+    /// **細い指示は丸ごと消えうる。** 最近傍は行と列を捨てるので、1px の線を
+    /// 10 分の 1 に縮めれば残らないことがあり、そのとき探索段は指示が無い
+    /// ものとして順位を付ける。呑んでいるのは、探索段が順位を付けるためだけの
+    /// ものだからである——**最終段は原寸の指示そのまま**で回るので、書き出される
+    /// 画素には影響しない。
     ///
     /// `sources` は引き継ぐ。写した表も「その入口が置いたもの」であることに
     /// 変わりはない。
@@ -730,5 +734,101 @@ mod tests {
         // 画像の外へ出る分は落ちるだけで、panic しない
         c.mark_disc(9, 9, 5, Constraint::ForcedFg);
         assert_eq!(c.at(9, 9), Constraint::ForcedFg);
+    }
+
+    /// 縮めても**確定前景は確定前景のまま**であること。
+    ///
+    /// `--optimize` の探索段はこれで指示を運ぶ。ここが意味を変えると、
+    /// トライマップを渡した画像で探索だけが別の世界を見ることになる。
+    #[test]
+    fn a_resampled_instruction_keeps_its_meaning() {
+        let mut c = Constraints::new(40, 20);
+        for y in 4..16 {
+            for x in 8..32 {
+                c.mark(x, y, Constraint::ForcedFg);
+            }
+        }
+        // 角の確定背景は 2x2 で置く。1px では**縮小で消えうる**
+        // （`a_hairline_instruction_can_vanish_when_resampled` を参照）
+        for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            c.mark(x, y, Constraint::ForcedBg);
+        }
+        c.note(ConstraintSource::Trimap);
+
+        let small = c.resampled(20, 10);
+        assert_eq!((small.width(), small.height()), (20, 10));
+        assert_eq!(
+            small.sources(),
+            &[ConstraintSource::Trimap],
+            "入口の名前は引き継ぐ"
+        );
+        // 塊の中は確定前景のまま。外は自由のまま
+        assert_eq!(small.at(10, 5), Constraint::ForcedFg);
+        assert_eq!(small.at(18, 8), Constraint::Free);
+        assert_eq!(small.at(0, 0), Constraint::ForcedBg);
+        // 面積はおおむね比で縮む（最近傍なので 1px の増減はありうる）
+        let (fg, bg) = small.counts();
+        assert!((66..=78).contains(&fg), "確定前景が縮小で消えている: {fg}");
+        assert_eq!(bg, 1);
+    }
+
+    /// 寸法 0 は panic せず、空の表を返す。
+    ///
+    /// `Constraints::new(0, 0)` は `flags` が空になる。添字を引く前に
+    /// 断っていなければ、**縮小の内側で範囲外参照になる。**
+    #[test]
+    fn a_resample_to_or_from_zero_never_panics() {
+        let mut c = Constraints::new(4, 4);
+        c.mark(1, 1, Constraint::ForcedFg);
+        for (w, h) in [(0, 4), (4, 0), (0, 0)] {
+            let out = c.resampled(w, h);
+            assert_eq!((out.width(), out.height()), (w, h));
+            assert_eq!(out.counts(), (0, 0));
+        }
+        assert_eq!(Constraints::new(0, 0).resampled(4, 4).counts(), (0, 0));
+    }
+
+    /// **細い指示は間引かれ切ることがある。** 最近傍は行と列を捨てるので、
+    /// 1px の線が縮小版から丸ごと消えうる。
+    ///
+    /// これは探索段だけの話である（最終段は原寸の指示そのままで回る）が、
+    /// 「指示を渡したのに候補の順位が指示無しと同じ」という形でしか現れない
+    /// ので、起こりうることをここに固定しておく。
+    #[test]
+    fn a_hairline_instruction_can_vanish_when_resampled() {
+        let mut c = Constraints::new(100, 4);
+        for y in 0..4 {
+            c.mark(1, y, Constraint::ForcedFg);
+        }
+        assert_eq!(c.counts().0, 4);
+        // 10 分の 1 では x=1 を代表する列が無くなる（0 と 10 が選ばれる）
+        assert_eq!(c.resampled(10, 4).counts().0, 0);
+        assert!(c.resampled(10, 4).is_empty());
+    }
+
+    /// 最近傍の式は画素の**中心**どうしを合わせ、端で飽和する。
+    ///
+    /// **`segment::grid_index` と同じ式でなければならない。** 2 本に分かれると、
+    /// 同じ指示が経路によって半画素ずれる。
+    #[test]
+    fn the_nearest_mapping_matches_pixel_centres() {
+        // 4 幅を 2 幅へ。中心 0.5/1.5/2.5/3.5 が 0.25/0.75/1.25/1.75 に落ちる
+        assert_eq!(
+            (0..4).map(|v| nearest(v, 4, 2)).collect::<Vec<_>>(),
+            vec![0, 0, 1, 1]
+        );
+        // 2 幅を 4 幅へ。中心はちょうど画素の境目に来るので、round の規約
+        // （0.5 は 0 から遠い側）でどちらへ倒れるかが決まる
+        assert_eq!(
+            (0..2).map(|v| nearest(v, 2, 4)).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        // 端は飽和する
+        assert_eq!(nearest(99, 100, 10), 9);
+        assert_eq!(nearest(0, 100, 10), 0);
+        // 寸法 0 は 0 を返す。**引き算が build の種類で panic したり
+        // ラップしたりしてはいけない**
+        assert_eq!(nearest(5, 0, 10), 0);
+        assert_eq!(nearest(5, 10, 0), 0);
     }
 }

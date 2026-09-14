@@ -2020,11 +2020,12 @@ fn print_the_optimize_rank_agreement() {
         )
     };
     // 良い順に並べた添字。中身は動かさずに順位だけを取る
-    let order = |trials: &[Trial], compare: fn(&Trial, &Trial) -> std::cmp::Ordering| -> Vec<usize> {
-        let mut index: Vec<usize> = (0..trials.len()).collect();
-        index.sort_by(|&a, &b| compare(&trials[a], &trials[b]));
-        index
-    };
+    let order =
+        |trials: &[Trial], compare: fn(&Trial, &Trial) -> std::cmp::Ordering| -> Vec<usize> {
+            let mut index: Vec<usize> = (0..trials.len()).collect();
+            index.sort_by(|&a, &b| compare(&trials[a], &trials[b]));
+            index
+        };
 
     println!(
         "\n| シーン | 候補 | 探索段の 1 位 | 原寸の 1 位 | 原寸 1 位の探索順位 | 原寸 1 位が上位 2 に居るか | search→final の比率（崩れていない候補の最大の落ち込み） |"

@@ -638,7 +638,7 @@ product.png  1600x2000  png  841.4 KB  (338 ms)
 | `--shadow-tolerance` | 35 | 実写の落ち影を**消す**明度(L\*)の落ち込みの上限。0 で影を残す |
 | `--shadow` | off | 切り抜いたアルファから落ち影を**合成する**。`off` / `synth`（[落ち影を合成する](#落ち影を合成する)） |
 | `--shadow-offset dx,dy` | 0,12 | 影をずらす量(px)。**長辺 1000px 換算**（基準は最終画像の長辺）。負値は上・左へ |
-| `--shadow-blur` | 10 | 影のぼかしの σ(px)。**長辺 1000px 換算**。0 でぼかさない |
+| `--shadow-blur` | 10 | 影のぼかしの σ(px)。**長辺 1000px 換算**。0 でぼかさない、上限 1000 |
 | `--shadow-color` | #000000 | 影の色 |
 | `--shadow-opacity` | 0.25 | 影の不透明度 (0.0-1.0) |
 | `--seal` | 1 | 幅 2N px 以下の隙間を通ってしか外周につながらない背景を前景へ戻す。0 で無効、上限 8 |
@@ -1598,7 +1598,7 @@ $ kiri cutout product.jpg -o product.png --canvas 1000 --shadow synth
 |---|---|---|
 | `--shadow` | `off` | `synth` で合成する。`off` なら成果物は 1 バイトも変わらない |
 | `--shadow-offset dx,dy` | `0,12` | 影をずらす量(px、長辺 1000px 換算)。負値は上・左へ |
-| `--shadow-blur σ` | `10` | ぼかしの σ(px、長辺 1000px 換算)。0 でぼかさない |
+| `--shadow-blur σ` | `10` | ぼかしの σ(px、長辺 1000px 換算)。0 でぼかさない、上限 1000 |
 | `--shadow-color` | `#000000` | 影の色 |
 | `--shadow-opacity` | `0.25` | 影の不透明度 (0.0-1.0) |
 
@@ -1633,7 +1633,7 @@ JPEG 出力では下地の上に焼き込まれる。
   "settings": { "shadow": "synth" },
   "shadow": {
     "offset": [0, 69],
-    "blur": 57.12,
+    "blur": 57.1664,
     "opacity": 0.25,
     "color": "#000000",
     "bounds": [31, 2063, 4283, 3522],
@@ -1643,14 +1643,27 @@ JPEG 出力では下地の上に焼き込まれる。
 ```
 
 `shadow` ブロックは **`synth` のときだけ**現れる（`constraints` と同じ規約）。
-頼んだかどうかは `settings.shadow` が常に言う。`bounds` は影が占めた矩形で、
-`clipped` は「ずらし＋ぼかしの範囲が外へ出た」ことを表す。**`bounds` が `null` でも
-`clipped` は真になりうる**——ずらし量が画像より大きければ影は 1 画素も残らないが、
-それは「影を置かなかった」のではなく「全部はみ出した」である。
+頼んだかどうかは `settings.shadow` が常に言う。
+
+`offset` と `blur` は**実際に効いた実寸の px** である。`blur` は要求した σ ではなく
+**箱型の幅が実現する σ** で、上の例では px@1000 の 10 が 57.12 へ換算され、幅
+`[113, 115, 115]` が実現する 57.1664 として返っている。σ が小さすぎて幅が 3 回とも
+1（恒等）に落ちるときは `0.0`——ぼかしていないのに σ を名乗ることはない。
+
+`bounds` は影が占めた矩形、`clipped` は**影の一部が画像の外にある**ことを表す。
+上の例で真なのは、リモコンが画像の幅いっぱいに写っていて影が左右の縁に達している
+ため（`bounds` の x が 31〜4283 で、画像の幅は 4284）。判定は最終の影のアルファで
+行うので、ぼかしの裾が丸めで消えていれば真にはならない。
+
+**`bounds` が `null` でも `clipped` は真になりうる。** ずらし量が画像より大きければ
+影は 1 画素も残らないが、それは「影を置かなかった」のではなく「全部はみ出した」で
+ある。`--shadow-opacity 0`（影を置かない指定）なら必ず偽になるので、2 つは
+`clipped` で見分けられる。
 
 ぼかしは箱型フィルタ 3 回でガウスを近似している（design.md 4.14）。移動和なので
-**σ をいくつにしても所要時間は変わらない**。24.5MP・σ 57px で合成の費用は
-約 0.13 秒（切り抜き全体 5.0 秒に対して）で、σ 228px でも同じだった。
+**σ をいくつ上げてもほとんど遅くならない**。24.5MP で合成そのものは σ 57px が
+159ms、σ 228px でも 167ms（切り抜き全体は 5.0 秒なので、`--shadow off` との差は
+実行ごとのばらつきに埋もれる）。
 
 `batch` の spec では `shadow` / `shadow_offset`（`[dx, dy]`）/ `shadow_blur` /
 `shadow_color` / `shadow_opacity` が同じ意味で使える。
@@ -1682,8 +1695,8 @@ JPEG 出力では下地の上に焼き込まれる。
     "step_tolerance": 2.2, "shadow_tolerance": 35.0, "seal": 1,
     "cleanup": 2, "feather": 1, "despill": true, "refine": true,
     "matting": "guided", "smooth_contour": 2.0, "reclassify": true,
-    "background_model": "flat", "shadow": "off",
-    "band_min_radius": 2, "smooth_radius_px": 2
+    "background_model": "flat",
+    "band_min_radius": 2, "smooth_radius_px": 2, "shadow": "off"
   },
   "mask": {
     "foreground_ratio": 0.2164,

@@ -674,7 +674,8 @@ fn fields() -> Vec<FieldEntry> {
             summary: "影のアルファが 0 より大きい画素の外接矩形 [x1, y1, x2, y2]",
             notes: Some(
                 "商品ではなく影の占める範囲である。--shadow-opacity 0 や、ずらし量が画像より\
-                 大きいときに null になる。どちらだったかは shadow.clipped が分ける",
+                 大きいときに null になる。どちらだったかは shadow.clipped が分ける\
+                 （前者は false、後者は true）",
             ),
         },
         FieldEntry {
@@ -685,11 +686,16 @@ fn fields() -> Vec<FieldEntry> {
             null_means: None,
             warns: vec![],
             gates: None,
-            summary: "ずらし＋ぼかしの範囲が画像（またはキャンバス）の外へ出たか",
+            summary: "影の一部が画像（またはキャンバス）の外にあるか",
             notes: Some(
-                "**shadow.bounds が null でも真になりうる。** ずらし量が画像より大きければ影は\
-                 1 画素も残らないが、それは「影を置かなかった」のではなく「全部はみ出した」で\
-                 ある。真のときに影を収めたければ --canvas を広げるか、--shadow-offset / \
+                "**最終の影のアルファで決める。** ずらしただけで画像の外へ落ちた画素があるか、\
+                 外周の 1 列・1 行に影が残っている（= その先へ続いていた）ときに true になる。\
+                 ぼかしの台が縁を跨いだかどうかでは決めない——箱型の台は約 3σ あるので、\
+                 裾が丸めで消えている場合まで true になってしまう。\
+                 **shadow.bounds が null でも true になりうる**——ずらし量が画像より大きければ\
+                 影は 1 画素も残らないが、それは「影を置かなかった」のではなく「全部はみ出した」\
+                 である。--shadow-opacity 0 は影を置かない指定なので必ず false。\
+                 true のときに影を収めたければ --canvas を広げるか、--shadow-offset / \
                  --shadow-blur を小さくする——**商品は影のために動かさない**ので、kiri が\
                  勝手に縮めることはない",
             ),

@@ -798,6 +798,46 @@ mod tests {
         assert_eq!(shadow_alpha(&out, 9, 22), 0, "外側へ漏れている");
     }
 
+    /// 24.5MP での合成そのものの所要時間を出す。
+    ///
+    /// **`cutout` 全体の `elapsed_ms` では測れない。** 切り抜きが 5 秒かかる
+    /// ので、その中の 0.2 秒は実行ごとのばらつき（実測で ±0.16 秒）に埋もれる。
+    /// design.md 4.14 の数値はここから取る。
+    ///
+    /// ```
+    /// cargo test --release --lib transform::shadow -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn print_the_blur_cost_on_a_large_alpha() {
+        use std::time::Instant;
+
+        // 実写素材と同じ 4284x5712（24.5MP）。中央に商品を置く
+        let (w, h) = (4284u32, 5712u32);
+        let product = block(w, h, w / 4, h / 4, w * 3 / 4, h * 3 / 4);
+
+        println!("24.5MP ({w}x{h})");
+        for sigma in [0.0, 57.12, 228.48] {
+            let spec = ShadowSpec {
+                offset: (0, 69),
+                sigma,
+                color: [0, 0, 0],
+                opacity: 0.25,
+            };
+            // 1 回目は確保で振れるので 2 回測って速いほうを採る
+            let mut best = f64::MAX;
+            for _ in 0..2 {
+                let input = product.clone();
+                let started = Instant::now();
+                let (out, _) = synth(input, &spec);
+                let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                std::hint::black_box(&out);
+                best = best.min(elapsed);
+            }
+            println!("  σ {sigma:>7.2}px  synth {best:>7.1} ms");
+        }
+    }
+
     /// 影の色は `--shadow-color` に従う。
     #[test]
     fn the_shadow_takes_the_requested_colour() {

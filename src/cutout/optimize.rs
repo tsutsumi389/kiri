@@ -192,7 +192,10 @@ pub fn candidates(
     subject: Option<&SubjectHint>,
     resolved: ResolvedModel,
 ) -> Vec<Candidate> {
-    let boxes: Vec<Option<CandidateBbox>> = if fixed.bbox {
+    // **矩形が渡っていれば、明示の印が無くてもそれだけを使う。** `--bbox` は
+    // 既定値を持たないので 2 つは同値だが、ライブラリの公開関数として
+    // 「利用者が指した矩形を黙って捨てる」経路を残さない
+    let boxes: Vec<Option<CandidateBbox>> = if fixed.bbox || base.bbox.is_some() {
         vec![base.bbox.map(CandidateBbox::Given)]
     } else {
         let mut boxes = vec![None];
@@ -724,6 +727,29 @@ mod tests {
         );
         assert_eq!(set.len(), 4);
         assert!(set.iter().all(|c| c.tolerance == 25.0));
+    }
+
+    /// 渡された矩形は、明示の印が無くても探索の軸から外れる。
+    ///
+    /// `--bbox` は既定値を持たないので 2 つは同値だが、ライブラリの公開関数として
+    /// 「利用者が指した矩形を黙って捨てる」経路を残さない。
+    #[test]
+    fn a_bbox_that_is_already_set_is_never_discarded() {
+        let base = CutoutOptions {
+            bbox: Some((5, 6, 70, 80)),
+            ..Default::default()
+        };
+        let set = candidates(
+            &base,
+            &free(),
+            Some(&hint(Confidence::High)),
+            ResolvedModel::Field,
+        );
+        assert_eq!(set.len(), 10);
+        assert!(
+            set.iter()
+                .all(|c| c.bbox == Some(CandidateBbox::Given((5, 6, 70, 80))))
+        );
     }
 
     /// 信頼度が `low` の主体は矩形の根拠にしない。

@@ -6637,6 +6637,18 @@ fn every_published_field_exists_in_the_result() {
         "--json",
         "--optimize",
     ]);
+    // **`shadow` も合成したときだけ現れる。** 既定の実行で探すと「配った path が
+    // 存在しない」になるので、影を足した実行も用意する（`constraints` と同じ扱い）
+    let shadowed = run(&[
+        "cutout",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--dry-run",
+        "--json",
+        "--shadow",
+        "synth",
+    ]);
     // **`segment` もモデルが走ったときだけ現れる。** モデルは 176MB あって
     // リポジトリにも CI にも置かないので、無ければその path だけを飛ばす。
     // 「配ったが確かめられなかった」と「配ったのに無い」は別で、後者だけを
@@ -6685,6 +6697,7 @@ fn every_published_field_exists_in_the_result() {
                 "info" => &info,
                 "cutout" if path.starts_with("constraints.") => &constrained,
                 "cutout" if path.starts_with("optimize.") => &optimized,
+                "cutout" if path.starts_with("shadow.") => &shadowed,
                 "cutout" => &cutout,
                 other => panic!("{path} が未知のコマンド {other} を名指ししている"),
             };

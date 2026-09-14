@@ -618,6 +618,83 @@ fn fields() -> Vec<FieldEntry> {
             ),
         },
         FieldEntry {
+            path: "settings.shadow",
+            appears_in: vec!["cutout"],
+            unit: "enum",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "落ち影を合成したか（off / synth）",
+            notes: Some(
+                "**--shadow-tolerance とは向きが逆である。** あちらは実写に写っている影を背景として\
+                 消す側で、こちらは消した後のアルファから影を作り直す側になる。off（既定）なら\
+                 成果物の画素は --shadow を足す前と 1 バイトも変わらず、shadow ブロックも現れない\
+                 （schema_version は据え置き）。実際に効いたずらし量とぼかしは shadow.offset / \
+                 shadow.blur のほう",
+            ),
+        },
+        FieldEntry {
+            path: "shadow.offset",
+            appears_in: vec!["cutout"],
+            unit: "px",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "影を実際にずらした量 [dx, dy]",
+            notes: Some(
+                "**指定値ではない。** --shadow-offset は長辺 1000px 換算で、基準は最終画像の長辺\
+                 （--canvas があればキャンバスの長辺、無ければ元画像の長辺）である。24.5MP の\
+                 素材に既定の 0,12 を渡すと 0,69 になる。負値は上・左へ出したことを意味する",
+            ),
+        },
+        FieldEntry {
+            path: "shadow.blur",
+            appears_in: vec!["cutout"],
+            unit: "px",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "影に実際に掛けたぼかしの σ",
+            notes: Some(
+                "shadow.offset と同じく長辺 1000px 換算からの掛け戻し。0 ならぼかしていない。\
+                 箱型フィルタ 3 回の近似なので、値をいくつにしても所要時間は変わらない",
+            ),
+        },
+        FieldEntry {
+            path: "shadow.bounds",
+            appears_in: vec!["cutout"],
+            unit: "px",
+            nullable: true,
+            null_means: Some("影が 1 画素も残らなかった。矩形が空（面積 0）ではない"),
+            warns: vec![],
+            gates: None,
+            summary: "影のアルファが 0 より大きい画素の外接矩形 [x1, y1, x2, y2]",
+            notes: Some(
+                "商品ではなく影の占める範囲である。--shadow-opacity 0 や、ずらし量が画像より\
+                 大きいときに null になる。どちらだったかは shadow.clipped が分ける",
+            ),
+        },
+        FieldEntry {
+            path: "shadow.clipped",
+            appears_in: vec!["cutout"],
+            unit: "bool",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "ずらし＋ぼかしの範囲が画像（またはキャンバス）の外へ出たか",
+            notes: Some(
+                "**shadow.bounds が null でも真になりうる。** ずらし量が画像より大きければ影は\
+                 1 画素も残らないが、それは「影を置かなかった」のではなく「全部はみ出した」で\
+                 ある。真のときに影を収めたければ --canvas を広げるか、--shadow-offset / \
+                 --shadow-blur を小さくする——**商品は影のために動かさない**ので、kiri が\
+                 勝手に縮めることはない",
+            ),
+        },
+        FieldEntry {
             path: "mask.foreground_ratio",
             appears_in: vec!["cutout"],
             unit: "ratio",

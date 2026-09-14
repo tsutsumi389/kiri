@@ -697,13 +697,9 @@ pub fn resolve_bbox(
         ));
     }
 
-    let x1 = scaled[0].floor().max(0.0) as u32;
-    let y1 = scaled[1].floor().max(0.0) as u32;
-    // 終点は画像内に収める。x1 より小さくならないよう下限も押さえる
-    let x2 = (scaled[2].ceil() as u32).min(width - 1).max(x1);
-    let y2 = (scaled[3].ceil() as u32).min(height - 1).max(y1);
-
-    Ok((x1, y1, x2, y2))
+    // 丸めの規約は `cutout::bbox_to_pixels` が 1 箇所で持つ。`--optimize` は
+    // 同じ矩形を寸法ごとに解き直すので、そこと式が分かれてはいけない
+    Ok(crate::cutout::bbox_to_pixels(scaled, width, height))
 }
 
 fn resolve_point(point: [f64; 2], normalized: bool, width: u32, height: u32) -> Result<(u32, u32)> {

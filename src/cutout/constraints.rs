@@ -189,6 +189,38 @@ impl Constraints {
         }
     }
 
+    /// 別の寸法へ最近傍で写した表を作る。
+    ///
+    /// **`--optimize` の探索段のためだけにある。** 候補を縮小版で回すのに、
+    /// 指示だけ原寸のままでは寸法が合わず、`foreground_mask` の規約に従って
+    /// 丸ごと無かったことにされる——利用者がトライマップを渡した画像で、
+    /// 探索だけが指示の無い世界で行われることになる。
+    ///
+    /// 最近傍にするのは、確定領域の意味を変えないためである。補間すると
+    /// 「半分だけ確定前景」という中間状態が生まれ、どちらへ丸めても
+    /// 指示が 1px 太るか痩せるかになる。最近傍では細い指示が間引かれうるが、
+    /// 探索段は順位を付けるためのものなので、そこは呑む。**最終段は原寸の
+    /// 指示そのまま**で回るので、書き出される画素には影響しない。
+    ///
+    /// `sources` は引き継ぐ。写した表も「その入口が置いたもの」であることに
+    /// 変わりはない。
+    pub fn resampled(&self, width: u32, height: u32) -> Constraints {
+        let mut out = Constraints::new(width, height);
+        out.sources = self.sources.clone();
+        if width == 0 || height == 0 || self.width == 0 || self.height == 0 {
+            return out;
+        }
+        for y in 0..height {
+            let sy = nearest(y, height, self.height);
+            for x in 0..width {
+                let sx = nearest(x, width, self.width);
+                let index = (y as usize) * (width as usize) + (x as usize);
+                out.flags[index] = self.flags[self.index(sx, sy)];
+            }
+        }
+        out
+    }
+
     /// 確定前景が 1 画素でもあるか。
     ///
     /// 表を確保するかどうかの判断に使う。`--fg-mask` だけを渡した実行で
@@ -384,6 +416,17 @@ impl Constraints {
         });
         marked
     }
+}
+
+/// 寸法 `from` の座標 `v` を、寸法 `to` の格子で最も近い座標へ写す。
+///
+/// 画素の中心どうしを合わせる（`+0.5` して比を掛け、`-0.5` で戻す）。左上を
+/// そのまま掛ける素朴な式だと、縮小のたびに半画素ずつ左上へ寄る。
+/// **`segment::to_constraints` が確率マップを原寸へ広げるときと同じ式**である
+/// ——確定領域を寸法の間で往き来させる道は 1 本だけにしておく。
+pub(crate) fn nearest(v: u32, from: u32, to: u32) -> u32 {
+    let mapped = ((f64::from(v) + 0.5) * f64::from(to) / f64::from(from) - 0.5).round();
+    (mapped.max(0.0) as u32).min(to - 1)
 }
 
 /// 円板に含まれる画素の添字を渡す。

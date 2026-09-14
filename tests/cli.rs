@@ -3632,6 +3632,334 @@ fn cutout_without_a_canvas_reports_no_canvas_field() {
     assert_eq!(v["outputs"][0]["width"], 120, "寸法は元のままであるべき");
 }
 
+// --- 落ち影の合成 (Phase 15) ---
+
+/// 影の合成を頼まない実行では、結果に `shadow` ブロックが現れない。
+///
+/// `null` も出さない（`constraints` と同じ規約）。走らなかった処理の
+/// 痕跡が残ると、エージェントは「合成したが影が出なかった」と読む。
+#[test]
+fn a_run_without_a_shadow_reports_no_shadow_block() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 160,
+        height: 160,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let v = cutout_on_canvas(dir.path(), &input, "out.png", &[]);
+    assert!(v.get("shadow").is_none(), "影を頼んでいないのに shadow が出た");
+    assert_eq!(
+        v["settings"]["shadow"], "off",
+        "settings.shadow は常に出すべき"
+    );
+}
+
+/// `--shadow off` は、`--shadow` を渡さない実行と 1 バイトも変わらない。
+#[test]
+fn an_explicit_shadow_off_writes_the_same_bytes_as_no_shadow_at_all() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    cutout_on_canvas(dir.path(), &input, "plain.png", &["--canvas", "400"]);
+    cutout_on_canvas(
+        dir.path(),
+        &input,
+        "off.png",
+        &["--canvas", "400", "--shadow", "off"],
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("plain.png")).unwrap(),
+        std::fs::read(dir.path().join("off.png")).unwrap(),
+        "--shadow off が成果物を変えている"
+    );
+}
+
+/// 効いた値は px@1000 から実寸へ掛け戻したものが出る。
+///
+/// 指定値をそのまま返すと、長辺が違う素材のあいだで同じ数字が違う見た目を
+/// 指すことになる。`settings.smooth_radius_px` と同じ理由で実寸を出す。
+#[test]
+fn a_synthetic_shadow_reports_the_pixels_that_actually_took_effect() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 400,
+        height: 400,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let v = cutout_on_canvas(dir.path(), &input, "out.png", &["--shadow", "synth"]);
+    assert_eq!(v["settings"]["shadow"], "synth");
+
+    let shadow = &v["shadow"];
+    // 長辺 400px なので、px@1000 の既定値 0,12 と σ 10 は 0.4 倍で効く
+    assert_eq!(
+        shadow["offset"],
+        serde_json::json!([0, 5]),
+        "オフセットが実寸に換算されていない: {shadow}"
+    );
+    assert_eq!(shadow["blur"], 4.0, "σ が実寸に換算されていない: {shadow}");
+    assert_eq!(shadow["opacity"], 0.25);
+    assert_eq!(shadow["color"], "#000000");
+    assert!(
+        shadow["bounds"].as_array().is_some_and(|b| b.len() == 4),
+        "影の矩形が出ていない: {shadow}"
+    );
+    assert!(
+        shadow["clipped"].is_boolean(),
+        "clipped が真偽で出ていない: {shadow}"
+    );
+}
+
+/// キャンバスの長辺が px@1000 の基準になる。
+#[test]
+fn the_canvas_long_side_is_what_px_at_1000_is_measured_against() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let v = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "out.png",
+        &["--canvas", "2000", "--shadow", "synth"],
+    );
+    assert_eq!(
+        v["shadow"]["offset"],
+        serde_json::json!([0, 24]),
+        "元画像 200px ではなくキャンバス 2000px を基準にすべき"
+    );
+    assert_eq!(v["shadow"]["blur"], 20.0);
+}
+
+/// 影を足しても商品の配置は動かず、切り抜きの診断値も動かない。
+///
+/// `fill_ratio` は商品だけで決める。影のぶん商品を小さくすると、同じ設定を
+/// 通した素材群で占有率が影の有無によって変わってしまう。
+#[test]
+fn a_shadow_moves_neither_the_product_nor_the_mask_statistics() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 300,
+        height: 300,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let off = cutout_on_canvas(dir.path(), &input, "off.png", &["--canvas", "1000"]);
+    let on = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "on.png",
+        &["--canvas", "1000", "--shadow", "synth"],
+    );
+
+    assert_eq!(off["canvas"], on["canvas"], "影で配置が変わっている");
+    assert_eq!(
+        off["mask"], on["mask"],
+        "影が切り抜きの診断値を動かしている（影は測る前に足してはいけない）"
+    );
+    assert_eq!(off["outputs"][0]["width"], on["outputs"][0]["width"]);
+    assert_eq!(off["outputs"][0]["height"], on["outputs"][0]["height"]);
+}
+
+/// 下地を塗るときの順序は「下地 → 影 → 商品」になる。
+#[test]
+fn a_flattened_canvas_shows_the_shadow_under_the_product_but_not_in_the_far_corner() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 300,
+        height: 300,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let v = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "out.png",
+        &[
+            "--canvas",
+            "1000",
+            "--fill-ratio",
+            "0.6",
+            "--flatten",
+            "--background",
+            "#FFFFFF",
+            "--shadow",
+            "synth",
+            "--shadow-offset",
+            "0,40",
+            "--shadow-blur",
+            "8",
+            "--shadow-opacity",
+            "0.5",
+        ],
+    );
+    let out = image::open(dir.path().join("out.png")).unwrap().to_rgba8();
+
+    let offset = v["canvas"]["offset"].as_array().unwrap();
+    let content = v["canvas"]["content"].as_array().unwrap();
+    let cx = (offset[0].as_u64().unwrap() + content[0].as_u64().unwrap() / 2) as u32;
+    let below = (offset[1].as_u64().unwrap() + content[1].as_u64().unwrap() + 10) as u32;
+
+    let under = out.get_pixel(cx, below).0;
+    assert_eq!(under[3], 255, "--flatten なのに透過が残っている");
+    assert!(
+        under[0] < 250,
+        "商品の下の余白が白のまま（影が落ちていない）: {under:?}"
+    );
+    assert_eq!(
+        out.get_pixel(3, 3).0,
+        [255, 255, 255, 255],
+        "商品から遠い角が純白でない"
+    );
+}
+
+/// 透過を保てる形式では、影は半透明のアルファとして残る。
+#[test]
+fn a_shadow_stays_translucent_when_the_format_keeps_alpha() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 300,
+        height: 300,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let v = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "out.png",
+        &[
+            "--canvas",
+            "1000",
+            "--fill-ratio",
+            "0.6",
+            "--shadow",
+            "synth",
+            "--shadow-offset",
+            "0,40",
+            "--shadow-blur",
+            "8",
+        ],
+    );
+    let out = image::open(dir.path().join("out.png")).unwrap().to_rgba8();
+
+    let offset = v["canvas"]["offset"].as_array().unwrap();
+    let content = v["canvas"]["content"].as_array().unwrap();
+    let cx = (offset[0].as_u64().unwrap() + content[0].as_u64().unwrap() / 2) as u32;
+    let below = (offset[1].as_u64().unwrap() + content[1].as_u64().unwrap() + 10) as u32;
+
+    let a = out.get_pixel(cx, below).0[3];
+    assert!(
+        a > 0 && a < 255,
+        "影が半透明のアルファとして残っていない: alpha={a}"
+    );
+    assert_eq!(out.get_pixel(3, 3).0[3], 0, "遠い角の余白が透明でない");
+}
+
+/// 影がキャンバスからはみ出しても寸法は変わらず、切れたことが報告される。
+#[test]
+fn a_shadow_running_off_the_canvas_is_clipped_and_says_so() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let v = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "out.png",
+        &[
+            "--canvas",
+            "500",
+            "--shadow",
+            "synth",
+            "--shadow-offset",
+            "0,900",
+        ],
+    );
+    assert_eq!(v["outputs"][0]["height"], 500, "寸法が変わっている");
+    assert_eq!(v["shadow"]["clipped"], true);
+    assert_eq!(v["canvas"]["content"], {
+        let plain = cutout_on_canvas(dir.path(), &input, "plain.png", &["--canvas", "500"]);
+        plain["canvas"]["content"].clone()
+    });
+}
+
+/// 負のオフセットで影を上・左へ出せる。
+#[test]
+fn a_negative_offset_throws_the_shadow_the_other_way() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 500,
+        height: 500,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let v = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "out.png",
+        &["--shadow", "synth", "--shadow-offset", "-20,-30"],
+    );
+    assert_eq!(v["shadow"]["offset"], serde_json::json!([-10, -15]));
+}
+
+/// 範囲外の指定は code を伴わない exit 2 で断る（clap の関門）。
+#[test]
+fn shadow_settings_outside_their_range_are_refused() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    for bad in [
+        vec!["--shadow-opacity", "1.5"],
+        vec!["--shadow-opacity", "-0.2"],
+        vec!["--shadow-blur", "-1"],
+        vec!["--shadow-color", "chartreuse"],
+        vec!["--shadow-offset", "1,2,3"],
+        vec!["--shadow", "drop"],
+    ] {
+        let mut args = vec![
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--json",
+            "--force",
+        ];
+        args.extend_from_slice(&bad);
+        let out = kiri().args(&args).output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{bad:?} が exit 2 で断られていない"
+        );
+    }
+}
+
 // --- batch (Phase 5) ---
 
 /// 商品画像を n 枚と spec.json を用意する。
@@ -4687,6 +5015,99 @@ fn a_misspelled_refine_key_suggests_the_right_one() {
     );
 }
 
+/// spec が影の 5 つのキーを受けること。
+#[test]
+fn batch_accepts_the_shadow_keys() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    write_png(dir.path(), "a.png", &img);
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        r##"{"defaults":{"canvas":"1000","shadow":"synth","shadow_offset":[6,20],
+                         "shadow_blur":4,"shadow_color":"#204060","shadow_opacity":0.4},
+             "items":[{"input":"a.png","output":"out.png"}]}"##,
+    )
+    .unwrap();
+
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = json_stdout(&out);
+    assert_eq!(json["succeeded"], 1);
+    let result = &json["results"][0]["result"];
+    assert_eq!(result["settings"]["shadow"], "synth");
+    assert_eq!(result["shadow"]["offset"], serde_json::json!([6, 20]));
+    assert_eq!(result["shadow"]["blur"], 4.0);
+    assert_eq!(result["shadow"]["color"], "#204060");
+    assert_eq!(result["shadow"]["opacity"], 0.4);
+}
+
+/// 影のキーの綴り違いも候補を返す。
+///
+/// `shadow_tolerance`（実写の影を消す側）と綴りが近いので、黙って無視されると
+/// 「消す側を指定したつもりが足す側だった」の取り違えが残る。
+#[test]
+fn a_misspelled_shadow_offset_key_suggests_the_right_one() {
+    let dir = fixture_dir();
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        r#"{"items":[{"input":"a.png","output":"b.png","shadow_ofset":[0,12]}]}"#,
+    )
+    .unwrap();
+
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let json = json_stdout(&out);
+    assert_eq!(json["error"]["code"], "SPEC_UNKNOWN_FIELD");
+    assert!(
+        json["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("shadow_offset"),
+        "候補に shadow_offset が出ていない: {}",
+        json["error"]["hint"]
+    );
+}
+
+/// spec でも範囲外の影の設定は断る（CLI と同じ関門）。
+#[test]
+fn an_out_of_range_shadow_opacity_is_refused_in_a_spec_too() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        ..Default::default()
+    });
+    write_png(dir.path(), "a.png", &img);
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        r#"{"items":[{"input":"a.png","output":"out.png","shadow":"synth","shadow_opacity":1.5}]}"#,
+    )
+    .unwrap();
+
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let json = json_stdout(&out);
+    assert_eq!(json["results"][0]["error"]["code"], "INVALID_SETTING");
+}
+
 // --- 既定値の重複 ---
 
 /// CLI の既定値とライブラリの既定値が食い違っていないこと。
@@ -5529,6 +5950,53 @@ fn schema_options_come_from_the_parser() {
     // 位置引数も出す。エージェントは入力の渡し方から知る必要がある
     assert_eq!(cutout["arguments"][0]["name"], "input");
     assert_eq!(cutout["arguments"][0]["required"], true);
+}
+
+/// 影の合成の 5 つのノブが契約に載ること。
+///
+/// **`--shadow-tolerance`（消す側）と綴りが並ぶ。** 6 つが同じ一覧に出て、
+/// それぞれの summary が「消す」「足す」のどちらなのかを言えていないと、
+/// エージェントは逆のノブを回す。
+#[test]
+fn schema_publishes_the_five_knobs_of_the_synthetic_shadow() {
+    let v = schema_json();
+    let cutout = v["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "cutout")
+        .expect("cutout が無い");
+    let option = |name: &str| -> Value {
+        cutout["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["name"] == name)
+            .unwrap_or_else(|| panic!("{name} が無い"))
+            .clone()
+    };
+
+    let accepts: Vec<String> = option("--shadow")["accepts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("--shadow が accepts を返さない"))
+        .iter()
+        .map(|x| x.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(accepts, vec!["off", "synth"]);
+    assert_eq!(option("--shadow")["default"], "off");
+    assert_eq!(option("--shadow-offset")["default"], "0,12");
+    assert_eq!(option("--shadow-blur")["default"], "10");
+    assert_eq!(option("--shadow-color")["default"], "#000000");
+    assert_eq!(option("--shadow-opacity")["default"], "0.25");
+
+    // 足す側と消す側が、1 行目だけで見分けられること
+    let adds = option("--shadow")["summary"].as_str().unwrap().to_string();
+    let removes = option("--shadow-tolerance")["summary"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(adds.contains("合成"), "足す側だと分からない: {adds}");
+    assert!(removes.contains("消す"), "消す側だと分からない: {removes}");
 }
 
 /// 契約に載っている code はすべて、実際に返りうる。

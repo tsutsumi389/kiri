@@ -51,15 +51,39 @@ pub const SEARCH_LONG_EDGE: u32 = 1500;
 /// 効けば実際に回るのは 1 つで済む。
 pub const FINALISTS: usize = 3;
 
+/// 「その候補は商品を飲んだ」とみなす前景比率の落ち込み。
+///
+/// **スコアは `eaten`（商品をどれだけ削ったか）を見られない。** 淡色商品では
+/// tolerance を上げると商品ごと背景として飲まれるが、飲まれた結果は
+/// 「halo が減った」「縁の汚染が消えた」という**良い数値**として現れる。
+/// 残った断片が外周に触れていなければ致命的な警告も出ない。
+///
+/// そこで、同じ bbox・同じモデルの列を許容量の昇順に見て、1 段上げたときに
+/// 前景比率がこれだけ落ちたら「減ったのは背景の残りではなく商品そのもの」と読む。
+///
+/// **この関門は R3（布との ΔE が 12 前後の淡色商品）で入れた。** 入れる前は
+/// tolerance 60 が選ばれ、商品が 100% 飲まれて輪郭誤差が 24.25 → 119.10 に
+/// なっていた。0.30 という値は R3 の列の落ち込み（0.19 → 0.01、実に 95%）と、
+/// 正常な列の最大の落ち込み（R1 の 0.30 → 0.21、28%）のあいだにある。
+pub const FOREGROUND_COLLAPSE: f64 = 0.30;
+
 /// 致命的な警告。**少ないほど良い**の第 1 位。
 ///
 /// どれも「切り抜きとして成立していない」を言う。品質の警告（縁の残り、
 /// 輪郭の粗さ）とは桁が違う失敗なので、重み和ではなく数で先に比べる。
-pub const FATAL_CODES: [WarningCode; 4] = [
+///
+/// **`BBOX_RECOMMENDED` を `SUBJECT_TOUCHES_EDGE` と並べて数える。** 2 つは
+/// 同じ事実（前景が外周に接している）の別の読み方で、`collect_warnings` は
+/// 「bbox 一つで解けるか」でどちらか一方だけを出す。片方を数えて片方を数えない
+/// と、**bbox 無しの候補だけが外周接触を無料で通過する**——bbox がまさに直す
+/// 失敗なのに、である。R6（柔らかい輪郭）では実際にそれが起き、矩形を使わない
+/// tolerance 60 が選ばれて輪郭誤差が 5.91 から 84.00 へ飛んだ。
+pub const FATAL_CODES: [WarningCode; 5] = [
     WarningCode::NotSeparable,
     WarningCode::ForegroundTooSmall,
     WarningCode::ForegroundTooLarge,
     WarningCode::SubjectTouchesEdge,
+    WarningCode::BboxRecommended,
 ];
 
 /// 品質の警告。早期打ち切りの条件に使う。
@@ -268,17 +292,37 @@ pub struct Trial {
     pub diagnostics: Diagnostics,
     /// 出た警告の code だけ。文言は実行ごとに変わるが code は契約である
     pub warnings: Vec<WarningCode>,
+    /// 同じ列の 1 つ手前より前景比率が `FOREGROUND_COLLAPSE` を超えて落ちたか。
+    ///
+    /// **候補そのものの性質であって、回した寸法の性質ではない。** 原寸で測り直しても
+    /// 引き継ぐ——列の中での位置は変わらないし、引き継がないと最終段で
+    /// `score.fatal` が素の数へ戻り、探索段で外したはずの候補が勝ち返す
+    pub collapsed: bool,
     pub score: Score,
 }
 
+/// 切り抜き 1 回の結果を順位付けの 3 つ組へ畳む。
+///
+/// **公開しているのは較正のためである。** 縮小探索の順位が原寸の順位と
+/// どれだけ合うかを測るには、ベンチ側が「同じ物差し」で並べ直せなければ
+/// ならない。物差しを書き写すとそこから離れる。
+pub fn score(result: &CutoutResult) -> Score {
+    Score {
+        fatal: result
+            .warnings
+            .iter()
+            .filter(|w| FATAL_CODES.contains(&w.code))
+            .count(),
+        quality: quality(&result.diagnostics),
+        separability: result.separability.unwrap_or(0.0),
+    }
+}
+
 impl Trial {
-    fn new(candidate: Candidate, stage: Stage, result: &CutoutResult) -> Self {
+    fn new(candidate: Candidate, stage: Stage, result: &CutoutResult, collapsed: bool) -> Self {
         let warnings: Vec<WarningCode> = result.warnings.iter().map(|w| w.code).collect();
-        let score = Score {
-            fatal: warnings.iter().filter(|c| FATAL_CODES.contains(*c)).count(),
-            quality: quality(&result.diagnostics),
-            separability: result.separability.unwrap_or(0.0),
-        };
+        let mut score = score(result);
+        score.fatal += usize::from(collapsed);
         Trial {
             candidate,
             stage,
@@ -287,6 +331,7 @@ impl Trial {
             separability: result.separability,
             diagnostics: result.diagnostics.clone(),
             warnings,
+            collapsed,
             score,
         }
     }
@@ -326,6 +371,56 @@ fn model_rank(model: BackgroundModel) -> u8 {
         BackgroundModel::Auto => 0,
         BackgroundModel::Flat => 1,
         BackgroundModel::Field => 2,
+    }
+}
+
+/// 商品を飲んだ候補に致命 +1 を足す。
+///
+/// **同じ bbox・同じモデルの列を、許容量の昇順に見る。** 直前の候補から前景比率が
+/// `FOREGROUND_COLLAPSE` を超えて落ちていたら、その候補は商品を飲んでいる。
+/// 列をまたいで比べないのは、bbox の有無やモデルの違いだけで前景比率が
+/// 何倍も動くためで、そこを混ぜると「矩形を与えたら飲まれた」と読んでしまう。
+///
+/// 落ち込みは**以降へ伝播させる**。60 で飲まれた列では 45 も既に飲まれている
+/// ことが多く、そこだけ無傷に見せると 1 つ手前が勝ってしまう。
+fn penalise_collapse(trials: &mut [Trial]) {
+    let key = |t: &Trial| {
+        (
+            t.candidate.bbox.is_some(),
+            model_rank(t.candidate.background_model),
+        )
+    };
+    let mut groups: Vec<(bool, u8)> = Vec::new();
+    for t in trials.iter() {
+        if !groups.contains(&key(t)) {
+            groups.push(key(t));
+        }
+    }
+    for group in groups {
+        let mut column: Vec<usize> = (0..trials.len())
+            .filter(|&i| key(&trials[i]) == group)
+            .collect();
+        column.sort_by(|&i, &j| {
+            trials[i]
+                .candidate
+                .tolerance
+                .total_cmp(&trials[j].candidate.tolerance)
+        });
+        let mut collapsed = false;
+        let mut previous: Option<f64> = None;
+        for i in column {
+            let ratio = trials[i].foreground_ratio;
+            if previous
+                .is_some_and(|before| before > 0.0 && ratio < before * (1.0 - FOREGROUND_COLLAPSE))
+            {
+                collapsed = true;
+            }
+            if collapsed && !trials[i].collapsed {
+                trials[i].collapsed = true;
+                trials[i].score.fatal += 1;
+            }
+            previous = Some(ratio);
+        }
     }
 }
 
@@ -394,10 +489,11 @@ pub fn optimize(
         .iter()
         .map(|candidate| {
             let opts = with(&search_base, candidate, source, target);
-            Trial::new(*candidate, Stage::Search, &cutout(&small, &opts))
+            Trial::new(*candidate, Stage::Search, &cutout(&small, &opts), false)
         })
         .collect();
     drop(small);
+    penalise_collapse(&mut trials);
     // 安定ソート。`better` が全順序を返すので、同じ入力からは必ず同じ並びが出る
     trials.sort_by(better);
 
@@ -407,7 +503,7 @@ pub fn optimize(
         let candidate = trials[i].candidate;
         let options = with(base, &candidate, source, source);
         let result = cutout(image, &options);
-        let trial = Trial::new(candidate, Stage::Final, &result);
+        let trial = Trial::new(candidate, Stage::Final, &result, trials[i].collapsed);
         let win = best
             .as_ref()
             .is_none_or(|(_, _, _, held)| better(&trial, held) == Ordering::Less);
@@ -435,6 +531,7 @@ pub fn optimize(
                 },
                 Stage::Final,
                 &result,
+                false,
             );
             trials.push(trial.clone());
             (trials.len() - 1, result, base.clone(), trial)
@@ -657,6 +754,7 @@ mod tests {
             separability: Some(separability),
             diagnostics: unmeasured(),
             warnings: Vec::new(),
+            collapsed: false,
             score: Score {
                 fatal,
                 quality,
@@ -740,6 +838,54 @@ mod tests {
             rim_contamination: Some(0.0),
         };
         assert_eq!(quality(&clean), 0.0);
+    }
+
+    /// 許容量を上げて前景比率が 3 割を超えて落ちた候補以降は、商品を飲んだ側。
+    #[test]
+    fn a_collapsing_foreground_is_treated_as_a_fatal_candidate() {
+        let mut trials: Vec<Trial> = [(12.0, 0.30), (20.0, 0.29), (30.0, 0.05), (45.0, 0.04)]
+            .into_iter()
+            .map(|(tolerance, ratio)| {
+                let mut t = trial(0, 1.0, 10.0, plain(tolerance));
+                t.foreground_ratio = ratio;
+                t
+            })
+            .collect();
+        penalise_collapse(&mut trials);
+        assert_eq!(
+            trials.iter().map(|t| t.score.fatal).collect::<Vec<_>>(),
+            vec![0, 0, 1, 1],
+            "落ち込みは以降へ伝播するべき"
+        );
+    }
+
+    /// 別の bbox・別のモデルの列は混ぜない。
+    ///
+    /// 矩形を与えるだけで前景比率は何倍も動く。列をまたいで比べると
+    /// 「矩形を与えたら飲まれた」と読んでしまう。
+    #[test]
+    fn the_collapse_gate_compares_within_one_column() {
+        let boxed = Candidate {
+            bbox: Some(CandidateBbox::Subject([0.1, 0.1, 0.9, 0.9])),
+            ..plain(12.0)
+        };
+        let mut trials = vec![
+            {
+                let mut t = trial(0, 1.0, 10.0, plain(12.0));
+                t.foreground_ratio = 0.50;
+                t
+            },
+            {
+                let mut t = trial(0, 1.0, 10.0, boxed);
+                t.foreground_ratio = 0.20;
+                t
+            },
+        ];
+        penalise_collapse(&mut trials);
+        assert!(
+            trials.iter().all(|t| t.score.fatal == 0),
+            "bbox の違う候補どうしを比べてはいけない"
+        );
     }
 
     /// 矩形は寸法ごとに解き直す。**利用者の指定は原寸で 1px も動かさない。**

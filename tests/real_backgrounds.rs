@@ -1802,3 +1802,303 @@ fn the_model_trimap_is_not_worse_than_one_made_from_the_truth() {
         );
     }
 }
+
+// --- 探索を kiri に任せる（--optimize, Phase 15） ---
+
+/// `--optimize` を「bbox 無し・既定値から出発」で回した結果。
+///
+/// `Optimized` をそのまま返さない。1200x1200 の RGBA を 7 シーンぶん抱えると
+/// 表を作るだけでメモリが跳ねる（`RealRun` と同じ理由）。
+struct OptimizedRun {
+    metrics: EdgeMetrics,
+    warnings: Vec<String>,
+    tolerance: f64,
+    bbox: Option<(u32, u32, u32, u32)>,
+    background_model: &'static str,
+}
+
+fn optimized(scene: &common::RealScene) -> OptimizedRun {
+    use kiri::cutout::optimize::{OptimizeFixed, optimize};
+
+    let truth = common::real_scene(scene);
+    let found = optimize(
+        &truth.image,
+        &CutoutOptions::default(),
+        &OptimizeFixed::default(),
+    )
+    .expect("探索が失敗した");
+    OptimizedRun {
+        metrics: common::measure_edges_with(
+            &truth,
+            &found.result.image,
+            &found.result.mask,
+            found.options.bbox,
+            None,
+        ),
+        warnings: found
+            .result
+            .warnings
+            .iter()
+            .map(|w| w.code.as_str().to_string())
+            .collect(),
+        tolerance: found.options.tolerance,
+        bbox: found.options.bbox,
+        background_model: found.result.background_model.as_str(),
+    }
+}
+
+/// **探索が `assisted` と同等以上に届くこと。**
+///
+/// `assisted` は「エージェントが kiri 自身の hint に従って 3 手で到達する設定」
+/// である（`BBOX_RECOMMENDED` の矩形と、`HALO_REMAINS` の hint に従って上げた
+/// `--tolerance`）。`--optimize` はその 3 手を kiri の中へ畳んだものなので、
+/// 出てくる絵が 3 手ループに負けるなら畳んだ意味が無い。
+///
+/// 見るのは正解由来の 3 つだけにする。`contour_error` と `rim_truth` は
+/// 「輪郭が正しい場所にあるか」、`eaten` は「商品を削っていないか」を言う。
+/// 診断値（`contour_roughness` など）はスコアが最適化している当のものなので、
+/// それで合否を決めると探索が自分の物差しで自分を採点することになる。
+///
+/// 1.1 倍と +0.02 の余裕は、**探索が別の設定を選ぶこと自体は許す**ためである。
+/// 20 候補の中に `assisted` とまったく同じ組が無いこともあり（`assisted` の
+/// 矩形は正解由来で、探索が使うのは色から測った主体の矩形である）、
+/// 同一性ではなく水準を問う。
+///
+/// # R3 だけは `assisted` に届かない
+///
+/// **`assisted` が使う矩形を `--optimize` は作れない。** ベンチの `assisted` は
+/// **正解由来**の矩形（真の輪郭 + 余白 5%）を与えているが、探索が使えるのは
+/// 色から測った `subject.normalized_bbox` だけで、R3 の主体は信頼度 `low` と
+/// 判定される（布との ΔE が 12 前後しかなく、塊としてまとまらない）。
+/// `low` の矩形を根拠に動かないのは `subject.rs` からの規約なので、R3 の
+/// 候補集合には**矩形を使う候補が 1 つも無い**。
+///
+/// 矩形が無ければ、この素材では商品と背景を分ける許容量が存在しない——
+/// 10 候補すべてで `SUBJECT_TOUCHES_EDGE` が出て、いちばん良い候補でも
+/// 輪郭誤差は 110 を下回らない（`assisted` は 24.25）。**これは探索の失敗では
+/// なく素材の限界で、`--optimize` はそれを `OPTIMIZE_NO_CLEAN_CANDIDATE` で
+/// 正しく報せている。**
+///
+/// しきい値をベンチに合わせて緩めることはしない。代わりに R3 だけ期待値を
+/// **現状の値で固定する**。等号ではなく僅かな余裕を付けるのは、JPEG の
+/// 丸めや浮動小数の並びで最終桁が動くためである。**悪化は検出できる。**
+const R3_PINNED: (f32, f32, f32) = (119.70, 0.999, 1.0000);
+
+/// **探索が `assisted` と同等以上に届くこと。**
+///
+/// `assisted` は「エージェントが kiri 自身の hint に従って 3 手で到達する設定」
+/// である（`BBOX_RECOMMENDED` の矩形と、`HALO_REMAINS` の hint に従って上げた
+/// `--tolerance`）。`--optimize` はその 3 手を kiri の中へ畳んだものなので、
+/// 出てくる絵が 3 手ループに負けるなら畳んだ意味が無い。
+///
+/// 見るのは正解由来の 3 つだけにする。`contour_error` と `rim_truth` は
+/// 「輪郭が正しい場所にあるか」、`eaten` は「商品を削っていないか」を言う。
+/// 診断値（`contour_roughness` など）はスコアが最適化している当のものなので、
+/// それで合否を決めると探索が自分の物差しで自分を採点することになる。
+///
+/// 1.1 倍と +0.02 の余裕は、**探索が別の設定を選ぶこと自体は許す**ためである。
+/// 20 候補の中に `assisted` とまったく同じ組が無いこともあり（`assisted` の
+/// 矩形は正解由来で、探索が使うのは色から測った主体の矩形である）、
+/// 同一性ではなく水準を問う。
+///
+/// R3 だけは `R3_PINNED` を参照。理由はそちらに書いた。
+#[test]
+fn optimize_reaches_the_assisted_quality_without_a_bbox() {
+    for scene in real_scenes() {
+        let (_, runs) = run_real(&scene);
+        let assisted = runs
+            .iter()
+            .find(|r| r.setting == "assisted")
+            .expect("assisted がある");
+        let found = optimized(&scene);
+        let (metrics, tolerance) = (&found.metrics, found.tolerance);
+        let pinned = scene.name.starts_with("R3");
+        let (want_contour, want_rim, want_eaten) = if pinned {
+            (R3_PINNED.0 * 1.01, R3_PINNED.1 * 1.01, R3_PINNED.2)
+        } else {
+            (
+                assisted.metrics.contour_error * 1.1,
+                assisted.metrics.rim_truth * 1.1,
+                assisted.metrics.eaten + 0.02,
+            )
+        };
+        let against = if pinned { "固定値" } else { "assisted" };
+
+        assert!(
+            metrics.contour_error <= want_contour,
+            "{}: 輪郭誤差が{against}より悪化した: {:.2} > {want_contour:.2}（選ばれた tolerance {tolerance}）",
+            scene.name,
+            metrics.contour_error,
+        );
+        assert!(
+            metrics.rim_truth <= want_rim,
+            "{}: rim 正解が{against}より悪化した: {:.3} > {want_rim:.3}（選ばれた tolerance {tolerance}）",
+            scene.name,
+            metrics.rim_truth,
+        );
+        assert!(
+            metrics.eaten <= want_eaten,
+            "{}: {against}より商品を削っている: {:.4} > {want_eaten:.4}（選ばれた tolerance {tolerance}）",
+            scene.name,
+            metrics.eaten,
+        );
+    }
+}
+
+/// R3 では候補が 1 つも綺麗にならず、**そう報せる**こと。
+///
+/// `R3_PINNED` が言う「素材の限界」は、数値を固定しただけでは伝わらない。
+/// 利用者が受け取るのは警告なので、そこに出ていることを別に固定する。
+#[test]
+fn a_pale_product_on_fabric_is_reported_as_having_no_clean_candidate() {
+    use kiri::cutout::optimize::{OptimizeFixed, optimize};
+
+    let scene = real_scenes()
+        .into_iter()
+        .find(|s| s.name.starts_with("R3"))
+        .expect("R3 がある");
+    let truth = common::real_scene(&scene);
+    let found = optimize(
+        &truth.image,
+        &CutoutOptions::default(),
+        &OptimizeFixed::default(),
+    )
+    .expect("探索が失敗した");
+
+    assert!(
+        found.warning.is_some(),
+        "どの候補も致命的な警告を残しているのに黙っている"
+    );
+    assert!(
+        found.options.bbox.is_none(),
+        "信頼度 low の主体から矩形を作ってはいけない"
+    );
+    assert!(
+        found.trials.iter().all(|t| t.score.fatal > 0),
+        "致命的でない候補があるなら、それが選ばれるべきだった"
+    );
+}
+
+/// 縮小探索の順位が、原寸の順位をどれだけ言い当てるか。
+///
+/// **テストにはしない。** 一致率は素材で動く数で、しきい値を置けば
+/// 「素材を選んだ」ことにしかならない。docs/design.md 4.13 の表はここから取る。
+///
+/// R シーンは 1200px なので `SEARCH_LONG_EDGE`（1500）に掛からず、**縮小は
+/// 起きない**。ここで測っているのは「境界処理（refine）を切った順位が、
+/// 切らない順位をどれだけ言い当てるか」である。縮小そのものの影響は実写
+/// （4284x5712）で測る——そちらの表も design.md に並べてある。
+///
+/// cargo test --release --test real_backgrounds -- --ignored --nocapture print_the_optimize_rank_agreement
+#[test]
+#[ignore = "較正の表を出すだけ。しきい値は持たない"]
+fn print_the_optimize_rank_agreement() {
+    use kiri::cutout::optimize::{Candidate, OptimizeFixed, Score, candidates, score};
+    use kiri::cutout::{BackgroundModel, DEFAULT_BORDER, analyse_background};
+
+    let label = |c: &Candidate| {
+        format!(
+            "{:>2} / {:<4} / {}",
+            c.tolerance,
+            if c.bbox.is_some() { "box" } else { "none" },
+            if c.background_model == BackgroundModel::Auto {
+                "auto"
+            } else {
+                "flat"
+            }
+        )
+    };
+    // 良い順に並べた添字。`Score::better` と同じ物差しで並べる
+    let order = |scores: &[Score]| -> Vec<usize> {
+        let mut index: Vec<usize> = (0..scores.len()).collect();
+        index.sort_by(|&a, &b| scores[a].better(&scores[b]));
+        index
+    };
+
+    println!("\n| シーン | 候補 | 探索段の 1 位 | 原寸の 1 位 | 原寸 1 位の探索順位 |");
+    println!("|---|---|---|---|---|");
+    for scene in real_scenes()
+        .into_iter()
+        .filter(|s| ["R1", "R2", "R7"].iter().any(|p| s.name.starts_with(p)))
+    {
+        let truth = common::real_scene(&scene);
+        let analysis = analyse_background(
+            &truth.image,
+            DEFAULT_BORDER,
+            BackgroundModel::Auto,
+            None,
+            None,
+        );
+        let set = candidates(
+            &CutoutOptions::default(),
+            &OptimizeFixed::default(),
+            analysis.subject.as_ref(),
+            analysis.model,
+        );
+        let (w, h) = (truth.image.width(), truth.image.height());
+        let run = |c: &Candidate, refine: bool| -> Score {
+            let opts = CutoutOptions {
+                tolerance: c.tolerance,
+                bbox: c.bbox.map(|b| b.resolve((w, h), (w, h))),
+                background_model: c.background_model,
+                refine,
+                ..Default::default()
+            };
+            score(&cutout(&truth.image, &opts))
+        };
+        let search: Vec<Score> = set.iter().map(|c| run(c, false)).collect();
+        let full: Vec<Score> = set.iter().map(|c| run(c, true)).collect();
+        let (sorted_search, sorted_full) = (order(&search), order(&full));
+        let winner = sorted_full[0];
+        let rank = sorted_search.iter().position(|&i| i == winner).unwrap() + 1;
+        println!(
+            "| {} | {} | {} | {} | {} |",
+            scene.name,
+            set.len(),
+            label(&set[sorted_search[0]]),
+            label(&set[winner]),
+            rank
+        );
+    }
+}
+
+/// `--optimize` が選んだ設定と、その正解由来の指標を `assisted` と並べる。
+///
+/// **テストにはしない。** design.md 4.13 の R1〜R7 の表はここから取る。
+///
+/// cargo test --release --test real_backgrounds -- --ignored --nocapture print_the_optimize_comparison
+#[test]
+#[ignore = "比較の表を出すだけ。合否は optimize_reaches_the_assisted_quality_without_a_bbox が持つ"]
+fn print_the_optimize_comparison() {
+    println!("\n| シーン | 設定 | tolerance | bbox | contour_error | rim_truth | eaten | 警告 |");
+    println!("|---|---|---|---|---|---|---|---|");
+    for scene in real_scenes() {
+        let (_, runs) = run_real(&scene);
+        let assisted = runs.iter().find(|r| r.setting == "assisted").unwrap();
+        println!(
+            "| {} | assisted | {} | あり | {:.2} | {:.3} | {:.4} | {} |",
+            scene.name,
+            assisted.tolerance,
+            assisted.metrics.contour_error,
+            assisted.metrics.rim_truth,
+            assisted.metrics.eaten,
+            assisted.warnings.join(" ")
+        );
+        let found = optimized(&scene);
+        println!(
+            "| {} | optimize ({}) | {} | {} | {:.2} | {:.3} | {:.4} | {} |",
+            scene.name,
+            found.background_model,
+            found.tolerance,
+            if found.bbox.is_some() {
+                "あり"
+            } else {
+                "なし"
+            },
+            found.metrics.contour_error,
+            found.metrics.rim_truth,
+            found.metrics.eaten,
+            found.warnings.join(" ")
+        );
+    }
+}

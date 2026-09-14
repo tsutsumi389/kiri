@@ -474,9 +474,14 @@ fn tie_break(a: &Trial, b: &Trial) -> Ordering {
 /// 実装のバージョンで変わる。**決定的であることは kiri の売りなので、順序も
 /// 環境で動いてはいけない。**
 pub fn better_search(a: &Trial, b: &Trial) -> Ordering {
+    // **測れなかった `separability` は最下位に置く。** `score.separability` は
+    // 報告のために `null` を 0.0 へ畳んでいるが、探索段でそれを使うと
+    // 「測れる境界が無かった」候補が「商品と背景の色が同じ」候補と同点になる。
+    // 前者は順位を付ける手がかりが 1 つも無いのだから、後ろで良い
+    let sep = |t: &Trial| t.separability.unwrap_or(f64::NEG_INFINITY);
     a.search_fatal_rank()
         .cmp(&b.search_fatal_rank())
-        .then_with(|| b.score.separability.total_cmp(&a.score.separability))
+        .then_with(|| sep(b).total_cmp(&sep(a)))
         .then_with(|| tie_break(a, b))
 }
 
@@ -1048,12 +1053,35 @@ mod tests {
         // 最終段では逆になる。**同じ 2 つを別の物差しが別の順に並べる**
         assert_eq!(better_final(&quiet, &edgy), Ordering::Less);
 
+        // 矩形の勧めも同じ事実の別の読み方なので、同じく見ない
+        let advised = with_warnings(
+            trial(0, 9.9, 50.0, plain(60.0)),
+            &[WarningCode::BboxRecommended],
+        );
+        assert_eq!(better_search(&advised, &quiet), Ordering::Less);
+
         // 前景比率そのものの失敗は探索段でも数える
         let tiny = with_warnings(
             trial(0, 0.0, 99.0, plain(12.0)),
             &[WarningCode::ForegroundTooSmall],
         );
         assert_eq!(better_search(&quiet, &tiny), Ordering::Less);
+    }
+
+    /// 測れなかった `separability` は、0.0 と測れた候補より**後ろ**。
+    ///
+    /// 2 つは別のことを言っている——`null` は「測れる境界が無かった」で、
+    /// 0.0 は「商品と背景の色が同じだった」である。報告用の
+    /// `score.separability` は `null` を 0.0 へ畳むので、探索段はそちらを
+    /// 使ってはいけない。
+    #[test]
+    fn an_unmeasurable_separability_ranks_below_a_measured_zero() {
+        let mut blind = trial(0, 1.0, 0.0, plain(12.0));
+        blind.separability = None;
+        let zero = trial(0, 1.0, 0.0, plain(60.0));
+        assert_eq!(better_search(&zero, &blind), Ordering::Less);
+        // tie-break（小さい tolerance）より先に決まること。逆なら blind が勝つ
+        assert_eq!(better_search(&blind, &zero), Ordering::Greater);
     }
 
     /// 同点なら小さい tolerance、次に bbox 無し、次に `auto`。**両方の段で。**

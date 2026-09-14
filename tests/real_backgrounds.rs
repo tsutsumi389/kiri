@@ -1847,22 +1847,7 @@ fn optimized(scene: &common::RealScene) -> OptimizedRun {
     }
 }
 
-/// **探索が `assisted` と同等以上に届くこと。**
-///
-/// `assisted` は「エージェントが kiri 自身の hint に従って 3 手で到達する設定」
-/// である（`BBOX_RECOMMENDED` の矩形と、`HALO_REMAINS` の hint に従って上げた
-/// `--tolerance`）。`--optimize` はその 3 手を kiri の中へ畳んだものなので、
-/// 出てくる絵が 3 手ループに負けるなら畳んだ意味が無い。
-///
-/// 見るのは正解由来の 3 つだけにする。`contour_error` と `rim_truth` は
-/// 「輪郭が正しい場所にあるか」、`eaten` は「商品を削っていないか」を言う。
-/// 診断値（`contour_roughness` など）はスコアが最適化している当のものなので、
-/// それで合否を決めると探索が自分の物差しで自分を採点することになる。
-///
-/// 1.1 倍と +0.02 の余裕は、**探索が別の設定を選ぶこと自体は許す**ためである。
-/// 20 候補の中に `assisted` とまったく同じ組が無いこともあり（`assisted` の
-/// 矩形は正解由来で、探索が使うのは色から測った主体の矩形である）、
-/// 同一性ではなく水準を問う。
+/// R3 だけ引いてある期待値（輪郭誤差 / rim 正解 / eaten）。**現状の値である。**
 ///
 /// # R3 だけは `assisted` に届かない
 ///
@@ -2007,11 +1992,19 @@ fn a_pale_product_on_fabric_is_reported_as_having_no_clean_candidate() {
 /// 切らない順位をどれだけ言い当てるか」である。縮小そのものの影響は実写
 /// （4284x5712）で測る——そちらの表も design.md に並べてある。
 ///
+/// **物差しは本番のものをそのまま使う。** 探索段は `better_search`、原寸は
+/// `better_final` で、崩れの印も本番と同じ手順で付ける（探索段は列の比較、
+/// 原寸は同じ候補の探索段の前景比率との比較）。ここで別の比較子を書き写すと、
+/// 表は「書き写した物差しの一致率」を語ることになる。
+///
 /// cargo test --release --test real_backgrounds -- --ignored --nocapture print_the_optimize_rank_agreement
 #[test]
 #[ignore = "較正の表を出すだけ。しきい値は持たない"]
 fn print_the_optimize_rank_agreement() {
-    use kiri::cutout::optimize::{Candidate, OptimizeFixed, Score, candidates, score};
+    use kiri::cutout::optimize::{
+        Candidate, FOREGROUND_COLLAPSE, OptimizeFixed, Stage, Trial, better_final, better_search,
+        candidates, penalise_collapse,
+    };
     use kiri::cutout::{BackgroundModel, DEFAULT_BORDER, analyse_background};
 
     let label = |c: &Candidate| {
@@ -2026,15 +2019,17 @@ fn print_the_optimize_rank_agreement() {
             }
         )
     };
-    // 良い順に並べた添字。`Score::better` と同じ物差しで並べる
-    let order = |scores: &[Score]| -> Vec<usize> {
-        let mut index: Vec<usize> = (0..scores.len()).collect();
-        index.sort_by(|&a, &b| scores[a].better(&scores[b]));
+    // 良い順に並べた添字。中身は動かさずに順位だけを取る
+    let order = |trials: &[Trial], compare: fn(&Trial, &Trial) -> std::cmp::Ordering| -> Vec<usize> {
+        let mut index: Vec<usize> = (0..trials.len()).collect();
+        index.sort_by(|&a, &b| compare(&trials[a], &trials[b]));
         index
     };
 
-    println!("\n| シーン | 候補 | 探索段の 1 位 | 原寸の 1 位 | 原寸 1 位の探索順位 |");
-    println!("|---|---|---|---|---|");
+    println!(
+        "\n| シーン | 候補 | 探索段の 1 位 | 原寸の 1 位 | 原寸 1 位の探索順位 | 原寸 1 位が上位 2 に居るか | search→final の比率（崩れていない候補の最大の落ち込み） |"
+    );
+    println!("|---|---|---|---|---|---|---|");
     for scene in real_scenes()
         .into_iter()
         .filter(|s| ["R1", "R2", "R7"].iter().any(|p| s.name.starts_with(p)))
@@ -2054,7 +2049,7 @@ fn print_the_optimize_rank_agreement() {
             analysis.model,
         );
         let (w, h) = (truth.image.width(), truth.image.height());
-        let run = |c: &Candidate, refine: bool| -> Score {
+        let run = |c: &Candidate, refine: bool| -> kiri::cutout::CutoutResult {
             let opts = CutoutOptions {
                 tolerance: c.tolerance,
                 bbox: c.bbox.map(|b| b.resolve((w, h), (w, h))),
@@ -2062,20 +2057,48 @@ fn print_the_optimize_rank_agreement() {
                 refine,
                 ..Default::default()
             };
-            score(&cutout(&truth.image, &opts))
+            cutout(&truth.image, &opts)
         };
-        let search: Vec<Score> = set.iter().map(|c| run(c, false)).collect();
-        let full: Vec<Score> = set.iter().map(|c| run(c, true)).collect();
-        let (sorted_search, sorted_full) = (order(&search), order(&full));
+        let mut search: Vec<Trial> = set
+            .iter()
+            .map(|c| Trial::new(*c, Stage::Search, &run(c, false), false))
+            .collect();
+        penalise_collapse(&mut search);
+        // 原寸の崩れは本番と同じく「同じ候補の探索段の比率」と比べる
+        let full: Vec<Trial> = set
+            .iter()
+            .zip(&search)
+            .map(|(c, s)| {
+                let result = run(c, true);
+                let collapsed = s.collapsed
+                    || (s.foreground_ratio > 0.0
+                        && result.stats.foreground_ratio
+                            < s.foreground_ratio * (1.0 - FOREGROUND_COLLAPSE));
+                Trial::new(*c, Stage::Final, &result, collapsed)
+            })
+            .collect();
+
+        let sorted_search = order(&search, better_search);
+        let sorted_full = order(&full, better_final);
         let winner = sorted_full[0];
         let rank = sorted_search.iter().position(|&i| i == winner).unwrap() + 1;
+        // 崩れていない候補が search → final でどれだけ動くか。
+        // `FOREGROUND_COLLAPSE`（0.30）の余裕を確かめるための数
+        let drift = search
+            .iter()
+            .zip(&full)
+            .filter(|(_, f)| !f.collapsed && f.foreground_ratio > 0.0)
+            .map(|(s, f)| 1.0 - f.foreground_ratio / s.foreground_ratio)
+            .fold(f64::NEG_INFINITY, f64::max);
         println!(
-            "| {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {:.1}% |",
             scene.name,
             set.len(),
             label(&set[sorted_search[0]]),
             label(&set[winner]),
-            rank
+            rank,
+            if rank <= 2 { "はい" } else { "いいえ" },
+            drift * 100.0,
         );
     }
 }

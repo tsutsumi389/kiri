@@ -6453,3 +6453,326 @@ fn the_subject_verdicts_do_not_flip_between_the_two_background_models() {
         }
     }
 }
+
+// --- 探索を kiri に任せる（--optimize, Phase 15） ---
+
+/// 探索の記録が結果 JSON に載り、**選ばれた候補と `settings` が一致する**こと。
+///
+/// 一致していなければ、エージェントは「表の 1 位」と「実際に書き出された絵」を
+/// 別のものとして読む。`settings` は効いた値を出す規約なので、`chosen` の側が
+/// 記録として意味を持つには両者が同じでなければならない。
+#[test]
+fn optimize_reports_every_candidate_and_agrees_with_the_settings() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--optimize",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+
+    let optimize = &v["optimize"];
+    let candidates = optimize["candidates"]
+        .as_array()
+        .unwrap_or_else(|| panic!("candidates が配列ではない: {optimize}"));
+    assert!(!candidates.is_empty(), "候補が 1 つも無い: {optimize}");
+    assert_eq!(
+        candidates.iter().filter(|c| c["chosen"] == true).count(),
+        1,
+        "選ばれた候補がちょうど 1 つでない: {optimize}"
+    );
+    let chosen = &optimize["chosen"];
+    assert_eq!(chosen["stage"], "final", "選ばれた候補は原寸で回すべき");
+    assert_eq!(chosen["tolerance"], v["settings"]["tolerance"]);
+    assert_eq!(v["settings"]["optimize"], true);
+    // 矩形を使わない候補が選ばれたなら applied_bbox ごと無い、という対応も見る
+    assert_eq!(
+        chosen["bbox"].is_null(),
+        v.get("applied_bbox").is_none(),
+        "chosen.bbox と applied_bbox が食い違う: {v}"
+    );
+    assert!(optimize["searched_at"].as_u64().unwrap() > 0, "{optimize}");
+}
+
+/// `--optimize` を渡さない実行では `optimize` ブロックごと現れない。
+///
+/// `null` を出すと「探索したが何も出なかった」と読める。走ったかどうかは
+/// `settings.optimize` が真偽で言う（`segment` と同じ規約）。
+#[test]
+fn a_plain_cutout_has_no_optimize_block() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let v = json_stdout(&out);
+    assert!(v.get("optimize").is_none(), "{v}");
+    assert_eq!(v["settings"]["optimize"], false);
+}
+
+/// **明示した値は探索しない。** `--tolerance 30 --optimize` は
+/// 「30 に固定して残りの軸を探す」の意味になる。
+///
+/// 既定値と同じ 12 を明示した場合も同じでなければならない。`--tolerance` は
+/// `default_value_t` を持つので、解いた後の値では区別が付かない——ここが
+/// 落ちるなら `ValueSource` を見る経路が切れている。
+#[test]
+fn an_explicit_tolerance_is_not_searched() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    let tolerances = |value: &str| -> Vec<f64> {
+        let out = kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--tolerance",
+                value,
+                "--optimize",
+                "--json",
+                "--force",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        json_stdout(&out)["optimize"]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["tolerance"].as_f64().unwrap())
+            .collect()
+    };
+
+    for value in ["30", "12"] {
+        let got = tolerances(value);
+        let want: f64 = value.parse().unwrap();
+        assert!(
+            got.iter().all(|t| *t == want),
+            "--tolerance {value} を明示したのに他の値を試した: {got:?}"
+        );
+    }
+}
+
+/// `--dry-run` と併用できる。成果物は 1 バイトも書かれない。
+#[test]
+fn optimize_writes_nothing_under_dry_run() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--optimize",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    assert_eq!(v["dry_run"], true);
+    assert!(v["optimize"]["candidates"].as_array().unwrap().len() > 1);
+    assert!(!output.exists(), "dry-run なのに成果物が書かれている");
+}
+
+/// spec の `optimize: true` が効き、そこに書いた値は探索の軸から外れる。
+///
+/// CLI 側は clap の `ValueSource` を見て「明示した」を判断するが、spec では
+/// `Some` がそのまま明示である。**同じ問いに 2 つの経路で答えている**ので、
+/// 片方だけが効いていないことがありうる。
+#[test]
+fn batch_accepts_the_optimize_key() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    write_png(dir.path(), "a.png", &img);
+    write_png(dir.path(), "b.png", &img);
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        r#"{"defaults":{"optimize":true},
+             "items":[{"input":"a.png","output":"a.out.png"},
+                      {"input":"b.png","output":"b.out.png","tolerance":30}]}"#,
+    )
+    .unwrap();
+
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    assert_eq!(v["succeeded"], 2, "{v}");
+    let results = v["results"].as_array().unwrap();
+
+    let free = &results[0]["result"];
+    assert_eq!(free["settings"]["optimize"], true);
+    assert!(
+        free["optimize"]["candidates"].as_array().unwrap().len() > 1,
+        "spec の optimize が効いていない: {}",
+        free["optimize"]
+    );
+
+    let fixed = &results[1]["result"];
+    let tolerances: Vec<f64> = fixed["optimize"]["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["tolerance"].as_f64().unwrap())
+        .collect();
+    assert!(
+        tolerances.iter().all(|t| *t == 30.0),
+        "spec に書いた tolerance が探索されている: {tolerances:?}"
+    );
+}
+
+/// 色では分けられない素材では、全候補を試しても致命的な警告が残る。
+///
+/// **その事実そのものが報告である。** 20 通り試して駄目だったなら、残る手は
+/// 素材を変えるか、色ではない手がかり（モデル）を足すかしかない。
+/// 実写のキーボード（暗い机の上の黒いキーボード）がこの形で、合成では
+/// 「背景と色がほとんど同じ商品が下端で見切れている」場面が同じ code を返す。
+#[test]
+fn an_inseparable_scene_says_that_no_candidate_was_clean() {
+    let dir = fixture_dir();
+    let mut img = image::RgbaImage::from_pixel(200, 200, image::Rgba([120, 118, 112, 255]));
+    for y in 90..200 {
+        for x in 50..150 {
+            img.put_pixel(x, y, image::Rgba([126, 124, 118, 255]));
+        }
+    }
+    let input = write_png(dir.path(), "flat.png", &img);
+    let output = dir.path().join("out.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--optimize",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    assert!(
+        has_warning(&v, "OPTIMIZE_NO_CLEAN_CANDIDATE"),
+        "{:?}",
+        warning_codes(&v)
+    );
+    assert!(
+        v["optimize"]["chosen"]["score"]["fatal"].as_u64().unwrap() > 0,
+        "警告は出ているのに fatal が 0: {}",
+        v["optimize"]["chosen"]
+    );
+    let warning = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "OPTIMIZE_NO_CLEAN_CANDIDATE")
+        .unwrap();
+    assert!(
+        !warning["data"]["remaining"].as_array().unwrap().is_empty(),
+        "残った code を載せていない: {warning}"
+    );
+}
+
+/// `kiri schema` が `--optimize` と新しい code を配る。
+///
+/// **エージェントはまず schema を読む。** 載っていない code が飛んでくると、
+/// 受け手は分岐を書きようがない。
+#[test]
+fn schema_publishes_the_optimize_option_and_its_warning() {
+    let v = schema_json();
+    let cutout = v["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "cutout")
+        .expect("cutout がある");
+    let option = cutout["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["name"] == "--optimize")
+        .unwrap_or_else(|| panic!("--optimize が schema に無い: {cutout}"));
+    assert_eq!(option["takes_value"], false, "フラグである");
+    assert!(
+        option["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("OPTIMIZE_NO_CLEAN_CANDIDATE"),
+        "長いヘルプが code を案内していない: {option}"
+    );
+    assert!(
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == "OPTIMIZE_NO_CLEAN_CANDIDATE"),
+        "警告の一覧に code が無い"
+    );
+}

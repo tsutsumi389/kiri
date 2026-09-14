@@ -44,7 +44,8 @@ src/
   transform/
     resize.rs          fast_image_resize ラッパ
     rotate.rs          回転。90 度単位は画素の入れ替え、それ以外は Catmull-Rom
-    canvas.rs          キャンバス配置、fill_ratio
+    canvas.rs          キャンバス配置、fill_ratio、1 画素の straight alpha 合成
+    shadow.rs          アルファから落ち影を合成する（箱型 3 回のガウス近似）
     composite.rs       背景色合成
   batch.rs             spec.json の読み込みと rayon 並列実行
 ```
@@ -555,7 +556,8 @@ MSRV の検査を CI に入れるのは、**宣言だけ置いても検査しな
         （`model list` の `segment_available` にしか無い）。schema にも 1 キー置くと、
         エージェントが 1 回の問い合わせで判断できる
 
-- [x] Phase 15: 探索を kiri 側に持たせる（`--optimize`）
+- [x] Phase 15: 探索を kiri 側に持たせ、影を合成する（`--optimize` / `--shadow synth`）
+  - [x] **探索（`--optimize`）**
   - [x] 固定の格子（`bbox` 2 × `tolerance` 5 × `background_model` 2 = 最大 20 通り）を
         長辺 1500px で総当たりし、上位 2 つだけを原寸で回す。致命的な警告も品質の
         警告も出ない候補に当たったら打ち切る（`src/cutout/optimize.rs`）
@@ -636,3 +638,46 @@ MSRV の検査を CI に入れるのは、**宣言だけ置いても検査しな
   - [ ] 許容量の格子は 5 点で固定である。選ばれた値の両隣をもう 1 度細かく刻む
         （12 / 20 / 30 / 45 / 60 → 45 が勝ったら 37 / 52 を足す）道があるが、
         原寸の回数が増えるので 15 秒の目標と相談になる
+  - [x] **影の合成（`--shadow synth`）**
+  - [x] `transform/shadow.rs` を足し、最終アルファをずらして σ でぼかしたものを
+        商品の下に敷く。`--shadow` / `--shadow-offset` / `--shadow-blur` /
+        `--shadow-color` / `--shadow-opacity` の 5 つ（design.md 4.14）
+  - [x] ぼかしは箱型フィルタ 3 回でガウスを近似する（Kovesi の幅の決め方）。
+        移動和なので画素あたり定数回で、**σ をいくつにしても所要時間が変わらない**。
+        24.5MP の実測は `--shadow off` 5.03 秒に対し σ 57.12px で 5.16 秒
+        （合成の費用は約 0.13 秒）、σ 228.48px でも 5.14 秒
+  - [x] 幅は必ず奇数。偶数幅は重心が半画素ずれ、3 回で 1.5px の位置ずれになる。
+        整数演算（アルファ u8 / 移動和 u32 / 四捨五入）で決定性を保つ
+        （24.5MP の 2 回の実行で md5 一致）
+  - [x] px@1000 の基準は**最終画像の長辺**。`--canvas` があればキャンバスの
+        長辺になる。実際に効いた px は `shadow.offset` / `shadow.blur` に出す
+  - [x] 商品の層は 1 画素も変えない。影のアルファが 0 の画素と、商品のアルファが
+        255 の画素は `--shadow off` の出力とビット一致する。合成の算術は
+        `transform/canvas.rs` の `over` を共有する
+  - [x] `--canvas --flatten` は「透明のまま配置 → 影 → 下地に載せる」へ組み替える。
+        **組み替えは `synth` のときだけ通す**（`off` にも通すと半透明の縁で
+        丸めが 1 ずつ変わる）
+  - [x] 非破壊: `--shadow` を渡さない 14 通りの実行で、変更前の release バイナリと
+        出力 PNG / JPEG / AVIF の md5 が一致（実写 24.5MP の既定値と最良設定、
+        実写キーボード、`tests/fixtures/backgrounds/*.jpg` の素通し・
+        `--canvas 1000 --flatten`・`--canvas 800 --flatten` の JPEG・AVIF）。
+        `--shadow off` を明示した出力も `--shadow` 無しとバイト一致
+  - [x] `mask` ブロックの統計と診断値は影を足す前の商品だけで測る。実写 24.5MP で
+        `--shadow off` / `--shadow synth` の 4 指標が完全一致
+  - [x] `batch` の spec に 5 キー。`schema` の `fields[]` に `settings.shadow` と
+        `shadow.offset` / `blur` / `bounds` / `clipped`
+  - [ ] **σ が 0 に近いときの丸めで、影の裾が数 px 早く切れる。** 各パスで
+        四捨五入した u8 に落とすため、3 回ぶんの丸め誤差が裾に溜まる。
+        中間を u16 で持てば消えるが、確保量が倍になるので見送った
+  - [ ] **影は 1 枚だけ。** 複数光源（キーライト + フィル）や、接地点だけ濃い
+        contact shadow は表せない。`--shadow-offset` を変えて 2 回通す道も無い
+        （2 回目の入力は影つきのアルファになる）
+  - [ ] `shadow.clipped` が真でも警告は出さない。はみ出しが意図どおりのことも
+        多い（背景いっぱいに広がる影）ので `warnings` へは載せなかったが、
+        「意図せず切れた」を見分ける材料はエージェント側に無い
+  - [ ] **影の色は 1 色だけ。** 台の色を拾った色付きの影（白い紙の上では
+        わずかに青い）は表せない。`--shadow-color` に指定すれば近いものは作れるが、
+        自動では決めない
+  - [ ] `synth` は原寸のアルファ 1 枚（24.5MP で 24.5MB）と出力の複製
+        （98MB）を確保する。キャンバス配置がある場合はキャンバス寸法なので軽いが、
+        `--canvas` 無しの 24.5MP では切り抜き本体のピークに上乗せされる

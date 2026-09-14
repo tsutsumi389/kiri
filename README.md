@@ -635,7 +635,12 @@ product.png  1600x2000  png  841.4 KB  (338 ms)
 | `--background-model` | auto | 背景を 1 色で持つか照明場 B(x, y) として持つか。`auto` / `flat` / `field`。`auto` は `background.uniformity` が 0.90 を下回るときだけ `field` を使う |
 | `--edge-threshold` | 8（自動調整あり） | 輪郭でフィルを止める勾配のしきい値。0 で無効。未指定なら、外周の勾配 p50 が 8 以上のときに p90 の 1.5 倍まで自動で引き上がる |
 | `--step-tolerance` | 2.2 | 背景を広げる際に 1px あたりに許す色差(ΔE)。0 で 2 段階フィルを無効化 |
-| `--shadow-tolerance` | 35 | 落ち影として消す明度(L\*)の落ち込みの上限。0 で影を残す |
+| `--shadow-tolerance` | 35 | 実写の落ち影を**消す**明度(L\*)の落ち込みの上限。0 で影を残す |
+| `--shadow` | off | 切り抜いたアルファから落ち影を**合成する**。`off` / `synth`（[落ち影を合成する](#落ち影を合成する)） |
+| `--shadow-offset dx,dy` | 0,12 | 影をずらす量(px)。**長辺 1000px 換算**（基準は最終画像の長辺）。負値は上・左へ |
+| `--shadow-blur` | 10 | 影のぼかしの σ(px)。**長辺 1000px 換算**。0 でぼかさない |
+| `--shadow-color` | #000000 | 影の色 |
+| `--shadow-opacity` | 0.25 | 影の不透明度 (0.0-1.0) |
 | `--seal` | 1 | 幅 2N px 以下の隙間を通ってしか外周につながらない背景を前景へ戻す。0 で無効、上限 8 |
 | `--cleanup` | 2 | 孤立ノイズ除去の半径(px)。**長辺 1000px 換算**で指定し、面積 (2n+1)² × (長辺/1000)² 未満の連結成分を消す。0 で無効、上限 64 |
 | `--feather` | 1 | 境界の階調を色から決められなかった箇所で使うフェザリング半径(px) |
@@ -911,6 +916,9 @@ field` を明示していてもである（**効いた値だけを報告する**
 **背景より明るい映り込みは対象外。** グレー背景での光沢や反射は明度が上がる方向に出るが、
 それを影と同じ規則で飲み込むと白背景の白い商品のハイライトまで消えてしまう。
 明るい映り込みを消したい場合は `--bbox` で範囲を切る。
+
+消した影の代わりが要るときは、切り抜いたアルファから影を作り直せる
+（「[落ち影を合成する](#落ち影を合成する)」）。
 
 #### 境界は matting として解く（形ではなく色から決める）
 
@@ -1570,6 +1578,83 @@ $ kiri cutout product.jpg -o product.jpg --canvas 1000 --flatten --background "#
 「この枠に収めたい」という要求であり、そのための拡縮は結果であって要求ではないため。
 ただし拡大した場合は倍率を添えて警告する。
 
+#### 落ち影を合成する
+
+`--shadow synth`。EC の納品先は「影なしの純白」と「自然な落ち影つき」の**両方**を
+求める。kiri は実写の落ち影を背景として消す側に倒してある（上の「落ち影の扱い」）ので、
+影つきが要るときは**切り抜いたアルファから影を作り直す**。
+
+```
+$ kiri cutout product.jpg -o product.png --canvas 1000 --shadow synth
+```
+
+撮影時の影をそのまま残すのではなく合成にするのは、**商品ごとに影の向きと濃さが
+揃う**ためである。撮り分けた素材を並べたときに影だけがばらつくのは、
+`--fill-ratio` で占有率を揃える理由とまったく同じ問題になる。
+
+##### 影の姿を決める 4 つのノブ（と、それを使うかどうかの 1 つ）
+
+| オプション | 既定 | 意味 |
+|---|---|---|
+| `--shadow` | `off` | `synth` で合成する。`off` なら成果物は 1 バイトも変わらない |
+| `--shadow-offset dx,dy` | `0,12` | 影をずらす量(px、長辺 1000px 換算)。負値は上・左へ |
+| `--shadow-blur σ` | `10` | ぼかしの σ(px、長辺 1000px 換算)。0 でぼかさない |
+| `--shadow-color` | `#000000` | 影の色 |
+| `--shadow-opacity` | `0.25` | 影の不透明度 (0.0-1.0) |
+
+`--shadow-offset` と `--shadow-blur` は**長辺 1000px 換算**で指定する。基準は
+**最終画像の長辺**で、`--canvas` があればキャンバスの長辺、無ければ元画像の長辺に
+なる。素材の解像度がばらついていても同じ指定で同じ見た目になり、24.5MP
+（4284x5712）の素材に既定値を渡せば実際には 69px ずれて σ 57px でぼける。
+**実際に効いた px は結果に出る**ので、換算を自分で追う必要はない。
+
+`--shadow-tolerance`（実写の影を**消す**側）と名前が並ぶが、向きは逆である。
+両方を既定のまま使うと「写っていた影を消してから、揃った影を合成し直す」に
+なる。撮影時の影をそのまま活かしたいなら `--shadow-tolerance 0 --shadow off` で、
+どちらも触らない。
+
+##### 重なる順序
+
+下地 → 影 → 商品。`--canvas` の配置（`fill_ratio` / `content` / `offset` /
+`scale`）は**影の有無で変わらない**——影のぶん商品を小さくはしない。影がキャンバスから
+はみ出すなら切り、切ったことを `shadow.clipped` が言う。
+
+透過を保てる形式（PNG / AVIF）では影も半透明のアルファとして残る。`--flatten` や
+JPEG 出力では下地の上に焼き込まれる。
+
+**商品の層は 1 画素も変わらない。** 影のアルファが 0 の画素と、商品のアルファが 255 の
+画素は、`--shadow off` の出力とビット一致する。`mask` ブロックの統計と診断値も影を
+足す**前**の商品だけで測るので、影を足したせいで数値が動くことはない。
+
+##### 結果
+
+```json
+{
+  "settings": { "shadow": "synth" },
+  "shadow": {
+    "offset": [0, 69],
+    "blur": 57.12,
+    "opacity": 0.25,
+    "color": "#000000",
+    "bounds": [31, 2063, 4283, 3522],
+    "clipped": true
+  }
+}
+```
+
+`shadow` ブロックは **`synth` のときだけ**現れる（`constraints` と同じ規約）。
+頼んだかどうかは `settings.shadow` が常に言う。`bounds` は影が占めた矩形で、
+`clipped` は「ずらし＋ぼかしの範囲が外へ出た」ことを表す。**`bounds` が `null` でも
+`clipped` は真になりうる**——ずらし量が画像より大きければ影は 1 画素も残らないが、
+それは「影を置かなかった」のではなく「全部はみ出した」である。
+
+ぼかしは箱型フィルタ 3 回でガウスを近似している（design.md 4.14）。移動和なので
+**σ をいくつにしても所要時間は変わらない**。24.5MP・σ 57px で合成の費用は
+約 0.13 秒（切り抜き全体 5.0 秒に対して）で、σ 228px でも同じだった。
+
+`batch` の spec では `shadow` / `shadow_offset`（`[dx, dy]`）/ `shadow_blur` /
+`shadow_color` / `shadow_opacity` が同じ意味で使える。
+
 #### 結果の検証
 
 `--json` が返す `mask` を見れば、画像を開かずに失敗を検出できる。
@@ -1597,7 +1682,7 @@ $ kiri cutout product.jpg -o product.jpg --canvas 1000 --flatten --background "#
     "step_tolerance": 2.2, "shadow_tolerance": 35.0, "seal": 1,
     "cleanup": 2, "feather": 1, "despill": true, "refine": true,
     "matting": "guided", "smooth_contour": 2.0, "reclassify": true,
-    "background_model": "flat",
+    "background_model": "flat", "shadow": "off",
     "band_min_radius": 2, "smooth_radius_px": 2
   },
   "mask": {
@@ -1974,7 +2059,8 @@ x broken.jpg  失敗
 `bg_mask` / `fg_polygons` / `bg_polygons` / `tolerance` / `border` /
 `cleanup` / `feather` / `despill` / `refine` / `matting` / `smooth_contour` /
 `reclassify` / `background_model` / `optimize` / `color_convert` / `edge_threshold` /
-`step_tolerance` / `shadow_tolerance` / `seal` / `canvas` / `fill_ratio` / `format` /
+`step_tolerance` / `shadow_tolerance` / `shadow` / `shadow_offset` / `shadow_blur` /
+`shadow_color` / `shadow_opacity` / `seal` / `canvas` / `fill_ratio` / `format` /
 `quality` / `effort` / `background` / `flatten`）。
 
 `trimap` / `fg_mask` / `bg_mask` は画像のパスで、`input` と同じく**仕様ファイルの

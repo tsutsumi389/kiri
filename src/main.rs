@@ -7,7 +7,7 @@
 use std::process::ExitCode;
 
 use clap::parser::ValueSource;
-use clap::{ArgMatches, CommandFactory, Error as ClapError, FromArgMatches};
+use clap::{ArgMatches, CommandFactory, FromArgMatches};
 use serde::Serialize;
 
 use kiri::cli::{Cli, Command};
@@ -16,7 +16,7 @@ use kiri::cutout::{Confidence, OptimizeFixed, bbox_argument};
 use kiri::error::{Error, ErrorCode, ErrorKind, Result};
 use kiri::report::{
     BackgroundReport, BatchReport, CutoutReport, ErrorReport, InfoReport, ModelReport,
-    ProcessReport, SchemaReport, SegmentReport, SubjectReport,
+    ProcessReport, SchemaReport, SegmentReport, SettingsReport, SubjectReport,
 };
 use kiri::warning::Warning;
 
@@ -45,11 +45,17 @@ fn main() -> ExitCode {
 /// `ValueSource` から拾って `CutoutArgs::fixed` へ畳む。
 fn parse() -> Cli {
     let matches = Cli::command().get_matches();
+    // **`from_arg_matches_mut` は使えない。** あちらは組み立てながら
+    // `ArgMatches` から値を抜き取るので、終わったあとの `value_source` は
+    // どの id についても `None` を返す。clone を 1 つ節約する代わりに、
+    // 「明示したかどうか」を知る手段がそこで消える
     let mut cli = match Cli::from_arg_matches(&matches) {
         Ok(cli) => cli,
         // clap 自身の作法で出して終わる。ここに来るのは derive とパーサの
-        // 食い違いだけなので、kiri の ErrorCode に混ぜる意味が無い
-        Err(e) => ClapError::exit(&e),
+        // 食い違いだけなので、kiri の ErrorCode に混ぜる意味が無い。
+        // **`format` を通すのは usage を添えるため**——`Parser::parse()` は
+        // 内部で同じことをしており、ここだけ素っ気ない出力にする理由が無い
+        Err(e) => e.format(&mut Cli::command()).exit(),
     };
     if let (Command::Cutout(args), Some(sub)) =
         (&mut cli.command, matches.subcommand_matches("cutout"))
@@ -259,7 +265,7 @@ fn print_segment(segment: Option<&SegmentReport>) {
 ///
 /// 人間向けには「何通り試して、原寸で何回回して、何が選ばれたか」の 1 行で足りる。
 /// 候補の一覧は 20 行になるのでテキストには出さない——比べたい人は `--json` を読む。
-fn print_optimize(optimize: Option<&kiri::report::OptimizeReport>) {
+fn print_optimize(optimize: Option<&kiri::report::OptimizeReport>, settings: &SettingsReport) {
     let Some(o) = optimize else {
         return;
     };
@@ -272,16 +278,24 @@ fn print_optimize(optimize: Option<&kiri::report::OptimizeReport>) {
         finals,
         o.elapsed_ms
     );
+    // **モデルは効いた値を出す。** 候補表が持つのは要求値（`auto`）だが、
+    // すぐ上の「背景」ブロックは効いた値を語っているので、同じ画面で同じ語が
+    // 2 つの意味を持つことになる
     println!(
-        "  採用      tolerance {}  bbox {}  background-model {}  (致命 {} / 品質 {:.2})",
+        "  採用      tolerance {}  bbox {}  background-model {}  (致命 {} / 品質 {:.2}{})",
         c.tolerance,
         match c.bbox {
             Some([x1, y1, x2, y2]) => format!("{x1},{y1} - {x2},{y2}"),
             None => "なし".to_string(),
         },
-        c.background_model,
+        settings.background_model,
         c.score.fatal,
-        c.score.quality
+        c.score.quality,
+        if c.collapsed {
+            " / 商品を飲んだ"
+        } else {
+            ""
+        }
     );
 }
 
@@ -415,7 +429,7 @@ fn print_cutout(report: &CutoutReport) {
     );
     print_perimeter(&report.background);
     print_segment(report.segment.as_ref());
-    print_optimize(report.optimize.as_ref());
+    print_optimize(report.optimize.as_ref(), &report.settings);
     // 指示を渡したときだけ 1 行増やす。**どの入口が効いたかまで出す**のは、
     // 渡したはずの入口が並びに無いことが「その指示は空だった」を意味するため
     // （そのときは CONSTRAINT_EMPTY も出る）。

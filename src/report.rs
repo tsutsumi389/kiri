@@ -474,14 +474,24 @@ pub struct OptimizeCandidate {
     pub rim_contamination: Option<f64>,
     /// 出た警告の code だけ。文言は `warnings` の側にある
     pub warnings: Vec<String>,
+    /// 同じ列（同じ bbox・同じモデル）で許容量を 1 段上げたときに、前景比率が
+    /// 3 割を超えて落ちた候補か。**警告 code は持たない。**
+    ///
+    /// 商品ごと背景として飲まれた結果は、縁の残りと汚染が減った**良い数値**として
+    /// 現れる。順位の上ではこれを致命的な警告 1 つと同じ重さで扱うが、
+    /// `score.fatal`（出た警告の数）には足さない
+    pub collapsed: bool,
     pub score: OptimizeScore,
     pub chosen: bool,
 }
 
 /// 候補の順位を決めた 3 つの値。**辞書式に上から比べる。**
+///
+/// 順位の第 1 項は `fatal + collapsed`（隣の `collapsed` を参照）で、ここに
+/// 出るのは警告の数だけである。
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct OptimizeScore {
-    /// 致命的な警告の数。少ないほど良い
+    /// 出た致命的な警告の数。少ないほど良い
     pub fatal: usize,
     /// 品質の重み和（縁の残り・輪郭の粗さ・縁の汚染を警告しきい値で割った和）。
     /// 小さいほど良い

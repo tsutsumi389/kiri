@@ -511,7 +511,9 @@ fn fields() -> Vec<FieldEntry> {
                  kiri が探索して選んだ値である（渡した値ではない）。何を試したかは \
                  optimize.candidates[]、選ばれた理由は optimize.chosen.score が言う。\
                  **明示した軸は探索しない**——--tolerance 30 --optimize なら候補の \
-                 tolerance は全部 30 になる",
+                 tolerance は全部 30 になる。false のときの成果物の画素は --optimize を\
+                 足す前と 1 バイトも変わらない（報告 JSON にはこの 1 キーだけが増える。\
+                 schema_version は据え置き）",
             ),
         },
         FieldEntry {
@@ -558,9 +560,28 @@ fn fields() -> Vec<FieldEntry> {
             summary: "選ばれた候補に残った致命的な警告の数",
             notes: Some(
                 "数えるのは NOT_SEPARABLE / FOREGROUND_TOO_SMALL / FOREGROUND_TOO_LARGE / \
-                 SUBJECT_TOUCHES_EDGE の 4 つ。**順位はこれを最初に比べる**（少ないほど良い）。\
+                 SUBJECT_TOUCHES_EDGE / BBOX_RECOMMENDED の 5 つ。最後の 2 つは\
+                 「前景が外周に接している」という同じ事実の別の読み方なので、同じ重さで数える。\
                  0 でなければ、どの候補でも切り抜きが成立しなかったということで、\
-                 OPTIMIZE_NO_CLEAN_CANDIDATE が同時に出る",
+                 OPTIMIZE_NO_CLEAN_CANDIDATE が同時に出る。\
+                 **順位を決める第 1 項はこの数 + optimize.candidates[].collapsed** で、\
+                 崩れは警告 code を持たないぶんここには現れない（少ないほど良い）",
+            ),
+        },
+        FieldEntry {
+            path: "optimize.candidates[].collapsed",
+            appears_in: vec!["cutout"],
+            unit: "bool",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "同じ列で許容量を 1 段上げたときに、前景比率が 3 割を超えて落ちた候補か",
+            notes: Some(
+                "列は「同じ bbox・同じ background_model」で、その中を tolerance の昇順に見る。\
+                 **淡い色の商品が背景ごと飲まれた候補を捕まえるためにある**——飲まれた結果は \
+                 halo_ratio と rim_contamination が減った良い数値として現れ、警告は 1 つも出ない。\
+                 順位の上では致命的な警告 1 つと同じ重さで扱うが、score.fatal には足さない",
             ),
         },
         FieldEntry {

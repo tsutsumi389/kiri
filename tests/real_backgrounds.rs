@@ -1880,9 +1880,18 @@ fn optimized(scene: &common::RealScene) -> OptimizedRun {
 /// 正しく報せている。**
 ///
 /// しきい値をベンチに合わせて緩めることはしない。代わりに R3 だけ期待値を
-/// **現状の値で固定する**。等号ではなく僅かな余裕を付けるのは、JPEG の
-/// 丸めや浮動小数の並びで最終桁が動くためである。**悪化は検出できる。**
+/// **現状の値で固定する**（輪郭誤差 / rim 正解 / eaten）。
+///
+/// **悪化を止められるのは輪郭誤差だけである。** rim 正解と eaten は 0.0-1.0 の
+/// 割合で、R3 の現状はどちらもほぼ上限（0.999 と 1.000）にある。上限に張り付いた
+/// 値に「これ以下」を課しても、割合の定義から常に真になる——**検査しているふりに
+/// しかならない。** そこで割合の 2 つは向きを変え、「**まだ上限に張り付いて
+/// いること**」を問う。R3 が改善したらそこが落ちるので、固定値を引き直す合図に
+/// なる（`R3_STILL_HOPELESS`）。
 const R3_PINNED: (f32, f32, f32) = (119.70, 0.999, 1.0000);
+
+/// R3 の割合が「まだ上限に張り付いている」と言える下限。`R3_PINNED` を参照。
+const R3_STILL_HOPELESS: f32 = 0.99;
 
 /// **探索が `assisted` と同等以上に届くこと。**
 ///
@@ -1912,35 +1921,44 @@ fn optimize_reaches_the_assisted_quality_without_a_bbox() {
             .expect("assisted がある");
         let found = optimized(&scene);
         let (metrics, tolerance) = (&found.metrics, found.tolerance);
-        let pinned = scene.name.starts_with("R3");
-        let (want_contour, want_rim, want_eaten) = if pinned {
-            (R3_PINNED.0 * 1.01, R3_PINNED.1 * 1.01, R3_PINNED.2)
-        } else {
-            (
-                assisted.metrics.contour_error * 1.1,
-                assisted.metrics.rim_truth * 1.1,
-                assisted.metrics.eaten + 0.02,
-            )
-        };
-        let against = if pinned { "固定値" } else { "assisted" };
+        if scene.name.starts_with("R3") {
+            assert!(
+                metrics.contour_error <= R3_PINNED.0 * 1.01,
+                "R3: 輪郭誤差が固定値より悪化した: {:.2} > {:.2}（選ばれた tolerance {tolerance}）",
+                metrics.contour_error,
+                R3_PINNED.0 * 1.01,
+            );
+            // 向きが逆。**改善したら落ちる。** 落ちたらこの素材が解けるように
+            // なったということなので、固定値を引き直して doc を書き換える
+            assert!(
+                metrics.rim_truth >= R3_STILL_HOPELESS && metrics.eaten >= R3_STILL_HOPELESS,
+                "R3 が改善した（rim 正解 {:.3} / eaten {:.4}）。固定値を引き直すこと",
+                metrics.rim_truth,
+                metrics.eaten,
+            );
+            continue;
+        }
 
         assert!(
-            metrics.contour_error <= want_contour,
-            "{}: 輪郭誤差が{against}より悪化した: {:.2} > {want_contour:.2}（選ばれた tolerance {tolerance}）",
+            metrics.contour_error <= assisted.metrics.contour_error * 1.1,
+            "{}: 輪郭誤差が assisted を 1 割超えて悪化した: {:.2} vs {:.2}（選ばれた tolerance {tolerance}）",
             scene.name,
             metrics.contour_error,
+            assisted.metrics.contour_error,
         );
         assert!(
-            metrics.rim_truth <= want_rim,
-            "{}: rim 正解が{against}より悪化した: {:.3} > {want_rim:.3}（選ばれた tolerance {tolerance}）",
+            metrics.rim_truth <= assisted.metrics.rim_truth * 1.1,
+            "{}: rim 正解が assisted を 1 割超えて悪化した: {:.3} vs {:.3}（選ばれた tolerance {tolerance}）",
             scene.name,
             metrics.rim_truth,
+            assisted.metrics.rim_truth,
         );
         assert!(
-            metrics.eaten <= want_eaten,
-            "{}: {against}より商品を削っている: {:.4} > {want_eaten:.4}（選ばれた tolerance {tolerance}）",
+            metrics.eaten <= assisted.metrics.eaten + 0.02,
+            "{}: assisted より商品を削っている: {:.4} vs {:.4}（選ばれた tolerance {tolerance}）",
             scene.name,
             metrics.eaten,
+            assisted.metrics.eaten,
         );
     }
 }

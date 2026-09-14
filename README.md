@@ -1403,13 +1403,13 @@ kiri は決定的で 1 回が数秒なので、**その 3 手を kiri の中へ�
 
 ```
 $ kiri cutout remote.jpg -o out.png --optimize
-out.png  4284x5712  png  41.6 MB  (13507 ms)
+out.png  4284x5712  png  41.6 MB  (13942 ms)
   背景色    #B2AEA7  (均一度 0.20, tolerance 45)
   外周ΔE    p50 11.9  p90 26.8  max 60.5
   場の残差  p50 5.5  p90 15.6  max 61.3  (場の振れ幅 ΔE 0.1〜21.5)
   外周勾配  p50 11.3  p90 27.9
-  探索      20 候補を 1500px で試し、原寸で 2 回  (13199 ms)
-  採用      tolerance 45  bbox 0,2022 - 4213,3828  background-model auto  (致命 0 / 品質 4.95)
+  探索      20 候補を 1500px で試し、原寸で 2 回  (13633 ms)
+  採用      tolerance 45  bbox 0,2022 - 4213,3828  background-model field  (致命 0 / 品質 4.95)
   前景比率  20.4%
   境界色差  ΔE 53.8  (tolerance 45)
   輪郭粗さ  0.25 px  (1000px 換算, 警告 0.16 超)
@@ -1448,8 +1448,11 @@ out.png  4284x5712  png  41.6 MB  (13507 ms)
 4. 同点なら小さい `tolerance`、次に bbox 無し、次に `auto`
 
 加えて、**許容量を 1 段上げて前景比率が 3 割を超えて落ちた候補**は「商品を飲んだ」
-とみなして致命に 1 を足す。淡い色の商品では、商品ごと飲まれた結果が
-「縁の残りが減った」という良い数値として現れるためである。
+とみなし、順位の上で致命的な警告 1 つと同じ重さを負わせる。淡い色の商品では、
+商品ごと飲まれた結果が「縁の残りが減った」という良い数値として現れるためである。
+これは候補ごとに `collapsed` として出る。**`score.fatal` には足さない**——
+あちらは出た警告の数で、`OPTIMIZE_NO_CLEAN_CANDIDATE` が数える対象と同じもの
+でなければならない。
 
 ##### どう見せるか
 
@@ -1465,6 +1468,7 @@ out.png  4284x5712  png  41.6 MB  (13507 ms)
       "contour_roughness": 0.8123, "rim_contamination": null,
       "warnings": ["EDGE_THRESHOLD_RAISED", "BACKGROUND_FIELD_USED",
                    "LOW_UNIFORMITY", "CONTOUR_ROUGH"],
+      "collapsed": true,
       "score": { "fatal": 0, "quality": 6.66, "separability": 48.7848 },
       "chosen": false },
     { "tolerance": 45, "bbox": [0, 2022, 4213, 3828], "background_model": "auto",
@@ -1473,11 +1477,12 @@ out.png  4284x5712  png  41.6 MB  (13507 ms)
       "contour_roughness": 0.2541, "rim_contamination": 0.0613,
       "warnings": ["EDGE_THRESHOLD_RAISED", "BACKGROUND_FIELD_USED",
                    "LOW_UNIFORMITY", "CONTOUR_ROUGH", "RIM_CONTAMINATED"],
+      "collapsed": false,
       "score": { "fatal": 0, "quality": 4.95, "separability": 53.8151 },
       "chosen": true }
   ],
   "chosen": { "...": "同じ形" },
-  "elapsed_ms": 13403
+  "elapsed_ms": 13970
 }
 ```
 
@@ -1487,10 +1492,14 @@ out.png  4284x5712  png  41.6 MB  (13507 ms)
 - `settings.tolerance` / `settings.background_model` / `applied_bbox` は選ばれた
   候補の値になる。`settings.optimize` は**常に**出る（この 1 行が 3 つの出所を変える）
 
+上の例では 1 位（`tolerance 60`）が `collapsed: true` で、原寸で回したら
+前景比率が 0.2037 から 0.0664 へ落ちている——商品の 3 分の 2 が背景として
+飲まれた。警告は 1 つも増えず、`halo_ratio` はむしろ下がるので、
+**この 1 行が無ければ「1 位のほうが良さそう」と読める。**
+
 **選ばれなかった候補も見せるのは、2 位のほうが目的に合うことがあるため**である。
-たとえば上の例で「輪郭の滑らかさより境界の色差を優先したい」なら、1 位の
-`tolerance 60` を `--tolerance 60 --bbox 0,2022,4213,3828` として明示指定へ
-切り替えればよい。候補の値はそのまま貼れる形で並んでいる。
+候補の値はそのまま `--tolerance` / `--bbox` / `--background-model` へ貼れる
+形で並んでいる。
 
 ##### どの候補も駄目だったとき
 
@@ -1510,11 +1519,15 @@ out.png  4284x5712  png  41.6 MB  (13507 ms)
 
 | 素材 | 候補 | 原寸で回した数 | 時間 |
 |---|---|---|---|
-| 実写リモコン 4284x5712（24.5MP、不織布） | 20 | 2 | 13.7 秒 |
-| 実写キーボード 3024x4032（12MP、暗い机） | 10 | 2 | 7.9 秒 |
+| 実写リモコン 4284x5712（24.5MP、不織布） | 20 | 2 | 14.3 秒 |
+| 実写キーボード 3024x4032（12MP、暗い机） | 10 | 2 | 8.2 秒 |
 
 目安は「3 手ループ 1 往復ぶん（数秒 × 3 + エージェントの往復）」と同じくらいで、
 **往復が無いぶん確実に速い**。
+
+メモリは 1 枚あたり 1.5 倍前後になる（原寸の候補を 2 つ同時に抱えるため。
+24.5MP で約 350MB）。`batch` は `--jobs` の数だけ積むので、`optimize: true` を
+書いた spec では並列度を落とすこと。
 
 ##### 3 手ループとの比較（実写リモコン、24.5MP）
 
@@ -1522,7 +1535,7 @@ out.png  4284x5712  png  41.6 MB  (13507 ms)
 |---|---|---|---|---|---|---|
 | 既定値のまま | 1 | 8.2 秒 | 0.2492 | 0.1264 | 19.6 | 1.239 |
 | 手で決めた最良（`--bbox` + `--tolerance 60`） | 3 + 往復 | 5.0 秒 | 0.0664 | 0.0581 | 48.8 | 0.812 |
-| **`--optimize`** | **1** | **13.7 秒** | **0.2037** | **0.0295** | **53.8** | **0.254** |
+| **`--optimize`** | **1** | **14.3 秒** | **0.2037** | **0.0295** | **53.8** | **0.254** |
 
 **探索は手で決めた設定より良い。** 手の最良値（`tolerance 60`）は照明場と
 matting が入る前に決めたもので、今では商品を 3 分の 2 まで飲む

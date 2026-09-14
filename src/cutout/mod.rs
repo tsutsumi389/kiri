@@ -842,12 +842,6 @@ fn apply_alpha(image: &mut RgbaImage, mask: &Mask) {
     }
 }
 
-/// 正規化 bbox を `--bbox` にそのまま貼れる文字列にする。
-///
-/// 桁を丸めない（`round4` までは JSON と揃える）。見栄えのために小数第 2 位へ
-/// 落とすと、**貼り付けた矩形が実際の主体より最大 0.5% 内側に入る**。bbox の外は
-/// 色によらず背景と確定されるため、その差がそのまま商品の欠けになる。
-/// 20MP の実写では 0.005 が 28px にあたる。
 /// 画素座標で表された矩形を、画像の中に収まる整数の矩形へ落とす。
 ///
 /// **丸めの規約を 1 箇所に持つ。** 始点は切り捨て、終点は切り上げ、終点だけを
@@ -858,15 +852,29 @@ fn apply_alpha(image: &mut RgbaImage, mask: &Mask) {
 /// 候補の矩形を寸法ごとに解き直す `optimize::CandidateBbox` が同じ式を使う。
 /// 片方だけ丸めが違うと、**同じ矩形を指定したのに `--optimize` の候補表と
 /// `applied_bbox` が食い違う**。
+///
+/// 寸法 0 の画像は呼び出し側が先に断る（読み込みが `EMPTY_IMAGE` で落とす）が、
+/// 公開関数なので `saturating_sub` で受ける。0 で panic するかラップするかが
+/// build の種類で変わるのは、公開 API の振る舞いとして最悪である。
 pub fn bbox_to_pixels(scaled: [f64; 4], width: u32, height: u32) -> (u32, u32, u32, u32) {
     let x1 = scaled[0].floor().max(0.0) as u32;
     let y1 = scaled[1].floor().max(0.0) as u32;
     // 終点は画像内に収める。x1 より小さくならないよう下限も押さえる
-    let x2 = (scaled[2].ceil() as u32).min(width - 1).max(x1);
-    let y2 = (scaled[3].ceil() as u32).min(height - 1).max(y1);
+    let x2 = (scaled[2].ceil() as u32)
+        .min(width.saturating_sub(1))
+        .max(x1);
+    let y2 = (scaled[3].ceil() as u32)
+        .min(height.saturating_sub(1))
+        .max(y1);
     (x1, y1, x2, y2)
 }
 
+/// 正規化 bbox を `--bbox` にそのまま貼れる文字列にする。
+///
+/// 桁を丸めない（`round4` までは JSON と揃える）。見栄えのために小数第 2 位へ
+/// 落とすと、**貼り付けた矩形が実際の主体より最大 0.5% 内側に入る**。bbox の外は
+/// 色によらず背景と確定されるため、その差がそのまま商品の欠けになる。
+/// 20MP の実写では 0.005 が 28px にあたる。
 pub fn bbox_argument(bbox: [f64; 4]) -> String {
     let v = bbox.map(round4);
     format!("{},{},{},{}", v[0], v[1], v[2], v[3])

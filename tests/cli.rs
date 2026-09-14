@@ -6776,3 +6776,130 @@ fn schema_publishes_the_optimize_option_and_its_warning() {
         "警告の一覧に code が無い"
     );
 }
+
+/// 明示した `--bbox` と `--background-model` も探索の軸から外れる。
+///
+/// **3 つの軸は別々の id で `ValueSource` を引いている。** 綴りを 1 つ外しても
+/// clap は `None` を返すだけなので（未知の id で panic しない）、経路が切れても
+/// 「明示した値が黙って探索される」という形でしか現れない。`--tolerance` は
+/// `an_explicit_tolerance_is_not_searched` が見ているので、残る 2 つをここで見る。
+#[test]
+fn an_explicit_bbox_and_background_model_are_not_searched() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    let candidates = |extra: &[&str]| -> Vec<Value> {
+        let mut args = vec![
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--optimize",
+            "--json",
+            "--force",
+        ];
+        args.extend_from_slice(extra);
+        let out = kiri().args(&args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        json_stdout(&out)["optimize"]["candidates"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+
+    let boxed = candidates(&["--bbox", "10,10,180,180"]);
+    assert!(
+        boxed
+            .iter()
+            .all(|c| c["bbox"] == serde_json::json!([10, 10, 180, 180])),
+        "--bbox を明示したのに別の矩形を試した: {boxed:?}"
+    );
+
+    // **既定値と同じ `auto` を明示した場合も外れる。** `--background-model` は
+    // `default_value_t` を持つので、値だけでは明示と既定を区別できない
+    for model in ["flat", "auto"] {
+        let got = candidates(&["--background-model", model]);
+        assert!(
+            got.iter().all(|c| c["background_model"] == model),
+            "--background-model {model} を明示したのに別のモデルを試した: {got:?}"
+        );
+    }
+}
+
+/// 順位の第 1 項は「出た警告の数」ではなく「それ + 前景比率の崩れ」である。
+///
+/// **`score.fatal` は警告の数だけを出す。** `OPTIMIZE_NO_CLEAN_CANDIDATE` が
+/// 数える対象と同じものでなければ、`fatal > 0` なのに警告が出ない状態が生まれ、
+/// schema の notes（0 でなければ同時に出る）がそのまま嘘になる。
+#[test]
+fn the_collapse_flag_is_reported_apart_from_the_warning_count() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--optimize",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+
+    let fatal_codes: Vec<&str> = kiri::cutout::optimize::FATAL_CODES
+        .iter()
+        .map(|c| c.as_str())
+        .collect();
+    for c in v["optimize"]["candidates"].as_array().unwrap() {
+        assert!(c["collapsed"].is_boolean(), "collapsed が真偽ではない: {c}");
+        let counted = c["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|w| fatal_codes.contains(&w.as_str().unwrap()))
+            .count();
+        assert_eq!(
+            c["score"]["fatal"].as_u64().unwrap() as usize,
+            counted,
+            "score.fatal が出た警告の数と食い違う: {c}"
+        );
+    }
+    // 契約の側（schema）が数える code の一覧と実装が揃っていること
+    let notes = fields_of(&schema_json())
+        .into_iter()
+        .find(|f| f["path"] == "optimize.chosen.score.fatal")
+        .expect("optimize.chosen.score.fatal がある")["notes"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for code in &fatal_codes {
+        assert!(
+            notes.contains(code),
+            "schema が数える code に {code} が載っていない: {notes}"
+        );
+    }
+}

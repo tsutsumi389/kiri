@@ -64,7 +64,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         None => user_constraints,
     };
 
-    let opts = CutoutOptions {
+    let mut opts = CutoutOptions {
         tolerance: args.tolerance,
         border: args.border,
         bbox,
@@ -87,12 +87,16 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     // ものなので、以降（キャンバス配置・書き出し・preview）はもう 1 回走らせずに
     // そのまま流す。`opts` も選ばれた候補で置き換える——`settings` と
     // `applied_bbox` は効いた値を出す規約であり、渡した値では嘘になる
-    let (result, opts, optimize, optimize_warning) = if args.optimize {
+    let (result, optimize, optimize_warning) = if args.optimize {
         let found = optimize::optimize(&loaded.image, &opts, &args.fixed)?;
         let report = optimize_report(&found, w, h);
-        (found.result, found.options, Some(report), found.warning)
+        // 代入で置き換える（シャドーイングではない）。**束縛を増やすと、
+        // 探索前の指示の表が関数の終わりまで生き残る**——24.5MP では
+        // 選ばれた候補のものと合わせて 24.5MB を 2 本抱えることになる
+        opts = found.options;
+        (found.result, Some(report), found.warning)
     } else {
-        (cutout(&loaded.image, &opts), opts, None, None)
+        (cutout(&loaded.image, &opts), None, None)
     };
     let bbox = opts.bbox;
 
@@ -230,11 +234,7 @@ fn optimize_report(found: &crate::cutout::Optimized, width: u32, height: u32) ->
             let (x1, y1, x2, y2) = b.resolve(source, source);
             [x1, y1, x2, y2]
         }),
-        background_model: match trial.candidate.background_model {
-            crate::cutout::BackgroundModel::Auto => "auto",
-            crate::cutout::BackgroundModel::Flat => "flat",
-            crate::cutout::BackgroundModel::Field => "field",
-        },
+        background_model: trial.candidate.background_model.as_str(),
         stage: trial.stage.as_str(),
         foreground_ratio: round4(trial.foreground_ratio),
         touches_edge: trial.touches_edge,
@@ -247,6 +247,7 @@ fn optimize_report(found: &crate::cutout::Optimized, width: u32, height: u32) ->
             .iter()
             .map(|c| c.as_str().to_string())
             .collect(),
+        collapsed: trial.collapsed,
         score: OptimizeScore {
             fatal: trial.score.fatal,
             quality: round4(trial.score.quality),

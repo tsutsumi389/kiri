@@ -210,12 +210,14 @@ impl Constraints {
         if width == 0 || height == 0 || self.width == 0 || self.height == 0 {
             return out;
         }
+        // 列の対応は行に依らない。内側で引き直すと 1500x1125 で 170 万回の
+        // 除算と `round` を払うことになる
+        let columns: Vec<u32> = (0..width).map(|x| nearest(x, width, self.width)).collect();
         for y in 0..height {
             let sy = nearest(y, height, self.height);
-            for x in 0..width {
-                let sx = nearest(x, width, self.width);
-                let index = (y as usize) * (width as usize) + (x as usize);
-                out.flags[index] = self.flags[self.index(sx, sy)];
+            let row = (y as usize) * (width as usize);
+            for (x, &sx) in columns.iter().enumerate() {
+                out.flags[row + x] = self.flags[self.index(sx, sy)];
             }
         }
         out
@@ -422,9 +424,18 @@ impl Constraints {
 ///
 /// 画素の中心どうしを合わせる（`+0.5` して比を掛け、`-0.5` で戻す）。左上を
 /// そのまま掛ける素朴な式だと、縮小のたびに半画素ずつ左上へ寄る。
-/// **`segment::to_constraints` が確率マップを原寸へ広げるときと同じ式**である
-/// ——確定領域を寸法の間で往き来させる道は 1 本だけにしておく。
+///
+/// **確定領域を寸法の間で往き来させる道はこの 1 本だけにしておく。**
+/// `segment::grid_index`（確率マップ → 原寸）も `Constraints::resampled`
+/// （原寸 → 探索段）もここを呼ぶ。式が 2 本に分かれると、片方だけ直した
+/// ときに同じ指示が経路によって半画素ずれる。
+///
+/// `to` が 0 のときは 0 を返す。呼び出し側は寸法 0 を先に断っているが、
+/// 引き算が build の種類で panic したりラップしたりするのは避ける。
 pub(crate) fn nearest(v: u32, from: u32, to: u32) -> u32 {
+    if from == 0 || to == 0 {
+        return 0;
+    }
     let mapped = ((f64::from(v) + 0.5) * f64::from(to) / f64::from(from) - 0.5).round();
     (mapped.max(0.0) as u32).min(to - 1)
 }

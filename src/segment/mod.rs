@@ -514,9 +514,12 @@ fn reachable_from_the_border(low: &Mask) -> Mask {
 
 /// 原寸の座標に対応する格子の座標。画素の中心どうしを合わせる
 /// （`Probability::at` の双線形と同じ対応で、丸めるだけの違い）。
+///
+/// **式は `constraints::nearest` が 1 本だけ持つ。** `--optimize` が指示を
+/// 縮小版へ写すときも同じ対応が要るので、2 本に分かれると確定領域が寸法の
+/// 間を往き来するたびに半画素ずれうる。
 fn grid_index(v: u32, from: u32, to: u32) -> u32 {
-    let mapped = ((f64::from(v) + 0.5) * f64::from(to) / f64::from(from) - 0.5).round();
-    (mapped.max(0.0) as u32).min(to - 1)
+    crate::cutout::constraints::nearest(v, from, to)
 }
 
 /// 確定領域を削る半径。**確率マップの格子で数える。**

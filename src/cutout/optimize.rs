@@ -246,6 +246,10 @@ pub struct Score {
 impl Score {
     /// 良い順。`Ordering::Less` なら `self` のほうが良い。
     ///
+    /// **前景比率の崩れ（`Trial::collapsed`）はここでは見ない。** `fatal` は
+    /// 「出た警告の数」であって順位そのものではなく、報告にもその意味で出す。
+    /// 崩れを足した順位は `better` が持つ。
+    ///
     /// 比較は `total_cmp` で行う。`partial_cmp` は NaN で `None` を返し、
     /// 呼び出し側が「どちらでもよい」と扱った瞬間に、ソートの結果が
     /// 入力の並びや実装のバージョンで変わる。**決定的であることは
@@ -306,9 +310,9 @@ pub struct Trial {
     pub warnings: Vec<WarningCode>,
     /// 同じ列の 1 つ手前より前景比率が `FOREGROUND_COLLAPSE` を超えて落ちたか。
     ///
-    /// **候補そのものの性質であって、回した寸法の性質ではない。** 原寸で測り直しても
-    /// 引き継ぐ——列の中での位置は変わらないし、引き継がないと最終段で
-    /// `score.fatal` が素の数へ戻り、探索段で外したはずの候補が勝ち返す
+    /// **`score.fatal` には足さない。** あちらは「出た警告の数」で、
+    /// `OPTIMIZE_NO_CLEAN_CANDIDATE` が数える対象と同じものでなければならない。
+    /// 崩れは警告 code を持たないので、順位の側（`better`）だけが足す
     pub collapsed: bool,
     pub score: Score,
 }
@@ -333,8 +337,7 @@ pub fn score(result: &CutoutResult) -> Score {
 impl Trial {
     fn new(candidate: Candidate, stage: Stage, result: &CutoutResult, collapsed: bool) -> Self {
         let warnings: Vec<WarningCode> = result.warnings.iter().map(|w| w.code).collect();
-        let mut score = score(result);
-        score.fatal += usize::from(collapsed);
+        let score = score(result);
         Trial {
             candidate,
             stage,
@@ -348,9 +351,17 @@ impl Trial {
         }
     }
 
+    /// 順位を決める第 1 項。**警告の数に前景比率の崩れを 1 つ足す。**
+    fn fatal_rank(&self) -> usize {
+        self.score.fatal + usize::from(self.collapsed)
+    }
+
     /// 致命的な警告も品質の警告も 1 つも無いか。早期打ち切りの条件。
+    ///
+    /// **崩れた候補は綺麗ではない。** 商品を飲んだ結果は警告を 1 つも出さずに
+    /// 指標だけ良くなるので、`warnings` だけを見ていると、ここで止まってしまう。
     fn clean(&self) -> bool {
-        self.score.fatal == 0 && !self.warnings.iter().any(|c| QUALITY_CODES.contains(c))
+        self.fatal_rank() == 0 && !self.warnings.iter().any(|c| QUALITY_CODES.contains(c))
     }
 
     fn fatal_codes(&self) -> Vec<&'static str> {
@@ -369,8 +380,10 @@ impl Trial {
 /// （既定の側）を選ぶ。どれも「同じ数値なら余計なことをしていないほうを採る」
 /// という一貫した方針である。
 pub fn better(a: &Trial, b: &Trial) -> Ordering {
-    a.score
-        .better(&b.score)
+    a.fatal_rank()
+        .cmp(&b.fatal_rank())
+        .then_with(|| a.score.quality.total_cmp(&b.score.quality))
+        .then_with(|| b.score.separability.total_cmp(&a.score.separability))
         .then_with(|| a.candidate.tolerance.total_cmp(&b.candidate.tolerance))
         .then_with(|| a.candidate.bbox.is_some().cmp(&b.candidate.bbox.is_some()))
         .then_with(|| {
@@ -427,10 +440,7 @@ fn penalise_collapse(trials: &mut [Trial]) {
             {
                 collapsed = true;
             }
-            if collapsed && !trials[i].collapsed {
-                trials[i].collapsed = true;
-                trials[i].score.fatal += 1;
-            }
+            trials[i].collapsed |= collapsed;
             previous = Some(ratio);
         }
     }
@@ -466,8 +476,14 @@ pub fn optimize(
     let small = reduced(image)?;
     let target = (small.width(), small.height());
 
-    // 探索段の土台。**利用者の数値ノブはそのまま渡す**（`--cleanup` や
-    // `--feather` は探索の軸ではない）。変えるのは寸法に依るものと `refine` だけ
+    // 探索段の土台。**利用者の数値ノブはそのまま渡す。** 変えるのは寸法で
+    // 表された指示（矩形・種・画素ごとの制約）と `refine` だけである。
+    //
+    // **`--border` と `--feather` は探索段で相対的に太くなる。** どちらも実寸の
+    // px で、`--cleanup` や `--smooth-contour` と違って長辺 1000px 換算では
+    // ないので、4284px の素材を 1500px で回すと 2.9 倍の幅に相当する。順位を
+    // 付けるだけなら全候補に同じ歪みが掛かるので実害は出ていない（一致率の
+    // 実測は docs/design.md 4.13）が、換算を足すなら**まずここを疑う**こと
     let search_base = CutoutOptions {
         bbox: base
             .bbox
@@ -509,25 +525,46 @@ pub fn optimize(
     // 安定ソート。`better` が全順序を返すので、同じ入力からは必ず同じ並びが出る
     trials.sort_by(better);
 
-    // 最終段。**保持するのは今までの最良 1 つだけ**で、負けた候補の画像は即捨てる
-    let mut best: Option<(usize, CutoutResult, CutoutOptions, Trial)> = None;
+    // 最終段。**選ぶのは全部回し終えてからである。**
+    //
+    // 原寸でだけ商品を飲む候補がある（実写では探索段の 1 位が 1500px では
+    // 崩れず、原寸で前景比率 0.2037 → 0.0664 になる）。崩れは列の比較でしか
+    // 見えないので、1 つ回すたびに勝者を決めていると原寸の崩れを誰も測れない。
+    //
+    // **`FINALISTS` ぶんの結果を同時に抱えることになる。** 24.5MP で 1 つ
+    // 120MB あるので、この定数は順位の安全側だけでなく確保量でも縛られている。
+    let mut finals: Vec<(usize, CutoutResult, CutoutOptions, Trial)> = Vec::new();
     for i in 0..trials.len().min(FINALISTS) {
         let candidate = trials[i].candidate;
         let options = with(base, &candidate, source, source);
         let result = cutout(image, &options);
         let trial = Trial::new(candidate, Stage::Final, &result, trials[i].collapsed);
-        let win = best
-            .as_ref()
-            .is_none_or(|(_, _, _, held)| better(&trial, held) == Ordering::Less);
         let stop = trial.clean();
         trials[i] = trial.clone();
-        if win {
-            best = Some((i, result, options, trial));
-        }
+        finals.push((i, result, options, trial));
         if stop {
             break;
         }
     }
+
+    // 原寸の前景比率で列を測り直す。探索段の判定は引き継いだうえで、
+    // 縮小では見えなかった崩れをここで足す
+    {
+        let mut measured: Vec<Trial> = finals.iter().map(|(_, _, _, t)| t.clone()).collect();
+        penalise_collapse(&mut measured);
+        for ((i, _, _, trial), refreshed) in finals.iter_mut().zip(measured) {
+            trial.collapsed = refreshed.collapsed;
+            trials[*i].collapsed = refreshed.collapsed;
+        }
+    }
+    // 負けたほうはここで落ちる（`reduce` が畳むたびに片方を手放す）
+    let best = finals.into_iter().reduce(|held, next| {
+        if better(&next.3, &held.3) == Ordering::Less {
+            next
+        } else {
+            held
+        }
+    });
 
     // 候補が 1 つも無いことは起こらない（許容量の軸は必ず 1 つ以上ある）が、
     // 公開関数なので「起こらないはず」で panic させない
@@ -888,9 +925,17 @@ mod tests {
             .collect();
         penalise_collapse(&mut trials);
         assert_eq!(
-            trials.iter().map(|t| t.score.fatal).collect::<Vec<_>>(),
-            vec![0, 0, 1, 1],
+            trials.iter().map(|t| t.collapsed).collect::<Vec<_>>(),
+            vec![false, false, true, true],
             "落ち込みは以降へ伝播するべき"
+        );
+        // **順位には効くが、出た警告の数は動かさない。** 崩れは code を
+        // 持たないので、`OPTIMIZE_NO_CLEAN_CANDIDATE` が数える対象と
+        // `score.fatal` は同じものでなければならない
+        assert!(trials.iter().all(|t| t.score.fatal == 0));
+        assert_eq!(
+            trials.iter().map(|t| t.fatal_rank()).collect::<Vec<_>>(),
+            vec![0, 0, 1, 1]
         );
     }
 
@@ -918,9 +963,21 @@ mod tests {
         ];
         penalise_collapse(&mut trials);
         assert!(
-            trials.iter().all(|t| t.score.fatal == 0),
+            trials.iter().all(|t| !t.collapsed),
             "bbox の違う候補どうしを比べてはいけない"
         );
+    }
+
+    /// 崩れた候補は「綺麗」ではない。**早期打ち切りをそこで止めない。**
+    ///
+    /// 商品を飲んだ結果は警告を 1 つも出さずに指標だけ良くなるので、
+    /// `warnings` だけを見ていると最終段が 1 つ目で止まってしまう。
+    #[test]
+    fn a_collapsed_candidate_never_counts_as_clean() {
+        let mut t = trial(0, 0.0, 50.0, plain(60.0));
+        assert!(t.clean());
+        t.collapsed = true;
+        assert!(!t.clean());
     }
 
     /// 矩形は寸法ごとに解き直す。**利用者の指定は原寸で 1px も動かさない。**

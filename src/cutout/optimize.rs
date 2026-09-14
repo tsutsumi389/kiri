@@ -13,6 +13,11 @@
 //!    順に回す。致命的な警告も品質の警告も出なければそこで打ち切る
 //!
 //! 原寸 1 回が 24.5MP で 5〜7 秒あるので、**早期打ち切りが所要時間の要**である。
+//!
+//! **2 つの段は別の物差しで並べる**（`better_search` / `better_final`）。
+//! 縮小と `refine` 抜きで意味が変わってしまう量——halo・輪郭の粗さ・縁の汚染、
+//! そして外周接触の警告——を探索段の順位に使うと、探索段が最終段とは別の
+//! 目的関数を最適化することになる。詳しくはそれぞれの doc にある。
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -25,7 +30,7 @@ use crate::cutout::{
     BackgroundModel, CutoutOptions, CutoutResult, Diagnostics, ResolvedModel, SubjectHint,
     analyse_background, bbox_to_pixels, cutout,
 };
-use crate::error::Result;
+use crate::error::{Error, ErrorCode, Result};
 use crate::transform::resize::{self, FitMode, ResizeSpec};
 use crate::warning::{Warning, WarningCode};
 
@@ -62,21 +67,30 @@ pub const FINALISTS: usize = 2;
 
 /// 「その候補は商品を飲んだ」とみなす前景比率の落ち込み。
 ///
-/// **スコアは `eaten`（商品をどれだけ削ったか）を見られない。** 淡色商品では
-/// tolerance を上げると商品ごと背景として飲まれるが、飲まれた結果は
-/// 「halo が減った」「縁の汚染が消えた」という**良い数値**として現れる。
-/// 残った断片が外周に触れていなければ致命的な警告も出ない。
+/// 落ち込みは 2 通りに測る。**探索段では同じ bbox・同じモデルの列を許容量の
+/// 昇順に**（`penalise_collapse`）、**最終段では同じ候補の探索段の値と**
+/// （`optimize` の最終段）。前景比率は寸法に依らない量なので、後者は 1500px と
+/// 原寸をそのまま比べられる。
 ///
-/// そこで、同じ bbox・同じモデルの列を許容量の昇順に見て、1 段上げたときに
-/// 前景比率がこれだけ落ちたら「減ったのは背景の残りではなく商品そのもの」と読む。
+/// **実際に効いているのは最終段の自己比較のほうである。** 実写の
+/// 60 / bbox / auto がそれで、探索段では 0.2037 だった前景比率が原寸で 0.0664
+/// まで落ちる——縮小版では崩れず、原寸でだけ商品を飲む。列の比較では最終段の
+/// 2 つが同じ列にいるとは限らないので捕まえられない。
 ///
-/// **この関門は R3（布との ΔE が 12 前後の淡色商品）で入れた。** 入れる前は
-/// tolerance 60 が選ばれ、商品が 100% 飲まれて輪郭誤差が 24.25 → 119.10 に
-/// なっていた。0.30 という値は R3 の列の落ち込み（0.19 → 0.01、実に 95%）と、
-/// 正常な列の最大の落ち込み（R1 の 0.30 → 0.21、28%）のあいだにある。
+/// **R3（布との ΔE が 12 前後の淡色商品）では順位を変えなかった。** 入れる前も
+/// 後も輪郭誤差は 119 台で（119.10 → 119.70）、この素材は矩形が作れない時点で
+/// 詰んでいる。それでも置くのは、**スコアが `eaten`（商品をどれだけ削ったか）を
+/// 見られない**という構造的な穴があるためである——飲まれた結果は「halo が
+/// 減った」「縁の汚染が消えた」という良い数値として現れ、残った断片が外周に
+/// 触れていなければ警告も 1 つも出ない。
+///
+/// 0.30 という値は、実写の崩れ（0.2037 → 0.0664、67%）と R3 の列の落ち込み
+/// （0.19 → 0.01、95%）の下に、正常な列の最大の落ち込み（R1 の 0.30 → 0.21、
+/// 28%）と `refine` による前景比率の揺れ（search → final で最大 3%。表は
+/// docs/design.md 4.13）の上に取ってある。
 pub const FOREGROUND_COLLAPSE: f64 = 0.30;
 
-/// 致命的な警告。**少ないほど良い**の第 1 位。
+/// 致命的な警告。**少ないほど良い**の第 1 位。**最終段（原寸）の物差しである。**
 ///
 /// どれも「切り抜きとして成立していない」を言う。品質の警告（縁の残り、
 /// 輪郭の粗さ）とは桁が違う失敗なので、重み和ではなく数で先に比べる。
@@ -93,6 +107,39 @@ pub const FATAL_CODES: [WarningCode; 5] = [
     WarningCode::ForegroundTooLarge,
     WarningCode::SubjectTouchesEdge,
     WarningCode::BboxRecommended,
+];
+
+/// 探索段（縮小・`refine` 抜き）で数える致命的な警告。
+///
+/// **`refine` の有無で出たり消えたりする code を探索段の順位に使わない。**
+/// 外周接触の 2 つ（`SUBJECT_TOUCHES_EDGE` / `BBOX_RECOMMENDED`）がまさに
+/// それで、実写（不織布の上のリモコン、主体の矩形の左辺が x=0 に接する）では
+/// **矩形つきの候補 6 つすべてが探索段で外周接触を出し、原寸では 1 つも
+/// 出さない**。境界の再分類が無いぶん縁に繊維が残り、前景が外周へ届くためで、
+/// 縮小のせいではない。数が信用できない項を第 1 項に置くと、順位はそこで
+/// 決まり切ってしまう。
+///
+/// 残る 3 つは前景比率そのもの（`FOREGROUND_TOO_SMALL` / `_TOO_LARGE`）か
+/// 背景の分離可能性（`NOT_SEPARABLE`）で、どちらも `refine` の前に決まる。
+pub const SEARCH_FATAL_CODES: [WarningCode; 3] = [
+    WarningCode::NotSeparable,
+    WarningCode::ForegroundTooSmall,
+    WarningCode::ForegroundTooLarge,
+];
+
+/// `OPTIMIZE_NO_CLEAN_CANDIDATE` が数える code。**順位用の `FATAL_CODES`
+/// から `BBOX_RECOMMENDED` を除いたもの。**
+///
+/// `BBOX_RECOMMENDED` は「この矩形を渡せ」と矩形つきで次の一手を言っている
+/// 警告である。それを「候補をすべて試しましたが駄目でした、撮り直してください」
+/// と重ねて言うと、**同じ結果に対して 2 つの矛盾した指示が並ぶ**。順位の上で
+/// 外周接触と同じ重さで扱うこと（`FATAL_CODES`）と、利用者に手詰まりを
+/// 告げること（ここ）は別の判断である。
+pub const NO_CLEAN_CANDIDATE_CODES: [WarningCode; 4] = [
+    WarningCode::NotSeparable,
+    WarningCode::ForegroundTooSmall,
+    WarningCode::ForegroundTooLarge,
+    WarningCode::SubjectTouchesEdge,
 ];
 
 /// 品質の警告。早期打ち切りの条件に使う。
@@ -232,34 +279,20 @@ pub fn candidates(
     out
 }
 
-/// 候補のスコア。**辞書式に上から比べる。**
+/// 候補のスコア。**報告に出る 4 つ組で、順位そのものではない。**
+///
+/// 順位は段ごとに違う物差しで付く（`better_search` / `better_final`）。
+/// ここに置くのは「どちらの段でも同じ意味で読める数」だけである。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Score {
-    /// 致命的な警告の数。少ないほど良い
+    /// 致命的な警告の数（`FATAL_CODES`）。少ないほど良い
     pub fatal: usize,
+    /// 測れなかった診断値の数（halo / 粗さ / rim のうち null の個数）。少ないほど良い
+    pub unmeasured: usize,
     /// 品質の重み和。小さいほど良い
     pub quality: f64,
     /// 境界の色差。大きいほど良い（測れなければ 0）
     pub separability: f64,
-}
-
-impl Score {
-    /// 良い順。`Ordering::Less` なら `self` のほうが良い。
-    ///
-    /// **前景比率の崩れ（`Trial::collapsed`）はここでは見ない。** `fatal` は
-    /// 「出た警告の数」であって順位そのものではなく、報告にもその意味で出す。
-    /// 崩れを足した順位は `better` が持つ。
-    ///
-    /// 比較は `total_cmp` で行う。`partial_cmp` は NaN で `None` を返し、
-    /// 呼び出し側が「どちらでもよい」と扱った瞬間に、ソートの結果が
-    /// 入力の並びや実装のバージョンで変わる。**決定的であることは
-    /// kiri の売りなので、順序も環境で動いてはいけない。**
-    pub fn better(&self, other: &Score) -> Ordering {
-        self.fatal
-            .cmp(&other.fatal)
-            .then_with(|| self.quality.total_cmp(&other.quality))
-            .then_with(|| other.separability.total_cmp(&self.separability))
-    }
 }
 
 /// 品質の重み和。
@@ -276,6 +309,23 @@ fn quality(d: &Diagnostics) -> f64 {
     term(d.rim_contamination, RIM_CONTAMINATION_WARN)
         + term(d.contour_roughness, CONTOUR_ROUGH_WARN)
         + term(d.halo_ratio, HALO_WARN)
+}
+
+/// 測れなかった診断値の数。
+///
+/// **`null → 1.0` だけでは足りない。** 3 つとも測れなければ重み和は 3.0 に
+/// なるが、境界がまともに引けている候補の重み和も 1〜3 に収まるので、
+/// 「何も測れなかった」が中位の成績として通ってしまう。実際 `desk_a.jpg` では
+/// 前景比率 0.0001 のほぼ空のマスクが重み和 2.0 で上位に来ていた——診断が
+/// 3 つとも null になるのは、たいてい**測る対象の境界が無い**からである。
+///
+/// そこで最終段では重み和より先にこの数を見る。**境界を測れる候補は、
+/// 測れない候補に勝つ。** 同じ null 数どうしなら重み和の中の 1.0 は相殺する
+/// ので、`quality` の側の扱いは変えなくてよい。
+fn unmeasured(d: &Diagnostics) -> usize {
+    usize::from(d.rim_contamination.is_none())
+        + usize::from(d.contour_roughness.is_none())
+        + usize::from(d.halo_ratio.is_none())
 }
 
 /// その候補をどの寸法で回したか。
@@ -329,13 +379,17 @@ pub fn score(result: &CutoutResult) -> Score {
             .iter()
             .filter(|w| FATAL_CODES.contains(&w.code))
             .count(),
+        unmeasured: unmeasured(&result.diagnostics),
         quality: quality(&result.diagnostics),
         separability: result.separability.unwrap_or(0.0),
     }
 }
 
 impl Trial {
-    fn new(candidate: Candidate, stage: Stage, result: &CutoutResult, collapsed: bool) -> Self {
+    /// **公開しているのは較正のためである**（`score` と同じ理由）。
+    /// 縮小探索の順位が原寸の順位をどれだけ言い当てるかを測るには、ベンチ側が
+    /// 本番と同じ `Trial` を組んで本番の比較子へ渡せなければならない。
+    pub fn new(candidate: Candidate, stage: Stage, result: &CutoutResult, collapsed: bool) -> Self {
         let warnings: Vec<WarningCode> = result.warnings.iter().map(|w| w.code).collect();
         let score = score(result);
         Trial {
@@ -351,9 +405,20 @@ impl Trial {
         }
     }
 
-    /// 順位を決める第 1 項。**警告の数に前景比率の崩れを 1 つ足す。**
-    fn fatal_rank(&self) -> usize {
+    /// 最終段の順位を決める第 1 項。**警告の数に前景比率の崩れを 1 つ足す。**
+    pub fn fatal_rank(&self) -> usize {
         self.score.fatal + usize::from(self.collapsed)
+    }
+
+    /// 探索段の順位を決める第 1 項。**`refine` に依らない code だけを数える。**
+    ///
+    /// 崩れ（列の比較）は足す。前景比率は寸法にも `refine` にも依らない。
+    pub fn search_fatal_rank(&self) -> usize {
+        self.warnings
+            .iter()
+            .filter(|c| SEARCH_FATAL_CODES.contains(c))
+            .count()
+            + usize::from(self.collapsed)
     }
 
     /// 致命的な警告も品質の警告も 1 つも無いか。早期打ち切りの条件。
@@ -364,31 +429,68 @@ impl Trial {
         self.fatal_rank() == 0 && !self.warnings.iter().any(|c| QUALITY_CODES.contains(c))
     }
 
-    fn fatal_codes(&self) -> Vec<&'static str> {
+    /// `OPTIMIZE_NO_CLEAN_CANDIDATE` に載せる code。
+    ///
+    /// **`BBOX_RECOMMENDED` は含めない**（`NO_CLEAN_CANDIDATE_CODES` を参照）。
+    fn remaining_codes(&self) -> Vec<&'static str> {
         self.warnings
             .iter()
-            .filter(|c| FATAL_CODES.contains(*c))
+            .filter(|c| NO_CLEAN_CANDIDATE_CODES.contains(*c))
             .map(|c| c.as_str())
             .collect()
     }
 }
 
-/// 候補どうしの順序。スコアが同点なら設定そのもので決める。
+/// 同点を設定そのもので決める。
 ///
 /// **同点を並びの偶然で決めさせない。** 小さい tolerance（商品を削る危険が
 /// 小さい側）、次に bbox 無し（利用者が構図を決めていない側）、次に `auto`
 /// （既定の側）を選ぶ。どれも「同じ数値なら余計なことをしていないほうを採る」
-/// という一貫した方針である。
-pub fn better(a: &Trial, b: &Trial) -> Ordering {
-    a.fatal_rank()
-        .cmp(&b.fatal_rank())
-        .then_with(|| a.score.quality.total_cmp(&b.score.quality))
-        .then_with(|| b.score.separability.total_cmp(&a.score.separability))
-        .then_with(|| a.candidate.tolerance.total_cmp(&b.candidate.tolerance))
+/// という一貫した方針である。**両方の段で同じものを使う。**
+fn tie_break(a: &Trial, b: &Trial) -> Ordering {
+    a.candidate
+        .tolerance
+        .total_cmp(&b.candidate.tolerance)
         .then_with(|| a.candidate.bbox.is_some().cmp(&b.candidate.bbox.is_some()))
         .then_with(|| {
             model_rank(a.candidate.background_model).cmp(&model_rank(b.candidate.background_model))
         })
+}
+
+/// 探索段（縮小・`refine` 抜き）の順序。`Ordering::Less` なら `a` のほうが良い。
+///
+/// **`refine` に依らない量だけで並べる。** 縮小版の halo / 輪郭の粗さ / 縁の
+/// 汚染は、原寸のそれと桁が違ううえに**倍率が候補ごとに違う**（実写では rim が
+/// 4〜6 倍、粗さが 3〜5 倍）。境界の再分類と平滑化を抜いたせいで、寸法の
+/// 換算では戻せない。並べ替えに使えば、探索段は最終段と別の目的関数を
+/// 最適化することになる。
+///
+/// 残るのは `separability` である。これは**境界の内側と外側を元画像の色で
+/// 測る**量なので、`refine` にも寸法にもほとんど依らない——実写の突き合わせで
+/// 55.97 対 56.57、52.64 対 53.16、47.42 対 47.54 と、1% 以内で一致した。
+///
+/// 比較は `total_cmp` で行う。`partial_cmp` は NaN で `None` を返し、
+/// 呼び出し側が「どちらでもよい」と扱った瞬間に、ソートの結果が入力の並びや
+/// 実装のバージョンで変わる。**決定的であることは kiri の売りなので、順序も
+/// 環境で動いてはいけない。**
+pub fn better_search(a: &Trial, b: &Trial) -> Ordering {
+    a.search_fatal_rank()
+        .cmp(&b.search_fatal_rank())
+        .then_with(|| b.score.separability.total_cmp(&a.score.separability))
+        .then_with(|| tie_break(a, b))
+}
+
+/// 最終段（原寸・利用者の設定そのまま）の順序。`Ordering::Less` なら `a` が良い。
+///
+/// ここでは診断値が原寸のもので揃うので、品質の重み和まで見る。ただし
+/// **重み和より先に「測れなかった診断値の数」を見る**（`unmeasured` を参照）。
+pub fn better_final(a: &Trial, b: &Trial) -> Ordering {
+    a.fatal_rank()
+        .cmp(&b.fatal_rank())
+        .then_with(|| a.score.unmeasured.cmp(&b.score.unmeasured))
+        .then_with(|| a.score.quality.total_cmp(&b.score.quality))
+        .then_with(|| b.score.separability.total_cmp(&a.score.separability))
+        .then_with(|| tie_break(a, b))
 }
 
 fn model_rank(model: BackgroundModel) -> u8 {
@@ -399,7 +501,7 @@ fn model_rank(model: BackgroundModel) -> u8 {
     }
 }
 
-/// 商品を飲んだ候補に致命 +1 を足す。
+/// 商品を飲んだ候補に致命 +1 を足す。**探索段専用である。**
 ///
 /// **同じ bbox・同じモデルの列を、許容量の昇順に見る。** 直前の候補から前景比率が
 /// `FOREGROUND_COLLAPSE` を超えて落ちていたら、その候補は商品を飲んでいる。
@@ -408,7 +510,13 @@ fn model_rank(model: BackgroundModel) -> u8 {
 ///
 /// 落ち込みは**以降へ伝播させる**。60 で飲まれた列では 45 も既に飲まれている
 /// ことが多く、そこだけ無傷に見せると 1 つ手前が勝ってしまう。
-fn penalise_collapse(trials: &mut [Trial]) {
+///
+/// **最終段では使えない。** 列の比較は 5 点そろって初めて意味を持つが、原寸で
+/// 回すのは `FINALISTS` 個だけで、その 2 つが同じ列にいるとも隣接しているとも
+/// 限らない。最終段は同じ候補の探索段の前景比率と比べる（`optimize` を参照）。
+///
+/// 公開しているのは較正のためである（`score` / `Trial::new` と同じ理由）。
+pub fn penalise_collapse(trials: &mut [Trial]) {
     let key = |t: &Trial| {
         (
             t.candidate.bbox.is_some(),
@@ -522,70 +630,30 @@ pub fn optimize(
         .collect();
     drop(small);
     penalise_collapse(&mut trials);
-    // 安定ソート。`better` が全順序を返すので、同じ入力からは必ず同じ並びが出る
-    trials.sort_by(better);
+    // 安定ソート。`better_search` が全順序を返すので、同じ入力からは必ず
+    // 同じ並びが出る
+    trials.sort_by(better_search);
 
-    // 最終段。**選ぶのは全部回し終えてからである。**
-    //
-    // 原寸でだけ商品を飲む候補がある（実写では探索段の 1 位が 1500px では
-    // 崩れず、原寸で前景比率 0.2037 → 0.0664 になる）。崩れは列の比較でしか
-    // 見えないので、1 つ回すたびに勝者を決めていると原寸の崩れを誰も測れない。
-    //
-    // **`FINALISTS` ぶんの結果を同時に抱えることになる。** 24.5MP で 1 つ
-    // 120MB あるので、この定数は順位の安全側だけでなく確保量でも縛られている。
-    let mut finals: Vec<(usize, CutoutResult, CutoutOptions, Trial)> = Vec::new();
-    for i in 0..trials.len().min(FINALISTS) {
-        let candidate = trials[i].candidate;
-        let options = with(base, &candidate, source, source);
+    let best = finalists(&mut trials, |candidate| {
+        let options = with(base, candidate, source, source);
         let result = cutout(image, &options);
-        let trial = Trial::new(candidate, Stage::Final, &result, trials[i].collapsed);
-        let stop = trial.clean();
-        trials[i] = trial.clone();
-        finals.push((i, result, options, trial));
-        if stop {
-            break;
-        }
-    }
-
-    // 原寸の前景比率で列を測り直す。探索段の判定は引き継いだうえで、
-    // 縮小では見えなかった崩れをここで足す
-    {
-        let mut measured: Vec<Trial> = finals.iter().map(|(_, _, _, t)| t.clone()).collect();
-        penalise_collapse(&mut measured);
-        for ((i, _, _, trial), refreshed) in finals.iter_mut().zip(measured) {
-            trial.collapsed = refreshed.collapsed;
-            trials[*i].collapsed = refreshed.collapsed;
-        }
-    }
-    // 負けたほうはここで落ちる（`reduce` が畳むたびに片方を手放す）
-    let best = finals.into_iter().reduce(|held, next| {
-        if better(&next.3, &held.3) == Ordering::Less {
-            next
-        } else {
-            held
-        }
+        let trial = Trial::new(*candidate, Stage::Final, &result, false);
+        (trial, (result, options))
     });
 
-    // 候補が 1 つも無いことは起こらない（許容量の軸は必ず 1 つ以上ある）が、
-    // 公開関数なので「起こらないはず」で panic させない
-    let (chosen, result, options, trial) = match best {
-        Some(best) => best,
-        None => {
-            let result = cutout(image, base);
-            let trial = Trial::new(
-                Candidate {
-                    tolerance: base.tolerance,
-                    bbox: base.bbox.map(CandidateBbox::Given),
-                    background_model: base.background_model,
-                },
-                Stage::Final,
-                &result,
-                false,
-            );
-            trials.push(trial.clone());
-            (trials.len() - 1, result, base.clone(), trial)
-        }
-    };
+    // 候補が 1 つも無いことは起こらない。`candidates` は 3 つの軸それぞれに
+    // 必ず 1 つ以上を積むので空にならず、空でなければ `finalists` が必ず
+    // 1 回は回る。**黙って `cutout` を走らせ直すほうが危うい**——探索の記録と
+    // 書き出した絵が食い違ったまま成功して返ることになる
+    debug_assert!(best.is_some(), "候補集合が空のまま最終段を抜けた");
+    let (chosen, (result, options)) = best.ok_or_else(|| {
+        Error::new(
+            ErrorCode::OptimizeNoCandidate,
+            "--optimize が試せる候補を 1 つも組めませんでした",
+        )
+        .with_hint("--tolerance や --background-model の明示を外して試してください")
+    })?;
+    let trial = trials[chosen].clone();
 
     let warning = no_clean_candidate(&trial);
     Ok(Optimized {
@@ -599,12 +667,66 @@ pub fn optimize(
     })
 }
 
+/// 原寸で商品を飲んだか。**同じ候補の探索段の前景比率と比べる。**
+///
+/// 前景比率は寸法に依らない量なので、1500px の値と原寸の値をそのまま比べられる。
+/// **列の相方が要らない**のがこの測り方の値打ちで、最終段で原寸まで回るのは
+/// `FINALISTS` 個だけ、その 2 つが同じ列にいるとも隣接しているとも限らない。
+///
+/// `refine` の再分類で前景比率が数 % 動くのは正常である（実測で最大 3%。表は
+/// docs/design.md 4.13）。`FOREGROUND_COLLAPSE` はその 10 倍の位置にある。
+fn collapsed_at_full_size(searched: f64, full: f64) -> bool {
+    searched > 0.0 && full < searched * (1.0 - FOREGROUND_COLLAPSE)
+}
+
+/// 最終段。**探索段の上位から順に原寸で回し、綺麗なものに当たったら止める。**
+///
+/// `run` は 1 候補を原寸で回して `Trial` と「一緒に持ち帰りたいもの」
+/// （本番では切り抜き結果と効いた設定）を返す。**`run` を引数にしてあるのは、
+/// 早期打ち切りの回数と崩れの判定を画像無しで確かめられるようにするため**で、
+/// これらは 24.5MP の素材でしか起きない振る舞いだった。
+///
+/// `searched` は探索段の順位で並んだ候補表で、回した候補は原寸の `Trial` で
+/// 上書きする（報告に出るのは原寸の数値である）。
+///
+/// 返すのは勝った候補の位置と `run` の持ち帰り。**負けた側はその場で落ちる**——
+/// 24.5MP の切り抜き 1 つが 120MB あるので、2 つを同時に抱えない。
+fn finalists<T>(
+    searched: &mut [Trial],
+    mut run: impl FnMut(&Candidate) -> (Trial, T),
+) -> Option<(usize, T)> {
+    let mut best: Option<(usize, Trial, T)> = None;
+    for i in 0..searched.len().min(FINALISTS) {
+        let candidate = searched[i].candidate;
+        let before = searched[i].foreground_ratio;
+        let (mut trial, extra) = run(&candidate);
+        // 探索段で既に崩れと判定されていれば引き継ぐ。列の比較で捕まえた崩れが、
+        // 原寸で比率が動かなかっただけで消えてはいけない
+        trial.collapsed =
+            searched[i].collapsed || collapsed_at_full_size(before, trial.foreground_ratio);
+        let stop = trial.clean();
+        searched[i] = trial.clone();
+        best = match best {
+            Some(held) if better_final(&held.1, &trial) != Ordering::Greater => Some(held),
+            _ => Some((i, trial, extra)),
+        };
+        if stop {
+            break;
+        }
+    }
+    best.map(|(i, _, extra)| (i, extra))
+}
+
 /// 選ばれた候補にも致命的な警告が残ったことを知らせる。
 ///
 /// **20 通り試して駄目だったという事実そのものが情報である。** ここまで来たら
 /// 残るのは素材を変えるか、色ではない手がかり（モデル）を足すかしかない。
+///
+/// **`BBOX_RECOMMENDED` しか残らなかったときは黙る**（`NO_CLEAN_CANDIDATE_CODES`）。
+/// あちらは矩形つきで次の一手を言っているので、重ねて「撮り直してください」と
+/// 言うと、同じ結果に対して 2 つの矛盾した指示が並ぶ。
 fn no_clean_candidate(trial: &Trial) -> Option<Warning> {
-    let remaining = trial.fatal_codes();
+    let remaining = trial.remaining_codes();
     if remaining.is_empty() {
         return None;
     }
@@ -808,12 +930,22 @@ mod tests {
     }
 
     /// 何も測れなかった診断値。スコアの比較そのものを見るテストで使う。
-    fn unmeasured() -> Diagnostics {
+    fn no_diagnostics() -> Diagnostics {
         Diagnostics {
             halo_ratio: None,
             edge_width: None,
             contour_roughness: None,
             rim_contamination: None,
+        }
+    }
+
+    /// 3 つとも測れた診断値。`unmeasured` が 0 になる。
+    fn measured() -> Diagnostics {
+        Diagnostics {
+            halo_ratio: Some(0.0),
+            edge_width: Some(1.5),
+            contour_roughness: Some(0.0),
+            rim_contamination: Some(0.0),
         }
     }
 
@@ -824,11 +956,12 @@ mod tests {
             foreground_ratio: 0.3,
             touches_edge: false,
             separability: Some(separability),
-            diagnostics: unmeasured(),
+            diagnostics: measured(),
             warnings: Vec::new(),
             collapsed: false,
             score: Score {
                 fatal,
+                unmeasured: 0,
                 quality,
                 separability,
             },
@@ -843,17 +976,24 @@ mod tests {
         }
     }
 
-    /// スコアは辞書式。上の項が決まれば下は見ない。
+    /// `warnings` を差し替えた候補。段ごとの致命の数え方を見るテストで使う。
+    fn with_warnings(mut t: Trial, codes: &[WarningCode]) -> Trial {
+        t.warnings = codes.to_vec();
+        t.score.fatal = codes.iter().filter(|c| FATAL_CODES.contains(c)).count();
+        t
+    }
+
+    /// 最終段のスコアは辞書式。上の項が決まれば下は見ない。
     #[test]
-    fn the_score_is_compared_from_the_top_down() {
+    fn the_final_score_is_compared_from_the_top_down() {
         let fatal = trial(1, 0.0, 99.0, plain(12.0));
         let clean = trial(0, 9.9, 0.1, plain(12.0));
-        assert_eq!(better(&clean, &fatal), Ordering::Less, "致命の数が先");
+        assert_eq!(better_final(&clean, &fatal), Ordering::Less, "致命の数が先");
 
         let rough = trial(0, 5.0, 99.0, plain(12.0));
         let smooth = trial(0, 1.0, 0.1, plain(12.0));
         assert_eq!(
-            better(&smooth, &rough),
+            better_final(&smooth, &rough),
             Ordering::Less,
             "品質が separability より先"
         );
@@ -861,40 +1001,91 @@ mod tests {
         let dull = trial(0, 1.0, 10.0, plain(12.0));
         let sharp = trial(0, 1.0, 50.0, plain(12.0));
         assert_eq!(
-            better(&sharp, &dull),
+            better_final(&sharp, &dull),
             Ordering::Less,
             "色差は大きいほど良い"
         );
     }
 
-    /// 同点なら小さい tolerance、次に bbox 無し、次に `auto`。
+    /// **境界を測れる候補は、測れない候補に勝つ。**
+    ///
+    /// `null → 1.0` だけでは、診断が 3 つとも測れなかった候補の重み和が 3.0 に
+    /// なるだけで、境界がまともに引けている候補（1〜3）と同じ帯に入る。
+    /// `desk_a.jpg` では前景比率 0.0001 のほぼ空のマスクが重み和 2.0 で
+    /// 上位へ来ていた。重み和より先に null の数を見ればそれが落ちる。
+    #[test]
+    fn a_candidate_with_a_measurable_edge_beats_one_without() {
+        let mut blank = trial(0, 2.0, 99.0, plain(12.0));
+        blank.diagnostics = no_diagnostics();
+        blank.score.unmeasured = 3;
+        blank.score.quality = quality(&no_diagnostics());
+
+        let real = trial(0, 2.5, 0.1, plain(60.0));
+        assert_eq!(
+            better_final(&real, &blank),
+            Ordering::Less,
+            "重み和でも色差でも負けているのに、測れる候補が勝つべき"
+        );
+    }
+
+    /// 探索段は `refine` に依らない量だけで並べる。
+    ///
+    /// 縮小・`refine` 抜きでは、矩形つきの候補が原寸では出さない外周接触を
+    /// 出し、halo と粗さと rim が候補ごとに違う倍率で膨らむ。それらを順位に
+    /// 使うと、探索段は最終段と別の目的関数を最適化することになる。
+    #[test]
+    fn the_search_stage_ignores_everything_refine_changes() {
+        let edgy = with_warnings(
+            trial(0, 9.9, 50.0, plain(60.0)),
+            &[WarningCode::SubjectTouchesEdge],
+        );
+        let quiet = trial(0, 0.1, 10.0, plain(12.0));
+        assert_eq!(
+            better_search(&edgy, &quiet),
+            Ordering::Less,
+            "外周接触も品質の重み和も探索段の順位に使ってはいけない"
+        );
+        // 最終段では逆になる。**同じ 2 つを別の物差しが別の順に並べる**
+        assert_eq!(better_final(&quiet, &edgy), Ordering::Less);
+
+        // 前景比率そのものの失敗は探索段でも数える
+        let tiny = with_warnings(
+            trial(0, 0.0, 99.0, plain(12.0)),
+            &[WarningCode::ForegroundTooSmall],
+        );
+        assert_eq!(better_search(&quiet, &tiny), Ordering::Less);
+    }
+
+    /// 同点なら小さい tolerance、次に bbox 無し、次に `auto`。**両方の段で。**
     #[test]
     fn a_tie_is_broken_by_the_least_intervention() {
-        let low = trial(0, 1.0, 10.0, plain(12.0));
-        let high = trial(0, 1.0, 10.0, plain(60.0));
-        assert_eq!(better(&low, &high), Ordering::Less);
-
-        let boxed = trial(
-            0,
-            1.0,
-            10.0,
-            Candidate {
+        let boxed = |t: Trial| Trial {
+            candidate: Candidate {
                 bbox: Some(CandidateBbox::Subject([0.1, 0.1, 0.9, 0.9])),
-                ..plain(12.0)
+                ..t.candidate
             },
-        );
-        assert_eq!(better(&low, &boxed), Ordering::Less);
+            ..t
+        };
+        for compare in [
+            better_search as fn(&Trial, &Trial) -> Ordering,
+            better_final as fn(&Trial, &Trial) -> Ordering,
+        ] {
+            let low = trial(0, 1.0, 10.0, plain(12.0));
+            let high = trial(0, 1.0, 10.0, plain(60.0));
+            assert_eq!(compare(&low, &high), Ordering::Less);
+            assert_eq!(compare(&low, &boxed(low.clone())), Ordering::Less);
 
-        let flat = trial(
-            0,
-            1.0,
-            10.0,
-            Candidate {
-                background_model: BackgroundModel::Flat,
-                ..plain(12.0)
-            },
-        );
-        assert_eq!(better(&low, &flat), Ordering::Less);
+            let flat = trial(
+                0,
+                1.0,
+                10.0,
+                Candidate {
+                    background_model: BackgroundModel::Flat,
+                    ..plain(12.0)
+                },
+            );
+            assert_eq!(compare(&low, &flat), Ordering::Less);
+        }
     }
 
     /// 測れなかった診断値はしきい値ちょうど（1.0）として数える。
@@ -902,7 +1093,9 @@ mod tests {
     /// 0 と扱うと「欠陥が無い」の最良点になり、測れなかった候補が勝ってしまう。
     #[test]
     fn an_unmeasurable_diagnostic_counts_as_exactly_at_the_threshold() {
-        assert_eq!(quality(&unmeasured()), 3.0);
+        assert_eq!(quality(&no_diagnostics()), 3.0);
+        assert_eq!(unmeasured(&no_diagnostics()), 3);
+        assert_eq!(unmeasured(&measured()), 0);
         let clean = Diagnostics {
             halo_ratio: Some(0.0),
             edge_width: Some(1.5),
@@ -935,6 +1128,15 @@ mod tests {
         assert!(trials.iter().all(|t| t.score.fatal == 0));
         assert_eq!(
             trials.iter().map(|t| t.fatal_rank()).collect::<Vec<_>>(),
+            vec![0, 0, 1, 1]
+        );
+        // **崩れは探索段の第 1 項にも効く。** 前景比率は `refine` にも寸法にも
+        // 依らないので、探索段で信用してよい数少ない量の 1 つである
+        assert_eq!(
+            trials
+                .iter()
+                .map(|t| t.search_fatal_rank())
+                .collect::<Vec<_>>(),
             vec![0, 0, 1, 1]
         );
     }
@@ -978,6 +1180,118 @@ mod tests {
         assert!(t.clean());
         t.collapsed = true;
         assert!(!t.clean());
+    }
+
+    /// 原寸の崩れは**同じ候補の探索段の前景比率**と比べる。
+    ///
+    /// 実写の 60 / bbox / auto は 1500px では崩れず、原寸で 0.2037 → 0.0664 に
+    /// なる。列の比較では捕まえられない（最終段の 2 つが同じ列にいるとは
+    /// 限らない）ので、自分の探索段の値と比べる。
+    #[test]
+    fn a_full_size_collapse_is_measured_against_the_same_candidate() {
+        assert!(
+            collapsed_at_full_size(0.2037, 0.0664),
+            "実写で商品を飲んだ候補を見逃している"
+        );
+        // `refine` の再分類で数 % 動くのは正常。誤爆させない
+        assert!(!collapsed_at_full_size(0.2037, 0.1980));
+        assert!(!collapsed_at_full_size(0.2037, 0.2037 * 0.71));
+        assert!(collapsed_at_full_size(0.2037, 0.2037 * 0.69));
+        // 探索段で前景が 1 画素も無かった候補は比べようがない（0 除算の側でも
+        // 「落ちた」の側でもなく、判定しない）
+        assert!(!collapsed_at_full_size(0.0, 0.0));
+    }
+
+    /// 最終段で回した候補の数と、そこで選ばれたもの。
+    fn finalise(searched: &mut [Trial], full: &[Trial]) -> (usize, Option<usize>) {
+        let mut ran = 0usize;
+        let chosen = finalists(searched, |_| {
+            let t = Trial {
+                stage: Stage::Final,
+                ..full[ran].clone()
+            };
+            ran += 1;
+            (t, ())
+        })
+        .map(|(i, ())| i);
+        (ran, chosen)
+    }
+
+    /// 綺麗な候補に当たったら**そこで止める**。原寸 1 回が数秒あるので、
+    /// 早期打ち切りが所要時間の要である。
+    #[test]
+    fn a_clean_first_finalist_stops_the_final_stage() {
+        let mut searched = vec![
+            trial(0, 1.0, 50.0, plain(12.0)),
+            trial(0, 1.0, 40.0, plain(20.0)),
+        ];
+        let full = vec![
+            trial(0, 0.0, 50.0, plain(12.0)),
+            trial(0, 0.0, 40.0, plain(20.0)),
+        ];
+        assert_eq!(finalise(&mut searched, &full), (1, Some(0)));
+        assert_eq!(searched[0].stage, Stage::Final, "回した候補は上書きされる");
+        assert_eq!(
+            searched[1].stage,
+            Stage::Search,
+            "回していない候補はそのまま"
+        );
+    }
+
+    /// **原寸で崩れた 1 位は早期打ち切りされず、2 位が選ばれる。**
+    ///
+    /// 商品を飲んだ結果は警告を 1 つも出さずに指標だけ良くなる。探索段の値と
+    /// 比べて初めて「これは残りの背景ではなく商品が消えた」と分かる。
+    #[test]
+    fn a_finalist_that_collapses_at_full_size_loses_to_the_runner_up() {
+        let mut searched = vec![
+            trial(0, 1.0, 50.0, plain(60.0)),
+            trial(0, 1.0, 40.0, plain(45.0)),
+        ];
+        searched[0].foreground_ratio = 0.2037;
+        searched[1].foreground_ratio = 0.2098;
+
+        let mut collapsed = trial(0, 0.0, 56.0, plain(60.0));
+        collapsed.foreground_ratio = 0.0664;
+        let mut survivor = trial(0, 0.9, 47.0, plain(45.0));
+        survivor.foreground_ratio = 0.2037;
+
+        assert_eq!(
+            finalise(&mut searched, &[collapsed, survivor]),
+            (2, Some(1)),
+            "崩れた 1 位で打ち切ってはいけない"
+        );
+        assert!(searched[0].collapsed, "崩れに印が付いていない");
+        assert!(!searched[1].collapsed);
+    }
+
+    /// `BBOX_RECOMMENDED` しか残らなかったら**黙る**。
+    ///
+    /// あちらは矩形つきで次の一手を言っているので、重ねて「撮り直すか
+    /// `--segment isnet` を試せ」と言うと、同じ結果に 2 つの矛盾した指示が並ぶ。
+    #[test]
+    fn a_bbox_recommendation_alone_is_not_a_dead_end() {
+        let only_bbox = with_warnings(
+            trial(0, 1.0, 10.0, plain(12.0)),
+            &[WarningCode::BboxRecommended],
+        );
+        assert_eq!(only_bbox.score.fatal, 1, "順位の上では致命として数える");
+        assert!(
+            no_clean_candidate(&only_bbox).is_none(),
+            "矩形を勧めている結果に「手詰まり」を重ねてはいけない"
+        );
+
+        let stuck = with_warnings(
+            trial(0, 1.0, 10.0, plain(12.0)),
+            &[WarningCode::BboxRecommended, WarningCode::NotSeparable],
+        );
+        let warning = no_clean_candidate(&stuck).expect("分離できないなら手詰まりを告げる");
+        let remaining = format!("{:?}", warning.data);
+        assert!(remaining.contains("NOT_SEPARABLE"), "{remaining}");
+        assert!(
+            !remaining.contains("BBOX_RECOMMENDED"),
+            "残った code に矩形の勧めを混ぜてはいけない: {remaining}"
+        );
     }
 
     /// 矩形は寸法ごとに解き直す。**利用者の指定は原寸で 1px も動かさない。**

@@ -522,14 +522,20 @@ pub struct OptimizeCandidate {
     pub chosen: bool,
 }
 
-/// 候補の順位を決めた 3 つの値。**辞書式に上から比べる。**
+/// 候補の指標を順位の形へ畳んだ 4 つの値。
 ///
-/// 順位の第 1 項は `fatal + collapsed`（隣の `collapsed` を参照）で、ここに
-/// 出るのは警告の数だけである。
+/// **2 つの段は別の並べ方をする。** 最終段（原寸）は `fatal + collapsed` →
+/// `unmeasured` → `quality` → `separability` の辞書式だが、探索段（縮小・
+/// `refine` 抜き）は `refine` に依らない量だけを見る——`NOT_SEPARABLE` /
+/// `FOREGROUND_TOO_SMALL` / `FOREGROUND_TOO_LARGE` の数 + `collapsed` →
+/// `separability` の順である。`stage` が `search` の候補で `quality` を
+/// 読むときは、その数がその候補の順位に効いていないことに注意する。
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct OptimizeScore {
     /// 出た致命的な警告の数。少ないほど良い
     pub fatal: usize,
+    /// 測れなかった診断値の数（0-3）。少ないほど良い
+    pub unmeasured: usize,
     /// 品質の重み和（縁の残り・輪郭の粗さ・縁の汚染を警告しきい値で割った和）。
     /// 小さいほど良い
     pub quality: f64,

@@ -281,6 +281,7 @@ fn optimize_report(found: &crate::cutout::Optimized, width: u32, height: u32) ->
         collapsed: trial.collapsed,
         score: OptimizeScore {
             fatal: trial.score.fatal,
+            unmeasured: trial.score.unmeasured,
             quality: round4(trial.score.quality),
             separability: round4(trial.score.separability),
         },

@@ -185,6 +185,8 @@ error_catalog! {
         => "リサイズに失敗した",
     SegmentFailed = "SEGMENT_FAILED", Processing
         => "モデルは読めたが推論が通らなかった",
+    OptimizeNoCandidate = "OPTIMIZE_NO_CANDIDATE", Processing
+        => "--optimize が試せる候補を 1 つも組めなかった（3 つの軸には必ず値があるため通常は起こらない）",
 }
 
 impl Serialize for ErrorCode {

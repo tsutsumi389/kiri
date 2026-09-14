@@ -542,10 +542,17 @@ fn fields() -> Vec<FieldEntry> {
             gates: None,
             summary: "その候補をどの寸法で回したか（search / final）",
             notes: Some(
-                "search は縮小版（optimize.searched_at px）だけで回した候補で、指標も\
-                 その寸法のものである。final は原寸でも回した候補で、指標は原寸の値に\
-                 上書きされている。**2 つの stage の数値を直接比べないこと**——\
-                 輪郭の粗さも縁の汚染も寸法に依る。原寸どうしの比較は final の\
+                "search は縮小版（optimize.searched_at px）を境界処理（refine）抜きで\
+                 回した候補で、final は原寸・利用者の設定そのままで回し直した候補である\
+                 （指標は原寸の値に上書きされる）。\
+                 **search の halo_ratio / contour_roughness / rim_contamination / \
+                 touches_edge は参考値で、順位には使っていない**——refine を抜くと縁に\
+                 背景が残るため、実測で rim が 4〜6 倍、粗さが 3〜5 倍に膨らみ、しかも\
+                 倍率が候補ごとに違う（寸法の換算では戻せない）。外周接触も同じ理由で\
+                 search でだけ出る。search の順位を決めるのは NOT_SEPARABLE / \
+                 FOREGROUND_TOO_SMALL / FOREGROUND_TOO_LARGE の数 + collapsed と、\
+                 refine にも寸法にもほとんど依らない separability だけである。\
+                 **2 つの stage の数値を直接比べないこと。** 原寸どうしの比較は final の\
                  候補どうしでだけ成り立つ",
             ),
         },
@@ -562,10 +569,14 @@ fn fields() -> Vec<FieldEntry> {
                 "数えるのは NOT_SEPARABLE / FOREGROUND_TOO_SMALL / FOREGROUND_TOO_LARGE / \
                  SUBJECT_TOUCHES_EDGE / BBOX_RECOMMENDED の 5 つ。最後の 2 つは\
                  「前景が外周に接している」という同じ事実の別の読み方なので、同じ重さで数える。\
-                 0 でなければ、どの候補でも切り抜きが成立しなかったということで、\
-                 OPTIMIZE_NO_CLEAN_CANDIDATE が同時に出る。\
-                 **順位を決める第 1 項はこの数 + optimize.candidates[].collapsed** で、\
-                 崩れは警告 code を持たないぶんここには現れない（少ないほど良い）",
+                 **最終段（stage=final）の順位を決める第 1 項はこの数 + \
+                 optimize.candidates[].collapsed** で、崩れは警告 code を持たないぶん\
+                 ここには現れない（少ないほど良い）。探索段はこのうち refine に依らない\
+                 3 つだけを数える（optimize.candidates[].stage を参照）。\
+                 **0 でなくても OPTIMIZE_NO_CLEAN_CANDIDATE が出るとは限らない。** \
+                 残ったのが BBOX_RECOMMENDED だけなら出ない——あちらが矩形つきで\
+                 次の一手を言っているので、重ねて「撮り直せ」とは言わない。警告が\
+                 数えるのは残り 4 つで、その code は warnings[].data.remaining に出る",
             ),
         },
         FieldEntry {
@@ -592,14 +603,20 @@ fn fields() -> Vec<FieldEntry> {
             null_means: None,
             warns: vec![],
             gates: None,
-            summary: "品質の重み和。小さいほど良い（fatal が同数のときに比べる）",
+            summary: "品質の重み和。小さいほど良い（最終段で fatal と unmeasured が同数のときに比べる）",
             notes: Some(
                 "rim_contamination / contour_roughness / halo_ratio を、それぞれの警告\
                  しきい値で割って足したもの。**3.0 が「3 つとも警告ちょうど」**にあたり、\
                  0 に近いほど良い。測れなかった項（null）はしきい値ちょうど（1.0）として\
                  数える——0 と扱うと、測れなかった候補が最良として勝ってしまう。\
-                 同点なら separability（大きいほど良い）、さらに同点なら小さい tolerance、\
-                 bbox 無し、auto の順で選ぶ",
+                 **ただし 1.0 でも足りないので、重み和より先に score.unmeasured\
+                 （測れなかった項の数、0-3）を見る。** 診断が 3 つとも null になるのは\
+                 たいてい測る対象の境界が無いからで、そういう候補が重み和 2〜3 で\
+                 中位に紛れ込む（前景比率 0.0001 のほぼ空のマスクが実際に上位へ来ていた）。\
+                 境界を測れる候補は測れない候補に勝つ。同点なら separability（大きいほど\
+                 良い）、さらに同点なら小さい tolerance、bbox 無し、auto の順で選ぶ。\
+                 **この順序は最終段のもので、探索段は separability だけを見る**\
+                 （optimize.candidates[].stage を参照）",
             ),
         },
         FieldEntry {

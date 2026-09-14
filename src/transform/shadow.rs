@@ -59,7 +59,7 @@ pub struct ShadowBounds {
     /// 影のアルファが 0 より大きい画素の外接矩形 [x1, y1, x2, y2]。
     /// 1 画素も無ければ None
     pub rect: Option<[u32; 4]>,
-    /// ずらし＋ぼかしの範囲が画像の外へ出たか
+    /// 影の一部が画像の外にあるか
     pub clipped: bool,
 }
 
@@ -69,17 +69,33 @@ pub struct ShadowBounds {
 /// 増やすほど端の扱い（外側 0）が内側へ食い込む距離も伸びる。
 const BOX_PASSES: usize = 3;
 
+/// 箱型フィルタ 1 回あたりの幅の上限(px)。
+///
+/// **上限があっても算術が壊れない形にするための保険である。** σ は
+/// `--shadow-blur` の関門（`cli::SHADOW_BLUR_MAX`）で抑えてあるので、実用の
+/// 範囲でここに当たることはない（24.5MP の長辺 5712px で σ を上限いっぱいの
+/// 5712 まで振っても幅は 11425 にしかならない）。それでも置くのは、
+/// `--shadow-blur` を通らない経路が将来できたときに、幅の 3 倍を足す
+/// `reach` や `half` が黙って溢れる形にしておきたくないためである。
+///
+/// 2^20 なら 3 回ぶんの半径を足しても 1.6M で、`u32` にも移動和の `u32` にも
+/// 遠く届かない。
+const MAX_BOX_WIDTH: i64 = (1 << 20) - 1;
+
 /// 商品の下に影を敷いた画像を返す。寸法は入力と同じ。
+///
+/// **`product` を値で受けてその場に書く。** 24.5MP の RGBA は 98MB あり、
+/// 複製する理由が無い——`compose` は画素ごとに独立で、読んだ画素をその場で
+/// 書き換えるだけである。
 ///
 /// 影が画像の外へ出る部分は切る。**商品の配置は影のために動かさない**——
 /// 影の分だけ商品を小さくすると、`--canvas --fill-ratio` で揃えたはずの
 /// 占有率が影の有無で変わってしまう。
-pub fn synth(product: &RgbaImage, spec: &ShadowSpec) -> (RgbaImage, ShadowBounds) {
+pub fn synth(mut product: RgbaImage, spec: &ShadowSpec) -> (RgbaImage, ShadowBounds) {
     let (w, h) = (product.width(), product.height());
-    let mut out = product.clone();
     if w == 0 || h == 0 {
         return (
-            out,
+            product,
             ShadowBounds {
                 rect: None,
                 clipped: false,
@@ -87,27 +103,20 @@ pub fn synth(product: &RgbaImage, spec: &ShadowSpec) -> (RgbaImage, ShadowBounds
         );
     }
 
-    let widths = box_widths(spec.sigma, BOX_PASSES);
-    let reach: u32 = widths.iter().map(|w| (w - 1) / 2).sum();
-
-    let shifted = shift_alpha(product, spec.offset);
+    let shifted = shift_alpha(&product, spec.offset);
     let mut alpha = shifted.alpha;
-    let clipped = match shifted.rect {
-        // ずらして残った矩形が、ぼかしの届く距離まで含めて画像に収まるか
-        Some([x1, y1, x2, y2]) => {
-            shifted.dropped || x1 < reach || y1 < reach || x2 + reach >= w || y2 + reach >= h
-        }
-        // ずらした時点で 1 画素も残らなかった。商品が空でなければ全部はみ出している
-        None => shifted.dropped,
-    };
 
-    for width in widths {
-        blur_pass(&mut alpha, w, h, width);
+    let mut scratch = Scratch::new(w as usize, h as usize);
+    for width in box_widths(spec.sigma, BOX_PASSES) {
+        blur_pass(&mut alpha, w as usize, h as usize, width, &mut scratch);
     }
 
     // 影のアルファ = round(opacity × ぼかしたアルファ)。ここだけは実数を通るが、
     // 1 画素あたり 1 回の乗算と丸めなので、総和の順序に依存する余地が無い
     let mut rect: Option<[u32; 4]> = None;
+    // **はみ出しは最終のアルファで決める**（下の `clipped` を参照）。外周の
+    // 1 列・1 行に影のインクが残っていれば、その先へ続いていたということである
+    let mut touches_border = false;
     for y in 0..h {
         for x in 0..w {
             let i = (y as usize) * (w as usize) + (x as usize);
@@ -116,6 +125,7 @@ pub fn synth(product: &RgbaImage, spec: &ShadowSpec) -> (RgbaImage, ShadowBounds
             if a == 0 {
                 continue;
             }
+            touches_border |= x == 0 || y == 0 || x == w - 1 || y == h - 1;
             rect = Some(match rect {
                 None => [x, y, x, y],
                 Some([x1, y1, x2, y2]) => [x1.min(x), y1.min(y), x2.max(x), y2.max(y)],
@@ -123,14 +133,40 @@ pub fn synth(product: &RgbaImage, spec: &ShadowSpec) -> (RgbaImage, ShadowBounds
         }
     }
 
-    compose(&mut out, product, &alpha, spec.color);
-    (out, ShadowBounds { rect, clipped })
+    // **不透明度 0 は「影を置かない」指定**なので、はみ出しようがない。ここを
+    // 通さないと、`rect` が `None` になる 2 つの理由——置かなかった／全部
+    // はみ出した——を `clipped` が分けられなくなる。
+    //
+    // 置いた場合は 2 つのどちらかで真になる。(a) ずらしただけで画像の外へ
+    // 落ちた画素があった、(b) 外周に影のインクが残っている。**ぼかしの台が
+    // 縁を跨いだかどうかでは決めない**——箱型の台は約 3σ あるので、裾が
+    // 丸めで 0 になって見えていない場合まで真になり、既定値で常に
+    // `clipped: true` が出る偽陽性になっていた
+    let clipped = spec.opacity > 0.0 && (shifted.dropped || touches_border);
+
+    compose(&mut product, &alpha, spec.color);
+    (product, ShadowBounds { rect, clipped })
+}
+
+/// 箱型フィルタが実際に実現する σ。
+///
+/// **要求した σ をそのまま報告してはいけない。** 幅は奇数の整数しか取れず、
+/// σ が 0.5 を下回るあたりで 3 回とも幅 1（恒等）に落ちる。そこで要求値を
+/// 返すと「ぼかしたと報告しているのに縁が 0→255 の段差」という、結果の
+/// JSON だけでは気づけない食い違いになる。
+///
+/// 幅 w の箱型の分散は (w² − 1) / 12 で、独立に重ねれば分散は足し合わさる。
+pub fn effective_sigma(sigma: f64) -> f64 {
+    let widths = box_widths(sigma, BOX_PASSES);
+    let variance: f64 = widths
+        .iter()
+        .map(|w| (f64::from(*w) * f64::from(*w) - 1.0) / 12.0)
+        .sum();
+    variance.sqrt()
 }
 
 struct Shifted {
     alpha: Vec<u8>,
-    /// 置けた画素（アルファ > 0）の外接矩形
-    rect: Option<[u32; 4]>,
     /// ずらしただけで画像の外へ落ちた画素があったか
     dropped: bool,
 }
@@ -139,7 +175,6 @@ struct Shifted {
 fn shift_alpha(product: &RgbaImage, offset: (i32, i32)) -> Shifted {
     let (w, h) = (product.width(), product.height());
     let mut alpha = vec![0u8; (w as usize) * (h as usize)];
-    let mut rect: Option<[u32; 4]> = None;
     let mut dropped = false;
     for (x, y, p) in product.enumerate_pixels() {
         if p[3] == 0 {
@@ -151,33 +186,24 @@ fn shift_alpha(product: &RgbaImage, offset: (i32, i32)) -> Shifted {
             dropped = true;
             continue;
         }
-        let (tx, ty) = (tx as u32, ty as u32);
         alpha[(ty as usize) * (w as usize) + (tx as usize)] = p[3];
-        rect = Some(match rect {
-            None => [tx, ty, tx, ty],
-            Some([x1, y1, x2, y2]) => [x1.min(tx), y1.min(ty), x2.max(tx), y2.max(ty)],
-        });
     }
-    Shifted {
-        alpha,
-        rect,
-        dropped,
-    }
+    Shifted { alpha, dropped }
 }
 
 /// 影の層の上に商品を載せる。
 ///
-/// 影のアルファが 0 の画素と、商品のアルファが 255 の画素には触れない
-/// （`out` は商品の複製なので、触れないことがそのままビット一致になる）。
-fn compose(out: &mut RgbaImage, product: &RgbaImage, alpha: &[u8], color: [u8; 3]) {
-    let w = product.width() as usize;
-    for (x, y, p) in product.enumerate_pixels() {
-        let sa = alpha[(y as usize) * w + (x as usize)];
-        if sa == 0 || p[3] == 255 {
+/// 影のアルファが 0 の画素と、商品のアルファが 255 の画素には触れない。
+/// **触れないことがそのままビット一致になる**ので、`--shadow off` の出力との
+/// 約束はここで保たれる。
+///
+/// `pixels_mut` は行優先で回るので、添字はそのまま影のアルファの添字になる。
+fn compose(image: &mut RgbaImage, alpha: &[u8], color: [u8; 3]) {
+    for (p, sa) in image.pixels_mut().zip(alpha) {
+        if *sa == 0 || p[3] == 255 {
             continue;
         }
-        let shadow = [color[0], color[1], color[2], sa];
-        out.put_pixel(x, y, image::Rgba(over(p.0, shadow)));
+        p.0 = over(p.0, [color[0], color[1], color[2], *sa]);
     }
 }
 
@@ -189,6 +215,11 @@ fn compose(out: &mut RgbaImage, product: &RgbaImage, alpha: &[u8], color: [u8; 3
 ///
 /// 幅は必ず奇数にする。偶数幅の箱型は重心が半画素ずれ、3 回重ねると影が
 /// オフセットの指定から 1.5px ずれる。
+///
+/// **桁外れの σ でも算術を壊さない。** `as i64` の飽和と `wl + 2` の桁溢れが
+/// そのまま panic（debug）や幅 0（release）になっていた。飽和つきの演算で
+/// `MAX_BOX_WIDTH` へ丸める——σ 自体は `cli::SHADOW_BLUR_MAX` が断るので、
+/// ここに当たるのは通らない経路ができたときだけである。
 fn box_widths(sigma: f64, n: usize) -> Vec<u32> {
     // 幅 1 の箱型は恒等。σ が 0（と nan——clap で弾いてあるが下流で守る）なら
     // ぼかさない
@@ -197,12 +228,14 @@ fn box_widths(sigma: f64, n: usize) -> Vec<u32> {
     }
     let nf = n as f64;
     let ideal = (12.0 * sigma * sigma / nf + 1.0).sqrt();
-    let mut wl = ideal.floor() as i64;
+    // f64 -> i64 の `as` は飽和するので、まず上限へ丸めてから偶奇を直す。
+    // 先に 1 を引くと i64::MIN 付近で桁が溢れる
+    let mut wl = (ideal.floor() as i64).clamp(1, MAX_BOX_WIDTH);
     if wl % 2 == 0 {
         wl -= 1;
     }
     let wl = wl.max(1);
-    let wu = wl + 2;
+    let wu = (wl + 2).min(MAX_BOX_WIDTH | 1);
     let wlf = wl as f64;
     let m = ((12.0 * sigma * sigma - nf * wlf * wlf - 4.0 * nf * wlf - 3.0 * nf)
         / (-4.0 * wlf - 4.0))
@@ -212,25 +245,46 @@ fn box_widths(sigma: f64, n: usize) -> Vec<u32> {
         .collect()
 }
 
+/// 箱型フィルタの作業領域。
+///
+/// **3 パスで毎回確保していた。** 24.5MP では 1 パスあたり 24.5MB の出力
+/// バッファと行のぶんを確保し直すことになる。寸法はパスを通して変わらないので、
+/// `synth` が 1 度だけ持つ。
+struct Scratch {
+    prefix: Vec<u32>,
+    row: Vec<u8>,
+    sums: Vec<u32>,
+    out: Vec<u8>,
+}
+
+impl Scratch {
+    fn new(w: usize, h: usize) -> Self {
+        Scratch {
+            prefix: vec![0u32; w + 1],
+            row: vec![0u8; w],
+            sums: vec![0u32; w],
+            out: vec![0u8; w * h],
+        }
+    }
+}
+
 /// 幅 `width`（奇数）の箱型フィルタを横 1 回・縦 1 回掛ける。
 ///
 /// 移動和なので画素あたり定数回の加減算で済む。割り算は四捨五入し、除数は
 /// 窓に収まった画素数ではなく常に `width` にする——**端の外側は 0（透明）**
 /// という約束をそのまま算術にすると、こうなる。窓の実数で割ると端で影が
 /// 濃くなり、画像の縁に沿って明るい線が立つ。
-fn blur_pass(buf: &mut [u8], w: u32, h: u32, width: u32) {
+fn blur_pass(buf: &mut [u8], w: usize, h: usize, width: u32, scratch: &mut Scratch) {
     if width <= 1 {
         return;
     }
     let r = ((width - 1) / 2) as usize;
-    let (w, h) = (w as usize, h as usize);
     // width は奇数なので width / 2 は半端の切り上げ位置になり、これを足してから
     // 割れば四捨五入になる
     let half = width / 2;
 
     // 横方向。行ごとの累積和から窓の和を引く
-    let mut prefix = vec![0u32; w + 1];
-    let mut row = vec![0u8; w];
+    let (prefix, row) = (&mut scratch.prefix, &mut scratch.row);
     for y in 0..h {
         let line = &mut buf[y * w..(y + 1) * w];
         for (x, v) in line.iter().enumerate() {
@@ -241,28 +295,28 @@ fn blur_pass(buf: &mut [u8], w: u32, h: u32, width: u32) {
             let hi = (x + r + 1).min(w);
             *slot = ((prefix[hi] - prefix[lo] + half) / width) as u8;
         }
-        line.copy_from_slice(&row);
+        line.copy_from_slice(row);
     }
 
     // 縦方向。行を足し引きする移動和にする。列ごとに走らせると 24.5MP で
     // キャッシュミスが画素数ぶん出る
-    let mut sums = vec![0u32; w];
-    let mut out = vec![0u8; w * h];
+    let (sums, out) = (&mut scratch.sums, &mut scratch.out);
+    sums.fill(0);
     for y in 0..r.min(h) {
-        add_row(&mut sums, &buf[y * w..(y + 1) * w]);
+        add_row(sums, &buf[y * w..(y + 1) * w]);
     }
     for y in 0..h {
         if y + r < h {
-            add_row(&mut sums, &buf[(y + r) * w..(y + r + 1) * w]);
+            add_row(sums, &buf[(y + r) * w..(y + r + 1) * w]);
         }
-        for (slot, s) in out[y * w..(y + 1) * w].iter_mut().zip(&sums) {
+        for (slot, s) in out[y * w..(y + 1) * w].iter_mut().zip(&*sums) {
             *slot = ((s + half) / width) as u8;
         }
         if y >= r {
-            sub_row(&mut sums, &buf[(y - r) * w..(y - r + 1) * w]);
+            sub_row(sums, &buf[(y - r) * w..(y - r + 1) * w]);
         }
     }
-    buf.copy_from_slice(&out);
+    buf.copy_from_slice(out);
 }
 
 fn add_row(sums: &mut [u32], row: &[u8]) {
@@ -306,6 +360,14 @@ mod tests {
         out.get_pixel(x, y).0[3]
     }
 
+    /// `synth` と同じ 3 パスを生のバッファへ掛ける。
+    fn blur_all(buf: &mut [u8], w: usize, h: usize, sigma: f64) {
+        let mut scratch = Scratch::new(w, h);
+        for width in box_widths(sigma, BOX_PASSES) {
+            blur_pass(buf, w, h, width, &mut scratch);
+        }
+    }
+
     /// 影のアルファの重心。
     fn centroid(img: &RgbaImage, product: &RgbaImage) -> (f64, f64) {
         let (mut sx, mut sy, mut sum) = (0.0, 0.0, 0.0);
@@ -330,7 +392,7 @@ mod tests {
             offset: (6, 9),
             ..spec()
         };
-        let (out, bounds) = synth(&product, &s);
+        let (out, bounds) = synth(product.clone(), &s);
         assert_eq!(
             bounds.rect,
             Some([26, 29, 35, 38]),
@@ -357,7 +419,7 @@ mod tests {
         let product_centre = (59.5, 39.5);
         for sigma in [0.0, 6.0] {
             let (out, bounds) = synth(
-                &product,
+                product.clone(),
                 &ShadowSpec {
                     offset,
                     sigma,
@@ -384,7 +446,7 @@ mod tests {
         let product = block(300, 300, 140, 140, 159, 159);
         let width = |sigma: f64| -> u32 {
             let (out, _) = synth(
-                &product,
+                product.clone(),
                 &ShadowSpec {
                     offset: (0, 0),
                     sigma,
@@ -406,7 +468,7 @@ mod tests {
     fn opaque_product_pixels_and_shadow_free_pixels_are_untouched() {
         let product = block(80, 80, 30, 30, 49, 49);
         let (out, _) = synth(
-            &product,
+            product.clone(),
             &ShadowSpec {
                 offset: (4, 4),
                 sigma: 3.0,
@@ -429,7 +491,7 @@ mod tests {
     fn a_zero_opacity_leaves_the_image_untouched() {
         let product = block(64, 64, 20, 20, 43, 43);
         let (out, bounds) = synth(
-            &product,
+            product.clone(),
             &ShadowSpec {
                 offset: (3, 5),
                 sigma: 4.0,
@@ -446,7 +508,7 @@ mod tests {
     fn a_shadow_running_off_the_image_is_clipped_and_reported() {
         let product = block(40, 40, 24, 24, 39, 39);
         let (out, bounds) = synth(
-            &product,
+            product.clone(),
             &ShadowSpec {
                 offset: (10, 10),
                 sigma: 2.0,
@@ -470,7 +532,7 @@ mod tests {
     fn a_shadow_pushed_entirely_off_the_image_still_reports_the_clipping() {
         let product = block(32, 32, 4, 4, 11, 11);
         let (_, bounds) = synth(
-            &product,
+            product.clone(),
             &ShadowSpec {
                 offset: (100, 100),
                 ..spec()
@@ -490,8 +552,8 @@ mod tests {
             color: [10, 20, 30],
             opacity: 0.37,
         };
-        let a = synth(&product, &s);
-        let b = synth(&product, &s);
+        let a = synth(product.clone(), &s);
+        let b = synth(product.clone(), &s);
         assert_eq!(a.0.as_raw(), b.0.as_raw());
         assert_eq!(a.1, b.1);
     }
@@ -513,9 +575,7 @@ mod tests {
                 buf[y * n + x] = 255;
             }
         }
-        for width in box_widths(6.0, BOX_PASSES) {
-            blur_pass(&mut buf, n as u32, n as u32, width);
-        }
+        blur_all(&mut buf, n, n, 6.0);
         assert!(buf[c * n + c] > 0, "中心が消えている");
         for d in 1..c {
             assert_eq!(
@@ -539,11 +599,11 @@ mod tests {
     fn the_box_approximation_preserves_a_uniform_field() {
         let (w, h) = (96usize, 96usize);
         let mut buf = vec![255u8; w * h];
-        let widths = box_widths(4.0, BOX_PASSES);
-        let reach: usize = widths.iter().map(|w| ((w - 1) / 2) as usize).sum();
-        for width in widths {
-            blur_pass(&mut buf, w as u32, h as u32, width);
-        }
+        let reach: usize = box_widths(4.0, BOX_PASSES)
+            .iter()
+            .map(|w| ((w - 1) / 2) as usize)
+            .sum();
+        blur_all(&mut buf, w, h, 4.0);
         for y in reach..h - reach {
             for x in reach..w - reach {
                 assert_eq!(buf[y * w + x], 255, "一様な面が減った ({x},{y})");
@@ -562,9 +622,7 @@ mod tests {
             }
         }
         let before: u64 = buf.iter().map(|v| u64::from(*v)).sum();
-        for width in box_widths(5.0, BOX_PASSES) {
-            blur_pass(&mut buf, w as u32, h as u32, width);
-        }
+        blur_all(&mut buf, w, h, 5.0);
         let after: u64 = buf.iter().map(|v| u64::from(*v)).sum();
         let drift = (before as f64 - after as f64).abs() / before as f64;
         assert!(drift < 0.05, "総和が {:.1}% 動いた", drift * 100.0);
@@ -583,12 +641,152 @@ mod tests {
         }
     }
 
+    /// 桁外れの σ でも算術が壊れない。
+    ///
+    /// `--shadow-blur` の関門（`cli::SHADOW_BLUR_MAX`）で実際には届かないが、
+    /// **届いたときに panic したり幅が 0 に化けたりしない**ことを保つ。
+    /// 以前は `wl + 2` が i64 を溢れて debug で panic し、release では幅が
+    /// 負から `u32` へ飽和して「ぼかしていないのに σ を報告する」嘘になった。
+    #[test]
+    fn an_absurd_sigma_neither_panics_nor_produces_a_bogus_width() {
+        for sigma in [1.0e9, 8.0e9, 1.0e30, f64::MAX] {
+            let widths = box_widths(sigma, BOX_PASSES);
+            assert_eq!(widths.len(), BOX_PASSES);
+            for w in &widths {
+                assert!(
+                    *w >= 1 && i64::from(*w) <= (MAX_BOX_WIDTH | 1),
+                    "σ={sigma} で幅 {w} が範囲外"
+                );
+                assert_eq!(w % 2, 1, "σ={sigma} で偶数幅 {w} が出た");
+            }
+            // 3 回ぶんの半径を足しても溢れない
+            let reach: u32 = widths.iter().map(|w| (w - 1) / 2).sum();
+            assert!(reach > 0, "σ={sigma} でぼかしが恒等に化けた");
+        }
+    }
+
+    /// 桁外れの σ で `synth` を通しても落ちず、報告する σ が実態と合う。
+    #[test]
+    fn an_absurd_sigma_survives_a_whole_synth() {
+        let product = block(32, 32, 8, 8, 23, 23);
+        let (out, bounds) = synth(
+            product.clone(),
+            &ShadowSpec {
+                sigma: 1.0e9,
+                ..spec()
+            },
+        );
+        assert_eq!((out.width(), out.height()), (32, 32));
+        // 台が画像よりはるかに広いので、影は丸めで消える
+        assert_eq!(bounds.rect, None, "これだけ広げて影が残るのはおかしい");
+    }
+
+    /// 報告する σ は要求値ではなく、箱型の幅が実現する σ である。
+    ///
+    /// **σ が小さいと 3 回とも幅 1（恒等）に落ちる。** そこで要求値を返すと
+    /// 「ぼかしたと報告しているのに縁が 0→255 の段差」になり、結果の JSON
+    /// だけでは食い違いに気づけない。
+    #[test]
+    fn the_reported_sigma_is_the_one_the_box_widths_realise() {
+        assert_eq!(effective_sigma(0.0), 0.0);
+        // 幅が 3 回とも 1 に落ちる領域では、ぼかしていないので 0 を返す
+        assert_eq!(box_widths(0.4, BOX_PASSES), vec![1, 1, 1]);
+        assert_eq!(effective_sigma(0.4), 0.0, "ぼかしていないのに σ を名乗った");
+
+        // [7, 7, 9] の分散は (49-1 + 49-1 + 81-1) / 12
+        assert_eq!(box_widths(4.0, BOX_PASSES), vec![7, 7, 9]);
+        let want = ((48.0 + 48.0 + 80.0) / 12.0f64).sqrt();
+        assert!((effective_sigma(4.0) - want).abs() < 1e-12);
+        assert!(
+            (effective_sigma(4.0) - 4.0).abs() > 1e-6,
+            "要求値をそのまま返している"
+        );
+
+        // 実用域では要求値の近くに収まる。**小さい σ ほど粗い**——幅が
+        // 奇数の整数しか取れないので、σ 2 は [3, 3, 5] で 1.83 にしかならない
+        for (sigma, slack) in [
+            (2.0, 0.10),
+            (6.0, 0.05),
+            (10.0, 0.05),
+            (57.12, 0.05),
+            (228.48, 0.05),
+        ] {
+            let got = effective_sigma(sigma);
+            assert!(
+                (got - sigma).abs() / sigma < slack,
+                "σ={sigma} の実現値 {got} が {}% を超えて離れている",
+                slack * 100.0
+            );
+        }
+    }
+
+    /// 不透明度 0 は「影を置かない」指定なので、はみ出しようがない。
+    ///
+    /// `rect` が `None` になる 2 つの理由——置かなかった／全部はみ出した——を
+    /// `clipped` が分ける、という契約そのものの検査である。
+    #[test]
+    fn a_zero_opacity_is_never_reported_as_clipped() {
+        let product = block(64, 64, 10, 10, 29, 29);
+        let far = ShadowSpec {
+            offset: (0, 340),
+            opacity: 0.0,
+            ..spec()
+        };
+        let (_, bounds) = synth(product.clone(), &far);
+        assert_eq!(bounds.rect, None);
+        assert!(!bounds.clipped, "影を置いていないのに切れたと報告した");
+
+        // 同じずらし量でも、影を置いたなら切れたと言う
+        let (_, bounds) = synth(
+            product,
+            &ShadowSpec {
+                opacity: 1.0,
+                ..far
+            },
+        );
+        assert_eq!(bounds.rect, None);
+        assert!(bounds.clipped);
+    }
+
+    /// 影が外周に届いていなければ `clipped` は偽。
+    ///
+    /// **箱型の台（約 3σ）が縁を跨いだかどうかでは決めない。** 裾が丸めで 0 に
+    /// なって見えていない場合まで真になり、既定値でも `clipped: true` が出る
+    /// 偽陽性になっていた。
+    #[test]
+    fn the_clipping_flag_follows_the_ink_that_actually_reaches_the_border() {
+        let product = block(200, 200, 90, 40, 109, 59);
+        // 影は中央付近に収まる。台は縁へ届くが、インクは届かない
+        let (_, inside) = synth(
+            product.clone(),
+            &ShadowSpec {
+                offset: (0, 30),
+                sigma: 8.0,
+                ..spec()
+            },
+        );
+        assert!(!inside.clipped, "外周にインクが無いのに切れたと報告した");
+        let rect = inside.rect.expect("影があるはず");
+        assert!(rect[0] > 0 && rect[1] > 0 && rect[2] < 199 && rect[3] < 199);
+
+        // 外周まで伸ばせば真になる
+        let (_, reaching) = synth(
+            product,
+            &ShadowSpec {
+                offset: (0, 130),
+                sigma: 8.0,
+                ..spec()
+            },
+        );
+        assert!(reaching.clipped, "外周に届いた影が切れていないと報告された");
+    }
+
     /// σ = 0 は影をぼかさない。
     #[test]
     fn a_zero_sigma_does_not_blur() {
         let product = block(40, 40, 10, 10, 19, 19);
         let (out, bounds) = synth(
-            &product,
+            product.clone(),
             &ShadowSpec {
                 offset: (0, 12),
                 sigma: 0.0,
@@ -605,7 +803,7 @@ mod tests {
     fn the_shadow_takes_the_requested_colour() {
         let product = block(40, 40, 10, 10, 19, 19);
         let (out, _) = synth(
-            &product,
+            product.clone(),
             &ShadowSpec {
                 offset: (0, 15),
                 color: [10, 200, 30],

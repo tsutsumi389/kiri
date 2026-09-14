@@ -88,7 +88,8 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     // ものなので、以降（キャンバス配置・書き出し・preview）はもう 1 回走らせずに
     // そのまま流す。`opts` も選ばれた候補で置き換える——`settings` と
     // `applied_bbox` は効いた値を出す規約であり、渡した値では嘘になる
-    let (result, optimize, optimize_warning) = if args.optimize {
+    // 影を敷くときだけ `result.image` を取り出して使い回すので mut で持つ
+    let (mut result, optimize, optimize_warning) = if args.optimize {
         let found = optimize::optimize(&loaded.image, &opts, &args.fixed)?;
         let report = optimize_report(&found, w, h);
         // 代入で置き換える（シャドーイングではない）。**束縛を増やすと、
@@ -140,11 +141,13 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
                 placement.shadow,
             )
         }
-        // 影を敷くときだけは複製が要る。商品の層を書き換えずに下へ 1 枚
-        // 足すので、元の画像を持ったまま作業する場所がいる
+        // **切り抜き結果の画像そのものを影の合成へ渡す。** 24.5MP の RGBA は
+        // 98MB あり、複製する理由が無い——`synth` は画素ごとにその場で書く。
+        // 取り出した後の `result.image` は空になるが、この枝では下の
+        // `unwrap_or` が必ず `placed` を採るので読まれない
         None => match shadow_spec.as_ref() {
             Some(spec) => {
-                let (image, bounds) = shadow::synth(&result.image, spec);
+                let (image, bounds) = shadow::synth(std::mem::take(&mut result.image), spec);
                 (Some(image), None, Some(shadow_report(spec, &bounds)))
             }
             None => (None, None, None),
@@ -318,7 +321,10 @@ fn shadow_report(spec: &ShadowSpec, bounds: &crate::transform::ShadowBounds) -> 
     let [r, g, b] = spec.color;
     ShadowReport {
         offset: [spec.offset.0, spec.offset.1],
-        blur: round4(spec.sigma),
+        // **要求した σ ではなく、箱型の幅が実現する σ を出す。** 幅は奇数の
+        // 整数しか取れず、σ が小さいと 3 回とも幅 1（恒等）に落ちる。要求値を
+        // 返すと「ぼかしたと報告しているのに縁が 0→255 の段差」になる
+        blur: round4(shadow::effective_sigma(spec.sigma)),
         opacity: round4(spec.opacity),
         color: format!("#{r:02X}{g:02X}{b:02X}"),
         bounds: bounds.rect,
@@ -369,8 +375,10 @@ fn place_on_canvas(
     let plan = canvas_plan((trimmed.width(), trimmed.height()), &spec)?;
     let mut placed = canvas_apply(&trimmed, &spec)?;
 
-    let shadow = shadow_spec.map(|spec| {
-        let (with_shadow, bounds) = shadow::synth(&placed, spec);
+    // 引数名を `spec` にすると上の `CanvasSpec` を隠す。どちらの仕様を
+    // 読んでいるのかが目で追えなくなる
+    let shadow = shadow_spec.map(|shadow| {
+        let (with_shadow, bounds) = shadow::synth(std::mem::take(&mut placed), shadow);
         placed = with_shadow;
         if args.out.flatten {
             // 透明のまま置いた影と商品を、改めて下地の上へ載せる。
@@ -381,7 +389,7 @@ fn place_on_canvas(
             composite(&mut base, &placed, (0, 0));
             placed = base;
         }
-        shadow_report(spec, &bounds)
+        shadow_report(shadow, &bounds)
     });
 
     if plan.scale > 1.0 {

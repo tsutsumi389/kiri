@@ -180,7 +180,14 @@ fn to_cutout_args(
         shadow_tolerance: checked(settings.shadow_tolerance, 35.0, "shadow_tolerance")?,
         shadow: value_enum(settings.shadow.as_deref(), ShadowMode::Off, "shadow")?,
         shadow_offset: offset(settings.shadow_offset, [0.0, 12.0], "shadow_offset")?,
-        shadow_blur: checked(settings.shadow_blur, 10.0, "shadow_blur")?,
+        // spec は clap を通らないので、CLI と同じ上限をここで掛ける。
+        // 抜けていると `--shadow-blur` では断る値が spec 経由でだけ通る
+        shadow_blur: capped_f64(
+            settings.shadow_blur,
+            10.0,
+            crate::cli::SHADOW_BLUR_MAX,
+            "shadow_blur",
+        )?,
         shadow_color: settings
             .shadow_color
             .as_deref()

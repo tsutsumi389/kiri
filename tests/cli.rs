@@ -55,6 +55,11 @@ fn has_warning(v: &Value, code: &str) -> bool {
     warning_codes(v).iter().any(|c| c == code)
 }
 
+/// 結果 JSON と同じ丸め方。実装の定数や関数と突き合わせるときに要る。
+fn round4(v: f64) -> f64 {
+    (v * 10_000.0).round() / 10_000.0
+}
+
 fn warning_codes(v: &Value) -> Vec<String> {
     v["warnings"]
         .as_array()
@@ -3708,7 +3713,17 @@ fn a_synthetic_shadow_reports_the_pixels_that_actually_took_effect() {
         serde_json::json!([0, 5]),
         "オフセットが実寸に換算されていない: {shadow}"
     );
-    assert_eq!(shadow["blur"], 4.0, "σ が実寸に換算されていない: {shadow}");
+    // **報告される σ は箱型の幅が実現する値**で、要求値そのものではない。
+    // 幅は奇数の整数しか取れないので、4.0 を頼むと 3.83 になる
+    assert_eq!(
+        shadow["blur"].as_f64().unwrap(),
+        round4(kiri::transform::shadow::effective_sigma(4.0)),
+        "σ が実寸に換算されていないか、要求値をそのまま返している: {shadow}"
+    );
+    assert!(
+        (shadow["blur"].as_f64().unwrap() - 4.0).abs() < 0.2,
+        "実現した σ が要求から離れすぎている: {shadow}"
+    );
     assert_eq!(shadow["opacity"], 0.25);
     assert_eq!(shadow["color"], "#000000");
     assert!(
@@ -3743,7 +3758,39 @@ fn the_canvas_long_side_is_what_px_at_1000_is_measured_against() {
         serde_json::json!([0, 24]),
         "元画像 200px ではなくキャンバス 2000px を基準にすべき"
     );
-    assert_eq!(v["shadow"]["blur"], 20.0);
+    assert_eq!(
+        v["shadow"]["blur"].as_f64().unwrap(),
+        round4(kiri::transform::shadow::effective_sigma(20.0))
+    );
+}
+
+/// ぼかしが小さすぎて箱型が恒等に落ちるときは、σ を名乗らない。
+///
+/// **要求値をそのまま返すと嘘になる。** 幅が 3 回とも 1 なら画素は 1 つも
+/// 動いておらず、縁は 0→255 の段差のままである。schema の「0 ならぼかして
+/// いない」という注記もそのときだけ成り立つ。
+#[test]
+fn a_blur_too_small_to_take_effect_is_reported_as_zero() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    // 長辺 200px なので px@1000 の 2 は実寸 0.4 にしかならない
+    let v = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "out.png",
+        &["--shadow", "synth", "--shadow-blur", "2"],
+    );
+    assert_eq!(
+        v["shadow"]["blur"], 0.0,
+        "ぼかしていないのに σ を名乗った: {}",
+        v["shadow"]
+    );
 }
 
 /// 影を足しても商品の配置は動かず、切り抜きの診断値も動かない。
@@ -3941,6 +3988,11 @@ fn shadow_settings_outside_their_range_are_refused() {
         vec!["--shadow-opacity", "1.5"],
         vec!["--shadow-opacity", "-0.2"],
         vec!["--shadow-blur", "-1"],
+        // **上限が無いと箱型の幅が u32 を溢れる。** release では panic せず、
+        // ぼかしていないのに σ を報告する嘘の結果になっていた
+        vec!["--shadow-blur", "1001"],
+        vec!["--shadow-blur", "8e9"],
+        vec!["--shadow-blur", "1e30"],
         vec!["--shadow-color", "chartreuse"],
         vec!["--shadow-offset", "1,2,3"],
         vec!["--shadow", "drop"],
@@ -3961,6 +4013,150 @@ fn shadow_settings_outside_their_range_are_refused() {
             "{bad:?} が exit 2 で断られていない"
         );
     }
+}
+
+/// 上限ちょうどは通る。
+///
+/// 上限を置いた側の検査で、`1000` まで断ってしまうと「σ を上げる」という
+/// 正当な指定が使えない幅で切られる。
+#[test]
+fn a_blur_at_exactly_the_limit_is_accepted() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let limit = kiri::cli::SHADOW_BLUR_MAX.to_string();
+    let v = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "out.png",
+        &["--shadow", "synth", "--shadow-blur", &limit],
+    );
+    // σ が画像より広いので影は丸めで消える。**落ちないこと**がここの主題
+    assert_eq!(v["settings"]["shadow"], "synth");
+    assert!(v["shadow"]["clipped"].is_boolean());
+}
+
+/// 上限は spec 経由でも効く。**spec は clap を通らない。**
+#[test]
+fn an_out_of_range_shadow_blur_is_refused_in_a_spec_too() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        ..Default::default()
+    });
+    write_png(dir.path(), "a.png", &img);
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        r#"{"items":[{"input":"a.png","output":"out.png","shadow":"synth","shadow_blur":8e9}]}"#,
+    )
+    .unwrap();
+
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let json = json_stdout(&out);
+    assert_eq!(json["results"][0]["error"]["code"], "INVALID_SETTING");
+}
+
+/// `--shadow-opacity 0` は、ずらし量が大きくても切れたとは言わない。
+///
+/// `bounds` が null になる 2 つの理由——影を置かなかった／全部はみ出した——を
+/// `clipped` が分ける、という契約そのものの検査である。
+#[test]
+fn a_zero_opacity_is_never_reported_as_clipped() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let empty = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "empty.png",
+        &[
+            "--canvas",
+            "500",
+            "--shadow",
+            "synth",
+            "--shadow-offset",
+            "0,2000",
+            "--shadow-opacity",
+            "0",
+        ],
+    );
+    assert!(empty["shadow"]["bounds"].is_null());
+    assert_eq!(
+        empty["shadow"]["clipped"], false,
+        "影を置いていないのに切れたと報告した: {}",
+        empty["shadow"]
+    );
+
+    // 同じずらし量でも、影を置いたなら切れたと言う
+    let pushed = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "pushed.png",
+        &[
+            "--canvas",
+            "500",
+            "--shadow",
+            "synth",
+            "--shadow-offset",
+            "0,2000",
+        ],
+    );
+    assert!(pushed["shadow"]["bounds"].is_null());
+    assert_eq!(pushed["shadow"]["clipped"], true);
+}
+
+/// 既定値で影がキャンバスに収まっていれば `clipped` は偽。
+///
+/// **箱型の台（約 3σ）が縁を跨いだかどうかで決めていた頃は、既定値でも
+/// 真になっていた。** 偽陽性が既定で出る旗は、読む側が無視するようになる。
+#[test]
+fn a_default_shadow_that_fits_the_canvas_is_not_reported_as_clipped() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 300,
+        height: 300,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let v = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "out.png",
+        &[
+            "--canvas",
+            "1000",
+            "--fill-ratio",
+            "0.7",
+            "--shadow",
+            "synth",
+        ],
+    );
+    let shadow = &v["shadow"];
+    assert_eq!(
+        shadow["clipped"], false,
+        "余白に収まっている影が切れたと報告された: {shadow}"
+    );
+    let bounds = shadow["bounds"].as_array().expect("影があるはず");
+    assert!(
+        bounds[0].as_u64().unwrap() > 0 && bounds[3].as_u64().unwrap() < 999,
+        "矩形が縁に接していないのに clipped の判定が縁を見ている: {shadow}"
+    );
 }
 
 // --- batch (Phase 5) ---
@@ -5051,7 +5247,10 @@ fn batch_accepts_the_shadow_keys() {
     let result = &json["results"][0]["result"];
     assert_eq!(result["settings"]["shadow"], "synth");
     assert_eq!(result["shadow"]["offset"], serde_json::json!([6, 20]));
-    assert_eq!(result["shadow"]["blur"], 4.0);
+    assert_eq!(
+        result["shadow"]["blur"].as_f64().unwrap(),
+        round4(kiri::transform::shadow::effective_sigma(4.0))
+    );
     assert_eq!(result["shadow"]["color"], "#204060");
     assert_eq!(result["shadow"]["opacity"], 0.4);
 }

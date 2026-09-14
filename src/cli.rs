@@ -601,6 +601,31 @@ pub fn smooth_contour_px(s: &str) -> Result<f64, String> {
     Ok(v)
 }
 
+/// `--shadow-blur` の上限(px, 長辺 1000px 換算)。
+///
+/// **σ が画像の長辺に達した時点で、影はどこもアルファ 0 まで薄まる。** 箱型の
+/// 台がそれだけ広がると、商品の面積ぶんのインクが画像全体へ均され、8bit へ
+/// 丸めた結果は一様な 0 になる。1000 は px@1000 換算でちょうど「最終画像の
+/// 長辺いっぱい」にあたる値で、これより大きい指定に意味のある結果は無い。
+///
+/// **上限が無いと算術が壊れる**のがもう半分の理由である。`--shadow-blur 8e9`
+/// は箱型の幅を 32 億まで押し上げ、3 回ぶんの半径を足す計算が `u32` を溢れて
+/// debug では panic し、release では幅が化けて「ぼかしていないのに
+/// `blur: 2e29` と報告する」嘘の結果になっていた。`transform/shadow.rs` 側の
+/// `MAX_BOX_WIDTH` は同じ事故への二重の備えで、こちらが第一の門である。
+pub const SHADOW_BLUR_MAX: f64 = 1000.0;
+
+/// 0 以上 `SHADOW_BLUR_MAX` 以下の実数だけを受け付ける。
+pub fn shadow_blur_px(s: &str) -> Result<f64, String> {
+    let v = non_negative(s)?;
+    if v > SHADOW_BLUR_MAX {
+        return Err(format!(
+            "'{s}' は 0 から {SHADOW_BLUR_MAX} の範囲で指定してください"
+        ));
+    }
+    Ok(v)
+}
+
 /// 0.0 以上 1.0 以下の有限な実数だけを受け付ける。
 ///
 /// 不透明度に 1.5 を渡せば飽和して 1.0 と同じ結果になり、-0.2 は影が消える。
@@ -759,8 +784,8 @@ pub struct CutoutArgs {
     )]
     pub shadow_offset: [f64; 2],
 
-    /// 影のぼかしの σ(px、長辺 1000px 換算)。0 でぼかさない。--shadow synth のときだけ効く
-    #[arg(long, default_value_t = 10.0, value_parser = non_negative)]
+    /// 影のぼかしの σ(px、長辺 1000px 換算)。0 でぼかさない（上限 1000）。--shadow synth のときだけ効く
+    #[arg(long, default_value_t = 10.0, value_parser = shadow_blur_px)]
     pub shadow_blur: f64,
 
     /// 影の色 (例 #000000)。--shadow synth のときだけ効く

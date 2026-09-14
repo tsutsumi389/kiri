@@ -278,17 +278,25 @@ fn print_optimize(optimize: Option<&kiri::report::OptimizeReport>, settings: &Se
         finals,
         o.elapsed_ms
     );
-    // **モデルは効いた値を出す。** 候補表が持つのは要求値（`auto`）だが、
-    // すぐ上の「背景」ブロックは効いた値を語っているので、同じ画面で同じ語が
-    // 2 つの意味を持つことになる
+    // **モデルは効いた値と要求値の両方を出す。** 候補表が持つのは要求値
+    // （`auto`）だが、すぐ上の「背景」ブロックは効いた値を語っているので、
+    // 効いた値だけを出すと `--background-model auto` を写せる候補表の側と
+    // 食い違い、要求値だけを出すと同じ画面で同じ語が 2 つの意味を持つ
+    let model = if settings.background_model == c.background_model {
+        settings.background_model.to_string()
+    } else {
+        format!(
+            "{}（要求 {}）",
+            settings.background_model, c.background_model
+        )
+    };
     println!(
-        "  採用      tolerance {}  bbox {}  background-model {}  (致命 {} / 品質 {:.2}{})",
+        "  採用      tolerance {}  bbox {}  background-model {model}  (致命 {} / 品質 {:.2}{})",
         c.tolerance,
         match c.bbox {
             Some([x1, y1, x2, y2]) => format!("{x1},{y1} - {x2},{y2}"),
             None => "なし".to_string(),
         },
-        settings.background_model,
         c.score.fatal,
         c.score.quality,
         if c.collapsed {

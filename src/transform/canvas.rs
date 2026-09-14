@@ -100,7 +100,7 @@ pub fn apply(content: &RgbaImage, spec: &CanvasSpec) -> Result<RgbaImage> {
 }
 
 /// アルファ合成でキャンバスへ載せる。
-fn composite(canvas: &mut RgbaImage, src: &RgbaImage, offset: (u32, u32)) {
+pub(crate) fn composite(canvas: &mut RgbaImage, src: &RgbaImage, offset: (u32, u32)) {
     for y in 0..src.height() {
         for x in 0..src.width() {
             let (cx, cy) = (offset.0 + x, offset.1 + y);
@@ -109,25 +109,36 @@ fn composite(canvas: &mut RgbaImage, src: &RgbaImage, offset: (u32, u32)) {
             }
             let s = *src.get_pixel(x, y);
             let d = canvas.get_pixel_mut(cx, cy);
-            let sa = u32::from(s[3]);
-            if sa == 255 {
-                *d = s;
-                continue;
-            }
-            if sa == 0 {
-                continue;
-            }
-            let da = u32::from(d[3]);
-            let out_a = sa + da * (255 - sa) / 255;
-            for c in 0..3 {
-                let sc = u32::from(s[c]) * sa;
-                let dc = u32::from(d[c]) * da * (255 - sa) / 255;
-                // sa == 0 は上で弾いているので out_a は 0 にならないが、念のため守る
-                d[c] = (sc + dc).checked_div(out_a).unwrap_or(0) as u8;
-            }
-            d[3] = out_a as u8;
+            d.0 = over(s.0, d.0);
         }
     }
+}
+
+/// `src` を `dst` の上に載せた 1 画素（straight alpha）。
+///
+/// **落ち影の合成（`transform/shadow.rs`）と同じ算術を使う。** 別々に書くと、
+/// 半透明の縁で 1 ずつ食い違う 2 種類の合成が同じ CLI の中に並ぶ。影のアルファが
+/// 0 の画素は影なしの出力とビット一致する、という約束はここを共有して初めて
+/// 成り立つ。
+pub(crate) fn over(src: [u8; 4], dst: [u8; 4]) -> [u8; 4] {
+    let sa = u32::from(src[3]);
+    if sa == 255 {
+        return src;
+    }
+    if sa == 0 {
+        return dst;
+    }
+    let da = u32::from(dst[3]);
+    let out_a = sa + da * (255 - sa) / 255;
+    let mut out = [0u8; 4];
+    for c in 0..3 {
+        let sc = u32::from(src[c]) * sa;
+        let dc = u32::from(dst[c]) * da * (255 - sa) / 255;
+        // sa == 0 は上で弾いているので out_a は 0 にならないが、念のため守る
+        out[c] = (sc + dc).checked_div(out_a).unwrap_or(0) as u8;
+    }
+    out[3] = out_a as u8;
+    out
 }
 
 #[cfg(test)]

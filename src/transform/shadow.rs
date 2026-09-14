@@ -11,6 +11,7 @@
 
 use image::RgbaImage;
 
+use crate::transform::canvas::over;
 
 /// 落ち影を合成するか。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -73,16 +74,204 @@ const BOX_PASSES: usize = 3;
 /// 影が画像の外へ出る部分は切る。**商品の配置は影のために動かさない**——
 /// 影の分だけ商品を小さくすると、`--canvas --fill-ratio` で揃えたはずの
 /// 占有率が影の有無で変わってしまう。
-pub fn synth(_product: &RgbaImage, _spec: &ShadowSpec) -> (RgbaImage, ShadowBounds) {
-    todo!("影の合成")
+pub fn synth(product: &RgbaImage, spec: &ShadowSpec) -> (RgbaImage, ShadowBounds) {
+    let (w, h) = (product.width(), product.height());
+    let mut out = product.clone();
+    if w == 0 || h == 0 {
+        return (
+            out,
+            ShadowBounds {
+                rect: None,
+                clipped: false,
+            },
+        );
+    }
+
+    let widths = box_widths(spec.sigma, BOX_PASSES);
+    let reach: u32 = widths.iter().map(|w| (w - 1) / 2).sum();
+
+    let shifted = shift_alpha(product, spec.offset);
+    let mut alpha = shifted.alpha;
+    let clipped = match shifted.rect {
+        // ずらして残った矩形が、ぼかしの届く距離まで含めて画像に収まるか
+        Some([x1, y1, x2, y2]) => {
+            shifted.dropped || x1 < reach || y1 < reach || x2 + reach >= w || y2 + reach >= h
+        }
+        // ずらした時点で 1 画素も残らなかった。商品が空でなければ全部はみ出している
+        None => shifted.dropped,
+    };
+
+    for width in widths {
+        blur_pass(&mut alpha, w, h, width);
+    }
+
+    // 影のアルファ = round(opacity × ぼかしたアルファ)。ここだけは実数を通るが、
+    // 1 画素あたり 1 回の乗算と丸めなので、総和の順序に依存する余地が無い
+    let mut rect: Option<[u32; 4]> = None;
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y as usize) * (w as usize) + (x as usize);
+            let a = (f64::from(alpha[i]) * spec.opacity).round() as u8;
+            alpha[i] = a;
+            if a == 0 {
+                continue;
+            }
+            rect = Some(match rect {
+                None => [x, y, x, y],
+                Some([x1, y1, x2, y2]) => [x1.min(x), y1.min(y), x2.max(x), y2.max(y)],
+            });
+        }
+    }
+
+    compose(&mut out, product, &alpha, spec.color);
+    (out, ShadowBounds { rect, clipped })
 }
 
-fn box_widths(_sigma: f64, _n: usize) -> Vec<u32> {
-    todo!("箱型の幅")
+struct Shifted {
+    alpha: Vec<u8>,
+    /// 置けた画素（アルファ > 0）の外接矩形
+    rect: Option<[u32; 4]>,
+    /// ずらしただけで画像の外へ落ちた画素があったか
+    dropped: bool,
 }
 
-fn blur_pass(_buf: &mut [u8], _w: u32, _h: u32, _width: u32) {
-    todo!("箱型 1 回")
+/// 商品のアルファをオフセットぶんずらして置く。外へ出た画素は捨てる。
+fn shift_alpha(product: &RgbaImage, offset: (i32, i32)) -> Shifted {
+    let (w, h) = (product.width(), product.height());
+    let mut alpha = vec![0u8; (w as usize) * (h as usize)];
+    let mut rect: Option<[u32; 4]> = None;
+    let mut dropped = false;
+    for (x, y, p) in product.enumerate_pixels() {
+        if p[3] == 0 {
+            continue;
+        }
+        let tx = i64::from(x) + i64::from(offset.0);
+        let ty = i64::from(y) + i64::from(offset.1);
+        if tx < 0 || ty < 0 || tx >= i64::from(w) || ty >= i64::from(h) {
+            dropped = true;
+            continue;
+        }
+        let (tx, ty) = (tx as u32, ty as u32);
+        alpha[(ty as usize) * (w as usize) + (tx as usize)] = p[3];
+        rect = Some(match rect {
+            None => [tx, ty, tx, ty],
+            Some([x1, y1, x2, y2]) => [x1.min(tx), y1.min(ty), x2.max(tx), y2.max(ty)],
+        });
+    }
+    Shifted {
+        alpha,
+        rect,
+        dropped,
+    }
+}
+
+/// 影の層の上に商品を載せる。
+///
+/// 影のアルファが 0 の画素と、商品のアルファが 255 の画素には触れない
+/// （`out` は商品の複製なので、触れないことがそのままビット一致になる）。
+fn compose(out: &mut RgbaImage, product: &RgbaImage, alpha: &[u8], color: [u8; 3]) {
+    let w = product.width() as usize;
+    for (x, y, p) in product.enumerate_pixels() {
+        let sa = alpha[(y as usize) * w + (x as usize)];
+        if sa == 0 || p[3] == 255 {
+            continue;
+        }
+        let shadow = [color[0], color[1], color[2], sa];
+        out.put_pixel(x, y, image::Rgba(over(p.0, shadow)));
+    }
+}
+
+/// σ と回数から箱型フィルタの整数幅を決める（Kovesi, Fast almost-Gaussian filtering）。
+///
+/// **素直なガウスは σ に比例して遅くなる。** 24.5MP で σ = 57px なら半径 3σ の
+/// 畳み込みが 2 × 171 × 24.5M 回になる。箱型は移動和で 1 画素あたり定数回なので、
+/// σ をいくら上げても時間が変わらない。
+///
+/// 幅は必ず奇数にする。偶数幅の箱型は重心が半画素ずれ、3 回重ねると影が
+/// オフセットの指定から 1.5px ずれる。
+fn box_widths(sigma: f64, n: usize) -> Vec<u32> {
+    if !(sigma > 0.0) {
+        return vec![1; n];
+    }
+    let nf = n as f64;
+    let ideal = (12.0 * sigma * sigma / nf + 1.0).sqrt();
+    let mut wl = ideal.floor() as i64;
+    if wl % 2 == 0 {
+        wl -= 1;
+    }
+    let wl = wl.max(1);
+    let wu = wl + 2;
+    let wlf = wl as f64;
+    let m = ((12.0 * sigma * sigma - nf * wlf * wlf - 4.0 * nf * wlf - 3.0 * nf)
+        / (-4.0 * wlf - 4.0))
+        .round() as i64;
+    (0..n as i64)
+        .map(|i| if i < m { wl as u32 } else { wu as u32 })
+        .collect()
+}
+
+/// 幅 `width`（奇数）の箱型フィルタを横 1 回・縦 1 回掛ける。
+///
+/// 移動和なので画素あたり定数回の加減算で済む。割り算は四捨五入し、除数は
+/// 窓に収まった画素数ではなく常に `width` にする——**端の外側は 0（透明）**
+/// という約束をそのまま算術にすると、こうなる。窓の実数で割ると端で影が
+/// 濃くなり、画像の縁に沿って明るい線が立つ。
+fn blur_pass(buf: &mut [u8], w: u32, h: u32, width: u32) {
+    if width <= 1 {
+        return;
+    }
+    let r = ((width - 1) / 2) as usize;
+    let (w, h) = (w as usize, h as usize);
+    let half = (width / 2) as u32;
+
+    // 横方向。行ごとの累積和から窓の和を引く
+    let mut prefix = vec![0u32; w + 1];
+    let mut row = vec![0u8; w];
+    for y in 0..h {
+        let line = &mut buf[y * w..(y + 1) * w];
+        for x in 0..w {
+            prefix[x + 1] = prefix[x] + u32::from(line[x]);
+        }
+        for x in 0..w {
+            let lo = x.saturating_sub(r);
+            let hi = (x + r + 1).min(w);
+            row[x] = ((prefix[hi] - prefix[lo] + half) / width) as u8;
+        }
+        line.copy_from_slice(&row);
+    }
+
+    // 縦方向。行を足し引きする移動和にする。列ごとに走らせると 24.5MP で
+    // キャッシュミスが画素数ぶん出る
+    let mut sums = vec![0u32; w];
+    let mut out = vec![0u8; w * h];
+    for y in 0..r.min(h) {
+        add_row(&mut sums, &buf[y * w..(y + 1) * w]);
+    }
+    for y in 0..h {
+        if y + r < h {
+            add_row(&mut sums, &buf[(y + r) * w..(y + r + 1) * w]);
+        }
+        for x in 0..w {
+            out[y * w + x] = ((sums[x] + half) / width) as u8;
+        }
+        if y >= r {
+            let drop = y - r;
+            sub_row(&mut sums, &buf[drop * w..(drop + 1) * w]);
+        }
+    }
+    buf.copy_from_slice(&out);
+}
+
+fn add_row(sums: &mut [u32], row: &[u8]) {
+    for (s, v) in sums.iter_mut().zip(row) {
+        *s += u32::from(*v);
+    }
+}
+
+fn sub_row(sums: &mut [u32], row: &[u8]) {
+    for (s, v) in sums.iter_mut().zip(row) {
+        *s -= u32::from(*v);
+    }
 }
 
 #[cfg(test)]

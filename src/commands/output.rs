@@ -78,6 +78,11 @@ pub fn round4(v: f64) -> f64 {
     (v * 10_000.0).round() / 10_000.0
 }
 
+/// `subject.source` の既定値。背景色から遠い画素の最大の塊として測ったもの。
+pub const SUBJECT_FROM_COLOUR: &str = "colour";
+/// `subject.source` がセグメンテーションモデル由来であることを表す綴り。
+pub const SUBJECT_FROM_SEGMENT: &str = "segment";
+
 /// 背景推定を JSON のレポートへ落とす。
 ///
 /// `info` と `cutout` の両方が同じ形を返す約束なので、組み立てを 1 箇所に置く。
@@ -115,8 +120,13 @@ pub fn background_report(
 ///
 /// `background_report` と同じ理由で組み立てを 1 箇所に置く。`info` と `cutout` が
 /// 別々に組むと、片方だけ丸め方や項目が食い違っていても誰も気づかない。
-pub fn subject_report(subject: &SubjectHint) -> SubjectReport {
+///
+/// `source` は「この矩形が何から出たか」である。**キーを足すだけで既存の値の
+/// 意味は変えない**——色から測ったものは今までどおり `"colour"` で、
+/// `info --segment` でモデルから測ったときだけ `"segment"` になる。
+pub fn subject_report(subject: &SubjectHint, source: &'static str) -> SubjectReport {
     SubjectReport {
+        source,
         bbox: subject.bbox,
         normalized_bbox: [
             round4(subject.normalized_bbox[0]),

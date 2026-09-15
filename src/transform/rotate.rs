@@ -138,8 +138,11 @@ fn resample(image: &RgbaImage, plan: &RotatePlan) -> RgbaImage {
     let mut out = RgbaImage::new(ow, oh);
     let row_bytes = ow as usize * 4;
 
-    out.as_mut()
-        .par_chunks_mut(row_bytes)
+    // 行き先の型を書く。`as_mut` の候補は依存グラフの中身で増えうるので、
+    // ここを推論に任せると**別のクレートを足しただけで**「型注釈が要る」に
+    // 落ちる（`segment` feature を入れた途端に起きた）
+    let rows: &mut [u8] = out.as_mut();
+    rows.par_chunks_mut(row_bytes)
         .enumerate()
         .for_each(|(y, row)| {
             let dy = y as f64 + 0.5 - ocy;

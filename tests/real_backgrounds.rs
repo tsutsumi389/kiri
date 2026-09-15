@@ -1595,3 +1595,210 @@ fn print_the_assisted_tolerance_sweep() {
         }
     }
 }
+
+/// この build が推論でき、かつモデルのファイルが置いてあるか。
+///
+/// **モデルはリポジトリにも CI にも置かない。** 無ければモデルを要する検査は
+/// 黙って飛ぶ（`tests/segment.rs` と同じ規約）。
+fn segment_ready() -> bool {
+    cfg!(feature = "segment")
+        && kiri::segment::model::ISNET
+            .expected_path()
+            .is_some_and(|p| p.is_file())
+}
+
+/// 飛ばすなら、**どこを見て飛ばしたのかを 1 行だけ言う。**
+///
+/// 黙って通ると、置いてある機械でしか回っていないことに誰も気づかない。
+/// 「緑だった」と「確かめた」は別である。
+fn skip_without_model() -> bool {
+    if segment_ready() {
+        return false;
+    }
+    let path = kiri::segment::model::ISNET
+        .expected_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(置き場所を決められません)".to_string());
+    if cfg!(feature = "segment") {
+        eprintln!("モデルが無いので飛ばす: {path}");
+    } else {
+        eprintln!("この build に segment 機能が無いので飛ばす: {path}");
+    }
+    true
+}
+
+/// R シーンをモデルの出したトライマップで回す。
+///
+/// **正解は一切渡さない。** `truth_trimap` が正解の二値を収縮・膨張して作るのに
+/// 対し、こちらは画像だけをモデルに見せて得た確率マップを落とす。両者を同じ
+/// 指標で並べたときに初めて、「モデルの提案は手で描いたトライマップの代わりに
+/// なるか」が言える。
+///
+/// **失敗したら本文ごと落ちる。** 呼ぶ側は既に `segment_ready` を通しているので、
+/// ここで失敗するのは「モデルが無い」以外の理由——壊れたファイル、graph の
+/// 解析失敗——であり、それを `None` に潰すと「モデルが無い機械」と同じ顔で
+/// 黙って飛ぶ。**何が起きたのかは、その本文にしか書かれていない。**
+fn run_segment(scene: &common::RealScene) -> (common::EdgeTruth, EdgeMetrics, Diagnostics, f64) {
+    let truth = common::real_scene(scene);
+    let (w, h) = (truth.image.width(), truth.image.height());
+    let run = kiri::segment::run(&truth.image, &kiri::segment::SegmentOptions::isnet())
+        .unwrap_or_else(|e| panic!("{}: モデルの推論に失敗した: {e}", scene.name));
+    let (constraints, _) = kiri::segment::to_constraints(&run.probability, w, h);
+    let opts = CutoutOptions {
+        constraints: Some(constraints),
+        tolerance: scene.assisted_tolerance,
+        ..Default::default()
+    };
+    let result = cutout(&truth.image, &opts);
+    let metrics = common::measure_edges_with(
+        &truth,
+        &result.image,
+        &result.mask,
+        None,
+        opts.constraints.as_ref(),
+    );
+    (
+        truth,
+        metrics,
+        result.diagnostics.clone(),
+        result.stats.foreground_ratio,
+    )
+}
+
+/// **モデルのトライマップは、手で描いたトライマップの代わりになるか。**
+///
+/// R1〜R7 を 3 通り（`defaults` / 正解由来の `trimap` / モデル由来の `segment`）で
+/// 回して、正解由来の指標を並べる。`--ignored` を付けたときだけ走る。
+///
+/// ```text
+/// cargo test --release --features segment --test real_backgrounds -- \
+///     --ignored --nocapture print_the_segment_comparison
+/// ```
+#[test]
+#[ignore = "計測用。モデルが無ければ何もしない"]
+fn print_the_segment_comparison() {
+    if skip_without_model() {
+        return;
+    }
+    println!(
+        "\n{:<30} {:<9} {:>9} {:>9} {:>8} {:>9} {:>9}  警告",
+        "シーン", "設定", "輪郭誤差", "rim正解", "eaten", "alphaMAE", "前景比率"
+    );
+    for scene in real_scenes() {
+        let truth = common::real_scene(&scene);
+        let mut rows: Vec<(&str, EdgeMetrics, f64, Vec<String>)> = Vec::new();
+
+        for (label, constraints) in [
+            ("defaults", None),
+            ("trimap", Some(common::truth_trimap(&truth))),
+        ] {
+            let opts = CutoutOptions {
+                constraints,
+                tolerance: if label == "defaults" {
+                    CutoutOptions::default().tolerance
+                } else {
+                    scene.assisted_tolerance
+                },
+                ..Default::default()
+            };
+            let result = cutout(&truth.image, &opts);
+            let m = common::measure_edges_with(
+                &truth,
+                &result.image,
+                &result.mask,
+                None,
+                opts.constraints.as_ref(),
+            );
+            rows.push((
+                label,
+                m,
+                result.stats.foreground_ratio,
+                result
+                    .warnings
+                    .iter()
+                    .map(|w| w.code.as_str().to_string())
+                    .collect(),
+            ));
+        }
+        let (_, m, _, fg) = run_segment(&scene);
+        rows.push(("segment", m, fg, Vec::new()));
+
+        for (label, m, fg, warnings) in rows {
+            println!(
+                "{:<30} {label:<9} {:>9.2} {:>9.4} {:>8.4} {:>9.4} {:>9.4}  {}",
+                scene.name,
+                m.contour_error,
+                m.rim_truth,
+                m.eaten,
+                m.alpha_mae,
+                fg,
+                warnings.join(",")
+            );
+        }
+    }
+}
+
+/// **モデルのトライマップは、正解から作ったトライマップに負けない。**
+///
+/// `trimap` 設定は正解の二値を長辺の 2% で収縮・膨張して作ったもので、
+/// **画像を見ずには作れない**。それと同じ土俵にモデルが立てなければ、
+/// `--segment` は「粗マスクの供給源」を名乗れない。
+///
+/// 実測（`print_the_segment_comparison`）では 7 シーンすべてで輪郭誤差も
+/// 縁の汚染も同等以上だった。窓を 5% + 0.01 取ってあるのは、R4 / R7 の
+/// ように**どちらも既定値で解けていて値がぴたりと並ぶ**シーンで、
+/// 最下位ビットの揺れに落ちないためである。
+///
+/// **`eaten` は別枠にする。** R5（幅 3px のストラップ）だけはモデルのほうが
+/// 1.0% 削る（正解由来のトライマップは 0.0%）。細部は 1024x1024 の格子に
+/// 載らないので、原理的にモデルが不利な唯一の指標である。
+///
+/// モデルが無ければ黙って飛ばす。
+#[test]
+fn the_model_trimap_is_not_worse_than_one_made_from_the_truth() {
+    if skip_without_model() {
+        return;
+    }
+    for scene in real_scenes() {
+        let truth = common::real_scene(&scene);
+        let with_trimap = {
+            let opts = CutoutOptions {
+                constraints: Some(common::truth_trimap(&truth)),
+                tolerance: scene.assisted_tolerance,
+                ..Default::default()
+            };
+            let result = cutout(&truth.image, &opts);
+            common::measure_edges_with(
+                &truth,
+                &result.image,
+                &result.mask,
+                None,
+                opts.constraints.as_ref(),
+            )
+        };
+        let (_, from_model, _, _) = run_segment(&scene);
+
+        assert!(
+            from_model.contour_error <= with_trimap.contour_error * 1.05 + 0.01,
+            "{}: モデルの輪郭誤差が正解由来のトライマップより悪い: {:.2} vs {:.2}",
+            scene.name,
+            from_model.contour_error,
+            with_trimap.contour_error
+        );
+        assert!(
+            from_model.rim_truth <= with_trimap.rim_truth * 1.05 + 0.01,
+            "{}: モデルの縁の汚染が正解由来のトライマップより悪い: {:.4} vs {:.4}",
+            scene.name,
+            from_model.rim_truth,
+            with_trimap.rim_truth
+        );
+        // 細部の取りこぼしだけは窓を広く取る（R5 の 3px ストラップ）
+        assert!(
+            from_model.eaten <= with_trimap.eaten + 0.02,
+            "{}: モデルが商品を余計に削っている: {:.4} vs {:.4}",
+            scene.name,
+            from_model.eaten,
+            with_trimap.eaten
+        );
+    }
+}

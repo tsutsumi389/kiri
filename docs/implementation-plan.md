@@ -36,6 +36,11 @@ src/
     diagnostics.rs     境界の診断値（halo_ratio, edge_width）
     mask.rs            マスク型と統計（foreground_ratio, bbox, touches_edge）
     subject.rs         主体（商品）の位置の推定。背景推定だけから求める
+  segment/             セグメンテーションモデル（feature `segment`、既定は無効）
+    mod.rs             3 値の指定、前処理、確率マップ、トライマップ化。**モデルが無くても検査できる**
+    model.rs           既知のモデルの素性（URL / ダイジェスト / ライセンス）と置き場所の解決
+    isnet.rs           tract-onnx による推論。**このファイルだけが tract を知る**
+    sha256.rs          モデル検証のためだけの SHA-256（自前、依存を足さない）
   transform/
     resize.rs          fast_image_resize ラッパ
     rotate.rs          回転。90 度単位は画素の入れ替え、それ以外は Catmull-Rom
@@ -61,6 +66,8 @@ src/
 | 10 | 境界の欠陥を測れるようにする：実写背景のベンチと、輪郭の粗さ・縁の汚染の診断値 | `mask.contour_roughness` / `mask.rim_contamination` / `tests/real_backgrounds.rs` | 1日 |
 | 11 | 空間的な指示：トライマップ / マスク画像 / 多角形を入口として受け、画素ごとの制約へ畳む | `--trimap` / `--fg-mask` / `--bg-mask` / `--fg-polygon` / `--bg-polygon` / `constraints` ブロック | 1日 |
 | 12 | 境界を matting として解く：帯の中の二値画素を色で塗り直し、色の門つきメディアンで均し、guided filter でアルファを解く | `--matting` / `--smooth-contour` / `--no-reclassify` / `settings.band_min_radius` | 1日 |
+| 13 | 背景を 1 色ではなく照明場 B(x, y) として持つ | `--background-model` / `background.field_range` / `background.residual` | 1日 |
+| 14 | 意味の事前知識：pure Rust 推論でセグメンテーションモデルを粗マスクの供給源にする | `--segment` / `kiri model list` / `segment` ブロック | 1日 |
 
 **Phase 1 の `kiri info` を最初に完成させる。** 最小で end-to-end が通り、JSON規約とエラー処理の型がそこで確定する。型が決まれば以降は同じ形で積み上げられる。
 
@@ -431,3 +438,118 @@ MSRV の検査を CI に入れるのは、**宣言だけ置いても検査しな
   - [ ] **`subject` を場に対して測る案は採らなかった。** 商品が外周の帯を
         大きく占めると場が商品の色を背景として学び、較正表で 2 件が裏返る
         （design.md 4.11）
+
+- [x] Phase 14: 意味の事前知識をモデルから借りる（feature `segment`、既定は無効）
+  - [x] `tract-onnx` 0.23.7（pure Rust、MIT OR Apache-2.0）で ISNet（DIS
+        general-use、Apache-2.0）を動かす。`cargo tree -e normal` に `*-sys` は
+        1 つも現れない。依存クレートは 97 → 175
+        （`cargo tree -e normal --prefix none | sed 's/ (\*)$//' | sort -u | wc -l`。
+        `(*)` を落とさずに数えると同じ木が 110 → 211 と出る）。ビルド中は
+        `tract-linalg` が `cc` で arm64 アセンブリを組むが、`rav1e` 経由で
+        `cc` は既に入っていた（design.md 3.1）
+  - [x] 推論の依存に `dyn-eq` 0.1.3（MPL-2.0）が 1 つ入る。改変しないので
+        配布物は MIT のまま。README のライセンス表に 1 行で添えた
+  - [x] **既定で無効。** `tract-onnx` の `rust-version` が 1.91 で kiri の MSRV
+        1.85 を超えるうえ、clean build が 50 秒 → 200 秒、バイナリが
+        3.26MB → 19.26MB になる。無効な build で `--segment` を渡すと
+        `SEGMENT_UNAVAILABLE`（**黙って off に落とさない**）
+  - [x] 確率マップ → トライマップ → Phase 2 の `Constraints` → 既存の切り抜き。
+        **新しい切り抜き経路は作らない**（`constraints.sources` に `segment` が
+        並ぶだけ）
+  - [x] **確定背景は「格子の外周からたどり着ける低確率の領域」だけ。** モデルが
+        返すのは顕著性であって背景ではない——実写キーボードでは黒いキーキャップが
+        確率ほぼ 0 になり、そのまま確定背景にするとキーが 1 つ残らず穴として抜けた
+  - [x] 二値化も収縮も**確率マップの格子で**行う。原寸で `erode` すると
+        `O(n * r)` で 24.5MP・半径 33px では 9.7 秒かかり、推論より重かった
+        （格子なら 0.16 秒）
+  - [x] 利用者の空間的な指示はモデルに**勝つ**（`Constraints::overlay`）。
+        `CONSTRAINT_CONFLICT` にはしない——モデルは提案で、利用者は決定である
+  - [x] 前処理は歪め（`Stretch`）を既定にした。**実測が設計の見込みと逆だった**
+        ——余白つき（`Letterbox`）はキーボードの右列を丸ごと落とす（前景比率
+        42.72% 対 45.00% ＋ 目視）。ISNet が歪めた画像で学習されているためと
+        見ている。**根拠に `separability` と粗さは使わない**——前者は商品を
+        削った側ほど高く出て、後者は素材の JPEG 品質で動く（design.md 4.12）
+  - [x] `kiri model list`（URL / MD5 / SHA-256 / ライセンス / 想定パス / 検証結果 /
+        取得の 1 行）。**ネットワークは触らない。** 検証は自前の SHA-256
+        （60 行、依存を足さない）で、切り抜きの経路では大きさしか見ない
+  - [x] `--segment <off|auto|isnet>` / `--model-path`、`settings.segment` と
+        `settings.segment_ran`、`segment` ブロック、`subject.source`、
+        警告 `SEGMENT_UNCERTAIN`、schema の `fields[]`
+  - [x] 実写キーボード（暗い机の上の黒いキーボード）が切れる。前景比率
+        0.6497 → 0.4500、外周接触 あり → なし、halo 0.1365 → 0.0992、
+        粗さ 0.8132 → 0.3883。SUBJECT_TOUCHES_EDGE と HALO_REMAINS が消える
+  - [x] **実写素材を作り方と digest で固定した**（design.md 4.12）。
+        `sips` の品質を変えただけで別のファイルになり、キーボードの粗さは
+        0.3883 と 0.5499 のあいだで動く。数値の出どころを書かないと、
+        次に測った人は「再現しない」としか言えない
+  - [x] 実写リモコンが **bbox なしで**手動 bbox の最良設定に並ぶ。4.8 が
+        「bbox なしならここまで」と書いた `--tolerance 20` と比べて境界色差
+        36.04 → 53.47、halo 0.1379 → 0.0787、粗さ 0.5922 → 0.2743、
+        縁汚染 0.0641 → 0.0619（手動 bbox の最良は 54.7）。既定値どうしなら
+        19.60 → 53.31 で `BBOX_RECOMMENDED` が消える
+  - [x] `--segment off` の出力バイト列が不変（旧バイナリと md5 一致）。
+        モデルが無くても全テストが通る
+  - [x] `info --segment` も `SEGMENT_UNCERTAIN` を出す。`schema` は
+        `segment.uncertain_ratio` を両コマンドに配っておきながら、警告は
+        `cutout` しか出していなかった（実写キーボードで 0.4768）。**配った値を
+        自分で比べたエージェントだけが気づける**状態で、しきい値を配る意味が
+        半分になっていた
+  - [x] `kiri model list` は**大きさが違うファイルを舐めない**。`present` だけを
+        門にしていたので、想定パスに置かれた巨大な別ファイルを最後まで読んで
+        いた。`metadata().len()` で先に弾き、`verified: false` と `actual_bytes`
+        を返す
+  - [x] 置き場所の決め方を純関数 `segment::model::dir_from` に切り出した。
+        テストが `std::env::set_var` を呼んでいたが、同じバイナリに
+        `default_dir` を読む検査が同居しており**並列に走ると未定義動作**だった
+  - [ ] **`--segment-size` は置かなかった。** ISNet の ONNX は 1024 を graph に
+        焼き込んでおり、512 では復号側の Concat が解析に失敗する
+        （`Impossible to unify Val(32) with Val(16)`）。常に失敗する値を契約に
+        載せる利得は無い
+  - [ ] **取っ手の内側のような「商品に囲まれた本物の背景」をモデルから受け取れない。**
+        上の外周連結の規則の裏返しで、`--bg-polygon` が逃げ道になる
+  - [ ] `info --segment` の `NOT_SEPARABLE` は**消えない**。モデルが主体を
+        見つけて初めて主体の色差（6.6）を測れるようになるので、むしろ新しく出る。
+        「色では分けられない」は事実のままなので code は変えず、hint だけを
+        「撮り直し」から「`--segment isnet` を渡すか bbox を指定する」へ差し替えた
+  - [ ] 実写キーボードの前景比率は 0.4500 で、目算の 0.5〜0.7 には届かない。
+        商品の外接矩形が画像の 53% x 94% なので、矩形を埋め切っても 0.50 で
+        あり、キーボードの輪郭が矩形より痩せているぶんが差である。**切り残しでは
+        ない**（外周接触なし・halo 0.0992）
+  - [ ] 実写キーボードは `SEGMENT_UNCERTAIN` が出たまま（不明の帯 47.7%）。
+        モデルがキーキャップを掴めていないことがそのまま出ており、**警告としては
+        正しい**が、確定前景は 0.8% しか置けていない
+  - [ ] `batch` は `--segment` を受けない。1 件あたり推論だけで 1.3 秒、
+        ピーク RSS 1.6GB を並列度ぶん積む使い方に見合う素材が無い
+  次フェーズへ送ったもの（Phase 5 のレビューで挙がり、今回は入れていない）:
+
+  - [ ] **推論時にダイジェストを照合しない。** 切り抜きの経路は大きさしか見ない
+        ので、想定と同じ長さの壊れたファイルは tract の解析失敗まで落ちない。
+        1 度だけ検証してその結果を憶えておく形（`.verified` の傍らファイル等）
+        なら、毎回 0.4 秒を払わずに塞げる
+  - [ ] **`--model-path` が既知のバイト数しか受けない。** 自前で微調整した
+        ISNet や、同じ構造の別の重みを渡せない。`--model-path` を渡した時点で
+        利用者は「これを使う」と決めているのだから、大きさの検査は
+        警告に落として通すほうが筋が良い
+  - [ ] `info --segment` はモデルの確率マップから `Constraints` を原寸で組み
+        直している（`cutout` と同じ経路を通すため）。主体の bbox を出すだけなら
+        格子のまま測れて、24MP で 0.16 秒を節約できる
+  - [ ] `to_constraints` の `grid_index` が内側のループで毎回割り算をしている。
+        行ごとに巻き上げれば原寸の画素数ぶんの除算が消える
+  - [ ] `auto` の門は背景と主体をもう 1 度測り直している（`decide` →
+        `colour_is_hopeless`）。`analyse_background` の結果を持ち回れば、
+        `auto` を渡したときの二度手間が無くなる
+  - [ ] **推論のピーク RSS 1.4GB を削る。** f16 での実行や、tract の実行計画を
+        持ち回して中間テンソルを使い回す道がある。ここが下がらないと
+        `batch` は `--segment` を受けられない
+  - [ ] BiRefNet は重みの学習データ（DIS5K）に商用制限があり、candle 経路も
+        パッチ依存を抱えている。解消されれば次の候補（design.md 3.6）。
+        **条件が揃ったかを確かめるところから**始める
+  - [ ] `--model-path` を `--segment off` と一緒に渡すと黙って無視される。「効いた値
+        だけを報告する」規約に照らすと、警告か `settings` への露出が要る
+  - [ ] `segment::to_probability` と `Probability::new` は `pub` なのに `raw` の長さを
+        `assert_eq!` でしか検査しない。ライブラリ API としては `Result` で断るべき
+  - [ ] `segment::nearest` は 0 寸法の画像で `get_pixel` が panic しうる（実運用では
+        復号側が弾くので到達しないが、`pub` である以上は早期 return が要る）
+  - [ ] `kiri schema --json` からは、この build が推論できるかを読めない
+        （`model list` の `segment_available` にしか無い）。schema にも 1 キー置くと、
+        エージェントが 1 回の問い合わせで判断できる

@@ -151,6 +151,8 @@ error_catalog! {
         => "出力形式を判別できない（拡張子、または spec の format 名）",
     SpecEmpty = "SPEC_EMPTY", Argument
         => "spec に項目が 1 つも無い",
+    SegmentUnavailable = "SEGMENT_UNAVAILABLE", Argument
+        => "この build には segment 機能が入っていない（--features segment で入れ直す）",
 
     // 入力 (exit 3)
     InputUnreadable = "INPUT_UNREADABLE", Input
@@ -167,6 +169,10 @@ error_catalog! {
         => "spec の構造が仕様に合わない",
     SpecUnknownField = "SPEC_UNKNOWN_FIELD", Input
         => "spec に未知のキーがある（綴り違いの疑い）",
+    ModelNotFound = "MODEL_NOT_FOUND", Input
+        => "セグメンテーションモデルのファイルが置き場所に無い（kiri model list が取得手順を返す）",
+    ModelUnreadable = "MODEL_UNREADABLE", Input
+        => "モデルのファイルが壊れている（大きさが違う、ONNX として解析できない）",
 
     // 処理 (exit 4)
     EmptyImage = "EMPTY_IMAGE", Processing
@@ -177,6 +183,8 @@ error_catalog! {
         => "キャンバスに配置する前景が 1 画素も残らなかった",
     ResizeFailed = "RESIZE_FAILED", Processing
         => "リサイズに失敗した",
+    SegmentFailed = "SEGMENT_FAILED", Processing
+        => "モデルは読めたが推論が通らなかった",
 }
 
 impl Serialize for ErrorCode {

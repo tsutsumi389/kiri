@@ -19,6 +19,22 @@ path = "src/main.rs"
 name = "kiri"
 path = "src/lib.rs"
 
+[features]
+# 既定は無効。**二つの理由がある。**
+#
+# 1. `tract-onnx` 0.23.7 の `rust-version` は 1.91 で、kiri の MSRV 1.85 を
+#    超える。既定で有効にすると `cargo +1.85 check` が引数の綴りすら見ずに
+#    落ちる。MSRV は「この版の rustc で使える」という約束なので、推論のために
+#    黙って上げない
+# 2. 素の kiri は clean build 50 秒 / 3.26MB で建つ。tract を足すと 200 秒 /
+#    19.26MB になる。切り抜きの大半（単色背景の EC 素材）はモデルを要しないので、
+#    その費用を全員に負わせる理由が無い
+#
+# 有効にすると `--segment` が動く。無効のまま `--segment isnet` を渡すと
+# `SEGMENT_UNAVAILABLE` で断る（黙って off に落とさない）。
+default = []
+segment = ["dep:tract-onnx"]
+
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 ravif = "0.13"
@@ -30,6 +46,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 fast_image_resize = "5.1.4"
 rayon = "1.12.0"
+# pure Rust の ONNX 推論。C 依存は無い（`cargo tree -e normal` に `*-sys` が
+# 1 つも現れない）。`segment` feature でのみ引く
+tract-onnx = { version = "0.23.7", optional = true }
 
 [dev-dependencies]
 assert_cmd = "2"

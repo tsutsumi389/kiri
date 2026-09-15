@@ -2031,10 +2031,10 @@ fn print_the_optimize_rank_agreement() {
         "\n| シーン | 候補 | 探索段の 1 位 | 原寸の 1 位 | 原寸 1 位の探索順位 | 原寸 1 位が上位 2 に居るか | search→final の比率（崩れていない候補の最大の落ち込み） |"
     );
     println!("|---|---|---|---|---|---|---|");
-    for scene in real_scenes()
-        .into_iter()
-        .filter(|s| ["R1", "R2", "R7"].iter().any(|p| s.name.starts_with(p)))
-    {
+    // **7 シーンすべてを出す。** 順位の一致率だけなら 3 つで足りるが、
+    // 右端の列（search→final の落ち込み）は `FOREGROUND_COLLAPSE` の余裕を
+    // 確かめるための数なので、素材を選んで測っては意味が無い
+    for scene in real_scenes() {
         let truth = common::real_scene(&scene);
         let analysis = analyse_background(
             &truth.image,

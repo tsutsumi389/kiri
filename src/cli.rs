@@ -423,7 +423,10 @@ fn optimize_long_help() -> String {
          （24.5MP で 10 秒台）。\n\
          試した全候補とその指標は結果 JSON の optimize.candidates[] に、\
          選ばれた設定は optimize.chosen と settings に出る。2 位のほうが目的に\
-         合うなら、その候補の値を明示指定へ写せばよい。\n\
+         合うなら、その候補の値を明示指定へ写せばよい。**stage が search の\
+         候補の halo_ratio / contour_roughness / rim_contamination / \
+         touches_edge は参考値**で、順位には使っていない（境界処理を抜くと\
+         候補ごとに違う倍率で膨らむため）。\n\
          どの候補にも致命的な警告が残ったら {} で報せる。",
         tolerances.join(" / "),
         2 * SEARCH_TOLERANCES.len() * 2,

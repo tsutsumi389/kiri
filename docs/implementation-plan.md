@@ -1,6 +1,6 @@
 # kiri 実装計画
 
-最終更新: 2026-09-12
+最終更新: 2026-09-15
 
 設計の詳細と決定根拠は [design.md](./design.md) を参照。本書は実装の進め方のみを扱う。
 
@@ -44,7 +44,8 @@ src/
   transform/
     resize.rs          fast_image_resize ラッパ
     rotate.rs          回転。90 度単位は画素の入れ替え、それ以外は Catmull-Rom
-    canvas.rs          キャンバス配置、fill_ratio
+    canvas.rs          キャンバス配置、fill_ratio、1 画素の straight alpha 合成
+    shadow.rs          アルファから落ち影を合成する（箱型 3 回のガウス近似）
     composite.rs       背景色合成
   batch.rs             spec.json の読み込みと rayon 並列実行
 ```
@@ -68,6 +69,7 @@ src/
 | 12 | 境界を matting として解く：帯の中の二値画素を色で塗り直し、色の門つきメディアンで均し、guided filter でアルファを解く | `--matting` / `--smooth-contour` / `--no-reclassify` / `settings.band_min_radius` | 1日 |
 | 13 | 背景を 1 色ではなく照明場 B(x, y) として持つ | `--background-model` / `background.field_range` / `background.residual` | 1日 |
 | 14 | 意味の事前知識：pure Rust 推論でセグメンテーションモデルを粗マスクの供給源にする | `--segment` / `kiri model list` / `segment` ブロック | 1日 |
+| 15 | 探索を kiri 側に持たせ、影を合成する | `--optimize` / `--shadow synth` | 1日 |
 
 **Phase 1 の `kiri info` を最初に完成させる。** 最小で end-to-end が通り、JSON規約とエラー処理の型がそこで確定する。型が決まれば以降は同じ形で積み上げられる。
 
@@ -553,3 +555,150 @@ MSRV の検査を CI に入れるのは、**宣言だけ置いても検査しな
   - [ ] `kiri schema --json` からは、この build が推論できるかを読めない
         （`model list` の `segment_available` にしか無い）。schema にも 1 キー置くと、
         エージェントが 1 回の問い合わせで判断できる
+
+- [x] Phase 15: 探索を kiri 側に持たせ、影を合成する（`--optimize` / `--shadow synth`）
+  - [x] **探索（`--optimize`）**
+  - [x] 固定の格子（`bbox` 2 × `tolerance` 5 × `background_model` 2 = 最大 20 通り）を
+        長辺 1500px で総当たりし、上位 2 つだけを原寸で回す。致命的な警告も品質の
+        警告も出ない候補に当たったら打ち切る（`src/cutout/optimize.rs`）
+  - [x] **明示した値は探索の軸から外れる。** `--tolerance` は `default_value_t` を
+        持つので値だけでは明示を検出できない。既定値を `Option` にすると
+        `kiri schema` の `default` から 12 が消えて「指定しなくても何が効くか」が
+        読めなくなるので、`main.rs` で clap の `ValueSource` を見て
+        `CutoutArgs::fixed` へ畳んだ（`Cli::parse()` → `get_matches()` +
+        `from_arg_matches`）。`batch` の spec では `Some` がそのまま明示になる
+  - [x] `optimize` ブロック（`candidates[]` / `chosen` / `searched_at` /
+        `elapsed_ms`）、`settings.optimize`、警告 `OPTIMIZE_NO_CLEAN_CANDIDATE`、
+        `kiri schema` の `fields[]` に 5 項目。`schema_version` は据え置き
+  - [x] **`--optimize` を渡さない経路の出力は 1 バイトも変わらない。** 実写 2 枚
+        （既定値・手動最良）と `tests/fixtures/backgrounds/*.jpg`（`--canvas 1000
+        --flatten`）で旧バイナリと md5 一致。結果 JSON で増えたのは
+        `settings.optimize` の 1 キーだけ
+  - [x] 空間的な指示は `Constraints::resampled` で縮小版へ最近傍で写す。**寸法の
+        合わない指示は丸ごと無かったことにされる規約**なので、写さなければ
+        探索だけが指示の無い世界で行われる。最終段は原寸の指示そのままで回る
+  - [x] 矩形の丸めを `cutout::bbox_to_pixels` に 1 箇所へ寄せた。探索段と最終段で
+        同じ矩形を解き直すので、`resolve_bbox` と式が分かれると候補表と
+        `applied_bbox` が食い違う
+  - [x] **致命の数え方を 2 つ直した**（design.md 4.13）。`BBOX_RECOMMENDED` を
+        `SUBJECT_TOUCHES_EDGE` と並べて数える（R6 で輪郭誤差 84.00 → 3.35）。
+        許容量を上げて前景比率が 3 割を超えて落ちた候補は「商品を飲んだ」と
+        みなす（`FOREGROUND_COLLAPSE`）
+  - [x] **探索段と最終段を別の物差しで並べる**（レビュー H1）。探索段は
+        `refine` に依らない量だけを見る——`NOT_SEPARABLE` / `FOREGROUND_TOO_SMALL`
+        / `FOREGROUND_TOO_LARGE` の数 + 崩れ → `separability`。外周接触の警告は
+        実写で**矩形つきの候補 6 つすべてが探索段でだけ出し**、縁の汚染は 4〜6 倍、
+        輪郭の粗さは 3〜5 倍に候補ごとに違う倍率で膨らむ。最終段は
+        致命 + 崩れ → **測れなかった診断値の数** → 品質の重み和 → `separability`
+  - [x] **原寸の崩れは同じ候補の探索段の前景比率と比べる**（レビュー H2）。
+        列の比較は 5 点そろう探索段だけで成り立ち、原寸まで来る 2 つは同じ列に
+        いるとも限らない。実写の 60/bbox/auto がまさにそれで、探索段 0.2049 →
+        原寸 0.0664（67.6%）。崩れていない候補の落ち込みは R1〜R7 で最大 19.5%、
+        実写 tol 45 で 0.9% なので 0.30 で誤爆しない
+  - [x] `OPTIMIZE_NO_CLEAN_CANDIDATE` は `BBOX_RECOMMENDED` を数えない
+        （レビュー M1）。あちらは矩形つきで次の一手を言っているので、重ねると
+        同じ結果に 2 つの矛盾した指示が並ぶ。順位（5 code）と警告（4 code）は別
+  - [x] 崩れは `score.fatal` に足さず、候補ごとの `collapsed` として出す。
+        `fatal` は**出た警告の数**で、`OPTIMIZE_NO_CLEAN_CANDIDATE` が数える
+        対象と同じものでなければ「fatal が 0 でないのに警告が出ない」状態が
+        生まれる。順位の第 1 項だけが `fatal + collapsed` を見る
+  - [x] R1〜R7 で `assisted`（3 手ループが到達する設定）と同等以上。7 点中 6 点で
+        同等以上、R1 / R5 / R6 は輪郭誤差が半分以下（4.23 → 2.54 / 9.52 → 2.24 /
+        5.91 → 3.35）
+  - [x] 実写リモコン 24.5MP を bbox 無し・既定値から出発して **13.7 秒**で切る
+        （目標 15 秒）。fg 0.2037 / halo 0.0295 / 境界色差 53.8 / 粗さ 0.254 /
+        縁汚染 0.061。**手で詰めた最良（`--tolerance 60 --background-model flat`
+        + bbox、3.0 秒）と同等**で、境界色差 53.8 対 56.6、粗さ 0.254 対 0.245。
+        時間を 5 倍払う代わりに 3 手を打たなくてよく、決定が JSON に残る
+  - [x] **メモリは増えない**（レビュー H3 / M5、`/usr/bin/time -l` で実測）。
+        同じリモコンで `--optimize` 873MB、既定 892MB、選ばれた設定を明示 809MB。
+        原寸を回す回数が同じで、探索段が抱えるのは 1500px 1 枚と指標だけである。
+        README の「`--jobs` を落とせ」は撤回した
+  - [x] 実写キーボード 12MP はどの候補にも致命的な警告が残り、
+        `OPTIMIZE_NO_CLEAN_CANDIDATE` が `SUBJECT_TOUCHES_EDGE` を載せて出る
+        （9.2 秒、479MB）。探索が何も改善できなかったことを明示する
+  - [x] **原寸で回す数を 3 から 2 へ落とした。** 3 では 18.7 秒で目標を超え、
+        選ばれる候補は測った 8 点すべてで同じだった。負けた候補を回すのは順位を
+        確かめるためで、1 位が崩れたときに 2 位が受ければ足りる
+  - [ ] **R3（布との ΔE が 12 前後の淡色商品）は `assisted` に届かない。** 主体の
+        信頼度が `low` なので候補集合に矩形を使う候補が 1 つも無く、矩形が無ければ
+        この素材で商品と背景を分ける許容量は存在しない（輪郭誤差 119.70 対
+        `assisted` 24.25）。しきい値をベンチに合わせて緩めるのではなく、R3 だけ
+        期待値を現状の値で固定して悪化を検出できる状態にした
+        （`tests/real_backgrounds.rs` の定数）
+  - [ ] **縮小探索の順位は原寸とあまり一致しない。** 段を分けた後は R1〜R7 の
+        7 点中 3 点しか上位 2 つに入らない（分ける前は R1 / R2 / R7 が 1 / 2 / 1 位）。
+        それでも品質は上がっている——R4 は原寸の 1 位（12/none/flat、探索段 20 位）
+        を外したが、選ばれた 45/box/flat の輪郭誤差は 0.41 で `assisted` と同じで
+        ある。**この数は 2 つの代理指標どうしの一致であって、絵の良さではない**
+  - [ ] **全候補が致命なら順位そのものに意味が無い。** 商品の写っていない
+        `desk_a.jpg` では 10 候補すべてが `FOREGROUND_TOO_SMALL` を出す。答えは
+        順位ではなく `OPTIMIZE_NO_CLEAN_CANDIDATE` のほうである
+  - [ ] **早期打ち切りが効かない素材がある。** 不織布の織り目は全候補で
+        `CONTOUR_ROUGH` を出すので、「品質の警告が 0」に到達する候補が存在しない。
+        きれいな素材では 1 位で止まり、原寸は 1 回で済む
+  - [ ] `batch` に `optimize: true` を書くと 1 件が数秒から十数秒になる。数百点に
+        一律で付ける値ではないが、`--segment` と違って**受けている**（メモリは
+        増えないので、並列度はそのままで回せる）
+  - [ ] 候補ごとに `CutoutOptions` を丸ごと複製している（`Constraints` を含む）。
+        24.5MP では 1 回 24MB の memcpy で、最終段の 2 回だけとはいえ無駄である
+  - [ ] **探索段では `--border` と `--feather` が相対的に太くなる。** どちらも
+        実寸の px で、`--cleanup` や `--smooth-contour` と違って長辺 1000px 換算
+        ではない。全候補に同じ歪みが掛かるので順位には効いていないが、換算を
+        足すならここが最初の候補である
+  - [ ] **探索段は `analyse_background` を 21 回走らせている。** 候補集合を決める
+        1 回と、候補ごとの `cutout()` の中の 20 回である。1500px なので目立たないが、
+        見立てを持ち回れば 20 回ぶん減る（Phase 14 の `auto` の門と同じ形の宿題）
+  - [ ] 許容量の格子は 5 点で固定である。選ばれた値の両隣をもう 1 度細かく刻む
+        （12 / 20 / 30 / 45 / 60 → 45 が勝ったら 37 / 52 を足す）道があるが、
+        原寸の回数が増えるので 15 秒の目標と相談になる
+  - [x] **影の合成（`--shadow synth`）**
+  - [x] `transform/shadow.rs` を足し、最終アルファをずらして σ でぼかしたものを
+        商品の下に敷く。`--shadow` / `--shadow-offset` / `--shadow-blur` /
+        `--shadow-color` / `--shadow-opacity` の 5 つ（design.md 4.14）
+  - [x] ぼかしは箱型フィルタ 3 回でガウスを近似する（Kovesi の幅の決め方）。
+        移動和なので画素あたり定数回で、**σ を上げてもほとんど遅くならない**。
+        24.5MP で `synth` 単体を測ると σ 0 で 45.1ms、σ 57.12px で 158.9ms、
+        σ 228.48px で 166.9ms（`print_the_blur_cost_on_a_large_alpha`）。
+        `cutout` 全体（5.0 秒）では実行ごとのばらつきに埋もれる大きさ
+  - [x] 幅は必ず奇数。偶数幅は重心が半画素ずれ、3 回で 1.5px の位置ずれになる。
+        整数演算（アルファ u8 / 移動和 u32 / 四捨五入）で決定性を保つ
+        （24.5MP の 2 回の実行で md5 一致）
+  - [x] px@1000 の基準は**最終画像の長辺**。`--canvas` があればキャンバスの
+        長辺になる。実際に効いた px は `shadow.offset` / `shadow.blur` に出す
+  - [x] 商品の層は 1 画素も変えない。影のアルファが 0 の画素と、商品のアルファが
+        255 の画素は `--shadow off` の出力とビット一致する。合成の算術は
+        `transform/canvas.rs` の `over` を共有する
+  - [x] `--canvas --flatten` は「透明のまま配置 → 影 → 下地に載せる」へ組み替える。
+        **組み替えは `synth` のときだけ通す**（`off` にも通すと半透明の縁で
+        丸めが 1 ずつ変わる）
+  - [x] 非破壊: `--shadow` を渡さない 14 通りの実行で、変更前の release バイナリと
+        出力 PNG / JPEG / AVIF の md5 が一致（実写 24.5MP の既定値と最良設定、
+        実写キーボード、`tests/fixtures/backgrounds/*.jpg` の素通し・
+        `--canvas 1000 --flatten`・`--canvas 800 --flatten` の JPEG・AVIF）。
+        `--shadow off` を明示した出力も `--shadow` 無しとバイト一致
+  - [x] `mask` ブロックの統計と診断値は影を足す前の商品だけで測る。実写 24.5MP で
+        `--shadow off` / `--shadow synth` の 4 指標が完全一致
+  - [x] `batch` の spec に 5 キー。`schema` の `fields[]` に `settings.shadow` と
+        `shadow.offset` / `blur` / `bounds` / `clipped`
+  - [x] レビューで出た 4 件を直した: `--shadow-blur` に上限（px@1000 で 1000）を
+        置き、箱型の幅の算術を飽和つきにする（無いと `8e9` で u32 が溢れ、
+        release では「ぼかしていないのに σ を報告する」嘘になっていた）。
+        `shadow.blur` を要求値ではなく**箱型が実現する σ** にする。`clipped` を
+        最終の影のアルファで決める（台で決めていたので既定値でも真が出ていた）。
+        `synth` の複製と作業領域の確保をやめる（24.5MP で 98MB）
+  - [ ] **σ が 0 に近いときの丸めで、影の裾が数 px 早く切れる。** 各パスで
+        四捨五入した u8 に落とすため、3 回ぶんの丸め誤差が裾に溜まる。
+        中間を u16 で持てば消えるが、確保量が倍になるので見送った
+  - [ ] **影は 1 枚だけ。** 複数光源（キーライト + フィル）や、接地点だけ濃い
+        contact shadow は表せない。`--shadow-offset` を変えて 2 回通す道も無い
+        （2 回目の入力は影つきのアルファになる）
+  - [ ] `shadow.clipped` が真でも警告は出さない。はみ出しが意図どおりのことも
+        多い（背景いっぱいに広がる影）ので `warnings` へは載せなかったが、
+        「意図せず切れた」を見分ける材料はエージェント側に無い
+  - [ ] **影の色は 1 色だけ。** 台の色を拾った色付きの影（白い紙の上では
+        わずかに青い）は表せない。`--shadow-color` に指定すれば近いものは作れるが、
+        自動では決めない
+  - [ ] `synth` は原寸のアルファ 1 枚（24.5MP で 24.5MB）と出力の複製
+        （98MB）を確保する。キャンバス配置がある場合はキャンバス寸法なので軽いが、
+        `--canvas` 無しの 24.5MP では切り抜き本体のピークに上乗せされる

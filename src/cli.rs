@@ -9,11 +9,12 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::cutout::background::DEFAULT_BORDER;
 use crate::cutout::constraints::{MASK_THRESHOLD, TRIMAP_BACKGROUND, TRIMAP_FOREGROUND};
-use crate::cutout::{BackgroundModel, DEFAULT_EDGE_THRESHOLD, Matting};
+use crate::cutout::{BackgroundModel, DEFAULT_EDGE_THRESHOLD, Matting, OptimizeFixed};
 use crate::image_io::OutputFormat;
 use crate::preview::DEFAULT_PANEL;
 use crate::segment::SegmentMode;
 use crate::transform::FitMode;
+use crate::transform::shadow::ShadowMode;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -180,6 +181,37 @@ fn segment_long_help() -> String {
          この build に segment 機能が無ければ {} で断る。",
         crate::error::ErrorCode::SegmentUnavailable.as_str()
     )
+}
+
+/// `--shadow` の長いヘルプ。
+///
+/// **AI エージェントは `--help` を読んで判断する**ので、「消す側のノブと名前が
+/// 並ぶこと」「px@1000 の基準が最終画像の長辺であること」「下地・影・商品の
+/// 順序」の 3 つをここで言う。どれも指定の前に知っていないと出来上がりを
+/// 予想できず、結果を見てから気づくのでは 1 往復を無駄にする。
+fn shadow_long_help() -> String {
+    "切り抜いたアルファから落ち影を合成する（既定 off）。\n\
+     off  … 何も足さない。成果物の画素は --shadow を足す前と 1 バイトも変わらない\
+     （報告 JSON には settings.shadow が増える。schema_version は据え置き）。\n\
+     synth… 商品のアルファを --shadow-offset ぶんずらし、--shadow-blur の σ で\
+     ぼかしたものを --shadow-color で塗り、--shadow-opacity を掛けて商品の下に敷く。\n\
+     **--shadow-tolerance とは向きが逆である。** あちらは実写に写っている影を\
+     背景として消す側で、こちらは消した後のアルファから影を作り直す側になる。\
+     合成なら商品ごとに影の向きと濃さが揃うので、EC の「影つき」の納品に使える。\n\
+     --shadow-offset と --shadow-blur は長辺 1000px 換算で指定する。基準は\
+     **最終画像の長辺**で、--canvas があればキャンバスの長辺、無ければ元画像の\
+     長辺になる。実際に効いた px は結果の shadow.offset / shadow.blur に出る。\n\
+     出力の寸法は変わらない。影が画像（またはキャンバス）の外へ出る分は切り、\
+     切ったことを shadow.clipped が言う。--canvas の配置は影なしと同じで、\
+     影のぶん商品を小さくはしない。\n\
+     shadow.blur には**要求した σ ではなく箱型の幅が実現する σ** が出る。\
+     σ が小さすぎて幅が 1 に落ちるときは 0.0 で、ぼかしていないのに σ を\
+     名乗ることはない。--shadow-blur の上限は 1000（px@1000 で最終画像の\
+     長辺いっぱい。これ以上広げると影は一様に 0 まで薄まる）。\n\
+     --flatten と併せると「下地 → 影 → 商品」の順に重なる。透過を保てる形式\
+     （PNG / AVIF）では影も半透明のアルファとして残る。\n\
+     mask ブロックの統計と診断値は影を足す前の商品だけで測る"
+        .to_string()
 }
 
 /// 出力に関する共通オプション。convert と resize で同じものを使う。
@@ -364,6 +396,44 @@ fn edge_threshold_long_help() -> String {
     )
 }
 
+/// `--optimize` の長いヘルプ。候補の数と縮小の寸法は定数から組む。
+///
+/// **AI エージェントは `--help` を読んで判断する**ので、「何を試すか」「明示した
+/// 値は探索されない」「時間が何倍になるか」の 3 つをここで言う。どれも指定の前に
+/// 知っていないと選びようがない。
+fn optimize_long_help() -> String {
+    use crate::cutout::optimize::{FINALISTS, SEARCH_LONG_EDGE, SEARCH_TOLERANCES};
+    let tolerances: Vec<String> = SEARCH_TOLERANCES
+        .iter()
+        .map(|t| format!("{t:.0}"))
+        .collect();
+    format!(
+        "tolerance / bbox / background-model の組を kiri 自身が総当たりして、指標で選ぶ\
+         （既定 off）。\n\
+         試すのは tolerance {} × bbox「無し / subject.normalized_bbox」× \
+         background-model「auto / flat」の最大 {} 通り。\
+         主体の信頼度が low なら bbox は「無し」だけ、auto が 1 色を選んだ画像では \
+         background-model も 1 通りになる。\n\
+         **明示した値は探索しない。** --tolerance 30 --optimize は「30 に固定して\
+         残りの軸を探す」の意味になる。--cleanup や --feather のような他のノブは\
+         全候補へ同じものを渡す。\n\
+         長辺 {SEARCH_LONG_EDGE}px へ縮めた画像で全候補を境界処理抜きに回し、\
+         上位 {FINALISTS} つだけを原寸で回す。致命的な警告も品質の警告も出ない\
+         候補に当たった時点で打ち切るので、多くの画像では原寸は 1 回で済む\
+         （24.5MP で 10 秒台）。\n\
+         試した全候補とその指標は結果 JSON の optimize.candidates[] に、\
+         選ばれた設定は optimize.chosen と settings に出る。2 位のほうが目的に\
+         合うなら、その候補の値を明示指定へ写せばよい。**stage が search の\
+         候補の halo_ratio / contour_roughness / rim_contamination / \
+         touches_edge は参考値**で、順位には使っていない（境界処理を抜くと\
+         候補ごとに違う倍率で膨らむため）。\n\
+         どの候補にも致命的な警告が残ったら {} で報せる。",
+        tolerances.join(" / "),
+        2 * SEARCH_TOLERANCES.len() * 2,
+        crate::warning::WarningCode::OptimizeNoCleanCandidate.as_str(),
+    )
+}
+
 /// `--trimap` のヘルプ。しきい値は `constraints.rs` の定数から組む。
 ///
 /// `edge_threshold_help` と同じ理由で直書きしない。**AI エージェントは
@@ -538,6 +608,44 @@ pub fn smooth_contour_px(s: &str) -> Result<f64, String> {
     Ok(v)
 }
 
+/// `--shadow-blur` の上限(px, 長辺 1000px 換算)。
+///
+/// **σ が画像の長辺に達した時点で、影はどこもアルファ 0 まで薄まる。** 箱型の
+/// 台がそれだけ広がると、商品の面積ぶんのインクが画像全体へ均され、8bit へ
+/// 丸めた結果は一様な 0 になる。1000 は px@1000 換算でちょうど「最終画像の
+/// 長辺いっぱい」にあたる値で、これより大きい指定に意味のある結果は無い。
+///
+/// **上限が無いと算術が壊れる**のがもう半分の理由である。`--shadow-blur 8e9`
+/// は箱型の幅を 32 億まで押し上げ、3 回ぶんの半径を足す計算が `u32` を溢れて
+/// debug では panic し、release では幅が化けて「ぼかしていないのに
+/// `blur: 2e29` と報告する」嘘の結果になっていた。`transform/shadow.rs` 側の
+/// `MAX_BOX_WIDTH` は同じ事故への二重の備えで、こちらが第一の門である。
+pub const SHADOW_BLUR_MAX: f64 = 1000.0;
+
+/// 0 以上 `SHADOW_BLUR_MAX` 以下の実数だけを受け付ける。
+pub fn shadow_blur_px(s: &str) -> Result<f64, String> {
+    let v = non_negative(s)?;
+    if v > SHADOW_BLUR_MAX {
+        return Err(format!(
+            "'{s}' は 0 から {SHADOW_BLUR_MAX} の範囲で指定してください"
+        ));
+    }
+    Ok(v)
+}
+
+/// 0.0 以上 1.0 以下の有限な実数だけを受け付ける。
+///
+/// 不透明度に 1.5 を渡せば飽和して 1.0 と同じ結果になり、-0.2 は影が消える。
+/// どちらも「指定したのに効かない」という最も追いにくい失敗になるので、
+/// 受け取る前に断る。
+pub fn unit_interval(s: &str) -> Result<f64, String> {
+    let v = non_negative(s)?;
+    if v > 1.0 {
+        return Err(format!("'{s}' は 0.0 から 1.0 の範囲で指定してください"));
+    }
+    Ok(v)
+}
+
 /// 有限な実数だけを受け付ける。符号は問わない。
 ///
 /// `non_negative` と分けているのは、角度だけが負値に意味を持つためである
@@ -657,8 +765,43 @@ pub struct CutoutArgs {
     /// 落ち影として消す明度(L*)の落ち込みの上限。0 で無効
     ///
     /// 彩度が背景とほぼ同じで暗いだけの画素に限って適用される
+    ///
+    /// **実写に写っている影を消す側**であり、影を合成する --shadow とは向きが逆である
     #[arg(long, default_value_t = 35.0, value_parser = non_negative)]
     pub shadow_tolerance: f64,
+
+    /// 切り抜いたアルファから落ち影を合成する（既定 off）。実写の影を消す --shadow-tolerance とは逆で、こちらは足す
+    ///
+    /// ヘルプの本文は `shadow_long_help` に置く。px@1000 の基準と合成順は、
+    /// 指定の前に知っていないと出来上がりを予想できない
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = ShadowMode::Off,
+        long_help = shadow_long_help()
+    )]
+    pub shadow: ShadowMode,
+
+    /// 影をずらす量 dx,dy(px、長辺 1000px 換算)。負値は上・左へ。--shadow synth のときだけ効く
+    #[arg(
+        long,
+        value_parser = parse_offset,
+        default_value = "0,12",
+        allow_hyphen_values = true
+    )]
+    pub shadow_offset: [f64; 2],
+
+    /// 影のぼかしの σ(px、長辺 1000px 換算)。0 でぼかさない（上限 1000）。--shadow synth のときだけ効く
+    #[arg(long, default_value_t = 10.0, value_parser = shadow_blur_px)]
+    pub shadow_blur: f64,
+
+    /// 影の色 (例 #000000)。--shadow synth のときだけ効く
+    #[arg(long, value_parser = parse_hex_color, default_value = "#000000")]
+    pub shadow_color: [u8; 3],
+
+    /// 影の不透明度 (0.0-1.0)。--shadow synth のときだけ効く
+    #[arg(long, default_value_t = 0.25, value_parser = unit_interval)]
+    pub shadow_opacity: f64,
 
     /// 幅 2N px 以下の隙間を通ってしか外周につながらない背景を前景へ戻す。0 で無効
     ///
@@ -707,6 +850,24 @@ pub struct CutoutArgs {
     /// 淡い色の商品で新方式が不安定なときの逃げ道
     #[arg(long)]
     pub no_refine: bool,
+
+    /// tolerance / bbox / background-model の組を kiri 自身が総当たりして指標で選ぶ（既定 off）
+    ///
+    /// ヘルプの本文は `optimize_long_help` が定数から組む。試す数と時間は
+    /// 指定の前に知っていないと選びようがない
+    #[arg(long, long_help = optimize_long_help())]
+    pub optimize: bool,
+
+    /// 利用者が明示した軸。**引数ではない**——`main.rs` が clap の
+    /// `ValueSource` を見て埋める。
+    ///
+    /// `--tolerance` は `default_value_t` を持つので、値だけでは「12 を明示した」と
+    /// 「既定のまま」を区別できない。既定値を `Option` にして区別する手もあるが、
+    /// それをやると `kiri schema` の `default` から 12 が消え、**指定しなくても
+    /// 何が効くのかをエージェントが読めなくなる**。表示は変えずに、明示したか
+    /// どうかだけを別経路で運ぶ
+    #[arg(skip)]
+    pub fixed: OptimizeFixed,
 
     /// 切り抜いた商品を指定サイズのキャンバス中央に配置する
     ///
@@ -815,6 +976,20 @@ pub fn parse_bbox(s: &str) -> Result<[f64; 4], String> {
 pub fn parse_point(s: &str) -> Result<[f64; 2], String> {
     let v = parse_numbers(s, 2)?;
     Ok([v[0], v[1]])
+}
+
+/// `dx,dy` を受け付ける。**負値を許す**点だけが `parse_point` と違う。
+///
+/// 座標は画像の中を指すので負値は取り違えでしかないが、ずらし量は影を上や
+/// 左へ出す正当な指定になる。同じ関数で両方を受けると、どちらかの関門が緩む。
+pub fn parse_offset(s: &str) -> Result<[f64; 2], String> {
+    let parts: Vec<&str> = s.split(',').map(str::trim).collect();
+    if parts.len() != 2 {
+        return Err(format!(
+            "'{s}' はカンマ区切りの数値 2 個である必要があります"
+        ));
+    }
+    Ok([finite(parts[0])?, finite(parts[1])?])
 }
 
 fn parse_numbers(s: &str, expected: usize) -> Result<Vec<f64>, String> {

@@ -77,6 +77,8 @@ warning_catalog! {
         => "指示の画像が EXIF Orientation を持つが、マスクは生の画素として読むので適用していない",
     ConstraintEmpty = "CONSTRAINT_EMPTY"
         => "渡した空間的な指示が 1 画素も塗らなかった（空のマスク、画像の外だけを指す多角形）",
+    OptimizeNoCleanCandidate = "OPTIMIZE_NO_CLEAN_CANDIDATE"
+        => "--optimize が候補をすべて試しても致命的な警告が残った（調整では解けない）",
     SegmentUncertain = "SEGMENT_UNCERTAIN"
         => "モデルが対象を掴めておらず、不明の帯が広すぎる（結果は --segment off に近づく）",
     CanvasUpscaled = "CANVAS_UPSCALED"

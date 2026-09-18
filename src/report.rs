@@ -362,6 +362,40 @@ pub struct MaskReport {
     pub debug_mask: Option<String>,
 }
 
+/// 合成した落ち影が実際にどう効いたか。
+///
+/// **`--shadow synth` のときだけ出る**（`constraints` / `segment` と同じ規約）。
+/// `--shadow off` でキーごと消すのは、`null` を出すと「合成したが影が残らなかった」
+/// と読めてしまうためである。頼んだかどうかは `settings.shadow` が常に言う。
+///
+/// 数値はすべて**実際に効いた実寸の px**。指定は長辺 1000px 換算なので、
+/// そのままでは「この画像で何 px ずらしたか」を語らない（`smooth_radius_px`
+/// と同じ理由）。
+#[derive(Debug, Serialize)]
+pub struct ShadowReport {
+    /// 実際にずらした量 [dx, dy]
+    pub offset: [i32; 2],
+    /// 実際に掛けたぼかしの σ
+    pub blur: f64,
+    pub opacity: f64,
+    /// `#RRGGBB`
+    pub color: String,
+    /// 影のアルファが 0 より大きい画素の外接矩形 [x1, y1, x2, y2]。
+    /// 1 画素も無ければ null
+    pub bounds: Option<[u32; 4]>,
+    /// 影の一部が画像（またはキャンバス）の外にあるか。
+    ///
+    /// **最終の影のアルファで決める。** ずらしただけで外へ落ちた画素があるか、
+    /// 外周の 1 列・1 行に影が残っている（= その先へ続いていた）ときに真。
+    ///
+    /// **`bounds` が null でも真になりうる。** ずらし量が画像より大きければ
+    /// 影は 1 画素も残らないが、それは「影を置かなかった」のではなく
+    /// 「全部はみ出した」である。2 つを 1 つのキーに畳むと、指定が効かなかった
+    /// 理由を追う手段が無くなる。`--shadow-opacity 0` は影を置かない指定
+    /// なので必ず偽になる
+    pub clipped: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CanvasReport {
     pub width: u32,
@@ -422,11 +456,91 @@ pub struct SettingsReport {
     /// 粗さぶんだけ持ち上がる。`--no-refine` では帯そのものが無いので現れない
     #[serde(skip_serializing_if = "Option::is_none")]
     pub band_min_radius: Option<u32>,
+    /// `--optimize` を渡したか。**常に出す。**
+    ///
+    /// 出したのは、この 1 行が上の `tolerance` / `background_model` /
+    /// `applied_bbox` の出所を変えるからである。true なら 3 つとも kiri が
+    /// 探索して選んだ値で、何を試したかは `optimize.candidates[]` にある
+    pub optimize: bool,
+    /// 落ち影を合成したか（"off" / "synth"）。**常に出す。**
+    /// 実際に効いたずらし量とぼかしは `shadow` ブロックのほう
+    pub shadow: &'static str,
     /// `--segment` の**指定値**（"off" / "auto" / "isnet"）
     pub segment: &'static str,
     /// 実際にモデルが走ったか。**`auto` では指定値から読めない**——
     /// 色で解けると判断すれば走らない。`off` なら必ず false
     pub segment_ran: bool,
+}
+
+/// `--optimize` が何を試し、どう選んだか。**走ったときだけ出る。**
+///
+/// **選ばれなかった候補も見せる。** エージェントが「2 位のほうが自分の目的に
+/// 合う」と判断して明示指定へ切り替えられるようにするためで、そのときは
+/// `candidates[]` の値をそのまま `--tolerance` / `--bbox` / `--background-model`
+/// へ写せばよい。
+#[derive(Debug, Serialize)]
+pub struct OptimizeReport {
+    /// 探索段で使った長辺(px)。元がこれより小さければ元の長辺
+    pub searched_at: u32,
+    /// 全候補。**並びは探索段（縮小版）の順位のまま**である。原寸でも回した
+    /// 候補は `stage` が `"final"` になり、数値は原寸のもので上書きしてある
+    pub candidates: Vec<OptimizeCandidate>,
+    /// 選ばれた候補。`candidates[]` の中の 1 つと同じ内容
+    pub chosen: OptimizeCandidate,
+    /// 探索そのものに掛かった時間。結果全体の `elapsed_ms` の内数
+    pub elapsed_ms: u128,
+}
+
+/// 1 候補の設定と、その設定で得られた指標。
+#[derive(Debug, Clone, Serialize)]
+pub struct OptimizeCandidate {
+    pub tolerance: f64,
+    /// **原寸の画素座標**。`stage` に関わらず原寸で表す（縮小版の座標を出しても
+    /// `--bbox` へ写せない）。矩形を使わない候補は null
+    pub bbox: Option<[u32; 4]>,
+    /// `--background-model` の**要求値**（"auto" / "flat"）。`auto` が何を選んだかは、
+    /// 選ばれた候補については `settings.background_model` が効いた値で答える
+    pub background_model: &'static str,
+    /// どの寸法で回したか（"search" = 縮小版だけ / "final" = 原寸でも回した）
+    pub stage: &'static str,
+    pub foreground_ratio: f64,
+    pub touches_edge: bool,
+    pub separability: Option<f64>,
+    pub halo_ratio: Option<f64>,
+    pub contour_roughness: Option<f64>,
+    pub rim_contamination: Option<f64>,
+    /// 出た警告の code だけ。文言は `warnings` の側にある
+    pub warnings: Vec<String>,
+    /// 同じ列（同じ bbox・同じモデル）で許容量を 1 段上げたときに、前景比率が
+    /// 3 割を超えて落ちた候補か。**警告 code は持たない。**
+    ///
+    /// 商品ごと背景として飲まれた結果は、縁の残りと汚染が減った**良い数値**として
+    /// 現れる。順位の上ではこれを致命的な警告 1 つと同じ重さで扱うが、
+    /// `score.fatal`（出た警告の数）には足さない
+    pub collapsed: bool,
+    pub score: OptimizeScore,
+    pub chosen: bool,
+}
+
+/// 候補の指標を順位の形へ畳んだ 4 つの値。
+///
+/// **2 つの段は別の並べ方をする。** 最終段（原寸）は `fatal + collapsed` →
+/// `unmeasured` → `quality` → `separability` の辞書式だが、探索段（縮小・
+/// `refine` 抜き）は `refine` に依らない量だけを見る——`NOT_SEPARABLE` /
+/// `FOREGROUND_TOO_SMALL` / `FOREGROUND_TOO_LARGE` の数 + `collapsed` →
+/// `separability` の順である。`stage` が `search` の候補で `quality` を
+/// 読むときは、その数がその候補の順位に効いていないことに注意する。
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct OptimizeScore {
+    /// 出た致命的な警告の数。少ないほど良い
+    pub fatal: usize,
+    /// 測れなかった診断値の数（0-3）。少ないほど良い
+    pub unmeasured: usize,
+    /// 品質の重み和（縁の残り・輪郭の粗さ・縁の汚染を警告しきい値で割った和）。
+    /// 小さいほど良い
+    pub quality: f64,
+    /// 境界の色差。大きいほど良い。測れなければ 0
+    pub separability: f64,
 }
 
 /// 空間的な指示（トライマップ・マスク画像・多角形・種）が何を占めたか。
@@ -493,9 +607,15 @@ pub struct CutoutReport {
     /// モデルが走ったときだけ出る。`--segment off`（既定）ではキーごと無い
     #[serde(skip_serializing_if = "Option::is_none")]
     pub segment: Option<SegmentReport>,
+    /// 探索が走ったときだけ出る。`--optimize` 無しではキーごと無い
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub optimize: Option<OptimizeReport>,
     pub mask: MaskReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canvas: Option<CanvasReport>,
+    /// 落ち影を合成したときだけ出る。`--shadow off`（既定）ではキーごと無い
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow: Option<ShadowReport>,
     /// --preview で書き出した検証用画像のパス
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,

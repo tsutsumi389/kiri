@@ -25,6 +25,7 @@ pub mod integral;
 pub mod local_colour;
 pub mod mask;
 pub mod morphology;
+pub mod optimize;
 pub mod refine;
 pub mod reshape;
 pub mod subject;
@@ -42,6 +43,7 @@ pub use diagnostics::Diagnostics;
 pub use edges::GradientQuantiles;
 pub use floodfill::{FG_SEED_RADIUS, FloodOptions, foreground_mask};
 pub use mask::{Mask, MaskStats};
+pub use optimize::{OptimizeFixed, Optimized};
 pub use refine::{DEFAULT_SMOOTH_CONTOUR, Matting, RefineOptions};
 pub use subject::{
     Confidence, LowReason, SubjectHint, detect_subject, detect_subject_from_probability,
@@ -838,6 +840,33 @@ fn apply_alpha(image: &mut RgbaImage, mask: &Mask) {
             pixel[3] = pixel[3].min(mask.get(x, y));
         }
     }
+}
+
+/// 画素座標で表された矩形を、画像の中に収まる整数の矩形へ落とす。
+///
+/// **丸めの規約を 1 箇所に持つ。** 始点は切り捨て、終点は切り上げ、終点だけを
+/// 画像の内側へ詰める。外側へ丸めるのは、bbox の外が色によらず背景と確定される
+/// からで、内側へ丸めた 1px はそのまま商品の欠けになる。
+///
+/// 利用者の入力を受ける `commands::cutout::resolve_bbox` と、`--optimize` が
+/// 候補の矩形を寸法ごとに解き直す `optimize::CandidateBbox` が同じ式を使う。
+/// 片方だけ丸めが違うと、**同じ矩形を指定したのに `--optimize` の候補表と
+/// `applied_bbox` が食い違う**。
+///
+/// 寸法 0 の画像は呼び出し側が先に断る（読み込みが `EMPTY_IMAGE` で落とす）が、
+/// 公開関数なので `saturating_sub` で受ける。0 で panic するかラップするかが
+/// build の種類で変わるのは、公開 API の振る舞いとして最悪である。
+pub fn bbox_to_pixels(scaled: [f64; 4], width: u32, height: u32) -> (u32, u32, u32, u32) {
+    let x1 = scaled[0].floor().max(0.0) as u32;
+    let y1 = scaled[1].floor().max(0.0) as u32;
+    // 終点は画像内に収める。x1 より小さくならないよう下限も押さえる
+    let x2 = (scaled[2].ceil() as u32)
+        .min(width.saturating_sub(1))
+        .max(x1);
+    let y2 = (scaled[3].ceil() as u32)
+        .min(height.saturating_sub(1))
+        .max(y1);
+    (x1, y1, x2, y2)
 }
 
 /// 正規化 bbox を `--bbox` にそのまま貼れる文字列にする。

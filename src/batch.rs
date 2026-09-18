@@ -58,11 +58,24 @@ pub struct ItemSettings {
     pub reclassify: Option<bool>,
     /// 背景のモデル（"auto" / "flat" / "field"）
     pub background_model: Option<String>,
+    /// 探索を kiri に任せるか。**書いた設定はその値に固定される**——
+    /// tolerance を書いた項目では tolerance を探索しない（CLI で
+    /// `--tolerance` を明示したときと同じ規約）
+    pub optimize: Option<bool>,
     /// 埋め込み ICC を sRGB へ変換するか（既定 true）
     pub color_convert: Option<bool>,
     pub edge_threshold: Option<f64>,
     pub step_tolerance: Option<f64>,
+    /// 実写に写っている影を**消す**側の許容量。足す側は `shadow` から下の 5 つ
     pub shadow_tolerance: Option<f64>,
+    /// 落ち影を合成するか（"off" / "synth"）
+    pub shadow: Option<String>,
+    /// 影をずらす量 `[dx, dy]`(px、長辺 1000px 換算)
+    pub shadow_offset: Option<[f64; 2]>,
+    pub shadow_blur: Option<f64>,
+    /// 影の色（"#RRGGBB"）
+    pub shadow_color: Option<String>,
+    pub shadow_opacity: Option<f64>,
     pub seal: Option<u32>,
     pub canvas: Option<String>,
     pub fill_ratio: Option<f64>,
@@ -102,10 +115,16 @@ impl ItemSettings {
             smooth_contour,
             reclassify,
             background_model,
+            optimize,
             color_convert,
             edge_threshold,
             step_tolerance,
             shadow_tolerance,
+            shadow,
+            shadow_offset,
+            shadow_blur,
+            shadow_color,
+            shadow_opacity,
             seal,
             canvas,
             fill_ratio,
@@ -138,10 +157,16 @@ const SETTING_KEYS: &[&str] = &[
     "smooth_contour",
     "reclassify",
     "background_model",
+    "optimize",
     "color_convert",
     "edge_threshold",
     "step_tolerance",
     "shadow_tolerance",
+    "shadow",
+    "shadow_offset",
+    "shadow_blur",
+    "shadow_color",
+    "shadow_opacity",
     "seal",
     "canvas",
     "fill_ratio",

@@ -150,6 +150,18 @@ pub enum BackgroundModel {
 }
 
 impl BackgroundModel {
+    /// `--background-model` の綴り。**要求値であって効いた値ではない。**
+    ///
+    /// 効いた値は `ResolvedModel::as_str` が返す。同じ名前にしてあるのは、
+    /// 呼び出し側が「今どちらを手に持っているか」で選べば正しくなるからである。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BackgroundModel::Auto => "auto",
+            BackgroundModel::Flat => "flat",
+            BackgroundModel::Field => "field",
+        }
+    }
+
     /// 実際に効くモデルを決める。`Auto` だけが背景の均一度を見る。
     pub fn resolve(self, background: &BackgroundEstimate) -> ResolvedModel {
         match self {

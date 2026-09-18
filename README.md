@@ -635,7 +635,12 @@ product.png  1600x2000  png  841.4 KB  (338 ms)
 | `--background-model` | auto | 背景を 1 色で持つか照明場 B(x, y) として持つか。`auto` / `flat` / `field`。`auto` は `background.uniformity` が 0.90 を下回るときだけ `field` を使う |
 | `--edge-threshold` | 8（自動調整あり） | 輪郭でフィルを止める勾配のしきい値。0 で無効。未指定なら、外周の勾配 p50 が 8 以上のときに p90 の 1.5 倍まで自動で引き上がる |
 | `--step-tolerance` | 2.2 | 背景を広げる際に 1px あたりに許す色差(ΔE)。0 で 2 段階フィルを無効化 |
-| `--shadow-tolerance` | 35 | 落ち影として消す明度(L\*)の落ち込みの上限。0 で影を残す |
+| `--shadow-tolerance` | 35 | 実写の落ち影を**消す**明度(L\*)の落ち込みの上限。0 で影を残す |
+| `--shadow` | off | 切り抜いたアルファから落ち影を**合成する**。`off` / `synth`（[落ち影を合成する](#落ち影を合成する)） |
+| `--shadow-offset dx,dy` | 0,12 | 影をずらす量(px)。**長辺 1000px 換算**（基準は最終画像の長辺）。負値は上・左へ |
+| `--shadow-blur` | 10 | 影のぼかしの σ(px)。**長辺 1000px 換算**。0 でぼかさない、上限 1000 |
+| `--shadow-color` | #000000 | 影の色 |
+| `--shadow-opacity` | 0.25 | 影の不透明度 (0.0-1.0) |
 | `--seal` | 1 | 幅 2N px 以下の隙間を通ってしか外周につながらない背景を前景へ戻す。0 で無効、上限 8 |
 | `--cleanup` | 2 | 孤立ノイズ除去の半径(px)。**長辺 1000px 換算**で指定し、面積 (2n+1)² × (長辺/1000)² 未満の連結成分を消す。0 で無効、上限 64 |
 | `--feather` | 1 | 境界の階調を色から決められなかった箇所で使うフェザリング半径(px) |
@@ -644,6 +649,7 @@ product.png  1600x2000  png  841.4 KB  (338 ms)
 | `--no-reclassify` | | 帯の中の二値画素を局所の前景色・背景色で塗り直さない |
 | `--no-refine` | | 境界のアルファを色から推定し直さず、マスクの形から作る旧方式に戻す |
 | `--no-despill` | | 境界画素から背景色の寄与を取り除かない |
+| `--optimize` | | `tolerance` / `bbox` / `background-model` の組を総当たりし、指標で選ぶ（[探索を kiri に任せる](#探索を-kiri-に任せるoptimize)） |
 | `--canvas WxH` | — | 商品をこのサイズのキャンバス中央に配置する。`1000` と書けば正方形 |
 | `--fill-ratio` | 0.85 | 商品がキャンバスの何割を占めるか |
 | `--flatten` | | 透過を残さず `--background` の色で塗り潰す |
@@ -910,6 +916,9 @@ field` を明示していてもである（**効いた値だけを報告する**
 **背景より明るい映り込みは対象外。** グレー背景での光沢や反射は明度が上がる方向に出るが、
 それを影と同じ規則で飲み込むと白背景の白い商品のハイライトまで消えてしまう。
 明るい映り込みを消したい場合は `--bbox` で範囲を切る。
+
+消した影の代わりが要るときは、切り抜いたアルファから影を作り直せる
+（「[落ち影を合成する](#落ち影を合成する)」）。
 
 #### 境界は matting として解く（形ではなく色から決める）
 
@@ -1391,6 +1400,195 @@ tolerance を上げるだけで済んだぶんが混ざる。
 掴めていない状態で、結果は `--segment off` に近づく。同じモデルを回し直しても
 変わらないので、**`--trimap` や `--bg-polygon` で直接教えるほうが早い**。
 
+#### 探索を kiri に任せる（`--optimize`）
+
+ここまでのオプションは、どれも「どの値が良いか」をエージェントに決めさせている。
+実写 1 枚を切るには `info` で主体を見て、`cutout --bbox` で矩形を与えて、
+`HALO_REMAINS` の hint に従って `--tolerance` を上げる——**最低 3 往復**かかる。
+
+kiri は決定的で 1 回が数秒なので、**その 3 手を kiri の中へ畳める**。
+`--optimize` は候補を総当たりして指標で選び、AI には決定の記録だけを渡す。
+
+```
+$ kiri cutout remote.jpg -o out.png --optimize
+out.png  4284x5712  png  41.6 MB  (13256 ms)
+  色空間    Display P3 → sRGB に変換
+  背景色    #B2AEA7  (均一度 0.20, tolerance 45)
+  外周ΔE    p50 11.9  p90 26.8  max 60.5
+  場の残差  p50 5.5  p90 15.6  max 61.3  (場の振れ幅 ΔE 0.1〜21.5)
+  外周勾配  p50 11.3  p90 27.9
+  探索      20 候補を 1500px で試し、原寸で 2 回  (12953 ms)
+  採用      tolerance 45  bbox 0,2022 - 4213,3828  background-model field（要求 auto）  (致命 0 / 品質 4.95)
+  前景比率  20.4%
+  境界色差  ΔE 53.8  (tolerance 45)
+  輪郭粗さ  0.25 px  (1000px 換算, 警告 0.16 超)
+  縁の汚染  6.1%  (警告 2.0% 超)
+  前景範囲  89,2080 - 4168,3389
+  主体候補  0,0.354,0.9834,0.662  (面積 23.4%, 信頼度 high, colour 由来)
+```
+
+候補の一覧はテキストには出さない（20 行になる）。比べたいときは `--json` を読む。
+`採用` の行の `field（要求 auto）` は、`auto` を試した候補が**実際には照明場を
+選んだ**という意味である（一致していれば片方だけ出る)。
+
+| オプション | 既定値 | 説明 |
+|---|---|---|
+| `--optimize` | off | `tolerance` / `bbox` / `background-model` の組を総当たりし、指標で選ぶ |
+
+##### 何を試すか
+
+| 軸 | 候補 | 1 通りに畳まれる条件 |
+|---|---|---|
+| `bbox` | 無し / `subject.normalized_bbox` | `--bbox` を明示した／主体の信頼度が `low` |
+| `tolerance` | 12 / 20 / 30 / 45 / 60 | `--tolerance` を明示した |
+| `background-model` | `auto` / `flat` | `--background-model` を明示した／`auto` が `flat` を選んだ |
+
+最大 2 × 5 × 2 = 20 通り。**明示した値は探索しない。**
+`--tolerance 30 --optimize` は「30 に固定して残りの軸を探す」の意味になる。
+`--cleanup` や `--feather`、`--trimap` などの他の指定は全候補へ同じものを渡す。
+
+##### どう選ぶか
+
+**2 つの段で物差しが違う。** 探索段は縮小版を境界処理（`refine`）抜きで回すので、
+そこで測れる量が限られている。
+
+原寸で回した候補（`stage: "final"`）は辞書式に上から比べる。
+
+1. 致命的な警告の数（`NOT_SEPARABLE` / `FOREGROUND_TOO_SMALL` /
+   `FOREGROUND_TOO_LARGE` / `SUBJECT_TOUCHES_EDGE` / `BBOX_RECOMMENDED`）+ 崩れ。少ないほど良い
+2. **測れなかった診断値の数**（`halo_ratio` / `contour_roughness` /
+   `rim_contamination` のうち `null` の個数、0-3）。少ないほど良い
+3. 品質の重み和（同じ 3 つを、それぞれの警告しきい値で割った和）。
+   **3.0 が「3 つとも警告ちょうど」**にあたる
+4. `separability`（大きいほど良い）
+5. 同点なら小さい `tolerance`、次に bbox 無し、次に `auto`
+
+縮小版で回した候補（`stage: "search"`）は次の順に並ぶ。
+
+1. `NOT_SEPARABLE` / `FOREGROUND_TOO_SMALL` / `FOREGROUND_TOO_LARGE` の数 + 崩れ
+2. `separability`（大きいほど良い。測れなければ最下位）
+3. 同点の決め方は同じ
+
+**縮小版の `halo_ratio` / `contour_roughness` / `rim_contamination` /
+`touches_edge` は順位に使っていない。** 境界処理を抜くと縁に背景が残るので、
+実測で縁の汚染は 4〜6 倍、輪郭の粗さは 3〜5 倍に膨らみ、しかも倍率が候補ごとに
+違う（寸法の換算では戻せない）。外周接触も同じ理由で縮小版にだけ出る。
+`separability` だけは境界の内側を元画像の色で測るので、縮小版と原寸で 1% 以内に
+一致する。候補表にはどちらの数値も出るが、**`search` の行の数値は参考値である。**
+
+加えて、**前景比率が 3 割を超えて落ちた候補**は「商品を飲んだ」とみなし、
+順位の上で致命的な警告 1 つと同じ重さを負わせる。淡い色の商品では、商品ごと
+飲まれた結果が「縁の残りが減った」という良い数値として現れるためである。
+比べる相手は段で違い、縮小版では同じ `bbox`・同じ `background-model` の列の
+1 段前と、原寸では**その候補自身の縮小版の前景比率**と比べる。これは候補ごとに
+`collapsed` として出る。**`score.fatal` には足さない**——あちらは出た警告の数である。
+
+##### どう見せるか
+
+`--json` を付けると `optimize` ブロックが増える（付けなければキーごと現れない）。
+
+```json
+"optimize": {
+  "searched_at": 1500,
+  "candidates": [
+    { "tolerance": 60, "bbox": [0, 2022, 4213, 3828], "background_model": "auto",
+      "stage": "final", "foreground_ratio": 0.0664, "touches_edge": false,
+      "separability": 48.7848, "halo_ratio": 0.0581,
+      "contour_roughness": 0.8123, "rim_contamination": null,
+      "warnings": ["EDGE_THRESHOLD_RAISED", "BACKGROUND_FIELD_USED",
+                   "LOW_UNIFORMITY", "CONTOUR_ROUGH"],
+      "collapsed": true,
+      "score": { "fatal": 0, "unmeasured": 1, "quality": 6.6577,
+                 "separability": 48.7848 },
+      "chosen": false },
+    { "tolerance": 45, "bbox": [0, 2022, 4213, 3828], "background_model": "auto",
+      "stage": "final", "foreground_ratio": 0.2037, "touches_edge": false,
+      "separability": 53.8151, "halo_ratio": 0.0295,
+      "contour_roughness": 0.2541, "rim_contamination": 0.0613,
+      "warnings": ["EDGE_THRESHOLD_RAISED", "BACKGROUND_FIELD_USED",
+                   "LOW_UNIFORMITY", "CONTOUR_ROUGH", "RIM_CONTAMINATED"],
+      "collapsed": false,
+      "score": { "fatal": 0, "unmeasured": 0, "quality": 4.9493,
+                 "separability": 53.8151 },
+      "chosen": true }
+  ],
+  "chosen": { "...": "同じ形" },
+  "elapsed_ms": 13682
+}
+```
+
+- `candidates[]` の並びは**探索段（縮小版）の順位**のまま。原寸でも回した候補は
+  `stage` が `"final"` になり、指標は原寸の値で上書きされる
+- `bbox` は `stage` に関わらず**原寸の画素座標**。そのまま `--bbox` へ写せる
+- `settings.tolerance` / `settings.background_model` / `applied_bbox` は選ばれた
+  候補の値になる。`settings.optimize` は**常に**出る（この 1 行が 3 つの出所を変える）
+
+上の例では 1 位（`tolerance 60`）が `collapsed: true` で、原寸で回したら
+前景比率が縮小版の 0.2049 から 0.0664 へ落ちている——商品の 3 分の 2 が背景と
+して飲まれた。警告は 1 つも増えず、`halo_ratio` はむしろ下がるので、
+**この 1 行が無ければ「1 位のほうが良さそう」と読める。**
+`rim_contamination` が `null` になっているのも同じ崩れの現れで（測る境界が
+残っていない）、`score.unmeasured` がそれを数えている。
+
+**選ばれなかった候補も見せるのは、2 位のほうが目的に合うことがあるため**である。
+候補の値はそのまま `--tolerance` / `--bbox` / `--background-model` へ貼れる
+形で並んでいる。
+
+##### どの候補も駄目だったとき
+
+選ばれた候補にも致命的な警告が残ったら `OPTIMIZE_NO_CLEAN_CANDIDATE` が出る。
+`data.remaining` に残った code が入り、hint は撮り直しか `--segment isnet` を
+案内する。**20 通り試して駄目だったという事実そのものが情報で**、そこから先に
+パラメータ調整の余地は無い。
+
+暗い机の上の黒いキーボード（色では分離できない既知の限界）がこれで、
+どの候補にも `SUBJECT_TOUCHES_EDGE` が残る。
+
+**`BBOX_RECOMMENDED` しか残らなかったときは出ない。** あちらは「この矩形を
+渡せ」と矩形つきで次の一手を言っているので、そこへ「撮り直してください」を
+重ねると指示が 2 つ並ぶ。`score.fatal` は順位のために 5 つを数えるが、
+この警告が数えるのは残り 4 つである（`score.fatal > 0` でも警告が出ないことが
+ある、ということでもある）。
+
+##### 所要時間
+
+長辺 1500px へ縮めた画像で全候補を境界処理抜きに回し、上位 2 つだけを原寸で
+回す。致命的な警告も品質の警告も出ない候補に当たった時点で打ち切るので、
+きれいな素材では原寸は 1 回で済む。
+
+| 素材 | 候補 | 原寸で回した数 | 時間 | ピーク RSS |
+|---|---|---|---|---|
+| 実写リモコン 4284x5712（24.5MP、不織布） | 20 | 2 | 13.7 秒 | 873MB |
+| 実写キーボード 3024x4032（12MP、暗い机） | 10 | 2 | 9.2 秒 | 479MB |
+
+目安は「3 手ループ 1 往復ぶん（数秒 × 3 + エージェントの往復）」と同じくらいで、
+**往復が無いぶん確実に速い**。
+
+**メモリは増えない。** 同じリモコンを `--optimize` 無しで切ると 892MB、探索が
+選んだ設定を明示して切ると 809MB で、`--optimize`（873MB）はそのあいだにある
+——原寸を回す回数は同じで、探索段が抱えるのは長辺 1500px の画像 1 枚と候補
+20 件ぶんの指標だけだからである（候補の画像はその場で捨てる）。`batch` の
+`--jobs` を `optimize: true` のために落とす必要は無い。
+
+##### 3 手ループとの比較（実写リモコン、24.5MP）
+
+| | 回数 | 時間 | fg | halo | 境界色差 | 輪郭粗さ |
+|---|---|---|---|---|---|---|
+| 既定値のまま | 1 | 7.9 秒 | 0.2492 | 0.1264 | 19.6 | 1.239 |
+| 手で決めた最良（`--bbox` + `--tolerance 60 --background-model flat`） | 3 + 往復 | 3.0 秒 | 0.2037 | 0.0296 | **56.6** | **0.245** |
+| **`--optimize`** | **1** | **13.7 秒** | **0.2037** | **0.0295** | 53.8 | 0.254 |
+
+**時間を 5 倍払って、手で詰めた最良と同等の絵に届く。** 境界色差 53.8 対 56.6、
+輪郭粗さ 0.254 対 0.245 の差はあるが、どちらも目で見て区別が付く差ではない。
+
+払っているのは速さではなく、**その 3 手を人（やエージェント）が打たなくて
+よいことと、決定の記録が JSON に残ること**である。加えて、手で決めた設定は
+アルゴリズムが変わった瞬間に古くなる——照明場と matting が入る前の「最良」
+（`--tolerance 60` を `auto` の上で使う）は、今では商品を 3 分の 2 まで飲む
+（前景比率 0.0664）。**探索は毎回引き直す。**
+
+`--dry-run` と併用できる。`batch` の spec では `"optimize": true` と書く。
+
 #### EC向けの整形
 
 切り抜きからキャンバス配置、形式変換までを1コマンドで完結できる。
@@ -1416,6 +1614,96 @@ $ kiri cutout product.jpg -o product.jpg --canvas 1000 --flatten --background "#
 キャンバス配置での拡大は禁止しない（`resize` とは異なる）。キャンバスサイズの指定は
 「この枠に収めたい」という要求であり、そのための拡縮は結果であって要求ではないため。
 ただし拡大した場合は倍率を添えて警告する。
+
+#### 落ち影を合成する
+
+`--shadow synth`。EC の納品先は「影なしの純白」と「自然な落ち影つき」の**両方**を
+求める。kiri は実写の落ち影を背景として消す側に倒してある（上の「落ち影の扱い」）ので、
+影つきが要るときは**切り抜いたアルファから影を作り直す**。
+
+```
+$ kiri cutout product.jpg -o product.png --canvas 1000 --shadow synth
+```
+
+撮影時の影をそのまま残すのではなく合成にするのは、**商品ごとに影の向きと濃さが
+揃う**ためである。撮り分けた素材を並べたときに影だけがばらつくのは、
+`--fill-ratio` で占有率を揃える理由とまったく同じ問題になる。
+
+##### 影の姿を決める 4 つのノブ（と、それを使うかどうかの 1 つ）
+
+| オプション | 既定 | 意味 |
+|---|---|---|
+| `--shadow` | `off` | `synth` で合成する。`off` なら成果物は 1 バイトも変わらない |
+| `--shadow-offset dx,dy` | `0,12` | 影をずらす量(px、長辺 1000px 換算)。負値は上・左へ |
+| `--shadow-blur σ` | `10` | ぼかしの σ(px、長辺 1000px 換算)。0 でぼかさない、上限 1000 |
+| `--shadow-color` | `#000000` | 影の色 |
+| `--shadow-opacity` | `0.25` | 影の不透明度 (0.0-1.0) |
+
+`--shadow-offset` と `--shadow-blur` は**長辺 1000px 換算**で指定する。基準は
+**最終画像の長辺**で、`--canvas` があればキャンバスの長辺、無ければ元画像の長辺に
+なる。素材の解像度がばらついていても同じ指定で同じ見た目になり、24.5MP
+（4284x5712）の素材に既定値を渡せば実際には 69px ずれて σ 57px でぼける。
+**実際に効いた px は結果に出る**ので、換算を自分で追う必要はない。
+
+`--shadow-tolerance`（実写の影を**消す**側）と名前が並ぶが、向きは逆である。
+両方を既定のまま使うと「写っていた影を消してから、揃った影を合成し直す」に
+なる。撮影時の影をそのまま活かしたいなら `--shadow-tolerance 0 --shadow off` で、
+どちらも触らない。
+
+##### 重なる順序
+
+下地 → 影 → 商品。`--canvas` の配置（`fill_ratio` / `content` / `offset` /
+`scale`）は**影の有無で変わらない**——影のぶん商品を小さくはしない。影がキャンバスから
+はみ出すなら切り、切ったことを `shadow.clipped` が言う。
+
+透過を保てる形式（PNG / AVIF）では影も半透明のアルファとして残る。`--flatten` や
+JPEG 出力では下地の上に焼き込まれる。
+
+**商品の層は 1 画素も変わらない。** 影のアルファが 0 の画素と、商品のアルファが 255 の
+画素は、`--shadow off` の出力とビット一致する。`mask` ブロックの統計と診断値も影を
+足す**前**の商品だけで測るので、影を足したせいで数値が動くことはない。
+
+##### 結果
+
+```json
+{
+  "settings": { "shadow": "synth" },
+  "shadow": {
+    "offset": [0, 69],
+    "blur": 57.1664,
+    "opacity": 0.25,
+    "color": "#000000",
+    "bounds": [31, 2063, 4283, 3522],
+    "clipped": true
+  }
+}
+```
+
+`shadow` ブロックは **`synth` のときだけ**現れる（`constraints` と同じ規約）。
+頼んだかどうかは `settings.shadow` が常に言う。
+
+`offset` と `blur` は**実際に効いた実寸の px** である。`blur` は要求した σ ではなく
+**箱型の幅が実現する σ** で、上の例では px@1000 の 10 が 57.12 へ換算され、幅
+`[113, 115, 115]` が実現する 57.1664 として返っている。σ が小さすぎて幅が 3 回とも
+1（恒等）に落ちるときは `0.0`——ぼかしていないのに σ を名乗ることはない。
+
+`bounds` は影が占めた矩形、`clipped` は**影の一部が画像の外にある**ことを表す。
+上の例で真なのは、リモコンが画像の幅いっぱいに写っていて影が左右の縁に達している
+ため（`bounds` の x が 31〜4283 で、画像の幅は 4284）。判定は最終の影のアルファで
+行うので、ぼかしの裾が丸めで消えていれば真にはならない。
+
+**`bounds` が `null` でも `clipped` は真になりうる。** ずらし量が画像より大きければ
+影は 1 画素も残らないが、それは「影を置かなかった」のではなく「全部はみ出した」で
+ある。`--shadow-opacity 0`（影を置かない指定）なら必ず偽になるので、2 つは
+`clipped` で見分けられる。
+
+ぼかしは箱型フィルタ 3 回でガウスを近似している（design.md 4.14）。移動和なので
+**σ をいくつ上げてもほとんど遅くならない**。24.5MP で合成そのものは σ 57px が
+159ms、σ 228px でも 167ms（切り抜き全体は 5.0 秒なので、`--shadow off` との差は
+実行ごとのばらつきに埋もれる）。
+
+`batch` の spec では `shadow` / `shadow_offset`（`[dx, dy]`）/ `shadow_blur` /
+`shadow_color` / `shadow_opacity` が同じ意味で使える。
 
 #### 結果の検証
 
@@ -1445,7 +1733,7 @@ $ kiri cutout product.jpg -o product.jpg --canvas 1000 --flatten --background "#
     "cleanup": 2, "feather": 1, "despill": true, "refine": true,
     "matting": "guided", "smooth_contour": 2.0, "reclassify": true,
     "background_model": "flat",
-    "band_min_radius": 2, "smooth_radius_px": 2
+    "band_min_radius": 2, "smooth_radius_px": 2, "shadow": "off"
   },
   "mask": {
     "foreground_ratio": 0.2164,
@@ -1820,8 +2108,9 @@ x broken.jpg  失敗
 オプションと対応する（`bbox` / `normalized` / `fg_seeds` / `trimap` / `fg_mask` /
 `bg_mask` / `fg_polygons` / `bg_polygons` / `tolerance` / `border` /
 `cleanup` / `feather` / `despill` / `refine` / `matting` / `smooth_contour` /
-`reclassify` / `background_model` / `color_convert` / `edge_threshold` /
-`step_tolerance` / `shadow_tolerance` / `seal` / `canvas` / `fill_ratio` / `format` /
+`reclassify` / `background_model` / `optimize` / `color_convert` / `edge_threshold` /
+`step_tolerance` / `shadow_tolerance` / `shadow` / `shadow_offset` / `shadow_blur` /
+`shadow_color` / `shadow_opacity` / `seal` / `canvas` / `fill_ratio` / `format` /
 `quality` / `effort` / `background` / `flatten`）。
 
 `trimap` / `fg_mask` / `bg_mask` は画像のパスで、`input` と同じく**仕様ファイルの
@@ -1830,6 +2119,11 @@ x broken.jpg  失敗
 
 `edge_threshold` は CLI と同じく「書かない」と「`8` と書く」を区別する。書かなければ
 背景のテクスチャに応じて自動調整され、書けばその値に従う。
+
+`optimize` を `true` にすると、その項目で探索が走る（[探索を kiri に任せる](#探索を-kiri-に任せるoptimize)）。
+**同じ項目に書いた `tolerance` / `bbox` / `background_model` は探索の軸から外れる**
+——CLI で明示したときと同じ規約で、spec では「書いたかどうか」がそのまま明示に
+あたる。1 件が数秒から十数秒になるので、数百点に一律で付ける値ではない。
 
 `matting` と `background_model` は綴りを検査する。未知の値を既定へ落とすと、その
 項目だけ黙って別の設定で処理され、数百点を回した後に仕上がりを見るまで気づけない。

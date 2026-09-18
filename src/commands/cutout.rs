@@ -11,6 +11,7 @@ use crate::cli::{CutoutArgs, Polygon};
 use crate::commands::output::{self, round4};
 use crate::commands::segment;
 use crate::cutout::constraints::{MASK_THRESHOLD, TRIMAP_BACKGROUND, TRIMAP_FOREGROUND};
+use crate::cutout::optimize;
 use crate::cutout::{
     Constraint, ConstraintSource, Constraints, CutoutOptions, FG_SEED_RADIUS, Matting, cutout,
 };
@@ -18,10 +19,11 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::{LoadOptions, OutputFormat, SaveOptions, load, save};
 use crate::preview::{PreviewSpec, contact_sheet};
 use crate::report::{
-    CanvasReport, ConstraintsReport, CutoutReport, Dimensions, MaskReport, SCHEMA_VERSION,
-    SettingsReport,
+    CanvasReport, ConstraintsReport, CutoutReport, Dimensions, MaskReport, OptimizeCandidate,
+    OptimizeReport, OptimizeScore, SCHEMA_VERSION, SettingsReport, ShadowReport,
 };
-use crate::transform::canvas::{CanvasSpec, apply as canvas_apply, plan as canvas_plan};
+use crate::transform::canvas::{CanvasSpec, apply as canvas_apply, composite, plan as canvas_plan};
+use crate::transform::shadow::{self, ShadowMode, ShadowSpec};
 use crate::warning::{Warning, WarningCode};
 
 pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
@@ -63,7 +65,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         None => user_constraints,
     };
 
-    let opts = CutoutOptions {
+    let mut opts = CutoutOptions {
         tolerance: args.tolerance,
         border: args.border,
         bbox,
@@ -82,7 +84,23 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         reclassify: !args.no_reclassify,
         background_model: args.background_model,
     };
-    let result = cutout(&loaded.image, &opts);
+    // **探索は 1 つの `CutoutResult` を返す。** 選ばれた候補は原寸で回し切った
+    // ものなので、以降（キャンバス配置・書き出し・preview）はもう 1 回走らせずに
+    // そのまま流す。`opts` も選ばれた候補で置き換える——`settings` と
+    // `applied_bbox` は効いた値を出す規約であり、渡した値では嘘になる
+    // 影を敷くときだけ `result.image` を取り出して使い回すので mut で持つ
+    let (mut result, optimize, optimize_warning) = if args.optimize {
+        let found = optimize::optimize(&loaded.image, &opts, &args.fixed)?;
+        let report = optimize_report(&found, w, h);
+        // 代入で置き換える（シャドーイングではない）。**束縛を増やすと、
+        // 探索前の指示の表が関数の終わりまで生き残る**——24.5MP では
+        // 選ばれた候補のものと合わせて 24.5MB を 2 本抱えることになる
+        opts = found.options;
+        (found.result, Some(report), found.warning)
+    } else {
+        (cutout(&loaded.image, &opts), None, None)
+    };
+    let bbox = opts.bbox;
 
     let debug_mask = write_debug_mask(args.debug_mask.as_ref(), &result.mask)?;
 
@@ -94,16 +112,46 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     // モデルが迷っていることも同じ理由で先に言う。確定領域が痩せていれば、
     // 以降の数値は `--segment off` のそれに近い
     warnings.extend(segment_warnings);
+    // 探索が「どれも駄目だった」と言うのも結果の警告より先である。以降に並ぶ
+    // 警告はすべて**選ばれた 1 つの候補**についてのもので、それが 20 通りの
+    // 中で最良だったという事実を知らずに読むと、まだ手が残っていると読める
+    warnings.extend(optimize_warning);
     warnings.extend(result.warnings.clone());
+
+    // 長辺 1000px 換算を実寸へ掛け戻す。**基準は最終画像の長辺**なので、
+    // キャンバスがあればそちらが基準になる。元画像の長辺で換算すると、
+    // 同じ指定が --canvas の有無で違う見た目を指す
+    let shadow_spec = resolve_shadow(
+        args,
+        match args.canvas {
+            Some((cw, ch)) => cw.max(ch),
+            None => w.max(h),
+        },
+    );
 
     // キャンバスを使わないときは切り抜き結果をそのまま書き出す。複製すると
     // 12MP で 48MB を余分に積み、batch の並列度ぶんだけ倍になる
-    let (placed, canvas) = match args.canvas {
+    let (placed, canvas, shadow) = match args.canvas {
         Some((cw, ch)) => {
-            let (image, report) = place_on_canvas(&result, cw, ch, args, &mut warnings)?;
-            (Some(image), Some(report))
+            let placement =
+                place_on_canvas(&result, cw, ch, args, shadow_spec.as_ref(), &mut warnings)?;
+            (
+                Some(placement.image),
+                Some(placement.report),
+                placement.shadow,
+            )
         }
-        None => (None, None),
+        // **切り抜き結果の画像そのものを影の合成へ渡す。** 24.5MP の RGBA は
+        // 98MB あり、複製する理由が無い——`synth` は画素ごとにその場で書く。
+        // 取り出した後の `result.image` は空になるが、この枝では下の
+        // `unwrap_or` が必ず `placed` を採るので読まれない
+        None => match shadow_spec.as_ref() {
+            Some(spec) => {
+                let (image, bounds) = shadow::synth(std::mem::take(&mut result.image), spec);
+                (Some(image), None, Some(shadow_report(spec, &bounds)))
+            }
+            None => (None, None, None),
+        },
     };
     let final_image = placed.as_ref().unwrap_or(&result.image);
 
@@ -172,6 +220,11 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             background_model: result.background_model.as_str(),
             // 実際に効いた値。指定値ではなく、輪郭の粗さで持ち上がった後の値
             band_min_radius: result.band_min_radius,
+            // 指定値。**選ばれた候補ではない**——探索したかどうかそのものは
+            // 利用者が決める。何が選ばれたかは上の 3 つと optimize ブロックが言う
+            optimize: args.optimize,
+            // 指定値。実際に効いたずらし量とぼかしは `shadow` ブロックのほう
+            shadow: args.shadow.as_str(),
             // 指定値。`auto` が走らせたかどうかは次の行が言う
             segment: decision.mode.as_str(),
             segment_ran: decision.ran(),
@@ -179,6 +232,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         applied_bbox: bbox.map(|(x1, y1, x2, y2)| [x1, y1, x2, y2]),
         constraints: opts.constraints.as_ref().map(constraints_report),
         segment: segment_report,
+        optimize,
         mask: MaskReport {
             foreground_ratio: round4(result.stats.foreground_ratio),
             bbox: result.stats.bbox.map(|(x1, y1, x2, y2)| [x1, y1, x2, y2]),
@@ -191,10 +245,99 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             debug_mask,
         },
         canvas,
+        shadow,
         preview,
         elapsed_ms: started.elapsed().as_millis(),
         warnings,
     })
+}
+
+/// 探索の記録を結果 JSON へ落とす。
+///
+/// **矩形は原寸の画素で出す。** 探索段は縮小版で回っているが、その座標を
+/// そのまま出しても `--bbox` へ写せない。候補は「どこから来た矩形か」を
+/// 持っているので、原寸へ解き直せばよい。
+fn optimize_report(found: &crate::cutout::Optimized, width: u32, height: u32) -> OptimizeReport {
+    let source = (width, height);
+    let entry = |(i, trial): (usize, &optimize::Trial)| OptimizeCandidate {
+        tolerance: trial.candidate.tolerance,
+        bbox: trial.candidate.bbox.map(|b| {
+            let (x1, y1, x2, y2) = b.resolve(source, source);
+            [x1, y1, x2, y2]
+        }),
+        background_model: trial.candidate.background_model.as_str(),
+        stage: trial.stage.as_str(),
+        foreground_ratio: round4(trial.foreground_ratio),
+        touches_edge: trial.touches_edge,
+        separability: trial.separability.map(round4),
+        halo_ratio: trial.diagnostics.halo_ratio.map(round4),
+        contour_roughness: trial.diagnostics.contour_roughness.map(round4),
+        rim_contamination: trial.diagnostics.rim_contamination.map(round4),
+        warnings: trial
+            .warnings
+            .iter()
+            .map(|c| c.as_str().to_string())
+            .collect(),
+        collapsed: trial.collapsed,
+        score: OptimizeScore {
+            fatal: trial.score.fatal,
+            unmeasured: trial.score.unmeasured,
+            quality: round4(trial.score.quality),
+            separability: round4(trial.score.separability),
+        },
+        chosen: i == found.chosen,
+    };
+    let candidates: Vec<OptimizeCandidate> = found.trials.iter().enumerate().map(entry).collect();
+    OptimizeReport {
+        searched_at: found.searched_at,
+        chosen: candidates[found.chosen].clone(),
+        candidates,
+        elapsed_ms: found.elapsed_ms,
+    }
+}
+
+/// 長辺 1000px 換算の指定を、最終画像の実寸へ掛け戻す。
+///
+/// `--shadow off` なら `None`。合成しない実行で仕様を組み立てても使い道が無く、
+/// 「影の設定は解釈された」という事実だけが下流に残ると、どこかで誤って
+/// 効いてしまう余地を作る。
+fn resolve_shadow(args: &CutoutArgs, long_side: u32) -> Option<ShadowSpec> {
+    if args.shadow != ShadowMode::Synth {
+        return None;
+    }
+    let scale = f64::from(long_side) / 1000.0;
+    Some(ShadowSpec {
+        offset: (
+            (args.shadow_offset[0] * scale).round() as i32,
+            (args.shadow_offset[1] * scale).round() as i32,
+        ),
+        sigma: args.shadow_blur * scale,
+        color: args.shadow_color,
+        opacity: args.shadow_opacity,
+    })
+}
+
+/// 効いた影を結果 JSON へ落とす。
+fn shadow_report(spec: &ShadowSpec, bounds: &crate::transform::ShadowBounds) -> ShadowReport {
+    let [r, g, b] = spec.color;
+    ShadowReport {
+        offset: [spec.offset.0, spec.offset.1],
+        // **要求した σ ではなく、箱型の幅が実現する σ を出す。** 幅は奇数の
+        // 整数しか取れず、σ が小さいと 3 回とも幅 1（恒等）に落ちる。要求値を
+        // 返すと「ぼかしたと報告しているのに縁が 0→255 の段差」になる
+        blur: round4(shadow::effective_sigma(spec.sigma)),
+        opacity: round4(spec.opacity),
+        color: format!("#{r:02X}{g:02X}{b:02X}"),
+        bounds: bounds.rect,
+        clipped: bounds.clipped,
+    }
+}
+
+/// キャンバス配置の成果。
+struct Placement {
+    image: image::RgbaImage,
+    report: CanvasReport,
+    shadow: Option<ShadowReport>,
 }
 
 /// 切り抜いた商品を余白ごと切り詰め、指定サイズのキャンバス中央へ配置する。
@@ -203,8 +346,9 @@ fn place_on_canvas(
     width: u32,
     height: u32,
     args: &CutoutArgs,
+    shadow_spec: Option<&ShadowSpec>,
     warnings: &mut Vec<Warning>,
-) -> Result<(image::RgbaImage, CanvasReport)> {
+) -> Result<Placement> {
     // フェザリングされた薄い縁まで含めて切り詰める。前景判定(128以上)で切ると
     // 輪郭の階調が落ちてギザギザに戻ってしまう
     let (x1, y1, x2, y2) = result.mask.bbox_above(0).ok_or_else(|| {
@@ -218,15 +362,36 @@ fn place_on_canvas(
     let trimmed =
         image::imageops::crop_imm(&result.image, x1, y1, x2 - x1 + 1, y2 - y1 + 1).to_image();
 
+    // **影があるときだけ塗る順序を組み替える。** 下地 → 影 → 商品でなければ
+    // 影が下地に隠れる。組み替えを `--shadow off` にも通すと、半透明の縁で
+    // 1 ずつ丸めが変わる（下地の上へ合成するか、後から下地へ落とすかの違い）
+    let flatten_here = args.out.flatten && shadow_spec.is_none();
     let spec = CanvasSpec {
         width,
         height,
         fill_ratio: args.fill_ratio,
         // --flatten が指定されていれば下地を塗る。既定は透明のまま
-        background: args.out.flatten.then_some(args.out.background),
+        background: flatten_here.then_some(args.out.background),
     };
     let plan = canvas_plan((trimmed.width(), trimmed.height()), &spec)?;
-    let placed = canvas_apply(&trimmed, &spec)?;
+    let mut placed = canvas_apply(&trimmed, &spec)?;
+
+    // 引数名を `spec` にすると上の `CanvasSpec` を隠す。どちらの仕様を
+    // 読んでいるのかが目で追えなくなる
+    let shadow = shadow_spec.map(|shadow| {
+        let (with_shadow, bounds) = shadow::synth(std::mem::take(&mut placed), shadow);
+        placed = with_shadow;
+        if args.out.flatten {
+            // 透明のまま置いた影と商品を、改めて下地の上へ載せる。
+            // 書き出し側の --flatten に任せると、影のアルファが 0 の画素まで
+            // 別の丸めを通り、影なしの出力とビット一致しなくなる
+            let [r, g, b] = args.out.background;
+            let mut base = image::RgbaImage::from_pixel(width, height, image::Rgba([r, g, b, 255]));
+            composite(&mut base, &placed, (0, 0));
+            placed = base;
+        }
+        shadow_report(shadow, &bounds)
+    });
 
     if plan.scale > 1.0 {
         warnings.push(
@@ -241,9 +406,9 @@ fn place_on_canvas(
         );
     }
 
-    Ok((
-        placed,
-        CanvasReport {
+    Ok(Placement {
+        image: placed,
+        report: CanvasReport {
             width,
             height,
             fill_ratio: args.fill_ratio,
@@ -251,7 +416,8 @@ fn place_on_canvas(
             offset: [plan.offset.0, plan.offset.1],
             scale: round4(plan.scale),
         },
-    ))
+        shadow,
+    })
 }
 
 /// 重い処理に入る前に、付随出力（プレビュー・デバッグマスク）のパスを検証する。
@@ -697,13 +863,9 @@ pub fn resolve_bbox(
         ));
     }
 
-    let x1 = scaled[0].floor().max(0.0) as u32;
-    let y1 = scaled[1].floor().max(0.0) as u32;
-    // 終点は画像内に収める。x1 より小さくならないよう下限も押さえる
-    let x2 = (scaled[2].ceil() as u32).min(width - 1).max(x1);
-    let y2 = (scaled[3].ceil() as u32).min(height - 1).max(y1);
-
-    Ok((x1, y1, x2, y2))
+    // 丸めの規約は `cutout::bbox_to_pixels` が 1 箇所で持つ。`--optimize` は
+    // 同じ矩形を寸法ごとに解き直すので、そこと式が分かれてはいけない
+    Ok(crate::cutout::bbox_to_pixels(scaled, width, height))
 }
 
 fn resolve_point(point: [f64; 2], normalized: bool, width: u32, height: u32) -> Result<(u32, u32)> {

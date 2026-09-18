@@ -13,10 +13,11 @@ use crate::cli::{
     BatchArgs, ColorOpts, CutoutArgs, OutputOpts, Polygon, SegmentOpts, parse_hex_color, parse_size,
 };
 use crate::commands::cutout;
-use crate::cutout::{BackgroundModel, CutoutOptions, DEFAULT_BORDER, Matting};
+use crate::cutout::{BackgroundModel, CutoutOptions, DEFAULT_BORDER, Matting, OptimizeFixed};
 use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::OutputFormat;
 use crate::report::{BatchItemReport, BatchReport, ErrorBody, SCHEMA_VERSION};
+use crate::transform::shadow::ShadowMode;
 
 pub fn run(args: &BatchArgs) -> Result<BatchReport> {
     let started = Instant::now();
@@ -156,6 +157,14 @@ fn to_cutout_args(
             BackgroundModel::Auto,
             "background_model",
         )?,
+        optimize: settings.optimize.unwrap_or(false),
+        // spec では `Some` がそのまま「明示した」である。CLI 側が clap の
+        // `ValueSource` を見て解いているのと同じ問いに、JSON では素直に答えられる
+        fixed: OptimizeFixed {
+            tolerance: settings.tolerance.is_some(),
+            bbox: settings.bbox.is_some(),
+            background_model: settings.background_model.is_some(),
+        },
         color: ColorOpts {
             no_color_convert: !settings.color_convert.unwrap_or(true),
         },
@@ -169,6 +178,23 @@ fn to_cutout_args(
         edge_threshold: checked_opt(settings.edge_threshold, "edge_threshold")?,
         step_tolerance: checked(settings.step_tolerance, 2.2, "step_tolerance")?,
         shadow_tolerance: checked(settings.shadow_tolerance, 35.0, "shadow_tolerance")?,
+        shadow: value_enum(settings.shadow.as_deref(), ShadowMode::Off, "shadow")?,
+        shadow_offset: offset(settings.shadow_offset, [0.0, 12.0], "shadow_offset")?,
+        // spec は clap を通らないので、CLI と同じ上限をここで掛ける。
+        // 抜けていると `--shadow-blur` では断る値が spec 経由でだけ通る
+        shadow_blur: capped_f64(
+            settings.shadow_blur,
+            10.0,
+            crate::cli::SHADOW_BLUR_MAX,
+            "shadow_blur",
+        )?,
+        shadow_color: settings
+            .shadow_color
+            .as_deref()
+            .map(|s| parse_hex_color(s).map_err(|e| Error::new(ErrorCode::InvalidColor, e)))
+            .transpose()?
+            .unwrap_or([0, 0, 0]),
+        shadow_opacity: ratio(settings.shadow_opacity, 0.25, "shadow_opacity")?,
         seal,
         canvas,
         fill_ratio: settings.fill_ratio.unwrap_or(0.85),
@@ -286,6 +312,33 @@ fn capped_f64(value: Option<f64>, default: f64, max: f64, key: &str) -> Result<f
         return Err(Error::new(
             ErrorCode::InvalidSetting,
             format!("{key} は 0 から {max} の範囲で指定してください（{value} が指定されました）"),
+        ));
+    }
+    Ok(value)
+}
+
+/// 0.0-1.0 の設定に CLI と同じ関門を掛ける（`unit_interval` の spec 版）。
+///
+/// 1.5 は飽和して 1.0 と同じ結果になり、-0.2 は機能が黙って消える。どちらも
+/// 数百点を回し終えてから仕上がりで気づく種類の失敗になる。
+fn ratio(value: Option<f64>, default: f64, key: &str) -> Result<f64> {
+    let value = validate(value.unwrap_or(default), key)?;
+    if value > 1.0 {
+        return Err(Error::new(
+            ErrorCode::InvalidSetting,
+            format!("{key} は 0.0 から 1.0 の範囲で指定してください（{value} が指定されました）"),
+        ));
+    }
+    Ok(value)
+}
+
+/// ずらし量に CLI と同じ関門を掛ける。**負値は通す**（影を上や左へ出す指定）。
+fn offset(value: Option<[f64; 2]>, default: [f64; 2], key: &str) -> Result<[f64; 2]> {
+    let value = value.unwrap_or(default);
+    if value.iter().any(|v| !v.is_finite()) {
+        return Err(Error::new(
+            ErrorCode::InvalidSetting,
+            format!("{key} は有限な数値 2 個である必要があります"),
         ));
     }
     Ok(value)

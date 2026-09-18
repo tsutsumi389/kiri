@@ -6,21 +6,22 @@
 
 use std::process::ExitCode;
 
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{ArgMatches, CommandFactory, FromArgMatches};
 use serde::Serialize;
 
 use kiri::cli::{Cli, Command};
 use kiri::commands;
-use kiri::cutout::{Confidence, bbox_argument};
+use kiri::cutout::{Confidence, OptimizeFixed, bbox_argument};
 use kiri::error::{Error, ErrorCode, ErrorKind, Result};
 use kiri::report::{
     BackgroundReport, BatchReport, CutoutReport, ErrorReport, InfoReport, ModelReport,
-    ProcessReport, SchemaReport, SegmentReport, SubjectReport,
+    ProcessReport, SchemaReport, SegmentReport, SettingsReport, SubjectReport,
 };
 use kiri::warning::Warning;
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = parse();
     match dispatch(&cli) {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
@@ -28,6 +29,48 @@ fn main() -> ExitCode {
             ExitCode::from(e.exit_code() as u8)
         }
     }
+}
+
+/// 引数を解いたうえで、**利用者が明示した項目**を記録する。
+///
+/// `Cli::parse()` では足りない。`--tolerance` は `default_value_t` を持つので、
+/// 解いた後の値からは「12 を明示した」と「既定のまま」を区別できない。
+/// `--optimize` はそこを区別しなければならない——明示した値は探索の軸から外す
+/// という規約があり、区別できなければ「30 に固定して探せ」と書いた指定が
+/// 12〜60 を舐めてしまう。
+///
+/// 既定値を `Option` にして区別する手もあるが、それをやると `kiri schema` の
+/// `commands[].options[].default` から 12 が消える。**指定しなくても何が効くのかを
+/// 読めることは契約そのもの**なので、表示は 1 文字も変えずに、明示したかどうかだけを
+/// `ValueSource` から拾って `CutoutArgs::fixed` へ畳む。
+fn parse() -> Cli {
+    let matches = Cli::command().get_matches();
+    // **`from_arg_matches_mut` は使えない。** あちらは組み立てながら
+    // `ArgMatches` から値を抜き取るので、終わったあとの `value_source` は
+    // どの id についても `None` を返す。clone を 1 つ節約する代わりに、
+    // 「明示したかどうか」を知る手段がそこで消える
+    let mut cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        // clap 自身の作法で出して終わる。ここに来るのは derive とパーサの
+        // 食い違いだけなので、kiri の ErrorCode に混ぜる意味が無い。
+        // **`format` を通すのは usage を添えるため**——`Parser::parse()` は
+        // 内部で同じことをしており、ここだけ素っ気ない出力にする理由が無い
+        Err(e) => e.format(&mut Cli::command()).exit(),
+    };
+    if let (Command::Cutout(args), Some(sub)) =
+        (&mut cli.command, matches.subcommand_matches("cutout"))
+    {
+        args.fixed = OptimizeFixed {
+            tolerance: from_command_line(sub, "tolerance"),
+            bbox: from_command_line(sub, "bbox"),
+            background_model: from_command_line(sub, "background_model"),
+        };
+    }
+    cli
+}
+
+fn from_command_line(matches: &ArgMatches, id: &str) -> bool {
+    matches.value_source(id) == Some(ValueSource::CommandLine)
 }
 
 /// 成功時も終了コードを返す。バッチは一部の項目が失敗しても処理を続けるため、
@@ -218,6 +261,52 @@ fn print_segment(segment: Option<&SegmentReport>) {
     );
 }
 
+/// 探索の要約。**走ったときしか出ない。**
+///
+/// 人間向けには「何通り試して、原寸で何回回して、何が選ばれたか」の 1 行で足りる。
+/// 候補の一覧は 20 行になるのでテキストには出さない——比べたい人は `--json` を読む。
+fn print_optimize(optimize: Option<&kiri::report::OptimizeReport>, settings: &SettingsReport) {
+    let Some(o) = optimize else {
+        return;
+    };
+    let finals = o.candidates.iter().filter(|c| c.stage == "final").count();
+    let c = &o.chosen;
+    println!(
+        "  探索      {} 候補を {}px で試し、原寸で {} 回  ({} ms)",
+        o.candidates.len(),
+        o.searched_at,
+        finals,
+        o.elapsed_ms
+    );
+    // **モデルは効いた値と要求値の両方を出す。** 候補表が持つのは要求値
+    // （`auto`）だが、すぐ上の「背景」ブロックは効いた値を語っているので、
+    // 効いた値だけを出すと `--background-model auto` を写せる候補表の側と
+    // 食い違い、要求値だけを出すと同じ画面で同じ語が 2 つの意味を持つ
+    let model = if settings.background_model == c.background_model {
+        settings.background_model.to_string()
+    } else {
+        format!(
+            "{}（要求 {}）",
+            settings.background_model, c.background_model
+        )
+    };
+    println!(
+        "  採用      tolerance {}  bbox {}  background-model {model}  (致命 {} / 品質 {:.2}{})",
+        c.tolerance,
+        match c.bbox {
+            Some([x1, y1, x2, y2]) => format!("{x1},{y1} - {x2},{y2}"),
+            None => "なし".to_string(),
+        },
+        c.score.fatal,
+        c.score.quality,
+        if c.collapsed {
+            " / 商品を飲んだ"
+        } else {
+            ""
+        }
+    );
+}
+
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
     let text = serde_json::to_string_pretty(value)
         .map_err(|e| Error::new(ErrorCode::JsonEncodeFailed, e.to_string()))?;
@@ -348,6 +437,7 @@ fn print_cutout(report: &CutoutReport) {
     );
     print_perimeter(&report.background);
     print_segment(report.segment.as_ref());
+    print_optimize(report.optimize.as_ref(), &report.settings);
     // 指示を渡したときだけ 1 行増やす。**どの入口が効いたかまで出す**のは、
     // 渡したはずの入口が並びに無いことが「その指示は空だった」を意味するため
     // （そのときは CONSTRAINT_EMPTY も出る）。

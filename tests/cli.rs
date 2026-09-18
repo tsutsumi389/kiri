@@ -55,6 +55,11 @@ fn has_warning(v: &Value, code: &str) -> bool {
     warning_codes(v).iter().any(|c| c == code)
 }
 
+/// 結果 JSON と同じ丸め方。実装の定数や関数と突き合わせるときに要る。
+fn round4(v: f64) -> f64 {
+    (v * 10_000.0).round() / 10_000.0
+}
+
 fn warning_codes(v: &Value) -> Vec<String> {
     v["warnings"]
         .as_array()
@@ -3632,6 +3637,528 @@ fn cutout_without_a_canvas_reports_no_canvas_field() {
     assert_eq!(v["outputs"][0]["width"], 120, "寸法は元のままであるべき");
 }
 
+// --- 落ち影の合成 (Phase 15) ---
+
+/// 影の合成を頼まない実行では、結果に `shadow` ブロックが現れない。
+///
+/// `null` も出さない（`constraints` と同じ規約）。走らなかった処理の
+/// 痕跡が残ると、エージェントは「合成したが影が出なかった」と読む。
+#[test]
+fn a_run_without_a_shadow_reports_no_shadow_block() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 160,
+        height: 160,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let v = cutout_on_canvas(dir.path(), &input, "out.png", &[]);
+    assert!(
+        v.get("shadow").is_none(),
+        "影を頼んでいないのに shadow が出た"
+    );
+    assert_eq!(
+        v["settings"]["shadow"], "off",
+        "settings.shadow は常に出すべき"
+    );
+}
+
+/// `--shadow off` は、`--shadow` を渡さない実行と 1 バイトも変わらない。
+#[test]
+fn an_explicit_shadow_off_writes_the_same_bytes_as_no_shadow_at_all() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    cutout_on_canvas(dir.path(), &input, "plain.png", &["--canvas", "400"]);
+    cutout_on_canvas(
+        dir.path(),
+        &input,
+        "off.png",
+        &["--canvas", "400", "--shadow", "off"],
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("plain.png")).unwrap(),
+        std::fs::read(dir.path().join("off.png")).unwrap(),
+        "--shadow off が成果物を変えている"
+    );
+}
+
+/// 効いた値は px@1000 から実寸へ掛け戻したものが出る。
+///
+/// 指定値をそのまま返すと、長辺が違う素材のあいだで同じ数字が違う見た目を
+/// 指すことになる。`settings.smooth_radius_px` と同じ理由で実寸を出す。
+#[test]
+fn a_synthetic_shadow_reports_the_pixels_that_actually_took_effect() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 400,
+        height: 400,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let v = cutout_on_canvas(dir.path(), &input, "out.png", &["--shadow", "synth"]);
+    assert_eq!(v["settings"]["shadow"], "synth");
+
+    let shadow = &v["shadow"];
+    // 長辺 400px なので、px@1000 の既定値 0,12 と σ 10 は 0.4 倍で効く
+    assert_eq!(
+        shadow["offset"],
+        serde_json::json!([0, 5]),
+        "オフセットが実寸に換算されていない: {shadow}"
+    );
+    // **報告される σ は箱型の幅が実現する値**で、要求値そのものではない。
+    // 幅は奇数の整数しか取れないので、4.0 を頼むと 3.83 になる
+    assert_eq!(
+        shadow["blur"].as_f64().unwrap(),
+        round4(kiri::transform::shadow::effective_sigma(4.0)),
+        "σ が実寸に換算されていないか、要求値をそのまま返している: {shadow}"
+    );
+    assert!(
+        (shadow["blur"].as_f64().unwrap() - 4.0).abs() < 0.2,
+        "実現した σ が要求から離れすぎている: {shadow}"
+    );
+    assert_eq!(shadow["opacity"], 0.25);
+    assert_eq!(shadow["color"], "#000000");
+    assert!(
+        shadow["bounds"].as_array().is_some_and(|b| b.len() == 4),
+        "影の矩形が出ていない: {shadow}"
+    );
+    assert!(
+        shadow["clipped"].is_boolean(),
+        "clipped が真偽で出ていない: {shadow}"
+    );
+}
+
+/// キャンバスの長辺が px@1000 の基準になる。
+#[test]
+fn the_canvas_long_side_is_what_px_at_1000_is_measured_against() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let v = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "out.png",
+        &["--canvas", "2000", "--shadow", "synth"],
+    );
+    assert_eq!(
+        v["shadow"]["offset"],
+        serde_json::json!([0, 24]),
+        "元画像 200px ではなくキャンバス 2000px を基準にすべき"
+    );
+    assert_eq!(
+        v["shadow"]["blur"].as_f64().unwrap(),
+        round4(kiri::transform::shadow::effective_sigma(20.0))
+    );
+}
+
+/// ぼかしが小さすぎて箱型が恒等に落ちるときは、σ を名乗らない。
+///
+/// **要求値をそのまま返すと嘘になる。** 幅が 3 回とも 1 なら画素は 1 つも
+/// 動いておらず、縁は 0→255 の段差のままである。schema の「0 ならぼかして
+/// いない」という注記もそのときだけ成り立つ。
+#[test]
+fn a_blur_too_small_to_take_effect_is_reported_as_zero() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    // 長辺 200px なので px@1000 の 2 は実寸 0.4 にしかならない
+    let v = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "out.png",
+        &["--shadow", "synth", "--shadow-blur", "2"],
+    );
+    assert_eq!(
+        v["shadow"]["blur"], 0.0,
+        "ぼかしていないのに σ を名乗った: {}",
+        v["shadow"]
+    );
+}
+
+/// 影を足しても商品の配置は動かず、切り抜きの診断値も動かない。
+///
+/// `fill_ratio` は商品だけで決める。影のぶん商品を小さくすると、同じ設定を
+/// 通した素材群で占有率が影の有無によって変わってしまう。
+#[test]
+fn a_shadow_moves_neither_the_product_nor_the_mask_statistics() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 300,
+        height: 300,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let off = cutout_on_canvas(dir.path(), &input, "off.png", &["--canvas", "1000"]);
+    let on = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "on.png",
+        &["--canvas", "1000", "--shadow", "synth"],
+    );
+
+    assert_eq!(off["canvas"], on["canvas"], "影で配置が変わっている");
+    assert_eq!(
+        off["mask"], on["mask"],
+        "影が切り抜きの診断値を動かしている（影は測る前に足してはいけない）"
+    );
+    assert_eq!(off["outputs"][0]["width"], on["outputs"][0]["width"]);
+    assert_eq!(off["outputs"][0]["height"], on["outputs"][0]["height"]);
+}
+
+/// 下地を塗るときの順序は「下地 → 影 → 商品」になる。
+#[test]
+fn a_flattened_canvas_shows_the_shadow_under_the_product_but_not_in_the_far_corner() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 300,
+        height: 300,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let v = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "out.png",
+        &[
+            "--canvas",
+            "1000",
+            "--fill-ratio",
+            "0.6",
+            "--flatten",
+            "--background",
+            "#FFFFFF",
+            "--shadow",
+            "synth",
+            "--shadow-offset",
+            "0,40",
+            "--shadow-blur",
+            "8",
+            "--shadow-opacity",
+            "0.5",
+        ],
+    );
+    let out = image::open(dir.path().join("out.png")).unwrap().to_rgba8();
+
+    let offset = v["canvas"]["offset"].as_array().unwrap();
+    let content = v["canvas"]["content"].as_array().unwrap();
+    let cx = (offset[0].as_u64().unwrap() + content[0].as_u64().unwrap() / 2) as u32;
+    let below = (offset[1].as_u64().unwrap() + content[1].as_u64().unwrap() + 10) as u32;
+
+    let under = out.get_pixel(cx, below).0;
+    assert_eq!(under[3], 255, "--flatten なのに透過が残っている");
+    assert!(
+        under[0] < 250,
+        "商品の下の余白が白のまま（影が落ちていない）: {under:?}"
+    );
+    assert_eq!(
+        out.get_pixel(3, 3).0,
+        [255, 255, 255, 255],
+        "商品から遠い角が純白でない"
+    );
+}
+
+/// 透過を保てる形式では、影は半透明のアルファとして残る。
+#[test]
+fn a_shadow_stays_translucent_when_the_format_keeps_alpha() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 300,
+        height: 300,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let v = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "out.png",
+        &[
+            "--canvas",
+            "1000",
+            "--fill-ratio",
+            "0.6",
+            "--shadow",
+            "synth",
+            "--shadow-offset",
+            "0,40",
+            "--shadow-blur",
+            "8",
+        ],
+    );
+    let out = image::open(dir.path().join("out.png")).unwrap().to_rgba8();
+
+    let offset = v["canvas"]["offset"].as_array().unwrap();
+    let content = v["canvas"]["content"].as_array().unwrap();
+    let cx = (offset[0].as_u64().unwrap() + content[0].as_u64().unwrap() / 2) as u32;
+    let below = (offset[1].as_u64().unwrap() + content[1].as_u64().unwrap() + 10) as u32;
+
+    let a = out.get_pixel(cx, below).0[3];
+    assert!(
+        a > 0 && a < 255,
+        "影が半透明のアルファとして残っていない: alpha={a}"
+    );
+    assert_eq!(out.get_pixel(3, 3).0[3], 0, "遠い角の余白が透明でない");
+}
+
+/// 影がキャンバスからはみ出しても寸法は変わらず、切れたことが報告される。
+#[test]
+fn a_shadow_running_off_the_canvas_is_clipped_and_says_so() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let v = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "out.png",
+        &[
+            "--canvas",
+            "500",
+            "--shadow",
+            "synth",
+            "--shadow-offset",
+            "0,900",
+        ],
+    );
+    assert_eq!(v["outputs"][0]["height"], 500, "寸法が変わっている");
+    assert_eq!(v["shadow"]["clipped"], true);
+    assert_eq!(v["canvas"]["content"], {
+        let plain = cutout_on_canvas(dir.path(), &input, "plain.png", &["--canvas", "500"]);
+        plain["canvas"]["content"].clone()
+    });
+}
+
+/// 負のオフセットで影を上・左へ出せる。
+#[test]
+fn a_negative_offset_throws_the_shadow_the_other_way() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 500,
+        height: 500,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let v = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "out.png",
+        &["--shadow", "synth", "--shadow-offset", "-20,-30"],
+    );
+    assert_eq!(v["shadow"]["offset"], serde_json::json!([-10, -15]));
+}
+
+/// 範囲外の指定は code を伴わない exit 2 で断る（clap の関門）。
+#[test]
+fn shadow_settings_outside_their_range_are_refused() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    for bad in [
+        vec!["--shadow-opacity", "1.5"],
+        vec!["--shadow-opacity", "-0.2"],
+        vec!["--shadow-blur", "-1"],
+        // **上限が無いと箱型の幅が u32 を溢れる。** release では panic せず、
+        // ぼかしていないのに σ を報告する嘘の結果になっていた
+        vec!["--shadow-blur", "1001"],
+        vec!["--shadow-blur", "8e9"],
+        vec!["--shadow-blur", "1e30"],
+        vec!["--shadow-color", "chartreuse"],
+        vec!["--shadow-offset", "1,2,3"],
+        vec!["--shadow", "drop"],
+    ] {
+        let mut args = vec![
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--json",
+            "--force",
+        ];
+        args.extend_from_slice(&bad);
+        let out = kiri().args(&args).output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{bad:?} が exit 2 で断られていない"
+        );
+    }
+}
+
+/// 上限ちょうどは通る。
+///
+/// 上限を置いた側の検査で、`1000` まで断ってしまうと「σ を上げる」という
+/// 正当な指定が使えない幅で切られる。
+#[test]
+fn a_blur_at_exactly_the_limit_is_accepted() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let limit = kiri::cli::SHADOW_BLUR_MAX.to_string();
+    let v = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "out.png",
+        &["--shadow", "synth", "--shadow-blur", &limit],
+    );
+    // σ が画像より広いので影は丸めで消える。**落ちないこと**がここの主題
+    assert_eq!(v["settings"]["shadow"], "synth");
+    assert!(v["shadow"]["clipped"].is_boolean());
+}
+
+/// 上限は spec 経由でも効く。**spec は clap を通らない。**
+#[test]
+fn an_out_of_range_shadow_blur_is_refused_in_a_spec_too() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        ..Default::default()
+    });
+    write_png(dir.path(), "a.png", &img);
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        r#"{"items":[{"input":"a.png","output":"out.png","shadow":"synth","shadow_blur":8e9}]}"#,
+    )
+    .unwrap();
+
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let json = json_stdout(&out);
+    assert_eq!(json["results"][0]["error"]["code"], "INVALID_SETTING");
+}
+
+/// `--shadow-opacity 0` は、ずらし量が大きくても切れたとは言わない。
+///
+/// `bounds` が null になる 2 つの理由——影を置かなかった／全部はみ出した——を
+/// `clipped` が分ける、という契約そのものの検査である。
+#[test]
+fn a_zero_opacity_is_never_reported_as_clipped() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let empty = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "empty.png",
+        &[
+            "--canvas",
+            "500",
+            "--shadow",
+            "synth",
+            "--shadow-offset",
+            "0,2000",
+            "--shadow-opacity",
+            "0",
+        ],
+    );
+    assert!(empty["shadow"]["bounds"].is_null());
+    assert_eq!(
+        empty["shadow"]["clipped"], false,
+        "影を置いていないのに切れたと報告した: {}",
+        empty["shadow"]
+    );
+
+    // 同じずらし量でも、影を置いたなら切れたと言う
+    let pushed = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "pushed.png",
+        &[
+            "--canvas",
+            "500",
+            "--shadow",
+            "synth",
+            "--shadow-offset",
+            "0,2000",
+        ],
+    );
+    assert!(pushed["shadow"]["bounds"].is_null());
+    assert_eq!(pushed["shadow"]["clipped"], true);
+}
+
+/// 既定値で影がキャンバスに収まっていれば `clipped` は偽。
+///
+/// **箱型の台（約 3σ）が縁を跨いだかどうかで決めていた頃は、既定値でも
+/// 真になっていた。** 偽陽性が既定で出る旗は、読む側が無視するようになる。
+#[test]
+fn a_default_shadow_that_fits_the_canvas_is_not_reported_as_clipped() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 300,
+        height: 300,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let v = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "out.png",
+        &[
+            "--canvas",
+            "1000",
+            "--fill-ratio",
+            "0.7",
+            "--shadow",
+            "synth",
+        ],
+    );
+    let shadow = &v["shadow"];
+    assert_eq!(
+        shadow["clipped"], false,
+        "余白に収まっている影が切れたと報告された: {shadow}"
+    );
+    let bounds = shadow["bounds"].as_array().expect("影があるはず");
+    assert!(
+        bounds[0].as_u64().unwrap() > 0 && bounds[3].as_u64().unwrap() < 999,
+        "矩形が縁に接していないのに clipped の判定が縁を見ている: {shadow}"
+    );
+}
+
 // --- batch (Phase 5) ---
 
 /// 商品画像を n 枚と spec.json を用意する。
@@ -4687,6 +5214,102 @@ fn a_misspelled_refine_key_suggests_the_right_one() {
     );
 }
 
+/// spec が影の 5 つのキーを受けること。
+#[test]
+fn batch_accepts_the_shadow_keys() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    write_png(dir.path(), "a.png", &img);
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        r##"{"defaults":{"canvas":"1000","shadow":"synth","shadow_offset":[6,20],
+                         "shadow_blur":4,"shadow_color":"#204060","shadow_opacity":0.4},
+             "items":[{"input":"a.png","output":"out.png"}]}"##,
+    )
+    .unwrap();
+
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = json_stdout(&out);
+    assert_eq!(json["succeeded"], 1);
+    let result = &json["results"][0]["result"];
+    assert_eq!(result["settings"]["shadow"], "synth");
+    assert_eq!(result["shadow"]["offset"], serde_json::json!([6, 20]));
+    assert_eq!(
+        result["shadow"]["blur"].as_f64().unwrap(),
+        round4(kiri::transform::shadow::effective_sigma(4.0))
+    );
+    assert_eq!(result["shadow"]["color"], "#204060");
+    assert_eq!(result["shadow"]["opacity"], 0.4);
+}
+
+/// 影のキーの綴り違いも候補を返す。
+///
+/// `shadow_tolerance`（実写の影を消す側）と綴りが近いので、黙って無視されると
+/// 「消す側を指定したつもりが足す側だった」の取り違えが残る。
+#[test]
+fn a_misspelled_shadow_offset_key_suggests_the_right_one() {
+    let dir = fixture_dir();
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        r#"{"items":[{"input":"a.png","output":"b.png","shadow_ofset":[0,12]}]}"#,
+    )
+    .unwrap();
+
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let json = json_stdout(&out);
+    assert_eq!(json["error"]["code"], "SPEC_UNKNOWN_FIELD");
+    assert!(
+        json["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("shadow_offset"),
+        "候補に shadow_offset が出ていない: {}",
+        json["error"]["hint"]
+    );
+}
+
+/// spec でも範囲外の影の設定は断る（CLI と同じ関門）。
+#[test]
+fn an_out_of_range_shadow_opacity_is_refused_in_a_spec_too() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        ..Default::default()
+    });
+    write_png(dir.path(), "a.png", &img);
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        r#"{"items":[{"input":"a.png","output":"out.png","shadow":"synth","shadow_opacity":1.5}]}"#,
+    )
+    .unwrap();
+
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let json = json_stdout(&out);
+    assert_eq!(json["results"][0]["error"]["code"], "INVALID_SETTING");
+}
+
 // --- 既定値の重複 ---
 
 /// CLI の既定値とライブラリの既定値が食い違っていないこと。
@@ -5531,6 +6154,53 @@ fn schema_options_come_from_the_parser() {
     assert_eq!(cutout["arguments"][0]["required"], true);
 }
 
+/// 影の合成の 5 つのノブが契約に載ること。
+///
+/// **`--shadow-tolerance`（消す側）と綴りが並ぶ。** 6 つが同じ一覧に出て、
+/// それぞれの summary が「消す」「足す」のどちらなのかを言えていないと、
+/// エージェントは逆のノブを回す。
+#[test]
+fn schema_publishes_the_five_knobs_of_the_synthetic_shadow() {
+    let v = schema_json();
+    let cutout = v["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "cutout")
+        .expect("cutout が無い");
+    let option = |name: &str| -> Value {
+        cutout["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["name"] == name)
+            .unwrap_or_else(|| panic!("{name} が無い"))
+            .clone()
+    };
+
+    let accepts: Vec<String> = option("--shadow")["accepts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("--shadow が accepts を返さない"))
+        .iter()
+        .map(|x| x.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(accepts, vec!["off", "synth"]);
+    assert_eq!(option("--shadow")["default"], "off");
+    assert_eq!(option("--shadow-offset")["default"], "0,12");
+    assert_eq!(option("--shadow-blur")["default"], "10");
+    assert_eq!(option("--shadow-color")["default"], "#000000");
+    assert_eq!(option("--shadow-opacity")["default"], "0.25");
+
+    // 足す側と消す側が、1 行目だけで見分けられること
+    let adds = option("--shadow")["summary"].as_str().unwrap().to_string();
+    let removes = option("--shadow-tolerance")["summary"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(adds.contains("合成"), "足す側だと分からない: {adds}");
+    assert!(removes.contains("消す"), "消す側だと分からない: {removes}");
+}
+
 /// 契約に載っている code はすべて、実際に返りうる。
 ///
 /// **返らない code を配るのは、誤った助言と同じ害を持つ。** エージェントはそれ用の
@@ -5874,10 +6544,17 @@ fn fields_of(v: &Value) -> Vec<Value> {
 }
 
 /// ドット区切りの path で JSON を辿る。無ければ None。
+///
+/// `candidates[]` のように `[]` で終わる区間は配列で、その先は要素の中を指す。
+/// **要素は 1 つ目だけを見る。** 契約が言っているのは「どの要素もこの形を
+/// 持つ」であって、空の配列はそもそも path を確かめる材料にならない。
 fn pick<'a>(report: &'a Value, path: &str) -> Option<&'a Value> {
     let mut node = report;
     for segment in path.split('.') {
-        node = node.get(segment)?;
+        match segment.strip_suffix("[]") {
+            Some(name) => node = node.get(name)?.get(0)?,
+            None => node = node.get(segment)?,
+        }
     }
     Some(node)
 }
@@ -6148,6 +6825,29 @@ fn every_published_field_exists_in_the_result() {
         "--fg-seed",
         "100,100",
     ]);
+    // **`optimize` も探索が走ったときだけ現れる。** 指示と同じ理由で、
+    // 走らせた実行を別に 1 つ用意する
+    let optimized = run(&[
+        "cutout",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--dry-run",
+        "--json",
+        "--optimize",
+    ]);
+    // **`shadow` も合成したときだけ現れる。** 既定の実行で探すと「配った path が
+    // 存在しない」になるので、影を足した実行も用意する（`constraints` と同じ扱い）
+    let shadowed = run(&[
+        "cutout",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--dry-run",
+        "--json",
+        "--shadow",
+        "synth",
+    ]);
     // **`segment` もモデルが走ったときだけ現れる。** モデルは 176MB あって
     // リポジトリにも CI にも置かないので、無ければその path だけを飛ばす。
     // 「配ったが確かめられなかった」と「配ったのに無い」は別で、後者だけを
@@ -6195,6 +6895,8 @@ fn every_published_field_exists_in_the_result() {
                 }
                 "info" => &info,
                 "cutout" if path.starts_with("constraints.") => &constrained,
+                "cutout" if path.starts_with("optimize.") => &optimized,
+                "cutout" if path.starts_with("shadow.") => &shadowed,
                 "cutout" => &cutout,
                 other => panic!("{path} が未知のコマンド {other} を名指ししている"),
             };
@@ -6433,4 +7135,625 @@ fn the_subject_verdicts_do_not_flip_between_the_two_background_models() {
             );
         }
     }
+}
+
+// --- 探索を kiri に任せる（--optimize, Phase 15） ---
+
+/// 探索の記録が結果 JSON に載り、**選ばれた候補と `settings` が一致する**こと。
+///
+/// 一致していなければ、エージェントは「表の 1 位」と「実際に書き出された絵」を
+/// 別のものとして読む。`settings` は効いた値を出す規約なので、`chosen` の側が
+/// 記録として意味を持つには両者が同じでなければならない。
+#[test]
+fn optimize_reports_every_candidate_and_agrees_with_the_settings() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--optimize",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+
+    let optimize = &v["optimize"];
+    let candidates = optimize["candidates"]
+        .as_array()
+        .unwrap_or_else(|| panic!("candidates が配列ではない: {optimize}"));
+    assert!(!candidates.is_empty(), "候補が 1 つも無い: {optimize}");
+    assert_eq!(
+        candidates.iter().filter(|c| c["chosen"] == true).count(),
+        1,
+        "選ばれた候補がちょうど 1 つでない: {optimize}"
+    );
+    let chosen = &optimize["chosen"];
+    assert_eq!(chosen["stage"], "final", "選ばれた候補は原寸で回すべき");
+    assert_eq!(chosen["tolerance"], v["settings"]["tolerance"]);
+    assert_eq!(v["settings"]["optimize"], true);
+    // 矩形を使わない候補が選ばれたなら applied_bbox ごと無い、という対応も見る
+    assert_eq!(
+        chosen["bbox"].is_null(),
+        v.get("applied_bbox").is_none(),
+        "chosen.bbox と applied_bbox が食い違う: {v}"
+    );
+    assert!(optimize["searched_at"].as_u64().unwrap() > 0, "{optimize}");
+}
+
+/// `--optimize` を渡さない実行では `optimize` ブロックごと現れない。
+///
+/// `null` を出すと「探索したが何も出なかった」と読める。走ったかどうかは
+/// `settings.optimize` が真偽で言う（`segment` と同じ規約）。
+#[test]
+fn a_plain_cutout_has_no_optimize_block() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let v = json_stdout(&out);
+    assert!(v.get("optimize").is_none(), "{v}");
+    assert_eq!(v["settings"]["optimize"], false);
+}
+
+/// **明示した値は探索しない。** `--tolerance 30 --optimize` は
+/// 「30 に固定して残りの軸を探す」の意味になる。
+///
+/// 既定値と同じ 12 を明示した場合も同じでなければならない。`--tolerance` は
+/// `default_value_t` を持つので、解いた後の値では区別が付かない——ここが
+/// 落ちるなら `ValueSource` を見る経路が切れている。
+#[test]
+fn an_explicit_tolerance_is_not_searched() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    let tolerances = |value: &str| -> Vec<f64> {
+        let out = kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--tolerance",
+                value,
+                "--optimize",
+                "--json",
+                "--force",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        json_stdout(&out)["optimize"]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["tolerance"].as_f64().unwrap())
+            .collect()
+    };
+
+    for value in ["30", "12"] {
+        let got = tolerances(value);
+        let want: f64 = value.parse().unwrap();
+        assert!(
+            got.iter().all(|t| *t == want),
+            "--tolerance {value} を明示したのに他の値を試した: {got:?}"
+        );
+    }
+}
+
+/// `--dry-run` と併用できる。成果物は 1 バイトも書かれない。
+#[test]
+fn optimize_writes_nothing_under_dry_run() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--optimize",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    assert_eq!(v["dry_run"], true);
+    assert!(v["optimize"]["candidates"].as_array().unwrap().len() > 1);
+    assert!(!output.exists(), "dry-run なのに成果物が書かれている");
+}
+
+/// spec の `optimize: true` が効き、そこに書いた値は探索の軸から外れる。
+///
+/// CLI 側は clap の `ValueSource` を見て「明示した」を判断するが、spec では
+/// `Some` がそのまま明示である。**同じ問いに 2 つの経路で答えている**ので、
+/// 片方だけが効いていないことがありうる。
+#[test]
+fn batch_accepts_the_optimize_key() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    write_png(dir.path(), "a.png", &img);
+    write_png(dir.path(), "b.png", &img);
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        r#"{"defaults":{"optimize":true},
+             "items":[{"input":"a.png","output":"a.out.png"},
+                      {"input":"b.png","output":"b.out.png","tolerance":30}]}"#,
+    )
+    .unwrap();
+
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    assert_eq!(v["succeeded"], 2, "{v}");
+    let results = v["results"].as_array().unwrap();
+
+    let free = &results[0]["result"];
+    assert_eq!(free["settings"]["optimize"], true);
+    assert!(
+        free["optimize"]["candidates"].as_array().unwrap().len() > 1,
+        "spec の optimize が効いていない: {}",
+        free["optimize"]
+    );
+
+    let fixed = &results[1]["result"];
+    let tolerances: Vec<f64> = fixed["optimize"]["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["tolerance"].as_f64().unwrap())
+        .collect();
+    assert!(
+        tolerances.iter().all(|t| *t == 30.0),
+        "spec に書いた tolerance が探索されている: {tolerances:?}"
+    );
+}
+
+/// 色では分けられない素材では、全候補を試しても致命的な警告が残る。
+///
+/// **その事実そのものが報告である。** 20 通り試して駄目だったなら、残る手は
+/// 素材を変えるか、色ではない手がかり（モデル）を足すかしかない。
+/// 実写のキーボード（暗い机の上の黒いキーボード）がこの形で、合成では
+/// 「背景と色がほとんど同じ商品が下端で見切れている」場面が同じ code を返す。
+#[test]
+fn an_inseparable_scene_says_that_no_candidate_was_clean() {
+    let dir = fixture_dir();
+    let mut img = image::RgbaImage::from_pixel(200, 200, image::Rgba([120, 118, 112, 255]));
+    for y in 90..200 {
+        for x in 50..150 {
+            img.put_pixel(x, y, image::Rgba([126, 124, 118, 255]));
+        }
+    }
+    let input = write_png(dir.path(), "flat.png", &img);
+    let output = dir.path().join("out.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--optimize",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    assert!(
+        has_warning(&v, "OPTIMIZE_NO_CLEAN_CANDIDATE"),
+        "{:?}",
+        warning_codes(&v)
+    );
+    assert!(
+        v["optimize"]["chosen"]["score"]["fatal"].as_u64().unwrap() > 0,
+        "警告は出ているのに fatal が 0: {}",
+        v["optimize"]["chosen"]
+    );
+    let warning = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "OPTIMIZE_NO_CLEAN_CANDIDATE")
+        .unwrap();
+    let remaining = warning["data"]["remaining"].as_array().unwrap();
+    assert!(
+        !remaining.is_empty(),
+        "残った code を載せていない: {warning}"
+    );
+    // **矩形の勧めは「手詰まり」に数えない。** BBOX_RECOMMENDED は矩形つきで
+    // 次の一手を言っているので、ここに混ぜると「その矩形を渡せ」と
+    // 「撮り直せ」が同じ結果に並ぶ
+    assert!(
+        !remaining.iter().any(|c| c == "BBOX_RECOMMENDED"),
+        "矩形の勧めを手詰まりの理由に混ぜている: {warning}"
+    );
+}
+
+/// `kiri schema` が `--optimize` と新しい code を配る。
+///
+/// **エージェントはまず schema を読む。** 載っていない code が飛んでくると、
+/// 受け手は分岐を書きようがない。
+#[test]
+fn schema_publishes_the_optimize_option_and_its_warning() {
+    let v = schema_json();
+    let cutout = v["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "cutout")
+        .expect("cutout がある");
+    let option = cutout["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["name"] == "--optimize")
+        .unwrap_or_else(|| panic!("--optimize が schema に無い: {cutout}"));
+    assert_eq!(option["takes_value"], false, "フラグである");
+    assert!(
+        option["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("OPTIMIZE_NO_CLEAN_CANDIDATE"),
+        "長いヘルプが code を案内していない: {option}"
+    );
+    assert!(
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == "OPTIMIZE_NO_CLEAN_CANDIDATE"),
+        "警告の一覧に code が無い"
+    );
+}
+
+/// 明示した `--bbox` と `--background-model` も探索の軸から外れる。
+///
+/// **3 つの軸は別々の id で `ValueSource` を引いている。** 綴りを 1 つ外しても
+/// clap は `None` を返すだけなので（未知の id で panic しない）、経路が切れても
+/// 「明示した値が黙って探索される」という形でしか現れない。`--tolerance` は
+/// `an_explicit_tolerance_is_not_searched` が見ているので、残る 2 つをここで見る。
+#[test]
+fn an_explicit_bbox_and_background_model_are_not_searched() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    let candidates = |extra: &[&str]| -> Vec<Value> {
+        let mut args = vec![
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--optimize",
+            "--json",
+            "--force",
+        ];
+        args.extend_from_slice(extra);
+        let out = kiri().args(&args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        json_stdout(&out)["optimize"]["candidates"]
+            .as_array()
+            .unwrap()
+            .clone()
+    };
+
+    let boxed = candidates(&["--bbox", "10,10,180,180"]);
+    assert!(
+        boxed
+            .iter()
+            .all(|c| c["bbox"] == serde_json::json!([10, 10, 180, 180])),
+        "--bbox を明示したのに別の矩形を試した: {boxed:?}"
+    );
+
+    // **既定値と同じ `auto` を明示した場合も外れる。** `--background-model` は
+    // `default_value_t` を持つので、値だけでは明示と既定を区別できない
+    for model in ["flat", "auto"] {
+        let got = candidates(&["--background-model", model]);
+        assert!(
+            got.iter().all(|c| c["background_model"] == model),
+            "--background-model {model} を明示したのに別のモデルを試した: {got:?}"
+        );
+    }
+}
+
+/// 順位の第 1 項は「出た警告の数」ではなく「それ + 前景比率の崩れ」である。
+///
+/// **`score.fatal` は警告の数だけを出す。** `OPTIMIZE_NO_CLEAN_CANDIDATE` が
+/// 数える対象と同じものでなければ、`fatal > 0` なのに警告が出ない状態が生まれ、
+/// schema の notes（0 でなければ同時に出る）がそのまま嘘になる。
+#[test]
+fn the_collapse_flag_is_reported_apart_from_the_warning_count() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--optimize",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+
+    let fatal_codes: Vec<&str> = kiri::cutout::optimize::FATAL_CODES
+        .iter()
+        .map(|c| c.as_str())
+        .collect();
+    for c in v["optimize"]["candidates"].as_array().unwrap() {
+        assert!(c["collapsed"].is_boolean(), "collapsed が真偽ではない: {c}");
+        let counted = c["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|w| fatal_codes.contains(&w.as_str().unwrap()))
+            .count();
+        assert_eq!(
+            c["score"]["fatal"].as_u64().unwrap() as usize,
+            counted,
+            "score.fatal が出た警告の数と食い違う: {c}"
+        );
+    }
+    // 契約の側（schema）が数える code の一覧と実装が揃っていること
+    let notes = fields_of(&schema_json())
+        .into_iter()
+        .find(|f| f["path"] == "optimize.chosen.score.fatal")
+        .expect("optimize.chosen.score.fatal がある")["notes"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for code in &fatal_codes {
+        assert!(
+            notes.contains(code),
+            "schema が数える code に {code} が載っていない: {notes}"
+        );
+    }
+    // **順位の致命と警告の致命は別である。** 0 でなくても
+    // OPTIMIZE_NO_CLEAN_CANDIDATE が出るとは限らないことを notes が言うこと
+    assert!(
+        notes.contains("OPTIMIZE_NO_CLEAN_CANDIDATE が出るとは限らない"),
+        "fatal と警告の関係が誤って読める notes: {notes}"
+    );
+}
+
+/// **綺麗な候補に当たったら原寸で 1 回しか回さない。**
+///
+/// 原寸 1 回が 24.5MP で数秒あるので、早期打ち切りが所要時間の要である。
+/// `stage` が `final` の候補の数がそのまま「原寸で回した回数」なので、
+/// そこを固定すれば打ち切りが効いているかを結果 JSON だけで読める。
+#[test]
+fn a_clean_scene_only_runs_one_candidate_at_full_size() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        noise: false,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--optimize",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    let candidates = v["optimize"]["candidates"].as_array().unwrap();
+    let finals = candidates.iter().filter(|c| c["stage"] == "final").count();
+    assert_eq!(
+        finals, 1,
+        "綺麗な素材なのに原寸で 2 回回している: {}",
+        v["optimize"]
+    );
+    assert_eq!(v["optimize"]["chosen"]["stage"], "final");
+    // 打ち切ったのだから、選ばれた候補には致命も品質の警告も無いはず
+    assert_eq!(v["optimize"]["chosen"]["score"]["fatal"], 0);
+    assert_eq!(v["optimize"]["chosen"]["collapsed"], false);
+}
+
+/// **1 位が原寸で商品を飲んだら打ち切らず、2 位まで回す。**
+///
+/// 商品を飲んだ結果は警告を 1 つも出さずに指標だけ良くなるので、`warnings`
+/// だけを見ていると 1 つ目で止まってしまう。崩れは「同じ候補の探索段の
+/// 前景比率」と比べて初めて分かる。
+///
+/// 背景と商品の色差を小さく取ると、許容量を上げた候補が商品ごと飲む。
+/// 原寸でだけ飲むかどうかは素材次第なので、ここで問うのは
+/// **「綺麗でない候補が 1 位なら 2 つ目も回す」**という打ち切りの条件そのもの。
+#[test]
+fn a_finalist_that_is_not_clean_does_not_stop_the_final_stage() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        background: [200, 198, 196],
+        product: [168, 166, 164],
+        noise: true,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--optimize",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    let candidates = v["optimize"]["candidates"].as_array().unwrap();
+    let finals: Vec<&Value> = candidates
+        .iter()
+        .filter(|c| c["stage"] == "final")
+        .collect();
+    assert_eq!(
+        finals.len(),
+        2,
+        "綺麗でない 1 位で打ち切っている: {}",
+        v["optimize"]
+    );
+    // 上限は `FINALISTS`。ここが増えると 24.5MP で所要時間が目標を超える
+    assert_eq!(finals.len(), kiri::cutout::optimize::FINALISTS);
+    assert!(
+        candidates[0]["stage"] == "final" && candidates[1]["stage"] == "final",
+        "原寸で回すのは探索段の上位から順のはず: {}",
+        v["optimize"]
+    );
+}
+
+/// `--trimap` と `--optimize` を同時に渡せること。
+///
+/// **探索段は縮小版で回るので、画素ごとの指示も縮めて渡さなければならない**
+/// （`Constraints::resampled`）。そこが切れていれば、指示を渡した実行で
+/// 探索だけが指示の無い世界を見ることになる。寸法の食い違いは
+/// `foreground_mask` の規約で黙って無視されるので、**落ちずに静かに間違う。**
+#[test]
+fn a_trimap_survives_the_optimize_search() {
+    let dir = fixture_dir();
+    let input = constraint_fixture(dir.path());
+    let output = dir.path().join("cut.png");
+
+    let mut trimap = image::RgbaImage::from_pixel(200, 200, image::Rgba([128, 128, 128, 255]));
+    paint(&mut trimap, (0, 0, 199, 19), 0);
+    paint(&mut trimap, (0, 180, 199, 199), 0);
+    paint(&mut trimap, (70, 70, 129, 129), 255);
+    let path = write_png(dir.path(), "trimap.png", &trimap);
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--trimap",
+            path.to_str().unwrap(),
+            "--optimize",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    // 指示は原寸のまま報告される（最終段は原寸の指示そのままで回る）
+    assert_eq!(v["constraints"]["sources"][0], "trimap");
+    assert!(v["constraints"]["fg_ratio"].as_f64().unwrap() > 0.0);
+    assert!(v["constraints"]["bg_ratio"].as_f64().unwrap() > 0.0);
+    // 探索も走っている。指示と探索は排他ではない
+    assert!(v["optimize"]["candidates"].as_array().unwrap().len() > 1);
+    assert_eq!(v["settings"]["optimize"], true);
+    // 確定前景は不透明のまま、確定背景は透明
+    let cut = image::open(&output).unwrap().to_rgba8();
+    assert_eq!(cut.get_pixel(100, 100)[3], 255, "確定前景が削られている");
+    assert_eq!(cut.get_pixel(5, 5)[3], 0, "確定背景が残っている");
 }

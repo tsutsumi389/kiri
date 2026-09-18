@@ -498,6 +498,226 @@ fn fields() -> Vec<FieldEntry> {
             ),
         },
         FieldEntry {
+            path: "settings.optimize",
+            appears_in: vec!["cutout"],
+            unit: "bool",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "--optimize を渡したか",
+            notes: Some(
+                "true なら settings.tolerance / settings.background_model / applied_bbox は\
+                 kiri が探索して選んだ値である（渡した値ではない）。何を試したかは \
+                 optimize.candidates[]、選ばれた理由は optimize.chosen.score が言う。\
+                 **明示した軸は探索しない**——--tolerance 30 --optimize なら候補の \
+                 tolerance は全部 30 になる。false のときの成果物の画素は --optimize を\
+                 足す前と 1 バイトも変わらない（報告 JSON にはこの 1 キーだけが増える。\
+                 schema_version は据え置き）",
+            ),
+        },
+        FieldEntry {
+            path: "optimize.candidates",
+            appears_in: vec!["cutout"],
+            unit: "list",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "試した全候補。並びは探索段（縮小版）の順位のまま",
+            notes: Some(
+                "**探索が走ったときだけ optimize ブロックごと現れる。** 各候補の \
+                 tolerance / bbox / background_model はそのまま --tolerance / --bbox / \
+                 --background-model へ写せる（bbox は原寸の画素座標）。2 位のほうが\
+                 目的に合うなら、その値を明示指定して回し直せばよい",
+            ),
+        },
+        FieldEntry {
+            path: "optimize.candidates[].stage",
+            appears_in: vec!["cutout"],
+            unit: "enum",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "その候補をどの寸法で回したか（search / final）",
+            notes: Some(
+                "search は縮小版（optimize.searched_at px）を境界処理（refine）抜きで\
+                 回した候補で、final は原寸・利用者の設定そのままで回し直した候補である\
+                 （指標は原寸の値に上書きされる）。\
+                 **search の halo_ratio / contour_roughness / rim_contamination / \
+                 touches_edge は参考値で、順位には使っていない**——refine を抜くと縁に\
+                 背景が残るため、実測で rim が 4〜6 倍、粗さが 3〜5 倍に膨らみ、しかも\
+                 倍率が候補ごとに違う（寸法の換算では戻せない）。外周接触も同じ理由で\
+                 search でだけ出る。search の順位を決めるのは NOT_SEPARABLE / \
+                 FOREGROUND_TOO_SMALL / FOREGROUND_TOO_LARGE の数 + collapsed と、\
+                 refine にも寸法にもほとんど依らない separability だけである。\
+                 **2 つの stage の数値を直接比べないこと。** 原寸どうしの比較は final の\
+                 候補どうしでだけ成り立つ",
+            ),
+        },
+        FieldEntry {
+            path: "optimize.chosen.score.fatal",
+            appears_in: vec!["cutout"],
+            unit: "count",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "選ばれた候補に残った致命的な警告の数",
+            notes: Some(
+                "数えるのは NOT_SEPARABLE / FOREGROUND_TOO_SMALL / FOREGROUND_TOO_LARGE / \
+                 SUBJECT_TOUCHES_EDGE / BBOX_RECOMMENDED の 5 つ。最後の 2 つは\
+                 「前景が外周に接している」という同じ事実の別の読み方なので、同じ重さで数える。\
+                 **最終段（stage=final）の順位を決める第 1 項はこの数 + \
+                 optimize.candidates[].collapsed** で、崩れは警告 code を持たないぶん\
+                 ここには現れない（少ないほど良い）。探索段はこのうち refine に依らない\
+                 3 つだけを数える（optimize.candidates[].stage を参照）。\
+                 **0 でなくても OPTIMIZE_NO_CLEAN_CANDIDATE が出るとは限らない。** \
+                 残ったのが BBOX_RECOMMENDED だけなら出ない——あちらが矩形つきで\
+                 次の一手を言っているので、重ねて「撮り直せ」とは言わない。警告が\
+                 数えるのは残り 4 つで、その code は warnings[].data.remaining に出る",
+            ),
+        },
+        FieldEntry {
+            path: "optimize.candidates[].collapsed",
+            appears_in: vec!["cutout"],
+            unit: "bool",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "同じ列で許容量を 1 段上げたときに、前景比率が 3 割を超えて落ちた候補か",
+            notes: Some(
+                "列は「同じ bbox・同じ background_model」で、その中を tolerance の昇順に見る。\
+                 **淡い色の商品が背景ごと飲まれた候補を捕まえるためにある**——飲まれた結果は \
+                 halo_ratio と rim_contamination が減った良い数値として現れ、警告は 1 つも出ない。\
+                 順位の上では致命的な警告 1 つと同じ重さで扱うが、score.fatal には足さない",
+            ),
+        },
+        FieldEntry {
+            path: "optimize.chosen.score.quality",
+            appears_in: vec!["cutout"],
+            unit: "ratio",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "品質の重み和。小さいほど良い（最終段で fatal と unmeasured が同数のときに比べる）",
+            notes: Some(
+                "rim_contamination / contour_roughness / halo_ratio を、それぞれの警告\
+                 しきい値で割って足したもの。**3.0 が「3 つとも警告ちょうど」**にあたり、\
+                 0 に近いほど良い。測れなかった項（null）はしきい値ちょうど（1.0）として\
+                 数える——0 と扱うと、測れなかった候補が最良として勝ってしまう。\
+                 **ただし 1.0 でも足りないので、重み和より先に score.unmeasured\
+                 （測れなかった項の数、0-3）を見る。** 診断が 3 つとも null になるのは\
+                 たいてい測る対象の境界が無いからで、そういう候補が重み和 2〜3 で\
+                 中位に紛れ込む（前景比率 0.0001 のほぼ空のマスクが実際に上位へ来ていた）。\
+                 境界を測れる候補は測れない候補に勝つ。同点なら separability（大きいほど\
+                 良い）、さらに同点なら小さい tolerance、bbox 無し、auto の順で選ぶ。\
+                 **この順序は最終段のもので、探索段は separability だけを見る**\
+                 （optimize.candidates[].stage を参照）",
+            ),
+        },
+        FieldEntry {
+            path: "optimize.searched_at",
+            appears_in: vec!["cutout"],
+            unit: "px",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "探索段で使った長辺(px)",
+            notes: Some(
+                "全候補はこの寸法で、境界処理（refine）抜きに回す。元の長辺がこれより\
+                 小さければ元の寸法がそのまま入る。上位の候補だけを原寸で回し直すので、\
+                 stage が final の候補の指標は原寸のものである",
+            ),
+        },
+        FieldEntry {
+            path: "settings.shadow",
+            appears_in: vec!["cutout"],
+            unit: "enum",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "落ち影を合成したか（off / synth）",
+            notes: Some(
+                "**--shadow-tolerance とは向きが逆である。** あちらは実写に写っている影を背景として\
+                 消す側で、こちらは消した後のアルファから影を作り直す側になる。off（既定）なら\
+                 成果物の画素は --shadow を足す前と 1 バイトも変わらず、shadow ブロックも現れない\
+                 （schema_version は据え置き）。実際に効いたずらし量とぼかしは shadow.offset / \
+                 shadow.blur のほう",
+            ),
+        },
+        FieldEntry {
+            path: "shadow.offset",
+            appears_in: vec!["cutout"],
+            unit: "px",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "影を実際にずらした量 [dx, dy]",
+            notes: Some(
+                "**指定値ではない。** --shadow-offset は長辺 1000px 換算で、基準は最終画像の長辺\
+                 （--canvas があればキャンバスの長辺、無ければ元画像の長辺）である。24.5MP の\
+                 素材に既定の 0,12 を渡すと 0,69 になる。負値は上・左へ出したことを意味する",
+            ),
+        },
+        FieldEntry {
+            path: "shadow.blur",
+            appears_in: vec!["cutout"],
+            unit: "px",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "影に実際に掛けたぼかしの σ",
+            notes: Some(
+                "shadow.offset と同じく長辺 1000px 換算からの掛け戻し。0 ならぼかしていない。\
+                 箱型フィルタ 3 回の近似なので、値をいくつにしても所要時間は変わらない",
+            ),
+        },
+        FieldEntry {
+            path: "shadow.bounds",
+            appears_in: vec!["cutout"],
+            unit: "px",
+            nullable: true,
+            null_means: Some("影が 1 画素も残らなかった。矩形が空（面積 0）ではない"),
+            warns: vec![],
+            gates: None,
+            summary: "影のアルファが 0 より大きい画素の外接矩形 [x1, y1, x2, y2]",
+            notes: Some(
+                "商品ではなく影の占める範囲である。--shadow-opacity 0 や、ずらし量が画像より\
+                 大きいときに null になる。どちらだったかは shadow.clipped が分ける\
+                 （前者は false、後者は true）",
+            ),
+        },
+        FieldEntry {
+            path: "shadow.clipped",
+            appears_in: vec!["cutout"],
+            unit: "bool",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "影の一部が画像（またはキャンバス）の外にあるか",
+            notes: Some(
+                "**最終の影のアルファで決める。** ずらしただけで画像の外へ落ちた画素があるか、\
+                 外周の 1 列・1 行に影が残っている（= その先へ続いていた）ときに true になる。\
+                 ぼかしの台が縁を跨いだかどうかでは決めない——箱型の台は約 3σ あるので、\
+                 裾が丸めで消えている場合まで true になってしまう。\
+                 **shadow.bounds が null でも true になりうる**——ずらし量が画像より大きければ\
+                 影は 1 画素も残らないが、それは「影を置かなかった」のではなく「全部はみ出した」\
+                 である。--shadow-opacity 0 は影を置かない指定なので必ず false。\
+                 true のときに影を収めたければ --canvas を広げるか、--shadow-offset / \
+                 --shadow-blur を小さくする——**商品は影のために動かさない**ので、kiri が\
+                 勝手に縮めることはない",
+            ),
+        },
+        FieldEntry {
             path: "mask.foreground_ratio",
             appears_in: vec!["cutout"],
             unit: "ratio",

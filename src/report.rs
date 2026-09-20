@@ -465,6 +465,13 @@ pub struct SettingsReport {
     /// 落ち影を合成したか（"off" / "synth"）。**常に出す。**
     /// 実際に効いたずらし量とぼかしは `shadow` ブロックのほう
     pub shadow: &'static str,
+    /// `--rotate` の**指定値**(度)。**常に出す。**
+    ///
+    /// `shadow` と同じ二段構えである。実際に効いた角度は `rotate.angle`
+    /// （`[0, 360)` へ正規化したもの）で、回らなかった指定——`0` と `360`——
+    /// では `rotate` ブロックごと現れない。**ここが無いと、`--rotate 360` を
+    /// 渡した実行と渡さなかった実行の JSON が 1 バイトも違わない**
+    pub rotate: f64,
     /// `--segment` の**指定値**（"off" / "auto" / "isnet"）
     pub segment: &'static str,
     /// 実際にモデルが走ったか。**`auto` では指定値から読めない**——
@@ -610,6 +617,11 @@ pub struct CutoutReport {
     /// 探索が走ったときだけ出る。`--optimize` 無しではキーごと無い
     #[serde(skip_serializing_if = "Option::is_none")]
     pub optimize: Option<OptimizeReport>,
+    /// `--rotate` で回したときだけ出る。既定（0 度）ではキーごと無い。
+    /// **`mask` / `background` / `subject` の座標は回す前のもの**で、
+    /// ここに出る角度はそれらを測った後に掛かった変換である
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotate: Option<RotateReport>,
     pub mask: MaskReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canvas: Option<CanvasReport>,
@@ -661,6 +673,14 @@ pub struct BatchReport {
 pub struct SchemaReport {
     pub schema_version: u32,
     pub kiri_version: &'static str,
+    /// この build が `--segment` を走らせられるか（feature `segment` の有無）。
+    ///
+    /// **契約を 1 回引けば分かるようにする。** ここが無いと、エージェントは
+    /// `--segment isnet` を渡して `SEGMENT_UNAVAILABLE` を踏むか、
+    /// `kiri model list` をもう 1 度呼ぶまで判断できない。`commands[]` には
+    /// `--segment` の綴りが feature の有無によらず並ぶので、**綴りが載って
+    /// いることは走らせられることを意味しない**
+    pub segment_available: bool,
     pub exit_codes: Vec<ExitCodeEntry>,
     pub errors: Vec<ErrorCodeEntry>,
     pub warnings: Vec<WarningCodeEntry>,

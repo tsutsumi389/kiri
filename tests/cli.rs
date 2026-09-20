@@ -6836,6 +6836,28 @@ fn every_published_field_exists_in_the_result() {
         "--json",
         "--optimize",
     ]);
+    // **`rotate` も回したときだけ現れる。** `cutout --rotate` と `kiri rotate` の
+    // 両方が同じブロックを返すので、`appears_in` が名指しする 2 つとも用意する
+    let rotated = run(&[
+        "cutout",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--dry-run",
+        "--json",
+        "--rotate",
+        "90",
+    ]);
+    let turned = run(&[
+        "rotate",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--dry-run",
+        "--json",
+        "--angle",
+        "90",
+    ]);
     // **`shadow` も合成したときだけ現れる。** 既定の実行で探すと「配った path が
     // 存在しない」になるので、影を足した実行も用意する（`constraints` と同じ扱い）
     let shadowed = run(&[
@@ -6897,6 +6919,8 @@ fn every_published_field_exists_in_the_result() {
                 "cutout" if path.starts_with("constraints.") => &constrained,
                 "cutout" if path.starts_with("optimize.") => &optimized,
                 "cutout" if path.starts_with("shadow.") => &shadowed,
+                "cutout" if path.starts_with("rotate.") => &rotated,
+                "rotate" => &turned,
                 "cutout" => &cutout,
                 other => panic!("{path} が未知のコマンド {other} を名指ししている"),
             };
@@ -7756,4 +7780,352 @@ fn a_trimap_survives_the_optimize_search() {
     let cut = image::open(&output).unwrap().to_rgba8();
     assert_eq!(cut.get_pixel(100, 100)[3], 255, "確定前景が削られている");
     assert_eq!(cut.get_pixel(5, 5)[3], 0, "確定背景が残っている");
+}
+
+// --- cutout --rotate ---
+
+/// 切り抜きと回転を 1 本の実行に畳む。
+///
+/// **順序は 切り抜き → 回転 → キャンバス → 影 で固定である。** `kiri rotate` で
+/// 先に回してから `cutout` へ流すと、回転が四隅に作った透過の余白が外周に乗り、
+/// 背景推定がそれを背景色の標本として数える。
+#[test]
+fn cutout_rotates_after_it_cuts_and_reports_the_angle() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 240,
+        height: 160,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("cut.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--rotate",
+            "90",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let v = json_stdout(&out);
+    assert_eq!(v["rotate"]["angle"], 90.0);
+    assert_eq!(v["rotate"]["resampled"], false, "90 度単位は補間し直さない");
+    // 出力の縦横が入れ替わっている
+    assert_eq!(v["outputs"][0]["width"], 160);
+    assert_eq!(v["outputs"][0]["height"], 240);
+    // 入力の寸法は回す前のまま
+    assert_eq!(v["source"]["width"], 240);
+    assert_eq!(v["source"]["height"], 160);
+}
+
+/// 負値は反時計回り。`kiri rotate` と同じく `[0, 360)` へ正規化して返す。
+#[test]
+fn cutout_normalizes_a_negative_rotation() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 160,
+        height: 120,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            dir.path().join("cut.png").to_str().unwrap(),
+            "--rotate",
+            "-90",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(json_stdout(&out)["rotate"]["angle"], 270.0);
+}
+
+/// 回さなかった実行は `rotate` ブロックを持たない。
+///
+/// `canvas` / `shadow` と同じ規約で、「回さなかった」と「回せない（古い版）」を
+/// `null` で混ぜない。`--rotate 360` は恒等変換なので回した側に数えない。
+#[test]
+fn cutout_without_a_rotation_has_no_rotate_block() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    for extra in [vec![], vec!["--rotate", "360"]] {
+        let output = dir.path().join(format!("cut{}.png", extra.len()));
+        let mut args = vec![
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--json",
+        ];
+        args.extend_from_slice(&extra);
+        let out = kiri().args(&args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            json_stdout(&out).get("rotate").is_none(),
+            "回していない実行に rotate ブロックが出ている: {extra:?}"
+        );
+    }
+}
+
+/// 回してからキャンバスへ載せる。**キャンバスの寸法は指定どおりに収まる。**
+///
+/// 逆順（載せてから回す）だと外接矩形が広がって指定の寸法を割る。
+#[test]
+fn cutout_places_the_rotated_subject_on_the_canvas() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 140,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("cut.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--rotate",
+            "30",
+            "--canvas",
+            "400x400",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let v = json_stdout(&out);
+    assert_eq!(v["rotate"]["angle"], 30.0);
+    assert_eq!(
+        v["rotate"]["resampled"], true,
+        "90 度単位でなければ補間する"
+    );
+    assert_eq!(v["outputs"][0]["width"], 400);
+    assert_eq!(v["outputs"][0]["height"], 400);
+    assert_eq!(v["canvas"]["width"], 400);
+
+    // 四隅は余白のまま。回した外接矩形が中央へ載っている
+    let placed = image::open(&output).unwrap().to_rgba8();
+    assert_eq!(placed.get_pixel(0, 0)[3], 0);
+    assert_eq!(placed.get_pixel(399, 399)[3], 0);
+}
+
+/// spec からも同じ角度を書ける。**CLI と同じ 1 本の経路を通る。**
+#[test]
+fn the_batch_spec_accepts_a_rotation() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 140,
+        ..Default::default()
+    });
+    write_png(dir.path(), "a.png", &img);
+    let spec = write_spec(
+        dir.path(),
+        r#"{"defaults":{"format":"png"},
+            "items":[{"input":"a.png","output":"out/a.png","rotate":90},
+                     {"input":"a.png","output":"out/b.png","rotate":-90}]}"#,
+    );
+
+    let out = run_batch(&spec, &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    assert_eq!(v["succeeded"], 2);
+    assert_eq!(v["results"][0]["result"]["rotate"]["angle"], 90.0);
+    // 負値は反時計回り。CLI と同じ正規化を通る
+    assert_eq!(v["results"][1]["result"]["rotate"]["angle"], 270.0);
+    assert_eq!(v["results"][0]["result"]["outputs"][0]["width"], 140);
+}
+
+/// 有限でない角度は spec へ書けない。**CLI の `finite` と同じ関門である。**
+///
+/// JSON に nan は書けず、桁が溢れた指数は JSON の段で断られる。`angle` の
+/// `is_finite` は（`offset` と同じく）そこを抜けてきた場合の受け皿として
+/// 残してある——spec を組み立てる経路が増えたときに黙って通らないように。
+#[test]
+fn the_batch_spec_rejects_an_angle_that_is_not_finite() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        ..Default::default()
+    });
+    write_png(dir.path(), "a.png", &img);
+    let spec = write_spec(
+        dir.path(),
+        r#"{"items":[{"input":"a.png","output":"out.png","rotate":1e999}]}"#,
+    );
+
+    let out = run_batch(&spec, &[]);
+    assert!(!out.status.success());
+    assert_eq!(json_stdout(&out)["error"]["code"], "SPEC_INVALID_JSON");
+}
+
+/// 数値でない角度は仕様の構造の検査で落ちる。
+#[test]
+fn the_batch_spec_rejects_an_angle_that_is_not_a_number() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        ..Default::default()
+    });
+    write_png(dir.path(), "a.png", &img);
+    let spec = write_spec(
+        dir.path(),
+        r#"{"items":[{"input":"a.png","output":"out.png","rotate":"90"}]}"#,
+    );
+
+    let out = run_batch(&spec, &[]);
+    assert!(!out.status.success());
+    assert_eq!(json_stdout(&out)["error"]["code"], "SPEC_INVALID");
+}
+
+/// 影の換算基準は**回した後の長辺**である。
+///
+/// 任意角で回すと外接矩形は必ず元より大きくなる（45 度なら約 1.41 倍）。
+/// そこを元画像の長辺で換算すると、回した実行でだけ影が小さく出る。
+#[test]
+fn the_shadow_scales_against_the_rotated_long_side() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 240,
+        height: 160,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let dy = |extra: &[&str], name: &str| -> f64 {
+        let output = dir.path().join(name);
+        let mut args = vec![
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--shadow",
+            "synth",
+            "--shadow-offset",
+            "0,400",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        let out = kiri().args(&args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        json_stdout(&out)["shadow"]["offset"][1].as_f64().unwrap()
+    };
+
+    // 回さなければ元画像の長辺 240 が基準（400 * 0.240 = 96）
+    let flat = dy(&[], "flat.png");
+    assert_eq!(flat, 96.0);
+
+    // 45 度回すと外接矩形は 283x283 になり、基準もそちらへ移る
+    let turned = dy(&["--rotate", "45"], "turned.png");
+    assert!(
+        turned > flat,
+        "回した後の長辺で換算していない: {turned} vs {flat}"
+    );
+}
+
+/// キャンバスへ載せる範囲の定義は**回転の有無で変わらない**。
+///
+/// 透過つき PNG を入力にすると、マスクは立っているのに画素は透明という
+/// 画素が出る（`apply_alpha` は元画像の透過と小さいほうを採る）。マスクと
+/// アルファで定義を分けていると、同じ画像が `--rotate 0` と `--rotate 90` で
+/// 違う切り詰め方をされる。
+#[test]
+fn the_canvas_trims_by_the_same_rule_with_and_without_a_rotation() {
+    let dir = fixture_dir();
+    // 外周を透明にした入力。マスクは立ちうるが、見えない余白である
+    let mut img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    for (x, y, pixel) in img.enumerate_pixels_mut() {
+        if x < 20 || y < 20 || x >= 180 || y >= 180 {
+            pixel[3] = 0;
+        }
+    }
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let content = |angle: &str, name: &str| -> (u64, u64) {
+        let output = dir.path().join(name);
+        let out = kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--canvas",
+                "400x400",
+                "--rotate",
+                angle,
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let v = json_stdout(&out);
+        (
+            v["canvas"]["content"][0].as_u64().unwrap(),
+            v["canvas"]["content"][1].as_u64().unwrap(),
+        )
+    };
+
+    let (w, h) = content("0", "flat.png");
+    let (rw, rh) = content("90", "turned.png");
+    assert_eq!(
+        (rw, rh),
+        (h, w),
+        "90 度回しただけで、載せた中身の縦横が入れ替わる以上の差が出ている"
+    );
 }

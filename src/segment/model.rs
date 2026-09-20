@@ -17,6 +17,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, ErrorCode, Result};
+use crate::warning::{Warning, WarningCode};
 
 /// 既知のモデル 1 件。**表はここにしか無い。**
 ///
@@ -184,7 +185,18 @@ pub fn resolve_path(model: &KnownModel, explicit: Option<&Path>) -> Result<PathB
 ///
 /// tract が解析に失敗した場合も `MODEL_UNREADABLE` になる（`isnet.rs`）。
 /// 大きさが合っていて中身が壊れている場合の受け皿はそちらである。
-pub fn check_size(model: &KnownModel, path: &Path) -> Result<()> {
+///
+/// # `--model-path` で指されたファイルは断らない
+///
+/// **大きさが違っても通し、警告に落とす。** `--model-path` を渡した時点で
+/// 利用者は「このファイルを使う」と決めている——自分で微調整した ISNet や、
+/// 同じ構造の別の重みがそれである。既知のバイト数しか受けないと、kiri の表に
+/// 載っているファイル以外は一切使えない。
+///
+/// 既定の置き場所から拾った場合は今までどおり断る。そちらは利用者が選んだ
+/// ファイルではなく「kiri が探し当てたもの」なので、想定と違えば取得が途中で
+/// 切れている疑いのほうが強い。
+pub fn check_size(model: &KnownModel, path: &Path, explicit: bool) -> Result<Option<Warning>> {
     let actual = std::fs::metadata(path)
         .map_err(|e| {
             Error::new(
@@ -194,7 +206,29 @@ pub fn check_size(model: &KnownModel, path: &Path) -> Result<()> {
         })?
         .len();
     if actual == model.bytes {
-        return Ok(());
+        return Ok(None);
+    }
+    if explicit {
+        return Ok(Some(
+            Warning::new(
+                WarningCode::ModelSizeUnexpected,
+                format!(
+                    "{} は {} バイトで、{} の想定 {} バイトと違いますが、--model-path の指定を \
+                     優先してそのまま読みます",
+                    path.display(),
+                    actual,
+                    model.name,
+                    model.bytes
+                ),
+            )
+            .with_hint(
+                "想定どおりのファイルのはずなら取得が途中で切れています。\
+                 kiri model list でダイジェストを突き合わせてください",
+            )
+            .with_data("path", path.display().to_string())
+            .with_data("actual_bytes", actual)
+            .with_data("expected_bytes", model.bytes),
+        ));
     }
     Err(Error::new(
         ErrorCode::ModelUnreadable,
@@ -333,5 +367,52 @@ mod tests {
         assert!(hint.contains("curl -L"), "{hint}");
         assert!(hint.contains(ISNET.url), "{hint}");
         assert!(hint.contains(ISNET.file_name), "{hint}");
+    }
+
+    /// `--model-path` で指したファイルは、大きさが違っても通り警告になる。
+    ///
+    /// **渡した時点で利用者は「これを使う」と決めている。** 自分で微調整した
+    /// ISNet や同じ構造の別の重みを断ると、表に載っているファイル以外は
+    /// 一切使えないことになる。
+    #[test]
+    fn an_explicit_model_path_of_another_size_warns_instead_of_failing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("mine.onnx");
+        std::fs::write(&path, b"not the published weights").unwrap();
+
+        let warning = check_size(&ISNET, &path, true)
+            .expect("--model-path は断らない")
+            .expect("大きさが違えば警告が要る");
+        assert_eq!(warning.code.as_str(), "MODEL_SIZE_UNEXPECTED");
+        assert_eq!(warning.data["actual_bytes"], 25);
+        assert_eq!(warning.data["expected_bytes"], ISNET.bytes);
+    }
+
+    /// 既定の置き場所から拾ったファイルは今までどおり断る。
+    ///
+    /// そちらは利用者が選んだものではなく kiri が探し当てたもので、想定と
+    /// 違えば取得が途中で切れている疑いのほうが強い。
+    #[test]
+    fn a_discovered_model_of_another_size_is_still_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("isnet.onnx");
+        std::fs::write(&path, b"truncated").unwrap();
+
+        let err = check_size(&ISNET, &path, false).unwrap_err();
+        assert_eq!(err.code.as_str(), "MODEL_UNREADABLE");
+    }
+
+    /// 大きさが合っていれば、どちらの経路でも何も言わない。
+    #[test]
+    fn a_model_of_the_published_size_says_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("isnet.onnx");
+        // 176MB は置けないので、想定バイト数だけを持つ疎ファイルを作る
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(ISNET.bytes).unwrap();
+        drop(file);
+
+        assert!(check_size(&ISNET, &path, false).unwrap().is_none());
+        assert!(check_size(&ISNET, &path, true).unwrap().is_none());
     }
 }

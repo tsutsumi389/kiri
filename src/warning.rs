@@ -81,6 +81,10 @@ warning_catalog! {
         => "--optimize が候補をすべて試しても致命的な警告が残った（調整では解けない）",
     SegmentUncertain = "SEGMENT_UNCERTAIN"
         => "モデルが対象を掴めておらず、不明の帯が広すぎる（結果は --segment off に近づく）",
+    ModelPathIgnored = "MODEL_PATH_IGNORED"
+        => "--model-path を渡したが --segment off なのでモデルを読んでいない",
+    ModelSizeUnexpected = "MODEL_SIZE_UNEXPECTED"
+        => "--model-path のファイルが既知のモデルと大きさが違う（指定を尊重してそのまま読んだ）",
     CanvasUpscaled = "CANVAS_UPSCALED"
         => "キャンバス配置で商品を拡大した",
     Upscaled = "UPSCALED"

@@ -196,6 +196,9 @@ fn to_cutout_args(
             .unwrap_or([0, 0, 0]),
         shadow_opacity: ratio(settings.shadow_opacity, 0.25, "shadow_opacity")?,
         seal,
+        // **角度だけは負値を通す。** 反時計回りの指定であり、他の設定の
+        // ように「負値は機能が黙って消える」種類の誤りではない
+        rotate: angle(settings.rotate, 0.0, "rotate")?,
         canvas,
         fill_ratio: settings.fill_ratio.unwrap_or(0.85),
         debug_mask: None,
@@ -327,6 +330,19 @@ fn ratio(value: Option<f64>, default: f64, key: &str) -> Result<f64> {
         return Err(Error::new(
             ErrorCode::InvalidSetting,
             format!("{key} は 0.0 から 1.0 の範囲で指定してください（{value} が指定されました）"),
+        ));
+    }
+    Ok(value)
+}
+
+/// 角度に CLI と同じ関門を掛ける（`finite` の spec 版）。**負値は通す**
+/// （反時計回りの指定）。nan と無限大だけを断る。
+fn angle(value: Option<f64>, default: f64, key: &str) -> Result<f64> {
+    let value = value.unwrap_or(default);
+    if !value.is_finite() {
+        return Err(Error::new(
+            ErrorCode::InvalidSetting,
+            format!("{key} は有限な数値である必要があります（{value} が指定されました）"),
         ));
     }
     Ok(value)

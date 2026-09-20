@@ -484,6 +484,19 @@ fn print_cutout(report: &CutoutReport) {
     if report.mask.touches_edge {
         println!("  外周接触  あり");
     }
+    // 切り抜き → 回転 → キャンバス の順に並べる。**`前景範囲` は回す前の
+    // 座標**なので、そのすぐ後に「この後で回した」と言う位置がここである
+    if let Some(r) = &report.rotate {
+        println!(
+            "  回転      {}°  ({})",
+            r.angle,
+            if r.resampled {
+                "再サンプリング"
+            } else {
+                "無劣化"
+            }
+        );
+    }
     if let Some(c) = &report.canvas {
         println!(
             "  キャンバス {}x{}  占有率 {:.0}%  配置 {}x{} @ {},{}  (倍率 {:.2})",

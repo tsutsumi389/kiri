@@ -402,7 +402,7 @@ bbox の外は色によらず背景と確定されるため、その差がその
 |---|---|---|
 | `--border` | 2 | 背景色推定に使う外周の幅(px)。**`subject` の信頼度判定にも効く**（上記の較正は既定値が前提） |
 | `--segment` | off | `subject` をセグメンテーションモデルから測る。`off` / `auto` / `isnet`。**既定のビルドには入っていない**（[意味の事前知識](#意味の事前知識モデルに何を聞くか)） |
-| `--model-path PATH` | — | モデルの ONNX を直接指す。未指定なら `$KIRI_MODEL_DIR` > `$XDG_CACHE_HOME/kiri/models` > OS 既定のキャッシュ |
+| `--model-path PATH` | — | モデルの ONNX を直接指す。未指定なら `$KIRI_MODEL_DIR` > `$XDG_CACHE_HOME/kiri/models` > OS 既定のキャッシュ。**大きさが違うファイルも読む**（`MODEL_SIZE_UNEXPECTED`） |
 | `--no-color-convert` | | 埋め込み ICC を解釈せず、画素の値をそのまま使う |
 
 ### 色空間の扱い
@@ -605,8 +605,10 @@ rotated.jpg  2386x2533  jpeg  688.4 KB  (78 ms)
 | `--force` | | 出力先が既に存在する場合に上書きする |
 | `--dry-run` | | 書き出さずに結果だけ返す |
 
-**`batch` はまだ回転を受け付けない。** `batch` の spec は `cutout` の設定を
-並べるもので、回転はそこに無い。一括で回すなら `rotate` を個別に呼ぶこと。
+**一括で回すなら `cutout --rotate` を使う。** `kiri rotate` は回転だけを行う
+コマンドで、`batch` の spec は `cutout` の設定を並べるものである。切り抜きと
+回転を 1 本の実行に畳めば順序を間違えようがなくなるので、spec の `rotate` キーも
+`cutout --rotate` へ繋がっている（[切り抜いた後に回す](#切り抜いた後に回すrotate)）。
 
 ### kiri cutout
 
@@ -636,7 +638,7 @@ product.png  1600x2000  png  841.4 KB  (338 ms)
 | `--fg-polygon x1,y1,x2,y2,...` | — | 内部を確定前景にする多角形（3 点以上）。複数回指定可 |
 | `--bg-polygon x1,y1,x2,y2,...` | — | 内部を確定背景にする多角形（3 点以上）。複数回指定可 |
 | `--segment` | off | セグメンテーションモデルを粗マスクの供給源にする。`off` / `auto` / `isnet`。**既定のビルドには入っていない**（[意味の事前知識](#意味の事前知識モデルに何を聞くか)） |
-| `--model-path PATH` | — | モデルの ONNX を直接指す。未指定なら `$KIRI_MODEL_DIR` > `$XDG_CACHE_HOME/kiri/models` > OS 既定のキャッシュ |
+| `--model-path PATH` | — | モデルの ONNX を直接指す。未指定なら `$KIRI_MODEL_DIR` > `$XDG_CACHE_HOME/kiri/models` > OS 既定のキャッシュ。**大きさが違うファイルも読む**（`MODEL_SIZE_UNEXPECTED`） |
 | `--tolerance` | 12 | 背景色との色差(ΔE)の許容量 |
 | `--background-model` | auto | 背景を 1 色で持つか照明場 B(x, y) として持つか。`auto` / `flat` / `field`。`auto` は `background.uniformity` が 0.90 を下回るときだけ `field` を使う |
 | `--edge-threshold` | 8（自動調整あり） | 輪郭でフィルを止める勾配のしきい値。0 で無効。未指定なら、外周の勾配 p50 が 8 以上のときに p90 の 1.5 倍まで自動で引き上がる |
@@ -656,6 +658,7 @@ product.png  1600x2000  png  841.4 KB  (338 ms)
 | `--no-refine` | | 境界のアルファを色から推定し直さず、マスクの形から作る旧方式に戻す |
 | `--no-despill` | | 境界画素から背景色の寄与を取り除かない |
 | `--optimize` | | `tolerance` / `bbox` / `background-model` の組を総当たりし、指標で選ぶ（[探索を kiri に任せる](#探索を-kiri-に任せるoptimize)） |
+| `--rotate` | 0 | 切り抜いた**後に**時計回りへ回す角度(度)。負値は反時計回り。90 の倍数のみ無劣化（[切り抜いた後に回す](#切り抜いた後に回すrotate)） |
 | `--canvas WxH` | — | 商品をこのサイズのキャンバス中央に配置する。`1000` と書けば正方形 |
 | `--fill-ratio` | 0.85 | 商品がキャンバスの何割を占めるか |
 | `--flatten` | | 透過を残さず `--background` の色で塗り潰す |
@@ -1273,6 +1276,16 @@ $ cargo install --path . --features segment
 断る。**黙って `off` に落ちない**——モデルを使った結果だと思ったまま数値を読む
 ほうが害が大きい。
 
+**踏む前に知りたければ `kiri schema --json` の `segment_available` を見る。**
+`kiri model list` の同名のキーと同じ事実を指す。`commands[]` には `--segment` の
+綴りが feature の有無によらず並ぶので（断り方も契約である）、**綴りが載って
+いることは走らせられることを意味しない。**
+
+```
+$ kiri schema --json | jq .segment_available
+true
+```
+
 既定を off にした理由は 2 つある。
 
 1. **MSRV。** `tract-onnx` 0.23.7 は rustc 1.91 を要求し、kiri の 1.85 を超える
@@ -1595,6 +1608,42 @@ out.png  4284x5712  png  41.6 MB  (13256 ms)
 
 `--dry-run` と併用できる。`batch` の spec では `"optimize": true` と書く。
 
+#### 切り抜いた後に回す（`--rotate`）
+
+傾いて撮れた商品の水平出しを、切り抜きと同じ 1 本の実行で済ませる。
+
+```
+$ kiri cutout product.jpg -o product.png --rotate 90
+$ kiri cutout product.jpg -o product.png --rotate -3.5 --canvas 1000
+```
+
+**順序は「切り抜き → 回転 → `--canvas` → `--shadow`」で固定である。** `kiri rotate`
+で先に回してから `cutout` へ流すと、回転が四隅に作った透過の余白が画像の外周に
+乗り、背景推定がそれを背景色の標本として数える（[切り抜きと併せるときは、切り抜いてから回す](#切り抜きと併せるときは切り抜いてから回す)）。
+1 本に畳めば、**順序を知らなくても間違えようがない。**
+
+角度の読み方は `kiri rotate` と同じである。`[0, 360)` へ正規化し、90 の倍数だけは
+画素を補間し直さない。実際に効いた角度は結果の `rotate` ブロックに出る。
+
+```json
+"rotate": { "angle": 270.0, "resampled": false }
+```
+
+回さなかった実行（`--rotate` 無し、または `--rotate 360`）は**このブロックを
+持たない**。`canvas` / `shadow` と同じ規約で、「回さなかった」と「回せない（古い版）」
+を `null` で混ぜない。
+
+**`mask` / `background` / `subject` の座標は回す前のもの**である。どれも
+「切り抜きがどう決まったか」を語る値で、回転はその後の配置にすぎない。`--canvas`
+と併せた場合は、回した後の外接矩形が中央へ載る。
+
+同じ理由で、`--debug-mask` が書き出す画像と `--preview` の中央パネル（マスク）は
+**回す前の向き**である。右パネル（結果）だけが回った姿になるので、プレビューを
+目で見たときに「マスクと結果の向きが違う」のは正しい。
+
+`batch` の spec では `"rotate": 90` と書く。**負値は反時計回り**で、他の数値と違って
+0 以上の検査は掛からない。
+
 #### EC向けの整形
 
 切り抜きからキャンバス配置、形式変換までを1コマンドで完結できる。
@@ -1646,8 +1695,10 @@ $ kiri cutout product.jpg -o product.png --canvas 1000 --shadow synth
 | `--shadow-opacity` | `0.25` | 影の不透明度 (0.0-1.0) |
 
 `--shadow-offset` と `--shadow-blur` は**長辺 1000px 換算**で指定する。基準は
-**最終画像の長辺**で、`--canvas` があればキャンバスの長辺、無ければ元画像の長辺に
-なる。素材の解像度がばらついていても同じ指定で同じ見た目になり、24.5MP
+**最終画像の長辺**で、`--canvas` があればキャンバスの長辺、無ければ `--rotate` まで
+済ませた画像の長辺になる（`--rotate` を渡さなければ元画像の長辺と同じ。任意角で
+回すと外接矩形は必ず元より大きくなるので、そこを元画像で換算すると影だけが
+小さく出る）。素材の解像度がばらついていても同じ指定で同じ見た目になり、24.5MP
 （4284x5712）の素材に既定値を渡せば実際には 69px ずれて σ 57px でぼける。
 **実際に効いた px は結果に出る**ので、換算を自分で追う必要はない。
 
@@ -1957,6 +2008,8 @@ sRGB のまま比べると**ガンマぶんだけ暗い側へ偏る**（黒い�
 | `CONSTRAINT_EMPTY` | 渡した空間的な指示が 1 画素も塗らなかった（空のマスク、画像の外だけを指す多角形） |
 | `OPTIMIZE_NO_CLEAN_CANDIDATE` | `--optimize` が候補をすべて試しても致命的な警告が残った（調整では解けない） |
 | `SEGMENT_UNCERTAIN` | モデルが対象を掴めておらず、不明の帯が広すぎる（結果は `--segment off` に近づく） |
+| `MODEL_PATH_IGNORED` | `--model-path` を渡したが `--segment off` なのでモデルを読んでいない |
+| `MODEL_SIZE_UNEXPECTED` | `--model-path` のファイルが既知のモデルと大きさが違う（指定を尊重してそのまま読んだ） |
 | `CANVAS_UPSCALED` | キャンバス配置で商品を拡大した |
 | `DRY_RUN_OUTPUT_EXISTS` | `--dry-run` の出力先が既にある。本番実行には `--force` が要る |
 | `UPSCALED` | `resize` で拡大した |
@@ -2117,8 +2170,8 @@ x broken.jpg  失敗
 `cleanup` / `feather` / `despill` / `refine` / `matting` / `smooth_contour` /
 `reclassify` / `background_model` / `optimize` / `color_convert` / `edge_threshold` /
 `step_tolerance` / `shadow_tolerance` / `shadow` / `shadow_offset` / `shadow_blur` /
-`shadow_color` / `shadow_opacity` / `seal` / `canvas` / `fill_ratio` / `format` /
-`quality` / `effort` / `background` / `flatten`）。
+`shadow_color` / `shadow_opacity` / `seal` / `rotate` / `canvas` / `fill_ratio` /
+`format` / `quality` / `effort` / `background` / `flatten`）。
 
 `trimap` / `fg_mask` / `bg_mask` は画像のパスで、`input` と同じく**仕様ファイルの
 場所**を基準に解決する。`fg_polygons` / `bg_polygons` は `[[x1,y1,x2,y2,...], ...]` で、

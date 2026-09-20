@@ -25,6 +25,10 @@ pub fn run() -> SchemaReport {
     SchemaReport {
         schema_version: SCHEMA_VERSION,
         kiri_version: env!("CARGO_PKG_VERSION"),
+        // `kiri model list` と同じ 1 つの定数を見る。2 箇所で別々に
+        // `cfg!` を書くと、片方だけが feature の綴りを取りこぼしても
+        // コンパイルは通る
+        segment_available: crate::commands::model::AVAILABLE,
         exit_codes: exit_codes(),
         errors: ErrorCode::ALL
             .iter()
@@ -662,8 +666,37 @@ fn fields() -> Vec<FieldEntry> {
             summary: "影を実際にずらした量 [dx, dy]",
             notes: Some(
                 "**指定値ではない。** --shadow-offset は長辺 1000px 換算で、基準は最終画像の長辺\
-                 （--canvas があればキャンバスの長辺、無ければ元画像の長辺）である。24.5MP の\
-                 素材に既定の 0,12 を渡すと 0,69 になる。負値は上・左へ出したことを意味する",
+                 （--canvas があればキャンバスの長辺、無ければ --rotate まで済ませた画像の長辺。\
+                 --rotate を渡さなければ元画像の長辺と同じ）である。24.5MP の素材に既定の \
+                 0,12 を渡すと 0,69 になる。負値は上・左へ出したことを意味する",
+            ),
+        },
+        FieldEntry {
+            path: "rotate.angle",
+            // `kiri rotate` と `cutout --rotate` が同じブロックを返す。
+            // 順序を固定したいなら後者を使う（README「切り抜いた後に回す」）
+            appears_in: vec!["cutout", "rotate"],
+            unit: "deg",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "実際に適用した時計回りの角度",
+            notes: Some(
+                "**指定値ではない。** -90 と 270 と 630 は同じ操作なので [0, 360) へ正規化した                  値が入る。回らない指定（0 と 360）では rotate ブロックごと現れない——                 渡した値は settings.rotate のほうが常に持つ。cutout では mask / background /                  subject の座標は**回す前**のものである",
+            ),
+        },
+        FieldEntry {
+            path: "rotate.resampled",
+            appears_in: vec!["cutout", "rotate"],
+            unit: "bool",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "画素を補間し直したか",
+            notes: Some(
+                "90 度単位なら false で、色は 1 バイトも変わらない（入れ替えだけで回る）。                 true なら Catmull-Rom で引き直しており、四隅に透過の余白が出る",
             ),
         },
         FieldEntry {

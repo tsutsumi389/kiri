@@ -23,7 +23,8 @@ use crate::error::{Error, ErrorCode, Result};
 pub fn run(image: &RgbaImage, opts: &SegmentOptions) -> Result<SegmentRun> {
     let started = Instant::now();
     let path = model::resolve_path(&opts.model, opts.model_path.as_deref())?;
-    model::check_size(&opts.model, &path)?;
+    // `--model-path` で指されたファイルは大きさが違っても通り、警告になる
+    let size_warning = model::check_size(&opts.model, &path, opts.model_path.is_some())?;
 
     let size = opts.model.input_size;
     let prepared = prepare(image, size, opts.fit);
@@ -52,13 +53,14 @@ pub fn run(image: &RgbaImage, opts: &SegmentOptions) -> Result<SegmentRun> {
         )));
     }
 
-    let probability = to_probability(&raw[..n * n], size, prepared.content);
+    let probability = to_probability(&raw[..n * n], size, prepared.content)?;
     Ok(SegmentRun {
         model: opts.model.name,
         input_size: size,
         elapsed_ms: started.elapsed().as_millis(),
         model_path: path.display().to_string(),
         probability,
+        warnings: size_warning.into_iter().collect(),
     })
 }
 

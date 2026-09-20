@@ -314,6 +314,27 @@ pub struct RotateArgs {
     pub out: OutputOpts,
 }
 
+/// `cutout --rotate` の長いヘルプ。
+///
+/// **`kiri rotate` を後段に繋ぐのと同じではない。** 1 本の実行に畳むことで、
+/// 回転が四隅に作る透過の余白を外周に持たない順序（切り抜き → 回転 →
+/// キャンバス → 影）が構造として決まる。エージェントは順序を知らなくても
+/// 間違えようがなくなる。
+fn cutout_rotate_long_help() -> String {
+    "切り抜いた後に時計回りへ回す角度(度)。負値は反時計回り。既定 0（回さない）。\n\
+     360 を超える値や負値は [0, 360) へ正規化し、実際に効いた角度は \
+     rotate.angle が返す。90 度単位だけは画素を補間し直さない\
+     （rotate.resampled が false）。\n\
+     **順序は「切り抜き → 回転 → --canvas → --shadow」で固定である。** \
+     kiri rotate で先に回してから cutout へ流すと、回転が四隅に作った透過の\
+     余白が画像の外周に乗り、背景推定がそれを背景色の標本として数える。\n\
+     mask / background / subject の座標は**回す前**のものである（どれも\
+     「切り抜きがどう決まったか」を語る値で、回転はその後の配置にすぎない）。\n\
+     --canvas と併せると、回した後の外接矩形が中央へ載る。\n\
+     回転だけを行う kiri rotate では、同じ値を --angle で渡す。"
+        .to_string()
+}
+
 /// `--angle` の長いヘルプ。
 ///
 /// **AI エージェントは `--help` を読んで判断する**ので、「90 度単位だけは
@@ -868,6 +889,19 @@ pub struct CutoutArgs {
     /// どうかだけを別経路で運ぶ
     #[arg(skip)]
     pub fixed: OptimizeFixed,
+
+    /// 切り抜いた後に時計回りへ回す角度(度)。負値は反時計回り。既定 0（回さない）
+    ///
+    /// ヘルプの本文は `cutout_rotate_long_help` に置く。順序（切り抜き →
+    /// 回転 → キャンバス → 影）は指定の前に知っていないと結果を読み違える
+    #[arg(
+        long,
+        default_value_t = 0.0,
+        allow_hyphen_values = true,
+        value_parser = finite,
+        long_help = cutout_rotate_long_help()
+    )]
+    pub rotate: f64,
 
     /// 切り抜いた商品を指定サイズのキャンバス中央に配置する
     ///

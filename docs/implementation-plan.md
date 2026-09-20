@@ -264,7 +264,27 @@ public リポジトリなので GitHub 製の標準ランナーは分数無制�
   - [x] 出力は外接矩形まで拡張し、寸法は**切り上げる**。丸めると四隅が小数画素
         ぶん欠ける。増えた余白はアルファ 0 で、JPEG へ出せば既存の
         `ALPHA_FLATTENED` が発火する
-  - [ ] `batch` の spec への追加（現状の spec は `cutout` の設定しか持たない）
+  - [x] `batch` の spec への追加。**`kiri rotate` を後段に繋ぐ形ではなく、
+        `cutout --rotate` として 1 本の実行に畳んだ**——順序（切り抜き → 回転 →
+        `--canvas` → `--shadow`）が構造で決まり、上の「切り抜いてから回す」を
+        散文の注意ではなく実装の形で守れる。spec の `rotate` キーは CLI と
+        同じ 1 本の経路を通る（`batch` は `cutout::run` をそのまま呼ぶ）。
+        回した実行だけが `rotate` ブロックを持ち、渡した値は `settings.rotate`
+        が常に持つ（`shadow` と同じ二段構え。無いと `--rotate 360` を渡した
+        実行と渡さなかった実行の JSON が 1 バイトも違わない）。`mask` /
+        `background` / `subject` の座標は回す前のまま——どれも「切り抜きが
+        どう決まったか」を語る値である。
+  - [x] **キャンバスへ載せる範囲の定義を 1 つにした。** `Mask::bbox_above(0)`
+        から画素のアルファの外接矩形へ移した。`mask` は回す前の格子に乗って
+        いるので回した画像には使えないが、**回さない実行も同じ関数を通す**
+        ——2 つ持つと、同じ画像が `--rotate 0` と `--rotate 90` で違う切り詰め
+        方をされる。しかも両者は一致しない（`apply_alpha` は元画像が既に持って
+        いた透過と小さいほうを採るので、透過つき PNG ではマスクが立っていても
+        画素は透明な場所が出る）。費用は変わらない——`bbox_above` も同じだけの
+        画素を舐めていた
+  - [x] 影の換算基準を回した後の長辺へ直し、`kiri schema` の `shadow.offset` と
+        README の文面を揃えた。任意角で回すと外接矩形は必ず元より大きくなる
+        ので、元画像の長辺で換算すると回した実行でだけ影が小さく出る
   - [ ] 自動水平出し（`info` が主体の傾き角を返し、`rotate` がそれを使う）。
         bbox と同じく**自動適用はしない**——傾きを直すかどうかは構図の判断である
   - [x] 縮小の入力を借用ビュー（`images::ImageRef`）にして 20MP の複製をやめる。
@@ -541,10 +561,13 @@ public リポジトリなので GitHub 製の標準ランナーは分数無制�
         ので、想定と同じ長さの壊れたファイルは tract の解析失敗まで落ちない。
         1 度だけ検証してその結果を憶えておく形（`.verified` の傍らファイル等）
         なら、毎回 0.4 秒を払わずに塞げる
-  - [ ] **`--model-path` が既知のバイト数しか受けない。** 自前で微調整した
-        ISNet や、同じ構造の別の重みを渡せない。`--model-path` を渡した時点で
-        利用者は「これを使う」と決めているのだから、大きさの検査は
-        警告に落として通すほうが筋が良い
+  - [x] **`--model-path` が既知のバイト数しか受けない。** 自前で微調整した
+        ISNet や、同じ構造の別の重みを渡せなかった。渡した時点で利用者は
+        「これを使う」と決めているので、`--model-path` のときだけ大きさの検査を
+        `MODEL_SIZE_UNEXPECTED` に落として通す。既定の置き場所から拾った
+        ファイルは今までどおり `MODEL_UNREADABLE` で断る——そちらは利用者が
+        選んだものではなく kiri が探し当てたもので、想定と違えば取得が途中で
+        切れている疑いのほうが強い
   - [ ] `info --segment` はモデルの確率マップから `Constraints` を原寸で組み
         直している（`cutout` と同じ経路を通すため）。主体の bbox を出すだけなら
         格子のまま測れて、24MP で 0.16 秒を節約できる
@@ -559,15 +582,21 @@ public リポジトリなので GitHub 製の標準ランナーは分数無制�
   - ※ BiRefNet は重みの学習データ（DIS5K）に商用制限があり、candle 経路も
         パッチ依存を抱えている。解消されれば次の候補（design.md 3.6）。
         **条件が揃ったかを確かめるところから**始める
-  - [ ] `--model-path` を `--segment off` と一緒に渡すと黙って無視される。「効いた値
-        だけを報告する」規約に照らすと、警告か `settings` への露出が要る
-  - [ ] `segment::to_probability` と `Probability::new` は `pub` なのに `raw` の長さを
-        `assert_eq!` でしか検査しない。ライブラリ API としては `Result` で断るべき
-  - [ ] `segment::nearest` は 0 寸法の画像で `get_pixel` が panic しうる（実運用では
-        復号側が弾くので到達しないが、`pub` である以上は早期 return が要る）
-  - [ ] `kiri schema --json` からは、この build が推論できるかを読めない
-        （`model list` の `segment_available` にしか無い）。schema にも 1 キー置くと、
-        エージェントが 1 回の問い合わせで判断できる
+  - [x] `--model-path` を `--segment off` と一緒に渡すと黙って無視されていた。
+        `MODEL_PATH_IGNORED` で言う（`info` と `cutout` の両方）。**`auto` が
+        走らないと決めた場合は黙っている**——そこは `settings.segment_ran` が
+        既に言っており、二重に言う値が無い
+  - [x] `segment::to_probability` と `Probability::new` は `pub` なのに `raw` の長さを
+        `assert_eq!` でしか検査していなかった。`Result`（`SEGMENT_FAILED`）で断る。
+        `to_probability` は切り出す窓が出力の中に収まることも先に見る——
+        下のループは `raw` を行ごとに添字で舐めるので、食い違えば panic する
+  - [x] `segment::nearest` は 0 寸法の画像で `get_pixel` が panic しうる。
+        標本が 1 つも無いので早期 return で空の画素を返す（実運用では復号側が
+        弾くので到達しない）
+  - [x] `kiri schema --json` からは、この build が推論できるかを読めなかった
+        （`model list` の `segment_available` にしか無かった）。schema にも同じ
+        1 キーを置いた。**2 箇所で `cfg!` を書かない**——`commands/model.rs` の
+        定数 1 つを両方が見る
 
 - [x] Phase 15: 探索を kiri 側に持たせ、影を合成する（`--optimize` / `--shadow synth`）
   - [x] **探索（`--optimize`）**
@@ -719,40 +748,25 @@ public リポジトリなので GitHub 製の標準ランナーは分数無制�
 
 ## 6. 残件の優先順位
 
-§5 の `[ ]` は 26 件ある（`※` の 19 件は作業ではないので数えない）。着手の順は
-P0 → P3 で、**同じ P の中では上から**。
+§5 の `[ ]` は 20 件ある（`※` の 19 件は作業ではないので数えない）。着手の順は
+P0 → P2 で、**同じ P の中では上から**。
+
+かつての P1「契約の穴」6 件は片付いた（`cutout --rotate` と spec の `rotate`、
+`--model-path` の 2 件、`kiri schema` の `segment_available`、
+`to_probability` / `Probability::new`、`nearest`）。中身は §5 の Phase 7 と
+Phase 14 に書いてある。
 
 ### P0 — 出荷の前提（1 件）
 
 - **リリース用 CI**（Phase 6）
 
-445 + 192 + 27 + 19 + 14 のテストと clippy / fmt / MSRV を、いまは手元でしか
+452 + 201 + 27 + 19 + 18 のテストと clippy / fmt / MSRV を、いまは手元でしか
 回していない。**他のすべての項目の安全網**なので最初に置く。何を回すかは
 [4. CI](#4-ci) に書いてある。feature `segment` の有無で 2 系統要り、**MSRV の検査に
 `--features segment` を付けてはならない**（`tract-onnx` 0.23.7 が rustc 1.91 を
 要求するので、付けると引数の綴りも見ずに落ちる）。
 
-### P1 — 契約の穴（6 件）
-
-kiri は「README を読ませる代わりに `kiri schema` を引かせる」道具である。
-**契約のずれは機能の欠損と同じ重さを持つ**——読んだ側が黙って分岐を落とす。
-
-- **`batch` の spec が `cutout` の設定しか持たない**（Phase 6）。`rotate` も
-  `--optimize` も `--shadow` も spec から書けない。数百点を流す道具としてここが
-  一番効く
-- **`--model-path` を `--segment off` と渡すと黙って無視される**（Phase 14）。
-  「効いた値だけを報告する」規約の違反
-- **`--model-path` が既知のバイト数しか受けない**（Phase 14）。渡した時点で
-  利用者は「これを使う」と決めているので、大きさの検査は警告に落として通す
-- **`kiri schema --json` から、この build が推論できるかを読めない**（Phase 14）。
-  いまは `SEGMENT_UNAVAILABLE` を踏むまで分からない
-- **`to_probability` / `Probability::new` が `assert_eq!` でしか長さを見ない**
-  （Phase 14）。`pub` なら `Result` で断る
-- **`nearest` が 0 寸法で panic しうる**（Phase 14）。同上
-
-後ろの 4 件は同じ節の小物なので 1 本にまとめられる。
-
-### P2 — 性能（9 件）
+### P1 — 性能（9 件）
 
 先頭の 1 件だけが**機能のブロッカー**で、残りは効くと分かっている無駄である。
 
@@ -766,7 +780,7 @@ kiri は「README を読ませる代わりに `kiri schema` を引かせる」�
   アルファと作業領域（Phase 16）、`to_constraints` の `grid_index` の除算（Phase 14）
 - **モデルのダイジェスト照合**（Phase 14）。正しさ寄りだが安い
 
-### P3 — 品質と機能（10 件）
+### P2 — 品質と機能（10 件）
 
 **効果が測れる保証が薄い。** 着手前に必ずベンチで見積もる——P0/P1 の 10 倍の
 時間を使って数値が動かないことがありうる。
@@ -774,7 +788,7 @@ kiri は「README を読ませる代わりに `kiri schema` を引かせる」�
 - **px@1000 換算の統一**（Phase 12 + Phase 15）。`rim_contamination` の帯に
   境界処理が高解像度で届かない件と、探索段で `--border` / `--feather` だけが
   実寸 px な件は**同じ根**である。実写リモコンの 0.061 を目標の 0.05 へ動かせる
-  唯一の筋なので、P3 の中では最初
+  唯一の筋なので、P2 の中では最初
 - 合成 S3 の `HALO_REMAINS` の偽陽性（Phase 12）
 - R2（織り目の不織布）が bbox 無しで切れない（Phase 13）。堤防側の担当
 - 実素材での既定値の再調整（Phase 6）。`--optimize` が入って意味が変わった

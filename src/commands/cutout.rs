@@ -20,9 +20,10 @@ use crate::image_io::{LoadOptions, OutputFormat, SaveOptions, load, save};
 use crate::preview::{PreviewSpec, contact_sheet};
 use crate::report::{
     CanvasReport, ConstraintsReport, CutoutReport, Dimensions, MaskReport, OptimizeCandidate,
-    OptimizeReport, OptimizeScore, SCHEMA_VERSION, SettingsReport, ShadowReport,
+    OptimizeReport, OptimizeScore, RotateReport, SCHEMA_VERSION, SettingsReport, ShadowReport,
 };
 use crate::transform::canvas::{CanvasSpec, apply as canvas_apply, composite, plan as canvas_plan};
+use crate::transform::rotate::{self, RotateSpec};
 use crate::transform::shadow::{self, ShadowMode, ShadowSpec};
 use crate::warning::{Warning, WarningCode};
 
@@ -51,7 +52,8 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     // ものになり、`CONSTRAINT_CONFLICT` にはしない
     let decision = segment::decide(&loaded.image, &args.segment, args.border)?;
     let mut segment_report = None;
-    let mut segment_warnings = Vec::new();
+    // 判断そのものから出た警告（`--segment off` に添えた `--model-path` など）
+    let mut segment_warnings = decision.warnings.clone();
     let constraints = match decision.run.as_ref() {
         Some(run) => {
             let (mut from_model, stats) = crate::segment::to_constraints(&run.probability, w, h);
@@ -118,14 +120,26 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     warnings.extend(optimize_warning);
     warnings.extend(result.warnings.clone());
 
+    // **切り抜いてから回す。** 逆順にすると、回転が四隅に作った透過の余白が
+    // 画像の外周に乗り、背景推定がその余白を背景色の標本として数える
+    // （`kiri rotate` の冒頭に書いてある注意を、ここでは順序そのもので封じる）。
+    //
+    // キャンバスと影より前に置くのは、キャンバスへ載せるのが**回した後の**
+    // 外接矩形であり、影は最終的な姿に落ちるものだからである。
+    //
+    // **`mask` / `background` / `subject` の座標は回す前のまま**である。
+    // どれも「切り抜きがどう決まったか」を語る値で、回転はその後の配置にすぎない
+    let rotation = apply_rotation(&mut result.image, args.rotate)?;
+
     // 長辺 1000px 換算を実寸へ掛け戻す。**基準は最終画像の長辺**なので、
-    // キャンバスがあればそちらが基準になる。元画像の長辺で換算すると、
-    // 同じ指定が --canvas の有無で違う見た目を指す
+    // キャンバスがあればそちらが基準になり、無ければ回した後の寸法になる。
+    // 元画像の長辺で換算すると、同じ指定が --canvas や --rotate の有無で
+    // 違う見た目を指す
     let shadow_spec = resolve_shadow(
         args,
         match args.canvas {
             Some((cw, ch)) => cw.max(ch),
-            None => w.max(h),
+            None => result.image.width().max(result.image.height()),
         },
     );
 
@@ -133,8 +147,15 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     // 12MP で 48MB を余分に積み、batch の並列度ぶんだけ倍になる
     let (placed, canvas, shadow) = match args.canvas {
         Some((cw, ch)) => {
-            let placement =
-                place_on_canvas(&result, cw, ch, args, shadow_spec.as_ref(), &mut warnings)?;
+            let placement = place_on_canvas(
+                &result.image,
+                content_bounds(&result.image),
+                cw,
+                ch,
+                args,
+                shadow_spec.as_ref(),
+                &mut warnings,
+            )?;
             (
                 Some(placement.image),
                 Some(placement.report),
@@ -225,6 +246,8 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             optimize: args.optimize,
             // 指定値。実際に効いたずらし量とぼかしは `shadow` ブロックのほう
             shadow: args.shadow.as_str(),
+            // 同じく指定値。効いた角度は `rotate` ブロックのほう
+            rotate: round4(args.rotate),
             // 指定値。`auto` が走らせたかどうかは次の行が言う
             segment: decision.mode.as_str(),
             segment_ran: decision.ran(),
@@ -233,6 +256,9 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         constraints: opts.constraints.as_ref().map(constraints_report),
         segment: segment_report,
         optimize,
+        // 回した実行だけがこのブロックを持つ。`canvas` / `shadow` と同じ規約で、
+        // 「回さなかった」と「回せない（古い版）」を `null` で混ぜない
+        rotate: rotation,
         mask: MaskReport {
             foreground_ratio: round4(result.stats.foreground_ratio),
             bbox: result.stats.bbox.map(|(x1, y1, x2, y2)| [x1, y1, x2, y2]),
@@ -340,18 +366,71 @@ struct Placement {
     shadow: Option<ShadowReport>,
 }
 
+/// `--rotate` を適用する。回らなければ画像に触れない。
+///
+/// **`[0, 360)` へ正規化した後に 0 なら何もしない。** `--rotate 360` は
+/// 恒等変換であり、そこで画素を舐め直すと 24MP の複製を無言で 1 つ積む。
+/// 報告も出さない——`canvas` / `shadow` と同じく、**走った工程だけが
+/// ブロックを持つ**規約である。
+fn apply_rotation(image: &mut image::RgbaImage, angle: f64) -> Result<Option<RotateReport>> {
+    let plan = rotate::plan((image.width(), image.height()), &RotateSpec { angle })?;
+    if plan.angle == 0.0 {
+        return Ok(None);
+    }
+    *image = rotate::apply(image, &plan)?;
+    Ok(Some(RotateReport {
+        angle: round4(plan.angle),
+        resampled: plan.resampled(),
+    }))
+}
+
+/// キャンバスへ載せる中身の範囲。アルファが 0 でない画素の外接矩形。
+///
+/// フェザリングされた薄い縁まで含める（前景判定の 128 で切ると輪郭の階調が
+/// 落ちてギザギザに戻る）。
+///
+/// # マスクではなく画素のアルファを見る
+///
+/// **`--rotate` を通った画像はマスクと同じ格子に乗っていない。** `mask` は
+/// 回す前のもので、回した後の座標とは対応しない。
+///
+/// **回さない実行も同じ関数を通す。** 2 つの定義を持つと、同じ画像が
+/// `--rotate 0` と `--rotate 90` で違う切り詰め方をされる。しかも両者は
+/// 一致しない——`apply_alpha` は元画像が既に持っていた透過と小さいほうを
+/// 採るので、**透過つき PNG を入力にするとマスクは立っているのに画素は
+/// 透明**という画素が出る。そこはキャンバスの上で見えない余白であり、
+/// 中身として数える理由が無い。
+///
+/// 費用は変わらない。`Mask::bbox_above` も同じだけの画素を舐めていた。
+fn content_bounds(image: &image::RgbaImage) -> Option<(u32, u32, u32, u32)> {
+    let (mut min, mut max) = ((u32::MAX, u32::MAX), (0u32, 0u32));
+    let mut found = false;
+    for (x, y, pixel) in image.enumerate_pixels() {
+        if pixel.0[3] == 0 {
+            continue;
+        }
+        found = true;
+        min = (min.0.min(x), min.1.min(y));
+        max = (max.0.max(x), max.1.max(y));
+    }
+    found.then_some((min.0, min.1, max.0, max.1))
+}
+
 /// 切り抜いた商品を余白ごと切り詰め、指定サイズのキャンバス中央へ配置する。
+///
+/// `bounds` は切り詰める範囲（`content_bounds` が決める）。**画像とマスクを
+/// 一緒に受けない**のは、`--rotate` を通った画像がマスクと同じ格子に乗って
+/// いないためである。
 fn place_on_canvas(
-    result: &crate::cutout::CutoutResult,
+    image: &image::RgbaImage,
+    bounds: Option<(u32, u32, u32, u32)>,
     width: u32,
     height: u32,
     args: &CutoutArgs,
     shadow_spec: Option<&ShadowSpec>,
     warnings: &mut Vec<Warning>,
 ) -> Result<Placement> {
-    // フェザリングされた薄い縁まで含めて切り詰める。前景判定(128以上)で切ると
-    // 輪郭の階調が落ちてギザギザに戻ってしまう
-    let (x1, y1, x2, y2) = result.mask.bbox_above(0).ok_or_else(|| {
+    let (x1, y1, x2, y2) = bounds.ok_or_else(|| {
         Error::new(
             ErrorCode::NoForeground,
             "前景が検出されなかったためキャンバスに配置できません",
@@ -359,8 +438,7 @@ fn place_on_canvas(
         .with_hint("--tolerance を下げるか --bbox で対象範囲を指定してください")
     })?;
 
-    let trimmed =
-        image::imageops::crop_imm(&result.image, x1, y1, x2 - x1 + 1, y2 - y1 + 1).to_image();
+    let trimmed = image::imageops::crop_imm(image, x1, y1, x2 - x1 + 1, y2 - y1 + 1).to_image();
 
     // **影があるときだけ塗る順序を組み替える。** 下地 → 影 → 商品でなければ
     // 影が下地に隠れる。組み替えを `--shadow off` にも通すと、半透明の縁で

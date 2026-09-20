@@ -938,3 +938,146 @@ fn images_in(dir: &Path) -> Vec<std::path::PathBuf> {
     paths.sort();
     paths
 }
+
+/// `--segment off` に `--model-path` を添えた指定は黙って捨てない。
+///
+/// **「効いた値だけを報告する」規約の裏返しである。** 渡した指定が無言で
+/// 落ちると、利用者はモデルで切ったつもりの結果を色だけの結果として受け取る。
+/// この検査はモデルも feature も要らない——読まないことを確かめている。
+#[test]
+fn an_ignored_model_path_is_reported() {
+    let (dir, input) = fixture();
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            dir.path().join("cut.png").to_str().unwrap(),
+            "--segment",
+            "off",
+            "--model-path",
+            dir.path().join("nowhere.onnx").to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "読まない指定でエラーにはしない: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let v = json_stdout(&out);
+    let warning = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "MODEL_PATH_IGNORED")
+        .unwrap_or_else(|| panic!("MODEL_PATH_IGNORED が出ていない: {v}"));
+    assert!(warning["hint"].as_str().unwrap().contains("--segment"));
+    assert!(warning["data"]["model_path"].is_string());
+    assert_eq!(v["settings"]["segment_ran"], false);
+}
+
+/// `info` も同じ警告を出す。**2 つのコマンドで契約の形が違う理由が無い。**
+#[test]
+fn info_reports_an_ignored_model_path_too() {
+    let (dir, input) = fixture();
+    let out = kiri()
+        .args([
+            "info",
+            input.to_str().unwrap(),
+            "--model-path",
+            dir.path().join("nowhere.onnx").to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    assert!(
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == "MODEL_PATH_IGNORED"),
+        "{v}"
+    );
+}
+
+/// この build が推論できるかを `kiri schema` から 1 回で読める。
+///
+/// **`commands[]` に `--segment` の綴りが並ぶことは、走らせられることを
+/// 意味しない。** 綴りは feature の有無によらず出る（断り方も契約である）。
+#[test]
+fn the_schema_states_whether_this_build_can_infer() {
+    let out = kiri().args(["schema", "--json"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    assert_eq!(
+        v["segment_available"],
+        cfg!(feature = "segment"),
+        "schema の segment_available が build と食い違う: {v}"
+    );
+
+    // `kiri model list` と同じ 1 つの事実を指していること
+    let models = kiri().args(["model", "list", "--json"]).output().unwrap();
+    assert_eq!(
+        json_stdout(&models)["segment_available"],
+        v["segment_available"]
+    );
+}
+
+/// `--segment auto` が「走らせるまでもない」と決めたときは**黙っている**。
+///
+/// `--model-path` は「走るならこれを読め」という指定であり、走らせない判断を
+/// したのは kiri 自身である。ここで `MODEL_PATH_IGNORED` を出すと、
+/// `settings.segment_ran` が既に言っていることを二重に言うことになる。
+///
+/// **沈黙の側こそ固定する。** 放っておくと後から逆へ倒れる種類の判断である。
+#[test]
+fn auto_that_decides_not_to_run_says_nothing_about_the_model_path() {
+    if !cfg!(feature = "segment") {
+        eprintln!("この build に segment 機能が無いので飛ばす（auto は届く前に断られる）");
+        return;
+    }
+    let (dir, input) = fixture();
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            dir.path().join("cut.png").to_str().unwrap(),
+            "--segment",
+            "auto",
+            "--model-path",
+            dir.path().join("nowhere.onnx").to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "色で解ける画像なのでモデルは要らないはず: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let v = json_stdout(&out);
+    assert_eq!(v["settings"]["segment_ran"], false, "{v}");
+    assert!(
+        !v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == "MODEL_PATH_IGNORED"),
+        "走らせない判断まで警告にすると settings.segment_ran と二重になる: {v}"
+    );
+}

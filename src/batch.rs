@@ -77,6 +77,9 @@ pub struct ItemSettings {
     pub shadow_color: Option<String>,
     pub shadow_opacity: Option<f64>,
     pub seal: Option<u32>,
+    /// 切り抜いた後に時計回りへ回す角度(度)。**負値に意味がある**
+    /// （反時計回り）ので、他の数値と違って 0 以上の検査は掛けない
+    pub rotate: Option<f64>,
     pub canvas: Option<String>,
     pub fill_ratio: Option<f64>,
     pub format: Option<String>,
@@ -126,6 +129,7 @@ impl ItemSettings {
             shadow_color,
             shadow_opacity,
             seal,
+            rotate,
             canvas,
             fill_ratio,
             format,
@@ -168,6 +172,7 @@ const SETTING_KEYS: &[&str] = &[
     "shadow_color",
     "shadow_opacity",
     "seal",
+    "rotate",
     "canvas",
     "fill_ratio",
     "format",

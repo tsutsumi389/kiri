@@ -21,9 +21,26 @@ pub struct Decision {
     /// 指定値そのまま（`settings.segment`）
     pub mode: SegmentMode,
     pub run: Option<SegmentRun>,
+    /// モデルを走らせる／走らせないの判断そのものから出た警告。
+    /// **`run` の有無によらず出る**——`--segment off` に `--model-path` を
+    /// 添えた指定は、モデルを読まないからこそ知らせる必要がある
+    pub warnings: Vec<Warning>,
 }
 
 impl Decision {
+    /// 推論の結果を畳む。**読み込みの途中で出た警告をここで引き取る。**
+    ///
+    /// `SegmentRun` の側に置いたままにすると、`decision.run` を持っている
+    /// 呼び出し側が `warnings` を見ずに捨てられる。移し替えてしまえば、
+    /// 出す場所は `Decision::warnings` の 1 つだけになる。
+    fn from_run(mode: SegmentMode, mut run: SegmentRun) -> Self {
+        Decision {
+            mode,
+            warnings: std::mem::take(&mut run.warnings),
+            run: Some(run),
+        }
+    }
+
     pub fn ran(&self) -> bool {
         self.run.is_some()
     }
@@ -41,15 +58,21 @@ pub fn decide(image: &RgbaImage, opts: &SegmentOpts, border: u32) -> Result<Deci
         return Ok(Decision {
             mode: opts.segment,
             run: None,
+            warnings: ignored_model_path(opts).into_iter().collect(),
         });
     }
     if !crate::commands::model::AVAILABLE {
         return Err(crate::segment::unavailable(opts.segment.as_str()));
     }
     if opts.segment == SegmentMode::Auto && !colour_is_hopeless(image, border) {
+        // **`auto` が走らなかっただけなら黙っている。** `--model-path` は
+        // 「走るならこれを読め」という指定であり、走らせない判断をしたのは
+        // kiri 自身である。ここで警告を出すと、`settings.segment_ran` が
+        // 既に言っていることを二重に言うことになる
         return Ok(Decision {
             mode: opts.segment,
             run: None,
+            warnings: Vec::new(),
         });
     }
 
@@ -59,10 +82,28 @@ pub fn decide(image: &RgbaImage, opts: &SegmentOpts, border: u32) -> Result<Deci
         ..SegmentOptions::isnet()
     };
     let run = crate::segment::run(image, &options)?;
-    Ok(Decision {
-        mode: opts.segment,
-        run: Some(run),
-    })
+    Ok(Decision::from_run(opts.segment, run))
+}
+
+/// `--segment off` に `--model-path` を添えた指定を知らせる。
+///
+/// **「効いた値だけを報告する」規約の裏返しである。** 渡した指定が黙って
+/// 捨てられると、利用者はモデルで切ったつもりの結果を色だけの結果として
+/// 受け取る。エラーにはしない——`--model-path` を既定値として持ち回し、
+/// `--segment` だけを切り替える呼び方は妥当である
+fn ignored_model_path(opts: &SegmentOpts) -> Option<Warning> {
+    let path = opts.model_path.as_ref()?;
+    Some(
+        Warning::new(
+            WarningCode::ModelPathIgnored,
+            format!(
+                "--segment off なので --model-path {} は読んでいません",
+                path.display()
+            ),
+        )
+        .with_hint("モデルを使うなら --segment isnet（または auto）を一緒に渡してください")
+        .with_data("model_path", path.display().to_string()),
+    )
 }
 
 /// `auto` の門。**`info` が「色では解けない」と言う画像**でだけ真になる。
@@ -128,4 +169,43 @@ pub fn uncertain_warning(stats: &SegmentStats) -> Option<Warning> {
         .with_data("fg_ratio", round4(stats.fg_ratio))
         .with_data("bg_ratio", round4(stats.bg_ratio))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::segment::Probability;
+
+    fn run_with(warnings: Vec<Warning>) -> SegmentRun {
+        SegmentRun {
+            model: "isnet",
+            input_size: 1,
+            elapsed_ms: 0,
+            model_path: "/tmp/isnet.onnx".to_string(),
+            probability: Probability::new(1, 1, vec![1.0]).unwrap(),
+            warnings,
+        }
+    }
+
+    /// モデルの読み込みで出た警告が、推論の結果に埋もれずに表へ出ること。
+    ///
+    /// **この配管は feature を持つ build でしか通らない**（推論そのものが
+    /// 要る）ので、繋ぎ目だけを取り出して、どの build でも検査する。
+    #[test]
+    fn a_warning_from_the_model_reaches_the_decision() {
+        let decision = Decision::from_run(
+            SegmentMode::Isnet,
+            run_with(vec![Warning::new(
+                WarningCode::ModelSizeUnexpected,
+                "大きさが違う",
+            )]),
+        );
+        assert_eq!(decision.warnings.len(), 1);
+        assert_eq!(decision.warnings[0].code.as_str(), "MODEL_SIZE_UNEXPECTED");
+        assert!(decision.ran());
+        assert!(
+            decision.run.unwrap().warnings.is_empty(),
+            "移し替えた側に残っていると、2 度出す道ができる"
+        );
+    }
 }

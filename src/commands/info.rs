@@ -46,6 +46,8 @@ pub fn run(args: &InfoArgs) -> Result<InfoReport> {
         None => (analysis.subject.clone(), SUBJECT_FROM_COLOUR),
     };
     let mut warnings = loaded.warnings();
+    // 判断そのものから出た警告（`--segment off` に添えた `--model-path` など）
+    warnings.extend(decision.warnings.iter().cloned());
     // **`cutout` と同じ警告を出す。** `schema` は `segment.uncertain_ratio` を
     // `info` にも配ったうえで「0.3 を超えたら SEGMENT_UNCERTAIN」と言っている。
     // ここで黙ると、配った値を読んで自分で比べたエージェントだけが気づく——

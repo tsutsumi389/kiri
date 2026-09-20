@@ -38,8 +38,9 @@ use image::RgbaImage;
 use crate::cutout::constraints::{Constraint, ConstraintSource, Constraints};
 use crate::cutout::mask::Mask;
 use crate::cutout::morphology::erode;
-use crate::error::Result;
+use crate::error::{Error, ErrorCode, Result};
 use crate::transform::{FitMode, ResizeSpec, apply as resize_apply, plan as resize_plan};
+use crate::warning::Warning;
 
 pub use model::KnownModel;
 
@@ -181,6 +182,14 @@ pub struct SegmentRun {
     pub elapsed_ms: u128,
     pub model_path: String,
     pub probability: Probability,
+    /// 読み込みの途中で気づいたこと（`--model-path` の大きさ違いなど）。
+    /// **結果の `warnings` へそのまま流す。** ここで握り潰すと、エージェントは
+    /// 「表に無いファイルで走った」ことを知る手立てを持たない。
+    ///
+    /// **`commands::segment::decide` を通った後は空である**——そちらが
+    /// `Decision::warnings` へ移し替える。`Decision` を持っている側がここを
+    /// 読んでも何も出ないので、流す先は必ず `Decision::warnings` のほう
+    pub warnings: Vec<Warning>,
 }
 
 /// 原寸へ伸ばす前の確率マップ。
@@ -196,13 +205,28 @@ pub struct Probability {
 }
 
 impl Probability {
-    pub fn new(width: u32, height: u32, data: Vec<f32>) -> Self {
-        assert_eq!(data.len(), (width as usize) * (height as usize));
-        Self {
+    /// 寸法と要素数が合っていることを確かめてから組む。
+    ///
+    /// **`pub` である以上、長さの食い違いは `assert!` ではなく `Result` で
+    /// 断る。** ライブラリとして呼ぶ側にとって、panic は「手当てのしようが
+    /// ない失敗」である——`kiri` の CLI は必ず `size * size` の出力を渡すので
+    /// ここを踏まないが、同じ関数を自分の推論結果で呼ぶ利用者はいる。
+    pub fn new(width: u32, height: u32, data: Vec<f32>) -> Result<Self> {
+        let expected = (width as usize) * (height as usize);
+        if data.len() != expected {
+            return Err(Error::new(
+                ErrorCode::SegmentFailed,
+                format!(
+                    "確率マップの要素数が寸法と合いません（{width}x{height} に対して {} 個）",
+                    data.len()
+                ),
+            ));
+        }
+        Ok(Self {
             width,
             height,
             data,
-        }
+        })
     }
 
     pub fn width(&self) -> u32 {
@@ -340,6 +364,12 @@ fn resize_to(image: &RgbaImage, width: u32, height: u32) -> RgbaImage {
 }
 
 fn nearest(image: &RgbaImage, width: u32, height: u32) -> RgbaImage {
+    // **標本が 1 つも無い画像からは引けない。** 復号側が 0 寸法を弾くので
+    // 実運用では届かないが、`get_pixel` は範囲外で panic するので、到達した
+    // ときに落ちるのではなく空の画素を返して先へ進める
+    if image.width() == 0 || image.height() == 0 {
+        return RgbaImage::new(width, height);
+    }
     let (sw, sh) = (image.width().max(1), image.height().max(1));
     RgbaImage::from_fn(width, height, |x, y| {
         let sx = ((u64::from(x) * u64::from(sw)) / u64::from(width.max(1))) as u32;
@@ -354,8 +384,29 @@ fn nearest(image: &RgbaImage, width: u32, height: u32) -> RgbaImage {
 /// 画像の一部だが、元画像には存在しない。そこの出力を分布に混ぜると、
 /// 平均色の余白にモデルが弱く反応しただけで最小値が動き、原寸側の確率が
 /// まるごと持ち上がる。
-pub fn to_probability(raw: &[f32], size: u32, content: (u32, u32, u32, u32)) -> Probability {
+pub fn to_probability(
+    raw: &[f32],
+    size: u32,
+    content: (u32, u32, u32, u32),
+) -> Result<Probability> {
     let (ox, oy, cw, ch) = content;
+    // **切り出す窓が実際に渡された並びへ収まることを先に確かめる。** 下の
+    // ループは `raw` を行ごとに添字で舐めるので、食い違えば panic する。
+    // `pub` な入口で panic を残す理由は無い（`Probability::new` と同じ判断）
+    // `checked_add(..) > Some(size)` と書いてはならない。`Option` の順序は
+    // `None < Some(_)` なので、**溢れた場合だけが関門を素通りする**
+    if ox.checked_add(cw).is_none_or(|v| v > size)
+        || oy.checked_add(ch).is_none_or(|v| v > size)
+        || raw.len() < (size as usize) * (size as usize)
+    {
+        return Err(Error::new(
+            ErrorCode::SegmentFailed,
+            format!(
+                "モデルの出力 {} 要素から {size}x{size} の ({ox},{oy})-{cw}x{ch} を切り出せません",
+                raw.len()
+            ),
+        ));
+    }
     let mut data = Vec::with_capacity((cw as usize) * (ch as usize));
     for y in 0..ch {
         let row = ((oy + y) as usize) * (size as usize) + ox as usize;
@@ -612,7 +663,7 @@ mod tests {
             let (x, y) = (1 + i % 2, 1 + i / 2);
             raw[y * 4 + x] = v;
         }
-        let p = to_probability(&raw, 4, (1, 1, 2, 2));
+        let p = to_probability(&raw, 4, (1, 1, 2, 2)).unwrap();
         assert_eq!((p.width(), p.height()), (2, 2));
         assert_eq!(
             p.as_slice(),
@@ -624,7 +675,7 @@ mod tests {
     /// 一様な出力からは、確定前景も確定背景も作らない。
     #[test]
     fn a_flat_output_says_nothing() {
-        let p = to_probability(&[0.42f32; 16], 4, (0, 0, 4, 4));
+        let p = to_probability(&[0.42f32; 16], 4, (0, 0, 4, 4)).unwrap();
         assert!(p.as_slice().iter().all(|&v| v == 0.0));
     }
 
@@ -640,7 +691,7 @@ mod tests {
         let data: Vec<f32> = (0..(w * h))
             .map(|i| if (i % w) < w / 2 { 1.0 } else { 0.0 })
             .collect();
-        let probability = Probability::new(w, h, data);
+        let probability = Probability::new(w, h, data).unwrap();
         let (c, stats) = to_constraints(&probability, w, h);
 
         assert_eq!(c.at(10, 100), Constraint::ForcedFg);
@@ -663,7 +714,7 @@ mod tests {
         let data: Vec<f32> = (0..16)
             .map(|i| if (i % 4) < 2 { 1.0 } else { 0.0 })
             .collect();
-        let p = Probability::new(4, 4, data);
+        let p = Probability::new(4, 4, data).unwrap();
         assert_eq!(p.at(0, 50, 400, 400), 1.0);
         assert_eq!(p.at(399, 50, 400, 400), 0.0);
         // 中央は遷移の途中
@@ -682,7 +733,7 @@ mod tests {
         let data: Vec<f32> = (0..(200 * 200))
             .map(|i| if (i % 200) < 100 { 1.0 } else { 0.0 })
             .collect();
-        let probability = Probability::new(200, 200, data);
+        let probability = Probability::new(200, 200, data).unwrap();
         let (c, stats) = to_constraints(&probability, 800, 800);
 
         assert_eq!(c.at(10, 400), Constraint::ForcedFg);
@@ -711,7 +762,7 @@ mod tests {
                 if inside && !island { 1.0 } else { 0.0 }
             })
             .collect();
-        let probability = Probability::new(w, h, data);
+        let probability = Probability::new(w, h, data).unwrap();
         // 半径は ceil(8 * 40/1000) = 1
         assert_eq!(margin_radius(w, h), 1);
         let (c, _) = to_constraints(&probability, w, h);
@@ -733,7 +784,7 @@ mod tests {
         let data: Vec<f32> = (0..(w * h))
             .map(|i| if (i % w) >= 20 { 1.0 } else { 0.0 })
             .collect();
-        let (c, _) = to_constraints(&Probability::new(w, h, data), w, h);
+        let (c, _) = to_constraints(&Probability::new(w, h, data).unwrap(), w, h);
         assert_eq!(c.at(5, 20), Constraint::ForcedBg);
         assert_eq!(c.at(35, 20), Constraint::ForcedFg);
     }
@@ -746,10 +797,49 @@ mod tests {
         assert_eq!(margin_radius(1000, 1000), 8, "SEG_MARGIN そのもの");
     }
 
+    /// 長さの食い違いは panic ではなく `Result` で返る。
+    ///
+    /// `pub` な入口なので、CLI を通さずに呼ぶ利用者にも手当ての余地を残す。
+    #[test]
+    fn a_probability_refuses_a_length_that_disagrees_with_its_size() {
+        let err = Probability::new(2, 2, vec![0.0; 3]).unwrap_err();
+        assert_eq!(err.code.as_str(), "SEGMENT_FAILED");
+        assert!(err.message.contains("2x2"), "{}", err.message);
+    }
+
+    /// 出力の外を指す窓も同じく `Result` で断る。**添字で舐める前に見る。**
+    #[test]
+    fn to_probability_refuses_a_window_outside_the_output() {
+        // 4x4 の出力に対して (3,0) から 2x2 は右端をはみ出す
+        let err = to_probability(&[0.0f32; 16], 4, (3, 0, 2, 2)).unwrap_err();
+        assert_eq!(err.code.as_str(), "SEGMENT_FAILED");
+
+        // 足し算が溢れる窓も断る。`Option` の順序（`None < Some(_)`）に
+        // 任せると、**溢れた場合だけが素通りして添字で落ちる**
+        let err = to_probability(&[0.0f32; 16], 4, (u32::MAX, 0, 2, 2)).unwrap_err();
+        assert_eq!(err.code.as_str(), "SEGMENT_FAILED");
+        let err = to_probability(&[0.0f32; 16], 4, (0, u32::MAX, 2, 2)).unwrap_err();
+        assert_eq!(err.code.as_str(), "SEGMENT_FAILED");
+
+        // 窓は収まっていても、並びそのものが短ければ同じく断る
+        let err = to_probability(&[0.0f32; 4], 4, (0, 0, 4, 4)).unwrap_err();
+        assert_eq!(err.code.as_str(), "SEGMENT_FAILED");
+    }
+
+    /// 0 寸法の画像を拡大しても panic しない。
+    ///
+    /// 実運用では復号側が弾くので届かないが、`get_pixel` は範囲外で落ちる。
+    #[test]
+    fn nearest_from_an_empty_image_returns_empty_pixels() {
+        let out = nearest(&RgbaImage::new(0, 0), 4, 4);
+        assert_eq!((out.width(), out.height()), (4, 4));
+        assert!(out.pixels().all(|p| p.0 == [0, 0, 0, 0]));
+    }
+
     /// 空の画像でも panic しない。
     #[test]
     fn an_empty_image_produces_nothing() {
-        let p = Probability::new(1, 1, vec![1.0]);
+        let p = Probability::new(1, 1, vec![1.0]).unwrap();
         let (c, stats) = to_constraints(&p, 0, 0);
         assert!(c.is_empty());
         assert_eq!(stats.fg_ratio, 0.0);

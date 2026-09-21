@@ -11,8 +11,8 @@ use crate::commands::output::{
 };
 use crate::commands::segment;
 use crate::cutout::{
-    BackgroundEstimate, DeltaEQuantiles, LowReason, ResolvedModel, SubjectHint, analyse_background,
-    bbox_argument, detect_subject_from_probability,
+    BackgroundEstimate, DeltaEQuantiles, LowReason, ResolvedModel, SubjectHint,
+    analyse_background_seen, bbox_argument, detect_subject_from_probability, see_background,
 };
 use crate::error::Result;
 use crate::image_io::load;
@@ -23,9 +23,15 @@ pub fn run(args: &InfoArgs) -> Result<InfoReport> {
     let loaded = load::load_with(&args.input, &args.color.to_load_options())?;
     // **`cutout` と同じ経路で見立てる。** `info` だけが 1 色で測っていると、
     // ここで見た数値と切り抜きが使う数値が別物になり、助言に従ったエージェントが
-    // 自分が読んだ世界と違う結果を受け取る
-    let analysis = analyse_background(
+    // 自分が読んだ世界と違う結果を受け取る。
+    //
+    // **1 度だけ測って、`auto` の門にも渡す。** 門は背景と主体しか見ないので
+    // （`commands::segment::colour_is_hopeless`）、ここで測ったものがそのまま
+    // 答えになる。渡さないと、24.5MP で同じ測定を 2 度払う
+    let seen = see_background(&loaded.image, args.border);
+    let analysis = analyse_background_seen(
         &loaded.image,
+        Some(&seen),
         args.border,
         args.background_model,
         None,
@@ -37,7 +43,7 @@ pub fn run(args: &InfoArgs) -> Result<InfoReport> {
     // 差し替えるのは、`--segment` を渡した利用者が知りたいのが
     // 「モデルはどこを商品と見たか」だからである。何から出たかは
     // `subject.source` が必ず名乗るので、取り違えようがない
-    let decision = segment::decide(&loaded.image, &args.segment, args.border)?;
+    let decision = segment::decide(&loaded.image, &args.segment, args.border, Some(&seen))?;
     let (subject, subject_source) = match decision.run.as_ref() {
         Some(run) => (
             detect_subject_from_probability(&loaded.image, background, &run.probability),
@@ -53,8 +59,10 @@ pub fn run(args: &InfoArgs) -> Result<InfoReport> {
     // ここで黙ると、配った値を読んで自分で比べたエージェントだけが気づく——
     // **しきい値を配る意味は、越えたときに kiri の側から言うこと**にある
     let segment_report = decision.run.as_ref().map(|run| {
-        let (_, stats) =
-            crate::segment::to_constraints(&run.probability, loaded.width(), loaded.height());
+        // **原寸の制約は組まない。** `info` は切り抜かないので、要るのは
+        // 割合の 3 つだけである（`segment::stats_of` は `to_constraints` と
+        // 同じ数を、格子のまま数える）
+        let stats = crate::segment::stats_of(&run.probability, loaded.width(), loaded.height());
         warnings.extend(segment::uncertain_warning(&stats));
         segment::report(run, &stats)
     });

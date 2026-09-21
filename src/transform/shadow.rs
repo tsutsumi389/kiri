@@ -106,8 +106,9 @@ pub fn synth(mut product: RgbaImage, spec: &ShadowSpec) -> (RgbaImage, ShadowBou
     let shifted = shift_alpha(&product, spec.offset);
     let mut alpha = shifted.alpha;
 
-    let mut scratch = Scratch::new(w as usize, h as usize);
-    for width in box_widths(spec.sigma, BOX_PASSES) {
+    let widths = box_widths(spec.sigma, BOX_PASSES);
+    let mut scratch = Scratch::new(w as usize, h as usize, &widths);
+    for width in widths {
         blur_pass(&mut alpha, w as usize, h as usize, width, &mut scratch);
     }
 
@@ -247,25 +248,54 @@ fn box_widths(sigma: f64, n: usize) -> Vec<u32> {
 
 /// 箱型フィルタの作業領域。
 ///
-/// **3 パスで毎回確保していた。** 24.5MP では 1 パスあたり 24.5MB の出力
-/// バッファと行のぶんを確保し直すことになる。寸法はパスを通して変わらないので、
-/// `synth` が 1 度だけ持つ。
+/// **3 パスで毎回確保していた。** 24.5MP では 1 パスあたりの行のぶんを
+/// 確保し直すことになる。寸法はパスを通して変わらないので、`synth` が
+/// 1 度だけ持つ。
+///
+/// # 原寸の出力バッファは持たない
+///
+/// 縦のパスは「読みながら書く」形にできる。窓に残っているのは
+/// **たかだか `r + 1` 行前まで**なので、そのぶんだけ元の値を控えておけば
+/// 同じ配列へ書き戻せる（`blur_pass`）。24.5MP・σ 57px では 24.5MB が
+/// 0.4MB になる。
+///
+/// **プロセスのピークは動かない。** 24.5MP で 874MB → 873MB、8000x8000 の
+/// キャンバスでも 1381MB のままだった（`/usr/bin/time -l`）。峰を作っているのは
+/// 切り抜き本体と書き出しで、影の層はその後ろに隠れている。減らしたのは
+/// 確保であって峰ではない——**測って外れた見立てをそのまま残しておく**ほうが、
+/// 次に同じ場所を疑う人の時間を節約する。
 struct Scratch {
     prefix: Vec<u32>,
     row: Vec<u8>,
     sums: Vec<u32>,
-    out: Vec<u8>,
+    /// 縦のパスで控える元の行。`r + 1` 行ぶん（画像より高くは取らない）
+    ring: Vec<u8>,
+    ring_rows: usize,
 }
 
 impl Scratch {
-    fn new(w: usize, h: usize) -> Self {
+    /// `widths` は掛ける箱型の幅すべて。**いちばん広い窓に合わせて控える。**
+    fn new(w: usize, h: usize, widths: &[u32]) -> Self {
+        let widest = widths.iter().copied().max().unwrap_or(1);
+        let ring_rows = ring_rows(widest, h);
         Scratch {
             prefix: vec![0u32; w + 1],
             row: vec![0u8; w],
             sums: vec![0u32; w],
-            out: vec![0u8; w * h],
+            ring: vec![0u8; ring_rows * w],
+            ring_rows,
         }
     }
+}
+
+/// 縦のパスで控えておく行数。
+///
+/// 行 `y` を書き換えた後も、その値は行 `y + r` を出すときの引き算に要る。
+/// 控えるのは `y - r ..= y` の `r + 1` 行で、画像がそれより低ければ
+/// 画像の高さで足りる（そのときは引く相手が画像の外にしか無い）。
+fn ring_rows(width: u32, h: usize) -> usize {
+    let r = ((width.max(1) - 1) / 2) as usize;
+    (r + 1).min(h.max(1))
 }
 
 /// 幅 `width`（奇数）の箱型フィルタを横 1 回・縦 1 回掛ける。
@@ -299,8 +329,13 @@ fn blur_pass(buf: &mut [u8], w: usize, h: usize, width: u32, scratch: &mut Scrat
     }
 
     // 縦方向。行を足し引きする移動和にする。列ごとに走らせると 24.5MP で
-    // キャッシュミスが画素数ぶん出る
-    let (sums, out) = (&mut scratch.sums, &mut scratch.out);
+    // キャッシュミスが画素数ぶん出る。
+    //
+    // **その場で書き換える。** 足す側が読むのは行 `y + r`——まだ書いていない
+    // 先の行である。引く側が読むのは行 `y - r`——既に書き換えた後なので、
+    // 元の値を `ring` から読む。控えてあるのは直近 `ring_rows` 行だけで足りる
+    let (sums, ring) = (&mut scratch.sums, &mut scratch.ring);
+    let rows = scratch.ring_rows.max(1);
     sums.fill(0);
     for y in 0..r.min(h) {
         add_row(sums, &buf[y * w..(y + 1) * w]);
@@ -309,14 +344,18 @@ fn blur_pass(buf: &mut [u8], w: usize, h: usize, width: u32, scratch: &mut Scrat
         if y + r < h {
             add_row(sums, &buf[(y + r) * w..(y + r + 1) * w]);
         }
-        for (slot, s) in out[y * w..(y + 1) * w].iter_mut().zip(&*sums) {
-            *slot = ((s + half) / width) as u8;
+        let slot = (y % rows) * w;
+        ring[slot..slot + w].copy_from_slice(&buf[y * w..(y + 1) * w]);
+        for (out, s) in buf[y * w..(y + 1) * w].iter_mut().zip(&*sums) {
+            *out = ((s + half) / width) as u8;
         }
         if y >= r {
-            sub_row(sums, &buf[(y - r) * w..(y - r + 1) * w]);
+            // `y - r ..= y` の `r + 1` 行しか生きていないので、`rows` 個の
+            // 枠で衝突しない（`ring_rows` を参照）
+            let old = ((y - r) % rows) * w;
+            sub_row(sums, &ring[old..old + w]);
         }
     }
-    buf.copy_from_slice(out);
 }
 
 fn add_row(sums: &mut [u32], row: &[u8]) {
@@ -362,8 +401,9 @@ mod tests {
 
     /// `synth` と同じ 3 パスを生のバッファへ掛ける。
     fn blur_all(buf: &mut [u8], w: usize, h: usize, sigma: f64) {
-        let mut scratch = Scratch::new(w, h);
-        for width in box_widths(sigma, BOX_PASSES) {
+        let widths = box_widths(sigma, BOX_PASSES);
+        let mut scratch = Scratch::new(w, h, &widths);
+        for width in widths {
             blur_pass(buf, w, h, width, &mut scratch);
         }
     }

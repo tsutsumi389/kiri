@@ -58,6 +58,15 @@ pub struct ItemSettings {
     pub reclassify: Option<bool>,
     /// 背景のモデル（"auto" / "flat" / "field"）
     pub background_model: Option<String>,
+    /// セグメンテーションモデルの使い方（"off" / "auto" / "isnet"）。
+    ///
+    /// **数百点に一律で付ける値ではない。** 1 件あたり推論だけで 1.3 秒
+    /// かかる。`auto` なら色で解ける画像は素通りするので、混ざった素材には
+    /// そちらが向く（`defaults` に書いて、効いた件は `segment_ran` で分かる）
+    pub segment: Option<String>,
+    /// モデルの ONNX ファイル。`input` と同じ規則で仕様ファイルの場所を
+    /// 基準に解決する
+    pub model_path: Option<PathBuf>,
     /// 探索を kiri に任せるか。**書いた設定はその値に固定される**——
     /// tolerance を書いた項目では tolerance を探索しない（CLI で
     /// `--tolerance` を明示したときと同じ規約）
@@ -118,6 +127,8 @@ impl ItemSettings {
             smooth_contour,
             reclassify,
             background_model,
+            segment,
+            model_path,
             optimize,
             color_convert,
             edge_threshold,
@@ -161,6 +172,8 @@ const SETTING_KEYS: &[&str] = &[
     "smooth_contour",
     "reclassify",
     "background_model",
+    "segment",
+    "model_path",
     "optimize",
     "color_convert",
     "edge_threshold",

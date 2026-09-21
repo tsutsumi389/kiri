@@ -85,6 +85,8 @@ warning_catalog! {
         => "--model-path を渡したが --segment off なのでモデルを読んでいない",
     ModelSizeUnexpected = "MODEL_SIZE_UNEXPECTED"
         => "--model-path のファイルが既知のモデルと大きさが違う（指定を尊重してそのまま読んだ）",
+    ModelDigestUnexpected = "MODEL_DIGEST_UNEXPECTED"
+        => "--model-path のファイルのダイジェストが既知のモデルと違う（指定を尊重してそのまま読んだ）",
     CanvasUpscaled = "CANVAS_UPSCALED"
         => "キャンバス配置で商品を拡大した",
     Upscaled = "UPSCALED"

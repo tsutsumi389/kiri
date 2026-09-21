@@ -5164,6 +5164,65 @@ fn batch_accepts_the_matting_keys() {
     assert_eq!(settings["reclassify"], false);
 }
 
+/// spec が `segment` と `model_path` を受けること。
+///
+/// **モデルは要らない。** ここで確かめるのは spec の入口が 2 つのキーを
+/// 受け取って `settings` へ流すところまでで、`off` なら推論の経路は
+/// 1 行も走らない（走らせる側は tests/segment.rs が受け持つ）。
+#[test]
+fn batch_accepts_the_segment_keys() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        ..Default::default()
+    });
+    write_png(dir.path(), "a.png", &img);
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        r#"{"defaults":{"segment":"off"},
+             "items":[{"input":"a.png","output":"out.png"}]}"#,
+    )
+    .unwrap();
+
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = json_stdout(&out);
+    assert_eq!(json["succeeded"], 1);
+    let settings = &json["results"][0]["result"]["settings"];
+    assert_eq!(settings["segment"], "off");
+    assert_eq!(settings["segment_ran"], false);
+}
+
+/// spec の `segment` は綴りを検査する。**未知の値を既定へ落とさない。**
+///
+/// 落とすと、その項目だけ黙ってモデル無しで処理され、数百点を回した後に
+/// 仕上がりを見るまで気づけない（`matting` と同じ理由）。
+#[test]
+fn an_unknown_segment_value_is_refused() {
+    let dir = fixture_dir();
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        r#"{"items":[{"input":"a.png","output":"b.png","segment":"isnet2"}]}"#,
+    )
+    .unwrap();
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let json = json_stdout(&out);
+    assert_eq!(json["results"][0]["error"]["code"], "SPEC_INVALID");
+}
+
 /// spec の綴り違いに候補を返すこと（`refine` と同じ関門）。
 #[test]
 fn a_misspelled_matting_key_suggests_the_right_one() {

@@ -27,8 +27,8 @@ use image::RgbaImage;
 
 use crate::cutout::diagnostics::{CONTOUR_ROUGH_WARN, HALO_WARN, RIM_CONTAMINATION_WARN};
 use crate::cutout::{
-    BackgroundModel, CutoutOptions, CutoutResult, Diagnostics, ResolvedModel, SubjectHint,
-    analyse_background, bbox_to_pixels, cutout,
+    BackgroundModel, BackgroundSeen, CutoutOptions, CutoutResult, Diagnostics, ResolvedModel,
+    SubjectHint, analyse_background_seen, bbox_to_pixels, cutout_seen, see_background,
 };
 use crate::error::{Error, ErrorCode, Result};
 use crate::transform::resize::{self, FitMode, ResizeSpec};
@@ -579,13 +579,25 @@ pub struct Optimized {
 }
 
 /// 候補を総当たりして、いちばん良い切り抜きを返す。
+///
+/// **指示の表を借りずに受け取る。** 返す `Optimized::options` は「効いた設定」
+/// であり、呼ぶ側は渡した表をそれで置き換える。借りて受け取ると、原寸の
+/// `Constraints`（24.5MP で 24MB）を**候補ごとに複製**することになる——
+/// 食ってしまえば、複製は 1 度も要らない。
+///
+/// `seen` は原寸の見立て（`--segment auto` の門が測ったもの）。最終段で
+/// そのまま使う。探索段は縮小版を見るので、そちらは中で 1 度だけ測る。
 pub fn optimize(
     image: &RgbaImage,
-    base: &CutoutOptions,
+    mut base: CutoutOptions,
     fixed: &OptimizeFixed,
+    seen: Option<&BackgroundSeen>,
 ) -> Result<Optimized> {
     let started = Instant::now();
     let source = (image.width(), image.height());
+    // **原寸の指示を先に抜く。** この後で土台を組むのに `base` を複製するが、
+    // 抜いてあれば複製されるのは数十バイトの数値だけになる
+    let full_constraints = base.constraints.take();
     let small = reduced(image)?;
     let target = (small.width(), small.height());
 
@@ -597,7 +609,7 @@ pub fn optimize(
     // ないので、4284px の素材を 1500px で回すと 2.9 倍の幅に相当する。順位を
     // 付けるだけなら全候補に同じ歪みが掛かるので実害は出ていない（一致率の
     // 実測は docs/design.md 4.13）が、換算を足すなら**まずここを疑う**こと
-    let search_base = CutoutOptions {
+    let mut search = CutoutOptions {
         bbox: base
             .bbox
             .map(|b| CandidateBbox::Given(b).resolve(source, target)),
@@ -606,44 +618,52 @@ pub fn optimize(
             .iter()
             .map(|&(x, y)| scale_point(x, y, source, target))
             .collect(),
-        constraints: base
-            .constraints
+        constraints: full_constraints
             .as_ref()
             .map(|c| c.resampled(target.0, target.1)),
         refine: false,
         ..base.clone()
     };
 
-    // **主体とモデルの見立ては 1 回だけ。** 候補ごとに測り直すと、候補集合が
-    // 候補の結果で変わることになり、探索が決定的でなくなる
-    let analysis = analyse_background(
+    // **縮小版の見立ては 1 回だけ。** 候補ごとに測り直すと、候補集合が
+    // 候補の結果で変わることになり、探索が決定的でなくなる。**持ち回すのも
+    // 同じ理由で正しい**——候補が動かすのは `--tolerance` と矩形とモデルで、
+    // どれも外周の 1 色分布と主体の決め方に入っていない（`BackgroundSeen`）
+    let small_seen = see_background(&small, search.border);
+    let analysis = analyse_background_seen(
         &small,
-        search_base.border,
+        Some(&small_seen),
+        search.border,
         BackgroundModel::Auto,
-        search_base.bbox,
-        search_base.constraints.as_ref(),
+        search.bbox,
+        search.constraints.as_ref(),
     );
-    let set = candidates(base, fixed, analysis.subject.as_ref(), analysis.model);
+    let set = candidates(&base, fixed, analysis.subject.as_ref(), analysis.model);
     drop(analysis);
 
+    // 候補ごとに表を組み直さず、**3 つの値だけを書き換えて回す**
     let mut trials: Vec<Trial> = set
         .iter()
         .map(|candidate| {
-            let opts = with(&search_base, candidate, source, target);
-            Trial::new(*candidate, Stage::Search, &cutout(&small, &opts), false)
+            apply(&mut search, candidate, source, target);
+            let result = cutout_seen(&small, &search, Some(&small_seen));
+            Trial::new(*candidate, Stage::Search, &result, false)
         })
         .collect();
+    drop(search);
     drop(small);
     penalise_collapse(&mut trials);
     // 安定ソート。`better_search` が全順序を返すので、同じ入力からは必ず
     // 同じ並びが出る
     trials.sort_by(better_search);
 
+    // 原寸の指示を戻す。最終段は**縮小していない指示そのまま**で回る
+    base.constraints = full_constraints;
     let best = finalists(&mut trials, |candidate| {
-        let options = with(base, candidate, source, source);
-        let result = cutout(image, &options);
+        apply(&mut base, candidate, source, source);
+        let result = cutout_seen(image, &base, seen);
         let trial = Trial::new(*candidate, Stage::Final, &result, false);
-        (trial, (result, options))
+        (trial, result)
     });
 
     // 候補が 1 つも無いことは起こらない。`candidates` は 3 つの軸それぞれに
@@ -651,7 +671,7 @@ pub fn optimize(
     // 1 回は回る。**黙って `cutout` を走らせ直すほうが危うい**——探索の記録と
     // 書き出した絵が食い違ったまま成功して返ることになる
     debug_assert!(best.is_some(), "候補集合が空のまま最終段を抜けた");
-    let (chosen, (result, options)) = best.ok_or_else(|| {
+    let (chosen, result) = best.ok_or_else(|| {
         Error::new(
             ErrorCode::OptimizeNoCandidate,
             "--optimize が試せる候補を 1 つも組めませんでした",
@@ -659,11 +679,16 @@ pub fn optimize(
         .with_hint("--tolerance や --background-model の明示を外して試してください")
     })?;
     let trial = trials[chosen].clone();
+    // **勝った候補をもう 1 度当ててから返す。** `base` には最後に回した候補が
+    // 残っており、早期打ち切りが無い限りそれは勝った候補ではない。当て直しは
+    // 3 つの数値の代入で、`result` を作ったときと同じ値になる（`apply` は
+    // 候補と寸法だけから決まる）
+    apply(&mut base, &trial.candidate, source, source);
 
     let warning = no_clean_candidate(&trial);
     Ok(Optimized {
         result,
-        options,
+        options: base,
         searched_at: target.0.max(target.1),
         trials,
         chosen,
@@ -749,18 +774,12 @@ fn no_clean_candidate(trial: &Trial) -> Option<Warning> {
 }
 
 /// 土台の設定に候補を重ねる。
-fn with(
-    base: &CutoutOptions,
-    candidate: &Candidate,
-    source: (u32, u32),
-    target: (u32, u32),
-) -> CutoutOptions {
-    CutoutOptions {
-        tolerance: candidate.tolerance,
-        bbox: candidate.bbox.map(|b| b.resolve(source, target)),
-        background_model: candidate.background_model,
-        ..base.clone()
-    }
+fn apply(base: &mut CutoutOptions, candidate: &Candidate, source: (u32, u32), target: (u32, u32)) {
+    base.tolerance = candidate.tolerance;
+    // **候補が矩形を持たないなら矩形は無い。** 元の指定を残してはならない——
+    // 矩形を探索の軸にしている以上、「矩形なし」も 1 つの候補である
+    base.bbox = candidate.bbox.map(|b| b.resolve(source, target));
+    base.background_model = candidate.background_model;
 }
 
 /// 探索段で使う縮小画像。元が `SEARCH_LONG_EDGE` 以下ならそのまま借りる。
@@ -1228,6 +1247,33 @@ mod tests {
         // 探索段で前景が 1 画素も無かった候補は比べようがない（0 除算の側でも
         // 「落ちた」の側でもなく、判定しない）
         assert!(!collapsed_at_full_size(0.0, 0.0));
+    }
+
+    /// **返す設定は、選ばれた候補のものである。**
+    ///
+    /// 最終段は 1 つの表を書き換えながら回す（複製を作らないため）ので、
+    /// 抜けた時点でそこに残っているのは**最後に回した候補**である。早期
+    /// 打ち切りが効かなければ勝者と一致しない——`settings` と `applied_bbox`
+    /// は効いた値を出す規約なので、ここが狂うと報告がそのまま嘘になる。
+    #[test]
+    fn the_returned_settings_belong_to_the_chosen_candidate() {
+        // 灰色の背景に濃い四角。候補ごとに結果が変わる程度には素直な絵
+        let mut image = RgbaImage::from_pixel(120, 90, image::Rgba([210, 208, 205, 255]));
+        for y in 25..65 {
+            for x in 30..90 {
+                image.put_pixel(x, y, image::Rgba([40, 60, 120, 255]));
+            }
+        }
+        let found = optimize(&image, CutoutOptions::default(), &free(), None).expect("探索が失敗");
+        let chosen = found.trials[found.chosen].candidate;
+
+        assert_eq!(found.options.tolerance, chosen.tolerance);
+        assert_eq!(found.options.background_model, chosen.background_model);
+        let (w, h) = (image.width(), image.height());
+        assert_eq!(
+            found.options.bbox,
+            chosen.bbox.map(|b| b.resolve((w, h), (w, h))),
+        );
     }
 
     /// 最終段で回した候補の数と、そこで選ばれたもの。

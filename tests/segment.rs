@@ -1081,3 +1081,80 @@ fn auto_that_decides_not_to_run_says_nothing_about_the_model_path() {
         "走らせない判断まで警告にすると settings.segment_ran と二重になる: {v}"
     );
 }
+
+/// **`batch` が spec の `segment` でモデルを走らせること。**
+///
+/// 2 件を 1 度のプロセスで回す。読み込みは 1 度きりだが、`segment` ブロックと
+/// `settings.segment_ran` は**どちらの件にも出る**——2 件目から黙ると、
+/// 数百点の spec で「モデルが効いた件」を数えられなくなる。
+#[test]
+fn batch_runs_the_model_for_every_item() {
+    if skip_without_model() {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    for name in ["a.png", "b.png"] {
+        write_png(dir.path(), name, &product_image(&ProductSpec::default()));
+    }
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        r#"{"defaults":{"segment":"isnet","format":"png"},
+             "items":[{"input":"a.png","output":"out/a.png"},
+                      {"input":"b.png","output":"out/b.png"}]}"#,
+    )
+    .unwrap();
+
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--jobs", "2", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    assert_eq!(v["succeeded"], 2, "{v}");
+    for i in 0..2 {
+        let item = &v["results"][i]["result"];
+        assert_eq!(item["settings"]["segment"], "isnet", "{i} 件目: {item}");
+        assert_eq!(item["settings"]["segment_ran"], true, "{i} 件目: {item}");
+        assert_eq!(item["segment"]["model"], "isnet", "{i} 件目: {item}");
+    }
+}
+
+/// spec の `model_path` は仕様ファイルの場所を基準に解決する
+/// （`trimap` などと同じ規則）。
+///
+/// **見つからないことで確かめる。** 176MB の複製をテストのために作らずに、
+/// 「どこを見に行ったか」だけをエラーの文面から読む。
+#[test]
+#[cfg(feature = "segment")]
+fn a_spec_model_path_resolves_against_the_spec_file() {
+    let dir = TempDir::new().unwrap();
+    write_png(dir.path(), "a.png", &product_image(&ProductSpec::default()));
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        r#"{"items":[{"input":"a.png","output":"out/a.png",
+                      "segment":"isnet","model_path":"models/nope.onnx"}]}"#,
+    )
+    .unwrap();
+
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let v = json_stdout(&out);
+    let error = &v["results"][0]["error"];
+    assert_eq!(error["code"], "MODEL_NOT_FOUND", "{v}");
+    let expected = dir.path().join("models").join("nope.onnx");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(expected.to_str().unwrap()),
+        "spec の場所を基準にしていない: {error}"
+    );
+}

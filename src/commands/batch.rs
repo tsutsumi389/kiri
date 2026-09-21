@@ -17,6 +17,7 @@ use crate::cutout::{BackgroundModel, CutoutOptions, DEFAULT_BORDER, Matting, Opt
 use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::OutputFormat;
 use crate::report::{BatchItemReport, BatchReport, ErrorBody, SCHEMA_VERSION};
+use crate::segment::SegmentMode;
 use crate::transform::shadow::ShadowMode;
 
 pub fn run(args: &BatchArgs) -> Result<BatchReport> {
@@ -168,11 +169,16 @@ fn to_cutout_args(
         color: ColorOpts {
             no_color_convert: !settings.color_convert.unwrap_or(true),
         },
-        // **spec からは segment を受けない。** 数百点を 1 件 1.2 秒・
-        // ピーク RSS 1.5GB で回すのは、並列度ぶんだけメモリが倍になる
-        // `batch` でいちばん割に合わない使い方である。モデルが要る数枚は
-        // `cutout` で個別に救う（README「意味の事前知識」を参照）
-        segment: SegmentOpts::default(),
+        // **spec からも segment を受ける。** 断っていたのは 1 件ごとに
+        // 176MB を読み直し、ピーク RSS 1.6GB を並列度ぶん積む形だったため
+        // である。いまは計画をプロセスで 1 つ持ち（`segment::isnet`）、
+        // 推論そのものは 1 本ずつ通すので、`--jobs` を上げてもモデルのぶんは
+        // 増えない。**時間は増える**——1 件あたり 1.3 秒は並べられないので、
+        // 数百点に一律で付ける値ではないことは変わらない
+        segment: SegmentOpts {
+            segment: value_enum(settings.segment.as_deref(), SegmentMode::Off, "segment")?,
+            model_path: path(&settings.model_path),
+        },
         // 未指定は未指定のまま渡す。既定値で埋めてしまうと、テクスチャに応じた
         // 自動調整が spec を書いた人の「8 を指定した」と区別できなくなる
         edge_threshold: checked_opt(settings.edge_threshold, "edge_threshold")?,

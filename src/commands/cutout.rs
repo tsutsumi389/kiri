@@ -13,7 +13,7 @@ use crate::commands::segment;
 use crate::cutout::constraints::{MASK_THRESHOLD, TRIMAP_BACKGROUND, TRIMAP_FOREGROUND};
 use crate::cutout::optimize;
 use crate::cutout::{
-    Constraint, ConstraintSource, Constraints, CutoutOptions, FG_SEED_RADIUS, Matting, cutout,
+    Constraint, ConstraintSource, Constraints, CutoutOptions, FG_SEED_RADIUS, Matting, cutout_seen,
 };
 use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::{LoadOptions, OutputFormat, SaveOptions, load, save};
@@ -50,7 +50,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     // **モデルは提案、利用者は決定。** 先にモデルの提案を敷いてから、利用者の
     // 指示を上から重ねる（`Constraints::overlay`）。重なった画素は利用者の
     // ものになり、`CONSTRAINT_CONFLICT` にはしない
-    let decision = segment::decide(&loaded.image, &args.segment, args.border)?;
+    let decision = segment::decide(&loaded.image, &args.segment, args.border, None)?;
     let mut segment_report = None;
     // 判断そのものから出た警告（`--segment off` に添えた `--model-path` など）
     let mut segment_warnings = decision.warnings.clone();
@@ -91,8 +91,14 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     // そのまま流す。`opts` も選ばれた候補で置き換える——`settings` と
     // `applied_bbox` は効いた値を出す規約であり、渡した値では嘘になる
     // 影を敷くときだけ `result.image` を取り出して使い回すので mut で持つ
+    // **`auto` の門が測った見立てをそのまま渡す。** 門を通らなかった実行では
+    // `None` で、切り抜き側が今までどおり自分で測る
+    let seen = decision.seen.as_ref();
     let (mut result, optimize, optimize_warning) = if args.optimize {
-        let found = optimize::optimize(&loaded.image, &opts, &args.fixed)?;
+        // 表を渡し切る（借りない）。借りると候補ごとに原寸の `Constraints`
+        // （24.5MP で 24MB）を複製することになる。`found.options` が
+        // 「効いた設定」として返ってくるので、下の `opts` はそれで置き換わる
+        let found = optimize::optimize(&loaded.image, opts, &args.fixed, seen)?;
         let report = optimize_report(&found, w, h);
         // 代入で置き換える（シャドーイングではない）。**束縛を増やすと、
         // 探索前の指示の表が関数の終わりまで生き残る**——24.5MP では
@@ -100,7 +106,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         opts = found.options;
         (found.result, Some(report), found.warning)
     } else {
-        (cutout(&loaded.image, &opts), None, None)
+        (cutout_seen(&loaded.image, &opts, seen), None, None)
     };
     let bbox = opts.bbox;
 

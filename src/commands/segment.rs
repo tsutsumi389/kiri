@@ -8,7 +8,7 @@
 use image::RgbaImage;
 
 use crate::cli::SegmentOpts;
-use crate::cutout::{BackgroundEstimate, detect_subject, estimate_background};
+use crate::cutout::{BackgroundSeen, see_background};
 use crate::error::Result;
 use crate::report::SegmentReport;
 use crate::segment::{
@@ -21,6 +21,15 @@ pub struct Decision {
     /// 指定値そのまま（`settings.segment`）
     pub mode: SegmentMode,
     pub run: Option<SegmentRun>,
+    /// 門が測った見立て。**切り抜きへそのまま渡す。**
+    ///
+    /// `auto` の門は背景と主体を測って「色では解けないか」を決める。その後の
+    /// `cutout` は同じ画像・同じ `border` で同じものを測り直していた——
+    /// 24.5MP では 1 回 0.2 秒で、`auto` を渡したときだけ 2 度払う形になる。
+    ///
+    /// **門を通らなかった実行では `None`**（`off`、`isnet` の指定、feature
+    /// 無しの断り）。そのときは切り抜き側が今までどおり自分で測る
+    pub seen: Option<BackgroundSeen>,
     /// モデルを走らせる／走らせないの判断そのものから出た警告。
     /// **`run` の有無によらず出る**——`--segment off` に `--model-path` を
     /// 添えた指定は、モデルを読まないからこそ知らせる必要がある
@@ -33,11 +42,12 @@ impl Decision {
     /// `SegmentRun` の側に置いたままにすると、`decision.run` を持っている
     /// 呼び出し側が `warnings` を見ずに捨てられる。移し替えてしまえば、
     /// 出す場所は `Decision::warnings` の 1 つだけになる。
-    fn from_run(mode: SegmentMode, mut run: SegmentRun) -> Self {
+    fn from_run(mode: SegmentMode, mut run: SegmentRun, seen: Option<BackgroundSeen>) -> Self {
         Decision {
             mode,
             warnings: std::mem::take(&mut run.warnings),
             run: Some(run),
+            seen,
         }
     }
 
@@ -53,27 +63,48 @@ impl Decision {
 ///
 /// `border` は `auto` の門で背景を見立てるのに使う（`--border` と同じ値を
 /// 渡すこと。別の帯で測ると `info` の助言と食い違う）。
-pub fn decide(image: &RgbaImage, opts: &SegmentOpts, border: u32) -> Result<Decision> {
+pub fn decide(
+    image: &RgbaImage,
+    opts: &SegmentOpts,
+    border: u32,
+    seen: Option<&BackgroundSeen>,
+) -> Result<Decision> {
     if opts.segment.is_off() {
         return Ok(Decision {
             mode: opts.segment,
             run: None,
             warnings: ignored_model_path(opts).into_iter().collect(),
+            // **門を通っていないので、測ってもいない。** 渡された見立てを
+            // そのまま返すこともできるが、`Decision::seen` は「門が測った
+            // もの」であり、呼ぶ側が自分で渡したものを受け取り直す道を
+            // 作ると、どちらが先に測ったのかが読めなくなる
+            seen: None,
         });
     }
     if !crate::commands::model::AVAILABLE {
         return Err(crate::segment::unavailable(opts.segment.as_str()));
     }
-    if opts.segment == SegmentMode::Auto && !colour_is_hopeless(image, border) {
-        // **`auto` が走らなかっただけなら黙っている。** `--model-path` は
-        // 「走るならこれを読め」という指定であり、走らせない判断をしたのは
-        // kiri 自身である。ここで警告を出すと、`settings.segment_ran` が
-        // 既に言っていることを二重に言うことになる
-        return Ok(Decision {
-            mode: opts.segment,
-            run: None,
-            warnings: Vec::new(),
-        });
+    let mut measured = None;
+    if opts.segment == SegmentMode::Auto {
+        // 渡されていればそれを使う（`info` は既に測っている）
+        let seen = match seen.filter(|s| s.border == border) {
+            Some(seen) => seen.clone(),
+            None => see_background(image, border),
+        };
+        let hopeless = colour_is_hopeless(&seen);
+        measured = Some(seen);
+        if !hopeless {
+            // **`auto` が走らなかっただけなら黙っている。** `--model-path` は
+            // 「走るならこれを読め」という指定であり、走らせない判断をしたのは
+            // kiri 自身である。ここで警告を出すと、`settings.segment_ran` が
+            // 既に言っていることを二重に言うことになる
+            return Ok(Decision {
+                mode: opts.segment,
+                run: None,
+                warnings: Vec::new(),
+                seen: measured,
+            });
+        }
     }
 
     let options = SegmentOptions {
@@ -82,7 +113,7 @@ pub fn decide(image: &RgbaImage, opts: &SegmentOpts, border: u32) -> Result<Deci
         ..SegmentOptions::isnet()
     };
     let run = crate::segment::run(image, &options)?;
-    Ok(Decision::from_run(opts.segment, run))
+    Ok(Decision::from_run(opts.segment, run, measured))
 }
 
 /// `--segment off` に `--model-path` を添えた指定を知らせる。
@@ -119,12 +150,15 @@ fn ignored_model_path(opts: &SegmentOpts) -> Option<Warning> {
 ///
 /// 場は作らない。門に要るのは外周の 1 色分布と主体だけで、`analyse_background`
 /// を丸ごと通すと照明場の推定（24MP で数百 ms）を捨てるために走らせることになる。
-fn colour_is_hopeless(image: &RgbaImage, border: u32) -> bool {
-    let background: BackgroundEstimate = estimate_background(image, border);
+///
+/// **測るのは呼ぶ側。** 門が自分で測ると、その結果を切り抜きへ渡す道が無い
+/// （`BackgroundSeen` の表を参照）。
+fn colour_is_hopeless(seen: &BackgroundSeen) -> bool {
+    let background = &seen.estimate;
     if background.is_uniform() {
         return false;
     }
-    match detect_subject(image, &background) {
+    match seen.subject.as_ref() {
         // 信頼度が低い＝そもそも主体を掴めていない（実写のキーボードがこれ）
         Some(s) if !s.confidence.is_high() => true,
         // 掴めてはいるが、その色差が背景自身のばらつきを下回る
@@ -199,6 +233,7 @@ mod tests {
                 WarningCode::ModelSizeUnexpected,
                 "大きさが違う",
             )]),
+            None,
         );
         assert_eq!(decision.warnings.len(), 1);
         assert_eq!(decision.warnings[0].code.as_str(), "MODEL_SIZE_UNEXPECTED");

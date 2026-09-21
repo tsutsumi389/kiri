@@ -176,15 +176,13 @@ pub fn resolve_path(model: &KnownModel, explicit: Option<&Path>) -> Result<PathB
 
 /// 読み込む直前の安い検査。**大きさだけを見る。**
 ///
-/// ここで 176MB を舐めて SHA-256 を突き合わせることもできるが、実測で
-/// 推論 1.2 秒に対して 0.5 秒を毎回足すことになり、**毎回払う割に 2 回目
-/// 以降は何も新しいことを言わない**。現実に起きる壊れ方は途中で切れた
-/// ダウンロードで、それは大きさで捕まる。全体の突き合わせは
-/// `kiri model list` が受け持つ——「このファイルは正しいか」を問う専用の
-/// コマンドがある以上、その費用はそちらにある。
+/// 現実に起きる壊れ方は途中で切れたダウンロードで、それは大きさで捕まる。
+/// **中身の突き合わせは `verify` が続けて行う**——そちらは 176MB を舐めるので、
+/// 確かめた結果を傍らファイルに残して 2 回目以降を飛ばす。先に大きさを見るのは、
+/// 切れたファイルを 0.4 秒かけて確かめる意味が無いからである。
 ///
 /// tract が解析に失敗した場合も `MODEL_UNREADABLE` になる（`isnet.rs`）。
-/// 大きさが合っていて中身が壊れている場合の受け皿はそちらである。
+/// 大きさもダイジェストも合っていて解析だけが通らない場合の受け皿はそちらである。
 ///
 /// # `--model-path` で指されたファイルは断らない
 ///
@@ -246,7 +244,174 @@ pub fn check_size(model: &KnownModel, path: &Path, explicit: bool) -> Result<Opt
     )))
 }
 
-/// ファイル全体の SHA-256。`kiri model list` だけが呼ぶ。
+/// 検証済みの印を置く傍らファイルの拡張子。
+///
+/// **モデルと同じ場所に置く。** モデルを消せば一緒に消えるのが自然で、
+/// 別の場所（設定ディレクトリ等）に持つと、モデルを入れ替えたのに印だけが
+/// 残る形を作ることになる。
+pub const VERIFIED_SUFFIX: &str = ".verified";
+
+/// 読み込む前にダイジェストを突き合わせる。**1 度だけ払う。**
+///
+/// # なぜ大きさだけでは足りないか
+///
+/// 切り抜きの経路は長さしか見ていなかった（`check_size`）ので、**想定と同じ
+/// 長さの壊れたファイル**は tract の解析失敗まで落ちない。そこで出るのは
+/// 「ONNX として解析できません」で、原因が取得の失敗なのかモデルの構造なのか
+/// を利用者が分けられない。
+///
+/// # 毎回 0.4 秒は払わない
+///
+/// 176MB の SHA-256 は実測 0.4 秒で、推論 1.2 秒に対して無視できない。
+/// **2 回目以降は何も新しいことを言わない**ので、確かめた結果を傍らの
+/// `.verified` に残し、ファイルが同じなら読み飛ばす。印が持つのは
+/// 「大きさ・更新時刻・そのとき計った値」で、**「正しい」ではなく
+/// 「何であるか」を記録する**——想定と違うファイルでも、印があれば
+/// 2 回目から計り直さずに同じ警告を出せる。
+///
+/// 印が書けない場所（読み取り専用のキャッシュ）でも断らない。毎回 0.4 秒を
+/// 払うだけで、答えは変わらない。
+pub fn verify(model: &KnownModel, path: &Path, explicit: bool) -> Result<Option<Warning>> {
+    let stamp = Stamp::of(path)?;
+    let actual = match read_mark(path).filter(|(mark, _)| *mark == stamp) {
+        Some((_, digest)) => digest,
+        None => {
+            let digest = self::digest(path)?;
+            write_mark(path, &stamp, &digest);
+            digest
+        }
+    };
+    if actual == model.sha256 {
+        return Ok(None);
+    }
+    if explicit {
+        return Ok(Some(
+            Warning::new(
+                WarningCode::ModelDigestUnexpected,
+                format!(
+                    "{} の SHA-256 は {} で、{} の想定 {} と違いますが、--model-path の指定を \
+                     優先してそのまま読みます",
+                    path.display(),
+                    actual,
+                    model.name,
+                    model.sha256
+                ),
+            )
+            .with_hint(
+                "想定どおりのファイルのはずなら取得が途中で壊れています。\
+                 kiri model list でダイジェストを突き合わせてください",
+            )
+            .with_data("path", path.display().to_string())
+            .with_data("actual_sha256", actual)
+            .with_data("expected_sha256", model.sha256),
+        ));
+    }
+    Err(Error::new(
+        ErrorCode::ModelUnreadable,
+        format!(
+            "{} の SHA-256 は {} で、{} の想定 {} と違います",
+            path.display(),
+            actual,
+            model.name,
+            model.sha256
+        ),
+    )
+    .with_hint(format!(
+        "取得が途中で壊れている可能性があります。取り直してください: {}",
+        model.download_hint()
+    )))
+}
+
+/// ファイルの素性。**中身は見ていない。**
+///
+/// 傍らファイルが「どのファイルを確かめたか」を指すのに使い、読み込み済みの
+/// 実行計画が「どのファイルから建てたか」を憶えるのにも使う（`segment::isnet`）。
+/// 長く生きるプロセス（ライブラリとして使う場合）でモデルが置き換わったときに、
+/// 古い計画を返し続けないためである。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stamp {
+    pub bytes: u64,
+    /// 更新時刻（UNIX エポックからのナノ秒）。取れない環境では 0。
+    ///
+    /// **秒では粗すぎる。** 同じ大きさのファイルを同じ秒のうちに差し替えると、
+    /// 秒だけでは同じ素性に見えてしまう（実際に検査で捕まえた）。APFS も ext4 も
+    /// ナノ秒まで持っているので、そこまで見る。1 秒刻みしか持たない
+    /// ファイルシステムでは同じ穴が残るが、そこは**計り直しても答えが
+    /// 変わらない**側の危険なので、断る理由にはしない
+    pub mtime: u128,
+}
+
+impl Stamp {
+    pub fn of(path: &Path) -> Result<Self> {
+        let meta = std::fs::metadata(path).map_err(|e| {
+            Error::new(
+                ErrorCode::ModelUnreadable,
+                format!("{} を読めません: {e}", path.display()),
+            )
+        })?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        Ok(Stamp {
+            bytes: meta.len(),
+            mtime,
+        })
+    }
+}
+
+fn mark_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(VERIFIED_SUFFIX);
+    PathBuf::from(name)
+}
+
+/// 印を読む。**読めない・古い・壊れているは、すべて「印が無い」と同じ。**
+fn read_mark(path: &Path) -> Option<(Stamp, String)> {
+    let text = std::fs::read_to_string(mark_path(path)).ok()?;
+    let mut fields = text.split_whitespace();
+    // 版を先頭に置く。形を変えたくなったときに、古い印を黙って読み違えない
+    if fields.next()? != "1" {
+        return None;
+    }
+    let digest = fields.next()?.to_string();
+    let bytes = fields.next()?.parse().ok()?;
+    let mtime = fields.next()?.parse().ok()?;
+    Some((Stamp { bytes, mtime }, digest))
+}
+
+/// 印を置く。**書けなくても黙って先へ進む。**
+///
+/// 同じディレクトリへ一時ファイルを書いてから置き換える。`batch` は同じ
+/// モデルを複数のスレッドから触りうるので、途中まで書かれた印を誰かが
+/// 読む形を作らない。
+fn write_mark(path: &Path, stamp: &Stamp, digest: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    /// 一時ファイルの名前を実行ごとに別にする連番。
+    ///
+    /// **プロセス番号だけでは足りない。** `verify` は `pub` なので、同じ
+    /// プロセスの 2 つのスレッドが同時に呼びうる（kiri 自身は計画の錠の
+    /// 中で呼ぶので届かないが、ライブラリとして使う側は知らない）。同じ
+    /// 名前へ両方が書くと、互いの途中の中身が混ざったまま置き換わる
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    let target = mark_path(path);
+    let mut name = target.clone().into_os_string();
+    name.push(format!(
+        ".tmp{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let temp = PathBuf::from(name);
+    let line = format!("1 {digest} {} {}\n", stamp.bytes, stamp.mtime);
+    if std::fs::write(&temp, line).is_ok() && std::fs::rename(&temp, &target).is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+}
+
+/// ファイル全体の SHA-256。`kiri model list` と、読み込み前の `verify` が呼ぶ。
 ///
 /// 1MiB ずつ読む。176MB を丸ごと確保しないためで、`Sha256` が逐次的な形を
 /// しているのもそれが理由である。
@@ -279,6 +444,92 @@ pub fn digest(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 検査用の偽のモデル。**中身は `"kiri"` の 4 バイト**で、
+    /// `sha256` は `shasum -a 256` で求めた値をそのまま置いてある
+    /// （kiri 自身の実装で求めた値を期待値にすると、実装が間違っていても
+    /// 一致してしまう）。
+    fn fake(sha256: &'static str) -> KnownModel {
+        KnownModel {
+            name: "fake",
+            file_name: "fake.onnx",
+            url: "https://example.invalid/fake.onnx",
+            md5: "",
+            sha256,
+            bytes: 4,
+            license: "",
+            input_size: 8,
+        }
+    }
+
+    const KIRI_SHA256: &str = "80d7688032dda428a5d1e0eea7ad434d219b770b7d3a0646fd58695e40107755";
+    const OTHER_SHA256: &str = "d9298a10d1b0735837dc4bd85dac641b0f3cef27a47e5d53a54f2f3f5b2fcffa";
+
+    /// 想定どおりのファイルは黙って通り、印が残る。
+    #[test]
+    fn a_matching_digest_passes_and_leaves_a_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake.onnx");
+        std::fs::write(&path, b"kiri").unwrap();
+
+        assert!(verify(&fake(KIRI_SHA256), &path, false).unwrap().is_none());
+        let mark = std::fs::read_to_string(mark_path(&path)).expect("印が置かれていない");
+        assert!(
+            mark.contains(KIRI_SHA256),
+            "印が計った値を持っていない: {mark}"
+        );
+        // 2 度目も同じ答え（こちらは印を読んで済ませている）
+        assert!(verify(&fake(KIRI_SHA256), &path, false).unwrap().is_none());
+    }
+
+    /// 既定の置き場所から拾ったファイルが違えば断る。**大きさでは捕まらない。**
+    #[test]
+    fn a_found_model_with_the_wrong_digest_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake.onnx");
+        std::fs::write(&path, b"kiri").unwrap();
+
+        let err = verify(&fake(OTHER_SHA256), &path, false).unwrap_err();
+        assert_eq!(err.code.as_str(), "MODEL_UNREADABLE");
+    }
+
+    /// `--model-path` で指されたファイルは、違っても警告で通す
+    /// （大きさのときと同じ分け方である）。
+    #[test]
+    fn an_explicit_model_with_the_wrong_digest_warns_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake.onnx");
+        std::fs::write(&path, b"kiri").unwrap();
+
+        let warning = verify(&fake(OTHER_SHA256), &path, true)
+            .unwrap()
+            .expect("警告が出ていない");
+        assert_eq!(warning.code.as_str(), "MODEL_DIGEST_UNEXPECTED");
+        assert_eq!(warning.data["actual_sha256"], KIRI_SHA256);
+    }
+
+    /// **印は「正しい」ではなく「何であるか」を記録する。**
+    ///
+    /// 中身が入れ替われば素性（大きさ・更新時刻）が変わるので、印は使われず
+    /// 計り直される。ここが効かないと、モデルを差し替えた利用者が古い判定を
+    /// 受け取り続ける。
+    #[test]
+    fn a_replaced_file_is_measured_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake.onnx");
+        std::fs::write(&path, b"kiri").unwrap();
+        verify(&fake(KIRI_SHA256), &path, false).unwrap();
+
+        // 同じ長さの別の中身へ差し替える。更新時刻が動くので印は無効になる
+        std::fs::write(&path, b"kir!").unwrap();
+        let err = verify(&fake(KIRI_SHA256), &path, false).unwrap_err();
+        assert_eq!(err.code.as_str(), "MODEL_UNREADABLE");
+        let mark = std::fs::read_to_string(mark_path(&path)).unwrap();
+        assert!(
+            !mark.contains(KIRI_SHA256),
+            "古い印が残っている（計り直していない）: {mark}"
+        );
+    }
 
     /// 綴りの重複が無いこと。`--segment` の値と 1:1 で対応する。
     #[test]

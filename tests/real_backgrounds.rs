@@ -1823,8 +1823,9 @@ fn optimized(scene: &common::RealScene) -> OptimizedRun {
     let truth = common::real_scene(scene);
     let found = optimize(
         &truth.image,
-        &CutoutOptions::default(),
+        CutoutOptions::default(),
         &OptimizeFixed::default(),
+        None,
     )
     .expect("探索が失敗した");
     OptimizedRun {
@@ -1963,8 +1964,9 @@ fn a_pale_product_on_fabric_is_reported_as_having_no_clean_candidate() {
     let truth = common::real_scene(&scene);
     let found = optimize(
         &truth.image,
-        &CutoutOptions::default(),
+        CutoutOptions::default(),
         &OptimizeFixed::default(),
+        None,
     )
     .expect("探索が失敗した");
 

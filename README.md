@@ -5,8 +5,8 @@ AIエージェントから使われることを前提とした、EC商品画像�
 単色背景の商品写真を対象に、背景透過の切り抜き・リサイズ・回転・キャンバス配置・Web配信形式への変換を1コマンドで行う。
 
 > **開発中です。** 主要なコマンドは一通り動作します（`info` / `convert` / `resize` / `rotate` / `cutout` / `batch` / `schema` / `model`）。
-> 残るはリリース用 CI と、契約の穴の埋め戻しです（`batch` の spec が `cutout` の設定しか
-> 持たない、`kiri schema` から推論できる build か読めない、など）。
+> 残るはリリース用 CI と、効果を測ってから着手する品質の項目です（px@1000 換算の
+> 統一、帯だけの closed-form matting、実素材での既定値の再調整など）。
 > 進捗は [docs/implementation-plan.md](docs/implementation-plan.md) を参照してください。
 
 ## 特徴
@@ -402,7 +402,7 @@ bbox の外は色によらず背景と確定されるため、その差がその
 |---|---|---|
 | `--border` | 2 | 背景色推定に使う外周の幅(px)。**`subject` の信頼度判定にも効く**（上記の較正は既定値が前提） |
 | `--segment` | off | `subject` をセグメンテーションモデルから測る。`off` / `auto` / `isnet`。**既定のビルドには入っていない**（[意味の事前知識](#意味の事前知識モデルに何を聞くか)） |
-| `--model-path PATH` | — | モデルの ONNX を直接指す。未指定なら `$KIRI_MODEL_DIR` > `$XDG_CACHE_HOME/kiri/models` > OS 既定のキャッシュ。**大きさが違うファイルも読む**（`MODEL_SIZE_UNEXPECTED`） |
+| `--model-path PATH` | — | モデルの ONNX を直接指す。未指定なら `$KIRI_MODEL_DIR` > `$XDG_CACHE_HOME/kiri/models` > OS 既定のキャッシュ。**大きさやダイジェストが違うファイルも読む**（`MODEL_SIZE_UNEXPECTED` / `MODEL_DIGEST_UNEXPECTED`） |
 | `--no-color-convert` | | 埋め込み ICC を解釈せず、画素の値をそのまま使う |
 
 ### 色空間の扱い
@@ -638,7 +638,7 @@ product.png  1600x2000  png  841.4 KB  (338 ms)
 | `--fg-polygon x1,y1,x2,y2,...` | — | 内部を確定前景にする多角形（3 点以上）。複数回指定可 |
 | `--bg-polygon x1,y1,x2,y2,...` | — | 内部を確定背景にする多角形（3 点以上）。複数回指定可 |
 | `--segment` | off | セグメンテーションモデルを粗マスクの供給源にする。`off` / `auto` / `isnet`。**既定のビルドには入っていない**（[意味の事前知識](#意味の事前知識モデルに何を聞くか)） |
-| `--model-path PATH` | — | モデルの ONNX を直接指す。未指定なら `$KIRI_MODEL_DIR` > `$XDG_CACHE_HOME/kiri/models` > OS 既定のキャッシュ。**大きさが違うファイルも読む**（`MODEL_SIZE_UNEXPECTED`） |
+| `--model-path PATH` | — | モデルの ONNX を直接指す。未指定なら `$KIRI_MODEL_DIR` > `$XDG_CACHE_HOME/kiri/models` > OS 既定のキャッシュ。**大きさやダイジェストが違うファイルも読む**（`MODEL_SIZE_UNEXPECTED` / `MODEL_DIGEST_UNEXPECTED`） |
 | `--tolerance` | 12 | 背景色との色差(ΔE)の許容量 |
 | `--background-model` | auto | 背景を 1 色で持つか照明場 B(x, y) として持つか。`auto` / `flat` / `field`。`auto` は `background.uniformity` が 0.90 を下回るときだけ `field` を使う |
 | `--edge-threshold` | 8（自動調整あり） | 輪郭でフィルを止める勾配のしきい値。0 で無効。未指定なら、外周の勾配 p50 が 8 以上のときに p90 の 1.5 倍まで自動で引き上がる |
@@ -1349,15 +1349,19 @@ CC BY-NC 4.0 なので採らない。
 |---|---|---|
 | 前景比率 | 0.6497（机が残る） | **0.4500** |
 | 外周接触 | **あり** | なし |
-| 縁の残り（halo） | 0.1365 | **0.0992** |
-| 輪郭の粗さ | 0.8132 | **0.3883** |
-| 境界色差 | 24.57 | 16.63 |
+| 縁の残り（halo） | 0.1365 | **0.0984** |
+| 輪郭の粗さ | 0.8132 | **0.3942** |
+| 境界色差 | 24.57 | 16.61 |
 | 所要時間 | 2.9 秒 | 4.0 秒（うち推論 1.3 秒） |
 | 警告 | `BACKGROUND_FIELD_USED` / `LOW_UNIFORMITY` / `SUBJECT_TOUCHES_EDGE` / `HALO_REMAINS` / `CONTOUR_ROUGH` | `BACKGROUND_FIELD_USED` / `LOW_UNIFORMITY` / `CONTOUR_ROUGH` / `SEGMENT_UNCERTAIN` |
 
+**f16 で動いたのは小数第 3 位である**（halo 0.0992 → 0.0984、粗さ 0.3883 →
+0.3942、境界色差 16.63 → 16.61）。前景比率・外周接触・警告の並びは変わらない。
+同じ比較を実写リモコン（下の表）で行うと 4 桁まで一致する。
+
 **この数値は素材のバイト列に紐づく。** 実写はリポジトリに置かないので、
 どう作ったかを書いておかないと突き合わせられない——**同じ写真でも JPEG の
-品質を変えると輪郭の粗さは 0.3883 と 0.5499 のあいだで動く**。上の表は
+品質を変えると輪郭の粗さは 0.39 と 0.55 のあいだで動く**。上の表は
 `sips -s format jpeg -s formatOptions 95 IMG_0238.HEIC --out keyboard.jpg`
 （3,808,626 バイト、SHA-256 `f6dd5873…4619`）で作ったファイルの実測である。
 作り方と digest は [docs/design.md 4.12](docs/design.md) に全部書いてある。
@@ -1397,15 +1401,47 @@ tolerance を上げるだけで済んだぶんが混ざる。
 
 | 費用 | 値 |
 |---|---|
-| 推論（1024x1024、モデルの読み込み込み） | 1.3 秒前後 |
-| そのうちモデルの読み込みと最適化 | 0.10 秒 |
-| トライマップ化（確率マップ → 制約） | 0.10 秒（12MP） / 0.16 秒（24MP） |
-| ピーク RSS | 474MB → 1660MB（12MP） / 943MB → 1691MB（24MP） |
+| 推論（1024x1024） | 1.2 秒前後 |
+| モデルの読み込みと最適化 | 0.4 秒（**プロセスで 1 度だけ**） |
+| ダイジェストの照合 | 0.4 秒（**ファイルごとに 1 度だけ**。下記） |
+| トライマップ化（確率マップ → 制約） | 0.10 秒（12MP） / 0.16 秒（24MP）。`info` では 0 |
+| ピーク RSS | 893MB → 1300MB（24.5MP の `cutout`） / 938MB（同じ画像の `info`） |
 
-**`batch` は `--segment` を受けない。** 数百点を 1 件あたり推論だけで 1.3 秒・
-ピーク RSS 1.6GB で回すのは、並列度ぶんだけメモリが倍になる `batch` でいちばん
-割に合わない。
-モデルが要る数枚は `cutout` で個別に救う。
+**推論は f16 で走る。** 中間テンソルは 1024² × 64ch が f32 では 1 枚 256MB あり、
+峰を作っているのは重み（176MB）ではなくこちらである。実測（5712x4284、
+`/usr/bin/time -l`、Apple M4 Pro）は下のとおりで、**前景比率は
+0.1745 → 0.1746 しか動かない**——kiri が確率マップから読むのは「0.9 以上か」
+「0.1 以下か」の 2 つだけで、そのあいだの帯は色と連結性が決めるからである。
+
+| | f32（従来） | f16 |
+|---|---|---|
+| `cutout --segment isnet` | 6.20 秒 / 1642MB | **5.61 秒 / 1300MB** |
+| `info --segment isnet` | 1.88 秒 / 1456MB | **1.97 秒 / 938MB** |
+
+f16 の核を持たない環境では f32 のまま走る（答えは変わらず、遅くて重いだけ）。
+
+**読み込む前にダイジェストを照合する。** 想定と同じ長さの壊れたファイルは
+大きさの検査では捕まらない。176MB の SHA-256 は 0.4 秒かかるので、確かめた
+結果をモデルの傍らの `<モデル名>.verified`（版・ダイジェスト・大きさ・更新時刻）
+に残し、**ファイルが同じなら計り直さない**。印が書けない場所でも断らない——
+毎回 0.4 秒を払うだけで、答えは変わらない。既定の置き場所のファイルが想定と
+違えば `MODEL_UNREADABLE` で断り、`--model-path` で指されたものは
+`MODEL_DIGEST_UNEXPECTED` で警告して通す（大きさのときと同じ分け方である）。
+
+**`batch` も `--segment` を受ける**（spec の `segment` / `model_path`）。
+実行計画はプロセスで 1 つだけ持ち、**推論そのものは 1 本ずつ通す**ので、
+`--jobs` を上げてもモデルのぶんのメモリは増えない。止まるのは推論だけで、
+復号・フィル・書き出しは今までどおり並列に走る。
+
+| 1000x1000 を 4 件 | `--jobs 1` | `--jobs 4` |
+|---|---|---|
+| `segment` 無し | 0.49 秒 / 63MB | 0.13 秒 / 188MB |
+| `"segment": "isnet"` | 5.81 秒 / 944MB | 5.32 秒 / 1062MB |
+
+モデルのぶんの増分は `--jobs 1` で 881MB、`--jobs 4` で 874MB と**変わらない**。
+一方**時間は並べられない**——1 件あたり 1.3 秒がそのまま積むので、数百点に
+一律で付ける値ではない。混ざった素材なら `auto` を `defaults` に書けば、
+色で解ける画像は素通りする（どの件で効いたかは `settings.segment_ran` が言う）。
 
 ##### 決定性
 
@@ -2010,6 +2046,7 @@ sRGB のまま比べると**ガンマぶんだけ暗い側へ偏る**（黒い�
 | `SEGMENT_UNCERTAIN` | モデルが対象を掴めておらず、不明の帯が広すぎる（結果は `--segment off` に近づく） |
 | `MODEL_PATH_IGNORED` | `--model-path` を渡したが `--segment off` なのでモデルを読んでいない |
 | `MODEL_SIZE_UNEXPECTED` | `--model-path` のファイルが既知のモデルと大きさが違う（指定を尊重してそのまま読んだ） |
+| `MODEL_DIGEST_UNEXPECTED` | `--model-path` のファイルのダイジェストが既知のモデルと違う（指定を尊重してそのまま読んだ） |
 | `CANVAS_UPSCALED` | キャンバス配置で商品を拡大した |
 | `DRY_RUN_OUTPUT_EXISTS` | `--dry-run` の出力先が既にある。本番実行には `--force` が要る |
 | `UPSCALED` | `resize` で拡大した |
@@ -2168,7 +2205,8 @@ x broken.jpg  失敗
 オプションと対応する（`bbox` / `normalized` / `fg_seeds` / `trimap` / `fg_mask` /
 `bg_mask` / `fg_polygons` / `bg_polygons` / `tolerance` / `border` /
 `cleanup` / `feather` / `despill` / `refine` / `matting` / `smooth_contour` /
-`reclassify` / `background_model` / `optimize` / `color_convert` / `edge_threshold` /
+`reclassify` / `background_model` / `segment` / `model_path` / `optimize` /
+`color_convert` / `edge_threshold` /
 `step_tolerance` / `shadow_tolerance` / `shadow` / `shadow_offset` / `shadow_blur` /
 `shadow_color` / `shadow_opacity` / `seal` / `rotate` / `canvas` / `fill_ratio` /
 `format` / `quality` / `effort` / `background` / `flatten`）。
@@ -2185,8 +2223,17 @@ x broken.jpg  失敗
 ——CLI で明示したときと同じ規約で、spec では「書いたかどうか」がそのまま明示に
 あたる。1 件が数秒から十数秒になるので、数百点に一律で付ける値ではない。
 
-`matting` と `background_model` は綴りを検査する。未知の値を既定へ落とすと、その
-項目だけ黙って別の設定で処理され、数百点を回した後に仕上がりを見るまで気づけない。
+`segment` は `cutout --segment` と同じ 3 値（`off` / `auto` / `isnet`）で、
+`model_path` は `trimap` などと同じく仕様ファイルの場所を基準に解決する。
+**モデルは全項目で 1 度だけ読み、推論は 1 本ずつ通す**ので、`--jobs` を
+上げてもモデルのぶんのメモリは増えない。ただし**時間は並べられない**
+（1 件あたり 1.3 秒がそのまま積む）ので、数百点に一律で付ける値ではない。
+混ざった素材なら `auto` を `defaults` に書けば、色で解ける画像は素通りする
+（[意味の事前知識](#意味の事前知識モデルに何を聞くか)）。
+
+`matting` と `background_model` と `segment` は綴りを検査する。未知の値を既定へ
+落とすと、その項目だけ黙って別の設定で処理され、数百点を回した後に仕上がりを
+見るまで気づけない。
 
 | オプション | 既定値 | 説明 |
 |---|---|---|

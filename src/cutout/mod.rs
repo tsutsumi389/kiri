@@ -255,9 +255,72 @@ pub fn analyse_background(
     bbox: Option<(u32, u32, u32, u32)>,
     constraints: Option<&Constraints>,
 ) -> BackgroundAnalysis {
+    analyse_background_seen(image, None, border, model, bbox, constraints)
+}
+
+/// 画像と `border` だけで決まる見立て。**持ち回せるのはここまで。**
+///
+/// 外周の 1 色分布（`estimate`）と主体（`subject`）は、`--tolerance` にも
+/// `--bbox` にも `--background-model` にも依らない。一方、照明場はそのすべてを
+/// 材料にするので持ち回せない——**だから場はここに入っていない。**
+///
+/// 同じ画像を何度も測る場所が 3 つある（どれも同じ形の無駄である）。
+///
+/// | 場所 | 測り直していた回数 |
+/// |---|---|
+/// | `--segment auto` の門 → `cutout` | 2 |
+/// | `info` の背景推定 → `auto` の門 | 2 |
+/// | `--optimize` の探索段（候補集合 + 候補 20 通り） | 21 |
+#[derive(Debug, Clone)]
+pub struct BackgroundSeen {
+    /// どの幅の帯で測ったか。**合わなければ使わない**（下の `usable_for`）
+    pub border: u32,
+    pub estimate: BackgroundEstimate,
+    pub subject: Option<SubjectHint>,
+}
+
+impl BackgroundSeen {
+    /// この `border` の見立てとして使えるか。
+    ///
+    /// **別の幅で測った分布を黙って使い回してはならない。** 外周の帯が
+    /// 変われば背景色もばらつきも変わり、そこから出る主体も変わる。
+    /// 呼ぶ側が渡し間違えたときに、静かに違う数値で切り抜くより、
+    /// 測り直して正しい答えを出すほうがよい
+    fn usable_for(&self, border: u32) -> bool {
+        self.border == border
+    }
+}
+
+/// 画像と `border` だけで決まるぶんを 1 度だけ測る。
+pub fn see_background(image: &RgbaImage, border: u32) -> BackgroundSeen {
     let estimate = estimate_background(image, border);
-    let resolved = model.resolve(&estimate);
     let subject = detect_subject(image, &estimate);
+    BackgroundSeen {
+        border,
+        estimate,
+        subject,
+    }
+}
+
+/// 見立てを持ち回れる版の `analyse_background`。
+///
+/// `seen` が `None`（または別の `border` のもの）なら、その場で測る。
+pub fn analyse_background_seen(
+    image: &RgbaImage,
+    seen: Option<&BackgroundSeen>,
+    border: u32,
+    model: BackgroundModel,
+    bbox: Option<(u32, u32, u32, u32)>,
+    constraints: Option<&Constraints>,
+) -> BackgroundAnalysis {
+    let seen = match seen.filter(|s| s.usable_for(border)) {
+        Some(seen) => seen.clone(),
+        None => see_background(image, border),
+    };
+    let BackgroundSeen {
+        estimate, subject, ..
+    } = seen;
+    let resolved = model.resolve(&estimate);
 
     if resolved == ResolvedModel::Flat {
         let field = BackgroundField::flat(estimate.rgb);
@@ -464,10 +527,24 @@ fn resolve_edge_threshold(
 }
 
 pub fn cutout(image: &RgbaImage, opts: &CutoutOptions) -> CutoutResult {
+    cutout_seen(image, opts, None)
+}
+
+/// 見立てを持ち回れる版の `cutout`。
+///
+/// **同じ画像・同じ `border` で何度も切る側のためにある**（`--optimize` の
+/// 探索段と、`--segment auto` の門を通ってきた本番）。`seen` が合わなければ
+/// その場で測り直すので、渡し間違えても答えは変わらない。
+pub fn cutout_seen(
+    image: &RgbaImage,
+    opts: &CutoutOptions,
+    seen: Option<&BackgroundSeen>,
+) -> CutoutResult {
     // 元画像から測る。アルファを適用した後の画像を渡すと、透明になった背景が
     // 「背景色から遠い」に化けて主体が画像全体へ広がる
-    let analysis = analyse_background(
+    let analysis = analyse_background_seen(
         image,
+        seen,
         opts.border,
         opts.background_model,
         opts.bbox,

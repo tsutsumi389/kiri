@@ -275,6 +275,18 @@ pub struct SegmentStats {
     pub uncertain_ratio: f64,
 }
 
+impl SegmentStats {
+    /// 何も言っていない状態。**不明が 0 であることに意味は無い**——
+    /// 0 寸法の画像や空の確率マップで、数える相手そのものが無い
+    fn empty() -> Self {
+        SegmentStats {
+            fg_ratio: 0.0,
+            bg_ratio: 0.0,
+            uncertain_ratio: 0.0,
+        }
+    }
+}
+
 /// 前処理を済ませた入力。
 pub struct Prepared {
     /// NCHW の f32。長さは `3 * size * size`
@@ -456,39 +468,28 @@ pub fn to_constraints(
 ) -> (Constraints, SegmentStats) {
     let mut constraints = Constraints::new(width, height);
     let (pw, ph) = (probability.width(), probability.height());
-    if width == 0 || height == 0 || pw == 0 || ph == 0 {
-        return (
-            constraints,
-            SegmentStats {
-                fg_ratio: 0.0,
-                bg_ratio: 0.0,
-                uncertain_ratio: 0.0,
-            },
-        );
+    // 配る先が無いなら格子の側も見ない（`decide_on_the_grid` は 1024² の
+    // 二値化と収縮を走らせる）
+    if width == 0 || height == 0 {
+        return (constraints, SegmentStats::empty());
     }
-    let radius = margin_radius(pw, ph);
+    let Some(decided) = decide_on_the_grid(probability) else {
+        return (constraints, SegmentStats::empty());
+    };
+    let (fg, bg) = (&decided.fg, &decided.bg);
 
-    let mut fg = Mask::new(pw, ph, 0);
-    let mut low = Mask::new(pw, ph, 0);
-    for (i, &p) in probability.as_slice().iter().enumerate() {
-        if p >= SEG_FG {
-            fg.as_mut_slice()[i] = 255;
-        } else if p <= SEG_BG {
-            low.as_mut_slice()[i] = 255;
-        }
-    }
-    let fg = erode(&fg, radius);
-    let bg = erode(&reachable_from_the_border(&low), radius);
-
+    // 列の対応は行に依らない。**内側で引き直すと原寸の画素数ぶんの除算を払う**
+    // ——24.5MP では 2450 万回である（`Constraints::resampled` と同じ理由で
+    // 巻き上げる）
+    let columns: Vec<u32> = (0..width).map(|x| grid_index(x, width, pw)).collect();
     for y in 0..height {
         let sy = grid_index(y, height, ph);
-        for x in 0..width {
-            let sx = grid_index(x, width, pw);
-            let index = (y as usize) * (width as usize) + (x as usize);
+        let row = (y as usize) * (width as usize);
+        for (x, &sx) in columns.iter().enumerate() {
             if fg.get(sx, sy) == 255 {
-                constraints.mark_index(index, Constraint::ForcedFg);
+                constraints.mark_index(row + x, Constraint::ForcedFg);
             } else if bg.get(sx, sy) == 255 {
-                constraints.mark_index(index, Constraint::ForcedBg);
+                constraints.mark_index(row + x, Constraint::ForcedBg);
             }
         }
     }
@@ -503,6 +504,90 @@ pub fn to_constraints(
             uncertain_ratio,
         },
     )
+}
+
+/// 確率マップの格子で二値化して収縮したもの。原寸へ配る前の姿である。
+struct Decided {
+    fg: Mask,
+    bg: Mask,
+}
+
+/// 格子の上で確定前景・確定背景を決める。**原寸には触れない。**
+///
+/// `to_constraints` と `stats_of` が同じ答えを見るための 1 本である。2 本に
+/// 分かれると、`info` が報せた割合と `cutout` が敷いた制約が、同じ実行の
+/// 中で食い違いうる。
+fn decide_on_the_grid(probability: &Probability) -> Option<Decided> {
+    let (pw, ph) = (probability.width(), probability.height());
+    if pw == 0 || ph == 0 {
+        return None;
+    }
+    let radius = margin_radius(pw, ph);
+    let mut fg = Mask::new(pw, ph, 0);
+    let mut low = Mask::new(pw, ph, 0);
+    for (i, &p) in probability.as_slice().iter().enumerate() {
+        if p >= SEG_FG {
+            fg.as_mut_slice()[i] = 255;
+        } else if p <= SEG_BG {
+            low.as_mut_slice()[i] = 255;
+        }
+    }
+    Some(Decided {
+        fg: erode(&fg, radius),
+        bg: erode(&reachable_from_the_border(&low), radius),
+    })
+}
+
+/// 原寸の制約を組まずに、その内訳だけを数える。
+///
+/// **`info` のためにある。** `info --segment` が要るのは割合の 3 つだけで、
+/// そのために `Constraints` を原寸で組むと 24MP で 24MB の確保と 2450 万回の
+/// 書き込みを払う（実測 0.16 秒）。
+///
+/// # `to_constraints` と 1 ビットも違わない
+///
+/// 原寸の 1 画素は格子の 1 つへ最近傍で対応し、**その対応は x と y で
+/// 独立している**。ならば「格子 (sx,sy) を引く原寸の画素数」は
+/// 「sx を引く列数 × sy を引く行数」であり、格子ごとの積を足せば原寸で
+/// 数えたのと同じ数になる。近似ではない——列数を数えるのに `grid_index` を
+/// 使っているので、丸めの癖まで同じものを見ている。
+pub fn stats_of(probability: &Probability, width: u32, height: u32) -> SegmentStats {
+    let (pw, ph) = (probability.width(), probability.height());
+    if width == 0 || height == 0 {
+        return SegmentStats::empty();
+    }
+    let Some(decided) = decide_on_the_grid(probability) else {
+        return SegmentStats::empty();
+    };
+    let span = |from: u32, to: u32| {
+        let mut counts = vec![0u64; to as usize];
+        for v in 0..from {
+            counts[grid_index(v, from, to) as usize] += 1;
+        }
+        counts
+    };
+    let (columns, rows) = (span(width, pw), span(height, ph));
+
+    let (mut fg, mut bg) = (0u64, 0u64);
+    for (sy, &row) in rows.iter().enumerate() {
+        if row == 0 {
+            continue;
+        }
+        for (sx, &column) in columns.iter().enumerate() {
+            let (sx, sy) = (sx as u32, sy as u32);
+            if decided.fg.get(sx, sy) == 255 {
+                fg += row * column;
+            } else if decided.bg.get(sx, sy) == 255 {
+                bg += row * column;
+            }
+        }
+    }
+    let total = (u64::from(width) * u64::from(height)).max(1) as f64;
+    SegmentStats {
+        fg_ratio: fg as f64 / total,
+        bg_ratio: bg as f64 / total,
+        uncertain_ratio: (total - fg as f64 - bg as f64) / total,
+    }
 }
 
 /// 外周から 4 近傍でたどり着ける画素だけを残す。
@@ -843,5 +928,35 @@ mod tests {
         let (c, stats) = to_constraints(&p, 0, 0);
         assert!(c.is_empty());
         assert_eq!(stats.fg_ratio, 0.0);
+        // 制約を組まない側も同じ答えを返す
+        assert_eq!(stats, stats_of(&p, 0, 0));
+    }
+
+    /// **格子のまま数えた内訳が、原寸で数えたものと 1 ビットも違わないこと。**
+    ///
+    /// `info` はこれを根拠に原寸の `Constraints` を組まずに済ませている
+    /// （24MP で 24MB と 0.16 秒）。寸法は**割り切れない比**を選ぶ——
+    /// 割り切れる比では、格子ごとの画素数が一定になって差が出ない
+    #[test]
+    fn counting_on_the_grid_matches_counting_at_full_resolution() {
+        // 37x23 の格子。確率は 3 つの帯（前景・不明・背景）に分かれる
+        let (pw, ph) = (37u32, 23u32);
+        let data: Vec<f32> = (0..(pw * ph))
+            .map(|i| {
+                let x = i % pw;
+                match x {
+                    x if x < pw / 3 => 1.0,
+                    x if x < 2 * pw / 3 => 0.5,
+                    _ => 0.0,
+                }
+            })
+            .collect();
+        let p = Probability::new(pw, ph, data).unwrap();
+
+        for (w, h) in [(800u32, 533u32), (101, 97), (37, 23), (7, 5)] {
+            let (_, full) = to_constraints(&p, w, h);
+            let grid = stats_of(&p, w, h);
+            assert_eq!(grid, full, "{w}x{h} で食い違った");
+        }
     }
 }

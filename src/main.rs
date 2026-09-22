@@ -595,6 +595,11 @@ fn print_subject(subject: Option<&SubjectReport>) {
         },
         s.source
     );
+    // **傾きは測れたときだけ 1 行増やす。** 測れなかった（丸いものなど）を
+    // 「0 度」と書くと、傾いていないと測り切ったように読める
+    if let Some(deg) = s.level_rotation {
+        println!("  傾き      --rotate {deg} で水平になる");
+    }
 }
 
 fn print_perimeter(bg: &BackgroundReport) {

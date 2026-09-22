@@ -351,6 +351,25 @@ fn fields() -> Vec<FieldEntry> {
             notes: Some("--bbox <値> --normalized へそのまま渡せる並びになっている"),
         },
         FieldEntry {
+            path: "subject.level_rotation",
+            appears_in: both(),
+            unit: "deg",
+            nullable: true,
+            null_means: Some(
+                "どの角度でも最小外接矩形の面積が変わらない形（円など）で、傾きを測れなかった。\
+                 0（傾いていない）ではない",
+            ),
+            warns: vec![],
+            gates: None,
+            summary: "主体の最小外接矩形が軸に揃う回転角(度、時計回りが正、範囲は (-45, 45])",
+            notes: Some(
+                "cutout --rotate <値> や kiri rotate --angle <値> へそのまま渡せる。傾きそのもの\
+                 （符号を反転して渡す値）ではないので、符号を考え直さないこと。**自動では\
+                 適用しない**——傾きを直すかどうかは bbox と同じく構図の判断である。\
+                 subject.confidence が high のときだけ根拠にしてよいのも bbox と同じ",
+            ),
+        },
+        FieldEntry {
             path: "subject.source",
             appears_in: both(),
             unit: "enum",

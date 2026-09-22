@@ -279,6 +279,74 @@ fn the_subject_key_is_always_present_in_both_commands() {
     }
 }
 
+/// 主体の傾きが `--rotate` にそのまま渡せる形で返り、渡すと水平になること。
+///
+/// **`info` → `rotate` の 1 往復で閉じることを確かめる。** 符号が逆でも
+/// 「角度は返っている」ので、値の存在だけを見るテストでは捕まらない。
+#[test]
+fn the_reported_level_rotation_actually_levels_the_subject() {
+    let dir = fixture_dir();
+    // 5 度傾いた濃色の矩形を白背景に置く
+    let (w, h) = (400u32, 400u32);
+    let mut scene = image::RgbaImage::from_pixel(w, h, image::Rgba([250, 250, 249, 255]));
+    let (sin, cos) = 5.0f64.to_radians().sin_cos();
+    for y in 0..h {
+        for x in 0..w {
+            let (dx, dy) = (f64::from(x) - 200.0, f64::from(y) - 200.0);
+            let (u, v) = (dx * cos + dy * sin, -dx * sin + dy * cos);
+            if u.abs() <= 130.0 && v.abs() <= 55.0 {
+                scene.put_pixel(x, y, image::Rgba([40, 40, 45, 255]));
+            }
+        }
+    }
+    let input = write_png(dir.path(), "tilted.png", &scene);
+
+    let v = json_stdout(
+        &kiri()
+            .args(["info", input.to_str().unwrap(), "--json"])
+            .output()
+            .unwrap(),
+    );
+    let deg = v["subject"]["level_rotation"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("傾きが返っていない: {v}"));
+    assert!(
+        (deg + 5.0).abs() < 1.0,
+        "5 度傾いた主体に対して {deg} を返した（期待は -5 付近）"
+    );
+
+    // 返った値をそのまま `rotate` に渡すと、次の `info` は 0 付近を返す
+    let rotated = dir.path().join("level.png");
+    let out = kiri()
+        .args([
+            "rotate",
+            input.to_str().unwrap(),
+            "-o",
+            rotated.to_str().unwrap(),
+            "--angle",
+            &deg.to_string(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = json_stdout(
+        &kiri()
+            .args(["info", rotated.to_str().unwrap(), "--json"])
+            .output()
+            .unwrap(),
+    );
+    let left = after["subject"]["level_rotation"].as_f64().unwrap();
+    assert!(
+        left.abs() < 1.0,
+        "水平出しした後もまだ {left} 度傾いていると言う"
+    );
+}
+
 /// テキストの「主体候補」行と hint は、同じ矩形を同じ丸めで出す。
 ///
 /// **貼り付け可能と謳う行が、貼り付けたときに違う結果になってはいけない。**

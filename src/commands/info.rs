@@ -294,6 +294,7 @@ mod tests {
             capture_ratio: 0.9793,
             delta_e,
             leftover_ratio: 0.0531,
+            level_rotation: None,
             touches_edge: true,
             confidence,
         }

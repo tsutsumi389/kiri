@@ -294,7 +294,7 @@ impl BackgroundSeen {
 /// 画像と `border` だけで決まるぶんを 1 度だけ測る。
 pub fn see_background(image: &RgbaImage, border: u32) -> BackgroundSeen {
     let estimate = estimate_background(image, border);
-    let subject = detect_subject(image, &estimate);
+    let subject = detect_subject(image, &estimate, border);
     BackgroundSeen {
         border,
         estimate,
@@ -1431,6 +1431,7 @@ mod tests {
             delta_e: 49.6,
             leftover_ratio: 0.0531,
             level_rotation: None,
+            border: DEFAULT_BORDER,
             touches_edge: true,
             confidence,
         }

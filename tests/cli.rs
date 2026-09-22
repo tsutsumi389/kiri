@@ -8429,3 +8429,80 @@ fn the_canvas_trims_by_the_same_rule_with_and_without_a_rotation() {
         "90 度回しただけで、載せた中身の縦横が入れ替わる以上の差が出ている"
     );
 }
+
+/// **主体の判定は `--border` に依らない。**
+///
+/// `--border` は背景色の推定範囲を決める値であって、主体の較正のための値では
+/// ない。しかし帯が変われば外周 ΔE の分布——`far` のしきい値そのもの——も
+/// 変わるので、放っておくと較正が `--border` にぶら下がる。実際、上限を置く
+/// 前は合成の「画面外へ抜ける大きな物体」と実写 IMG_0238 が `--border 110`
+/// で low → high（どちらも誤り）へ裏返っていた。
+///
+/// 較正の 11 点すべてで、帯を 2 から 400 まで振っても判定が動かないことを
+/// 固定する。**数値ではなく判定を見る**——`area_ratio` などは帯とともに
+/// 多少動いてよく、動いてはいけないのは「この矩形に従ってよいか」の答えである。
+#[test]
+fn the_subject_verdict_does_not_follow_the_border() {
+    for (name, image, want_high) in common::subject_scenes() {
+        let dir = fixture_dir();
+        let input = write_png(dir.path(), "s.png", &image);
+        for border in ["2", "8", "32", "110", "400"] {
+            let v = json_stdout(
+                &kiri()
+                    .args([
+                        "info",
+                        input.to_str().unwrap(),
+                        "--border",
+                        border,
+                        "--json",
+                    ])
+                    .output()
+                    .unwrap(),
+            );
+            let got = v["subject"]["confidence"].as_str().unwrap_or("null");
+            assert_eq!(
+                got,
+                if want_high { "high" } else { "low" },
+                "{name}: --border {border} で判定が裏返った（{v}）"
+            );
+        }
+    }
+}
+
+/// 上限が効いたときは、測った帯を `subject.border` が名乗ること。
+///
+/// **黙って別の帯で測らない。** `settings.border` と食い違う理由が JSON から
+/// 読めなければ、エージェントには「指定が効いていない」としか見えない。
+#[test]
+fn the_subject_reports_the_band_it_measured() {
+    let dir = fixture_dir();
+    let (_, image, _) = common::subject_scenes()
+        .into_iter()
+        .next()
+        .expect("較正シーンがある");
+    let (w, h) = (image.width(), image.height());
+    let input = write_png(dir.path(), "s.png", &image);
+    let cap = ((f64::from(w.min(h)) * 0.03).round() as u32).max(2);
+
+    for (given, want) in [(2u32, 2u32), (cap, cap), (cap * 4, cap)] {
+        let v = json_stdout(
+            &kiri()
+                .args([
+                    "info",
+                    input.to_str().unwrap(),
+                    "--border",
+                    &given.to_string(),
+                    "--json",
+                ])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(
+            v["subject"]["border"].as_u64().unwrap(),
+            u64::from(want),
+            "--border {given} で subject.border が {want} でない: {v}"
+        );
+        // `info` の JSON には `settings` が無い（切り抜きの設定を持たない）ので、
+        // 食い違いは `subject.border` と渡した値を並べて読む
+    }
+}

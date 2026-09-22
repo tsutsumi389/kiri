@@ -18,7 +18,7 @@ use image::RgbaImage;
 use serde::Serialize;
 
 use crate::color::lab::delta_e_rgb;
-use crate::cutout::background::{BackgroundEstimate, UNIFORM_DELTA_E};
+use crate::cutout::background::{BackgroundEstimate, DEFAULT_BORDER, UNIFORM_DELTA_E};
 use crate::transform::{FitMode, ResizeSpec, apply, plan};
 
 /// 主体を測るときの長辺の上限(px)。
@@ -56,7 +56,8 @@ const BBOX_MARGIN: f64 = 0.01;
 /// それを弾き、EC 写真として意味のある大きさ（画像の 5%、
 /// 1000x1000 なら 224x224 相当）を残す線である。
 ///
-/// **較正は既定の `--border 2` を前提にしている。** 詳細は
+/// **較正は既定の `--border 2` を前提にしている。** そのぶんを
+/// `calibrated_border` が帯の上限として引き受ける。詳細は
 /// `MIN_CAPTURE_RATIO` のコメントを参照。
 pub const MIN_AREA_RATIO: f64 = 0.05;
 
@@ -71,9 +72,9 @@ pub const MIN_AREA_RATIO: f64 = 0.05;
 /// 背景との ΔE が 64.4 とリモコン（49.6）より大きく出る。色の違いの大きさは
 /// 「そこが商品か」を何も語らない。
 ///
-/// **較正は既定の `--border 2` を前提にしており、帯を大きく広げると成立しない。**
-/// `--border` は背景色の推定範囲を決めると同時に、外周 ΔE の分布——つまり
-/// `far` の閾値そのもの——を決める。帯を広げれば背景色も分布も別物になる。
+/// **較正は既定の `--border 2` を前提にしている。** `--border` は背景色の推定
+/// 範囲を決めると同時に、外周 ΔE の分布——つまり `far` の閾値そのもの——を
+/// 決めるので、帯を広げれば背景色も分布も別物になる。上限を置く前の実測。
 ///
 /// | 素材 | --border | p50 / p90 | area / capture | confidence |
 /// |---|---|---|---|---|
@@ -82,10 +83,44 @@ pub const MIN_AREA_RATIO: f64 = 0.05;
 /// | IMG_0251（救える） | 2（既定） | 11.9 / 26.8 | 0.234 / 0.979 | high |
 /// | IMG_0251（救える） | 110 | 12.4 / 27.2 | 0.234 / 0.982 | high |
 ///
-/// 救えないほうだけが裏返る。**`--border` を既定から大きく動かしたときは、
-/// `confidence` を根拠に動いてはならない。** しきい値を `--border` から
-/// 切り離す改修は範囲が大きいので、いまは前提を書き残すに留める。
+/// **いまは `calibrated_border` が帯に上限を置いて切り離してある。** 上の
+/// 110 は上限に掛かるので、既定と同じ判定（low）が出る。
+///
+/// 救えないほうだけが裏返る。**そこで主体は `--border` をそのまま使わず、
+/// 自分の帯を持つ**（`calibrated_border`）。上の 110 は帯の上限に掛かるので、
+/// いまは既定と同じ判定（low）が出る。
 pub const MIN_CAPTURE_RATIO: f64 = 0.70;
+
+/// 主体が統計を測る帯の上限（短辺に対する割合）。
+///
+/// **`--border` は背景色の推定範囲を決める値であって、主体の較正のための
+/// 値ではない。** しかし帯が変われば外周 ΔE の分布——`far` のしきい値
+/// そのもの——も変わるので、そのままでは較正が `--border` にぶら下がる。
+/// 上限を置いて切り離す。
+///
+/// 上限を割合で持つのは、帯の役目が「外枠を見る」ことにあるためである。
+/// 実寸 px の上限にすると、小さい画像では帯が画像の半分を覆い、大きい画像では
+/// 外周 1 行しか見ない。
+///
+/// **0.03 は掃引が選んだ値である。** 合成 11 点（600px 級）と実写 2 枚で
+/// `--border` を 2 / 4 / 8 / 16 / 32 / 64 / 110 / 200 / 400 と振ると、
+/// **64 まではどの点も判定が動かず、110 で 2 点が裏返る**——合成の
+/// 「画面外へ抜ける大きな物体」と実写 IMG_0238（どちらも low → high の誤り）。
+/// 実写側の裏返りは 105 と 110 のあいだにある。0.03 は 600px で 18px、
+/// 3024px（IMG_0238 の短辺）で 90px、4284px（IMG_0251）で 128px になり、
+/// 測ったどの点も正しい側に残る。`texture_band` が外周の勾配を測る帯と
+/// 同じ割合でもある。
+const SUBJECT_BORDER_FRACTION: f64 = 0.03;
+
+/// 主体が統計を測る帯の幅(px)。`--border` を超えて広げることはしない。
+///
+/// 既定の `--border 2` では常に 2 のままなので、**既定の経路では 1 ビットも
+/// 変わらない**。
+pub fn calibrated_border(width: u32, height: u32, border: u32) -> u32 {
+    let short = f64::from(width.min(height));
+    let cap = (short * SUBJECT_BORDER_FRACTION).round() as u32;
+    border.min(cap.max(DEFAULT_BORDER))
+}
 
 /// 最小外接矩形の面積が「どの角度でも変わらない」と判じる相対差。
 ///
@@ -241,6 +276,12 @@ pub struct SubjectHint {
     /// `None`。0 と答えると「傾いていないと測り切った」に読めるが、実際には
     /// 測れていない。
     pub level_rotation: Option<f64>,
+    /// 主体の統計を測った外周の帯の幅(px)。
+    ///
+    /// 既定では `--border` と同じだが、`--border` が短辺の 3% を超えると
+    /// ここで頭打ちになる（`calibrated_border`）。**`--border` は背景色の
+    /// 推定範囲を決める値で、主体の較正のための値ではない。**
+    pub border: u32,
     pub confidence: Confidence,
 }
 
@@ -269,11 +310,26 @@ impl SubjectHint {
 /// 閾値を超えた画素が 1 つも無ければ（＝背景しか写っていなければ）`None`。
 /// 空の画像でも `None` を返す。**「主体が無い」と「測っていない」は別なので、
 /// 呼び出し側は `None` をそのまま `null` として報告すること。**
-pub fn detect_subject(image: &RgbaImage, background: &BackgroundEstimate) -> Option<SubjectHint> {
+pub fn detect_subject(
+    image: &RgbaImage,
+    background: &BackgroundEstimate,
+    border: u32,
+) -> Option<SubjectHint> {
     let (full_w, full_h) = (image.width(), image.height());
     if full_w == 0 || full_h == 0 {
         return None;
     }
+    // **主体は自分の帯で測る。** `--border` が短辺の 3% を超えたときだけ、
+    // その幅で測り直す（`calibrated_border`）。既定の `--border 2` では
+    // 頭打ちに掛からないので、**1 度も測り直さない**
+    let capped = calibrated_border(full_w, full_h, border);
+    let own;
+    let background = if capped == border {
+        background
+    } else {
+        own = crate::cutout::background::estimate_background(image, capped);
+        &own
+    };
     let small = downscale(image)?;
     let (w, h) = (small.width(), small.height());
 
@@ -318,7 +374,14 @@ pub fn detect_subject(image: &RgbaImage, background: &BackgroundEstimate) -> Opt
     if far_count == 0 {
         return None;
     }
-    hint_from(&small, (full_w, full_h), background, &far, far_count)
+    hint_from(
+        &small,
+        (full_w, full_h),
+        background,
+        capped,
+        &far,
+        far_count,
+    )
 }
 
 /// セグメンテーションモデルの確率マップから主体を求める。
@@ -339,6 +402,7 @@ pub fn detect_subject(image: &RgbaImage, background: &BackgroundEstimate) -> Opt
 pub fn detect_subject_from_probability(
     image: &RgbaImage,
     background: &BackgroundEstimate,
+    border: u32,
     probability: &crate::segment::Probability,
 ) -> Option<SubjectHint> {
     let (full_w, full_h) = (image.width(), image.height());
@@ -361,7 +425,24 @@ pub fn detect_subject_from_probability(
     if far_count == 0 {
         return None;
     }
-    hint_from(&small, (full_w, full_h), background, &far, far_count)
+    // モデルが決める `far` は外周の帯に依らないが、`delta_e` と
+    // `leftover_ratio` は色から測るので、帯の規約は色の経路と揃える
+    let capped = calibrated_border(full_w, full_h, border);
+    let own;
+    let background = if capped == border {
+        background
+    } else {
+        own = crate::cutout::background::estimate_background(image, capped);
+        &own
+    };
+    hint_from(
+        &small,
+        (full_w, full_h),
+        background,
+        capped,
+        &far,
+        far_count,
+    )
 }
 
 /// 「背景でない画素」の集合から主体候補を組み立てる。
@@ -373,6 +454,7 @@ fn hint_from(
     small: &RgbaImage,
     full: (u32, u32),
     background: &BackgroundEstimate,
+    border: u32,
     far: &[bool],
     far_count: usize,
 ) -> Option<SubjectHint> {
@@ -435,6 +517,7 @@ fn hint_from(
         leftover_ratio,
         touches_edge,
         level_rotation: level_rotation(&row_extremes(far, w, h, largest.seed)),
+        border,
         confidence,
     })
 }
@@ -797,7 +880,7 @@ mod tests {
 
     fn detect(img: &RgbaImage) -> Option<SubjectHint> {
         let bg = estimate_background(img, DEFAULT_BORDER);
-        detect_subject(img, &bg)
+        detect_subject(img, &bg, DEFAULT_BORDER)
     }
 
     /// 外周を汚染するシーン。**縮小が走る 600px で作る。**

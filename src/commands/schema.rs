@@ -370,6 +370,23 @@ fn fields() -> Vec<FieldEntry> {
             ),
         },
         FieldEntry {
+            path: "subject.border",
+            appears_in: both(),
+            unit: "px",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "主体の統計を測った外周の帯の幅",
+            notes: Some(
+                "既定では --border と同じ値。--border が短辺の 3% を超えたときだけ、ここが\
+                 頭打ちになって食い違う。**--border は背景色の推定範囲を決める値であって、\
+                 主体の較正のための値ではない**——帯を画像の半分まで広げると外周 ΔE の分布\
+                 （主体を拾うしきい値そのもの）が商品自身に汚染され、救えない画像が high と\
+                 名乗り始める。area_ratio / capture_ratio / leftover_ratio はこの帯で測った値である",
+            ),
+        },
+        FieldEntry {
             path: "subject.source",
             appears_in: both(),
             unit: "enum",

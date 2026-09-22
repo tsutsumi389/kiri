@@ -604,12 +604,15 @@ pub fn optimize(
     // 探索段の土台。**利用者の数値ノブはそのまま渡す。** 変えるのは寸法で
     // 表された指示（矩形・種・画素ごとの制約）と `refine` だけである。
     //
-    // **`--border` と `--feather` は探索段で相対的に太くなる。** どちらも実寸の
-    // px で、`--cleanup` や `--smooth-contour` と違って長辺 1000px 換算では
-    // ないので、4284px の素材を 1500px で回すと 2.9 倍の幅に相当する。順位を
-    // 付けるだけなら全候補に同じ歪みが掛かるので実害は出ていない（一致率の
-    // 実測は docs/design.md 4.13）が、換算を足すなら**まずここを疑う**こと
+    // **例外は `--border`。** 実寸の px なので、そのまま渡すと 4284px の素材を
+    // 1500px で回したときに 2.9 倍の幅に相当する。探索段は原寸の代理なので、
+    // 寸法で表された値は矩形と同じように縮尺へ合わせる。0 にはしない——外周を
+    // 1 画素も見ない見立ては背景を決められない。
+    //
+    // **`--feather` は縮めない。** 探索段は `refine: false` で回るので、その値を
+    // 読む段そのものが走らない。縮める形だけ書くと「効いている」と誤読させる
     let mut search = CutoutOptions {
+        border: scale_length(base.border, source, target).max(1),
         bbox: base
             .bbox
             .map(|b| CandidateBbox::Given(b).resolve(source, target)),
@@ -799,6 +802,17 @@ fn reduced(image: &RgbaImage) -> Result<Cow<'_, RgbaImage>> {
     };
     let plan = resize::plan((image.width(), image.height()), &spec)?;
     Ok(Cow::Owned(resize::apply(image, &plan)?))
+}
+
+/// 長さを別の寸法へ写す。長辺の比で縮め、**四捨五入する**（切り捨てると
+/// `--feather 1` のような 1px の指定が縮小のたびに消える）。
+fn scale_length(value: u32, source: (u32, u32), target: (u32, u32)) -> u32 {
+    let (from, to) = (source.0.max(source.1), target.0.max(target.1));
+    if value == 0 || from == 0 || to >= from {
+        return value;
+    }
+    let scaled = f64::from(value) * f64::from(to) / f64::from(from);
+    scaled.round() as u32
 }
 
 /// 点を別の寸法へ写す。`Constraints::resampled` と同じ最近傍の規約。
@@ -1381,6 +1395,23 @@ mod tests {
             small.0 <= 33 && small.2 >= 207,
             "縮小版へ写せていない: {small:?}"
         );
+    }
+
+    /// `--border` は縮尺へ合わせるが、0 にはしない。縮めないほうの端
+    /// （原寸 = 探索段、または探索段のほうが大きい）は素通し。
+    #[test]
+    fn a_border_follows_the_search_scale_but_never_reaches_zero() {
+        // 24.5MP を 1500px で回す。2px は比では 0.53px なので四捨五入で 1
+        assert_eq!(scale_length(2, (4284, 5712), (1125, 1500)), 1);
+        // 0.5 を割っても 1 を下回らせない側は呼び出し側の `.max(1)` が持つ
+        assert_eq!(scale_length(1, (4284, 5712), (1125, 1500)).max(1), 1);
+        // 縮んでいなければ 1px も動かさない
+        assert_eq!(scale_length(2, (1200, 1200), (1200, 1200)), 2);
+        assert_eq!(scale_length(7, (700, 1400), (700, 1400)), 7);
+        // 0 は 0 のまま（「外周を見ない」指定を勝手に 1px へ持ち上げない）
+        assert_eq!(scale_length(0, (4284, 5712), (1125, 1500)), 0);
+        // 大きい帯は比のぶんだけ縮む
+        assert_eq!(scale_length(110, (4284, 5712), (1125, 1500)), 29);
     }
 
     #[test]

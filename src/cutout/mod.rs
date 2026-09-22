@@ -663,7 +663,13 @@ pub fn cutout_seen(
         opts.bbox,
         opts.constraints.as_ref(),
     );
-    let diagnostics = diagnostics::diagnose(image, &mask, background.rgb, opts.bbox);
+    let diagnostics = diagnostics::diagnose(
+        image,
+        &mask,
+        &field,
+        diagnostics::halo_reference_gate(residual.p90),
+        opts.bbox,
+    );
     // 設定の調整はいちばん先に伝える。結果への警告は、その設定で走った結果に
     // ついてのものなので、順序が逆だと読み手が原因を後から知ることになる
     let mut warnings = Vec::from_iter(texture_warning);

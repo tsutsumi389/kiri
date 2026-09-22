@@ -14,6 +14,8 @@
 //! 複数商品や意図的な見切れでは人／AI が決めるべきものである。堤防のしきい値
 //! （純粋な内部パラメータ）の自動調整とは性質が違う。ヒントとして返すに留める。
 
+use std::f64::consts::FRAC_PI_4;
+
 use image::RgbaImage;
 use serde::Serialize;
 
@@ -129,10 +131,24 @@ pub fn calibrated_border(width: u32, height: u32, border: u32) -> u32 {
 /// 答えない。**「0 度」と答えてはならない**——傾いていないことを測り切った
 /// ように読めるが、実際には測れていない。
 ///
-/// 2% は「1200px の主体で 1 度回したときに外接矩形の面積が動く量」より
-/// はるかに小さい（長辺 800px / 短辺 400px の矩形を 1 度回すと面積は 3.5%
-/// 増える）ので、**答えられる形を落とさない**。一方で正 12 角形の面積の
-/// 振れ幅は 1.1% なので、そこは落ちる。
+/// **面積の標本には辺の向きだけでなく「辺 + 45 度」も入れる。** 最小は辺の
+/// 向きからしか出ない（最小面積外接矩形の定理）が、最大は辺の上には無い。
+/// 凸包がちょうど矩形なら 4 本の辺がすべて同じ面積を返すので、辺だけを見ると
+/// 振れ幅 0——つまり円と同じ——になる。**正面から撮った箱・本・パッケージが
+/// それで、測り切れているのに `None` を返していた。**
+///
+/// 2% は測った形の振れ幅の下から十分に離れている。
+///
+/// | 形 | 辺の向きだけ | 辺 + 45 度 |
+/// |---|---|---|
+/// | 400x150 の矩形 | 0.0% | **60.3%** |
+/// | 正方形 | 0.0% | **50.0%** |
+/// | 正 6 角形 / 正 12 角形 | 0.0% | 7.2% / 6.7% |
+/// | 正 8 角形 / 正 16 角形 | 0.0% | **0.0%** |
+/// | 円（正 64 角形以上） | 0.0% | **0.0%** |
+///
+/// 正 8 角形と正 16 角形が落ちるのは正しい——45 度がその形の対称の向きなので、
+/// どの答えを返しても同じ絵になる。
 const TILT_AMBIGUOUS: f64 = 0.02;
 
 /// 提案した矩形の外に残ってよい塊の上限（画像に占める割合）。
@@ -275,6 +291,11 @@ pub struct SubjectHint {
     /// どの角度でも外接矩形の面積が変わらない形（円、辺の多い多角形）では
     /// `None`。0 と答えると「傾いていないと測り切った」に読めるが、実際には
     /// 測れていない。
+    ///
+    /// **分解能は 0.1〜0.5 度である。** 主体は長辺 `MEASURE_LONG_EDGE` へ縮めて
+    /// から測るので、輪郭の量子化がそのまま角度の誤差になる（実測: 真値 0.5 度
+    /// で 0.0、1.0 度で 0.97、12.0 度で 11.98）。**0.5 度を下回る差を有意と
+    /// 読んではならない。**
     pub level_rotation: Option<f64>,
     /// 主体の統計を測った外周の帯の幅(px)。
     ///
@@ -716,6 +737,12 @@ fn row_extremes(far: &[bool], w: u32, h: u32, seed: (u32, u32)) -> Vec<Option<(u
 /// `TILT_AMBIGUOUS` を切ったら `None` を返す——「0 度」と答えると、
 /// 傾いていないことを測り切ったように読める。
 ///
+/// **ほぼ同じ面積の最小が 2 つある形は捕まえられない。** L 字や十字のように、
+/// 無関係な 2 つの角度がほぼ同じ外接矩形を作る形では、1 画素の違いで答えが
+/// 跳ぶ（同じ入力からは同じ答えが出るので決定的ではあるが、入力の微差に対して
+/// 連続ではない）。`TILT_AMBIGUOUS` は「全向きで平ら」しか見ていないので、
+/// ここは通ってしまう。
+///
 /// 座標系は y 下向きなので、標準の回転行列がそのまま画面上の時計回りになる。
 /// `kiri rotate` の「時計回りが正」と一致する。
 fn level_rotation(rows: &[Option<(u32, u32)>]) -> Option<f64> {
@@ -728,7 +755,7 @@ fn level_rotation(rows: &[Option<(u32, u32)>]) -> Option<f64> {
             points.push((f64::from(hi) + 0.5, fy));
         }
     }
-    let hull = convex_hull(&mut points);
+    let hull = convex_hull(points);
     if hull.len() < 3 {
         return None;
     }
@@ -743,26 +770,17 @@ fn level_rotation(rows: &[Option<(u32, u32)>]) -> Option<f64> {
         }
         // 辺を x 軸へ寝かせる回転。**これがそのまま `--rotate` の値である**
         let angle = -dy.atan2(dx);
-        let (sin, cos) = angle.sin_cos();
-        let (mut x1, mut y1, mut x2, mut y2) = (
-            f64::INFINITY,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            f64::NEG_INFINITY,
-        );
-        for &(px, py) in &hull {
-            let (rx, ry) = (px * cos - py * sin, px * sin + py * cos);
-            x1 = x1.min(rx);
-            y1 = y1.min(ry);
-            x2 = x2.max(rx);
-            y2 = y2.max(ry);
-        }
-        let area = (x2 - x1) * (y2 - y1);
-        hi_area = hi_area.max(area);
+        let area = bbox_area(&hull, angle);
         if area < lo_area {
             lo_area = area;
             best = angle;
         }
+        // **曖昧さの物差しには辺と無関係な向きも要る。** 最小は辺の向きからしか
+        // 出ない（最小面積外接矩形の定理）が、最大は辺の上には無い。凸包が
+        // ちょうど矩形なら 4 本の辺がすべて同じ面積を返すので、辺だけを見ると
+        // 「どの角度でも面積が変わらない」＝円と同じ、と判じてしまう。
+        // 正面から撮った箱がまさにそれで、測り切れているのに `None` になっていた
+        hi_area = hi_area.max(area).max(bbox_area(&hull, angle + FRAC_PI_4));
     }
     if !lo_area.is_finite() || lo_area <= 0.0 || hi_area <= 0.0 {
         return None;
@@ -784,14 +802,33 @@ fn level_rotation(rows: &[Option<(u32, u32)>]) -> Option<f64> {
     Some(deg + 0.0)
 }
 
+/// 凸包を `angle` だけ回したときの、軸並行の外接矩形の面積。
+fn bbox_area(hull: &[(f64, f64)], angle: f64) -> f64 {
+    let (sin, cos) = angle.sin_cos();
+    let (mut x1, mut y1, mut x2, mut y2) = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for &(px, py) in hull {
+        let (rx, ry) = (px * cos - py * sin, px * sin + py * cos);
+        x1 = x1.min(rx);
+        y1 = y1.min(ry);
+        x2 = x2.max(rx);
+        y2 = y2.max(ry);
+    }
+    (x2 - x1) * (y2 - y1)
+}
+
 /// 単調連鎖法（Andrew）による凸包。反時計回り（y 下向きなので画面では時計回り）。
 ///
 /// 同一直線上の点は落とす。残すと辺の数だけ同じ角度を測り直すことになる。
-fn convex_hull(points: &mut Vec<(f64, f64)>) -> Vec<(f64, f64)> {
+fn convex_hull(mut points: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
     points.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
     points.dedup();
     if points.len() < 3 {
-        return points.clone();
+        return points;
     }
     let cross = |o: (f64, f64), a: (f64, f64), b: (f64, f64)| {
         (a.0 - o.0) * (b.1 - o.1) - (a.1 - o.1) * (b.0 - o.0)
@@ -1058,7 +1095,7 @@ mod tests {
     /// 大きさだけ合っていても意味が無い。
     #[test]
     fn a_tilted_rectangle_reports_the_angle_that_levels_it() {
-        for tilt in [-12.0f64, -5.0, -1.0, 1.0, 5.0, 12.0] {
+        for tilt in [-12.0f64, -5.0, -1.0, 0.0, 1.0, 5.0, 12.0] {
             // 画面上で時計回りに `tilt` 度傾いた 400x160 の矩形（y 下向き）
             let (sin, cos) = tilt.to_radians().sin_cos();
             let rows = rows_of(
@@ -1076,6 +1113,28 @@ mod tests {
                 (got + tilt).abs() < 0.6,
                 "傾き {tilt} 度を戻す角として {got} を返した（期待は {}）",
                 -tilt
+            );
+        }
+    }
+
+    /// **軸に揃った矩形は「測れない」ではなく 0 である。**
+    ///
+    /// 凸包がちょうど 4 点になると、4 本の辺がすべて同じ外接矩形を返す。
+    /// 辺の向きだけで曖昧さを測っていた頃は、そこが円と区別できずに `None` へ
+    /// 落ちていた——正面から撮った箱・本・パッケージという、EC でいちばん
+    /// ありふれた主体がそれである。
+    #[test]
+    fn an_axis_aligned_rectangle_reports_zero_rather_than_nothing() {
+        for (w, h) in [(200.0f64, 75.0f64), (150.0, 150.0), (75.0, 200.0)] {
+            let rows = rows_of(
+                |x, y| (x - 300.0).abs() <= w && (y - 300.0).abs() <= h,
+                600,
+                600,
+            );
+            assert_eq!(
+                level_rotation(&rows),
+                Some(0.0),
+                "{w}x{h} の軸並行な矩形が測り切れていない"
             );
         }
     }
@@ -1116,11 +1175,16 @@ mod tests {
         }
     }
 
-    /// 画素が 1 行しか無い成分では包が作れない。panic せずに None を返す。
+    /// 潰れた成分では包が作れない。panic せずに `None` を返す。
     #[test]
     fn a_degenerate_component_has_no_level_rotation() {
-        let rows = rows_of(|_, y| (299.0..301.0).contains(&y), 600, 600);
-        assert!(level_rotation(&rows).is_some() || level_rotation(&rows).is_none());
+        // 1 行だけの成分。包が 2 点に潰れる
+        let single = rows_of(|_, y| (300.0..301.0).contains(&y), 600, 600);
+        assert_eq!(level_rotation(&single), None);
+        // 1 列だけの成分。行ごとに 1 点しか出ないので同じく潰れる
+        let column = rows_of(|x, _| (300.0..301.0).contains(&x), 600, 600);
+        assert_eq!(level_rotation(&column), None);
+        // 画素が 1 つも無い
         let empty: Vec<Option<(u32, u32)>> = vec![None; 10];
         assert_eq!(level_rotation(&empty), None);
     }

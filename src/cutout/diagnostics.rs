@@ -33,7 +33,26 @@ use crate::cutout::mask::{FOREGROUND_THRESHOLD, Mask};
 use crate::cutout::morphology::BitPlane;
 
 /// 局所背景の参照に採る色の窓を、背景の残差 p90 の何倍に取るか。
-/// `halo_reference_gate` を参照。
+///
+/// **下げるほど指標が欠陥を見なくなる。** 実写リモコン（24.5MP、不織布の上の
+/// 黒いリモコン）で倍率を振ると、門が狭いほど `halo_ratio` が一様に小さく出る
+/// ——参照から落ちるのが食われた商品だけでなく、繊維でざらついた**本物の
+/// 背景**にもなるためである。
+///
+/// | 倍率 | 最良設定(flat/tol 60) | tol 12（`--tolerance` の導線） | tol 46 |
+/// |---|---|---|---|
+/// | 1.0 | 0.0054 | 0.1261 | 0.0001 |
+/// | 1.5 | 0.0285 | 0.2176 | 0.0085 |
+/// | **2.0（採用）** | **0.0296** | **0.2275** | **0.0235** |
+/// | 3.0 | 0.0296 | 0.2336 | 0.0289 |
+///
+/// **2.0 は飽和の入口である。** 最良設定の 0.0296 は門を掛ける前の値と同じで、
+/// そこから広げても動かない。つまり 2.0 で「本物の背景を落とさない」に達して
+/// おり、それより狭いと指標が欠陥を過小に言い始める。
+///
+/// 上限は置かない。門が素材のばらつきより広くなるのは、商品の色差がその
+/// ばらつきに埋もれている場合だけで、そこは色では分けられない——
+/// `NOT_SEPARABLE` が名指している限界そのものである。
 const REFERENCE_GATE_GAIN: f64 = 2.0;
 
 /// 境界近傍とみなす距離(px)。
@@ -791,6 +810,10 @@ pub fn halo_ratio(
     // ——**値は 1 ビットも変わらない**（`near_boundary` の窓は 3px の
     // チェビシェフ近傍そのもので、画像の外は数えない）
     let near = background_distance(mask);
+    // **参照に採れる画素は 1 度だけ決める。** 窓は重なり合うので、画素ごとに
+    // 門を掛け直すと同じ画素の色差を何十回も測ることになる（17x17 の窓で
+    // 24.5MP の実写では `--optimize` が 12.9 → 16.0 秒へ伸びた）
+    let usable = usable_references(image, mask, field, reference_gate);
 
     for y in 0..h {
         for x in 0..w {
@@ -802,7 +825,7 @@ pub fn halo_ratio(
             // 参照が 1 つも採れなければ、その場所の背景モデルそのものを使う。
             // 大域の 1 色へ落とすと、照明場を持っている素材で「その場所の
             // 背景」ではない色と比べることになる
-            let local = local_background(image, mask, x, y, field, reference_gate);
+            let local = local_background(image, mask, x, y, &usable);
             let reference = srgb_to_lab(local.unwrap_or_else(|| field.rgb_at(x, y)));
             let p = image.get_pixel(x, y).0;
             if delta_e76(srgb_to_lab([p[0], p[1], p[2]]), reference) <= SAME_AS_BACKGROUND {
@@ -819,12 +842,25 @@ pub fn halo_ratio(
 /// 画像の外は種にしない——`near_boundary` が窓を画像の中へ切り詰めていたのと
 /// 同じで、見切れた商品の縁を境界と見なさないためである。
 fn background_distance(mask: &Mask) -> Vec<u8> {
+    chebyshev_distance(mask, false)
+}
+
+/// 前景画素からのチェビシェフ距離(px)。255 で飽和する。
+///
+/// `background_distance` の裏返しで、種が前景の側にある。`usable_references`
+/// が「参照として見られうる背景画素」を帯へ絞るのに使う。
+fn foreground_distance(mask: &Mask) -> Vec<u8> {
+    chebyshev_distance(mask, true)
+}
+
+/// 種からのチェビシェフ距離(px)。`seed_foreground` が種の側を選ぶ。
+fn chebyshev_distance(mask: &Mask, seed_foreground: bool) -> Vec<u8> {
     let (w, h) = (mask.width() as usize, mask.height() as usize);
     let alpha = mask.as_slice();
     let mut d: Vec<u8> = alpha
         .iter()
         .map(|&v| {
-            if v >= FOREGROUND_THRESHOLD {
+            if (v >= FOREGROUND_THRESHOLD) != seed_foreground {
                 u8::MAX
             } else {
                 0
@@ -900,10 +936,10 @@ fn local_background(
     mask: &Mask,
     x: u32,
     y: u32,
-    field: &BackgroundField,
-    gate: f64,
+    usable: &[bool],
 ) -> Option<[u8; 3]> {
     let (w, h) = (mask.width(), mask.height());
+    let stride = w as usize;
     let x0 = (x as i64 - LOCAL_BG_WINDOW).max(0) as u32;
     let x1 = ((x as i64 + LOCAL_BG_WINDOW) as u32).min(w - 1);
     let y0 = (y as i64 - LOCAL_BG_WINDOW).max(0) as u32;
@@ -911,15 +947,12 @@ fn local_background(
     let mut sum = [0u64; 3];
     let mut n = 0u64;
     for ny in y0..=y1 {
+        let row = (ny as usize) * stride;
         for nx in x0..=x1 {
-            if mask.get(nx, ny) != 0 {
+            if !usable[row + (nx as usize)] {
                 continue;
             }
             let p = image.get_pixel(nx, ny).0;
-            let rgb = [p[0], p[1], p[2]];
-            if delta_e76(srgb_to_lab(rgb), srgb_to_lab(field.rgb_at(nx, ny))) > gate {
-                continue;
-            }
             for (k, slot) in sum.iter_mut().enumerate() {
                 *slot += u64::from(p[k]);
             }
@@ -927,6 +960,35 @@ fn local_background(
         }
     }
     (n > 0).then(|| [(sum[0] / n) as u8, (sum[1] / n) as u8, (sum[2] / n) as u8])
+}
+
+/// 局所背景の参照に採ってよい画素（`local_background` の門を 1 度だけ掛けた面）。
+///
+/// **測る範囲を帯に絞る。** 参照が要るのは「境界近傍の前景画素の窓の中」だけ
+/// なので、前景から `NEAR_BOUNDARY + LOCAL_BG_WINDOW` より遠い背景画素の色差は
+/// 誰も見ない。24.5MP の画像で全画素の ΔE を測ると、それだけで 1 秒級になる。
+fn usable_references(
+    image: &RgbaImage,
+    mask: &Mask,
+    field: &BackgroundField,
+    gate: f64,
+) -> Vec<bool> {
+    let (w, h) = (mask.width(), mask.height());
+    let reach = (NEAR_BOUNDARY + LOCAL_BG_WINDOW) as u8;
+    let far = foreground_distance(mask);
+    let mut usable = vec![false; (w as usize) * (h as usize)];
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y as usize) * (w as usize) + (x as usize);
+            if mask.get(x, y) != 0 || far[i] > reach {
+                continue;
+            }
+            let p = image.get_pixel(x, y).0;
+            let rgb = [p[0], p[1], p[2]];
+            usable[i] = delta_e76(srgb_to_lab(rgb), srgb_to_lab(field.rgb_at(x, y))) <= gate;
+        }
+    }
+    usable
 }
 
 /// 境界法線方向にアルファが 0.9 から 0.1 へ落ちるまでの幅(px)の中央値。

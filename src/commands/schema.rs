@@ -366,7 +366,9 @@ fn fields() -> Vec<FieldEntry> {
                 "cutout --rotate <値> や kiri rotate --angle <値> へそのまま渡せる。傾きそのもの\
                  （符号を反転して渡す値）ではないので、符号を考え直さないこと。**自動では\
                  適用しない**——傾きを直すかどうかは bbox と同じく構図の判断である。\
-                 subject.confidence が high のときだけ根拠にしてよいのも bbox と同じ",
+                 subject.confidence が high のときだけ根拠にしてよいのも bbox と同じ。\
+                 **分解能は 0.1〜0.5 度**（主体は縮小版で測る）。小数第 4 位まで出るが、\
+                 0.5 度を下回る差を有意と読まないこと——0 になるまで回し直すループは組めない",
             ),
         },
         FieldEntry {
@@ -383,7 +385,9 @@ fn fields() -> Vec<FieldEntry> {
                  頭打ちになって食い違う。**--border は背景色の推定範囲を決める値であって、\
                  主体の較正のための値ではない**——帯を画像の半分まで広げると外周 ΔE の分布\
                  （主体を拾うしきい値そのもの）が商品自身に汚染され、救えない画像が high と\
-                 名乗り始める。area_ratio / capture_ratio / leftover_ratio はこの帯で測った値である",
+                 名乗り始める。area_ratio / capture_ratio / leftover_ratio / delta_e と\
+                 level_rotation はこの帯で測った値で、background.rgb（--border の帯で測る）\
+                 とは別の背景色を基準にすることがある",
             ),
         },
         FieldEntry {

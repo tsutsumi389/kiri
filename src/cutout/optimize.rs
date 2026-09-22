@@ -805,7 +805,11 @@ fn reduced(image: &RgbaImage) -> Result<Cow<'_, RgbaImage>> {
 }
 
 /// 長さを別の寸法へ写す。長辺の比で縮め、**四捨五入する**（切り捨てると
-/// `--feather 1` のような 1px の指定が縮小のたびに消える）。
+/// 既定の `--border 2` のような小さい指定が縮小のたびに 0 へ落ちる）。
+///
+/// 0 は 0 のまま返す。「外周を見ない」という指定を 1px へ持ち上げるかどうかは
+/// 呼び出し側の判断で、`optimize` は `.max(1)` を掛けている（背景を決められない
+/// 見立てを探索段へ渡さないため）。
 fn scale_length(value: u32, source: (u32, u32), target: (u32, u32)) -> u32 {
     let (from, to) = (source.0.max(source.1), target.0.max(target.1));
     if value == 0 || from == 0 || to >= from {
@@ -1410,8 +1414,10 @@ mod tests {
         // 縮んでいなければ 1px も動かさない
         assert_eq!(scale_length(2, (1200, 1200), (1200, 1200)), 2);
         assert_eq!(scale_length(7, (700, 1400), (700, 1400)), 7);
-        // 0 は 0 のまま（「外周を見ない」指定を勝手に 1px へ持ち上げない）
+        // 0 は 0 のまま。**持ち上げるのは呼び出し側**（`optimize` の `.max(1)`）
+        // なので、`--border 0 --optimize` は探索段だけ 1px で回る
         assert_eq!(scale_length(0, (4284, 5712), (1125, 1500)), 0);
+        assert_eq!(scale_length(0, (4284, 5712), (1125, 1500)).max(1), 1);
         // 大きい帯は比のぶんだけ縮む
         assert_eq!(scale_length(110, (4284, 5712), (1125, 1500)), 29);
     }

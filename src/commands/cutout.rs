@@ -10,7 +10,9 @@ use std::time::Instant;
 use crate::cli::{CutoutArgs, Polygon};
 use crate::commands::output::{self, round4};
 use crate::commands::segment;
-use crate::cutout::constraints::{MASK_THRESHOLD, TRIMAP_BACKGROUND, TRIMAP_FOREGROUND};
+use crate::cutout::constraints::{
+    ALPHA_BACKGROUND, ALPHA_FOREGROUND, MASK_THRESHOLD, TRIMAP_BACKGROUND, TRIMAP_FOREGROUND,
+};
 use crate::cutout::optimize;
 use crate::cutout::{
     Constraint, ConstraintSource, Constraints, CutoutOptions, FG_SEED_RADIUS, Matting, cutout_seen,
@@ -644,6 +646,7 @@ fn resolve_constraints(
     height: u32,
 ) -> Result<(Option<Constraints>, Vec<Warning>)> {
     let nothing_given = args.trimap.is_none()
+        && args.alpha_trimap.is_none()
         && args.fg_mask.is_none()
         && args.bg_mask.is_none()
         && args.fg_polygon.is_empty()
@@ -683,6 +686,43 @@ fn resolve_constraints(
             marked,
             "--trimap",
             ConstraintSource::Trimap,
+        );
+    }
+
+    // **アルファで読む入口。** 輝度で読む `--trimap` と分けてあるのは、同じ
+    // ファイルが 2 通りに読まれるのを避けるためである（`ConstraintSource`）
+    if let Some(path) = args.alpha_trimap.as_ref() {
+        let (image, warning) = load_constraint_image(path, "--alpha-trimap", width, height)?;
+        warnings.extend(warning);
+        // **全画素が不透明なら断る。** そのまま読むと画像全体が確定前景になり、
+        // 「指示したのに何も変わらない」ではなく「何も切り抜かれない」が起きる。
+        // アルファを持たない JPEG を渡した場合がまさにこれで、黙って進めない
+        if image.pixels().all(|p| p.0[3] >= ALPHA_FOREGROUND) {
+            return Err(Error::new(
+                ErrorCode::ConstraintAllOpaque,
+                format!(
+                    "--alpha-trimap {} は全画素が不透明（アルファ {ALPHA_FOREGROUND} 以上）です",
+                    path.display()
+                ),
+            )
+            .with_hint(
+                "切り抜き済みの PNG を渡してください。輝度で塗ったグレー画像なら --trimap です",
+            ));
+        }
+        let marked = constraints.mark_by_alpha(&image, |alpha| {
+            if alpha >= ALPHA_FOREGROUND {
+                Some(Constraint::ForcedFg)
+            } else if alpha <= ALPHA_BACKGROUND {
+                Some(Constraint::ForcedBg)
+            } else {
+                None
+            }
+        });
+        note(
+            &mut constraints,
+            marked,
+            "--alpha-trimap",
+            ConstraintSource::AlphaTrimap,
         );
     }
 

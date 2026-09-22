@@ -771,8 +771,13 @@ fn print_the_refine_cost_on_large_inputs() {
     // いない状態から 1 回だけ回して前後の差を見る**。時間の計測（最短を採るには
     // 何回か回す必要がある）と同じパスではできない
     let before = resident_kb();
-    let d =
-        kiri::cutout::diagnostics::diagnose(&cases[0].1, &result.mask, result.background.rgb, None);
+    let d = kiri::cutout::diagnostics::diagnose(
+        &cases[0].1,
+        &result.mask,
+        &kiri::cutout::BackgroundField::flat(result.background.rgb),
+        3.0,
+        None,
+    );
     let after = resident_kb();
     std::hint::black_box((d.contour_roughness, d.rim_contamination));
 
@@ -785,7 +790,8 @@ fn print_the_refine_cost_on_large_inputs() {
         let d = kiri::cutout::diagnostics::diagnose(
             &cases[0].1,
             &result.mask,
-            result.background.rgb,
+            &kiri::cutout::BackgroundField::flat(result.background.rgb),
+            3.0,
             None,
         );
         std::hint::black_box((d.contour_roughness, d.rim_contamination));
@@ -799,7 +805,8 @@ fn print_the_refine_cost_on_large_inputs() {
         std::hint::black_box(kiri::cutout::diagnostics::halo_ratio(
             &cases[0].1,
             &result.mask,
-            result.background.rgb,
+            &kiri::cutout::BackgroundField::flat(result.background.rgb),
+            3.0,
         ));
         halo = halo.min(started.elapsed().as_secs_f64() * 1000.0);
         let started = std::time::Instant::now();

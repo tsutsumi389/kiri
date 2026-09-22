@@ -294,7 +294,7 @@ impl BackgroundSeen {
 /// 画像と `border` だけで決まるぶんを 1 度だけ測る。
 pub fn see_background(image: &RgbaImage, border: u32) -> BackgroundSeen {
     let estimate = estimate_background(image, border);
-    let subject = detect_subject(image, &estimate);
+    let subject = detect_subject(image, &estimate, border);
     BackgroundSeen {
         border,
         estimate,
@@ -663,7 +663,13 @@ pub fn cutout_seen(
         opts.bbox,
         opts.constraints.as_ref(),
     );
-    let diagnostics = diagnostics::diagnose(image, &mask, background.rgb, opts.bbox);
+    let diagnostics = diagnostics::diagnose(
+        image,
+        &mask,
+        &field,
+        diagnostics::halo_reference_gate(residual.p90),
+        opts.bbox,
+    );
     // 設定の調整はいちばん先に伝える。結果への警告は、その設定で走った結果に
     // ついてのものなので、順序が逆だと読み手が原因を後から知ることになる
     let mut warnings = Vec::from_iter(texture_warning);
@@ -1424,6 +1430,8 @@ mod tests {
             capture_ratio: 0.9793,
             delta_e: 49.6,
             leftover_ratio: 0.0531,
+            level_rotation: None,
+            border: DEFAULT_BORDER,
             touches_edge: true,
             confidence,
         }

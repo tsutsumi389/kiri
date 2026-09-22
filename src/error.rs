@@ -125,6 +125,9 @@ error_catalog! {
         => "同じ画素が確定前景と確定背景の両方に指定されている",
     MaskSizeMismatch = "MASK_SIZE_MISMATCH", Argument
         => "トライマップやマスク画像の寸法が入力画像と違う",
+    ConstraintAllOpaque = "CONSTRAINT_ALL_OPAQUE", Argument
+        => "--alpha-trimap に渡した画像が全画素不透明で、指示として読むと画像全体が確定前景になる\
+            （アルファを持たない JPEG などを渡した場合がこれ）",
     InvalidCanvas = "INVALID_CANVAS", Argument
         => "--canvas の書式か寸法が不正",
     InvalidColor = "INVALID_COLOR", Argument

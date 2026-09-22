@@ -14,11 +14,13 @@
 //! 複数商品や意図的な見切れでは人／AI が決めるべきものである。堤防のしきい値
 //! （純粋な内部パラメータ）の自動調整とは性質が違う。ヒントとして返すに留める。
 
+use std::f64::consts::FRAC_PI_4;
+
 use image::RgbaImage;
 use serde::Serialize;
 
 use crate::color::lab::delta_e_rgb;
-use crate::cutout::background::{BackgroundEstimate, UNIFORM_DELTA_E};
+use crate::cutout::background::{BackgroundEstimate, DEFAULT_BORDER, UNIFORM_DELTA_E};
 use crate::transform::{FitMode, ResizeSpec, apply, plan};
 
 /// 主体を測るときの長辺の上限(px)。
@@ -56,7 +58,8 @@ const BBOX_MARGIN: f64 = 0.01;
 /// それを弾き、EC 写真として意味のある大きさ（画像の 5%、
 /// 1000x1000 なら 224x224 相当）を残す線である。
 ///
-/// **較正は既定の `--border 2` を前提にしている。** 詳細は
+/// **較正は既定の `--border 2` を前提にしている。** そのぶんを
+/// `calibrated_border` が帯の上限として引き受ける。詳細は
 /// `MIN_CAPTURE_RATIO` のコメントを参照。
 pub const MIN_AREA_RATIO: f64 = 0.05;
 
@@ -71,9 +74,9 @@ pub const MIN_AREA_RATIO: f64 = 0.05;
 /// 背景との ΔE が 64.4 とリモコン（49.6）より大きく出る。色の違いの大きさは
 /// 「そこが商品か」を何も語らない。
 ///
-/// **較正は既定の `--border 2` を前提にしており、帯を大きく広げると成立しない。**
-/// `--border` は背景色の推定範囲を決めると同時に、外周 ΔE の分布——つまり
-/// `far` の閾値そのもの——を決める。帯を広げれば背景色も分布も別物になる。
+/// **較正は既定の `--border 2` を前提にしている。** `--border` は背景色の推定
+/// 範囲を決めると同時に、外周 ΔE の分布——つまり `far` の閾値そのもの——を
+/// 決めるので、帯を広げれば背景色も分布も別物になる。上限を置く前の実測。
 ///
 /// | 素材 | --border | p50 / p90 | area / capture | confidence |
 /// |---|---|---|---|---|
@@ -82,10 +85,71 @@ pub const MIN_AREA_RATIO: f64 = 0.05;
 /// | IMG_0251（救える） | 2（既定） | 11.9 / 26.8 | 0.234 / 0.979 | high |
 /// | IMG_0251（救える） | 110 | 12.4 / 27.2 | 0.234 / 0.982 | high |
 ///
-/// 救えないほうだけが裏返る。**`--border` を既定から大きく動かしたときは、
-/// `confidence` を根拠に動いてはならない。** しきい値を `--border` から
-/// 切り離す改修は範囲が大きいので、いまは前提を書き残すに留める。
+/// **いまは `calibrated_border` が帯に上限を置いて切り離してある。** 上の
+/// 110 は上限に掛かるので、既定と同じ判定（low）が出る。
+///
+/// 救えないほうだけが裏返る。**そこで主体は `--border` をそのまま使わず、
+/// 自分の帯を持つ**（`calibrated_border`）。上の 110 は帯の上限に掛かるので、
+/// いまは既定と同じ判定（low）が出る。
 pub const MIN_CAPTURE_RATIO: f64 = 0.70;
+
+/// 主体が統計を測る帯の上限（短辺に対する割合）。
+///
+/// **`--border` は背景色の推定範囲を決める値であって、主体の較正のための
+/// 値ではない。** しかし帯が変われば外周 ΔE の分布——`far` のしきい値
+/// そのもの——も変わるので、そのままでは較正が `--border` にぶら下がる。
+/// 上限を置いて切り離す。
+///
+/// 上限を割合で持つのは、帯の役目が「外枠を見る」ことにあるためである。
+/// 実寸 px の上限にすると、小さい画像では帯が画像の半分を覆い、大きい画像では
+/// 外周 1 行しか見ない。
+///
+/// **0.03 は掃引が選んだ値である。** 合成 11 点（600px 級）と実写 2 枚で
+/// `--border` を 2 / 4 / 8 / 16 / 32 / 64 / 110 / 200 / 400 と振ると、
+/// **64 まではどの点も判定が動かず、110 で 2 点が裏返る**——合成の
+/// 「画面外へ抜ける大きな物体」と実写 IMG_0238（どちらも low → high の誤り）。
+/// 実写側の裏返りは 105 と 110 のあいだにある。0.03 は 600px で 18px、
+/// 3024px（IMG_0238 の短辺）で 90px、4284px（IMG_0251）で 128px になり、
+/// 測ったどの点も正しい側に残る。`texture_band` が外周の勾配を測る帯と
+/// 同じ割合でもある。
+const SUBJECT_BORDER_FRACTION: f64 = 0.03;
+
+/// 主体が統計を測る帯の幅(px)。`--border` を超えて広げることはしない。
+///
+/// 既定の `--border 2` では常に 2 のままなので、**既定の経路では 1 ビットも
+/// 変わらない**。
+pub fn calibrated_border(width: u32, height: u32, border: u32) -> u32 {
+    let short = f64::from(width.min(height));
+    let cap = (short * SUBJECT_BORDER_FRACTION).round() as u32;
+    border.min(cap.max(DEFAULT_BORDER))
+}
+
+/// 最小外接矩形の面積が「どの角度でも変わらない」と判じる相対差。
+///
+/// `level_rotation` は辺ごとに外接矩形の面積を測って最小を採るが、円や辺の
+/// 多い形では最小の位置が雑音で決まる。面積の最大と最小の差がこれを切ったら
+/// 答えない。**「0 度」と答えてはならない**——傾いていないことを測り切った
+/// ように読めるが、実際には測れていない。
+///
+/// **面積の標本には辺の向きだけでなく「辺 + 45 度」も入れる。** 最小は辺の
+/// 向きからしか出ない（最小面積外接矩形の定理）が、最大は辺の上には無い。
+/// 凸包がちょうど矩形なら 4 本の辺がすべて同じ面積を返すので、辺だけを見ると
+/// 振れ幅 0——つまり円と同じ——になる。**正面から撮った箱・本・パッケージが
+/// それで、測り切れているのに `None` を返していた。**
+///
+/// 2% は測った形の振れ幅の下から十分に離れている。
+///
+/// | 形 | 辺の向きだけ | 辺 + 45 度 |
+/// |---|---|---|
+/// | 400x150 の矩形 | 0.0% | **60.3%** |
+/// | 正方形 | 0.0% | **50.0%** |
+/// | 正 6 角形 / 正 12 角形 | 0.0% | 7.2% / 6.7% |
+/// | 正 8 角形 / 正 16 角形 | 0.0% | **0.0%** |
+/// | 円（正 64 角形以上） | 0.0% | **0.0%** |
+///
+/// 正 8 角形と正 16 角形が落ちるのは正しい——45 度がその形の対称の向きなので、
+/// どの答えを返しても同じ絵になる。
+const TILT_AMBIGUOUS: f64 = 0.02;
 
 /// 提案した矩形の外に残ってよい塊の上限（画像に占める割合）。
 ///
@@ -215,6 +279,30 @@ pub struct SubjectHint {
     /// 判定に使うしきい値は主体検出のものより低い（`MAX_LEFTOVER_RATIO` 参照）。
     pub leftover_ratio: f64,
     pub touches_edge: bool,
+    /// 主体の最小外接矩形が軸に揃う回転角(度)。**`--rotate` にそのまま渡せる。**
+    ///
+    /// `normalized_bbox` と同じく「次の一手をそのまま書ける形」で返す。傾き
+    /// そのもの（符号を反転して渡す値）にしないのは、符号を取り違える余地を
+    /// 残さないためである。範囲は (-45, 45]。
+    ///
+    /// **自動では適用しない。** 傾きを直すかどうかは構図の判断で、`bbox` と
+    /// 同じ扱いである。
+    ///
+    /// どの角度でも外接矩形の面積が変わらない形（円、辺の多い多角形）では
+    /// `None`。0 と答えると「傾いていないと測り切った」に読めるが、実際には
+    /// 測れていない。
+    ///
+    /// **分解能は 0.1〜0.5 度である。** 主体は長辺 `MEASURE_LONG_EDGE` へ縮めて
+    /// から測るので、輪郭の量子化がそのまま角度の誤差になる（実測: 真値 0.5 度
+    /// で 0.0、1.0 度で 0.97、12.0 度で 11.98）。**0.5 度を下回る差を有意と
+    /// 読んではならない。**
+    pub level_rotation: Option<f64>,
+    /// 主体の統計を測った外周の帯の幅(px)。
+    ///
+    /// 既定では `--border` と同じだが、`--border` が短辺の 3% を超えると
+    /// ここで頭打ちになる（`calibrated_border`）。**`--border` は背景色の
+    /// 推定範囲を決める値で、主体の較正のための値ではない。**
+    pub border: u32,
     pub confidence: Confidence,
 }
 
@@ -243,11 +331,26 @@ impl SubjectHint {
 /// 閾値を超えた画素が 1 つも無ければ（＝背景しか写っていなければ）`None`。
 /// 空の画像でも `None` を返す。**「主体が無い」と「測っていない」は別なので、
 /// 呼び出し側は `None` をそのまま `null` として報告すること。**
-pub fn detect_subject(image: &RgbaImage, background: &BackgroundEstimate) -> Option<SubjectHint> {
+pub fn detect_subject(
+    image: &RgbaImage,
+    background: &BackgroundEstimate,
+    border: u32,
+) -> Option<SubjectHint> {
     let (full_w, full_h) = (image.width(), image.height());
     if full_w == 0 || full_h == 0 {
         return None;
     }
+    // **主体は自分の帯で測る。** `--border` が短辺の 3% を超えたときだけ、
+    // その幅で測り直す（`calibrated_border`）。既定の `--border 2` では
+    // 頭打ちに掛からないので、**1 度も測り直さない**
+    let capped = calibrated_border(full_w, full_h, border);
+    let own;
+    let background = if capped == border {
+        background
+    } else {
+        own = crate::cutout::background::estimate_background(image, capped);
+        &own
+    };
     let small = downscale(image)?;
     let (w, h) = (small.width(), small.height());
 
@@ -292,7 +395,14 @@ pub fn detect_subject(image: &RgbaImage, background: &BackgroundEstimate) -> Opt
     if far_count == 0 {
         return None;
     }
-    hint_from(&small, (full_w, full_h), background, &far, far_count)
+    hint_from(
+        &small,
+        (full_w, full_h),
+        background,
+        capped,
+        &far,
+        far_count,
+    )
 }
 
 /// セグメンテーションモデルの確率マップから主体を求める。
@@ -313,6 +423,7 @@ pub fn detect_subject(image: &RgbaImage, background: &BackgroundEstimate) -> Opt
 pub fn detect_subject_from_probability(
     image: &RgbaImage,
     background: &BackgroundEstimate,
+    border: u32,
     probability: &crate::segment::Probability,
 ) -> Option<SubjectHint> {
     let (full_w, full_h) = (image.width(), image.height());
@@ -335,7 +446,24 @@ pub fn detect_subject_from_probability(
     if far_count == 0 {
         return None;
     }
-    hint_from(&small, (full_w, full_h), background, &far, far_count)
+    // モデルが決める `far` は外周の帯に依らないが、`delta_e` と
+    // `leftover_ratio` は色から測るので、帯の規約は色の経路と揃える
+    let capped = calibrated_border(full_w, full_h, border);
+    let own;
+    let background = if capped == border {
+        background
+    } else {
+        own = crate::cutout::background::estimate_background(image, capped);
+        &own
+    };
+    hint_from(
+        &small,
+        (full_w, full_h),
+        background,
+        capped,
+        &far,
+        far_count,
+    )
 }
 
 /// 「背景でない画素」の集合から主体候補を組み立てる。
@@ -347,6 +475,7 @@ fn hint_from(
     small: &RgbaImage,
     full: (u32, u32),
     background: &BackgroundEstimate,
+    border: u32,
     far: &[bool],
     far_count: usize,
 ) -> Option<SubjectHint> {
@@ -408,6 +537,8 @@ fn hint_from(
         delta_e,
         leftover_ratio,
         touches_edge,
+        level_rotation: level_rotation(&row_extremes(far, w, h, largest.seed)),
+        border,
         confidence,
     })
 }
@@ -493,6 +624,9 @@ struct Component {
     x2: u32,
     y2: u32,
     sum: [u64; 3],
+    /// 走査がこの成分に最初に触れた画素。**傾きを測るときに、同じ成分を
+    /// もう一度だけ辿り直すための入口である**（`row_extremes`）
+    seed: (u32, u32),
 }
 
 /// `far` の 4-連結成分のうち最大のものを返す。
@@ -528,6 +662,7 @@ fn largest_component(image: &RgbaImage, far: &[bool], w: u32, h: u32) -> Option<
                 x2: x,
                 y2: y,
                 sum: [0; 3],
+                seed: (x, y),
             };
             while let Some((cx, cy)) = stack.pop() {
                 comp.area += 1;
@@ -554,6 +689,166 @@ fn largest_component(image: &RgbaImage, far: &[bool], w: u32, h: u32) -> Option<
         }
     }
     best
+}
+
+/// 成分の行ごとの左端・右端。`None` の行はその成分の画素が無い。
+///
+/// **凸包の頂点は必ずこの中にある。** 行ごとの左右の端より外に成分の画素は
+/// 無いのだから、包の頂点になりうるのは端の画素だけである。成分の全画素を
+/// 積むと 1500px 級の縮小版でも百万点になるが、これなら高さぶんで済む。
+fn row_extremes(far: &[bool], w: u32, h: u32, seed: (u32, u32)) -> Vec<Option<(u32, u32)>> {
+    let stride = w as usize;
+    let mut rows: Vec<Option<(u32, u32)>> = vec![None; h as usize];
+    let mut visited = vec![false; far.len()];
+    let mut stack = vec![seed];
+    visited[(seed.1 as usize) * stride + (seed.0 as usize)] = true;
+    while let Some((cx, cy)) = stack.pop() {
+        let slot = &mut rows[cy as usize];
+        *slot = Some(match *slot {
+            None => (cx, cx),
+            Some((lo, hi)) => (lo.min(cx), hi.max(cx)),
+        });
+        for (nx, ny) in neighbors(cx, cy, w, h) {
+            let i = (ny as usize) * stride + (nx as usize);
+            if visited[i] || !far[i] {
+                continue;
+            }
+            visited[i] = true;
+            stack.push((nx, ny));
+        }
+    }
+    rows
+}
+
+/// 最小外接矩形が軸に揃う回転角(度)。`--rotate` にそのまま渡せる向きで返す。
+///
+/// **「主体をどれだけ回せば水平になるか」を直接返す。** 傾きそのもの（符号を
+/// 反転して渡す値）ではないのは、`normalized_bbox` が `--bbox --normalized`
+/// にそのまま渡せる形であるのと同じ理由である——エージェントが符号を
+/// 取り違える余地を残さない。
+///
+/// 求め方は最小面積外接矩形（rotating calipers の素朴版）である。凸包の
+/// 最小面積外接矩形は**必ず包の辺のどれかと平行**なので、辺ごとに包を回して
+/// 軸並行の外接矩形の面積を測り、最小のものを採る。包の頂点は多くて数百なので
+/// O(h²) で足りる。
+///
+/// **丸いものには答えない。** どの角度でも面積が変わらない形（円、正多角形の
+/// ように辺が多い形）では最小の位置が雑音で決まる。面積の最大と最小の差が
+/// `TILT_AMBIGUOUS` を切ったら `None` を返す——「0 度」と答えると、
+/// 傾いていないことを測り切ったように読める。
+///
+/// **ほぼ同じ面積の最小が 2 つある形は捕まえられない。** L 字や十字のように、
+/// 無関係な 2 つの角度がほぼ同じ外接矩形を作る形では、1 画素の違いで答えが
+/// 跳ぶ（同じ入力からは同じ答えが出るので決定的ではあるが、入力の微差に対して
+/// 連続ではない）。`TILT_AMBIGUOUS` は「全向きで平ら」しか見ていないので、
+/// ここは通ってしまう。
+///
+/// 座標系は y 下向きなので、標準の回転行列がそのまま画面上の時計回りになる。
+/// `kiri rotate` の「時計回りが正」と一致する。
+fn level_rotation(rows: &[Option<(u32, u32)>]) -> Option<f64> {
+    let mut points: Vec<(f64, f64)> = Vec::new();
+    for (y, row) in rows.iter().enumerate() {
+        let Some((lo, hi)) = *row else { continue };
+        let fy = y as f64 + 0.5;
+        points.push((f64::from(lo) + 0.5, fy));
+        if hi != lo {
+            points.push((f64::from(hi) + 0.5, fy));
+        }
+    }
+    let hull = convex_hull(points);
+    if hull.len() < 3 {
+        return None;
+    }
+
+    let (mut best, mut lo_area, mut hi_area) = (0.0f64, f64::INFINITY, 0.0f64);
+    for i in 0..hull.len() {
+        let (ax, ay) = hull[i];
+        let (bx, by) = hull[(i + 1) % hull.len()];
+        let (dx, dy) = (bx - ax, by - ay);
+        if dx.hypot(dy) <= f64::EPSILON {
+            continue;
+        }
+        // 辺を x 軸へ寝かせる回転。**これがそのまま `--rotate` の値である**
+        let angle = -dy.atan2(dx);
+        let area = bbox_area(&hull, angle);
+        if area < lo_area {
+            lo_area = area;
+            best = angle;
+        }
+        // **曖昧さの物差しには辺と無関係な向きも要る。** 最小は辺の向きからしか
+        // 出ない（最小面積外接矩形の定理）が、最大は辺の上には無い。凸包が
+        // ちょうど矩形なら 4 本の辺がすべて同じ面積を返すので、辺だけを見ると
+        // 「どの角度でも面積が変わらない」＝円と同じ、と判じてしまう。
+        // 正面から撮った箱がまさにそれで、測り切れているのに `None` になっていた
+        hi_area = hi_area.max(area).max(bbox_area(&hull, angle + FRAC_PI_4));
+    }
+    if !lo_area.is_finite() || lo_area <= 0.0 || hi_area <= 0.0 {
+        return None;
+    }
+    if (hi_area - lo_area) / hi_area < TILT_AMBIGUOUS {
+        return None;
+    }
+
+    // 90 度ごとに同じ矩形になるので、(-45, 45] へ畳む。**回すのは水平を出す
+    // ためであって、商品を横倒しにするためではない**
+    let mut deg = best.to_degrees() % 90.0;
+    if deg > 45.0 {
+        deg -= 90.0;
+    } else if deg <= -45.0 {
+        deg += 90.0;
+    }
+    // `-0.0` を返さない。JSON に出ると「負の傾き」に見えるうえ、丸めた値の
+    // 符号がその場の浮動小数の端数で決まることになる
+    Some(deg + 0.0)
+}
+
+/// 凸包を `angle` だけ回したときの、軸並行の外接矩形の面積。
+fn bbox_area(hull: &[(f64, f64)], angle: f64) -> f64 {
+    let (sin, cos) = angle.sin_cos();
+    let (mut x1, mut y1, mut x2, mut y2) = (
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    );
+    for &(px, py) in hull {
+        let (rx, ry) = (px * cos - py * sin, px * sin + py * cos);
+        x1 = x1.min(rx);
+        y1 = y1.min(ry);
+        x2 = x2.max(rx);
+        y2 = y2.max(ry);
+    }
+    (x2 - x1) * (y2 - y1)
+}
+
+/// 単調連鎖法（Andrew）による凸包。反時計回り（y 下向きなので画面では時計回り）。
+///
+/// 同一直線上の点は落とす。残すと辺の数だけ同じ角度を測り直すことになる。
+fn convex_hull(mut points: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
+    points.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    points.dedup();
+    if points.len() < 3 {
+        return points;
+    }
+    let cross = |o: (f64, f64), a: (f64, f64), b: (f64, f64)| {
+        (a.0 - o.0) * (b.1 - o.1) - (a.1 - o.1) * (b.0 - o.0)
+    };
+    let mut hull: Vec<(f64, f64)> = Vec::with_capacity(points.len() * 2);
+    for &p in points.iter() {
+        while hull.len() >= 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0 {
+            hull.pop();
+        }
+        hull.push(p);
+    }
+    let lower = hull.len() + 1;
+    for &p in points.iter().rev() {
+        while hull.len() >= lower && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0 {
+            hull.pop();
+        }
+        hull.push(p);
+    }
+    hull.pop();
+    hull
 }
 
 fn neighbors(x: u32, y: u32, w: u32, h: u32) -> impl Iterator<Item = (u32, u32)> {
@@ -622,7 +917,7 @@ mod tests {
 
     fn detect(img: &RgbaImage) -> Option<SubjectHint> {
         let bg = estimate_background(img, DEFAULT_BORDER);
-        detect_subject(img, &bg)
+        detect_subject(img, &bg, DEFAULT_BORDER)
     }
 
     /// 外周を汚染するシーン。**縮小が走る 600px で作る。**
@@ -773,6 +1068,127 @@ mod tests {
     /// 座標変換は、呼び出し側の性質に頼らず単体で安全であること。
     ///
     /// `clamp` は下限が上限を超えると panic する。左上が画像の右下端に
+    /// 行の左右端から `level_rotation` を組み立てる小道具。
+    ///
+    /// `far` を作って BFS を通すのではなく、**`level_rotation` が受け取る形を
+    /// 直接作る**。測りたいのは角度の算術であって連結成分の走査ではない。
+    fn rows_of(shape: impl Fn(f64, f64) -> bool, w: u32, h: u32) -> Vec<Option<(u32, u32)>> {
+        (0..h)
+            .map(|y| {
+                let mut span: Option<(u32, u32)> = None;
+                for x in 0..w {
+                    if shape(f64::from(x) + 0.5, f64::from(y) + 0.5) {
+                        span = Some(match span {
+                            None => (x, x),
+                            Some((lo, hi)) => (lo.min(x), hi.max(x)),
+                        });
+                    }
+                }
+                span
+            })
+            .collect()
+    }
+
+    /// 傾けた矩形を、傾けたぶんだけ戻す角度が返ること。
+    ///
+    /// **符号まで確かめる。** `--rotate` にそのまま渡せると謳う以上、
+    /// 大きさだけ合っていても意味が無い。
+    #[test]
+    fn a_tilted_rectangle_reports_the_angle_that_levels_it() {
+        for tilt in [-12.0f64, -5.0, -1.0, 0.0, 1.0, 5.0, 12.0] {
+            // 画面上で時計回りに `tilt` 度傾いた 400x160 の矩形（y 下向き）
+            let (sin, cos) = tilt.to_radians().sin_cos();
+            let rows = rows_of(
+                |x, y| {
+                    let (dx, dy) = (x - 300.0, y - 300.0);
+                    let u = dx * cos + dy * sin;
+                    let v = -dx * sin + dy * cos;
+                    u.abs() <= 200.0 && v.abs() <= 80.0
+                },
+                600,
+                600,
+            );
+            let got = level_rotation(&rows).expect("細長い矩形なら測れる");
+            assert!(
+                (got + tilt).abs() < 0.6,
+                "傾き {tilt} 度を戻す角として {got} を返した（期待は {}）",
+                -tilt
+            );
+        }
+    }
+
+    /// **軸に揃った矩形は「測れない」ではなく 0 である。**
+    ///
+    /// 凸包がちょうど 4 点になると、4 本の辺がすべて同じ外接矩形を返す。
+    /// 辺の向きだけで曖昧さを測っていた頃は、そこが円と区別できずに `None` へ
+    /// 落ちていた——正面から撮った箱・本・パッケージという、EC でいちばん
+    /// ありふれた主体がそれである。
+    #[test]
+    fn an_axis_aligned_rectangle_reports_zero_rather_than_nothing() {
+        for (w, h) in [(200.0f64, 75.0f64), (150.0, 150.0), (75.0, 200.0)] {
+            let rows = rows_of(
+                |x, y| (x - 300.0).abs() <= w && (y - 300.0).abs() <= h,
+                600,
+                600,
+            );
+            assert_eq!(
+                level_rotation(&rows),
+                Some(0.0),
+                "{w}x{h} の軸並行な矩形が測り切れていない"
+            );
+        }
+    }
+
+    /// 丸いものには答えない。**0 度と答えてはならない。**
+    #[test]
+    fn a_disc_has_no_level_rotation() {
+        let rows = rows_of(|x, y| (x - 300.0).hypot(y - 300.0) <= 200.0, 600, 600);
+        assert_eq!(level_rotation(&rows), None);
+    }
+
+    /// 90 度ごとに同じ矩形になるので、答えは (-45, 45] へ畳まれる。
+    #[test]
+    fn the_angle_is_folded_into_a_quarter_turn() {
+        for tilt in [80.0f64, 91.0, 179.0, -95.0] {
+            let (sin, cos) = tilt.to_radians().sin_cos();
+            let rows = rows_of(
+                |x, y| {
+                    let (dx, dy) = (x - 300.0, y - 300.0);
+                    let u = dx * cos + dy * sin;
+                    let v = -dx * sin + dy * cos;
+                    u.abs() <= 200.0 && v.abs() <= 80.0
+                },
+                600,
+                600,
+            );
+            let got = level_rotation(&rows).expect("細長い矩形なら測れる");
+            assert!(
+                got > -45.0 && got <= 45.0,
+                "畳めていない: {tilt} 度 → {got}"
+            );
+            // 畳んだ後も「回せば軸に揃う」ことは変わらない
+            let residual = (got + tilt).rem_euclid(90.0);
+            assert!(
+                residual < 0.6 || residual > 89.4,
+                "{tilt} 度の主体に {got} を当てても揃わない"
+            );
+        }
+    }
+
+    /// 潰れた成分では包が作れない。panic せずに `None` を返す。
+    #[test]
+    fn a_degenerate_component_has_no_level_rotation() {
+        // 1 行だけの成分。包が 2 点に潰れる
+        let single = rows_of(|_, y| (300.0..301.0).contains(&y), 600, 600);
+        assert_eq!(level_rotation(&single), None);
+        // 1 列だけの成分。行ごとに 1 点しか出ないので同じく潰れる
+        let column = rows_of(|x, _| (300.0..301.0).contains(&x), 600, 600);
+        assert_eq!(level_rotation(&column), None);
+        // 画素が 1 つも無い
+        let empty: Vec<Option<(u32, u32)>> = vec![None; 10];
+        assert_eq!(level_rotation(&empty), None);
+    }
+
     /// 達した矩形（`[1.0, 1.0, 1.0, 1.0]`）はいま到達しないが、**到達しない
     /// ことに寄りかかった算術は、上流が 1 行変わった日に panic で返ってくる。**
     #[test]

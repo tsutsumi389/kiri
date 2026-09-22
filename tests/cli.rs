@@ -279,6 +279,74 @@ fn the_subject_key_is_always_present_in_both_commands() {
     }
 }
 
+/// 主体の傾きが `--rotate` にそのまま渡せる形で返り、渡すと水平になること。
+///
+/// **`info` → `rotate` の 1 往復で閉じることを確かめる。** 符号が逆でも
+/// 「角度は返っている」ので、値の存在だけを見るテストでは捕まらない。
+#[test]
+fn the_reported_level_rotation_actually_levels_the_subject() {
+    let dir = fixture_dir();
+    // 5 度傾いた濃色の矩形を白背景に置く
+    let (w, h) = (400u32, 400u32);
+    let mut scene = image::RgbaImage::from_pixel(w, h, image::Rgba([250, 250, 249, 255]));
+    let (sin, cos) = 5.0f64.to_radians().sin_cos();
+    for y in 0..h {
+        for x in 0..w {
+            let (dx, dy) = (f64::from(x) - 200.0, f64::from(y) - 200.0);
+            let (u, v) = (dx * cos + dy * sin, -dx * sin + dy * cos);
+            if u.abs() <= 130.0 && v.abs() <= 55.0 {
+                scene.put_pixel(x, y, image::Rgba([40, 40, 45, 255]));
+            }
+        }
+    }
+    let input = write_png(dir.path(), "tilted.png", &scene);
+
+    let v = json_stdout(
+        &kiri()
+            .args(["info", input.to_str().unwrap(), "--json"])
+            .output()
+            .unwrap(),
+    );
+    let deg = v["subject"]["level_rotation"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("傾きが返っていない: {v}"));
+    assert!(
+        (deg + 5.0).abs() < 1.0,
+        "5 度傾いた主体に対して {deg} を返した（期待は -5 付近）"
+    );
+
+    // 返った値をそのまま `rotate` に渡すと、次の `info` は 0 付近を返す
+    let rotated = dir.path().join("level.png");
+    let out = kiri()
+        .args([
+            "rotate",
+            input.to_str().unwrap(),
+            "-o",
+            rotated.to_str().unwrap(),
+            "--angle",
+            &deg.to_string(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = json_stdout(
+        &kiri()
+            .args(["info", rotated.to_str().unwrap(), "--json"])
+            .output()
+            .unwrap(),
+    );
+    let left = after["subject"]["level_rotation"].as_f64().unwrap();
+    assert!(
+        left.abs() < 1.0,
+        "水平出しした後もまだ {left} 度傾いていると言う"
+    );
+}
+
 /// テキストの「主体候補」行と hint は、同じ矩形を同じ丸めで出す。
 ///
 /// **貼り付け可能と謳う行が、貼り付けたときに違う結果になってはいけない。**
@@ -2004,6 +2072,179 @@ fn a_trimap_decides_both_sides() {
     let cut = image::open(&output).unwrap().to_rgba8();
     assert_eq!(cut.get_pixel(100, 100)[3], 255, "確定前景が透けている");
     assert_eq!(cut.get_pixel(5, 5)[3], 0, "確定背景が残っている");
+}
+
+/// 切り抜き済みのアルファを指示として読めること（`--alpha-trimap`）。
+///
+/// **`--trimap` と同じ約束を、輝度ではなくアルファで確かめる。** 不透明は
+/// 確定前景、透明は確定背景、半透明は不明の 3 つが同時に成り立たなければ、
+/// 入口は届いていない。
+#[test]
+fn an_alpha_trimap_decides_both_sides() {
+    let dir = fixture_dir();
+    let input = constraint_fixture(dir.path());
+    let output = dir.path().join("cut.png");
+
+    // 中央の 60x60 を不透明（確定前景）、外周 20px を透明（確定背景）、
+    // あいだは半透明（不明）。**色はすべて同じにする**——輝度で読まれていたら
+    // 1 画素も塗られず、`CONSTRAINT_EMPTY` が出て落ちる
+    let mut alpha = image::RgbaImage::from_pixel(200, 200, image::Rgba([90, 90, 90, 128]));
+    for (rect, a) in [
+        ((0u32, 0u32, 199u32, 19u32), 0u8),
+        ((0, 180, 199, 199), 0),
+        ((70, 70, 129, 129), 255),
+    ] {
+        for y in rect.1..=rect.3 {
+            for x in rect.0..=rect.2 {
+                alpha.get_pixel_mut(x, y).0[3] = a;
+            }
+        }
+    }
+    let path = write_png(dir.path(), "cutout.png", &alpha);
+
+    let out = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--alpha-trimap",
+        path.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    assert_eq!(v["constraints"]["sources"][0], "alpha_trimap");
+    assert!(v["constraints"]["fg_ratio"].as_f64().unwrap() > 0.0);
+    assert!(v["constraints"]["bg_ratio"].as_f64().unwrap() > 0.0);
+    assert!(
+        v["constraints"]["unknown_ratio"].as_f64().unwrap() > 0.0,
+        "不明の帯が消えている: {v}"
+    );
+
+    let cut = image::open(&output).unwrap().to_rgba8();
+    assert_eq!(cut.get_pixel(100, 100)[3], 255, "確定前景が透けている");
+    assert_eq!(cut.get_pixel(5, 5)[3], 0, "確定背景が残っている");
+}
+
+/// **全画素が不透明な画像は断る。** アルファを持たない JPEG を
+/// `--alpha-trimap` へ渡すと、そのまま読めば画像全体が確定前景になる。
+/// 「指示が効かない」ではなく「何も切り抜かれない」が起きるので黙って進めない。
+#[test]
+fn an_opaque_image_is_refused_as_an_alpha_trimap() {
+    let dir = fixture_dir();
+    let input = constraint_fixture(dir.path());
+    let output = dir.path().join("cut.png");
+    let opaque = image::RgbaImage::from_pixel(200, 200, image::Rgba([10, 200, 10, 255]));
+    let path = write_png(dir.path(), "opaque.png", &opaque);
+
+    let out = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--alpha-trimap",
+        path.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success());
+    let v = json_stdout(&out);
+    assert_eq!(v["error"]["code"], "CONSTRAINT_ALL_OPAQUE");
+    assert!(
+        v["error"]["hint"].as_str().unwrap().contains("--trimap"),
+        "輝度で読む入口への案内が無い: {v}"
+    );
+    assert!(!output.exists(), "断ったのに書き出している");
+}
+
+/// **同じファイルを 2 通りに読まない。** 切り抜き済み PNG を `--trimap` へ
+/// 渡すと輝度で読まれ、黒い商品が確定背景になって指示が裏返る。入口が
+/// 分かれていること自体を、出力の違いとして固定する。
+#[test]
+fn the_two_trimap_entries_read_the_same_file_differently() {
+    let dir = fixture_dir();
+    let input = constraint_fixture(dir.path());
+
+    // 中央 60x60 だけが不透明な「暗い商品の切り抜き」。輝度で読めば全面が
+    // 確定背景（30 <= 63）、アルファで読めば中央だけが確定前景になる
+    let mut cut = image::RgbaImage::from_pixel(200, 200, image::Rgba([30, 30, 30, 0]));
+    for y in 70..=129 {
+        for x in 70..=129 {
+            cut.get_pixel_mut(x, y).0[3] = 255;
+        }
+    }
+    let path = write_png(dir.path(), "dark_cut.png", &cut);
+
+    let by_alpha = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        dir.path().join("a.png").to_str().unwrap(),
+        "--alpha-trimap",
+        path.to_str().unwrap(),
+    ]);
+    let by_luma = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        dir.path().join("b.png").to_str().unwrap(),
+        "--trimap",
+        path.to_str().unwrap(),
+    ]);
+    assert!(by_alpha.status.success() && by_luma.status.success());
+    let a = json_stdout(&by_alpha);
+    let b = json_stdout(&by_luma);
+    assert_eq!(a["constraints"]["sources"][0], "alpha_trimap");
+    assert_eq!(b["constraints"]["sources"][0], "trimap");
+    // アルファで読めば中央が確定前景、輝度で読めば確定前景は 1 画素も無い
+    assert!(a["constraints"]["fg_ratio"].as_f64().unwrap() > 0.0);
+    assert_eq!(b["constraints"]["fg_ratio"].as_f64().unwrap(), 0.0);
+    assert!(b["constraints"]["bg_ratio"].as_f64().unwrap() > 0.99);
+}
+
+/// **一度切ったものを戻しても、確定した画素は動かない。**
+///
+/// `--alpha-trimap` の用途は「別の道具（あるいは前回の kiri）が出した切り抜きを、
+/// 境界だけ解き直す」である。戻したときに不透明だった画素が透けたり、透明だった
+/// 画素が戻ったりすれば、その用途は成り立たない。
+#[test]
+fn a_cutout_fed_back_as_an_alpha_trimap_keeps_what_it_decided() {
+    let dir = fixture_dir();
+    let input = constraint_fixture(dir.path());
+    let first = dir.path().join("first.png");
+    let second = dir.path().join("second.png");
+
+    let out = run_cutout(&[input.to_str().unwrap(), "-o", first.to_str().unwrap()]);
+    assert!(out.status.success());
+
+    let out = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        second.to_str().unwrap(),
+        "--alpha-trimap",
+        first.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        json_stdout(&out)["constraints"]["sources"][0],
+        "alpha_trimap"
+    );
+
+    let a = image::open(&first).unwrap().to_rgba8();
+    let b = image::open(&second).unwrap().to_rgba8();
+    assert_eq!(a.dimensions(), b.dimensions());
+    let (mut kept_fg, mut kept_bg) = (0u32, 0u32);
+    for (p, q) in a.pixels().zip(b.pixels()) {
+        if p.0[3] >= 250 {
+            assert_eq!(q.0[3], 255, "確定前景が透けた");
+            kept_fg += 1;
+        } else if p.0[3] <= 5 {
+            assert_eq!(q.0[3], 0, "確定背景が戻った");
+            kept_bg += 1;
+        }
+    }
+    assert!(kept_fg > 0 && kept_bg > 0, "確定領域が両側とも無い");
 }
 
 /// 商品の色をした画素でも、確定背景と言われれば消えること。
@@ -8187,4 +8428,81 @@ fn the_canvas_trims_by_the_same_rule_with_and_without_a_rotation() {
         (h, w),
         "90 度回しただけで、載せた中身の縦横が入れ替わる以上の差が出ている"
     );
+}
+
+/// **主体の判定は `--border` に依らない。**
+///
+/// `--border` は背景色の推定範囲を決める値であって、主体の較正のための値では
+/// ない。しかし帯が変われば外周 ΔE の分布——`far` のしきい値そのもの——も
+/// 変わるので、放っておくと較正が `--border` にぶら下がる。実際、上限を置く
+/// 前は合成の「画面外へ抜ける大きな物体」と実写 IMG_0238 が `--border 110`
+/// で low → high（どちらも誤り）へ裏返っていた。
+///
+/// 較正の 11 点すべてで、帯を 2 から 400 まで振っても判定が動かないことを
+/// 固定する。**数値ではなく判定を見る**——`area_ratio` などは帯とともに
+/// 多少動いてよく、動いてはいけないのは「この矩形に従ってよいか」の答えである。
+#[test]
+fn the_subject_verdict_does_not_follow_the_border() {
+    for (name, image, want_high) in common::subject_scenes() {
+        let dir = fixture_dir();
+        let input = write_png(dir.path(), "s.png", &image);
+        for border in ["2", "8", "32", "110", "400"] {
+            let v = json_stdout(
+                &kiri()
+                    .args([
+                        "info",
+                        input.to_str().unwrap(),
+                        "--border",
+                        border,
+                        "--json",
+                    ])
+                    .output()
+                    .unwrap(),
+            );
+            let got = v["subject"]["confidence"].as_str().unwrap_or("null");
+            assert_eq!(
+                got,
+                if want_high { "high" } else { "low" },
+                "{name}: --border {border} で判定が裏返った（{v}）"
+            );
+        }
+    }
+}
+
+/// 上限が効いたときは、測った帯を `subject.border` が名乗ること。
+///
+/// **黙って別の帯で測らない。** `settings.border` と食い違う理由が JSON から
+/// 読めなければ、エージェントには「指定が効いていない」としか見えない。
+#[test]
+fn the_subject_reports_the_band_it_measured() {
+    let dir = fixture_dir();
+    let (_, image, _) = common::subject_scenes()
+        .into_iter()
+        .next()
+        .expect("較正シーンがある");
+    let (w, h) = (image.width(), image.height());
+    let input = write_png(dir.path(), "s.png", &image);
+    let cap = ((f64::from(w.min(h)) * 0.03).round() as u32).max(2);
+
+    for (given, want) in [(2u32, 2u32), (cap, cap), (cap * 4, cap)] {
+        let v = json_stdout(
+            &kiri()
+                .args([
+                    "info",
+                    input.to_str().unwrap(),
+                    "--border",
+                    &given.to_string(),
+                    "--json",
+                ])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(
+            v["subject"]["border"].as_u64().unwrap(),
+            u64::from(want),
+            "--border {given} で subject.border が {want} でない: {v}"
+        );
+        // `info` の JSON には `settings` が無い（切り抜きの設定を持たない）ので、
+        // 食い違いは `subject.border` と渡した値を並べて読む
+    }
 }

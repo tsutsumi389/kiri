@@ -85,7 +85,7 @@ pub fn run(args: &BatchArgs) -> Result<BatchReport> {
 ///
 /// cutout コマンドをそのまま呼ぶことで、単体実行とバッチで挙動が食い違わないようにする。
 ///
-/// `base` を受けるのは、指示として渡される画像（`trimap` / `fg_mask` /
+/// `base` を受けるのは、指示として渡される画像（`trimap` / `alpha_trimap` / `fg_mask` /
 /// `bg_mask`）のパスを `input` と同じ規則で解決するためである。**片方だけ
 /// カレントディレクトリ基準にすると、同じ spec が実行場所によって違う
 /// マスクを読む。**
@@ -135,6 +135,7 @@ fn to_cutout_args(
         normalized: settings.normalized.unwrap_or(false),
         fg_seed: settings.fg_seeds.clone().unwrap_or_default(),
         trimap: path(&settings.trimap),
+        alpha_trimap: path(&settings.alpha_trimap),
         fg_mask: path(&settings.fg_mask),
         bg_mask: path(&settings.bg_mask),
         fg_polygon: polygons(settings.fg_polygons.as_deref(), "fg_polygons")?,

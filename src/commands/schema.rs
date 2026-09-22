@@ -351,6 +351,46 @@ fn fields() -> Vec<FieldEntry> {
             notes: Some("--bbox <値> --normalized へそのまま渡せる並びになっている"),
         },
         FieldEntry {
+            path: "subject.level_rotation",
+            appears_in: both(),
+            unit: "deg",
+            nullable: true,
+            null_means: Some(
+                "どの角度でも最小外接矩形の面積が変わらない形（円など）で、傾きを測れなかった。\
+                 0（傾いていない）ではない",
+            ),
+            warns: vec![],
+            gates: None,
+            summary: "主体の最小外接矩形が軸に揃う回転角(度、時計回りが正、範囲は (-45, 45])",
+            notes: Some(
+                "cutout --rotate <値> や kiri rotate --angle <値> へそのまま渡せる。傾きそのもの\
+                 （符号を反転して渡す値）ではないので、符号を考え直さないこと。**自動では\
+                 適用しない**——傾きを直すかどうかは bbox と同じく構図の判断である。\
+                 subject.confidence が high のときだけ根拠にしてよいのも bbox と同じ。\
+                 **分解能は 0.1〜0.5 度**（主体は縮小版で測る）。小数第 4 位まで出るが、\
+                 0.5 度を下回る差を有意と読まないこと——0 になるまで回し直すループは組めない",
+            ),
+        },
+        FieldEntry {
+            path: "subject.border",
+            appears_in: both(),
+            unit: "px",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "主体の統計を測った外周の帯の幅",
+            notes: Some(
+                "既定では --border と同じ値。--border が短辺の 3% を超えたときだけ、ここが\
+                 頭打ちになって食い違う。**--border は背景色の推定範囲を決める値であって、\
+                 主体の較正のための値ではない**——帯を画像の半分まで広げると外周 ΔE の分布\
+                 （主体を拾うしきい値そのもの）が商品自身に汚染され、救えない画像が high と\
+                 名乗り始める。area_ratio / capture_ratio / leftover_ratio / delta_e と\
+                 level_rotation はこの帯で測った値で、background.rgb（--border の帯で測る）\
+                 とは別の背景色を基準にすることがある",
+            ),
+        },
+        FieldEntry {
             path: "subject.source",
             appears_in: both(),
             unit: "enum",
@@ -804,7 +844,12 @@ fn fields() -> Vec<FieldEntry> {
             }],
             gates: None,
             summary: "境界近傍で不透明なのに、元の色が局所背景と見分けがつかない画素の割合",
-            notes: Some("白い下地では見えず、黒や色付きの下地に載せて初めて輪郭の光として現れる"),
+            notes: Some(
+                "白い下地では見えず、黒や色付きの下地に載せて初めて輪郭の光として現れる。\
+                 参照にする局所背景は背景モデルと矛盾しないものだけから採る——\
+                 輪郭の色差が tolerance を下回る素材ではフィルが商品の外縁を食い、\
+                 その跡を参照にすると残った商品が「背景色のまま」と数えられる",
+            ),
         },
         FieldEntry {
             path: "mask.edge_width",
@@ -881,8 +926,8 @@ fn fields() -> Vec<FieldEntry> {
             null_means: None,
             warns: vec![],
             gates: None,
-            summary: "画素を 1 つ以上塗った入口の名前（trimap / fg_mask / bg_mask / fg_polygon / \
-                      bg_polygon / fg_seed）",
+            summary: "画素を 1 つ以上塗った入口の名前（trimap / alpha_trimap / fg_mask / bg_mask / \
+                      fg_polygon / bg_polygon / fg_seed）",
             notes: Some(
                 "渡した入口のうち 1 画素以上塗ったものだけが並ぶ。渡したのにここへ無ければ、\
                  その指示は空だった（空のマスク、画像の外だけを指す多角形）——そのときは \
@@ -925,8 +970,8 @@ fn fields() -> Vec<FieldEntry> {
             gates: None,
             summary: "確定前景として指示された画素が、画像に占める割合",
             notes: Some(
-                "空間的な指示（--trimap / --fg-mask / --bg-mask / --fg-polygon / --bg-polygon / \
-                 --fg-seed）を渡したときだけ現れる。渡していなければ constraints ごと無い。\
+                "空間的な指示（--trimap / --alpha-trimap / --fg-mask / --bg-mask / --fg-polygon / \
+                 --bg-polygon / --fg-seed）を渡したときだけ現れる。渡していなければ constraints ごと無い。\
                  --bbox はここに入らない（settings と applied_bbox が言う）",
             ),
         },

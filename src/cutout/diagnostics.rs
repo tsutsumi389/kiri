@@ -27,9 +27,33 @@
 use image::RgbaImage;
 
 use crate::color::lab::{delta_e76, srgb_to_lab};
+use crate::cutout::background::BackgroundField;
 use crate::cutout::local_colour::{self, Lean, Role};
 use crate::cutout::mask::{FOREGROUND_THRESHOLD, Mask};
 use crate::cutout::morphology::BitPlane;
+
+/// 局所背景の参照に採る色の窓を、背景の残差 p90 の何倍に取るか。
+///
+/// **下げるほど指標が欠陥を見なくなる。** 実写リモコン（24.5MP、不織布の上の
+/// 黒いリモコン）で倍率を振ると、門が狭いほど `halo_ratio` が一様に小さく出る
+/// ——参照から落ちるのが食われた商品だけでなく、繊維でざらついた**本物の
+/// 背景**にもなるためである。
+///
+/// | 倍率 | 最良設定(flat/tol 60) | tol 12（`--tolerance` の導線） | tol 46 |
+/// |---|---|---|---|
+/// | 1.0 | 0.0054 | 0.1261 | 0.0001 |
+/// | 1.5 | 0.0285 | 0.2176 | 0.0085 |
+/// | **2.0（採用）** | **0.0296** | **0.2275** | **0.0235** |
+/// | 3.0 | 0.0296 | 0.2336 | 0.0289 |
+///
+/// **2.0 は飽和の入口である。** 最良設定の 0.0296 は門を掛ける前の値と同じで、
+/// そこから広げても動かない。つまり 2.0 で「本物の背景を落とさない」に達して
+/// おり、それより狭いと指標が欠陥を過小に言い始める。
+///
+/// 上限は置かない。門が素材のばらつきより広くなるのは、商品の色差がその
+/// ばらつきに埋もれている場合だけで、そこは色では分けられない——
+/// `NOT_SEPARABLE` が名指している限界そのものである。
+const REFERENCE_GATE_GAIN: f64 = 2.0;
 
 /// 境界近傍とみなす距離(px)。
 const NEAR_BOUNDARY: i64 = 3;
@@ -181,16 +205,19 @@ pub struct Diagnostics {
 /// `bbox` を受けるのは `boundary_separability` と同じ理由である。bbox の外は
 /// 色によらず背景と確定させた領域なので、その境目は「利用者が矩形をどこに
 /// 置いたか」でしかなく、輪郭の粗さも縁の汚染も語らない。
+/// `reference_gate` は `halo_ratio` が局所背景の参照に採る色の許容 ΔE。
+/// `halo_reference_gate` が背景の残差から組む。
 pub fn diagnose(
     image: &RgbaImage,
     mask: &Mask,
-    background: [u8; 3],
+    field: &BackgroundField,
+    reference_gate: f64,
     bbox: Option<(u32, u32, u32, u32)>,
 ) -> Diagnostics {
     // 輪郭画素の抽出は全画素の走査なので、2 つの指標で使い回す
     let contour = contour_pixels(mask, bbox);
     Diagnostics {
-        halo_ratio: halo_ratio(image, mask, background),
+        halo_ratio: halo_ratio(image, mask, field, reference_gate),
         edge_width: edge_width(mask),
         contour_roughness: roughness_of(mask, &contour, bbox),
         rim_contamination: contamination_of(image, mask, &contour),
@@ -753,13 +780,29 @@ fn chamfer_distance(seeds: &[(u32, u32)], roi: (u32, u32, u32, u32)) -> Field {
     }
 }
 
+/// 背景の参照として採る色の許容 ΔE。
+///
+/// **背景の残差そのものから組む。** 「背景と言えるか」の物差しは素材ごとに
+/// 違う——単色の紙では ΔE 3 も外れだが、不織布の織り目は ΔE 15 まで振れる。
+/// 場（または 1 色）に対する外周の残差 p90 はその振れ幅そのものなので、
+/// それを 2 倍して窓にする。下限は `SAME_AS_BACKGROUND`——この指標自身が
+/// 「ΔE 3 以内なら背景色のまま」と言っている以上、それより狭い窓で参照を
+/// 捨てる理由が無い。
+pub fn halo_reference_gate(residual_p90: f64) -> f64 {
+    (REFERENCE_GATE_GAIN * residual_p90).max(SAME_AS_BACKGROUND)
+}
+
 /// 境界近傍で「背景色のままなのに不透明」な画素の割合。測る対象が無ければ None。
-pub fn halo_ratio(image: &RgbaImage, mask: &Mask, background: [u8; 3]) -> Option<f64> {
+pub fn halo_ratio(
+    image: &RgbaImage,
+    mask: &Mask,
+    field: &BackgroundField,
+    reference_gate: f64,
+) -> Option<f64> {
     let (w, h) = (mask.width(), mask.height());
     if image.width() != w || image.height() != h {
         return None;
     }
-    let fallback = srgb_to_lab(background);
     let (mut halo, mut total) = (0u64, 0u64);
     // 「境界近傍か」は 1 画素ごとに 7x7 を数えていた。前景の内側ほど全部を
     // 舐めることになり、2.5MP で 29ms、12MP で 125ms をここだけで食っていた。
@@ -767,6 +810,10 @@ pub fn halo_ratio(image: &RgbaImage, mask: &Mask, background: [u8; 3]) -> Option
     // ——**値は 1 ビットも変わらない**（`near_boundary` の窓は 3px の
     // チェビシェフ近傍そのもので、画像の外は数えない）
     let near = background_distance(mask);
+    // **参照に採れる画素は 1 度だけ決める。** 窓は重なり合うので、画素ごとに
+    // 門を掛け直すと同じ画素の色差を何十回も測ることになる（17x17 の窓で
+    // 24.5MP の実写では `--optimize` が 12.9 → 16.0 秒へ伸びた）
+    let usable = usable_references(image, mask, field, reference_gate);
 
     for y in 0..h {
         for x in 0..w {
@@ -775,8 +822,11 @@ pub fn halo_ratio(image: &RgbaImage, mask: &Mask, background: [u8; 3]) -> Option
                 continue;
             }
             total += 1;
-            let local = local_background(image, mask, x, y);
-            let reference = local.map_or(fallback, srgb_to_lab);
+            // 参照が 1 つも採れなければ、その場所の背景モデルそのものを使う。
+            // 大域の 1 色へ落とすと、照明場を持っている素材で「その場所の
+            // 背景」ではない色と比べることになる
+            let local = local_background(image, mask, x, y, &usable);
+            let reference = srgb_to_lab(local.unwrap_or_else(|| field.rgb_at(x, y)));
             let p = image.get_pixel(x, y).0;
             if delta_e76(srgb_to_lab([p[0], p[1], p[2]]), reference) <= SAME_AS_BACKGROUND {
                 halo += 1;
@@ -792,12 +842,25 @@ pub fn halo_ratio(image: &RgbaImage, mask: &Mask, background: [u8; 3]) -> Option
 /// 画像の外は種にしない——`near_boundary` が窓を画像の中へ切り詰めていたのと
 /// 同じで、見切れた商品の縁を境界と見なさないためである。
 fn background_distance(mask: &Mask) -> Vec<u8> {
+    chebyshev_distance(mask, false)
+}
+
+/// 前景画素からのチェビシェフ距離(px)。255 で飽和する。
+///
+/// `background_distance` の裏返しで、種が前景の側にある。`usable_references`
+/// が「参照として見られうる背景画素」を帯へ絞るのに使う。
+fn foreground_distance(mask: &Mask) -> Vec<u8> {
+    chebyshev_distance(mask, true)
+}
+
+/// 種からのチェビシェフ距離(px)。`seed_foreground` が種の側を選ぶ。
+fn chebyshev_distance(mask: &Mask, seed_foreground: bool) -> Vec<u8> {
     let (w, h) = (mask.width() as usize, mask.height() as usize);
     let alpha = mask.as_slice();
     let mut d: Vec<u8> = alpha
         .iter()
         .map(|&v| {
-            if v >= FOREGROUND_THRESHOLD {
+            if (v >= FOREGROUND_THRESHOLD) != seed_foreground {
                 u8::MAX
             } else {
                 0
@@ -852,12 +915,31 @@ fn background_distance(mask: &Mask) -> Vec<u8> {
     d
 }
 
-/// 窓内の完全に透明な画素の平均色。1つも無ければ None。
+/// 窓内の完全に透明な画素のうち、**背景モデルと矛盾しないもの**の平均色。
+/// 1 つも無ければ None。
 ///
 /// 大域の背景色ではなく局所の色を使うのは、照明ムラや落ち影のある場所で
 /// 「大域の背景色とは違うが、その場所の背景ではある」画素を見逃さないため。
-fn local_background(image: &RgbaImage, mask: &Mask, x: u32, y: u32) -> Option<[u8; 3]> {
+///
+/// **門を掛けるのは、この参照が循環していたからである。** 輪郭の色差が
+/// 許容量を下回る素材（合成 S3、輪郭 ΔE 9.5 対 tolerance 12）ではフィルが
+/// 商品の外縁を食う。食われた画素は透明なので参照の材料になり、参照色が
+/// 商品色そのもの（sRGB 218.5、大域の背景は 248）へ寄る。すると**残った
+/// 純粋な商品**が「局所背景と ΔE 3 以内」に収まって `HALO_REMAINS` が出て、
+/// その hint は「`--tolerance` を上げろ」と言う——商品をもっと食えという
+/// 意味になる。詳細は design.md 4.10。
+///
+/// 門は「その場所の背景モデルからの ΔE が `gate` 以内」。背景が本当に背景で
+/// あるかぎり素通りし、食われた商品だけが落ちる。
+fn local_background(
+    image: &RgbaImage,
+    mask: &Mask,
+    x: u32,
+    y: u32,
+    usable: &[bool],
+) -> Option<[u8; 3]> {
     let (w, h) = (mask.width(), mask.height());
+    let stride = w as usize;
     let x0 = (x as i64 - LOCAL_BG_WINDOW).max(0) as u32;
     let x1 = ((x as i64 + LOCAL_BG_WINDOW) as u32).min(w - 1);
     let y0 = (y as i64 - LOCAL_BG_WINDOW).max(0) as u32;
@@ -865,8 +947,9 @@ fn local_background(image: &RgbaImage, mask: &Mask, x: u32, y: u32) -> Option<[u
     let mut sum = [0u64; 3];
     let mut n = 0u64;
     for ny in y0..=y1 {
+        let row = (ny as usize) * stride;
         for nx in x0..=x1 {
-            if mask.get(nx, ny) != 0 {
+            if !usable[row + (nx as usize)] {
                 continue;
             }
             let p = image.get_pixel(nx, ny).0;
@@ -877,6 +960,35 @@ fn local_background(image: &RgbaImage, mask: &Mask, x: u32, y: u32) -> Option<[u
         }
     }
     (n > 0).then(|| [(sum[0] / n) as u8, (sum[1] / n) as u8, (sum[2] / n) as u8])
+}
+
+/// 局所背景の参照に採ってよい画素（`local_background` の門を 1 度だけ掛けた面）。
+///
+/// **測る範囲を帯に絞る。** 参照が要るのは「境界近傍の前景画素の窓の中」だけ
+/// なので、前景から `NEAR_BOUNDARY + LOCAL_BG_WINDOW` より遠い背景画素の色差は
+/// 誰も見ない。24.5MP の画像で全画素の ΔE を測ると、それだけで 1 秒級になる。
+fn usable_references(
+    image: &RgbaImage,
+    mask: &Mask,
+    field: &BackgroundField,
+    gate: f64,
+) -> Vec<bool> {
+    let (w, h) = (mask.width(), mask.height());
+    let reach = (NEAR_BOUNDARY + LOCAL_BG_WINDOW) as u8;
+    let far = foreground_distance(mask);
+    let mut usable = vec![false; (w as usize) * (h as usize)];
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y as usize) * (w as usize) + (x as usize);
+            if mask.get(x, y) != 0 || far[i] > reach {
+                continue;
+            }
+            let p = image.get_pixel(x, y).0;
+            let rgb = [p[0], p[1], p[2]];
+            usable[i] = delta_e76(srgb_to_lab(rgb), srgb_to_lab(field.rgb_at(x, y))) <= gate;
+        }
+    }
+    usable
 }
 
 /// 境界法線方向にアルファが 0.9 から 0.1 へ落ちるまでの幅(px)の中央値。
@@ -964,14 +1076,16 @@ mod tests {
     #[test]
     fn a_clean_edge_has_no_halo() {
         let (image, mask) = scene(0, 2);
-        let r = halo_ratio(&image, &mask, [250, 250, 249]).expect("境界があるので測れる");
+        let r = halo_ratio(&image, &mask, &BackgroundField::flat([250, 250, 249]), 3.0)
+            .expect("境界があるので測れる");
         assert!(r < 0.05, "縁が無いのに halo_ratio が高い: {r:.3}");
     }
 
     #[test]
     fn a_background_coloured_rim_is_detected() {
         let (image, mask) = scene(3, 2);
-        let r = halo_ratio(&image, &mask, [250, 250, 249]).expect("境界があるので測れる");
+        let r = halo_ratio(&image, &mask, &BackgroundField::flat([250, 250, 249]), 3.0)
+            .expect("境界があるので測れる");
         assert!(r > 0.5, "背景色の縁を検出できていない: {r:.3}");
     }
 
@@ -979,16 +1093,58 @@ mod tests {
     fn a_wider_rim_scores_higher() {
         let narrow = {
             let (i, m) = scene(1, 2);
-            halo_ratio(&i, &m, [250, 250, 249]).unwrap()
+            halo_ratio(&i, &m, &BackgroundField::flat([250, 250, 249]), 3.0).unwrap()
         };
         let wide = {
             let (i, m) = scene(3, 2);
-            halo_ratio(&i, &m, [250, 250, 249]).unwrap()
+            halo_ratio(&i, &m, &BackgroundField::flat([250, 250, 249]), 3.0).unwrap()
         };
         assert!(
             wide > narrow,
             "縁の厚みに反応していない: {wide} <= {narrow}"
         );
+    }
+
+    /// **食われた商品は参照の材料にならない。**
+    ///
+    /// 輪郭の色差が許容量を下回る素材では、フィルが商品の外縁を食う。食われた
+    /// 画素は透明なので、門が無ければ局所背景の参照が商品色そのものへ寄り、
+    /// 残った純粋な商品が「背景色のまま」と数えられる（合成 S3、design.md 4.10）。
+    #[test]
+    fn an_eaten_product_rim_does_not_become_the_background_reference() {
+        // 背景 248、商品 219。左半分（x < 30）が商品で、そのうち外縁の 14px
+        // （16 ≤ x < 30）が「食われた」——マスクは透明だが画素は商品色である。
+        // 幅は参照の窓（`LOCAL_BG_WINDOW` = 8px）より広く取る。狭いと窓に
+        // 本物の背景が混ざり、循環そのものが起きない
+        let (w, h) = (60u32, 20u32);
+        let mut image = RgbaImage::from_pixel(w, h, Rgba([248, 248, 248, 255]));
+        let mut mask = Mask::new(w, h, 0);
+        for y in 0..h {
+            for x in 0..w {
+                if x < 30 {
+                    image.put_pixel(x, y, Rgba([219, 219, 219, 255]));
+                }
+                if x < 16 {
+                    mask.set(x, y, 255);
+                }
+            }
+        }
+        let field = BackgroundField::flat([248, 248, 248]);
+        // 門を開け放つと、参照が商品色へ寄って前景が丸ごと「背景色のまま」になる
+        let open = halo_ratio(&image, &mask, &field, 1e9).unwrap();
+        assert!(open > 0.9, "循環が再現していない: {open:.3}");
+        // 背景の残差から組んだ門（単色の合成なので下限の ΔE 3）なら 0
+        let gated = halo_ratio(&image, &mask, &field, halo_reference_gate(0.0)).unwrap();
+        assert_eq!(gated, 0.0, "食われた縁がまだ参照になっている: {gated:.3}");
+    }
+
+    /// 門は素材の振れ幅から広がる。織り目の ΔE 15 を「背景ではない」と
+    /// 言わせないための下側の保証。
+    #[test]
+    fn the_reference_gate_follows_the_material() {
+        assert_eq!(halo_reference_gate(0.0), SAME_AS_BACKGROUND);
+        assert_eq!(halo_reference_gate(1.0), SAME_AS_BACKGROUND);
+        assert_eq!(halo_reference_gate(15.6), 31.2);
     }
 
     #[test]
@@ -1012,7 +1168,13 @@ mod tests {
     fn an_empty_mask_is_not_a_panic() {
         let image = RgbaImage::from_pixel(8, 8, Rgba([250, 250, 249, 255]));
         let mask = Mask::new(8, 8, 0);
-        let d = diagnose(&image, &mask, [250, 250, 249], None);
+        let d = diagnose(
+            &image,
+            &mask,
+            &BackgroundField::flat([250, 250, 249]),
+            3.0,
+            None,
+        );
         // 「縁が無い」ではなく「測れなかった」。0 と報告すると良い結果に見える
         assert_eq!(d.halo_ratio, None);
         assert_eq!(d.edge_width, None);
@@ -1025,7 +1187,10 @@ mod tests {
         let image = RgbaImage::from_pixel(8, 8, Rgba([0, 0, 0, 255]));
         let mut mask = Mask::new(10, 10, 0);
         mask.set(5, 5, 255);
-        assert_eq!(halo_ratio(&image, &mask, [0; 3]), None);
+        assert_eq!(
+            halo_ratio(&image, &mask, &BackgroundField::flat([0; 3]), 3.0),
+            None
+        );
         assert_eq!(rim_contamination(&image, &mask, None), None);
     }
 

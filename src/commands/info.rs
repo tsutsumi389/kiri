@@ -46,7 +46,12 @@ pub fn run(args: &InfoArgs) -> Result<InfoReport> {
     let decision = segment::decide(&loaded.image, &args.segment, args.border, Some(&seen))?;
     let (subject, subject_source) = match decision.run.as_ref() {
         Some(run) => (
-            detect_subject_from_probability(&loaded.image, background, &run.probability),
+            detect_subject_from_probability(
+                &loaded.image,
+                background,
+                args.border,
+                &run.probability,
+            ),
             SUBJECT_FROM_SEGMENT,
         ),
         None => (analysis.subject.clone(), SUBJECT_FROM_COLOUR),
@@ -294,6 +299,8 @@ mod tests {
             capture_ratio: 0.9793,
             delta_e,
             leftover_ratio: 0.0531,
+            level_rotation: None,
+            border: crate::cutout::DEFAULT_BORDER,
             touches_edge: true,
             confidence,
         }

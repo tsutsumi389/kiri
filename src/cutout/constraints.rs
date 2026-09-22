@@ -35,6 +35,20 @@ pub const TRIMAP_FOREGROUND: u8 = 192;
 /// この帯を作業領域にする。
 pub const TRIMAP_BACKGROUND: u8 = 63;
 
+/// 切り抜き済みのアルファ（`--alpha-trimap`）で確定前景とみなす下限。
+///
+/// **アルファは輝度と違って「どれだけ商品に覆われているか」を直接言っている。**
+/// だから帯を広く取る理由が無い——不透明なら商品、透明なら背景、そのあいだは
+/// 遷移そのものであり、matting に解き直させたい帯とちょうど一致する。
+///
+/// それでも 255 / 0 ちょうどにしないのは、アルファが非可逆の容器を一度でも
+/// 通っていると平坦な面が 253 や 2 に振れるためである。kiri が読めるのは
+/// JPEG と PNG だけで PNG のアルファは可逆だが、**渡されるのは他の道具が
+/// 作ったファイルである**。±5 なら遷移の帯を 1px も広げずにその揺れを吸う。
+pub const ALPHA_FOREGROUND: u8 = 250;
+/// 同じく確定背景とみなすアルファの上限。
+pub const ALPHA_BACKGROUND: u8 = 5;
+
 /// `--fg-mask` / `--bg-mask` で指示とみなす輝度の下限。
 ///
 /// **「0 でない」では JPEG のリンギングを拾う。** 白く塗った矩形を q85 で
@@ -61,6 +75,11 @@ pub enum ConstraintSource {
     /// にはならない
     Segment,
     Trimap,
+    /// 切り抜き済み画像のアルファ（`--alpha-trimap`）。
+    ///
+    /// `Trimap` と別に持つのは、**同じファイルが 2 通りに読まれる**のを
+    /// 避けるためである。輝度で読むのか、アルファで読むのかは利用者が選ぶ
+    AlphaTrimap,
     FgMask,
     BgMask,
     FgPolygon,
@@ -73,6 +92,7 @@ impl ConstraintSource {
         match self {
             ConstraintSource::Segment => "segment",
             ConstraintSource::Trimap => "trimap",
+            ConstraintSource::AlphaTrimap => "alpha_trimap",
             ConstraintSource::FgMask => "fg_mask",
             ConstraintSource::BgMask => "bg_mask",
             ConstraintSource::FgPolygon => "fg_polygon",
@@ -347,6 +367,33 @@ impl Constraints {
         let mut marked = 0u64;
         for (i, p) in image.pixels().enumerate() {
             if let Some(kind) = decide(luma(p.0)) {
+                self.mark_index(i, kind);
+                marked += 1;
+            }
+        }
+        marked
+    }
+
+    /// 画素ごとの**アルファ**から印を付ける。`decide` が `None` を返した画素は
+    /// 触らない。
+    ///
+    /// `mark_by_luma` と対になる。輝度で読む入口（トライマップ・マスク）と
+    /// 分けてあるのは、**同じファイルが 2 通りに読まれる**のを避けるためである
+    /// （`ConstraintSource::AlphaTrimap`）。切り抜き済みの PNG は輝度で読むと
+    /// 「黒い商品」が確定背景になり、指示が裏返る。
+    ///
+    /// 寸法が違えば何もしない。印を付けた画素数を返す（`mark_by_luma` と同じ）。
+    pub fn mark_by_alpha(
+        &mut self,
+        image: &RgbaImage,
+        decide: impl Fn(u8) -> Option<Constraint>,
+    ) -> u64 {
+        if image.width() != self.width || image.height() != self.height {
+            return 0;
+        }
+        let mut marked = 0u64;
+        for (i, p) in image.pixels().enumerate() {
+            if let Some(kind) = decide(p.0[3]) {
                 self.mark_index(i, kind);
                 marked += 1;
             }

@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 
 use crate::cutout::background::DEFAULT_BORDER;
-use crate::cutout::constraints::{MASK_THRESHOLD, TRIMAP_BACKGROUND, TRIMAP_FOREGROUND};
+use crate::cutout::constraints::{
+    ALPHA_BACKGROUND, ALPHA_FOREGROUND, MASK_THRESHOLD, TRIMAP_BACKGROUND, TRIMAP_FOREGROUND,
+};
 use crate::cutout::{BackgroundModel, DEFAULT_EDGE_THRESHOLD, Matting, OptimizeFixed};
 use crate::image_io::OutputFormat;
 use crate::preview::DEFAULT_PANEL;
@@ -477,6 +479,27 @@ fn trimap_long_help() -> String {
     ) + &image_constraint_notes()
 }
 
+/// `--alpha-trimap` のヘルプ。しきい値は `constraints.rs` の定数から組む。
+fn alpha_trimap_help() -> String {
+    format!(
+        "切り抜き済み画像のアルファを指示として読む。{ALPHA_FOREGROUND} 以上を確定前景、\
+         {ALPHA_BACKGROUND} 以下を確定背景、その間（半透明＝境界）は不明"
+    )
+}
+
+fn alpha_trimap_long_help() -> String {
+    format!(
+        "{}\n{}",
+        alpha_trimap_help(),
+        "--trimap が輝度で読むのに対し、こちらはアルファだけを読む。切り抜き済みの PNG を\
+         そのまま渡せる入口で、半透明の境界がそのまま matting の作業領域になる。\
+         同じファイルを --trimap に渡すと輝度で読まれ、黒い商品が確定背景になって指示が\
+         裏返るので、入口を取り違えないこと。\n\
+         アルファを持たない画像（JPEG など）を渡すと全画素が確定前景になる。\
+         それを防ぐため、半透明も透明も 1 画素も無いファイルは CONSTRAINT_ALL_OPAQUE で断る。",
+    ) + &image_constraint_notes()
+}
+
 /// `--fg-mask` / `--bg-mask` の短いヘルプ。しきい値は定数から組む。
 fn mask_help(role: &str) -> String {
     format!("輝度 {MASK_THRESHOLD} 以上の画素を{role}にするマスク画像")
@@ -712,6 +735,17 @@ pub struct CutoutArgs {
         long_help = trimap_long_help()
     )]
     pub trimap: Option<PathBuf>,
+
+    /// 切り抜き済み画像のアルファを指示として読む
+    ///
+    /// ヘルプの文言は `alpha_trimap_help` がしきい値の定数から組む
+    #[arg(
+        long = "alpha-trimap",
+        value_name = "PATH",
+        help = alpha_trimap_help(),
+        long_help = alpha_trimap_long_help()
+    )]
+    pub alpha_trimap: Option<PathBuf>,
 
     /// 明るい画素を確定前景にするマスク画像
     ///

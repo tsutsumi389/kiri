@@ -886,8 +886,8 @@ fn fields() -> Vec<FieldEntry> {
             null_means: None,
             warns: vec![],
             gates: None,
-            summary: "画素を 1 つ以上塗った入口の名前（trimap / fg_mask / bg_mask / fg_polygon / \
-                      bg_polygon / fg_seed）",
+            summary: "画素を 1 つ以上塗った入口の名前（trimap / alpha_trimap / fg_mask / bg_mask / \
+                      fg_polygon / bg_polygon / fg_seed）",
             notes: Some(
                 "渡した入口のうち 1 画素以上塗ったものだけが並ぶ。渡したのにここへ無ければ、\
                  その指示は空だった（空のマスク、画像の外だけを指す多角形）——そのときは \
@@ -930,8 +930,8 @@ fn fields() -> Vec<FieldEntry> {
             gates: None,
             summary: "確定前景として指示された画素が、画像に占める割合",
             notes: Some(
-                "空間的な指示（--trimap / --fg-mask / --bg-mask / --fg-polygon / --bg-polygon / \
-                 --fg-seed）を渡したときだけ現れる。渡していなければ constraints ごと無い。\
+                "空間的な指示（--trimap / --alpha-trimap / --fg-mask / --bg-mask / --fg-polygon / \
+                 --bg-polygon / --fg-seed）を渡したときだけ現れる。渡していなければ constraints ごと無い。\
                  --bbox はここに入らない（settings と applied_bbox が言う）",
             ),
         },

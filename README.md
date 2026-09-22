@@ -13,7 +13,7 @@ AIエージェントから使われることを前提とした、EC商品画像�
 
 - **依存ゼロの単一バイナリ** — Python環境も外部ツールも不要。pure Rust で完結する（C のライブラリを 1 つも引かない）
 - **背景は 1 色でなくてよい** — 照明ムラは[照明場](#背景は-1-色ではなく場で持つ)として推定し、不織布や段ボールの織り目には堤防を自動で合わせる。境界は形ではなく**色から matting として**解く
-- **どこが商品かを面で教えられる** — `--trimap` / `--fg-mask` / `--bg-mask` / `--fg-polygon` / `--bg-polygon`。**数値ノブにはもう余地が無い**——粗いトライマップを 1 枚渡すだけで輪郭の誤差が 5 分の 1 になる
+- **どこが商品かを面で教えられる** — `--trimap` / `--alpha-trimap` / `--fg-mask` / `--bg-mask` / `--fg-polygon` / `--bg-polygon`。**数値ノブにはもう余地が無い**——粗いトライマップを 1 枚渡すだけで輪郭の誤差が 5 分の 1 になる
 - **色で解けないものはモデルに聞ける** — 任意の `--segment` でセグメンテーションモデルを**粗マスクの供給源**として使う。既定では走らず、モデルは別ファイル。[意味の事前知識](#意味の事前知識モデルに何を聞くか)を参照
 - **設定の探索を kiri に任せられる** — `--optimize` は `info` → `cutout` → 調整という 3 手のループを 1 コマンドへ畳む。[探索を kiri に任せる](#探索を-kiri-に任せるoptimize)を参照
 - **仕上げまで 1 本で** — キャンバス配置、[落ち影の合成](#落ち影を合成する)（`--shadow synth`）、回転、Web配信形式への変換
@@ -633,6 +633,7 @@ product.png  1600x2000  png  841.4 KB  (338 ms)
 | `--normalized` | | `--bbox` / `--fg-seed` / `--fg-polygon` / `--bg-polygon` の座標を 0.0-1.0 として解釈する |
 | `--fg-seed x,y` | — | 「ここは必ず前景」を指定する。複数回指定可 |
 | `--trimap PATH` | — | 輝度 192 以上を確定前景、63 以下を確定背景、その間を不明とするグレー画像 |
+| `--alpha-trimap PATH` | — | **切り抜き済み画像のアルファ**を指示として読む。250 以上を確定前景、5 以下を確定背景、その間（半透明＝境界）を不明とする |
 | `--fg-mask PATH` | — | 輝度 128 以上の画素を確定前景にするマスク画像 |
 | `--bg-mask PATH` | — | 輝度 128 以上の画素を確定背景にするマスク画像 |
 | `--fg-polygon x1,y1,x2,y2,...` | — | 内部を確定前景にする多角形（3 点以上）。複数回指定可 |
@@ -1083,13 +1084,26 @@ Apple M4 Pro、release、`/usr/bin/time -l` の maximum resident set size。実�
 | 入口 | 確定前景 | 確定背景 |
 |---|---|---|
 | `--trimap` | 輝度 192 以上 | 輝度 63 以下 |
+| `--alpha-trimap` | アルファ 250 以上 | アルファ 5 以下 |
 | `--fg-mask` / `--bg-mask` | 輝度 128 以上 | 同左 |
 | `--fg-polygon` / `--bg-polygon` | 内部（偶奇規則） | 内部 |
 | `--fg-seed`（既存） | 半径 5px の円 | — |
 | `--bbox`（既存） | — | 矩形の外 |
 
 トライマップの 64〜191 は**不明**で、何も強制しない。そこは今までどおり色と
-連結性が決める。
+連結性が決める。`--alpha-trimap` では半透明（アルファ 6〜249）がその帯にあたる。
+
+**`--trimap` と `--alpha-trimap` は同じファイルの 2 通りの読み方ではなく、別の
+入口である。** 前者は輝度だけを、後者はアルファだけを読む。切り抜き済みの PNG を
+`--trimap` へ渡すと、黒い商品が「輝度 63 以下＝確定背景」と読まれて指示が裏返る
+ので、入口を取り違えないこと。アルファを持たない画像（JPEG など）を
+`--alpha-trimap` へ渡すと全画素が確定前景になるので、半透明も透明も 1 画素も
+無いファイルは `CONSTRAINT_ALL_OPAQUE` で断る。
+
+`--alpha-trimap` の用途は「一度切ったものを、別の設定でもう一度解き直す」である。
+他の道具が出した切り抜きでも、kiri が前に出した切り抜きでもよい。**半透明の境界が
+そのまま matting の作業領域になる**ので、確定領域はそのまま残したまま境界だけを
+引き直せる。
 
 - **確定背景はフィルの種になる。** 外周・bbox の縁に加えて、指した画素そのものが
   起点になる。**商品に囲まれて外周から届かない背景も、これで消せる。** 種は色に
@@ -2202,7 +2216,7 @@ x broken.jpg  失敗
 ```
 
 `defaults` は全項目に適用され、項目側の指定が優先される。指定できるキーは `cutout` の
-オプションと対応する（`bbox` / `normalized` / `fg_seeds` / `trimap` / `fg_mask` /
+オプションと対応する（`bbox` / `normalized` / `fg_seeds` / `trimap` / `alpha_trimap` / `fg_mask` /
 `bg_mask` / `fg_polygons` / `bg_polygons` / `tolerance` / `border` /
 `cleanup` / `feather` / `despill` / `refine` / `matting` / `smooth_contour` /
 `reclassify` / `background_model` / `segment` / `model_path` / `optimize` /
@@ -2211,8 +2225,8 @@ x broken.jpg  失敗
 `shadow_color` / `shadow_opacity` / `seal` / `rotate` / `canvas` / `fill_ratio` /
 `format` / `quality` / `effort` / `background` / `flatten`）。
 
-`trimap` / `fg_mask` / `bg_mask` は画像のパスで、`input` と同じく**仕様ファイルの
-場所**を基準に解決する。`fg_polygons` / `bg_polygons` は `[[x1,y1,x2,y2,...], ...]` で、
+`trimap` / `alpha_trimap` / `fg_mask` / `bg_mask` は画像のパスで、`input` と同じく
+**仕様ファイルの場所**を基準に解決する。`fg_polygons` / `bg_polygons` は `[[x1,y1,x2,y2,...], ...]` で、
 1 つの配列が 1 つの多角形になる。
 
 `edge_threshold` は CLI と同じく「書かない」と「`8` と書く」を区別する。書かなければ
@@ -2374,7 +2388,7 @@ sRGB へ変換するので、そこで色が転ぶことはない。
 | 4 | 処理失敗 |
 
 `--json` 指定時はエラーも JSON で stdout に返る。**code と exit code の対応は
-`kiri schema --json` の `errors[]` が返す**（43 種ある）。
+`kiri schema --json` の `errors[]` が返す**（44 種ある）。
 
 **ただし引数の書式や値域で落ちた場合は JSON が返らない。** 検証は clap が行い、
 kiri のエラー型を通らないため、`--json` を付けても **stdout は空のまま exit 2 で

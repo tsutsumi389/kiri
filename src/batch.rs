@@ -40,6 +40,9 @@ pub struct ItemSettings {
     /// 確定前景・確定背景・不明を表すグレー画像。`input` と同じ規則で
     /// 仕様ファイルの場所を基準に解決する
     pub trimap: Option<PathBuf>,
+    /// 切り抜き済み画像のアルファを指示として読む。`trimap` と同じ規則で
+    /// 仕様ファイルの場所を基準に解決する
+    pub alpha_trimap: Option<PathBuf>,
     pub fg_mask: Option<PathBuf>,
     pub bg_mask: Option<PathBuf>,
     /// 内部を確定前景にする多角形。`[[x,y,x,y,...], ...]` の形で複数書ける
@@ -113,6 +116,7 @@ impl ItemSettings {
             normalized,
             fg_seeds,
             trimap,
+            alpha_trimap,
             fg_mask,
             bg_mask,
             fg_polygons,
@@ -158,6 +162,7 @@ const SETTING_KEYS: &[&str] = &[
     "normalized",
     "fg_seeds",
     "trimap",
+    "alpha_trimap",
     "fg_mask",
     "bg_mask",
     "fg_polygons",
@@ -389,6 +394,23 @@ mod tests {
             s.items[0].settings.merged_over(&s.defaults).tolerance,
             Some(9.0)
         );
+    }
+
+    /// 画像で渡す指示は 2 つの入口を別のキーで受ける。
+    ///
+    /// **`trimap` と `alpha_trimap` は同じファイルの 2 通りの読み方**なので、
+    /// 片方だけが spec から渡せると「CLI では選べるのに batch では選べない」
+    /// 差が生まれる。
+    #[test]
+    fn both_trimap_entries_come_through_the_spec() {
+        let s = spec_from(
+            r#"{"defaults":{"alpha_trimap":"cut.png"},
+                 "items":[{"input":"a.jpg","output":"a.avif","trimap":"t.png"}]}"#,
+        )
+        .unwrap();
+        let merged = s.items[0].settings.merged_over(&s.defaults);
+        assert_eq!(merged.trimap, Some(PathBuf::from("t.png")));
+        assert_eq!(merged.alpha_trimap, Some(PathBuf::from("cut.png")));
     }
 
     /// AI が生成した JSON の綴り違いを黙って無視しないこと。

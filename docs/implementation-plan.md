@@ -955,9 +955,65 @@ public リポジトリなので GitHub 製の標準ランナーは分数無制�
         許した。** 着手時点で `every_code_named_in_the_docs_exists` が落ちていた。
         許すのは計画書の中だけで、表に載ったまま実装された code は別の表明で落とす
 
+- [x] Phase 19: `--max-bytes`（品質を梯子状に落として出力を上限へ収める）
+  - [x] 探索は `image_io/derive.rs` の `encode_within_budget()` に閉じた。**固定の梯子**
+        `85 / 75 / 65 / 55 / 45 / 35 / 25` のうち `--quality` より小さい段だけを上から試し、
+        最初に収まった段で止める（既定の 75 なら 5 段、要求品質を入れて 6 回）
+  - [x] `QUALITY_REDUCED` と `MAX_BYTES_UNREACHABLE`。`data` には「いくつからいくつへ」
+        「何バイトになったか」「何回エンコードしたか」を入れ、未達のときは
+        `smallest_bytes` / `smallest_quality` で**あとどれだけ足りないか**を言う
+  - [x] `outputs[].quality_used`（PNG は null）と `outputs[].attempts`。**`SCHEMA_VERSION`
+        は据え置き**——キーの追加は後方互換で、2 へ上げる根拠は Phase 20 の
+        「`outputs[]` が複数になる」だけである（§7.4 の 1 番）
+  - [x] spec の `max_bytes` は**数値でも文字列でも書ける**（`512000` と `"500k"`）。
+        読めない値は `INVALID_MAX_BYTES` でその項目を落とす。`batch.rs` の 3 箇所
+        （`ItemSettings` / `pick!` / `SETTING_KEYS`）は Phase 18 のテストが揃いを守った
+  - [x] **`--max-bytes` を渡さない実行は 1 バイトも変わらない。** `attempts` は必ず 1 で、
+        `quality_used` は `--quality` の指定値になる
+  - ※ **未達でも要求品質のものを書く。** 下限まで降りて届かなければ、最初に取った
+        バッファをそのまま書き出す（再エンコードもしない）。どうせ上限は破れている
+        ので、画質まで捨てる理由が無い。成果物は残り、終了コードも変わらない
+        ——合否で落とすのは Phase 21 の `--fail-on` の仕事である
+  - ※ **PNG は段を降りない。** 無損失で `quality` を持たず、段を変えてもバイト列が
+        1 バイトも動かない。段の数だけ同じエンコードに時間を払う代わりに、1 回で
+        `MAX_BYTES_UNREACHABLE` を出す（`attempts` は 1、`quality_used` は null）
+  - ※ **AVIF の `effort` は動かさない。** 時間が桁で変わるつまみを探索の軸にすると、
+        梯子が数分になる。動かすのは `quality` だけにした
+  - ※ **梯子は絶対値で、時刻にもタイムアウトにも依存させない。** 「制限時間まで
+        二分探索する」形は機械ごとに違う答えを出す。要求品質からの相対（-10 ずつ）も
+        採らなかった——`--quality 80` と `--quality 78` が別の着地点へ落ちる
+  - ※ **`--optimize` と併せても時間は積にならない。** 計画時（§7.2）の見積もりは
+        「総当たり × 梯子」だったが、探索はマスクの指標で候補を選んでおり、候補ごとに
+        エンコードはしない。`write_image` は探索が終わって最終画像が決まった後に
+        1 度だけ呼ばれるので、実際は**探索 + 最大 6 回のエンコードの和**である。
+        エンコードが積になるのは、1 実行で複数の派生を書く Phase 20 からになる。
+        ヘルプと README の「積になる」は誤った見積もりだったので書き直した
+  - ※ **梯子の段ごとに画素の下ごしらえをやり直さない。** `encode` を `prepare`
+        （値域の検査・アルファの走査・合成・警告）と `encode_prepared` に割り、探索は
+        前者を 1 回だけ呼ぶ。割る前は cutout → JPEG の 24.5MP で 1 段ごとに 98MB の
+        複製と全画素走査が積んでいた。「2 回目以降の警告を捨てる」後始末も、警告が
+        `Prepared` に 1 組しか無くなった時点で構造的に消えた
+  - ※ **`k` / `kb` は 1000 進にした。** 収めにいく先（ストアの出品規定、CDN の制限、
+        メールの添付上限）は十進で書かれていることが多く、「500KB まで」に対して
+        `500kb` が 512,000 バイトを許すと**解釈の誤りが上限を破る向きへずれる**。
+        1024 系は `kib` / `mib` で明示的に言える
+  - ※ **`quality_used` はエンコーダが受け取った値である。** `image` の JPEG
+        エンコーダは `u8` しか受けないので、`--quality 33.3` は 33 として効く。
+        丸めを `encode_jpeg` の中に閉じていたときは、報告だけが 33.3 を名乗って
+        「実際に使った品質」が嘘になっていた。丸める場所は
+        `OutputFormat::effective_quality` の 1 つだけにした
+  - ※ **同じ数を 2 通りに綴らない。** `f32` は serde が `33.3` と書くのに、
+        `serde_json::Value` へ入れると `f64` へ広がって `33.29999923706055` になる。
+        結果の `quality_used` と警告の `data.quality_used` は突き合わせられる値なので、
+        `report::quality_number` を両方が通る 1 つの関門にした
+  - ※ **テストの上限を「基準の半分」で決め打ちにしたら、達成の検査が未達の道を
+        通ったまま緑になった。** 200x200 の JPEG には ICC の APP2 が 534 バイト固定で
+        乗るので、品質 25 まで落としても半分には届かない。**梯子の下限で実際に
+        何バイトになるかを測ってから上限を決める**形に直した（`reachable_budget`）
+
 ## 6. 残件の優先順位
 
-§5 の `[ ]` は 1 件だけになった（`※` の 31 件は作業ではないので数えない）。
+§5 の `[ ]` は 1 件だけになった（`※` の 42 件は作業ではないので数えない）。
 
 ここに並ぶのは**いまの kiri を完成させるための残件**である。EC 特化のために
 **足す**ものは [7. EC 特化のロードマップ](#7-ec-特化のロードマップphase-1725)
@@ -1086,6 +1142,8 @@ N 個の派生」という内部型を通し、**N = 1 のときに 1 バイト�
 
 #### Phase 19: `--max-bytes`
 
+**済（§5 の Phase 19）。**
+
 **なぜここか。** `render()` の中で「エンコード → 大きすぎたら品質を落として再試行」を
 閉じる。Phase 20 の前に置くのは、**多派生になってから実装すると、派生ごとの探索
 コストと報告形式を後付けすることになる**ため。1 派生で規約を確定させてから増やす。
@@ -1099,8 +1157,9 @@ N 個の派生」という内部型を通し、**N = 1 のときに 1 バイト�
   固定する
 
 規模 M。衝突リスク **中** — 24.5MP の AVIF は 1 回のエンコードが数秒かかる。探索
-回数の上限と、超えたら警告で降参する規約が要る。`--optimize` と併用すると総当たり
-× 探索で時間が積になるので、見積もりをヘルプで言う。
+回数の上限と、超えたら警告で降参する規約が要る。~~`--optimize` と併用すると総当たり
+× 探索で時間が積になるので、見積もりをヘルプで言う。~~ **積ではなく和だった**
+（§5 の Phase 19 の `※`）。
 
 #### Phase 20: 多派生出力 ＋ マニフェスト
 
@@ -1315,9 +1374,39 @@ batch spec には `profile` / `max_bytes` / `derive` / `naming` / `fail_on` /
   `the_profile_bytes_are_pinned`）。加えて、`--no-color-convert` の画素を書いた
   ファイルに ICC が無く `ICC_NOT_EMBEDDED` が 1 回だけ出ることを、convert と batch の
   両方でファイルの中身から確かめる（`unconverted_pixels_are_written_without_the_srgb_icc`）
-- **Phase 19** — 「達成したら必ず `max_bytes` 以下」「未達なら必ず
-  `MAX_BYTES_UNREACHABLE`」「同じ入力で `quality_used` と `attempts` が毎回同じ」。
-  単調性は固定しない
+- **Phase 19**（済。結果は §5 の Phase 19 に、テスト名はここに並べた）。
+  **受け入れ基準の letter はこの一覧が定義である**——テストの doc コメントが
+  `受け入れ基準 (a)` のように引くので、参照先をここに置く。
+  - **(a) 達成したら必ず `max_bytes` 以下**（`a_reachable_budget_always_lands_under_the_limit` /
+    `the_ladder_stops_at_the_first_rung_that_fits`）。報告と実ファイルの両方を見る。
+    JPEG と AVIF を、きつい上限と緩い上限の 2 点ずつ
+  - **(b) 未達なら必ず `MAX_BYTES_UNREACHABLE`**
+    （`an_unreachable_budget_writes_the_requested_quality_file` /
+    `an_unreachable_budget_writes_the_requested_quality_untouched`）。**書いたファイルが
+    `--max-bytes` 無しの出力と 1 バイト一致する**ことまで固定する
+  - **(c) 同じ入力で `quality_used` と `attempts` が毎回同じ**
+    （`the_same_input_lands_on_the_same_rung_every_time` /
+    `the_landing_spot_is_the_same_every_time`）。**段で止まる経路を必ず通す**——
+    未達の上限では 3 回とも同じ答えになり、探索を通らずに一致してしまう
+  - **(d) 無害性の回帰**（`render_with_one_derivation_writes_what_encode_returns` が
+    `attempts == 1` まで見る / `a_budget_that_already_fits_changes_nothing`）
+  - **(e) PNG は段を降りない**（`png_ignores_the_budget_but_says_why` /
+    `png_never_walks_down_the_ladder` / `png_bytes_do_not_move_with_quality`）
+  - **(f) `--dry-run` でも探索は走る**（`a_dry_run_searches_for_the_budget_without_writing`）
+  - **(g) 書式の解釈**（`parses_a_byte_budget_with_and_without_a_unit` /
+    `the_decimal_units_never_exceed_the_binary_ones` / `rejects_a_malformed_byte_budget` /
+    `rejects_a_byte_budget_that_overflows`）
+  - **(h) spec 経由**（`a_spec_takes_the_budget_as_a_number_or_a_string` /
+    `a_malformed_budget_in_a_spec_is_refused` /
+    `a_malformed_budget_on_the_command_line_is_refused_by_the_parser`）
+  - **(i) 警告の `data` が揃っている**（`the_quality_reduced_warning_carries_every_number` /
+    `a_fractional_quality_is_spelled_the_same_everywhere`。報告と警告で同じ数が
+    同じ字面になることまで見る）
+  - **単調性は固定しない**（JPEG は品質を下げてもサイズが単調に減らない区間がある）。
+    契約そのものの回帰は
+    `the_readme_warning_table_lists_every_warning_in_the_contract` /
+    `the_published_prose_spells_the_real_ladder` /
+    `every_published_unit_is_in_the_known_vocabulary` が持つ
 - **Phase 20** — (a) 派生 1 個のときの完全一致（最重要の回帰）。(b) マニフェスト
   JSON のゴールデン。(c) 命名衝突を**書き始める前に**検出する。(d) 派生 N 個でも
   ピークメモリが N に比例しない（[3.2b](#32b-境界品質の回帰テストtestsedge_qualityrs)

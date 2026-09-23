@@ -283,6 +283,20 @@ pub struct InfoReport {
     pub warnings: Vec<Warning>,
 }
 
+/// 品質を結果 JSON と警告の `data` で同じ字面にする。
+///
+/// **同じ数が 2 通りに綴られてはいけない。** `serde` は `f32` を `33.3` と
+/// 書くが、`serde_json::Value::from(33.3_f32)` は `f64` へ広げた
+/// `33.29999923706055` になる。`outputs[].quality_used` と
+/// `QUALITY_REDUCED` の `data.quality_used` は同じ値を指しているので、
+/// エージェントが突き合わせたときに一致しなければならない。
+///
+/// 小数第 2 位で丸めるのは、`--quality` が刻む意味のある桁がそこまでだから
+/// である（JPEG はそもそも整数へ丸まる。`OutputFormat::effective_quality`）。
+pub fn quality_number(quality: f32) -> f64 {
+    (quality as f64 * 100.0).round() / 100.0
+}
+
 #[derive(Debug, Serialize)]
 pub struct OutputReport {
     pub path: String,
@@ -293,6 +307,16 @@ pub struct OutputReport {
     /// 色空間をどう名乗ったか（embedded / nclx / none）。キーは常に出す——省くと
     /// 「古い版で走った」と「名乗っていない」が同じ形になる
     pub icc: IccSignal,
+    /// 実際に使った品質（エンコーダが受け取った値。JPEG は整数へ丸めた後）。
+    /// **キーは常に出す**（省くと「古い版で走った」と「品質を持たない形式
+    /// だった」が同じ形になる）。PNG は無損失なので null。
+    ///
+    /// `f32` ではなく `quality_number` を通した `f64` を持つ。`f32` のまま
+    /// `serde_json::Value` にすると `33.3` が `33.29999923706055` と綴られ、
+    /// **同じ数が結果と警告の `data` で違う字面になる**
+    pub quality_used: Option<f64>,
+    /// エンコードした回数。`--max-bytes` が無ければ必ず 1
+    pub attempts: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -808,8 +832,13 @@ pub struct FieldEntry {
     pub path: &'static str,
     /// この項目が現れるコマンド。`info` で取れない値を待たせないため
     pub appears_in: Vec<&'static str>,
-    /// 値の種類。`ratio` / `delta_e` / `gradient` / `px` / `bool` /
-    /// `normalized_bbox` / `enum`
+    /// 値の種類。**語彙はこの一覧がすべてである**——`ratio` / `delta_e` /
+    /// `gradient` / `px` / `px_at_1000` / `deg` / `ms` / `count` / `quality` /
+    /// `bool` / `enum` / `path` / `list` / `normalized_bbox`。
+    ///
+    /// schema はこれをそのまま配るので、綴りも契約である。増やすときはここと
+    /// `every_published_unit_is_in_the_known_vocabulary` の両方を直す。
+    /// 一覧を実態から外したまま放置すると、受け手は `unit` で分岐できなくなる
     pub unit: &'static str,
     pub nullable: bool,
     /// `null` が何を意味するか。**0 と混同させないために要る。**

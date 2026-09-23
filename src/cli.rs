@@ -236,6 +236,10 @@ pub struct OutputOpts {
     #[arg(long, default_value_t = 6)]
     pub effort: u8,
 
+    /// 出力の上限バイト数。品質を梯子状に落として収める (例 500k)
+    #[arg(long, value_parser = parse_max_bytes, long_help = MAX_BYTES_HELP)]
+    pub max_bytes: Option<u64>,
+
     /// 透過を保持できない形式へ出力する際の合成色 (例 #FFFFFF)
     #[arg(long, value_parser = parse_hex_color, default_value = "#FFFFFF")]
     pub background: [u8; 3],
@@ -353,6 +357,35 @@ fn angle_long_help() -> String {
      回すか」を意味する"
         .to_string()
 }
+
+/// `--max-bytes` の長いヘルプ。
+///
+/// **AI エージェントは `--help` を読んで判断する**ので、「収まらなかったときに
+/// 何が起きるか」をここで言い切る。書式（`500k`）だけを言って規約を書かないと、
+/// 成果物が消えたと読んで再実行するか、警告を無視して上限超過のまま配信する。
+const MAX_BYTES_HELP: &str = "出力の上限バイト数。10 進の整数に単位を付けられる。\n\
+     単位は k / kb = 1,000、m / mb = 1,000,000、kib = 1,024、mib = 1,048,576。\
+     **k と kb は 1000 進である**——「500KB まで」のような十進で書かれた規約に対して、\
+     解釈の誤りが上限を破る向きへずれないようにしている。2 の冪が要るなら kib / mib と書く。\
+     小数は受けない（1.5m ではなく 1500k）。\n\
+     収まらなければ品質を**固定の梯子** 85 / 75 / 65 / 55 / 45 / 35 / 25 に沿って落とす。\
+     降りるのは --quality より小さい段だけで、最初に収まった段で止め、\
+     QUALITY_REDUCED が落とした事実と着地点を言う（既定の --quality 75 なら降りる段は \
+     5 つで、要求品質そのものを入れて最大 6 回のエンコードになる）。\n\
+     **段が時刻にもタイムアウトにも依存しない**ので、同じ入力からは毎回同じ \
+     outputs[].quality_used と outputs[].attempts が出る。\n\
+     下限まで降りても届かなければ、**要求品質のものをそのまま書いて** \
+     MAX_BYTES_UNREACHABLE を出す。成果物は残り、終了コードも変わらない\
+     （data.smallest_bytes が最小で何バイトまで縮んだかを言う）。\
+     kiri resize で寸法を落とすほうへ進むための値である。\n\
+     PNG は無損失で品質を持たないので効かない。1 回のエンコードで収まらなければ\
+     段を降りずに MAX_BYTES_UNREACHABLE を出す（quality_used は null、attempts は 1）。\n\
+     **--optimize と併せても時間は積にならない。** 探索はマスクの指標で候補を選び、\
+     エンコードするのは決まった 1 枚だけなので、掛かる時間は探索 + 最大 6 回の\
+     エンコードの**和**である。24.5MP の AVIF は 1 段あたり数秒かかるので、\
+     その数秒 × 段数が探索の後ろに足されると見ればよい。\n\
+     --dry-run でも実際にエンコードするので、bytes / quality_used / attempts は\
+     見積もりではなく実測値である";
 
 /// `--dry-run` の長いヘルプ。
 ///
@@ -1117,6 +1150,69 @@ pub fn parse_hex_color(s: &str) -> Result<[u8; 3], String> {
     }
 }
 
+/// `--max-bytes` の値を読む。10 進の整数に単位を付けられる（大文字も可）。
+///
+/// | 単位 | 倍率 |
+/// |---|---|
+/// | なし | 1 |
+/// | `k` / `kb` | 1,000 |
+/// | `m` / `mb` | 1,000,000 |
+/// | `kib` | 1,024 |
+/// | `mib` | 1,048,576 |
+///
+/// **`k` と `kb` は 1000 進である。** これは「外部の上限に収める」ための機能で、
+/// 規約の側（ストアの出品規定、CDN の制限、メールの添付上限）は十進で書かれて
+/// いることが多い。「500KB まで」に対して `500kb` が 512,000 バイトを許すと、
+/// **解釈の誤りが上限を破る向きにずれる。** 1000 進なら常に安全側に倒れ、
+/// 2 の冪が要る場合は `kib` / `mib` で明示的に言える。
+///
+/// 小数を断るのは、`1.5m` を丸めた値が指定と食い違うためである——`1500k` と
+/// 書けば同じことが誤解なく言える。**0 も断る。** 0 バイトに収まる画像は無いので、
+/// 指定できてしまうと必ず `MAX_BYTES_UNREACHABLE` が出る実行になる。
+///
+/// spec 経由でも同じ関門を通す（`commands::batch`）。片方だけ緩いと、その項目
+/// だけ上限が黙って効かないまま数百点が処理される。
+pub fn parse_max_bytes(s: &str) -> Result<u64, String> {
+    let lower = s.to_ascii_lowercase();
+    let split = lower
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(lower.len());
+    let (digits, unit) = lower.split_at(split);
+
+    if unit.starts_with('.') {
+        return Err(format!(
+            "'{s}' は小数です。整数で指定してください（1.5m なら 1500k）"
+        ));
+    }
+    let multiplier: u64 = match unit {
+        "" => 1,
+        "k" | "kb" => 1_000,
+        "m" | "mb" => 1_000_000,
+        "kib" => 1024,
+        "mib" => 1024 * 1024,
+        _ => {
+            return Err(format!(
+                "'{s}' はバイト数として解釈できません（整数に k / kb / m / mb / kib / mib を\
+                 付けて指定してください）"
+            ));
+        }
+    };
+    if digits.is_empty() {
+        return Err(format!(
+            "'{s}' に数値がありません（例: 500k / 2mb / 512000）"
+        ));
+    }
+    let bytes = digits
+        .parse::<u64>()
+        .ok()
+        .and_then(|v| v.checked_mul(multiplier))
+        .ok_or_else(|| format!("'{s}' は大きすぎます（バイト数は 2^64 未満で指定してください）"))?;
+    if bytes == 0 {
+        return Err("0 バイトに収まる画像はありません（1 以上を指定してください）".to_string());
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1170,6 +1266,64 @@ mod tests {
         assert!(parse_hex_color("#12345").is_err());
         assert!(parse_hex_color("white").is_err());
         assert!(parse_hex_color("").is_err());
+    }
+
+    #[test]
+    fn parses_a_byte_budget_with_and_without_a_unit() {
+        assert_eq!(parse_max_bytes("512000"), Ok(512_000));
+        assert_eq!(parse_max_bytes("500k"), Ok(500_000));
+        assert_eq!(parse_max_bytes("500kb"), Ok(500_000));
+        assert_eq!(parse_max_bytes("2m"), Ok(2_000_000));
+        assert_eq!(parse_max_bytes("2MB"), Ok(2_000_000), "大文字も読む");
+        assert_eq!(parse_max_bytes("500kib"), Ok(512_000));
+        assert_eq!(parse_max_bytes("2MiB"), Ok(2 * 1024 * 1024));
+        assert_eq!(parse_max_bytes("1"), Ok(1), "1 バイトは値として正しい");
+    }
+
+    /// **k と kb は 1000 進、kib と mib だけが 1024 進。**
+    ///
+    /// 「500KB まで」という十進で書かれた規約に対して `500kb` が 512,000 バイトを
+    /// 許すと、解釈の誤りが**上限を破る向き**へずれる。この機能は外部の上限に
+    /// 収めるためのものなので、誤るなら常に安全側でなければならない
+    #[test]
+    fn the_decimal_units_never_exceed_the_binary_ones() {
+        for (decimal, binary) in [("500k", "500kib"), ("2m", "2mib")] {
+            let (d, b) = (parse_max_bytes(decimal), parse_max_bytes(binary));
+            assert!(d.unwrap() < b.unwrap(), "{decimal} < {binary} であるべき");
+        }
+        assert_eq!(parse_max_bytes("1k"), Ok(1_000));
+        assert_eq!(parse_max_bytes("1kib"), Ok(1_024));
+    }
+
+    /// **0 と小数と符号は断る。** どれも「書けてしまうが意図どおりに効かない」
+    /// 種類の指定で、黙って丸めると成果物を見るまで気づけない
+    #[test]
+    fn rejects_a_malformed_byte_budget() {
+        assert!(parse_max_bytes("0").is_err(), "0 バイトに収まる画像は無い");
+        assert!(parse_max_bytes("0k").is_err());
+        assert!(parse_max_bytes("1.5m").is_err(), "小数は 1500k と書く");
+        assert!(parse_max_bytes("0.5").is_err());
+        assert!(parse_max_bytes("-500k").is_err());
+        assert!(parse_max_bytes("+500k").is_err());
+        assert!(parse_max_bytes("500 k").is_err(), "空白は挟めない");
+        assert!(parse_max_bytes("500g").is_err(), "単位は k / m 系だけ");
+        assert!(parse_max_bytes("500b").is_err(), "単位なしが素のバイト数");
+        assert!(parse_max_bytes("k").is_err(), "単位だけでは数にならない");
+        assert!(parse_max_bytes("").is_err());
+        assert!(parse_max_bytes("big").is_err());
+    }
+
+    /// 桁あふれで小さな値へ化けさせない。`u64::MAX` に単位を付けた値は
+    /// 掛け算で一周し、**指定より小さい上限**として効いてしまう
+    #[test]
+    fn rejects_a_byte_budget_that_overflows() {
+        assert!(parse_max_bytes("18446744073709551616").is_err(), "u64 超え");
+        assert!(parse_max_bytes("18446744073709551615k").is_err());
+        assert_eq!(
+            parse_max_bytes(&format!("{}", u64::MAX)),
+            Ok(u64::MAX),
+            "単位なしなら u64 の上限まで読める"
+        );
     }
 
     #[test]

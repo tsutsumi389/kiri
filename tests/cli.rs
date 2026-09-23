@@ -1128,6 +1128,479 @@ fn unconverted_pixels_are_written_without_the_srgb_icc() {
     }
 }
 
+// --- --max-bytes（Phase 19）---
+
+/// 梯子を回す素材。**圧縮しにくいノイズを載せる。**
+///
+/// 真っ平らな合成画像は品質 25 でも 75 でも数百バイトに収まってしまい、
+/// 「段を降りた」と「最初から収まっていた」の区別が付かない。200x200 に
+/// 抑えるのは、AVIF の梯子を大きな画像で回すと CI がそのぶん伸びるためである
+fn budget_input(dir: &Path) -> PathBuf {
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        shadow: true,
+        ..Default::default()
+    });
+    write_jpeg(dir, "budget.jpg", &img)
+}
+
+/// 品質の梯子。**実装の定数をそのまま引く。** 文面もテストも同じ 1 つの表を
+/// 見ていないと、段を動かしたときに片方だけが古いまま緑になる
+fn ladder() -> &'static [f32] {
+    kiri::image_io::derive::QUALITY_LADDER
+}
+
+/// `convert` を 1 回回して結果 JSON を返す。
+fn convert_json(input: &Path, output: &Path, extra: &[&str]) -> Value {
+    let mut args = vec![
+        "convert",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--force",
+        "--json",
+    ];
+    args.extend_from_slice(extra);
+    let out = kiri().args(&args).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    json_stdout(&out)
+}
+
+/// 要求品質では収まらず、梯子のどこかでは収まる上限を 2 点返す。
+///
+/// **「基準の半分」のような割合で決め打ちにしない。** 素材は 200x200 と小さく、
+/// JPEG には ICC の APP2 が 534 バイト固定で乗る。半分は品質 25 でも届かない
+/// ことがあり、そこで固定すると (a) の検査が未達の道を通ったまま緑になる
+/// （実際そうなった）。梯子の下限で何バイトになるかを測ってから決める。
+///
+/// 2 点返すのは、1 点だけだと「どんな上限でも最下段まで降りる」実装が通って
+/// しまうためである。**どちらも実測から相対で決める**——絶対値のゆとりを
+/// 足すと、素材が変わったときに意味が変わる
+fn reachable_budgets(input: &Path, output: &Path, format: &str) -> [u64; 2] {
+    let at = |quality: &str| {
+        convert_json(input, output, &["--format", format, "--quality", quality])["outputs"][0]
+            ["bytes"]
+            .as_u64()
+            .unwrap()
+    };
+    // 要求品質は CLI の既定（75）、下限は梯子のいちばん下の段
+    let baseline = at("75");
+    let floor = at(&ladder().last().unwrap().to_string());
+    assert!(
+        floor < baseline,
+        "{format}: 品質を落としても縮まない素材では梯子を試せない（{floor} / {baseline}）"
+    );
+    // いちばんきつい達成可能な上限と、そこから基準までの中点
+    [floor, floor + (baseline - floor) / 2]
+}
+
+/// 達成できる上限を 1 つだけ要るとき用。緩いほうを使う
+fn reachable_budget(input: &Path, output: &Path, format: &str) -> u64 {
+    reachable_budgets(input, output, format)[1]
+}
+
+/// 受け入れ基準 (a)。**達成したら必ず `--max-bytes` 以下**である。
+///
+/// 報告と実ファイルの両方を見る。`render` が探索した大きさと書いたバイト列が
+/// 食い違っても、報告だけを見る検査は素通りする。AVIF を 1 ケースに絞るのは、
+/// 梯子 1 段あたりのエンコードが JPEG より桁で重いためである
+#[test]
+fn a_reachable_budget_always_lands_under_the_limit() {
+    let dir = fixture_dir();
+    let input = budget_input(dir.path());
+
+    for format in ["jpeg", "avif"] {
+        let output = dir.path().join(format!("out.{format}"));
+        // 上限は 1 形式につき 1 度だけ測る。同じ値を 2 度測り直す理由が無い
+        for max in reachable_budgets(&input, &output, format) {
+            let v = convert_json(
+                &input,
+                &output,
+                &["--format", format, "--max-bytes", &max.to_string()],
+            );
+            let out = &v["outputs"][0];
+            let label = format!("{format} max={max}");
+            assert!(
+                out["bytes"].as_u64().unwrap() <= max,
+                "{label}: 報告が上限を超えた: {out}"
+            );
+            assert_eq!(
+                std::fs::metadata(&output).unwrap().len(),
+                out["bytes"].as_u64().unwrap(),
+                "{label}: 実ファイルと報告がずれた"
+            );
+
+            let quality = out["quality_used"].as_f64().unwrap() as f32;
+            assert!(
+                ladder().contains(&quality) && quality < 75.0,
+                "{label}: {quality} は要求品質より下の梯子の段ではない"
+            );
+            assert!(out["attempts"].as_u64().unwrap() > 1, "{label}: {out}");
+            assert!(has_warning(&v, "QUALITY_REDUCED"), "{label}: {v}");
+            assert!(
+                !has_warning(&v, "MAX_BYTES_UNREACHABLE"),
+                "{label}: 収まったのに未達と言っている"
+            );
+        }
+    }
+}
+
+/// 受け入れ基準 (i)。`QUALITY_REDUCED` の `data` が揃っていること。
+///
+/// **エージェントは `message` を読まない。** 落とした事実だけでは次の判断が
+/// できず、「いくつからいくつへ」「何バイトになったか」が要る
+#[test]
+fn the_quality_reduced_warning_carries_every_number() {
+    let dir = fixture_dir();
+    let input = budget_input(dir.path());
+    let output = dir.path().join("reduced.jpg");
+    let max = reachable_budget(&input, &output, "jpeg");
+
+    let v = convert_json(&input, &output, &["--max-bytes", &max.to_string()]);
+    let warning = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "QUALITY_REDUCED")
+        .unwrap_or_else(|| panic!("QUALITY_REDUCED が無い: {v}"));
+    let data = &warning["data"];
+    let out = &v["outputs"][0];
+
+    assert_eq!(data["requested"], 75.0);
+    assert_eq!(data["quality_used"], out["quality_used"]);
+    assert_eq!(data["max_bytes"], max);
+    assert_eq!(data["bytes"], out["bytes"]);
+    assert_eq!(data["attempts"], out["attempts"]);
+    assert_eq!(data["format"], "jpeg");
+}
+
+/// 受け入れ基準 (b)。**未達なら要求品質のものを書く。**
+///
+/// 書いたファイルが `--max-bytes` 無しの出力と 1 バイトも違わないことで、
+/// 「どうせ制約は破れているので画質まで捨てない」という決定を固定する。
+/// 成果物は残り、終了コードも変わらない——合否で落とすのは別の仕事である
+#[test]
+fn an_unreachable_budget_writes_the_requested_quality_file() {
+    let dir = fixture_dir();
+    let input = budget_input(dir.path());
+    let plain_path = dir.path().join("plain.jpg");
+    let plain = convert_json(&input, &plain_path, &[]);
+    let expected = std::fs::read(&plain_path).unwrap();
+
+    let output = dir.path().join("tiny.jpg");
+    let v = convert_json(&input, &output, &["--max-bytes", "64"]);
+    assert_eq!(
+        std::fs::read(&output).unwrap(),
+        expected,
+        "未達のときに書くものが --max-bytes 無しの出力と違う"
+    );
+
+    let out = &v["outputs"][0];
+    assert_eq!(out["bytes"], plain["outputs"][0]["bytes"]);
+    assert_eq!(out["quality_used"], 75.0, "要求品質へ戻る");
+    // 要求品質の 1 回 + 75 より下の 5 段（65 / 55 / 45 / 35 / 25）
+    assert_eq!(out["attempts"], 6);
+
+    let warning = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "MAX_BYTES_UNREACHABLE")
+        .unwrap_or_else(|| panic!("MAX_BYTES_UNREACHABLE が無い: {v}"));
+    let data = &warning["data"];
+    assert_eq!(data["max_bytes"], 64);
+    assert_eq!(data["bytes"], out["bytes"], "書いたファイルの大きさを言う");
+    assert_eq!(data["attempts"], out["attempts"]);
+    assert_eq!(data["format"], "jpeg");
+    let smallest = data["smallest_bytes"].as_u64().unwrap();
+    assert!(
+        smallest > 64 && smallest <= out["bytes"].as_u64().unwrap(),
+        "あとどれだけ足りないかを言えていない: {data}"
+    );
+    assert!(data["smallest_quality"].as_f64().unwrap() <= 75.0);
+    assert!(warning["hint"].is_string(), "次の一手が要る: {warning}");
+}
+
+/// 受け入れ基準 (c)。同じ入力からは毎回同じ着地点になる。
+///
+/// **決定性は kiri の中核の約束である。** 梯子が時刻やタイムアウトを見た
+/// 瞬間にここが割れる
+#[test]
+fn the_same_input_lands_on_the_same_rung_every_time() {
+    let dir = fixture_dir();
+    let input = budget_input(dir.path());
+    let output = dir.path().join("stable.jpg");
+    let max = reachable_budget(&input, &output, "jpeg").to_string();
+
+    let once = || {
+        let out = convert_json(&input, &output, &["--max-bytes", &max])["outputs"][0].clone();
+        (
+            out["quality_used"].clone(),
+            out["attempts"].clone(),
+            out["bytes"].clone(),
+        )
+    };
+    let first = once();
+    assert_eq!(once(), first);
+    assert_eq!(once(), first);
+}
+
+/// 受け入れ基準 (f)。`--dry-run` でも探索は走る。
+///
+/// 書かないだけで、`bytes` / `quality_used` / `attempts` は本番と同じ実測値で
+/// ある。ここが見積もりになると、dry-run は品質とサイズを決める用に使えない
+#[test]
+fn a_dry_run_searches_for_the_budget_without_writing() {
+    let dir = fixture_dir();
+    let input = budget_input(dir.path());
+    let output = dir.path().join("real.jpg");
+    let max = reachable_budget(&input, &output, "jpeg").to_string();
+
+    let real = convert_json(&input, &output, &["--max-bytes", &max]);
+    let dry_path = dir.path().join("dry.jpg");
+    let dry = convert_json(&input, &dry_path, &["--max-bytes", &max, "--dry-run"]);
+
+    assert!(!dry_path.exists(), "dry-run が書いている");
+    assert!(
+        real["outputs"][0]["attempts"].as_u64().unwrap() > 1,
+        "探索が走らない上限では dry-run と本番の一致を見たことにならない"
+    );
+    for key in ["bytes", "quality_used", "attempts"] {
+        assert_eq!(
+            dry["outputs"][0][key], real["outputs"][0][key],
+            "{key} が本番と食い違う"
+        );
+    }
+    assert_eq!(warning_codes(&dry), warning_codes(&real));
+}
+
+/// 受け入れ基準 (e)。PNG は無損失なので段を降りない。
+///
+/// ファイルは `--max-bytes` 無しの PNG と 1 バイトも変わらず、`attempts` は 1、
+/// `quality_used` は null になる。**同じバイト列を 8 回作らない**ことが要点で、
+/// 「試したが変わらなかった」と「試す意味が無い」は結果が同じでも報告が違う
+#[test]
+fn png_ignores_the_budget_but_says_why() {
+    let dir = fixture_dir();
+    let input = budget_input(dir.path());
+    let plain_path = dir.path().join("plain.png");
+    convert_json(&input, &plain_path, &[]);
+    let expected = std::fs::read(&plain_path).unwrap();
+
+    let output = dir.path().join("budget.png");
+    let v = convert_json(&input, &output, &["--max-bytes", "1k"]);
+    assert_eq!(std::fs::read(&output).unwrap(), expected);
+
+    let out = &v["outputs"][0];
+    assert_eq!(out["attempts"], 1, "段を降りてはいけない");
+    assert!(out["quality_used"].is_null(), "PNG に品質は無い: {out}");
+    let warning = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "MAX_BYTES_UNREACHABLE")
+        .unwrap_or_else(|| panic!("MAX_BYTES_UNREACHABLE が無い: {v}"));
+    assert_eq!(warning["data"]["attempts"], 1);
+    assert!(
+        warning["data"].get("smallest_bytes").is_none(),
+        "段を降りていないのに最小を語っている: {warning}"
+    );
+    let hint = warning["hint"].as_str().unwrap();
+    assert!(hint.contains("jpeg"), "品質で収める道を示すべき: {hint}");
+}
+
+/// 同じ品質が、結果と警告の `data` で同じ字面になる。
+///
+/// **`f32` をそのまま JSON へ出すと綴りが割れる。** serde は `33.3` と書くが、
+/// `serde_json::Value` へ入れると `f64` へ広がって `33.29999923706055` になる。
+/// `outputs[].quality_used` と `data.quality_used` は同じ値を指しているので、
+/// エージェントが突き合わせたときに一致しなければならない。
+///
+/// **JPEG の報告は「エンコーダが受け取った値」である。** `image` の JPEG
+/// エンコーダは `u8` しか受けず、`--quality 33.3` は 33 として効く
+#[test]
+fn a_fractional_quality_is_spelled_the_same_everywhere() {
+    let dir = fixture_dir();
+    let input = budget_input(dir.path());
+
+    // AVIF は f32 をそのまま受けるので 33.3 が残る
+    let avif = dir.path().join("frac.avif");
+    let v = convert_json(&input, &avif, &["--format", "avif", "--quality", "33.3"]);
+    assert_eq!(v["outputs"][0]["quality_used"], 33.3, "{v}");
+
+    let jpeg = dir.path().join("frac.jpg");
+    let v = convert_json(&input, &jpeg, &["--format", "jpeg", "--quality", "33.3"]);
+    assert_eq!(
+        v["outputs"][0]["quality_used"], 33.0,
+        "JPEG は整数へ丸めて渡している: {v}"
+    );
+
+    // 落とした実行では requested も同じ規約で綴られる
+    let at = |quality: &str| {
+        convert_json(&input, &jpeg, &["--format", "jpeg", "--quality", quality])["outputs"][0]
+            ["bytes"]
+            .as_u64()
+            .unwrap()
+    };
+    let bottom = ladder().last().unwrap().to_string();
+    let (baseline, floor) = (at("33.3"), at(&bottom));
+    assert!(floor < baseline, "品質を落としても縮まない素材");
+    let max = floor + (baseline - floor) / 2;
+
+    let v = convert_json(
+        &input,
+        &jpeg,
+        &[
+            "--format",
+            "jpeg",
+            "--quality",
+            "33.3",
+            "--max-bytes",
+            &max.to_string(),
+        ],
+    );
+    let warning = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "QUALITY_REDUCED")
+        .unwrap_or_else(|| panic!("QUALITY_REDUCED が無い: {v}"));
+    assert_eq!(
+        warning["data"]["requested"], 33.3,
+        "要求した値をそのまま言う: {warning}"
+    );
+    assert_eq!(
+        warning["data"]["quality_used"], v["outputs"][0]["quality_used"],
+        "同じ品質が 2 通りに綴られている: {v}"
+    );
+    // 33.3 より下の段は下限だけ
+    assert_eq!(
+        v["outputs"][0]["quality_used"],
+        *ladder().last().unwrap() as f64
+    );
+}
+
+/// 受け入れ基準 (h)。spec の `max_bytes` は数値でも文字列でも書ける。
+///
+/// エージェントが書く JSON には両方が現れる。片方を断ると、CLI では通る
+/// 書き方が spec でだけ通らない道具になる
+#[test]
+fn a_spec_takes_the_budget_as_a_number_or_a_string() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        shadow: true,
+        ..Default::default()
+    });
+    write_jpeg(dir.path(), "p.jpg", &img);
+
+    // 要求品質と梯子の下限を先に測って、届く上限を決める（`reachable_budget`
+    // と同じ理由。割合で決め打ちにすると未達の道を通ったまま緑になる）
+    let spec = write_spec(
+        dir.path(),
+        r#"{"defaults":{"format":"jpeg"},
+            "items":[{"input":"p.jpg","output":"out/plain.jpg"},
+                     {"input":"p.jpg","output":"out/floor.jpg","quality":25}]}"#,
+    );
+    let probe = json_stdout(&run_batch(&spec, &[]));
+    let bytes = |i: usize| {
+        probe["results"][i]["result"]["outputs"][0]["bytes"]
+            .as_u64()
+            .unwrap()
+    };
+    let (baseline, floor) = (bytes(0), bytes(1));
+    assert!(floor < baseline, "品質を落としても縮まない素材");
+    let max = (baseline + floor) / 2;
+
+    let spec = write_spec(
+        dir.path(),
+        &format!(
+            r#"{{"defaults":{{"format":"jpeg"}},
+                 "items":[{{"input":"p.jpg","output":"out/n.jpg","max_bytes":{max}}},
+                          {{"input":"p.jpg","output":"out/s.jpg","max_bytes":"{max}"}}]}}"#
+        ),
+    );
+    let v = json_stdout(&run_batch(&spec, &[]));
+    assert_eq!(v["failed"], 0, "{v}");
+    for i in 0..2 {
+        let result = &v["results"][i]["result"];
+        let out = &result["outputs"][0];
+        assert!(out["bytes"].as_u64().unwrap() <= max, "{i}: {out}");
+        assert!(has_warning(result, "QUALITY_REDUCED"), "{i}: {result}");
+    }
+    assert_eq!(
+        v["results"][0]["result"]["outputs"][0]["quality_used"],
+        v["results"][1]["result"]["outputs"][0]["quality_used"],
+        "数値と文字列で着地点が違う"
+    );
+}
+
+/// 受け入れ基準 (h)。読めない `max_bytes` はその項目を落とす。
+///
+/// **黙って無視しない。** 上限が効かないまま数百点が処理されると、気づけるのは
+/// 配信の段になる。CLI では clap が code 無しの exit 2 で断るので、
+/// `INVALID_MAX_BYTES` が出るのは spec 経由だけである（batch は 1 件の失敗で
+/// 全体を止めないので、終了コードは処理失敗の 4 になる）
+#[test]
+fn a_malformed_budget_in_a_spec_is_refused() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 60,
+        height: 60,
+        ..Default::default()
+    });
+    write_jpeg(dir.path(), "p.jpg", &img);
+
+    for written in ["\"1.5m\"", "\"500g\"", "\"\"", "0", "-1", "1.5", "true"] {
+        let spec = write_spec(
+            dir.path(),
+            &format!(
+                r#"{{"items":[{{"input":"p.jpg","output":"out/x.jpg","max_bytes":{written}}}]}}"#
+            ),
+        );
+        let out = run_batch(&spec, &[]);
+        assert_eq!(out.status.code(), Some(4), "max_bytes:{written}");
+        let v = json_stdout(&out);
+        assert_eq!(
+            v["results"][0]["error"]["code"], "INVALID_MAX_BYTES",
+            "max_bytes:{written}"
+        );
+    }
+}
+
+/// CLI 側の書式違いは clap が断る。**code は伴わない**（`ErrorKind::Argument`
+/// の説明がそう述べている唯一の失敗である）ので、stdout は空のままになる
+#[test]
+fn a_malformed_budget_on_the_command_line_is_refused_by_the_parser() {
+    let dir = fixture_dir();
+    let input = budget_input(dir.path());
+    for written in ["1.5m", "0", "500g", "-1"] {
+        let out = kiri()
+            .args([
+                "convert",
+                input.to_str().unwrap(),
+                "-o",
+                dir.path().join("x.jpg").to_str().unwrap(),
+                "--max-bytes",
+                written,
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "--max-bytes {written}");
+        assert!(
+            out.stdout.is_empty(),
+            "--max-bytes {written} で stdout が出た"
+        );
+    }
+}
+
 // --- エラー処理 ---
 
 #[test]
@@ -6985,8 +7458,6 @@ fn a_parser_level_failure_returns_no_json() {
 /// **実装したら必ずここから消す**——実装済みのまま残っていると下の検査が落ちる。
 /// README / design.md には許さない（エージェントが写し取る場所だから）
 const PLANNED_CODES: &[&str] = &[
-    "MAX_BYTES_UNREACHABLE",
-    "QUALITY_REDUCED",
     "MANIFEST_PARTIAL",
     "PROFILE_OVERRIDDEN",
     "PROFILE_UNCHECKABLE",
@@ -6994,7 +7465,6 @@ const PLANNED_CODES: &[&str] = &[
     "SET_SCALE_CLAMPED",
     "WHITE_BALANCE_SKIPPED",
     "REFLECT_CLIPPED",
-    "INVALID_MAX_BYTES",
     "INVALID_DERIVATION",
     "INVALID_NAMING_TEMPLATE",
     "OUTPUT_NAME_COLLISION",
@@ -7420,6 +7890,127 @@ fn the_published_prose_has_no_stray_spaces() {
         stray.len(),
         stray.join("\n")
     );
+}
+
+/// README の警告の表は、契約の `warnings[]` を 1 つも落としていない。
+///
+/// 表の直後に「この表は `kiri schema --json` の `warnings[]` が同じものを返す」と
+/// 書いてある。ところが `every_code_named_in_the_docs_exists` は**文書 → カタログ**の
+/// 向きしか見ないので、**カタログへ足して表へ足し忘れる**と素通りする。実際
+/// Phase 19 の 2 つがそうやって抜けた。逆向きをここで塞ぐ。
+///
+/// 見るのは警告だけである。README は error の全一覧を持たない（持つと名乗っても
+/// いない）ので、同じ表明を errors[] へ広げると「文書に無いから落ちる」だけの
+/// 検査になる。**同期を守るのは、同期すると書いてある表に対してだけ意味がある。**
+#[test]
+fn the_readme_warning_table_lists_every_warning_in_the_contract() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
+    // 表の行は `| `CODE` | 意味 |`。code を名乗る行だけを拾う
+    let listed: Vec<&str> = readme
+        .lines()
+        .filter_map(|line| line.strip_prefix("| `"))
+        .filter_map(|rest| rest.split('`').next())
+        .filter(|word| {
+            !word.is_empty()
+                && word
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        })
+        .collect();
+
+    let missing: Vec<String> = codes_of(&schema_json(), "warnings")
+        .into_iter()
+        .filter(|code| !listed.contains(&code.as_str()))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "README の警告の表に載っていない code がある（{} 件）: {}",
+        missing.len(),
+        missing.join(" / ")
+    );
+}
+
+/// 梯子の段は、実装と配る文面で同じ綴りである。
+///
+/// 同じ 7 つの数が `--max-bytes` の長いヘルプと `outputs[].quality_used` の
+/// notes に出る。**手書きが 2 つあれば、段を動かしたとき片方だけが古くなる。**
+/// どちらも `QUALITY_LADDER` と突き合わせる
+#[test]
+fn the_published_prose_spells_the_real_ladder() {
+    let spelled = ladder()
+        .iter()
+        .map(|q| q.to_string())
+        .collect::<Vec<_>>()
+        .join(" / ");
+    let v = schema_json();
+
+    let detail = v["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "convert")
+        .unwrap()["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["name"] == "--max-bytes")
+        .unwrap_or_else(|| panic!("--max-bytes が無い: {v}"))["detail"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        detail.contains(&spelled),
+        "--max-bytes のヘルプが梯子 '{spelled}' を綴っていない: {detail}"
+    );
+
+    let notes = fields_of(&v)
+        .into_iter()
+        .find(|f| f["path"] == "outputs[].quality_used")
+        .unwrap()["notes"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        notes.contains(&spelled),
+        "quality_used の notes が梯子 '{spelled}' を綴っていない: {notes}"
+    );
+}
+
+/// `fields[].unit` の綴りは決まった語彙の中にある。
+///
+/// schema は `unit` をそのまま配るので、これも契約である。**一覧を持たずに
+/// 増やすと、受け手は `unit` で分岐できなくなる**（`ratio` と `quality` の
+/// ように、値域が違うのに同じ綴りへ寄せてしまう誤りも起きる）。
+/// 語彙は `FieldEntry::unit` の doc コメントと同じもの
+#[test]
+fn every_published_unit_is_in_the_known_vocabulary() {
+    const KNOWN: &[&str] = &[
+        "ratio",
+        "delta_e",
+        "gradient",
+        "px",
+        "px_at_1000",
+        "deg",
+        "ms",
+        "count",
+        "quality",
+        "bool",
+        "enum",
+        "path",
+        "list",
+        "normalized_bbox",
+    ];
+    for f in fields_of(&schema_json()) {
+        let unit = f["unit"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{f} が unit を持たない"));
+        assert!(
+            KNOWN.contains(&unit),
+            "{} の unit '{unit}' が語彙に無い（FieldEntry::unit の doc も直すこと）",
+            f["path"]
+        );
+    }
 }
 
 /// 値を取らない項目に選択肢は無い。

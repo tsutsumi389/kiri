@@ -140,6 +140,10 @@ error_catalog! {
         => "--quality が 0-100 の外",
     InvalidEffort = "INVALID_EFFORT", Argument
         => "--effort が 1-10 の外",
+    InvalidMaxBytes = "INVALID_MAX_BYTES", Argument
+        => "--max-bytes の値がバイト数として読めない（0、小数、単位の綴り違い、桁あふれ）。\
+            spec 経由でのみこの code で、CLI では clap が code 無しの exit 2 で断る。\
+            batch は 1 件の失敗で全体を止めないので、この code が出る実行の終了コードは 4 になる",
     InvalidSetting = "INVALID_SETTING", Argument
         => "spec の設定値が不正（負値・nan・上限超過）",
     MissingDimension = "MISSING_DIMENSION", Argument

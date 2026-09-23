@@ -124,6 +124,8 @@ fn to_cutout_args(
         .transpose()?
         .unwrap_or([255, 255, 255]);
 
+    let max_bytes = max_bytes(settings.max_bytes.as_ref())?;
+
     let seal = capped(settings.seal, 1, crate::cli::MAX_SEAL, "seal")?;
     let cleanup = capped(settings.cleanup, 2, crate::cli::MAX_CLEANUP, "cleanup")?;
 
@@ -218,6 +220,7 @@ fn to_cutout_args(
             format,
             quality: settings.quality.unwrap_or(75.0),
             effort: settings.effort.unwrap_or(6),
+            max_bytes,
             background,
             flatten: settings.flatten.unwrap_or(false),
             force,
@@ -285,6 +288,41 @@ fn polygons(values: Option<&[Vec<f64>]>, key: &str) -> Result<Vec<Polygon>> {
             })
         })
         .collect()
+}
+
+/// spec の `max_bytes` を解く。**数値でも文字列でも受ける。**
+///
+/// エージェントが書く JSON には `512000` と `"500k"` の両方が現れる。片方を
+/// 断ると、CLI では通る書き方が spec でだけ通らない道具になる。文字列は CLI と
+/// 同じ `parse_max_bytes` へ流し、数値は `u64` として読めて 0 より大きいことだけを
+/// 見る——小数・負値・0 はどれも `as_u64()` か大小比較で落ちる。
+///
+/// 断るときの code は `INVALID_MAX_BYTES` で、`INVALID_SETTING` ではない。
+/// **上限バイト数の誤りは「どの値をどう直すか」が他の設定と違う**（単位の綴りか、
+/// 小数か、0 か）ので、受け手が同じ分岐でまとめて扱える種類の失敗ではない。
+fn max_bytes(value: Option<&serde_json::Value>) -> Result<Option<u64>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let invalid = |message: String| {
+        Error::new(ErrorCode::InvalidMaxBytes, message).with_hint(
+            "max_bytes は 512000 のような整数か、\"500k\" / \"2mb\" のような文字列で指定してください",
+        )
+    };
+    match value {
+        serde_json::Value::String(s) => crate::cli::parse_max_bytes(s)
+            .map(Some)
+            .map_err(|e| invalid(format!("max_bytes: {e}"))),
+        serde_json::Value::Number(n) => match n.as_u64() {
+            Some(bytes) if bytes > 0 => Ok(Some(bytes)),
+            _ => Err(invalid(format!(
+                "max_bytes は 1 以上の整数である必要があります（{n} が指定されました）"
+            ))),
+        },
+        other => Err(invalid(format!(
+            "max_bytes を数値としても文字列としても読めません（{other} が指定されました）"
+        ))),
+    }
 }
 
 /// 数値の設定に CLI と同じ約束を掛ける。

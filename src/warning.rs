@@ -93,6 +93,10 @@ warning_catalog! {
         => "resize で元画像より大きくした",
     AlphaFlattened = "ALPHA_FLATTENED"
         => "出力形式が透過を保持できないので背景色で合成した",
+    QualityReduced = "QUALITY_REDUCED"
+        => "--max-bytes に収めるため要求品質から品質を落とした",
+    MaxBytesUnreachable = "MAX_BYTES_UNREACHABLE"
+        => "下限品質でも --max-bytes に届かなかった（要求品質のまま書いた）",
     IccNotEmbedded = "ICC_NOT_EMBEDDED"
         => "画素が sRGB でないので sRGB の ICC を埋め込まなかった（AVIF は AV1 の色情報で sRGB を名乗ったまま）",
     PreviewFailed = "PREVIEW_FAILED"

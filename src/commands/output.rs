@@ -182,6 +182,7 @@ fn derivation(opts: &OutputOpts, format: OutputFormat, icc: IccPolicy) -> Deriva
         background: opts.background,
         flatten: opts.flatten,
         icc,
+        max_bytes: opts.max_bytes,
     }
 }
 
@@ -261,6 +262,7 @@ mod tests {
             format: None,
             quality: 75.0,
             effort: 6,
+            max_bytes: None,
             background: [255, 255, 255],
             flatten: false,
             force: false,

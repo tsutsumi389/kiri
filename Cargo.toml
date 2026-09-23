@@ -60,3 +60,20 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+# テストを回すためのプロファイル。**最適化しつつ assert を残す。**
+#
+# debug のままだと `tests/real_backgrounds.rs` の較正ベンチが手元で 861 秒、
+# 標準ランナーでは 36 分かかる。画像処理を最適化なしで回しているためで、
+# release にすると 41 秒（20.9 倍）になる。
+#
+# ただし素の release は `debug_assert!` と整数のオーバーフロー検査を落とす。
+# 不変条件の一部はそこに預けてあるので（§5 の Phase 12）、落とすと守るものが
+# 減る。lto と codegen-units は外す——テストの実行時間には効かないのに、
+# ビルドだけが伸びる。
+[profile.ci-test]
+inherits = "release"
+lto = false
+codegen-units = 16
+debug-assertions = true
+overflow-checks = true

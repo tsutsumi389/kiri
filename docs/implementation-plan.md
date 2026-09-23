@@ -189,10 +189,14 @@ R シーンだけ線形 RGB で混ぜる。前者は回帰の基準であり、�
 
 GitHub Actions で以下を実行する。
 
-- `cargo test`
-- `cargo clippy -- -D warnings`
+- `cargo test --profile ci-test`
+- `cargo clippy --profile ci-test -- -D warnings`
 - `cargo fmt --check`
 - `cargo +1.85 check --all-targets`（MSRV）
+
+**テストは `ci-test` プロファイルで回す。** debug のままだと `tests/real_backgrounds.rs` の較正ベンチだけで手元 861 秒・標準ランナー 36 分かかり、`test` ジョブ全体が 55 分になっていた。画像処理を最適化なしで回していたためで、最適化すると手元の実行は 996 秒 → 51 秒（19.4 倍）になる。**テストの数を減らして得た速さではない**——19 本はそれぞれ別の Phase の受け入れ基準を持っており、計測用の 7 本はもともと `#[ignore]` である。
+
+素の `--release` を使わないのは、`debug_assert!` と整数のオーバーフロー検査が落ちるからである。不変条件の一部はそこに預けてある。`ci-test` は `release` を継承したうえで両方を戻し、`lto` と `codegen-units` は外す——テストの実行時間には効かないのに、ビルドだけが伸びる。clippy も同じプロファイルを指すのは、中間生成物を共有するためである。
 
 MSRV の検査を CI に入れるのは、**宣言だけ置いても検査しなければ守られない**ためである。実際に一度、`rust-version = "1.85"` を掲げたまま let-chains（安定化は 1.88）が2箇所入り込んでいた。ローカルの新しいツールチェーンでは通ってしまうので、CI でしか検出できない。
 

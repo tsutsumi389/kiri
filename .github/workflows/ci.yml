@@ -53,12 +53,10 @@ jobs:
     # なる。
     name: test (${{ matrix.label }})
     runs-on: ubuntu-latest
-    # **実測で 41 分かかる。** 手元（Apple Silicon）では 16 分なので、標準ランナー
-    # では 2.5 倍と見ておく。内訳は `tests/real_backgrounds.rs` の較正ベンチが
-    # 大半で、debug ビルドの画像処理がそのまま効いている。45 分では `segment`
-    # 系統（tract のビルドが数分ぶん重い）が入り切らなかったので枠を広げた。
-    # 縮めるなら timeout ではなくテストの側を見ること。
-    timeout-minutes: 90
+    # 実測は `default` が 6 分 32 秒、`segment` が 8 分 51 秒（`ci-test`
+    # プロファイル。debug では 55 分と 24 分 51 秒かかっていた）。**枠は最長の
+    # 3 倍強を取ってある**——標準ランナーは同じジョブでも 3 割ほどぶれる。
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -93,8 +91,11 @@ jobs:
             ~/.cargo/git/db
           key: cargo-${{ runner.os }}-${{ matrix.label }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-${{ matrix.label }}-
-      - run: cargo clippy --locked --all-targets ${{ matrix.features }} -- -D warnings
-      - run: cargo test --locked ${{ matrix.features }}
+      # **`ci-test` プロファイルで回す（Cargo.toml を見よ）。** debug のままだと
+      # `tests/real_backgrounds.rs` だけで 36 分かかる。clippy と test で同じ
+      # プロファイルを指すのは、中間生成物を捨てずに共有するためである。
+      - run: cargo clippy --profile ci-test --locked --all-targets ${{ matrix.features }} -- -D warnings
+      - run: cargo test --profile ci-test --locked ${{ matrix.features }}
 
   msrv:
     # 宣言だけ置いても検査しなければ守られない。実際に一度、`rust-version =

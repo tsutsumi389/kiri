@@ -53,11 +53,10 @@ jobs:
     # なる。
     name: test (${{ matrix.label }})
     runs-on: ubuntu-latest
-    # debug で回していたときは 55 分かかっていた（`test (default)` の実測。別の
-    # run では 41 分で、ばらつきも大きい）。`ci-test` プロファイルにして手元の
-    # 実行は 996 秒 → 51 秒になったが、**そのぶんビルドは重くなる**ので、枠は
-    # 当面 90 分のままにして実測を見る。
-    timeout-minutes: 90
+    # 実測は `default` が 6 分 32 秒、`segment` が 8 分 51 秒（`ci-test`
+    # プロファイル。debug では 55 分と 24 分 51 秒かかっていた）。**枠は最長の
+    # 3 倍強を取ってある**——標準ランナーは同じジョブでも 3 割ほどぶれる。
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

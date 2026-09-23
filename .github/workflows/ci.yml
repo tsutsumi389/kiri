@@ -64,6 +64,19 @@ jobs:
             features: "--features segment"
     steps:
       - uses: actions/checkout@v7
+      # **`rav1e` の `asm` feature は x86_64 で NASM を要る。** `ravif` が既定で
+      # 引いており、標準ランナーには入っていない。手元の aarch64 macOS では
+      # 要らないので、CI に載せて初めて出た。
+      #
+      # asm を切る道は採らない。AVIF のエンコードが遅くなるうえ、出力バイト列が
+      # 変わらない保証が無いからである（Phase 18 は「ICC を除けば 1 バイトも
+      # 変わらない」を md5 で固定している）。アセンブラのほうを入れる。
+      #
+      # これは**ビルド時のツール**であって、生成物が C ライブラリを引くわけでは
+      # ない。`cargo tree -e normal` に `*-sys` が現れないという Cargo.toml の
+      # 基準はそのまま保たれている。
+      - name: nasm を入れる（rav1e の asm ビルド用）
+        run: sudo apt-get update && sudo apt-get install -y nasm
       - run: rustup component add clippy
       # `target` をまるごとではなく依存だけを載せる（キャッシュはリポジトリ
       # あたり 10GB）。
@@ -90,6 +103,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+      # rav1e の asm ビルドに要る（理由は test ジョブのコメント）。
+      - name: nasm を入れる（rav1e の asm ビルド用）
+        run: sudo apt-get update && sudo apt-get install -y nasm
       - run: rustup toolchain install 1.85 --profile minimal --no-self-update
       - uses: actions/cache@v6
         with:

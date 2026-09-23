@@ -712,6 +712,24 @@ fn fields() -> Vec<FieldEntry> {
             ),
         },
         FieldEntry {
+            path: "outputs[].icc",
+            appears_in: vec!["convert", "resize", "rotate", "cutout"],
+            unit: "enum",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "出力が色空間をどう名乗っているか（embedded / nclx / none）",
+            notes: Some(
+                "embedded は PNG の iCCP か JPEG の APP2 に sRGB の ICC を埋めた。nclx は AVIF で、\
+                 ICC ではなく AV1 の色情報（BT.709 の原色と sRGB の転送特性）で sRGB を名乗る——\
+                 colr ボックスは既定値と同じなので省かれ、コンテナには現れない。none は何も名乗って\
+                 いない。--no-color-convert で画素を sRGB へ変換しなかったときだけこうなり、\
+                 ICC_NOT_EMBEDDED が理由を言う（AVIF はそのときも nclx のまま）。--dry-run でも\
+                 実際にエンコードした結果を言う",
+            ),
+        },
+        FieldEntry {
             path: "rotate.angle",
             // `kiri rotate` と `cutout --rotate` が同じブロックを返す。
             // 順序を固定したいなら後者を使う（README「切り抜いた後に回す」）

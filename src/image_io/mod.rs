@@ -1,6 +1,7 @@
+pub mod derive;
 pub mod heif;
 pub mod load;
 pub mod save;
 
 pub use load::{LoadOptions, LoadedImage};
-pub use save::{OutputFormat, SaveOptions, encode, save};
+pub use save::{IccPolicy, IccSignal, OutputFormat, SaveOptions, encode, save, write_encoded};

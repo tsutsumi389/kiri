@@ -93,6 +93,8 @@ warning_catalog! {
         => "resize で元画像より大きくした",
     AlphaFlattened = "ALPHA_FLATTENED"
         => "出力形式が透過を保持できないので背景色で合成した",
+    IccNotEmbedded = "ICC_NOT_EMBEDDED"
+        => "画素が sRGB でないので sRGB の ICC を埋め込まなかった（AVIF は AV1 の色情報で sRGB を名乗ったまま）",
     PreviewFailed = "PREVIEW_FAILED"
         => "プレビューを書き出せなかった（本出力の成否とは独立。--dry-run なら本出力は無い）",
     ColorProfileUnsupported = "COLOR_PROFILE_UNSUPPORTED"

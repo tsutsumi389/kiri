@@ -1,6 +1,6 @@
 # kiri 実装計画
 
-最終更新: 2026-09-15
+最終更新: 2026-09-23
 
 設計の詳細と決定根拠は [design.md](./design.md) を参照。本書は実装の進め方のみを扱う。
 
@@ -19,10 +19,12 @@ src/
   image_io/
     load.rs            JPEG/PNG 読み込み + EXIF Orientation 正規化 + ICC → sRGB
     heif.rs            HEIC/AVIF の判別と、変換手順を添えたエラー
-    save.rs            AVIF/PNG/JPEG 書き出し、拡張子からの形式推論
+    save.rs            AVIF/PNG/JPEG 書き出し、拡張子からの形式推論、sRGB の名乗り（IccPolicy）
+    derive.rs          最終画像 1 枚 → 書き出す派生（Derivation）のエンコードと書き込み
   color/
     lab.rs             sRGB ↔ Lab 変換、知覚的色距離（ΔE）
     icc.rs             埋め込み ICC の解釈と sRGB への変換（行列 + TRC 型のみ）
+    srgb_profile.rs    出力へ埋める sRGB の ICC（v2、516B）を自前で組む
     synthetic.rs       テスト用の合成 ICC 生成（#[cfg(test)]）
   cutout/
     background.rs      背景色推定、uniformity とテクスチャ（外周の勾配分布）算出
@@ -894,9 +896,36 @@ public リポジトリなので GitHub 製の標準ランナーは分数無制�
         形が無い（切り出すとしたら商品の外接矩形 + 3σ だが、商品が画面を占める
         EC の素材では縮まない）
 
+- [x] Phase 18: 出力を 1 本の派生パイプラインへ畳み、sRGB の ICC を埋める
+  - [x] `image_io/derive.rs` の `Derivation` / `render()` を `write_image()` が通る。
+        convert / resize / rotate / cutout / batch の全経路が 1 本になった
+  - [x] **ICC を除けば出力バイト列は 1 バイトも変わらない。** 旧バイナリ（main の
+        d923e4a）との md5 比較 33 本（`tests/fixtures/backgrounds` の 3 枚の convert と、
+        実写 2 枚（Display P3、`sips` で JPEG 化）・合成 2 枚の convert / cutout を、
+        それぞれ PNG / JPEG / AVIF へ。cutout の JPEG は `--canvas 800x800 --flatten`）。
+        AVIF はそのまま一致、PNG は iCCP を、JPEG は ICC の APP2 を抜くと一致する。
+        増えるのは PNG で 318 バイト、JPEG で 534 バイト（APP2 の 18 + プロファイル 516）
+  - [x] 書いた PNG / JPEG を `kiri info` に戻すと `color_profile` が
+        `sRGB IEC61966-2.1` で、変換も警告も起きない（`color_space` だけでは ICC が
+        無くても `sRGB` と答えるので、名前で確かめる）
+  - [x] `outputs[].icc`（`embedded` / `nclx` / `none`）と `ICC_NOT_EMBEDDED`。
+        警告は `--no-color-convert` で画素を変換しなかったときだけ出る
+  - [x] `batch.rs` の `ItemSettings` と `SETTING_KEYS` の一致をテスト 1 本で守る
+        （serde の derive が渡すフィールド名を横取りして比べる）
+  - ※ **AVIF は `colr` を書けない。** ravif 0.13 に口が無く、sRGB は AV1 シーケンス
+        ヘッダの CICP でしか名乗れない。`--no-color-convert` の画素でも名乗りを
+        外せないので、`nclx` のまま警告だけを出す。kiri は AVIF を読めないので、
+        名乗りの検査はテストの中のボックスと OBU の読み取りに頼っている
+  - ※ **PNG に `sRGB` チャンクを併記しない。** png クレートが iCCP と排他にしており、
+        PNG 3 も併存を勧めない。`sRGB` チャンクだけを見る古い読み手には名乗りが
+        届かない
+  - ※ **計画書が先に名指しする未実装の code を、`tests/cli.rs` の予定の code の表で
+        許した。** 着手時点で `every_code_named_in_the_docs_exists` が落ちていた。
+        許すのは計画書の中だけで、表に載ったまま実装された code は別の表明で落とす
+
 ## 6. 残件の優先順位
 
-§5 の `[ ]` は 2 件ある（`※` の 23 件は作業ではないので数えない）。着手の順は
+§5 の `[ ]` は 2 件ある（`※` の 27 件は作業ではないので数えない）。着手の順は
 P0 → P2 で、**同じ P の中では上から**。
 
 ここに並ぶのは**いまの kiri を完成させるための残件**である。EC 特化のために
@@ -976,33 +1005,51 @@ P0 → P2 で、**同じ P の中では上から**。
 
 #### Phase 18: 出力パイプラインの一本化 ＋ sRGB ICC の埋め込み
 
+**済（§5 の Phase 18）。**
+
 **なぜここか。** Phase 19 / 20 が同じ `encode()` を奪い合う。先に「1 つの最終画像 →
 N 個の派生」という内部型を通し、**N = 1 のときに 1 バイトも変わらないことを固定**
 してから機能を載せる。ICC をここへ畳むのは 7.1 の 2 による。
 
-- `image_io/derive.rs`（新）に `Derivation { role, width, height, fit, format,
-  quality, effort, max_bytes, flatten, background }` と
-  `render(&RgbaImage, &[Derivation]) -> Vec<OutputReport>` を置く。この時点では
-  `OutputOpts` から `Derivation` を 1 個作るだけで、外から見た挙動は変わらない
-- `SaveOptions` に `icc: IccPolicy`（`Embed` / `None`）を足す。PNG は iCCP + sRGB
-  チャンク、JPEG は SOI 直後への APP2 挿入、AVIF は ravif が書く nclx で sRGB を
-  名乗り、**ICC ボックスは入れない**
+- `image_io/derive.rs`（新）に `Derivation { path, format, quality, effort,
+  background, flatten, icc }` と
+  `render(&RgbaImage, &[Derivation], dry_run: bool) -> Result<Vec<Rendered>>`
+  （`Rendered { report: OutputReport, warnings }`。最初の失敗で止まる）を置いた。
+  `write_image()` は `OutputOpts` から `Derivation` を 1 個作るだけで、外から見た
+  挙動は変わらない。**`role` / 寸法 / `max_bytes` は置いていない。** 読まれない
+  フィールドを先に置くと「指定したのに効かない」が型として作れてしまうので、
+  それを読むフェーズ（19 / 20）で足す。寸法は `ResizeSpec` を 1 つ足す形にする
+- `SaveOptions` に `icc: IccPolicy`（`Embed` / `None`。既定は `Embed`）を足した。
+  PNG / JPEG は `image` 0.25.6 以降の `ImageEncoder::set_icc_profile` に渡すだけで、
+  チャンクもセグメントも自前では挿さない。PNG は IHDR 直後の **iCCP 1 個だけ**
+  （png クレートが iCCP と sRGB チャンクを排他にしており、PNG 3 も併存を勧めない）、
+  JPEG は **APP0（JFIF）の直後**の APP2（SOI の直後に置くと JFIF に反する）。
+  AVIF は `IccPolicy` を見ず、ravif が AV1 シーケンスヘッダの CICP（1 / 13 / 6 /
+  full）で sRGB を名乗る。**`colr` ボックスは出ない**（既定値と同じなので
+  avif-serialize が省く）。ICC ボックスも入れない
 - **プロファイルのバイト列は外から持ってこず自前で生成する。** `color/icc.rs` が
-  既に行列 + TRC 型を解釈しているので、逆向きに最小の v2 プロファイル（〜500B）を
-  組むのは短い。`qcms` や `lcms2` を引くより依存も権利も軽い
+  既に行列 + TRC 型を解釈しているので、逆向きに最小の v2 プロファイル（516B）を
+  組んだ（`color/srgb_profile.rs`）。`qcms` や `lcms2` を引くより依存も権利も軽い
+- **出すかどうかは画素の素性で決める。** `LoadedImage.srgb_pixels` が偽のとき
+  （`--no-color-convert` で変換しなかった）だけ `IccPolicy::None` にして
+  `ICC_NOT_EMBEDDED` を出す。preview のコンタクトシートは成果物ではないので常に `None`
 - `batch.rs` の 3 箇所（`ItemSettings` のフィールド / `merged_over` の `pick!` /
-  `SETTING_KEYS`）が一致していることを守るテストを**ここで入れる**。以降の
-  フェーズで spec のキーが 10 個以上増えるのに、いまその一致を守るものが無い
+  `SETTING_KEYS`）の一致は**テスト 1 本で守る**。serde の derive が渡すフィールド名を
+  横取りして `SETTING_KEYS` と比べる。`pick!` は構造体リテラルなので読み忘れは
+  コンパイラが止める。1 つの表へ畳むマクロは差分に見合わないので採らなかった
 
-規模 L。衝突リスク:
+規模 L。衝突リスク（着手前の見立てと実態）:
 
-- **中** — `image` 0.25 の `PngEncoder` / `JpegEncoder` は ICC の埋め込み API を
-  公開していない。PNG はチャンクを自前で挿入し、JPEG は APP2 を挿す。どちらも
-  pure Rust の縛りには触れない
-- **中** — 全ゴールデンが一度動く。**このフェーズ以外では動かさない**ことを守るのが、
-  後続フェーズの回帰判定を成立させる
+- 中 → 無し — 「`image` 0.25 は ICC の埋め込み API を公開していない」という見立ては
+  **外れていた**。0.25.6 で `set_icc_profile` が入っている。`Cargo.toml` の下限を
+  `0.25.6` に上げただけで、チャンクやセグメントの自前の挿入は書いていない
+- 中 → 小 — 「全ゴールデンが一度動く」も外れていた。保存されたバイト列のゴールデンは
+  存在しなかった。取り直したのは入力とのバイト一致を見ていた
+  `rotate_by_a_full_turn_returns_the_original_bytes` の 1 本だけ（iCCP を抜いて
+  比べる）。既存の決定性テストは無修正で通る。**このフェーズ以外では出力バイト列を
+  動かさない**ことは引き続き守る
 - **小** — 「PNG/JPEG は ICC、AVIF は nclx」という非対称が契約に出る。
-  `outputs[].icc`（`"embedded"` / `"nclx"` / `"none"`）で明示する
+  `outputs[].icc`（`"embedded"` / `"nclx"` / `"none"`）で明示した
 
 #### Phase 19: `--max-bytes`
 
@@ -1090,7 +1137,8 @@ Phase 22 が同じ exit code の語彙を使うので、その前に置く。
   占有率」と規格を主張しており、**profile と二重定義になる**。profile 側を正とし、
   既定値のコメントから規格の主張を外す
 - `kiri lint <file> --profile amazon` の**画素の検査は JPEG / PNG のみ**。AVIF は
-  コンテナ（寸法・alpha・colr）までとし、検査できなかった項目は
+  コンテナ（寸法・alpha、色の名乗りは `colr` があればそれを、無ければ AV1 シーケンス
+  ヘッダの CICP）までとし、検査できなかった項目は
   `checks[].status: "skipped"` ＋ `PROFILE_UNCHECKABLE` で明示する。**黙って合格に
   しない**
 
@@ -1166,8 +1214,10 @@ Phase 25 --reflect（依存なし。いつでも繰り上げ可）
 
 **一度に直すべき点は Phase 18 の 1 箇所である。** Phase 19 / 20 と ICC はすべて
 `write_image()` → `encode()` を通るので、そこへ `Derivation` と `render()` を
-差し込み、`SaveOptions` に `icc` を足す手術を 1 回だけ行い、**N = 1・ICC あり**で
-既存の全ゴールデンを取り直す。以降のフェーズはこの上に載るだけになる。
+差し込み、`SaveOptions` に `icc` を足す手術を 1 回だけ行う。保存されたゴールデンは
+無かったので、取り直したのは入力とのバイト一致を見ていた rotate の 1 本だけで、
+**ICC 込みの決定性**は新しいテストで固定した（§7.5 の Phase 18）。以降のフェーズは
+この上に載るだけになる。
 
 ### 7.4 契約への影響
 
@@ -1176,7 +1226,7 @@ Phase 25 --reflect（依存なし。いつでも繰り上げ可）
 
 | Phase | code | 出る条件 |
 |---|---|---|
-| 18 | `ICC_NOT_EMBEDDED` | 形式が ICC を持てない（AVIF は nclx で名乗る） |
+| 18 | `ICC_NOT_EMBEDDED` | `--no-color-convert` で画素を sRGB へ変換しなかった（PNG / JPEG は ICC を埋めず、AVIF は名乗ったまま） |
 | 19 | `MAX_BYTES_UNREACHABLE` | 下限品質でも目標サイズに届かなかった |
 | 19 | `QUALITY_REDUCED` | 要求品質から落として目標サイズを達成した |
 | 20 | `MANIFEST_PARTIAL` | 一部の派生が失敗したままマニフェストを書いた |
@@ -1217,11 +1267,21 @@ batch spec には `profile` / `max_bytes` / `derive` / `naming` / `fail_on` /
 
 ### 7.5 テスト方針
 
-- **Phase 18** — (a) `Derivation` 1 個のとき、ICC 抜きの出力が Phase 17 と 1 バイトも
-  一致する（構造変更の無害性）。(b) 書いた PNG/JPEG を `kiri info` に食わせると
-  `color_profile` が sRGB を名乗る（**外部ツールに頼らない自己完結の検証**）。
-  (c) iCCP / APP2 が 1 個だけ、位置が規格どおりであることをバイト列で検査。
-  (d) 既存の決定性テストを ICC 込みで再固定
+- **Phase 18**（済。結果は §5 の Phase 18 に、テスト名はここに並べた）— (a)
+  `Derivation` 1 個のとき、ICC 抜きの出力が Phase 17 と 1 バイトも一致する（構造変更の無害性。
+  `icc_none_png_is_the_phase17_encoder_output` / `icc_none_jpeg_…` /
+  `avif_bytes_do_not_depend_on_the_icc_policy` /
+  `render_with_one_derivation_writes_what_encode_returns`）。(b) 書いた PNG/JPEG を
+  `kiri info` に食わせると `color_profile` が sRGB を名乗る（**外部ツールに頼らない
+  自己完結の検証**。`a_written_png_and_jpeg_name_srgb_when_read_back`）。
+  (c) iCCP / APP2 が 1 個だけ、位置が規格どおりであることをバイト列で検査
+  （`png_carries_exactly_one_iccp_right_after_ihdr` /
+  `jpeg_carries_exactly_one_icc_app2_right_after_jfif` /
+  `avif_names_srgb_only_through_the_av1_sequence_header` ほか）。(d) 決定性を
+  ICC 込みで再固定（`png_and_jpeg_outputs_are_deterministic_with_icc` /
+  `the_profile_bytes_are_pinned`）。加えて、`--no-color-convert` の画素を書いた
+  ファイルに ICC が無く `ICC_NOT_EMBEDDED` が 1 回だけ出ることを、convert と batch の
+  両方でファイルの中身から確かめる（`unconverted_pixels_are_written_without_the_srgb_icc`）
 - **Phase 19** — 「達成したら必ず `max_bytes` 以下」「未達なら必ず
   `MAX_BYTES_UNREACHABLE`」「同じ入力で `quality_used` と `attempts` が毎回同じ」。
   単調性は固定しない
@@ -1257,7 +1317,7 @@ batch spec には `profile` / `max_bytes` / `derive` / `naming` / `fail_on` /
   `kiri schema` が配る契約が二重化する。batch の `defaults` の隣に `set` を足すほうが
   既存の継承規約をそのまま使えて、エージェントが覚える規則が増えない
 - ※ **合否を警告のまま exit 0 で返し、仕分けは呼び出し側の jq に任せる。** いまの
-  問題はまさに「27 の警告があるのに合否が無い」ことで、そこを外部化すると
+  問題はまさに「28 の警告があるのに合否が無い」ことで、そこを外部化すると
   「契約を自分で配る」設計から合否だけが漏れる。加えて exit code で分岐できないと、
   batch の数百点を仕分ける最短経路が JSON の全走査になる
 - ※ **多派生の形式に WebP を足す。** 7.1 の 3 のとおり pure Rust では可逆しか

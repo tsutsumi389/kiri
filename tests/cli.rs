@@ -808,6 +808,326 @@ fn convert_is_deterministic() {
     );
 }
 
+/// JPEG の SOS より前のセグメントを (マーカー, ペイロード) で並べる。
+fn jpeg_segments(bytes: &[u8]) -> Vec<(u8, &[u8])> {
+    assert_eq!(&bytes[..2], &[0xFF, 0xD8], "JPEG ではない");
+    let mut out = Vec::new();
+    let mut i = 2;
+    loop {
+        // 区切りを確かめずに長さで歩くと、1 度読み違えただけで以降のセグメントを
+        // 黙って取り違える。数え上げの検査が偽りの緑になる
+        assert_eq!(bytes[i], 0xFF, "{i} にマーカーが無い");
+        let marker = bytes[i + 1];
+        let len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
+        out.push((marker, &bytes[i + 4..i + 2 + len]));
+        if marker == 0xDA {
+            return out;
+        }
+        i += 2 + len;
+    }
+}
+
+/// ICC を運ぶ APP2 の数。
+fn jpeg_icc_segments(bytes: &[u8]) -> usize {
+    jpeg_segments(bytes)
+        .iter()
+        .filter(|(m, p)| *m == 0xE2 && p.starts_with(b"ICC_PROFILE\0"))
+        .count()
+}
+
+/// 歩く途中で区切りが `0xFF` でなければ止まる。長さを信じて進むだけだと、
+/// 壊れた並びでも何かしらのセグメント列を返してしまう
+#[test]
+#[should_panic(expected = "マーカーが無い")]
+fn jpeg_segments_refuses_a_misaligned_marker() {
+    // SOI の次が 0x00 で始まる。長さどおりに歩けば SOS まで「読めて」しまう
+    let bytes = [
+        0xFF, 0xD8, 0x00, 0xE0, 0x00, 0x04, 0x00, 0x00, 0xFF, 0xDA, 0x00, 0x02,
+    ];
+    jpeg_segments(&bytes);
+}
+
+/// 書いた出力を kiri 自身に戻すと sRGB と読める。
+///
+/// `color_space` だけでは足りない——ICC が無くても "sRGB" と答えるので、
+/// 名乗りが効いていることは `color_profile` の名前で確かめる。ここが外れると
+/// kiri の出力を kiri へ戻すたびに色変換が走る
+#[test]
+fn a_written_png_and_jpeg_name_srgb_when_read_back() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec::default());
+    let input = write_jpeg(dir.path(), "product.jpg", &img);
+
+    for ext in ["png", "jpg"] {
+        let output = dir.path().join(format!("out.{ext}"));
+        let out = kiri()
+            .args([
+                "convert",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{ext}");
+        assert_eq!(json_stdout(&out)["outputs"][0]["icc"], "embedded", "{ext}");
+
+        let out = kiri()
+            .args(["info", output.to_str().unwrap(), "--json"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{ext}");
+        let v = json_stdout(&out);
+        assert_eq!(v["icc_profile"], true, "{ext}");
+        assert_eq!(v["color_space"], "sRGB", "{ext}");
+        assert_eq!(v["color_profile"], "sRGB IEC61966-2.1", "{ext}");
+        assert_eq!(v["color_converted"], false, "{ext}");
+        assert_eq!(v["warnings"], Value::Array(vec![]), "{ext}");
+    }
+}
+
+/// ICC を埋めても決定性は崩れない。JPEG の決定性はこれまで 1 本も見ていなかった
+#[test]
+fn png_and_jpeg_outputs_are_deterministic_with_icc() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 100,
+        height: 100,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let encode = |name: &str| -> Vec<u8> {
+        let output = dir.path().join(name);
+        let out = kiri()
+            .args([
+                "convert",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{name}");
+        std::fs::read(&output).unwrap()
+    };
+
+    let png = encode("a.png");
+    assert_eq!(png, encode("b.png"), "同じ入力から同じ PNG が出ていない");
+    assert_eq!(
+        png_chunk_kinds(&png)
+            .iter()
+            .filter(|k| *k == b"iCCP")
+            .count(),
+        1
+    );
+
+    let jpeg = encode("a.jpg");
+    assert_eq!(jpeg, encode("b.jpg"), "同じ入力から同じ JPEG が出ていない");
+    assert_eq!(jpeg_icc_segments(&jpeg), 1);
+}
+
+/// 形式ごとの名乗りを結果が言う。`--dry-run` でも書いたときと同じ値になる
+#[test]
+fn outputs_report_how_they_name_the_colour() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 80,
+        height: 80,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    for (ext, expected) in [("png", "embedded"), ("jpg", "embedded"), ("avif", "nclx")] {
+        for dry_run in [false, true] {
+            let output = dir.path().join(format!("out-{dry_run}.{ext}"));
+            let mut args = vec![
+                "convert",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--json",
+            ];
+            if dry_run {
+                args.push("--dry-run");
+            }
+            let out = kiri().args(&args).output().unwrap();
+            assert!(out.status.success(), "{ext} dry_run={dry_run}");
+            let v = json_stdout(&out);
+            assert_eq!(v["outputs"][0]["icc"], expected, "{ext} dry_run={dry_run}");
+            assert!(
+                !has_warning(&v, "ICC_NOT_EMBEDDED"),
+                "{ext} dry_run={dry_run}: sRGB の画素で鳴ってはいけない"
+            );
+            assert_eq!(output.exists(), !dry_run, "{ext}");
+        }
+    }
+}
+
+/// sRGB ではない ICC。kiri 自身の sRGB プロファイルの赤と緑の原色を入れ替えて作る。
+///
+/// 合成プロファイルの組み立て（`color::synthetic`）はライブラリの `cfg(test)` に
+/// しか無く、ここからは呼べない。1 本書き起こすより、外部の検証器を通った自前の
+/// sRGB をタグ表だけいじるほうが、壊れた ICC として別の分岐（`Unsupported`）へ
+/// 落ちる心配が無い
+fn swapped_primaries_icc() -> Vec<u8> {
+    let mut icc = kiri::color::srgb_profile::srgb_icc().to_vec();
+    let count = u32::from_be_bytes(icc[128..132].try_into().unwrap()) as usize;
+    let entry = |icc: &[u8], sig: &[u8; 4]| {
+        (0..count)
+            .map(|k| 132 + 12 * k)
+            .find(|&at| &icc[at..at + 4] == sig)
+            .unwrap_or_else(|| panic!("{} のタグが無い", String::from_utf8_lossy(sig)))
+    };
+    let r = entry(&icc, b"rXYZ");
+    let g = entry(&icc, b"gXYZ");
+    // 署名はそのままに、指す先（オフセットと長さの 8 バイト）だけを入れ替える
+    let r_ptr: [u8; 8] = icc[r + 4..r + 12].try_into().unwrap();
+    let g_ptr: [u8; 8] = icc[g + 4..g + 12].try_into().unwrap();
+    icc[r + 4..r + 12].copy_from_slice(&g_ptr);
+    icc[g + 4..g + 12].copy_from_slice(&r_ptr);
+
+    // 名乗りが sRGB のままだと、警告の文面が「sRGB を sRGB へ変換していない」と読めて
+    // 紛らわしい。長さを変えるとタグの長さも直すことになるので、同じ長さで書き換える
+    let from = kiri::color::srgb_profile::SRGB_PROFILE_NAME.as_bytes();
+    let to = SWAPPED_PROFILE_NAME.as_bytes();
+    assert_eq!(from.len(), to.len());
+    let at = icc
+        .windows(from.len())
+        .position(|w| w == from)
+        .expect("desc に名前が無い");
+    icc[at..at + to.len()].copy_from_slice(to);
+    icc
+}
+
+const SWAPPED_PROFILE_NAME: &str = "kiri: R/G swapped";
+
+fn write_jpeg_with_icc(dir: &Path, name: &str, img: &image::RgbaImage, icc: Vec<u8>) -> PathBuf {
+    use image::ImageEncoder;
+
+    let rgb = image::DynamicImage::ImageRgba8(img.clone()).to_rgb8();
+    let mut jpeg = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90);
+    encoder.set_icc_profile(icc).unwrap();
+    encoder
+        .write_image(
+            rgb.as_raw(),
+            rgb.width(),
+            rgb.height(),
+            image::ExtendedColorType::Rgb8,
+        )
+        .unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, jpeg).unwrap();
+    path
+}
+
+/// 書いたファイルが ICC を運んでいるか。AVIF は ICC を書かないので問わない
+fn file_carries_icc(path: &Path) -> Option<bool> {
+    let bytes = std::fs::read(path).unwrap();
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("png") => Some(png_chunk_kinds(&bytes).contains(b"iCCP")),
+        Some("jpg") => Some(jpeg_icc_segments(&bytes) > 0),
+        _ => None,
+    }
+}
+
+/// `--no-color-convert` で変換しなかった画素は、書いたファイルでも sRGB を名乗らない。
+///
+/// 単体テスト（`output.rs`）は dry-run の報告だけを見ている。報告と中身は同じ
+/// `Derivation` から作られるが、**`write_image` が派生を組む段で値を取り違えても
+/// 報告の側は合ったまま通る**。だからファイルの中身で確かめる。変換した側を対に
+/// 置くのは、入力の ICC がそもそも読めていない（`Unsupported` で埋め込みへ倒れる）
+/// 取り違えを、ここで分けるため
+#[test]
+fn unconverted_pixels_are_written_without_the_srgb_icc() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 80,
+        height: 80,
+        ..Default::default()
+    });
+    let input = write_jpeg_with_icc(dir.path(), "wide.jpg", &img, swapped_primaries_icc());
+
+    for (ext, unconverted) in [("png", "none"), ("jpg", "none"), ("avif", "nclx")] {
+        for convert in [true, false] {
+            let output = dir.path().join(format!("out-{convert}.{ext}"));
+            let mut args = vec![
+                "convert",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--json",
+            ];
+            if !convert {
+                args.push("--no-color-convert");
+            }
+            let out = kiri().args(&args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "{ext} convert={convert}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let v = json_stdout(&out);
+            assert_eq!(v["color_converted"], convert, "{ext} convert={convert}");
+            let named: Vec<&Value> = v["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|w| w["code"] == "ICC_NOT_EMBEDDED")
+                .collect();
+
+            if convert {
+                let expected = if ext == "avif" { "nclx" } else { "embedded" };
+                assert_eq!(v["outputs"][0]["icc"], expected, "{ext}");
+                assert!(named.is_empty(), "{ext}: 変換した画素で鳴っている");
+                assert_ne!(file_carries_icc(&output), Some(false), "{ext}");
+            } else {
+                assert_eq!(v["outputs"][0]["icc"], unconverted, "{ext}");
+                assert_eq!(named.len(), 1, "{ext}: {:?}", warning_codes(&v));
+                assert_eq!(named[0]["data"]["format"], v["outputs"][0]["format"]);
+                assert_eq!(named[0]["data"]["icc"], unconverted, "{ext}");
+                assert_eq!(named[0]["data"]["profile"], SWAPPED_PROFILE_NAME);
+                assert_ne!(
+                    file_carries_icc(&output),
+                    Some(true),
+                    "{ext}: 変換していない画素に sRGB の ICC を付けた"
+                );
+            }
+        }
+    }
+
+    // batch は項目ごとの `color_convert` で同じ分かれ道を通る
+    let spec = write_spec(
+        dir.path(),
+        r#"{"defaults":{"format":"png"},
+            "items":[{"input":"wide.jpg","output":"b/kept.png","color_convert":false},
+                     {"input":"wide.jpg","output":"b/converted.png"}]}"#,
+    );
+    let out = run_batch(&spec, &[]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    for (i, name, icc, warned) in [
+        (0, "kept.png", "none", true),
+        (1, "converted.png", "embedded", false),
+    ] {
+        let result = &v["results"][i]["result"];
+        assert_eq!(result["outputs"][0]["icc"], icc, "{name}");
+        assert_eq!(has_warning(result, "ICC_NOT_EMBEDDED"), warned, "{name}");
+        assert_eq!(
+            file_carries_icc(&dir.path().join("b").join(name)),
+            Some(!warned),
+            "{name}"
+        );
+    }
+}
+
 // --- エラー処理 ---
 
 #[test]
@@ -1313,6 +1633,33 @@ fn resize_respects_the_overwrite_guard() {
 
 // --- rotate ---
 
+/// PNG のチャンクの型を並べる。
+fn png_chunk_kinds(bytes: &[u8]) -> Vec<[u8; 4]> {
+    assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "PNG ではない");
+    let mut kinds = Vec::new();
+    let mut i = 8;
+    while i < bytes.len() {
+        let len = u32::from_be_bytes(bytes[i..i + 4].try_into().unwrap()) as usize;
+        kinds.push(bytes[i + 4..i + 8].try_into().unwrap());
+        i += 12 + len;
+    }
+    kinds
+}
+
+/// 指定した型のチャンクを落とす。CRC はチャンクごと持ち運ぶので計算し直さない
+fn png_without_chunk(bytes: &[u8], kind: &[u8; 4]) -> Vec<u8> {
+    let mut out = bytes[..8].to_vec();
+    let mut i = 8;
+    while i < bytes.len() {
+        let len = u32::from_be_bytes(bytes[i..i + 4].try_into().unwrap()) as usize;
+        if &bytes[i + 4..i + 8] != kind {
+            out.extend_from_slice(&bytes[i..i + 12 + len]);
+        }
+        i += 12 + len;
+    }
+    out
+}
+
 /// 回転結果の JSON を取る。角度以外は常に同じ呼び方をする。
 fn rotate_json(input: &Path, output: &Path, angle: &str, extra: &[&str]) -> Value {
     let mut args: Vec<String> = vec![
@@ -1380,10 +1727,19 @@ fn rotate_by_a_full_turn_returns_the_original_bytes() {
 
     let v = rotate_json(&input, &output, "360", &[]);
     assert_eq!(v["rotate"]["angle"], 0.0);
+    assert_eq!(v["outputs"][0]["icc"], "embedded");
+    let written = std::fs::read(&output).unwrap();
+    assert_eq!(
+        png_chunk_kinds(&written)
+            .iter()
+            .filter(|k| *k == b"iCCP")
+            .count(),
+        1
+    );
     assert_eq!(
         std::fs::read(&input).unwrap(),
-        std::fs::read(&output).unwrap(),
-        "1 周は何もしないのと同じでなければならない"
+        png_without_chunk(&written, b"iCCP"),
+        "1 周は何もしないのと同じでなければならない（sRGB の名乗りを除く）"
     );
 }
 
@@ -6625,12 +6981,41 @@ fn a_parser_level_failure_returns_no_json() {
     );
 }
 
+/// 計画書（docs/implementation-plan.md）だけが先に名指ししてよい、未実装の code。
+/// **実装したら必ずここから消す**——実装済みのまま残っていると下の検査が落ちる。
+/// README / design.md には許さない（エージェントが写し取る場所だから）
+const PLANNED_CODES: &[&str] = &[
+    "MAX_BYTES_UNREACHABLE",
+    "QUALITY_REDUCED",
+    "MANIFEST_PARTIAL",
+    "PROFILE_OVERRIDDEN",
+    "PROFILE_UNCHECKABLE",
+    "ROTATE_AUTO_SKIPPED",
+    "SET_SCALE_CLAMPED",
+    "WHITE_BALANCE_SKIPPED",
+    "REFLECT_CLIPPED",
+    "INVALID_MAX_BYTES",
+    "INVALID_DERIVATION",
+    "INVALID_NAMING_TEMPLATE",
+    "OUTPUT_NAME_COLLISION",
+    "UNKNOWN_PROFILE",
+    "INVALID_FAIL_ON",
+    "MANIFEST_WRITE_FAILED",
+    "QUALITY_GATE_FAILED",
+    "PROFILE_VIOLATION",
+];
+
 /// ドキュメントが名指しする code は、実在する code か実在する定数のどちらかである。
 ///
 /// `every_documented_code_is_actually_reachable` はカタログ → 実装の向きしか見ない。
 /// **逆向き（文書 → カタログ）が抜けていて、実際に幽霊を 2 つ通した**
 /// （README の `NOT_FOUND` と design.md の `BACKGROUND_NOT_UNIFORM`）。
 /// 書き写した例は、エージェントが最も写し取りやすい場所にある。
+///
+/// 計画書だけは例外で、これから作る code を先に名指しする。そこを一律に落とすと
+/// 計画を書いた時点で赤くなり、検査ごと外したくなる。**予定の code を表で数え上げ、
+/// 計画書の中でだけ通す。** 表に載ったまま実装された code と、計画書から消えたのに
+/// 表に残った code は別の表明で落とす——表が実態から少しずつずれないようにするため
 #[test]
 fn every_code_named_in_the_docs_exists() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -6651,13 +7036,30 @@ fn every_code_named_in_the_docs_exists() {
     collect_source(&root.join("src"), &mut source);
     collect_public_string_constants(&root.join("tests"), &mut source);
 
+    // 逆向きも見る。計画書が名指しをやめた code が表に残ると、次に誰かが同じ名前を
+    // 計画書へ書いたとき、検討されないまま素通しになる
+    let plan =
+        all_caps_words(&std::fs::read_to_string(root.join("docs/implementation-plan.md")).unwrap());
+    for p in PLANNED_CODES {
+        assert!(
+            !known.iter().any(|k| k == p),
+            "{p} は実装済みなので PLANNED_CODES から消すこと"
+        );
+        assert!(
+            plan.iter().any(|w| w == p),
+            "{p} は計画書が名指ししていないので PLANNED_CODES から消すこと"
+        );
+    }
+
     for doc in ["README.md", "docs/design.md", "docs/implementation-plan.md"] {
         let text = std::fs::read_to_string(root.join(doc)).unwrap();
         for name in all_caps_words(&text) {
             let is_code = known.contains(&name);
             let is_constant = source.contains(&format!("const {name}"));
+            let is_planned =
+                doc == "docs/implementation-plan.md" && PLANNED_CODES.contains(&name.as_str());
             assert!(
-                is_code || is_constant,
+                is_code || is_constant || is_planned,
                 "{doc} が実在しない code を名指ししている: {name}"
             );
         }
@@ -7158,6 +7560,25 @@ fn every_published_field_exists_in_the_result() {
         "--angle",
         "90",
     ]);
+    // `outputs[]` は書き出すコマンドすべてに出る。convert / resize も名指しされる
+    let converted = run(&[
+        "convert",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--dry-run",
+        "--json",
+    ]);
+    let resized = run(&[
+        "resize",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--width",
+        "200",
+        "--dry-run",
+        "--json",
+    ]);
     // **`shadow` も合成したときだけ現れる。** 既定の実行で探すと「配った path が
     // 存在しない」になるので、影を足した実行も用意する（`constraints` と同じ扱い）
     let shadowed = run(&[
@@ -7221,6 +7642,8 @@ fn every_published_field_exists_in_the_result() {
                 "cutout" if path.starts_with("shadow.") => &shadowed,
                 "cutout" if path.starts_with("rotate.") => &rotated,
                 "rotate" => &turned,
+                "convert" => &converted,
+                "resize" => &resized,
                 "cutout" => &cutout,
                 other => panic!("{path} が未知のコマンド {other} を名指ししている"),
             };

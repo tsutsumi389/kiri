@@ -18,7 +18,7 @@ use crate::cutout::{
     Constraint, ConstraintSource, Constraints, CutoutOptions, FG_SEED_RADIUS, Matting, cutout_seen,
 };
 use crate::error::{Error, ErrorCode, Result};
-use crate::image_io::{LoadOptions, OutputFormat, SaveOptions, load, save};
+use crate::image_io::{IccPolicy, LoadOptions, OutputFormat, SaveOptions, load, save};
 use crate::preview::{PreviewSpec, contact_sheet};
 use crate::report::{
     CanvasReport, ConstraintsReport, CutoutReport, Dimensions, MaskReport, OptimizeCandidate,
@@ -184,7 +184,8 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     };
     let final_image = placed.as_ref().unwrap_or(&result.image);
 
-    let (output_report, save_warnings) = output::write_image(final_image, &args.out, format)?;
+    let (output_report, save_warnings) =
+        output::write_image(final_image, &loaded, &args.out, format)?;
     warnings.extend(save_warnings);
 
     let preview = write_preview(
@@ -586,6 +587,8 @@ fn write_preview(
         effort: 6,
         background: [255, 255, 255],
         flatten: false,
+        // preview は成果物ではない。名乗りを付けずバイト列を動かさない
+        icc: IccPolicy::None,
     };
 
     let written = contact_sheet(original, mask, final_image, constraints, &spec)

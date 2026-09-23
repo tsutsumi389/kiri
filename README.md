@@ -17,7 +17,7 @@ AIエージェントから使われることを前提とした、EC商品画像�
 - **色で解けないものはモデルに聞ける** — 任意の `--segment` でセグメンテーションモデルを**粗マスクの供給源**として使う。既定では走らず、モデルは別ファイル。[意味の事前知識](#意味の事前知識モデルに何を聞くか)を参照
 - **設定の探索を kiri に任せられる** — `--optimize` は `info` → `cutout` → 調整という 3 手のループを 1 コマンドへ畳む。[探索を kiri に任せる](#探索を-kiri-に任せるoptimize)を参照
 - **仕上げまで 1 本で** — キャンバス配置、[落ち影の合成](#落ち影を合成する)（`--shadow synth`）、回転、Web配信形式への変換
-- **結果を自分で採点する** — `mask` が返す 7 項目（前景比率・ハロー・境界の色差・遷移幅・輪郭の粗さ・縁の汚染・外周接触）と、機械可読な 24 の警告
+- **結果を自分で採点する** — `mask` が返す 7 項目（前景比率・ハロー・境界の色差・遷移幅・輪郭の粗さ・縁の汚染・外周接触）と、機械可読な 28 の警告
 - **AIエージェント向けの構造化I/O** — `--json` で結果を返し、stdout はJSONのみ、ログは stderr に分離
 - **契約を自分で配る** — `kiri schema` がオプションと警告・エラー code の一覧を返す。README を読ませなくてよい
 - **書かずに試せる** — `--dry-run` は成果物を 1 バイトも変えずに、書いたときと同じ結果を返す
@@ -478,7 +478,8 @@ Adobe RGB (1998)、各種モニタプロファイルはすべてこの型に収�
 
 sRGB 相当のプロファイルは変換しない。判定は名前ではなく原色と TRC で行う（「sRGB」を
 名乗りながらガンマが違うプロファイルは実在するため）。往復の丸め誤差を足すだけであり、
-**sRGB 素材の出力バイト列はこの機能の前後で 1 バイトも変わらない。**
+**sRGB 素材の画素はこの機能の前後で 1 バイトも変わらない。** 変わらないのは画素の話で、
+出力ファイルには[後述の](#出力は-srgb-を名乗る) sRGB の ICC ぶん（数百バイト）が加わる。
 
 > バイト一致は**同じバイナリを同じ環境で走らせたとき**の話である。色変換は `powf` を
 > 経由するので、libm の実装が違うプラットフォームやコンパイラの版をまたぐと最下位
@@ -491,6 +492,24 @@ sRGB 相当のプロファイルは変換しない。判定は名前ではなく
 
 変換にかかるコストは 12MP で **5ms 前後**、ピーク RSS の増加は **2MB**（Apple M4 Pro、
 `/usr/bin/time -l`）。画像を複製せずその場で書き換えるため、メモリはほぼ増えない。
+
+#### 出力は sRGB を名乗る
+
+入力を sRGB へ揃えても、出力が何も名乗らなければ閲覧側はモニタの色空間と取り違え得る。
+**既定で出力に sRGB を名乗らせる。** 何を名乗ったかは `outputs[].icc` が返す。
+
+| 形式 | `icc` | 名乗り方 |
+|---|---|---|
+| PNG | `embedded` | `iCCP` チャンクに sRGB の ICC（`sRGB` チャンクは併記しない） |
+| JPEG | `embedded` | APP0（JFIF）の直後の APP2 に sRGB の ICC |
+| AVIF | `nclx` | ICC ではなく AV1 の色情報（BT.709 の原色 / sRGB の転送特性）。`colr` ボックスは既定値と同じなので省かれる |
+
+AVIF に ICC を入れないのは、AV1 の色情報だけで sRGB を言い切れるうえ、使っている
+エンコーダ（ravif）に ICC を渡す口が無いため。**kiri は AVIF を読めないので、`kiri info` で名乗りを確かめられるのは
+PNG / JPEG だけ**である。`--no-color-convert` で画素を sRGB へ変換しなかったときは、PNG / JPEG
+は ICC を埋めず `icc: "none"` と `ICC_NOT_EMBEDDED` を返す（名乗りが嘘になるため）。AVIF は
+名乗りを外す手段が無いので `nclx` のまま、警告だけが出る。プロファイルは kiri が自前で組む
+516 バイトの v2 プロファイルで、外部ファイルや `lcms2` / `qcms` には頼らない。
 
 ### kiri convert
 
@@ -2101,6 +2120,7 @@ sRGB のまま比べると**ガンマぶんだけ暗い側へ偏る**（黒い�
 | `DRY_RUN_OUTPUT_EXISTS` | `--dry-run` の出力先が既にある。本番実行には `--force` が要る |
 | `UPSCALED` | `resize` で拡大した |
 | `ALPHA_FLATTENED` | 出力形式が透過を保持できないので合成した |
+| `ICC_NOT_EMBEDDED` | 画素が sRGB でないので ICC を埋め込まなかった（AVIF は名乗ったまま） |
 | `PREVIEW_FAILED` | プレビューを書き出せなかった（成果物自体は書けている） |
 | `COLOR_PROFILE_UNSUPPORTED` | ICC が LUT 型などで sRGB へ変換できなかった |
 | `COLOR_CONVERSION_SKIPPED` | `--no-color-convert` により変換していない |
@@ -2189,7 +2209,7 @@ $ kiri cutout product.jpg -o product.png --preview check.png
 $ kiri cutout product.jpg -o product.png --tolerance 18 --dry-run --json
 {
   "dry_run": true,
-  "outputs": [{ "path": "product.png", "format": "png", "width": 1600, "height": 2000, "bytes": 861432 }],
+  "outputs": [{ "path": "product.png", "format": "png", "width": 1600, "height": 2000, "bytes": 861432, "icc": "embedded" }],
   "mask": { "foreground_ratio": 0.2164, "separability": 68.3, "halo_ratio": 0.0, "edge_width": 1.0 },
   "warnings": []
 }
@@ -2354,6 +2374,7 @@ $ kiri model list --json
 
 - **入力**: JPEG, PNG
 - **出力**: AVIF, PNG, JPEG
+- 出力は sRGB を名乗る（PNG / JPEG は ICC、AVIF は AV1 の色情報）
 
 WebP は実用的なロッシー圧縮に libwebp（C）が必要なため、AVIF入力はデコードに dav1d（C）が
 必要なため、いずれも非対応とした。依存ゼロの単一バイナリを優先した結果である。

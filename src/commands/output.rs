@@ -8,7 +8,8 @@ use image::RgbaImage;
 use crate::cli::OutputOpts;
 use crate::cutout::{BackgroundEstimate, DeltaEQuantiles, ResolvedModel, SubjectHint};
 use crate::error::{Error, ErrorCode, Result};
-use crate::image_io::{LoadedImage, OutputFormat, SaveOptions, encode, save};
+use crate::image_io::derive::{Derivation, Rendered, render};
+use crate::image_io::{IccPolicy, IccSignal, LoadedImage, OutputFormat};
 use crate::report::{
     BackgroundReport, Dimensions, OutputReport, PerimeterDeltaE, PerimeterTexture, ProcessReport,
     SCHEMA_VERSION, SubjectReport,
@@ -146,37 +147,71 @@ pub fn subject_report(subject: &SubjectHint, source: &'static str) -> SubjectRep
 }
 
 /// 画像を書き出し、出力レポートと警告を返す。
+///
+/// 読み込み結果を受けるのは、**出力が何を名乗るかを画素の素性で決める**ため。
+/// `--no-color-convert` で変換しなかった画素に sRGB の ICC を付けると、名乗りが嘘になる
 pub fn write_image(
     image: &RgbaImage,
+    loaded: &LoadedImage,
     opts: &OutputOpts,
     format: OutputFormat,
 ) -> Result<(OutputReport, Vec<Warning>)> {
-    let save_opts = SaveOptions {
+    let icc = if loaded.srgb_pixels {
+        IccPolicy::Embed
+    } else {
+        IccPolicy::None
+    };
+    let mut rendered = render(image, &[derivation(opts, format, icc)], opts.dry_run)?;
+    // 派生は 1 個しか渡していないので、戻りも必ず 1 個
+    let Rendered {
+        report,
+        mut warnings,
+    } = rendered.remove(0);
+    if icc == IccPolicy::None {
+        warnings.push(icc_not_embedded(loaded, format, report.icc));
+    }
+    Ok((report, warnings))
+}
+
+fn derivation(opts: &OutputOpts, format: OutputFormat, icc: IccPolicy) -> Derivation {
+    Derivation {
+        path: opts.output.clone(),
         format,
         quality: opts.quality,
         effort: opts.effort,
         background: opts.background,
         flatten: opts.flatten,
+        icc,
+    }
+}
+
+/// 名乗りを外した（AVIF では外せなかった）ことを伝える。
+///
+/// 読み込み時の `COLOR_CONVERSION_SKIPPED` は「変換しなかった」までしか言わない。
+/// 出力の側で何が起きたかは形式で違うので、ここで別に言う
+fn icc_not_embedded(loaded: &LoadedImage, format: OutputFormat, signal: IccSignal) -> Warning {
+    let label = match &loaded.color_profile {
+        Some(n) => format!("'{n}'"),
+        None => "（名前なし）".to_string(),
     };
-    // dry-run でもエンコードは通す。`bytes` を見積もりにすると、
-    // 品質と形式の判断が本番実行を挟まないと下せなくなる
-    let (bytes, warnings) = if opts.dry_run {
-        let (encoded, warnings) = encode(image, &save_opts)?;
-        (encoded.len() as u64, warnings)
-    } else {
-        let outcome = save(&opts.output, image, &save_opts)?;
-        (outcome.bytes, outcome.warnings)
+    let message = match format {
+        OutputFormat::Avif => format!(
+            "入力の ICC プロファイル {label} を sRGB へ変換していませんが、AVIF は AV1 の\
+             色情報で sRGB を名乗ったままです（外す手段がありません）"
+        ),
+        OutputFormat::Png | OutputFormat::Jpeg => format!(
+            "入力の ICC プロファイル {label} を sRGB へ変換していないため、sRGB の ICC を\
+             埋め込みませんでした"
+        ),
     };
-    Ok((
-        OutputReport {
-            path: opts.output.display().to_string(),
-            format: format.as_str().to_string(),
-            width: image.width(),
-            height: image.height(),
-            bytes,
-        },
-        warnings,
-    ))
+    let mut warning = Warning::new(WarningCode::IccNotEmbedded, message)
+        .with_hint("--no-color-convert を外すと sRGB へ変換し、名乗りと画素が一致します")
+        .with_data("format", format.as_str())
+        .with_data("icc", signal.as_str());
+    if let Some(n) = &loaded.color_profile {
+        warning = warning.with_data("profile", n.clone());
+    }
+    warning
 }
 
 /// 書き出して結果レポートを組み立てる。
@@ -192,7 +227,7 @@ pub fn finish(
     started: Instant,
     mut warnings: Vec<Warning>,
 ) -> Result<ProcessReport> {
-    let (output, save_warnings) = write_image(image, opts, format)?;
+    let (output, save_warnings) = write_image(image, loaded, opts, format)?;
     warnings.extend(save_warnings);
 
     Ok(ProcessReport {
@@ -212,4 +247,84 @@ pub fn finish(
         elapsed_ms: started.elapsed().as_millis(),
         warnings,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::image_io::load::{LoadOptions, load_with};
+    use image::ImageEncoder;
+
+    fn opts(output: std::path::PathBuf) -> OutputOpts {
+        OutputOpts {
+            output,
+            format: None,
+            quality: 75.0,
+            effort: 6,
+            background: [255, 255, 255],
+            flatten: false,
+            force: false,
+            dry_run: true,
+        }
+    }
+
+    fn not_embedded(warnings: &[Warning]) -> Vec<&Warning> {
+        warnings
+            .iter()
+            .filter(|w| w.code == WarningCode::IccNotEmbedded)
+            .collect()
+    }
+
+    /// 名乗りを外すのは画素が sRGB でないときだけ。sRGB へ変換した画素に
+    /// 警告を出すと、既定の実行で毎回鳴ってしまう
+    #[test]
+    fn icc_not_embedded_only_when_pixels_are_not_srgb() {
+        use crate::color::synthetic::{build, display_p3};
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("p3.jpg");
+        let img = image::RgbImage::from_pixel(16, 16, image::Rgb([200, 60, 40]));
+        let mut raw = Vec::new();
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut raw, 95);
+        encoder.set_icc_profile(build(&display_p3())).unwrap();
+        encoder
+            .write_image(img.as_raw(), 16, 16, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        std::fs::write(&input, raw).unwrap();
+
+        let raw_pixels = load_with(
+            &input,
+            &LoadOptions {
+                convert_color: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!raw_pixels.srgb_pixels);
+        let cases = [
+            (OutputFormat::Png, IccSignal::None),
+            (OutputFormat::Jpeg, IccSignal::None),
+            (OutputFormat::Avif, IccSignal::Nclx),
+        ];
+        for (format, signal) in cases {
+            let out = dir.path().join(format!("out.{}", format.as_str()));
+            let (report, warnings) =
+                write_image(&raw_pixels.image, &raw_pixels, &opts(out), format).unwrap();
+            assert_eq!(report.icc, signal, "{format:?}");
+            let found = not_embedded(&warnings);
+            assert_eq!(found.len(), 1, "{format:?}");
+            assert_eq!(found[0].data["format"], format.as_str());
+            assert_eq!(found[0].data["icc"], signal.as_str());
+            assert_eq!(found[0].data["profile"], "Display P3");
+        }
+
+        let converted = load_with(&input, &LoadOptions::default()).unwrap();
+        assert!(converted.srgb_pixels);
+        for format in [OutputFormat::Png, OutputFormat::Jpeg, OutputFormat::Avif] {
+            let out = dir.path().join(format!("out.{}", format.as_str()));
+            let (report, warnings) =
+                write_image(&converted.image, &converted, &opts(out), format).unwrap();
+            assert!(not_embedded(&warnings).is_empty(), "{format:?}");
+            assert_eq!(report.icc, IccPolicy::Embed.signal(format), "{format:?}");
+        }
+    }
 }

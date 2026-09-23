@@ -338,8 +338,9 @@ pub(crate) fn build(spec: &ProfileSpec) -> Vec<u8> {
 
 /// JPEG に APP2 の `ICC_PROFILE` セグメントを差し込む。
 ///
-/// `image` クレートのエンコーダは ICC を書けないので、読み込み側の経路を
-/// 実ファイルで確かめるには自前で埋め込むしかない。
+/// 本番の出力は `image` の `set_icc_profile` が APP0 の後ろへ書く。これはわざと
+/// SOI の直後へ挿し、読み込み側が位置に寛容であることを確かめるために使う。
+/// 本番の出力の比較基準にはしない。
 pub(crate) fn embed_in_jpeg(jpeg: &[u8], icc: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(jpeg.len() + icc.len() + 32);
     out.extend_from_slice(&jpeg[..2]); // SOI

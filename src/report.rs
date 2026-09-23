@@ -7,6 +7,7 @@ use serde::Serialize;
 
 use crate::cutout::Confidence;
 use crate::error::{Error, ErrorCode};
+use crate::image_io::IccSignal;
 use crate::warning::{Warning, WarningCode};
 
 /// 結果 JSON の契約の版。
@@ -289,6 +290,9 @@ pub struct OutputReport {
     pub width: u32,
     pub height: u32,
     pub bytes: u64,
+    /// 色空間をどう名乗ったか（embedded / nclx / none）。キーは常に出す——省くと
+    /// 「古い版で走った」と「名乗っていない」が同じ形になる
+    pub icc: IccSignal,
 }
 
 #[derive(Debug, Serialize)]

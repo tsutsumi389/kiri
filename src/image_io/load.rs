@@ -55,6 +55,10 @@ pub struct LoadedImage {
     pub color_profile: Option<String>,
     /// 実際に sRGB へ変換したか
     pub color_converted: bool,
+    /// 画素を sRGB として扱えるか。出力に sRGB を名乗らせてよいかをこれで決める。
+    /// false になるのは、変換できるプロファイルを `--no-color-convert` で変換しなかったときだけ——
+    /// LUT 型や uncalibrated は既に「sRGB として扱う」と宣言しているので true
+    pub srgb_pixels: bool,
     /// 実際に不透明でないピクセルが存在するか
     pub has_alpha: bool,
     /// 色空間に起因する警告
@@ -153,6 +157,7 @@ pub fn load_with(path: &Path, opts: &LoadOptions) -> Result<LoadedImage> {
         color_space: color.name,
         color_profile: color.profile,
         color_converted: color.converted,
+        srgb_pixels: color.srgb,
         has_alpha,
         color_warnings: color.warnings,
     })
@@ -164,6 +169,8 @@ struct ColorOutcome {
     /// 埋め込み ICC 自身の名乗り
     profile: Option<String>,
     converted: bool,
+    /// 読み終えた画素を sRGB として扱えるか
+    srgb: bool,
     warnings: Vec<Warning>,
 }
 
@@ -183,6 +190,7 @@ fn normalize_color(
                 name: "uncalibrated".into(),
                 profile: None,
                 converted: false,
+                srgb: true,
                 // ICC が無いので実体を確かめる術がない。sRGB として扱ったことを
                 // 伝えるしかなく、次の一手も「変換して渡し直す」以外に無い
                 warnings: vec![
@@ -200,6 +208,7 @@ fn normalize_color(
                 name: "sRGB".into(),
                 profile: None,
                 converted: false,
+                srgb: true,
                 warnings: Vec::new(),
             },
         };
@@ -223,6 +232,7 @@ fn normalize_color(
             name: "sRGB".into(),
             profile,
             converted: false,
+            srgb: true,
             warnings: Vec::new(),
         },
         Interpretation::Convertible(transform) => {
@@ -233,6 +243,7 @@ fn normalize_color(
                     name,
                     profile,
                     converted: true,
+                    srgb: true,
                     warnings: Vec::new(),
                 }
             } else {
@@ -250,6 +261,7 @@ fn normalize_color(
                     name,
                     profile,
                     converted: false,
+                    srgb: false,
                     warnings: vec![warning],
                 }
             }
@@ -266,6 +278,7 @@ fn normalize_color(
                 name: reported(),
                 profile,
                 converted: false,
+                srgb: true,
                 warnings: vec![warning],
             }
         }
@@ -430,6 +443,7 @@ mod tests {
         assert!(loaded.icc_profile);
         assert_eq!(loaded.color_space, "Display P3");
         assert!(loaded.color_converted);
+        assert!(loaded.srgb_pixels, "変換した画素は sRGB を名乗ってよい");
         assert!(loaded.warnings().is_empty(), "変換できたら黙るべき");
 
         let px = loaded.image.get_pixel(12, 12);
@@ -453,6 +467,11 @@ mod tests {
         .unwrap();
 
         assert!(!raw.color_converted);
+        assert!(
+            !raw.srgb_pixels,
+            "P3 のままの画素に sRGB を名乗らせてはいけない"
+        );
+        assert!(converted.srgb_pixels);
         assert_eq!(raw.color_space, "Display P3");
         assert_eq!(raw.warnings().len(), 1, "変換していないことは伝えるべき");
         assert_ne!(

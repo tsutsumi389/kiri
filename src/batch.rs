@@ -487,4 +487,67 @@ mod tests {
             PathBuf::from("/images/a.jpg")
         );
     }
+
+    /// serde の derive が `deserialize_struct` へ渡すフィールド名（rename 適用後）を
+    /// 横取りする。serde に reflection は無いが、derive は受け付ける名前の一覧を
+    /// `&'static [&'static str]` で必ず渡してくるので、それを読んで即座に止める
+    fn serde_field_names<T: for<'de> Deserialize<'de>>() -> &'static [&'static str] {
+        use serde::de::{self, Deserializer, Visitor};
+
+        struct Probe(Option<&'static [&'static str]>);
+
+        #[derive(Debug)]
+        struct Stop;
+        impl std::fmt::Display for Stop {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("stop")
+            }
+        }
+        impl std::error::Error for Stop {}
+        impl de::Error for Stop {
+            fn custom<M: std::fmt::Display>(_: M) -> Self {
+                Stop
+            }
+        }
+
+        impl<'de> Deserializer<'de> for &mut Probe {
+            type Error = Stop;
+            fn deserialize_any<V: Visitor<'de>>(self, _: V) -> std::result::Result<V::Value, Stop> {
+                Err(Stop)
+            }
+            fn deserialize_struct<V: Visitor<'de>>(
+                self,
+                _: &'static str,
+                fields: &'static [&'static str],
+                _: V,
+            ) -> std::result::Result<V::Value, Stop> {
+                self.0 = Some(fields);
+                Err(Stop)
+            }
+            serde::forward_to_deserialize_any! {
+                bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+                bytes byte_buf option unit unit_struct newtype_struct seq tuple
+                tuple_struct map enum identifier ignored_any
+            }
+        }
+
+        let mut probe = Probe(None);
+        let _ = T::deserialize(&mut probe);
+        probe.0.expect("derive(Deserialize) の構造体であるべき")
+    }
+
+    /// 綴りの検査に使うキー表と、serde が実際に読むキーが一致すること。
+    ///
+    /// `pick!` は `..Default` 無しの構造体リテラルなので、フィールドの読み漏れは
+    /// コンパイラが止める。残るずれ——キー表にだけある / フィールドにだけある /
+    /// `#[serde(rename)]` で名前が変わった——はこの 1 本が止める。ずれると
+    /// 「検査は通るのに値が入らない」か「正しいキーが未知と言われる」になる
+    #[test]
+    fn setting_keys_are_exactly_what_serde_reads() {
+        let mut serde_keys = serde_field_names::<ItemSettings>().to_vec();
+        let mut ours = SETTING_KEYS.to_vec();
+        serde_keys.sort_unstable();
+        ours.sort_unstable();
+        assert_eq!(ours, serde_keys);
+    }
 }

@@ -70,6 +70,18 @@ src/
 | 13 | 背景を 1 色ではなく照明場 B(x, y) として持つ | `--background-model` / `background.field_range` / `background.residual` | 1日 |
 | 14 | 意味の事前知識：pure Rust 推論でセグメンテーションモデルを粗マスクの供給源にする | `--segment` / `kiri model list` / `segment` ブロック | 1日 |
 | 15 | 探索を kiri 側に持たせ、影を合成する | `--optimize` / `--shadow synth` | 1日 |
+| 17 | リリース用 CI：検査のワークフローを置き、feature の有無で 2 系統回す | GitHub Actions | 0.5日 |
+| 18 | 出力を 1 本の派生パイプラインへ畳み、sRGB の ICC を埋める | `Derivation` / `render()` / `outputs[].icc` | 1.5日 |
+| 19 | 目標バイト数へ品質を自動探索する | `--max-bytes` / `outputs[].quality_used` | 1日 |
+| 20 | 1 枚から複数サイズ・複数形式を書き、書いたものを列挙する | `--derive` / `--sizes` / `--formats` / `--manifest` | 2日 |
+| 21 | 品質指標を合否に畳み、exit code で仕分けられるようにする | `--fail-on` / exit 5 / `BatchReport.rejected` | 1日 |
+| 22 | モール規格をプリセットとして持ち、既存画像を検査する | `--profile` / `kiri lint` / `schema.profiles[]` | 2日 |
+| 23 | 主体の傾きを畳み、セット内で大きさと余白を揃える | `--rotate auto` / batch の `set` | 1.5日 |
+| 24 | 背景が中性だという前提と照明場から白点と露出を直す | `--white-balance` / `--exposure` | 2日 |
+| 25 | 反射を合成する | `--reflect` | 1日 |
+
+**Phase 17 以降は EC 特化のロードマップ**で、狙いと順序の根拠は
+[7. EC 特化のロードマップ](#7-ec-特化のロードマップphase-1725)に置く。
 
 **Phase 1 の `kiri info` を最初に完成させる。** 最小で end-to-end が通り、JSON規約とエラー処理の型がそこで確定する。型が決まれば以降は同じ形で積み上げられる。
 
@@ -887,6 +899,12 @@ public リポジトリなので GitHub 製の標準ランナーは分数無制�
 §5 の `[ ]` は 2 件ある（`※` の 23 件は作業ではないので数えない）。着手の順は
 P0 → P2 で、**同じ P の中では上から**。
 
+ここに並ぶのは**いまの kiri を完成させるための残件**である。EC 特化のために
+**足す**ものは [7. EC 特化のロードマップ](#7-ec-特化のロードマップphase-1725)
+に分けた。P0 の「リリース用 CI」はそのまま Phase 17 であり、**2 つの表の交点は
+そこ 1 点だけ**である。P2 の closed-form matting は Phase 24 と同じ「効果が
+測れる保証が薄い」群なので、どちらも着手前にベンチで見積もる。
+
 片付いたものが 2 群ある。かつての P1「契約の穴」6 件（`cutout --rotate` と spec の
 `rotate`、`--model-path` の 2 件、`kiri schema` の `segment_available`、
 `to_probability` / `Probability::new`、`nearest`）と、**P1「性能」9 件**である。
@@ -917,3 +935,334 @@ P0 → P2 で、**同じ P の中では上から**。
 時間を使って数値が動かないことがありうる。
 
 - 帯だけを切り出した closed-form matting（Phase 12）
+
+## 7. EC 特化のロードマップ（Phase 17〜25）
+
+§6 が「いまの kiri を完成させる」残件なのに対し、ここは**EC の運用へ寄せるために
+足すもの**を並べる。いまの kiri は「1 枚をきれいに抜く」方向に尖っていて、
+「カタログ数百点を規格へ揃えて出す」側がほとんど無い。足りないのはそちらである。
+
+### 7.1 順序を決めている 3 つの事実
+
+順序は好みではなく、次の 3 つから決まっている。
+
+1. **出力の合流点はすでに 1 箇所ある。** `commands/output.rs` の `write_image()` と
+   `image_io/save.rs` の `encode()` を、convert / resize / cutout / batch の**全経路が
+   通る**。多派生・`--max-bytes`・マニフェスト・ICC はすべてこの 2 関数の中か直上に
+   着地するので、**手術は 1 回で済ませられるし、済ませるべき**である。バラバラに
+   入れると同じ関数を 4 回開くことになる。
+
+2. **バイト列を動かす変更は、バイト列に依存する機能より前に置く。** ICC の埋め込みは
+   ファイルサイズを数百バイト〜数 KB 動かす。`--max-bytes` の探索結果も、多派生の
+   全出力も、既存の決定性ゴールデンも、後から ICC を入れれば全部取り直しになる。
+
+3. **pure Rust の縛りが 2 箇所で効く。** lossy WebP には libwebp（C）が要り、
+   `image` 0.25 の WebP エンコーダは**可逆のみ**である（`codecs/webp/encoder.rs` が
+   「lossy が要るなら libwebp を使え」と明記している）。AVIF のデコーダも実質
+   dav1d（C）しかない。つまり **kiri は自分が吐いた AVIF の画素を読めない**。
+   これが Phase 20 の形式選びと Phase 22 の `kiri lint` の設計を規定する。
+   `Cargo.toml` が `tract-onnx` について立てた「`*-sys` が 1 つも現れない」という
+   基準は、ここでも同じ重さで効く。
+
+### 7.2 各フェーズ
+
+#### Phase 17: リリース用 CI（= §6 の P0）
+
+**なぜここか。** 以降の全フェーズが出力バイト列とゴールデンを動かす。安全網が
+手元にしか無い状態でエンコーダに触るのは順序として逆である。
+
+中身は [4. CI](#4-ci) のとおり。feature `segment` の有無で 2 系統要り、**MSRV の
+検査に `--features segment` を付けてはならない**。規模 S〜M、新規コードなし。
+
+#### Phase 18: 出力パイプラインの一本化 ＋ sRGB ICC の埋め込み
+
+**なぜここか。** Phase 19 / 20 が同じ `encode()` を奪い合う。先に「1 つの最終画像 →
+N 個の派生」という内部型を通し、**N = 1 のときに 1 バイトも変わらないことを固定**
+してから機能を載せる。ICC をここへ畳むのは 7.1 の 2 による。
+
+- `image_io/derive.rs`（新）に `Derivation { role, width, height, fit, format,
+  quality, effort, max_bytes, flatten, background }` と
+  `render(&RgbaImage, &[Derivation]) -> Vec<OutputReport>` を置く。この時点では
+  `OutputOpts` から `Derivation` を 1 個作るだけで、外から見た挙動は変わらない
+- `SaveOptions` に `icc: IccPolicy`（`Embed` / `None`）を足す。PNG は iCCP + sRGB
+  チャンク、JPEG は SOI 直後への APP2 挿入、AVIF は ravif が書く nclx で sRGB を
+  名乗り、**ICC ボックスは入れない**
+- **プロファイルのバイト列は外から持ってこず自前で生成する。** `color/icc.rs` が
+  既に行列 + TRC 型を解釈しているので、逆向きに最小の v2 プロファイル（〜500B）を
+  組むのは短い。`qcms` や `lcms2` を引くより依存も権利も軽い
+- `batch.rs` の 3 箇所（`ItemSettings` のフィールド / `merged_over` の `pick!` /
+  `SETTING_KEYS`）が一致していることを守るテストを**ここで入れる**。以降の
+  フェーズで spec のキーが 10 個以上増えるのに、いまその一致を守るものが無い
+
+規模 L。衝突リスク:
+
+- **中** — `image` 0.25 の `PngEncoder` / `JpegEncoder` は ICC の埋め込み API を
+  公開していない。PNG はチャンクを自前で挿入し、JPEG は APP2 を挿す。どちらも
+  pure Rust の縛りには触れない
+- **中** — 全ゴールデンが一度動く。**このフェーズ以外では動かさない**ことを守るのが、
+  後続フェーズの回帰判定を成立させる
+- **小** — 「PNG/JPEG は ICC、AVIF は nclx」という非対称が契約に出る。
+  `outputs[].icc`（`"embedded"` / `"nclx"` / `"none"`）で明示する
+
+#### Phase 19: `--max-bytes`
+
+**なぜここか。** `render()` の中で「エンコード → 大きすぎたら品質を落として再試行」を
+閉じる。Phase 20 の前に置くのは、**多派生になってから実装すると、派生ごとの探索
+コストと報告形式を後付けすることになる**ため。1 派生で規約を確定させてから増やす。
+
+- 品質の探索は**固定の梯子**にし、時刻やタイムアウトに依存させない。決定性は
+  kiri の中核の約束である
+- 動かすのは `quality` だけ。**AVIF の `effort` は動かさない**（時間が桁で変わる）
+- `OutputReport` に `quality_used` / `attempts` を足す。`--dry-run` でも実測が出る
+- ※ **JPEG は quality を下げてもサイズが単調に減らない区間がある。** テストは
+  単調性ではなく「達成したら必ず `max_bytes` 以下」「達成できなければ必ず警告」で
+  固定する
+
+規模 M。衝突リスク **中** — 24.5MP の AVIF は 1 回のエンコードが数秒かかる。探索
+回数の上限と、超えたら警告で降参する規約が要る。`--optimize` と併用すると総当たり
+× 探索で時間が積になるので、見積もりをヘルプで言う。
+
+#### Phase 20: 多派生出力 ＋ マニフェスト
+
+**なぜここか。** この 2 つは同じデータ構造の表と裏（何を書いたかを列挙するのが
+マニフェスト）で、別フェーズにすると `OutputReport` を 2 回設計し直すことになる。
+**`SCHEMA_VERSION` を 2 へ上げるのはこの 1 回だけ**にする。
+
+- `--derive 'width=1600,format=jpeg,quality=82,max_bytes=500k'` を繰り返し指定できる
+  ようにし、糖衣として `--sizes 400,800,1600` × `--formats avif,jpeg` の直積を置く
+- ※ **`--output` をディレクトリと解釈させる案は採らない。** `OUTPUT_EXISTS` の
+  規約が壊れる
+- 命名は `--naming '{stem}_{index}_{width}.{ext}'`。**書き始める前に全派生のパスを
+  作って衝突を検査する**（書いてから気づくと半端な成果物が残る）
+- 切り抜きは 1 回。派生は最終画像からのリサイズのみで、**逐次処理して都度解放する**
+  （24.5MP × N を同時に持たない。並列は batch の項目単位に任せる）
+- マニフェストは `--manifest path.json`。cutout では 1 入力ぶん、batch では実行全体で
+  1 つ。tmp + rename で書く
+- ※ **WebP は足さない。** 7.1 の 3 のとおり pure Rust では可逆しか書けず、写真素材の
+  可逆 WebP は AVIF / JPEG にサイズで負ける。必要になったら独立した調査項目として切る
+
+規模 L。衝突リスク:
+
+- **高（契約）** — `warnings` が「実行に 1 回ずつ」から「派生ごとに複数」へ変わる。
+  `ALPHA_FLATTENED` や `DRY_RUN_OUTPUT_EXISTS` が 1 実行で複数回出る。全警告の
+  `data` に「どの派生か」を示す `output` キーを足す規約を、ここで一律に入れる
+- **小** — `--preview` / `--debug-mask` との衝突検査（`SIDE_OUTPUT_CONFLICT`）の
+  対象が増える
+
+#### Phase 21: `--fail-on`
+
+**なぜここか。** 「不合格を exit code で返す」という契約の変更を、**最も面積の
+小さいところで 1 回だけ**行う。使う指標（`mask` の 7 項目）もしきい値
+（`cutout/diagnostics.rs`）も**もう全部ある**ので、新しい計算は要らない。
+Phase 22 が同じ exit code の語彙を使うので、その前に置く。
+
+- `ErrorKind` は現在 `General` / `Argument` / `Input` / `Processing` の 4 種で、
+  ここに 5 つ目 `Compliance`（exit 5）を足す。**exit 4「処理失敗」を流用しない**
+  ——処理は成功していて、成果物が規格に達しなかっただけである。この区別が無いと、
+  エージェントは「やり直せば直る失敗」と「人が見るべき結果」を分けられない
+- `--fail-on halo>0.10,contour_roughness>0.16` 形式と、`kiri schema` の `warns`
+  しきい値をそのまま使う `--fail-on default` の 2 つ
+- batch は項目ごとの不合格を `status: "rejected"` として `succeeded` / `failed` とは
+  別に数え、`BatchReport` に `rejected` を足す。実行全体の exit code は「1 件でも
+  不合格なら 5」、ただし `failed > 0` の 4 が優先
+- ※ **`--optimize` の順位関数は `--fail-on` のしきい値に合わせない。** 探索の順位は
+  すでに 4 値の辞書式で較正されている。合わせると較正をやり直すことになる
+
+規模 S〜M。衝突リスク **中（契約）** — 「0 以外は失敗」と読んでいる呼び出し側に
+とって 5 は新しい意味である。`exit_codes[].meaning` に「成果物はある。人が見る
+対象」と書く。
+
+#### Phase 22: `--profile` ＋ `kiri lint`
+
+**なぜここか。** profile の実体は「1600px の JPEG を白背景で、占有率 85%、1MB 以内」
+のような**複合指定の別名**であり、Phase 19 / 20 / 21 が揃って初めて片肺でなくなる。
+先に置くと検査だけの機能になり、しかも**中間状態の契約が外へ出てしまう**
+（一度配った契約は引っ込められない）。
+
+- 表は `src/profile.rs`（新）に持つ。※ **外部 JSON で差し替える口は作らない**
+  ——「契約を自分で配る」設計と決定性に反する。代わりに各プリセットへ
+  `revision`（例 `"2026-09"`）を持たせ、`kiri schema` の新ブロック `profiles[]` と
+  結果 JSON の `settings.profile` に出す
+- 優先順位は **明示指定 > profile > 既定** の 1 本だけ。profile の値を明示指定が
+  上書きしたら `PROFILE_OVERRIDDEN` で必ず報せる（「指定したのに効かない」を
+  作らない、という `cli.rs` 全体の姿勢と同じ）
+- `--fill-ratio` の既定 0.85 は doc コメントが「EC プラットフォームで広く求められる
+  占有率」と規格を主張しており、**profile と二重定義になる**。profile 側を正とし、
+  既定値のコメントから規格の主張を外す
+- `kiri lint <file> --profile amazon` の**画素の検査は JPEG / PNG のみ**。AVIF は
+  コンテナ（寸法・alpha・colr）までとし、検査できなかった項目は
+  `checks[].status: "skipped"` ＋ `PROFILE_UNCHECKABLE` で明示する。**黙って合格に
+  しない**
+
+規模 L。衝突リスク:
+
+- **高** — 上記の AVIF デコード不可。曖昧にすると「lint が通ったのに落とされた」が
+  起きる。`--help` と `kiri schema` の両方で明示する
+- **中** — モール規格は変わる。`revision` を出す以上、古い kiri が古い規格で合格を
+  出すことは避けられない。結果に `profile.revision` を必ず載せ、呼び出し側が鮮度を
+  判断できるようにする
+
+#### Phase 23: `--rotate auto` ＋ セット内のスケール・余白の統一
+
+**なぜここか。** 両方とも `subject`（`level_rotation` / `normalized_bbox`）を消費する。
+前者は「測った角度を畳むだけ」の S で、後者の 2 パスは「pass 1 で subject を測って
+持ち回る」構造そのものなので、**同じ機構を 1 度作って 2 つに使う**。
+
+- `--rotate` を `f64 | "auto"` に広げる。`confidence` が `high` のときだけ適用し、
+  そうでなければ 0 度のまま `ROTATE_AUTO_SKIPPED` で報せる。分解能 0.5 度の注意を
+  ヘルプへ引く
+- batch に `set: { align: "height" | "bbox", fill_ratio: ... }` を足す。**pass 1 では
+  切り抜きを回さない**——`--optimize` の探索段が使う縮小で subject だけを測り、
+  全点の代表寸法（中央値）を決める。pass 2 は今までどおり `par_iter` で回す
+- 揃えた結果 1 点だけが極端に外れるときは `SET_SCALE_CLAMPED` で報せる
+
+規模 S（`--rotate auto`）/ M（セット統一）。衝突リスク **中** — 2 パス化と `--jobs`。
+`commands/batch.rs` は `par_iter().map().collect()` で**もともとストリーミングでは
+ない**（全件を集めてから返す）ので構造的な衝突は無い。増えるのは pass 1 の
+decode コストで、1000 点級でも「2 回デコードする」が素直。キャッシュは要らない。
+
+#### Phase 24: ホワイトバランス／露出の正規化
+
+**なぜここか。** **画素を動かす唯一のフェーズ**で、マスク品質の 7 指標すべてに
+影響する。Phase 21 の合否と Phase 23 の一貫性が先に入っていれば「良くなったか」を
+数値で言える。逆順にすると悪化を目視でしか検出できない。
+
+- 既存の照明場 B(x, y)（`cutout/background.rs`）を使い、背景が中性（白/グレー）
+  だという前提のもとで白点と露出を推定する。`--white-balance auto|off` /
+  `--exposure auto|off`、**既定は off**
+- **off のとき 1 バイトも変わらないこと**をテストで固定する（`--shadow` /
+  `--segment` と同じ規約）
+- 背景が中性でないと判定したら適用せず `WHITE_BALANCE_SKIPPED`
+- 適用量を結果 JSON（`color.white_point_shift` 等）に出す
+
+規模 L（計算は M だが較正とベンチの往復が長い）。衝突リスク **高** — 正規化は
+切り抜きの**前**に掛かるので、`tolerance` の意味（背景色との ΔE）が実質変わる。
+既定 off を崩さないことと、`--optimize` と併用したとき探索の前段に置くことを設計で
+固定する。§6 の P2 と同じ注意が効く——**着手前に必ずベンチで見積もる**。
+
+#### Phase 25: `--reflect`
+
+**なぜここか。** 依存が無く、`transform/shadow.rs` の構造（アルファを複製 → 変形 →
+ぼかし → 色を塗る → 下に敷く）をほぼそのまま流用できる、最も安全で価値の小さい
+項目。**どこかで詰まったときに前へ繰り上げてよい唯一のフェーズ**でもある。
+
+`--reflect on` / `--reflect-height`（px@1000）/ `--reflect-opacity` /
+`--reflect-gap`。合成順は「下地 → 影 → 反射 → 商品」。`reflect.bounds` /
+`reflect.clipped` を `ShadowReport` と同型で出す。規模 M、衝突リスク小。
+
+### 7.3 依存関係
+
+```
+Phase 17 CI ──（安全網。以降すべての前提）
+Phase 18 パイプライン一本化 + ICC
+   └→ Phase 19 --max-bytes
+         └→ Phase 20 多派生 + マニフェスト ── schema_version 2 はここだけ
+               └→ Phase 22 --profile + kiri lint
+Phase 21 --fail-on（exit 5 の新設）───────┘ 語彙を Phase 22 が再利用
+Phase 23 --rotate auto + セット統一（subject を共有。Phase 22 の後が望ましい）
+Phase 24 色の正規化（Phase 21 の物差しが要る）
+Phase 25 --reflect（依存なし。いつでも繰り上げ可）
+```
+
+**一度に直すべき点は Phase 18 の 1 箇所である。** Phase 19 / 20 と ICC はすべて
+`write_image()` → `encode()` を通るので、そこへ `Derivation` と `render()` を
+差し込み、`SaveOptions` に `icc` を足す手術を 1 回だけ行い、**N = 1・ICC あり**で
+既存の全ゴールデンを取り直す。以降のフェーズはこの上に載るだけになる。
+
+### 7.4 契約への影響
+
+新しい code は `warning.rs` / `error.rs` のカタログへ足す以外に作る方法が無い構造に
+なっているので、フェーズごとに次を追加する。
+
+| Phase | code | 出る条件 |
+|---|---|---|
+| 18 | `ICC_NOT_EMBEDDED` | 形式が ICC を持てない（AVIF は nclx で名乗る） |
+| 19 | `MAX_BYTES_UNREACHABLE` | 下限品質でも目標サイズに届かなかった |
+| 19 | `QUALITY_REDUCED` | 要求品質から落として目標サイズを達成した |
+| 20 | `MANIFEST_PARTIAL` | 一部の派生が失敗したままマニフェストを書いた |
+| 22 | `PROFILE_OVERRIDDEN` | profile の値を明示指定が上書きした |
+| 22 | `PROFILE_UNCHECKABLE` | lint が検査できない項目を飛ばした（AVIF の画素など） |
+| 23 | `ROTATE_AUTO_SKIPPED` | `--rotate auto` だが `confidence` が high でない |
+| 23 | `SET_SCALE_CLAMPED` | セット統一で 1 点だけ極端に外れ、上限で止めた |
+| 24 | `WHITE_BALANCE_SKIPPED` | 背景が中性でないため正規化しなかった |
+| 25 | `REFLECT_CLIPPED` | 反射が画像の外へ出た |
+
+新しいエラー code:
+
+- 引数（exit 2）: `INVALID_MAX_BYTES` / `INVALID_DERIVATION` /
+  `INVALID_NAMING_TEMPLATE` / `OUTPUT_NAME_COLLISION` / `UNKNOWN_PROFILE` /
+  `INVALID_FAIL_ON`
+- 一般（exit 1）: `MANIFEST_WRITE_FAILED`
+- **新分類 `Compliance`（exit 5）**: `QUALITY_GATE_FAILED`（Phase 21）/
+  `PROFILE_VIOLATION`（Phase 22）
+
+**既存の意味が変わるもの**は 4 件ある。ここを黙って変えると古い読み手が誤読する。
+
+1. `outputs[]` — 型は `Vec<OutputReport>` のままだが、**常に 1 要素だった前提が
+   崩れる**。`SCHEMA_VERSION` を 2 へ上げる唯一の根拠（Phase 20）
+2. `UPSCALED` — summary を「resize / 派生で元画像より大きくした」へ広げる
+   （code は流用、意味は拡張）
+3. `ALPHA_FLATTENED` / `DRY_RUN_OUTPUT_EXISTS` — 1 実行で複数回出るようになる。
+   全警告の `data` に `output` キーを足す
+4. `exit_codes[]` — 表そのものが伸びる。5 は「成果物はあるが人が見るべき」である
+   ことを `meaning` に書く
+
+新しいブロック: `schema.profiles[]`（**実装の定数から組む**。`fields[]` と同じ）、
+`outputs[].quality_used` / `.role` / `.icc`、lint の `LintReport { checks: [{ name,
+status, expected, actual }] }`。
+
+batch spec には `profile` / `max_bytes` / `derive` / `naming` / `fail_on` /
+`white_balance` / `reflect*` と、最上位の `set` が増える。**そのたびに `batch.rs` の
+3 箇所を同時に触る**（Phase 18 のテストがこれを守る）。
+
+### 7.5 テスト方針
+
+- **Phase 18** — (a) `Derivation` 1 個のとき、ICC 抜きの出力が Phase 17 と 1 バイトも
+  一致する（構造変更の無害性）。(b) 書いた PNG/JPEG を `kiri info` に食わせると
+  `color_profile` が sRGB を名乗る（**外部ツールに頼らない自己完結の検証**）。
+  (c) iCCP / APP2 が 1 個だけ、位置が規格どおりであることをバイト列で検査。
+  (d) 既存の決定性テストを ICC 込みで再固定
+- **Phase 19** — 「達成したら必ず `max_bytes` 以下」「未達なら必ず
+  `MAX_BYTES_UNREACHABLE`」「同じ入力で `quality_used` と `attempts` が毎回同じ」。
+  単調性は固定しない
+- **Phase 20** — (a) 派生 1 個のときの完全一致（最重要の回帰）。(b) マニフェスト
+  JSON のゴールデン。(c) 命名衝突を**書き始める前に**検出する。(d) 派生 N 個でも
+  ピークメモリが N に比例しない（[3.2b](#32b-境界品質の回帰テストtestsedge_qualityrs)
+  の計測手法を流用）
+- **Phase 21** — (a) 各指標 × しきい値 → exit code の対応表。(b) `--fail-on` 無指定
+  なら exit code が 1 つも変わらない。(c) batch で「1 件不合格 + 0 件失敗 → 5」
+  「1 件失敗 + 1 件不合格 → 4」の優先順位
+- **Phase 22** — (a) `profiles[]` が実装の定数と一致する。(b) プリセットごとに
+  「合格する合成画像」と「1 項目だけ外した合成画像」で合否と `checks[].name` を固定。
+  (c) AVIF の lint で画素検査が `skipped` になり `PROFILE_UNCHECKABLE` が出る。
+  (d) `--profile amazon --quality 60` で `PROFILE_OVERRIDDEN` が出て 60 が効く
+- **Phase 23** — `auto` を適用した画像へもう一度 `info` を掛けると `level_rotation`
+  が 0 に近い（許容 0.5 度）。セット統一は「同じ商品を 3 通りの距離で撮った合成
+  セット → 出力上の商品高さが ±1px で揃う」「`set` 無しの結果が 1 バイトも
+  変わらない」
+- **Phase 24** — `tests/real_backgrounds.rs` と `tests/edge_quality.rs` を**着手前後で
+  必ず取る**（[3.2b](#32b-境界品質の回帰テストtestsedge_qualityrs) の作法）。既知の
+  色温度ずれを与えた合成シーンで元へ戻せることと、`off` で 1 バイトも変わらないこと
+- **Phase 25** — `--shadow` と同型（`bounds` / `clipped` / 決定性 / `off` で無変化）
+
+### 7.6 却下した代替案
+
+- ※ **`--profile` を最初に置く。** profile は複合指定の別名なので、多派生と
+  `--max-bytes` が無い状態では検査しかできない片肺の機能になる。しかも中間状態の
+  `--profile` が契約として外へ出てしまい、**一度配った契約は引っ込められない**
+- ※ **ICC の埋め込みを最後に回す。** 7.1 の 2 のとおり、`--max-bytes` の探索結果も
+  全派生のバイト列も既存ゴールデンも取り直しになる
+- ※ **セット統一を新サブコマンド `kiri set` として作る。** spec / `ItemSettings` /
+  警告の継承 / `--jobs` / `--dry-run` の規約をもう 1 系統持つことになり、
+  `kiri schema` が配る契約が二重化する。batch の `defaults` の隣に `set` を足すほうが
+  既存の継承規約をそのまま使えて、エージェントが覚える規則が増えない
+- ※ **合否を警告のまま exit 0 で返し、仕分けは呼び出し側の jq に任せる。** いまの
+  問題はまさに「27 の警告があるのに合否が無い」ことで、そこを外部化すると
+  「契約を自分で配る」設計から合否だけが漏れる。加えて exit code で分岐できないと、
+  batch の数百点を仕分ける最短経路が JSON の全走査になる
+- ※ **多派生の形式に WebP を足す。** 7.1 の 3 のとおり pure Rust では可逆しか
+  書けず、写真素材では AVIF / JPEG にサイズで負ける。lossy には libwebp（C）が要り、
+  `Cargo.toml` が `tract-onnx` について立てた基準を崩す
+- ※ **`kiri lint` を AVIF も含めた完全な検査として設計する。** pure Rust の AVIF
+  デコーダが実質存在しない以上、C 依存か巨大な自前実装のどちらかになる。
+  **検査できる範囲を正直に返す**ほうが、黙って合格を出すより安全である

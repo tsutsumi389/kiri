@@ -5,8 +5,8 @@ AIエージェントから使われることを前提とした、EC商品画像�
 単色背景の商品写真を対象に、背景透過の切り抜き・リサイズ・回転・キャンバス配置・Web配信形式への変換を1コマンドで行う。
 
 > **開発中です。** 主要なコマンドは一通り動作します（`info` / `convert` / `resize` / `rotate` / `cutout` / `batch` / `schema` / `model`）。
-> 残るはリリース用 CI と、帯だけの closed-form matting（髪の毛・半透明の袋、
-> `--matting` の 3 つ目の値になる見込み）の 2 件です。
+> 残るは帯だけの closed-form matting（髪の毛・半透明の袋、`--matting` の 3 つ目の
+> 値になる見込み）の 1 件です。
 > 進捗は [docs/implementation-plan.md](docs/implementation-plan.md) を参照してください。
 
 ## 特徴

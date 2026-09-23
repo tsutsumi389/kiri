@@ -511,6 +511,47 @@ PNG / JPEG だけ**である。`--no-color-convert` で画素を sRGB へ変換�
 名乗りを外す手段が無いので `nclx` のまま、警告だけが出る。プロファイルは kiri が自前で組む
 516 バイトの v2 プロファイルで、外部ファイルや `lcms2` / `qcms` には頼らない。
 
+#### サイズの上限に収める（`--max-bytes`）
+
+`--max-bytes 500k` のように上限を渡すと、収まるまで品質を落として書き出す。
+
+| 単位 | 倍率 | 例 |
+|---|---|---|
+| なし | 1 | `512000` |
+| `k` / `kb` | 1,000 | `500k` = 500,000 |
+| `m` / `mb` | 1,000,000 | `2mb` = 2,000,000 |
+| `kib` | 1,024 | `500kib` = 512,000 |
+| `mib` | 1,048,576 | `2mib` = 2,097,152 |
+
+**`k` と `kb` は 1000 進である。** この機能が収めにいく先——ストアの出品規定、CDN の
+制限、メールの添付上限——は十進で書かれていることが多い。「500KB まで」に対して
+`500kb` が 512,000 バイトを許すと、**解釈の誤りが上限を破る向きへずれる。** 1000 進なら
+誤っても常に安全側で、2 の冪が要るときは `kib` / `mib` と明示的に書ける。小数は受けない
+（`1.5m` ではなく `1500k`）。
+
+落とし方は**固定の梯子**である。`85 / 75 / 65 / 55 / 45 / 35 / 25` のうち `--quality` より
+小さい段だけを上から順に試し、最初に収まった段で止める。既定の `--quality 75` なら
+最大 5 段、要求品質そのものを入れて 6 回のエンコードになる。時刻にもタイムアウトにも
+依存しないので、**同じ入力からは毎回同じ `outputs[].quality_used` と
+`outputs[].attempts`** が出る。実際に効いた品質と回数はその 2 つが返し、落としたときは
+`QUALITY_REDUCED` が「いくつからいくつへ、何バイトになったか」を `data` で言う。
+
+**下限まで降りても届かなければ、要求品質のものをそのまま書く。** どうせ上限は破れて
+いるので、画質まで捨てる理由が無い。書いたファイルは `--max-bytes` を付けない実行と
+1 バイトも変わらず、`MAX_BYTES_UNREACHABLE` が未達を言う（`data.smallest_bytes` が
+「最小で何バイトまで縮んだか」）。成果物は残り、終了コードも変わらないので、次は
+`kiri resize` で寸法を落とすか、`--format avif` へ移る。
+
+PNG は無損失で品質を持たないため効かない。1 回のエンコードで収まらなければ段を降りずに
+`MAX_BYTES_UNREACHABLE` を出す（`quality_used` は `null`、`attempts` は 1）。
+
+`cutout --optimize` と併せても**時間は積にならない**。探索はマスクの指標で候補を選んで
+おり、候補ごとにエンコードはしない——書き出すのは最後に決まった 1 枚だけなので、
+掛かる時間は「探索 + 最大 6 回のエンコード」の**和**である。24.5MP の AVIF は 1 段あたり
+数秒なので、その数秒 × 段数が探索の後ろに 1 度だけ足されると見ればよい。
+`--dry-run` でも実際にエンコードするので、`bytes` / `quality_used` / `attempts` は見積もり
+ではなく実測値である。
+
 ### kiri convert
 
 形式変換のみを行う。
@@ -524,6 +565,7 @@ $ kiri convert product.jpg -o product.avif --json
 | `--format` | 拡張子から推論 | `avif` / `png` / `jpeg` |
 | `--quality` | 75 | 0-100。AVIF は75を超えるとサイズが急増する |
 | `--effort` | 6 | AVIFのエンコード速度 1-10。小さいほど高品質・低速 |
+| `--max-bytes` | — | 出力の上限バイト数（例 `500k`）。収まるまで品質を梯子状に落とす |
 | `--background` | `#FFFFFF` | 透過を保持できない形式へ出力する際の合成色 |
 | `--no-color-convert` | | 埋め込み ICC を解釈せず、画素の値をそのまま使う |
 | `--force` | | 出力先が既に存在する場合に上書きする |
@@ -569,6 +611,7 @@ $ kiri resize small.jpg -o out.avif --width 3000 --json
 | `--format` | 拡張子から推論 | `avif` / `png` / `jpeg` |
 | `--quality` | 75 | 0-100。AVIF は75を超えるとサイズが急増する |
 | `--effort` | 6 | AVIFのエンコード速度 1-10。小さいほど高品質・低速 |
+| `--max-bytes` | — | 出力の上限バイト数（例 `500k`）。収まるまで品質を梯子状に落とす |
 | `--background` | `#FFFFFF` | 透過を保持できない形式へ出力する際の合成色 |
 | `--flatten` | | 透過を残さず `--background` の色で塗り潰す |
 | `--no-color-convert` | | 埋め込み ICC を解釈せず、画素の値をそのまま使う |
@@ -654,6 +697,7 @@ rotated.jpg  2386x2533  jpeg  688.4 KB  (78 ms)
 | `--format` | 拡張子から推論 | `avif` / `png` / `jpeg` |
 | `--quality` | 75 | 0-100。AVIF は75を超えるとサイズが急増する |
 | `--effort` | 6 | AVIFのエンコード速度 1-10。小さいほど高品質・低速 |
+| `--max-bytes` | — | 出力の上限バイト数（例 `500k`）。収まるまで品質を梯子状に落とす |
 | `--background` | `#FFFFFF` | 透過を保持できない形式へ出力する際の合成色 |
 | `--flatten` | | 透過を残さず `--background` の色で塗り潰す |
 | `--no-color-convert` | | 埋め込み ICC を解釈せず、画素の値をそのまま使う |
@@ -2120,6 +2164,8 @@ sRGB のまま比べると**ガンマぶんだけ暗い側へ偏る**（黒い�
 | `DRY_RUN_OUTPUT_EXISTS` | `--dry-run` の出力先が既にある。本番実行には `--force` が要る |
 | `UPSCALED` | `resize` で拡大した |
 | `ALPHA_FLATTENED` | 出力形式が透過を保持できないので合成した |
+| `QUALITY_REDUCED` | `--max-bytes` に収めるため要求品質から品質を落とした |
+| `MAX_BYTES_UNREACHABLE` | 下限品質でも `--max-bytes` に届かなかった（要求品質のまま書いた） |
 | `ICC_NOT_EMBEDDED` | 画素が sRGB でないので ICC を埋め込まなかった（AVIF は名乗ったまま） |
 | `PREVIEW_FAILED` | プレビューを書き出せなかった（成果物自体は書けている） |
 | `COLOR_PROFILE_UNSUPPORTED` | ICC が LUT 型などで sRGB へ変換できなかった |
@@ -2209,7 +2255,8 @@ $ kiri cutout product.jpg -o product.png --preview check.png
 $ kiri cutout product.jpg -o product.png --tolerance 18 --dry-run --json
 {
   "dry_run": true,
-  "outputs": [{ "path": "product.png", "format": "png", "width": 1600, "height": 2000, "bytes": 861432, "icc": "embedded" }],
+  "outputs": [{ "path": "product.png", "format": "png", "width": 1600, "height": 2000, "bytes": 861432,
+                "icc": "embedded", "quality_used": null, "attempts": 1 }],
   "mask": { "foreground_ratio": 0.2164, "separability": 68.3, "halo_ratio": 0.0, "edge_width": 1.0 },
   "warnings": []
 }
@@ -2279,7 +2326,7 @@ x broken.jpg  失敗
 `color_convert` / `edge_threshold` /
 `step_tolerance` / `shadow_tolerance` / `shadow` / `shadow_offset` / `shadow_blur` /
 `shadow_color` / `shadow_opacity` / `seal` / `rotate` / `canvas` / `fill_ratio` /
-`format` / `quality` / `effort` / `background` / `flatten`）。
+`format` / `quality` / `effort` / `max_bytes` / `background` / `flatten`）。
 
 `trimap` / `alpha_trimap` / `fg_mask` / `bg_mask` は画像のパスで、`input` と同じく
 **仕様ファイルの場所**を基準に解決する。`fg_polygons` / `bg_polygons` は `[[x1,y1,x2,y2,...], ...]` で、
@@ -2292,6 +2339,12 @@ x broken.jpg  失敗
 **同じ項目に書いた `tolerance` / `bbox` / `background_model` は探索の軸から外れる**
 ——CLI で明示したときと同じ規約で、spec では「書いたかどうか」がそのまま明示に
 あたる。1 件が数秒から十数秒になるので、数百点に一律で付ける値ではない。
+
+`max_bytes` は**数値でも文字列でも書ける**（`"max_bytes": 500000` と `"max_bytes": "500k"` は
+同じ意味になる。数値は常にバイト数で、単位を付けたいときだけ文字列にする）。読めない値
+——0、小数、単位の綴り違い——はその項目を `INVALID_MAX_BYTES` で落とす。黙って無視すると、
+上限が効かないまま数百点が仕上がる。**1 件の失敗で全体は止まらない**ので、その実行の
+終了コードは他の失敗と同じ 4 になる（[サイズの上限に収める](#サイズの上限に収めるmax-bytes)）。
 
 `segment` は `cutout --segment` と同じ 3 値（`off` / `auto` / `isnet`）で、
 `model_path` は `trimap` などと同じく仕様ファイルの場所を基準に解決する。

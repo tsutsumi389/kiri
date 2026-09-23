@@ -9,17 +9,18 @@ use std::path::PathBuf;
 
 use image::RgbaImage;
 
-use super::save::{IccPolicy, OutputFormat, SaveOptions, encode, write_encoded};
+use super::save::{IccPolicy, OutputFormat, SaveOptions, encode_prepared, prepare, write_encoded};
 use crate::error::Result;
-use crate::report::OutputReport;
-use crate::warning::Warning;
+use crate::report::{OutputReport, quality_number};
+use crate::warning::{Warning, WarningCode};
 
 /// 書き出す 1 本。
 ///
-/// 計画 7.2 が挙げた `role` / `width` / `height` / `fit` / `max_bytes` は、それを読む
-/// フェーズで足す。**読まれないフィールドを先に置くと「指定したのに効かない」が
-/// 型として作れてしまう。** 寸法は Phase 20 で `transform::resize::ResizeSpec` を
-/// 1 つ足す形にする（`allow_upscale` を落とさないため）
+/// 計画 7.2 が挙げた `role` / `width` / `height` / `fit` は、それを読むフェーズで足す。
+/// **読まれないフィールドを先に置くと「指定したのに効かない」が型として作れて
+/// しまう。** `max_bytes` はこの Phase 19 で読む側が揃ったので入った。寸法は
+/// Phase 20 で `transform::resize::ResizeSpec` を 1 つ足す形にする
+/// （`allow_upscale` を落とさないため）
 #[derive(Debug, Clone)]
 pub struct Derivation {
     /// 解決済みの書き出し先。命名や衝突の検査は render より前に済ませる
@@ -30,6 +31,9 @@ pub struct Derivation {
     pub background: [u8; 3],
     pub flatten: bool,
     pub icc: IccPolicy,
+    /// 出力の上限バイト数。品質を梯子状に落として収める（`QUALITY_LADDER`）。
+    /// `None` なら 1 回エンコードして終わりで、Phase 18 と 1 バイトも変わらない
+    pub max_bytes: Option<u64>,
 }
 
 impl Derivation {
@@ -52,6 +56,29 @@ pub struct Rendered {
     pub warnings: Vec<Warning>,
 }
 
+/// 品質の梯子。**時刻にもタイムアウトにも依存させない。** 決定性は kiri の
+/// 中核の約束で、同じ入力なら `quality_used` と `attempts` が毎回同じでなければ
+/// ならない。「制限時間まで二分探索する」形は 1 段あたり数秒かかる 24.5MP の
+/// AVIF で機械ごとに違う答えを出すので採らなかった。
+///
+/// **段は固定の絶対値である。** 要求品質からの相対（-10 ずつ）にすると、
+/// `--quality 80` と `--quality 78` が別の着地点へ落ちる。絶対値なら要求品質が
+/// 違っても綴りが揃い、数百点のセットの中で品質が 2 種類か 3 種類に収まる。
+///
+/// **公開しているのは文面と食い違わせないためである。** 同じ 7 つの数が
+/// `--max-bytes` の長いヘルプと `kiri schema` の notes にも出るので、
+/// `the_published_prose_spells_the_real_ladder` がここと突き合わせる
+pub const QUALITY_LADDER: &[f32] = &[85.0, 75.0, 65.0, 55.0, 45.0, 35.0, 25.0];
+
+/// 1 派生ぶんの探索の結果。
+struct Encoded {
+    bytes: Vec<u8>,
+    /// エンコーダが実際に受け取った品質。持たない形式（PNG）では None
+    quality_used: Option<f32>,
+    attempts: u32,
+    warnings: Vec<Warning>,
+}
+
 /// 派生を順にエンコードし、`dry_run` でなければ書く。
 ///
 /// **ICC はエンコーダの内側で埋まる**ので、`report.bytes` は ICC 込みの大きさで
@@ -65,7 +92,12 @@ pub fn render(
     derivations
         .iter()
         .map(|d| {
-            let (bytes, warnings) = encode(image, &d.save_options())?;
+            let Encoded {
+                bytes,
+                quality_used,
+                attempts,
+                warnings,
+            } = encode_within_budget(image, d)?;
             if !dry_run {
                 write_encoded(&d.path, &bytes)?;
             }
@@ -77,6 +109,8 @@ pub fn render(
                     height: image.height(),
                     bytes: bytes.len() as u64,
                     icc: d.icc.signal(d.format),
+                    quality_used: quality_used.map(quality_number),
+                    attempts,
                 },
                 warnings,
             })
@@ -84,9 +118,183 @@ pub fn render(
         .collect()
 }
 
+/// `max_bytes` に収まるバイト列を探す。
+///
+/// **1 回目は必ず要求品質である。** `max_bytes` が無ければそこで返すので、
+/// 指定しない実行は Phase 18 と 1 バイトも変わらず、`attempts` も 1 のままになる。
+///
+/// 収まらなければ `QUALITY_LADDER` のうち**要求品質より小さい段だけ**を上から
+/// 順に試し、最初に収まった段で止める。全部外したら**1 回目のバッファを書く**
+/// ——どうせ制約は破れているので、画質まで捨てる理由が無い。利用者は `kiri resize`
+/// や形式の変更へ進める。最上段のバッファは最初に取ったものを持ち続け、
+/// **再エンコードはしない**（決定性とコストの両面）。
+///
+/// 動かすのは `quality` だけで、**AVIF の `effort` には触らない**。時間が桁で
+/// 変わるつまみを探索の軸にすると、最大 8 回のエンコードが数分では済まなくなる。
+///
+/// 画素の下ごしらえ（アルファの走査と合成）は `prepare` で 1 回だけ行う。
+/// 段ごとにやり直すと 24.5MP の JPEG で 1 段あたり 98MB の複製が積む
+fn encode_within_budget(image: &RgbaImage, d: &Derivation) -> Result<Encoded> {
+    let mut opts = d.save_options();
+    let mut prepared = prepare(image, &opts)?;
+    // 警告は 1 組しか無いので、先に引き取る。段ごとに集めて捨てる後始末が要らない
+    let mut warnings = std::mem::take(&mut prepared.warnings);
+    let first = encode_prepared(&prepared, &opts)?;
+    // 品質を持たない形式では「要求品質」を名乗らない。null は
+    // 「この形式に品質は無い」を意味する（`OutputReport::quality_used`）。
+    // 持つ形式では**エンコーダが受け取った値**を名乗る（JPEG は丸めた後）
+    let asked = d.format.effective_quality(d.quality);
+    let done = |bytes: Vec<u8>, quality_used, attempts, warnings| Encoded {
+        bytes,
+        quality_used,
+        attempts,
+        warnings,
+    };
+
+    let Some(max) = d.max_bytes else {
+        return Ok(done(first, asked, 1, warnings));
+    };
+    if first.len() as u64 <= max {
+        return Ok(done(first, asked, 1, warnings));
+    }
+
+    // 降りられる段。**要求品質より下だけ**を上から順に試す。PNG は無損失で
+    // バイト列が動かないので空になり、`--quality 20` のように梯子の下限より
+    // 低い要求でも空になる。どちらも 1 回で降参する
+    let rungs: Vec<f32> = if d.format.has_quality() {
+        QUALITY_LADDER
+            .iter()
+            .copied()
+            .filter(|&q| q < d.quality)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // 「あとどれだけ足りないか」を言えるのは**実際に降りた段**で測った値だけ。
+    // **JPEG は品質を下げてもサイズが単調に減らない区間がある**ので、最下段が
+    // 最小とは限らない。等しいときは先に出たほう（＝より高い品質）を残す
+    let mut smallest: Option<(u64, f32)> = None;
+    let mut attempts = 1;
+    for quality in rungs {
+        opts.quality = quality;
+        let bytes = encode_prepared(&prepared, &opts)?;
+        attempts += 1;
+        let len = bytes.len() as u64;
+        if len <= max {
+            warnings.push(reduced(d, max, len, quality, attempts));
+            return Ok(done(
+                bytes,
+                d.format.effective_quality(quality),
+                attempts,
+                warnings,
+            ));
+        }
+        if smallest.is_none_or(|(smallest, _)| len < smallest) {
+            smallest = Some((len, quality));
+        }
+    }
+
+    warnings.push(unreachable(d, max, first.len() as u64, attempts, smallest));
+    Ok(done(first, asked, attempts, warnings))
+}
+
+/// 要求品質から落として収まった。**直すものは無い**ので hint は付けない。
+///
+/// `quality_used` は `outputs[].quality_used` と同じ値・同じ字面である
+/// （`quality_number` を通す）。エージェントは 2 つを突き合わせる
+fn reduced(d: &Derivation, max: u64, bytes: u64, quality: f32, attempts: u32) -> Warning {
+    let used = d.format.effective_quality(quality).unwrap_or(quality);
+    Warning::new(
+        WarningCode::QualityReduced,
+        format!(
+            "--max-bytes {max} に収めるため品質を {} から {used} へ落としました（{bytes} バイト）",
+            quality_number(d.quality)
+        ),
+    )
+    .with_data("requested", quality_number(d.quality))
+    .with_data("quality_used", quality_number(used))
+    .with_data("max_bytes", max)
+    .with_data("bytes", bytes)
+    .with_data("attempts", attempts)
+    .with_data("format", d.format.as_str())
+}
+
+/// `--max-bytes` に届かなかった。**書いたのは要求品質のもの**である。
+///
+/// 文面は「降りる段があったか」で分かれる。**下限まで降りたときにしか
+/// 「下限まで落としても」とは言わない**——`--quality 20` は梯子の下限 25 より
+/// 低いので 1 段も降りておらず、降りたふりをすると次の一手を誤らせる。
+///
+/// `smallest` は**実際に降りた段**で得た最小の大きさとその品質で、「あとどれ
+/// だけ足りないか」が分かる唯一の値である。段を 1 つも降りていないとき
+/// （PNG、要求品質が下限より低いとき）は入れない。書いたものと同じ数を「最小」と
+/// 名乗ると「品質を落とせばあと少し」という読み方を誘うためで、これは
+/// 2 つの枝に同じ理由で効く
+fn unreachable(
+    d: &Derivation,
+    max: u64,
+    bytes: u64,
+    attempts: u32,
+    smallest: Option<(u64, f32)>,
+) -> Warning {
+    let used = d.format.effective_quality(d.quality);
+    let message = match (used, attempts) {
+        (None, _) => format!(
+            "{} は無損失で品質を持たないため、--max-bytes {max} に対して {bytes} バイトを\
+             そのまま書きました",
+            d.format.as_str()
+        ),
+        // 1 回で終わったのは、降りられる段が無かったからである
+        (Some(used), 1) => format!(
+            "要求品質 {used} より下に降りられる段がありません（梯子は {} まで）。\
+             --max-bytes {max} に対して {bytes} バイトをそのまま書きました",
+            bottom_rung()
+        ),
+        (Some(used), _) => format!(
+            "品質を下限 {} まで落としても --max-bytes {max} に届かないので、\
+             要求品質 {used} の {bytes} バイトを書きました",
+            bottom_rung()
+        ),
+    };
+    let hint = match d.format {
+        // 既に AVIF なら、同じ寸法でこれより小さくなる形式が kiri に無い
+        OutputFormat::Avif => "kiri resize で寸法を落としてください",
+        OutputFormat::Jpeg => "kiri resize で寸法を落とすか、--format avif を試してください",
+        OutputFormat::Png => {
+            "PNG は無損失で品質を持ちません。--format jpeg / avif なら品質で収められます"
+        }
+    };
+    let mut warning = Warning::new(WarningCode::MaxBytesUnreachable, message)
+        .with_hint(hint)
+        .with_data("max_bytes", max)
+        .with_data("bytes", bytes)
+        // 書いたものの品質。`QUALITY_REDUCED` と同じキーが同じ意味を持つ
+        // （どちらも `outputs[].quality_used` と一致する）。PNG では null
+        .with_data("quality_used", used.map(quality_number))
+        .with_data("attempts", attempts)
+        .with_data("format", d.format.as_str());
+    if let Some((smallest_bytes, smallest_quality)) = smallest {
+        let smallest_quality = d
+            .format
+            .effective_quality(smallest_quality)
+            .unwrap_or(smallest_quality);
+        warning = warning
+            .with_data("smallest_bytes", smallest_bytes)
+            .with_data("smallest_quality", quality_number(smallest_quality));
+    }
+    warning
+}
+
+/// 梯子のいちばん下の段。文面が数を手書きしないために引く
+fn bottom_rung() -> f32 {
+    *QUALITY_LADDER.last().expect("梯子が空ではない")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image_io::save::encode;
 
     fn derivation(path: PathBuf, format: OutputFormat, icc: IccPolicy) -> Derivation {
         Derivation {
@@ -97,7 +305,51 @@ mod tests {
             background: [255, 255, 255],
             flatten: false,
             icc,
+            max_bytes: None,
         }
+    }
+
+    /// 圧縮しにくいノイズ。単色で梯子を回すと、どの段でも同じ大きさに収まって
+    /// しまい「落とした段」が見えない
+    fn noisy(width: u32, height: u32) -> RgbaImage {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        RgbaImage::from_fn(width, height, |_, _| {
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 33) as u8
+            };
+            image::Rgba([next(), next(), next(), 255])
+        })
+    }
+
+    fn codes(warnings: &[Warning]) -> Vec<WarningCode> {
+        warnings.iter().map(|w| w.code).collect()
+    }
+
+    fn bytes_at(img: &RgbaImage, d: &Derivation, quality: f32) -> u64 {
+        let opts = SaveOptions {
+            quality,
+            ..d.save_options()
+        };
+        encode(img, &opts).unwrap().0.len() as u64
+    }
+
+    /// 要求品質では収まらず、梯子のどこかでは収まる上限を作る。
+    ///
+    /// **「基準の半分」のような割合で決め打ちにしない。** 素材が小さいと
+    /// 下限まで落としても半分に届かず、達成を見るはずの検査が未達の道を通った
+    /// まま緑になる（実際に一度そうなった）。下限で何バイトになるかを測ってから
+    /// 決める
+    fn reachable_budget(img: &RgbaImage, d: &Derivation) -> u64 {
+        let baseline = bytes_at(img, d, d.quality);
+        let floor = bytes_at(img, d, bottom_rung());
+        assert!(
+            floor < baseline,
+            "品質を落としても縮まない素材では梯子を試せない（{floor} / {baseline}）"
+        );
+        (baseline + floor) / 2
     }
 
     /// 受け入れ基準 (a)。render は encode の結果に何も足さず、何も引かない。
@@ -128,10 +380,17 @@ mod tests {
                 assert_eq!(report.icc, icc.signal(format), "{name}");
                 assert_eq!(report.path, d.path.display().to_string());
                 assert_eq!((report.width, report.height), (20, 16));
-                let codes = |w: &[Warning]| w.iter().map(|w| w.code).collect::<Vec<_>>();
                 assert_eq!(
                     codes(&rendered[0].warnings),
                     codes(&expected_warnings),
+                    "{name}"
+                );
+                // 受け入れ基準 (d)。**--max-bytes を渡さない実行は 1 回で終わる。**
+                // ここが 1 を超えたら、指定していない機能が時間を食っている
+                assert_eq!(report.attempts, 1, "{name}");
+                assert_eq!(
+                    report.quality_used,
+                    format.effective_quality(75.0).map(quality_number),
                     "{name}"
                 );
             }
@@ -155,5 +414,267 @@ mod tests {
             assert_eq!(rendered[0].report.bytes, expected.len() as u64);
             assert_eq!(rendered[0].report.icc, IccPolicy::Embed.signal(format));
         }
+    }
+
+    /// 要求品質で既に収まっているなら、梯子は 1 段も降りない。
+    ///
+    /// **ここが動くと `--max-bytes` は「付けても損の無い指定」でなくなる。**
+    /// 余裕のある上限を一律に付けたセットで、全件が 8 倍の時間を払うことになる
+    #[test]
+    fn a_budget_that_already_fits_changes_nothing() {
+        let img = noisy(64, 64);
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = derivation(
+            dir.path().join("fits.jpg"),
+            OutputFormat::Jpeg,
+            IccPolicy::Embed,
+        );
+        let (plain, _) = encode(&img, &d.save_options()).unwrap();
+
+        d.max_bytes = Some(plain.len() as u64);
+        let rendered = render(&img, std::slice::from_ref(&d), false).unwrap();
+        assert_eq!(
+            std::fs::read(&d.path).unwrap(),
+            plain,
+            "上限ちょうどは収まり"
+        );
+        assert_eq!(rendered[0].report.attempts, 1);
+        assert_eq!(rendered[0].report.quality_used, Some(75.0));
+        assert!(
+            rendered[0].warnings.is_empty(),
+            "{:?}",
+            rendered[0].warnings
+        );
+    }
+
+    /// 受け入れ基準 (a) と (i)。収まった段は梯子の値で、報告と実ファイルの
+    /// 両方が上限以下になる
+    #[test]
+    fn the_ladder_stops_at_the_first_rung_that_fits() {
+        let img = noisy(200, 200);
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = derivation(
+            dir.path().join("budget.jpg"),
+            OutputFormat::Jpeg,
+            IccPolicy::Embed,
+        );
+        let max = reachable_budget(&img, &d);
+        d.max_bytes = Some(max);
+
+        let rendered = render(&img, std::slice::from_ref(&d), false).unwrap();
+        let report = &rendered[0].report;
+        let written = std::fs::read(&d.path).unwrap();
+        assert!(
+            report.bytes <= max,
+            "報告 {} が上限 {max} を超えた",
+            report.bytes
+        );
+        assert_eq!(
+            written.len() as u64,
+            report.bytes,
+            "実ファイルと報告がずれた"
+        );
+
+        let quality = report.quality_used.expect("JPEG は品質を持つ") as f32;
+        assert!(
+            QUALITY_LADDER.contains(&quality) && quality < 75.0,
+            "{quality} は要求品質より下の梯子の段ではない"
+        );
+        assert_eq!(
+            report.attempts,
+            1 + QUALITY_LADDER
+                .iter()
+                .filter(|&&q| q < 75.0)
+                .position(|&q| q == quality)
+                .unwrap() as u32
+                + 1,
+            "止まった段より後まで試している"
+        );
+
+        assert_eq!(
+            codes(&rendered[0].warnings),
+            vec![WarningCode::QualityReduced]
+        );
+        let data = &rendered[0].warnings[0].data;
+        assert_eq!(data["requested"], 75.0);
+        // 報告と警告で同じ数が同じ字面で出る（`quality_number`）
+        assert_eq!(data["quality_used"], report.quality_used.unwrap());
+        assert_eq!(data["max_bytes"], max);
+        assert_eq!(data["bytes"], report.bytes);
+        assert_eq!(data["attempts"], report.attempts);
+        assert_eq!(data["format"], "jpeg");
+        assert!(rendered[0].warnings[0].hint.is_none(), "直すものは無い");
+    }
+
+    /// 受け入れ基準 (b)。**未達なら要求品質のものを書く。**
+    /// 書いたバイト列が `--max-bytes` 無しの出力と 1 バイトも違わないことで、
+    /// 「どうせ制約は破れているので画質まで捨てない」という決定を固定する
+    #[test]
+    fn an_unreachable_budget_writes_the_requested_quality_untouched() {
+        let img = noisy(200, 200);
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = derivation(
+            dir.path().join("tiny.jpg"),
+            OutputFormat::Jpeg,
+            IccPolicy::Embed,
+        );
+        let (plain, _) = encode(&img, &d.save_options()).unwrap();
+        d.max_bytes = Some(64);
+
+        let rendered = render(&img, std::slice::from_ref(&d), false).unwrap();
+        assert_eq!(std::fs::read(&d.path).unwrap(), plain);
+        let report = &rendered[0].report;
+        assert_eq!(report.bytes, plain.len() as u64);
+        assert_eq!(report.quality_used, Some(75.0), "要求品質へ戻る");
+        // 要求品質の 1 回 + 75 より下の段の数
+        assert_eq!(
+            report.attempts,
+            1 + QUALITY_LADDER.iter().filter(|&&q| q < 75.0).count() as u32
+        );
+
+        assert_eq!(
+            codes(&rendered[0].warnings),
+            vec![WarningCode::MaxBytesUnreachable]
+        );
+        let w = &rendered[0].warnings[0];
+        assert_eq!(w.data["max_bytes"], 64);
+        assert_eq!(
+            w.data["bytes"], report.bytes,
+            "書いたファイルの大きさを言う"
+        );
+        assert_eq!(w.data["attempts"], report.attempts);
+        assert_eq!(w.data["format"], "jpeg");
+        assert_eq!(
+            w.data["quality_used"],
+            report.quality_used.unwrap(),
+            "書いたものの品質は報告と同じ数である"
+        );
+
+        // 最小は**実際に降りた段**のものである。上限を超えていることまで見ないと、
+        // 「収まったのに未達と言っている」実装を通してしまう
+        let smallest_bytes = w.data["smallest_bytes"].as_u64().unwrap();
+        let smallest_quality = w.data["smallest_quality"].as_f64().unwrap() as f32;
+        assert!(smallest_bytes > 64, "収まっているのに未達と言っている");
+        assert!(
+            QUALITY_LADDER.contains(&smallest_quality) && smallest_quality < 75.0,
+            "{smallest_quality} は降りた段ではない"
+        );
+        assert_eq!(
+            smallest_bytes,
+            bytes_at(&img, &d, smallest_quality),
+            "smallest_bytes が smallest_quality で得た大きさと違う"
+        );
+        assert!(w.hint.is_some());
+    }
+
+    /// 受け入れ基準 (e)。PNG は無損失なので段を降りない。
+    /// ファイルは `--max-bytes` 無しの PNG と 1 バイトも変わらない
+    #[test]
+    fn png_never_walks_down_the_ladder() {
+        let img = noisy(64, 64);
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = derivation(
+            dir.path().join("lossless.png"),
+            OutputFormat::Png,
+            IccPolicy::Embed,
+        );
+        let (plain, _) = encode(&img, &d.save_options()).unwrap();
+        d.max_bytes = Some(32);
+
+        let rendered = render(&img, std::slice::from_ref(&d), false).unwrap();
+        assert_eq!(std::fs::read(&d.path).unwrap(), plain);
+        let report = &rendered[0].report;
+        assert_eq!(report.attempts, 1, "段を降りてはいけない");
+        assert_eq!(report.quality_used, None, "PNG に品質は無い");
+        assert_eq!(
+            codes(&rendered[0].warnings),
+            vec![WarningCode::MaxBytesUnreachable]
+        );
+        let w = &rendered[0].warnings[0];
+        assert!(
+            !w.data.contains_key("smallest_bytes") && !w.data.contains_key("smallest_quality"),
+            "段を降りていないので最小は語れない: {:?}",
+            w.data
+        );
+        assert!(
+            w.data["quality_used"].is_null(),
+            "PNG の品質は報告と同じく null: {:?}",
+            w.data
+        );
+    }
+
+    /// 受け入れ基準 (c)。同じ入力からは毎回同じ着地点になる。
+    /// 梯子が時刻やタイムアウトを見た瞬間にここが割れる。
+    ///
+    /// **段で止まる経路を必ず通す。** 未達の上限を渡すと 3 回とも「要求品質へ
+    /// 戻した」同じ答えになり、探索を 1 度も通らずに一致してしまう
+    #[test]
+    fn the_landing_spot_is_the_same_every_time() {
+        let img = noisy(160, 160);
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = derivation(
+            dir.path().join("stable.jpg"),
+            OutputFormat::Jpeg,
+            IccPolicy::Embed,
+        );
+        d.max_bytes = Some(reachable_budget(&img, &d));
+
+        let once = |d: &Derivation| {
+            let r = render(&img, std::slice::from_ref(d), true).unwrap();
+            (
+                r[0].report.quality_used,
+                r[0].report.attempts,
+                r[0].report.bytes,
+            )
+        };
+        let first = once(&d);
+        assert!(first.1 > 1, "段を 1 つも降りていない: {first:?}");
+        assert!(
+            first.0.unwrap() < d.quality as f64,
+            "要求品質のまま止まっている: {first:?}"
+        );
+        assert_eq!(once(&d), first);
+        assert_eq!(once(&d), first);
+    }
+
+    /// 要求品質より下に段が無ければ、探索は 1 回で終わる。
+    /// **`--quality 20` で 7 段を試すのは、どの段も要求品質より高いという
+    /// 意味になる**——収めるどころか大きくしにいくことになる。
+    ///
+    /// 降りていない以上、`smallest_*` は名乗らない（PNG と同じ理由）。文面も
+    /// 「下限まで落としても」とは言わない
+    #[test]
+    fn a_quality_below_the_bottom_rung_has_nowhere_to_descend() {
+        let img = noisy(64, 64);
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = derivation(
+            dir.path().join("low.jpg"),
+            OutputFormat::Jpeg,
+            IccPolicy::Embed,
+        );
+        d.quality = 20.0;
+        d.max_bytes = Some(64);
+
+        let rendered = render(&img, std::slice::from_ref(&d), true).unwrap();
+        assert_eq!(rendered[0].report.attempts, 1);
+        assert_eq!(rendered[0].report.quality_used, Some(20.0));
+        let w = &rendered[0].warnings[0];
+        assert_eq!(w.code, WarningCode::MaxBytesUnreachable);
+        assert!(
+            !w.data.contains_key("smallest_bytes") && !w.data.contains_key("smallest_quality"),
+            "降りた段が無いのに最小を名乗っている: {:?}",
+            w.data
+        );
+        assert_eq!(w.data["quality_used"], 20.0);
+        assert!(
+            !w.message.contains("下限"),
+            "1 段も降りていないのに下限まで降りたと言っている: {}",
+            w.message
+        );
+        assert!(
+            w.message.contains("降りられる段がありません"),
+            "なぜ 1 回で終わったかを言っていない: {}",
+            w.message
+        );
     }
 }

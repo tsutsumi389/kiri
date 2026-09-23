@@ -730,6 +730,50 @@ fn fields() -> Vec<FieldEntry> {
             ),
         },
         FieldEntry {
+            path: "outputs[].quality_used",
+            appears_in: vec!["convert", "resize", "rotate", "cutout"],
+            // 0-100 の品質は既存のどの綴りでもない。`ratio` と名乗ると 0.0-1.0 に
+            // 読めてしまうので、`delta_e` / `px_at_1000` と同じく専用の綴りを置く
+            unit: "quality",
+            nullable: true,
+            null_means: Some("PNG は無損失で品質を持たない（--quality も --max-bytes も効かない）"),
+            // **しきい値では出ない警告なので warns には載せない。**
+            // ここは「この値がいくつを超えたら鳴るか」を配る欄で、
+            // QUALITY_REDUCED / MAX_BYTES_UNREACHABLE はどちらも
+            // 「--max-bytes に収まったか」で決まる。notes で名指しする
+            warns: vec![],
+            gates: None,
+            summary: "実際に使った品質（--quality の指定値、--max-bytes で落としたならその段）",
+            notes: Some(
+                "--max-bytes が無ければ --quality の指定値がそのまま出る。収まらなかったときは\
+                 固定の梯子 85 / 75 / 65 / 55 / 45 / 35 / 25 のうち --quality より小さい段を\
+                 上から試し、最初に収まった段がここに出て QUALITY_REDUCED が落とした事実を言う。\
+                 **下限まで降りても届かなければ要求品質のものを書く**ので、ここは --quality の\
+                 指定値に戻り、MAX_BYTES_UNREACHABLE が未達を言う（成果物は残り、終了コードも\
+                 変わらない）。段は時刻にもタイムアウトにも依存しないので、同じ入力からは\
+                 毎回同じ値が出る。--dry-run でも実際にエンコードした結果である",
+            ),
+        },
+        FieldEntry {
+            path: "outputs[].attempts",
+            appears_in: vec!["convert", "resize", "rotate", "cutout"],
+            unit: "count",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "この出力をエンコードした回数",
+            notes: Some(
+                "--max-bytes が無ければ必ず 1 である。探索が走ると、要求品質の 1 回に\
+                 降りた段の数が積む（既定の --quality 75 なら降りる段は 5 つで最大 6 回、\
+                 --quality 100 でも最大 8 回）。PNG は品質を持たず\
+                 段を降りないので --max-bytes を渡しても 1 のまま。**時間の見積もりに使える\
+                 唯一の値**で、24.5MP の AVIF では 1 回あたり数秒かかる。\
+                 --optimize と併せても掛け算にはならない——候補はマスクの指標で選ばれ、\
+                 エンコードするのは決まった 1 枚だけなので、この回数は探索の後ろに 1 度だけ積む",
+            ),
+        },
+        FieldEntry {
             path: "rotate.angle",
             // `kiri rotate` と `cutout --rotate` が同じブロックを返す。
             // 順序を固定したいなら後者を使う（README「切り抜いた後に回す」）

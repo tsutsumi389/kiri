@@ -35,6 +35,35 @@ impl OutputFormat {
         !matches!(self, OutputFormat::Jpeg)
     }
 
+    /// この形式のエンコーダが**実際に受け取る**品質。持たない形式では `None`。
+    ///
+    /// **JPEG はここで丸める。** `image` の JPEG エンコーダは `u8` しか受けず、
+    /// `--quality 33.3` は 33 として効く。丸めを `encode_jpeg` の中に閉じていた
+    /// ときは、報告の `quality_used` が 33.3 を名乗って「実際に使った品質」が
+    /// 嘘になっていた。**丸める場所は 1 つだけにする**——`encode_jpeg` も
+    /// `--max-bytes` の報告もここを引く。
+    ///
+    /// AVIF は `ravif` が f32 をそのまま受けるので手を入れない。PNG は無損失で、
+    /// `SaveOptions::quality` を何に変えてもバイト列は 1 バイトも動かない
+    pub fn effective_quality(self, quality: f32) -> Option<f32> {
+        match self {
+            OutputFormat::Avif => Some(quality),
+            OutputFormat::Jpeg => Some(quality.round()),
+            OutputFormat::Png => None,
+        }
+    }
+
+    /// 品質というつまみを持つ形式か。**PNG だけが持たない。**
+    ///
+    /// `--max-bytes` の探索が段を降りられるかはこれで決まる。「試したが
+    /// 変わらなかった」と「試す意味が無い」は結果が同じでも報告が違う
+    /// （前者は attempts が伸び、後者は 1 のまま）ので、形式の側で答える。
+    /// **答えは `effective_quality` から引く。** 2 つの述語を別々に持つと、
+    /// 形式が増えたときに片方だけが更新されうる
+    pub fn has_quality(self) -> bool {
+        self.effective_quality(0.0).is_some()
+    }
+
     /// 名前から出力形式を得る。仕様ファイルの "format" 用。
     pub fn from_name(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
@@ -132,13 +161,24 @@ pub struct SaveOutcome {
     pub warnings: Vec<Warning>,
 }
 
-/// エンコードだけを行い、書き出さない。
+/// エンコードへ渡す直前の画素と、そこまでで出た警告。
 ///
-/// `--dry-run` はここで止まる。「書かない」を「何もしない」にはしない。
-/// エンコードまで通しておかないと `bytes` が見積もりになり、品質やサイズを
-/// 決めるための実行に使えなくなる。**書き出しの直前までは同じ道を通る**ので、
-/// `ALPHA_FLATTENED` のような書き出し由来の警告も本番と同じに出る。
-pub fn encode(image: &RgbaImage, opts: &SaveOptions) -> Result<(Vec<u8>, Vec<Warning>)> {
+/// **品質に依らない前処理をここで抱える。** `--max-bytes` の探索は同じ画像を
+/// 品質だけ変えて何度もエンコードするので、アルファの全画素走査と合成を段ごとに
+/// やり直すと、24.5MP の JPEG では 1 段あたり 98MB の複製と全画素走査が積む。
+/// 合成が要らなければ入力を借りたままにする（`Cow::Borrowed`）ので、
+/// **単発のエンコードでは今までと 1 バイトも 1 回の複製も変わらない。**
+pub struct Prepared<'a> {
+    image: std::borrow::Cow<'a, RgbaImage>,
+    pub warnings: Vec<Warning>,
+}
+
+/// 品質に依らない下ごしらえ。**値域の検査・アルファの走査・合成はここ 1 回だけ。**
+///
+/// `opts` のうちここが見るのは `format` / `flatten` / `background` / `effort` で、
+/// **`quality` は見ない**（値域の検査を除く）。だから探索が段を降りても結果は
+/// 変わらず、1 回で済む。
+pub fn prepare<'a>(image: &'a RgbaImage, opts: &SaveOptions) -> Result<Prepared<'a>> {
     let mut warnings = Vec::new();
 
     if !(0.0..=100.0).contains(&opts.quality) {
@@ -173,21 +213,37 @@ pub fn encode(image: &RgbaImage, opts: &SaveOptions) -> Result<(Vec<u8>, Vec<War
         );
     }
 
-    let flattened;
-    let target = if must_flatten {
-        flattened = flatten_image(image, opts.background);
-        &flattened
+    let image = if must_flatten {
+        std::borrow::Cow::Owned(flatten_image(image, opts.background))
     } else {
-        image
+        std::borrow::Cow::Borrowed(image)
     };
+    Ok(Prepared { image, warnings })
+}
 
-    let encoded = match opts.format {
-        OutputFormat::Avif => encode_avif(target, opts)?,
-        OutputFormat::Png => encode_png(target, opts.icc)?,
-        OutputFormat::Jpeg => encode_jpeg(target, opts)?,
-    };
+/// 下ごしらえ済みの画素を、いまの `opts.quality` でエンコードする。
+///
+/// **探索が何度も呼ぶのはここだけ。** 警告は `Prepared` が 1 組だけ持っている
+/// ので、段の数だけ同じ警告が積むこともない。
+pub fn encode_prepared(prepared: &Prepared, opts: &SaveOptions) -> Result<Vec<u8>> {
+    let target = prepared.image.as_ref();
+    match opts.format {
+        OutputFormat::Avif => encode_avif(target, opts),
+        OutputFormat::Png => encode_png(target, opts.icc),
+        OutputFormat::Jpeg => encode_jpeg(target, opts),
+    }
+}
 
-    Ok((encoded, warnings))
+/// エンコードだけを行い、書き出さない。
+///
+/// `--dry-run` はここで止まる。「書かない」を「何もしない」にはしない。
+/// エンコードまで通しておかないと `bytes` が見積もりになり、品質やサイズを
+/// 決めるための実行に使えなくなる。**書き出しの直前までは同じ道を通る**ので、
+/// `ALPHA_FLATTENED` のような書き出し由来の警告も本番と同じに出る。
+pub fn encode(image: &RgbaImage, opts: &SaveOptions) -> Result<(Vec<u8>, Vec<Warning>)> {
+    let prepared = prepare(image, opts)?;
+    let encoded = encode_prepared(&prepared, opts)?;
+    Ok((encoded, prepared.warnings))
 }
 
 pub fn save(path: &Path, image: &RgbaImage, opts: &SaveOptions) -> Result<SaveOutcome> {
@@ -268,8 +324,11 @@ fn encode_png(image: &RgbaImage, icc: IccPolicy) -> Result<Vec<u8>> {
 fn encode_jpeg(image: &RgbaImage, opts: &SaveOptions) -> Result<Vec<u8>> {
     let rgb = flatten_onto(image, opts.background);
     let mut buf = Vec::new();
-    let mut encoder =
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, opts.quality.round() as u8);
+    // 丸めはここでは決めない。`effective_quality` が 1 箇所で決め、報告も同じ値を出す
+    let quality = OutputFormat::Jpeg
+        .effective_quality(opts.quality)
+        .unwrap_or(opts.quality) as u8;
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
     if opts.icc == IccPolicy::Embed {
         // APP2 は image が APP0(JFIF) の直後へ書く。SOI の直後に置くと JFIF に反する
         encoder
@@ -346,6 +405,61 @@ mod tests {
         assert!(OutputFormat::Avif.supports_alpha());
         assert!(OutputFormat::Png.supports_alpha());
         assert!(!OutputFormat::Jpeg.supports_alpha());
+    }
+
+    /// PNG だけが品質を持たない。ここが反転すると `--max-bytes` が
+    /// 無損失の形式で梯子を降り、同じバイト列を 8 回作る
+    #[test]
+    fn only_png_lacks_a_quality_knob() {
+        assert!(OutputFormat::Avif.has_quality());
+        assert!(OutputFormat::Jpeg.has_quality());
+        assert!(!OutputFormat::Png.has_quality());
+    }
+
+    /// **JPEG の丸めは 1 箇所にしかない。** エンコーダへ渡る値と
+    /// `effective_quality` が名乗る値が割れると、`quality_used` が嘘になる
+    #[test]
+    fn the_effective_quality_is_what_the_encoder_receives() {
+        assert_eq!(OutputFormat::Jpeg.effective_quality(33.3), Some(33.0));
+        assert_eq!(OutputFormat::Jpeg.effective_quality(33.7), Some(34.0));
+        assert_eq!(OutputFormat::Avif.effective_quality(33.3), Some(33.3));
+        assert_eq!(OutputFormat::Png.effective_quality(33.3), None);
+
+        // 丸めた先と同じ値を渡したエンコードは 1 バイトも違わない
+        let img = gradient(false);
+        let at = |quality: f32| {
+            encode(
+                &img,
+                &SaveOptions {
+                    format: OutputFormat::Jpeg,
+                    quality,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .0
+        };
+        assert_eq!(at(33.3), at(33.0));
+    }
+
+    /// PNG の「品質を持たない」は主張であって、実装が追随していなければ嘘になる。
+    /// 梯子の両端で同じバイト列が出ることをここで固定する
+    #[test]
+    fn png_bytes_do_not_move_with_quality() {
+        let img = gradient(true);
+        let at = |quality: f32| {
+            encode(
+                &img,
+                &SaveOptions {
+                    format: OutputFormat::Png,
+                    quality,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .0
+        };
+        assert_eq!(at(85.0), at(25.0));
     }
 
     #[test]

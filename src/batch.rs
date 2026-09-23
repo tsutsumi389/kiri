@@ -97,6 +97,13 @@ pub struct ItemSettings {
     pub format: Option<String>,
     pub quality: Option<f32>,
     pub effort: Option<u8>,
+    /// 出力の上限バイト数。**数値でも文字列でも書ける**（`512000` と `"500k"`）。
+    ///
+    /// 型を `u64` に決めないのは、エージェントが書く JSON に両方が現れるため
+    /// である。`"500k"` を SPEC_INVALID で断ると、CLI では通る書き方が spec
+    /// でだけ通らない。解くのは `commands::batch`——CLI と同じ
+    /// `cli::parse_max_bytes` を通し、読めない値は INVALID_MAX_BYTES にする
+    pub max_bytes: Option<serde_json::Value>,
     pub background: Option<String>,
     pub flatten: Option<bool>,
 }
@@ -150,6 +157,7 @@ impl ItemSettings {
             format,
             quality,
             effort,
+            max_bytes,
             background,
             flatten,
         )
@@ -196,6 +204,7 @@ const SETTING_KEYS: &[&str] = &[
     "format",
     "quality",
     "effort",
+    "max_bytes",
     "background",
     "flatten",
 ];

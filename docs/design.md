@@ -2890,7 +2890,7 @@ kiri cutout in.jpg -o out.avif \
   [--shadow-color "#000000"] [--shadow-opacity 0.25] \
   [--canvas 1000x1000] [--fill-ratio 0.85] \
   [--background "#FFFFFF"] \
-  [--quality 75] [--effort 6] \
+  [--quality 75] [--effort 6] [--max-bytes 500k] \
   [--json] [--debug-mask mask.png] [--force]
 ```
 
@@ -3014,7 +3014,9 @@ AI エージェントが `--allow-upscale` を付けるか元素材を見直す�
 
 ```json
 {
-  "input": "in.jpg", "outputs": [{ "path": "out.avif", "bytes": 31200, "icc": "nclx" }],
+  "input": "in.jpg",
+  "outputs": [{ "path": "out.avif", "bytes": 31200, "icc": "nclx",
+               "quality_used": 75.0, "attempts": 1 }],
   "source": { "width": 2400, "height": 3200 },
   "color_space": "Display P3", "color_converted": true,
   "mask": {

@@ -1,0 +1,102 @@
+# 検査のワークフロー。**リリース用は製品化を決めるまで置かない**
+# （docs/implementation-plan.md §4）。
+#
+# public リポジトリなので GitHub 製の標準ランナーは分数無制限で無料である。
+# larger runner は public でも課金されるので、`runs-on` には標準のラベル
+# （`ubuntu-latest`）以外を書かないこと。
+#
+# ツールチェーンの用意にサードパーティの action を使わないのは、Cargo.toml が
+# 依存について立てた基準（C 依存を持ち込まない、素性の知れたものだけを引く）を
+# CI 側でも同じ重さで守るためである。標準ランナーには rustup が入っているので
+# 公式 action ふたつと rustup だけで足りる。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# 同じ枝に続けて push したとき、古い実行は畳む。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # CI は毎回 clean build なので、インクリメンタルの中間物はキャッシュを
+  # 太らせるだけで効かない。
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup component add rustfmt
+      - run: cargo fmt --check
+
+  test:
+    # feature `segment` の有無で 2 系統要る。既定は無効なので、既定のまま壊れて
+    # いないことと、有効にしても壊れないことを別々に見る。
+    #
+    # **ISNet の 176MB は CI では取得しない。** モデルが無ければ推論の検査は
+    # 黙って飛ぶ設計（tests/segment.rs）なので、ここで守るのはコンパイルと
+    # 非推論部分である。
+    #
+    # 2 系統を同じ機械で同時に走らせないこと。同じ `target/` を共有すると
+    # 統合テストが相手の実行ファイルを掴む。ジョブを分けてあるので別の機械に
+    # なる。
+    name: test (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: default
+            features: ""
+          - label: segment
+            features: "--features segment"
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup component add clippy
+      # `target` をまるごとではなく依存だけを載せる（キャッシュはリポジトリ
+      # あたり 10GB）。
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ matrix.label }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ matrix.label }}-
+      - run: cargo clippy --locked --all-targets ${{ matrix.features }} -- -D warnings
+      - run: cargo test --locked ${{ matrix.features }}
+
+  msrv:
+    # 宣言だけ置いても検査しなければ守られない。実際に一度、`rust-version =
+    # "1.85"` を掲げたまま let-chains（安定化は 1.88）が 2 箇所入り込んでいた。
+    # 手元の新しいツールチェーンでは通ってしまうので、ここでしか検出できない。
+    #
+    # **`--features segment` を付けてはならない。** `tract-onnx` 0.23.7 の
+    # `rust-version` は 1.91 で、付けると引数の綴りも見ずに落ちる。
+    name: msrv (1.85)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install 1.85 --profile minimal --no-self-update
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-msrv-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-msrv-
+      - run: cargo +1.85 check --locked --all-targets

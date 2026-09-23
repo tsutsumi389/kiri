@@ -53,7 +53,12 @@ jobs:
     # なる。
     name: test (${{ matrix.label }})
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # **実測で 41 分かかる。** 手元（Apple Silicon）では 16 分なので、標準ランナー
+    # では 2.5 倍と見ておく。内訳は `tests/real_backgrounds.rs` の較正ベンチが
+    # 大半で、debug ビルドの画像処理がそのまま効いている。45 分では `segment`
+    # 系統（tract のビルドが数分ぶん重い）が入り切らなかったので枠を広げた。
+    # 縮めるなら timeout ではなくテストの側を見ること。
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:

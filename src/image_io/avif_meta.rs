@@ -20,23 +20,21 @@
 //! # 壊れた入力に対する態度
 //!
 //! 入力は他所で作られたファイルである。**このモジュールは panic しない。**
-//! 添字ではなく `get()` 系だけを使い、長さの足し算は `checked_add` を通し、
-//! 入れ子には上限を置く。切り詰め・0 長ボックス・巨大な size はすべて
-//! `INPUT_DECODE_FAILED` として返る。
+//! 添字ではなく `get()` 系だけを使い、長さの足し算は `checked_add` を通す。
+//! 切り詰め・0 長ボックス・巨大な size はすべて `INPUT_DECODE_FAILED` として返る。
+//!
+//! 落ちないだけでは足りない。**入力の大きさに対して素直に効かない数には
+//! 上限を置く**——`MAX_BOXES`（1 階層のボックス数）、`MAX_ASSOCIATIONS` と
+//! `MAX_PROPERTY_REFS`（`ipma` の量）がそれで、どれも現実の AVIF が届かない
+//! 水準に取ってある。ここを空けておくと、数百 KB のファイルが数十秒と
+//! 数 GB を要求できてしまう。
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::heif::{self, Family};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// アルファの補助画像であることを名乗る URN（ISO/IEC 23000-22）。
 const ALPHA_URN: &str = "urn:mpeg:mpegB:cicp:systems:auxiliary:alpha";
-
-/// ボックスの入れ子をどこまで降りるか。
-///
-/// 今このモジュールが辿る最も深い道は `meta` → `iprp` → `ipco` → プロパティの
-/// 4 段しかないので、この上限に当たることは**正しい入力では起こらない**。
-/// 置いてあるのは、自己参照するような壊れ方・作為的な入れ子で
-/// スタックを食い潰させないための関門である。
-const MAX_DEPTH: u32 = 8;
 
 /// 1 階層に並ぶ子ボックスの数の上限。
 ///
@@ -44,6 +42,31 @@ const MAX_DEPTH: u32 = 8;
 /// 上限は「size 8 の空ボックスを敷き詰めた入力で Vec を伸ばし続けない」ための
 /// もので、正常なファイルを弾く水準にはしていない。
 const MAX_BOXES: usize = 4096;
+
+/// `ipma` が並べられる要素（item 1 つ分の割り当て）の総数の上限。
+///
+/// item がいちばん増えるのは grid である。ISO/IEC 23008-12 の `grid` は行数と
+/// 列数をそれぞれ 8bit で持つので、タイルは多くても 256 × 256 = 65536 枚。
+/// これに grid 本体・アルファ・Exif・XMP などが少し足される。**その倍の
+/// 131072 を上限に置く**——現実の AVIF が届く見込みのない水準で、かつ
+/// `ipma` の 1 要素は最小 3 バイトなので、ここへ届くには 393KB の `ipma` が要る。
+///
+/// 上限が要るのは、`ipma` の `entry_count` が 32bit で、ファイルの大きさに
+/// 対して要素数がいくらでも増やせるため。`MAX_BOXES` と同じ思想で、
+/// **正常なファイルを弾かない水準で「際限なく伸ばさない」ことだけを保証する。**
+const MAX_ASSOCIATIONS: usize = 1 << 17;
+
+/// `ipma` が並べられるプロパティ番号の総数の上限。
+///
+/// 1 つの item に付くプロパティは実ファイルで `ispe` / `av1C` / `pixi` /
+/// `colr` / `irot` / `auxC` など十数個まで。上の 131072 item すべてに 8 個ずつ
+/// 付いても 1048576 に収まるので、そこを上限にする。
+///
+/// 要素数とは別に数える必要がある。`ipma` の 1 要素が持てるプロパティ数は
+/// 8bit（255）なので、要素数だけを見ていると 131072 × 255 = 3300 万本の
+/// 参照が素通りする。**実測ではそれが 1.5MB の入力で 31 秒 / RSS 2.4GB
+/// になっていた。**
+const MAX_PROPERTY_REFS: usize = 1 << 20;
 
 /// コンテナから読み取れた事実。
 ///
@@ -117,23 +140,28 @@ pub fn probe(bytes: &[u8]) -> Result<AvifMeta> {
         .with_hint("このコマンドが読めるのは AVIF のコンテナだけです"));
     }
 
-    let top = children(bytes, 0)?;
+    let top = children(bytes)?;
     let meta = find(&top, b"meta").ok_or_else(|| broken("meta ボックスがありません"))?;
     let (_, _, meta) = full_box(meta)?;
-    let meta = children(meta, 1)?;
+    let meta = children(meta)?;
 
     let primary = primary_item_id(&meta)?;
 
     let iprp = find(&meta, b"iprp").ok_or_else(|| broken("iprp ボックスがありません"))?;
-    let iprp = children(iprp, 2)?;
+    let iprp = children(iprp)?;
     let ipco = find(&iprp, b"ipco").ok_or_else(|| broken("ipco ボックスがありません"))?;
-    let properties = children(ipco, 3)?;
+    let properties = children(ipco)?;
     let associations = item_properties(&iprp)?;
 
     // **主画像のプロパティだけを見る。** アルファの補助画像も `ispe` を持つので、
     // 「最初に見つけた ispe」や「いちばん大きい ispe」で代用すると、アルファを
-    // 別解像度で符号化したファイル（規格上は許される）で寸法が入れ替わる
-    let primary_props = properties_of(&properties, &associations, primary);
+    // 別解像度で符号化したファイル（規格上は許される）で寸法が入れ替わる。
+    //
+    // ここだけは実体化する。主画像 1 つ分の並びを `color_naming` と `ispe` の
+    // 2 箇所が別々に走査するので、そのたびに索引を引き直す意味が無い。
+    // 量は `MAX_PROPERTY_REFS` が押さえている
+    let primary_props: Vec<Child<'_>> =
+        properties_of(&properties, &associations, primary).collect();
 
     let ispe = primary_props
         .iter()
@@ -218,7 +246,7 @@ fn color_naming(
             return Ok(naming);
         }
     }
-    match primary_bitstream_head(file, meta, primary) {
+    match primary_bitstream_head(file, meta, primary)? {
         Some(head) => Ok(sequence_header_cicp(&head)),
         None => Ok(ColorNaming::Unknown),
     }
@@ -230,24 +258,85 @@ fn color_naming(
 /// 数十バイトで置かれる。画像全体を複製する理由は無い。
 const BITSTREAM_HEAD: usize = 8192;
 
+/// `iloc` のヘッダが宣言する、各フィールドのバイト幅。
+#[derive(Clone, Copy)]
+struct IlocWidths {
+    offset: usize,
+    length: usize,
+    base: usize,
+    index: usize,
+}
+
 /// 主画像の AV1 ビットストリームの**先頭だけ**を `iloc` 経由で切り出す。
 ///
 /// `construction_method` は 0（ファイル先頭からのオフセット）だけを扱う。
 /// 1（`idat` の中）と 2（別 item の中）は kiri が書かず、扱いを増やしても
-/// 検証できる素材が無い——読めないものは `None` として `Unknown` に流す。
-fn primary_bitstream_head(file: &[u8], meta: &[Child<'_>], primary: u32) -> Option<Vec<u8>> {
-    let iloc = find(meta, b"iloc")?;
-    let (version, _, body) = full_box(iloc).ok()?;
-    let sizes = bytes_at::<2>(body, 0).ok()?;
-    let offset_size = usize::from(sizes[0] >> 4);
-    let length_size = usize::from(sizes[0] & 0xF);
-    let base_size = usize::from(sizes[1] >> 4);
-    // version 0 ではここは予約領域で、index は並びに現れない
-    let index_size = if version >= 1 {
-        usize::from(sizes[1] & 0xF)
-    } else {
-        0
+/// 検証できる素材が無い——読めないものは `Ok(None)` として `Unknown` に流す。
+///
+/// # 「読めない」と「壊れている」を分ける
+///
+/// 返り値が `Result<Option<_>>` なのは、`iloc` の**幅の宣言そのものが破綻して
+/// いる**場合だけを `Unknown` ではなくエラーにするため。`colr` があるのに
+/// 中身が切れているときと同じ扱いで（`color_naming` のドキュメントを参照）、
+/// そこはコンテナが壊れているという別の事実である。
+fn primary_bitstream_head(
+    file: &[u8],
+    meta: &[Child<'_>],
+    primary: u32,
+) -> Result<Option<Vec<u8>>> {
+    let Some(iloc) = find(meta, b"iloc") else {
+        return Ok(None);
     };
+    let Ok((version, _, body)) = full_box(iloc) else {
+        return Ok(None);
+    };
+    let Ok(sizes) = bytes_at::<2>(body, 0) else {
+        return Ok(None);
+    };
+    let widths = IlocWidths {
+        offset: usize::from(sizes[0] >> 4),
+        length: usize::from(sizes[0] & 0xF),
+        base: usize::from(sizes[1] >> 4),
+        // version 0 ではここは予約領域で、index は並びに現れない
+        index: if version >= 1 {
+            usize::from(sizes[1] & 0xF)
+        } else {
+            0
+        },
+    };
+
+    // extent 1 つが読み進めるバイト数が 0 になる組み合わせをここで断る。
+    // `uint(data, at, 0)` は `data.get(at..at)` で必ず `Some(0)` を返すので、
+    // 内側のループは脱出もせずに extent_count 回（u16 なので 1 エントリ
+    // あたり最大 65535 回）空回りする。実測で 360KB の入力に 3.6 秒かかった。
+    //
+    // `children()` が 0 長ボックスを「進めない以上どう解釈しても無限ループに
+    // なる」として断っているのと**同じ判断**である。位置が進まない繰り返しは、
+    // 読み方の問題ではなく、その並びが並びとして成立していないということ
+    if widths.index + widths.offset + widths.length == 0 {
+        return Err(broken("iloc の extent が 1 バイトも読み進めません"));
+    }
+
+    Ok(iloc_primary_head(file, body, version, &widths, primary))
+}
+
+/// `iloc` の並びを実際に辿って、主画像の extent を繋ぐ。
+///
+/// 幅の検査は呼び出し側が済ませてある。ここでの読み取り失敗は
+/// 「色が読めなかった」であって壊れているとは限らないので、`None` に落とす。
+fn iloc_primary_head(
+    file: &[u8],
+    body: &[u8],
+    version: u8,
+    widths: &IlocWidths,
+    primary: u32,
+) -> Option<Vec<u8>> {
+    let IlocWidths {
+        offset: offset_size,
+        length: length_size,
+        base: base_size,
+        index: index_size,
+    } = *widths;
 
     let mut at = 2usize;
     let count = if version < 2 {
@@ -337,26 +426,30 @@ fn uint(data: &[u8], at: usize, size: usize) -> Option<u64> {
 fn has_alpha(
     meta: &[Child<'_>],
     properties: &[Child<'_>],
-    associations: &[(u32, Vec<u16>)],
+    associations: &Associations,
     primary: u32,
 ) -> Result<bool> {
-    let links = match find(meta, b"iref") {
-        Some(iref) => auxl_links(iref)?,
-        None => Vec::new(),
+    // 集合にしてから引く。`auxl` の対応は 1 つの `iref` に何万も書けるので、
+    // item ごとに線形に探すと item 数との掛け算になる。`auxl_links` の側を
+    // 並びのまま残してあるのは、**書いてある順**がテストの検査対象だから
+    let links: BTreeSet<(u32, u32)> = match find(meta, b"iref") {
+        Some(iref) => auxl_links(iref)?.into_iter().collect(),
+        None => BTreeSet::new(),
     };
 
-    for (item, _) in associations {
-        if *item == primary {
+    for &item in associations.keys() {
+        if item == primary {
             continue;
         }
-        let is_alpha = properties_of(properties, associations, *item)
-            .iter()
+        // `any` で打ち切る。alpha の `auxC` は 1 つ見つかれば十分で、
+        // その item の残りのプロパティを最後まで引く理由が無い
+        let is_alpha = properties_of(properties, associations, item)
             .filter(|p| p.kind == *b"auxC")
             .any(|p| aux_urn(p.payload).is_some_and(|urn| urn == ALPHA_URN));
         if !is_alpha {
             continue;
         }
-        if links.is_empty() || links.contains(&(*item, primary)) {
+        if links.is_empty() || links.contains(&(item, primary)) {
             return Ok(true);
         }
     }
@@ -374,7 +467,7 @@ fn aux_urn(payload: &[u8]) -> Option<&str> {
 fn auxl_links(iref: &[u8]) -> Result<Vec<(u32, u32)>> {
     let (version, _, body) = full_box(iref)?;
     let mut out = Vec::new();
-    for reference in children(body, 3)? {
+    for reference in children(body)? {
         if reference.kind != *b"auxl" {
             continue;
         }
@@ -411,16 +504,35 @@ fn primary_item_id(meta: &[Child<'_>]) -> Result<u32> {
     }
 }
 
-/// `ipma` を (item_ID, プロパティ番号の並び) にほどく。
+/// item_ID から、その item に割り当てられたプロパティ番号の並びを引く索引。
 ///
-/// `ipma` は 1 つとは限らない（item を分けて複数書ける）ので全部を連結する。
-fn item_properties(iprp: &[Child<'_>]) -> Result<Vec<(u32, Vec<u16>)>> {
-    let mut out = Vec::new();
+/// **並びではなく索引にしてある。** 並びのまま持つと「ある item のプロパティ」を
+/// 取り出すたびに全体を走査することになり、`has_alpha` がそれを item ごとに
+/// 呼ぶので要素数の二乗になる（実測で 1.5MB の入力に 31 秒）。
+type Associations = BTreeMap<u32, Vec<u16>>;
+
+/// `ipma` を item_ID → プロパティ番号の索引にほどく。
+///
+/// `ipma` は 1 つとは限らない（item を分けて複数書ける）し、同じ item が
+/// 複数回現れることもある。**どちらも連結する**——規格上は割り当ての追記で、
+/// 後勝ちで上書きすると先に書かれたプロパティが消える。
+///
+/// 量には `MAX_ASSOCIATIONS` / `MAX_PROPERTY_REFS` で上限を置く。
+/// `entry_count` は 32bit、1 要素あたりのプロパティ数は 8bit で、どちらも
+/// ファイルの大きさに対して素直に効かない。
+fn item_properties(iprp: &[Child<'_>]) -> Result<Associations> {
+    let mut out = Associations::new();
+    let mut entries = 0usize;
+    let mut refs = 0usize;
     for ipma in iprp.iter().filter(|c| c.kind == *b"ipma") {
         let (version, flags, body) = full_box(ipma.payload)?;
         let count = be32(body, 0)?;
         let mut at = 4usize;
         for _ in 0..count {
+            entries = add(entries, 1)?;
+            if entries > MAX_ASSOCIATIONS {
+                return Err(broken("ipma の割り当てが多すぎます"));
+            }
             let item = if version < 1 {
                 let v = be16(body, at)? as u32;
                 at = add(at, 2)?;
@@ -434,7 +546,11 @@ fn item_properties(iprp: &[Child<'_>]) -> Result<Vec<(u32, Vec<u16>)>> {
                 .get(at)
                 .ok_or_else(|| broken("ipma が途中で終わっています"))?;
             at = add(at, 1)?;
-            let mut indices = Vec::new();
+            refs = add(refs, usize::from(n))?;
+            if refs > MAX_PROPERTY_REFS {
+                return Err(broken("ipma のプロパティ参照が多すぎます"));
+            }
+            let indices = out.entry(item).or_default();
             for _ in 0..n {
                 // flags の最下位ビットが立っていると番号は 15bit。先頭ビットは
                 // essential（読めないなら画像を出すな）で、番号ではない
@@ -451,7 +567,6 @@ fn item_properties(iprp: &[Child<'_>]) -> Result<Vec<(u32, Vec<u16>)>> {
                 };
                 indices.push(index);
             }
-            out.push((item, indices));
         }
     }
     Ok(out)
@@ -460,23 +575,26 @@ fn item_properties(iprp: &[Child<'_>]) -> Result<Vec<(u32, Vec<u16>)>> {
 /// ある item に割り当てられたプロパティを `ipco` から引く。
 ///
 /// `ipma` の番号は **1 始まり**で、0 は「割り当て無し」を表す予約値。
-fn properties_of<'a>(
-    properties: &[Child<'a>],
-    associations: &[(u32, Vec<u16>)],
+///
+/// **`Vec` に実体化せず、借りたまま返す。** 返す側で複製すると、呼び出し側が
+/// 最初の 1 つで足りる場合（`has_alpha` の `auxC` 探し）でも全部を組み立てる
+/// 費用を払うことになる。実体化が要るのは主画像のプロパティだけで、そこは
+/// `probe` が明示的に `collect` する。
+fn properties_of<'a, 'i>(
+    properties: &'i [Child<'a>],
+    associations: &'i Associations,
     item: u32,
-) -> Vec<Child<'a>> {
-    let mut out = Vec::new();
-    for (_, indices) in associations.iter().filter(|(id, _)| *id == item) {
-        for index in indices {
-            if let Some(p) = index
+) -> impl Iterator<Item = Child<'a>> + 'i {
+    associations
+        .get(&item)
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .filter_map(|index| {
+            index
                 .checked_sub(1)
-                .and_then(|i| properties.get(i as usize))
-            {
-                out.push(*p);
-            }
-        }
-    }
-    out
+                .and_then(|i| properties.get(usize::from(i)))
+                .copied()
+        })
 }
 
 /// ISOBMFF の 1 つのボックス。中身は借りたままで、複製しない。
@@ -495,10 +613,15 @@ fn find<'a>(children: &[Child<'a>], kind: &[u8; 4]) -> Option<&'a [u8]> {
 /// `size == 1`（64bit の largesize）と `size == 0`（親の末尾まで）の両方を
 /// 扱う。`size` がヘッダより小さい入力——0 長ボックスを含む——は、進めない
 /// 以上どう解釈しても無限ループになるので、その場でエラーにする。
-fn children(data: &[u8], depth: u32) -> Result<Vec<Child<'_>>> {
-    if depth > MAX_DEPTH {
-        return Err(broken("ボックスの入れ子が深すぎます"));
-    }
+///
+/// **入れ子はここで再帰しない。** 降りる先は `probe` が `meta` → `iprp` →
+/// `ipco` と 1 段ずつ書き下しているだけなので、どんな入力でもスタックは
+/// 入力の内容で深くならない。以前ここには深さの上限（`MAX_DEPTH`）が
+/// 置いてあったが、深さは呼び出し側が定数で渡していたので一度も効かず、
+/// 「上限がある」という見かけだけが残っていた。入力の量に効く関門は
+/// `MAX_BOXES`（1 階層の数）と `MAX_ASSOCIATIONS` / `MAX_PROPERTY_REFS`
+/// （`ipma` の量）が持つ。
+fn children(data: &[u8]) -> Result<Vec<Child<'_>>> {
     let mut out = Vec::new();
     let mut at = 0usize;
     while at < data.len() {
@@ -852,9 +975,9 @@ mod tests {
         let bytes = avif(true);
         assert!(probe(&bytes).unwrap().has_alpha);
 
-        let top = children(&bytes, 0).unwrap();
+        let top = children(&bytes).unwrap();
         let (_, _, meta) = full_box(find(&top, b"meta").unwrap()).unwrap();
-        let meta = children(meta, 1).unwrap();
+        let meta = children(meta).unwrap();
         let iref = find(&meta, b"iref").expect("iref が無い");
         assert_eq!(auxl_links(iref).unwrap(), vec![(2, 1)]);
     }
@@ -871,9 +994,9 @@ mod tests {
         bump(&mut bytes, meta.0, -((iref.1 - iref.0) as isize));
 
         let meta_children = {
-            let top = children(&bytes, 0).unwrap();
+            let top = children(&bytes).unwrap();
             let (_, _, meta) = full_box(find(&top, b"meta").unwrap()).unwrap();
-            children(meta, 1).unwrap().len()
+            children(meta).unwrap().len()
         };
         assert!(meta_children > 0, "meta を壊している");
         assert!(probe(&bytes).unwrap().has_alpha);
@@ -909,11 +1032,11 @@ mod tests {
     #[test]
     fn an_av1c_box_from_kiri_carries_no_config_obus() {
         let bytes = avif(false);
-        let top = children(&bytes, 0).unwrap();
+        let top = children(&bytes).unwrap();
         let (_, _, meta) = full_box(find(&top, b"meta").unwrap()).unwrap();
-        let meta = children(meta, 1).unwrap();
-        let iprp = children(find(&meta, b"iprp").unwrap(), 2).unwrap();
-        let ipco = children(find(&iprp, b"ipco").unwrap(), 3).unwrap();
+        let meta = children(meta).unwrap();
+        let iprp = children(find(&meta, b"iprp").unwrap()).unwrap();
+        let ipco = children(find(&iprp, b"ipco").unwrap()).unwrap();
         let av1c = ipco
             .iter()
             .find(|c| c.kind == *b"av1C")
@@ -1095,6 +1218,172 @@ mod tests {
         let err = probe(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\0").unwrap_err();
         assert_eq!(err.code.as_str(), "UNSUPPORTED_FORMAT");
         assert_eq!(err.exit_code(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // 量で殴る入力
+    //
+    // ここから下は「落ちない」ではなく**「現実的な時間で断る」**を固定する。
+    // 素材は外のファイルではなくここで組み立てる——再現の手順がテストから
+    // 読めないと、上限を動かしたくなったときに何を壊すのかが分からなくなる。
+    // -----------------------------------------------------------------------
+
+    fn plain_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut out = ((payload.len() + 8) as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(kind);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn versioned_box(kind: &[u8; 4], version: u8, flags: u32, payload: &[u8]) -> Vec<u8> {
+        let mut body = vec![
+            version,
+            (flags >> 16) as u8,
+            (flags >> 8) as u8,
+            flags as u8,
+        ];
+        body.extend_from_slice(payload);
+        plain_box(kind, &body)
+    }
+
+    /// `ftyp` + `meta` だけの器。`meta` の中身は呼び出し側が組む。
+    fn synthetic_avif(meta_body: &[u8]) -> Vec<u8> {
+        let mut out = plain_box(b"ftyp", b"avif\0\0\0\0avifmif1miaf");
+        out.extend_from_slice(&versioned_box(b"meta", 0, 0, meta_body));
+        out
+    }
+
+    fn ispe_1600() -> Vec<u8> {
+        let mut dims = 1600u32.to_be_bytes().to_vec();
+        dims.extend_from_slice(&1600u32.to_be_bytes());
+        versioned_box(b"ispe", 0, 0, &dims)
+    }
+
+    /// `ipma` に要素を並べた AVIF。
+    ///
+    /// 先頭は主画像（item 1）に `ispe` を割り当てる正しい要素で、そのあとへ
+    /// `entries` 個を足す。`same_item` が真だとそれらは全部同じ item_ID に
+    /// なる——索引を持たない実装では「1 件引くのに全体を走査する」が
+    /// 最悪の形で出る並びである。
+    fn avif_with_ipma(entries: usize, props: usize, same_item: bool) -> Vec<u8> {
+        let ipco = plain_box(b"ipco", &ispe_1600());
+
+        let mut rows = 1u16.to_be_bytes().to_vec();
+        rows.push(1); // 主画像のプロパティは 1 個
+        rows.push(1); // ipco の 1 番目（ispe）
+        for i in 0..entries {
+            let item = if same_item {
+                2u16
+            } else {
+                (i as u16).wrapping_add(2)
+            };
+            rows.extend_from_slice(&item.to_be_bytes());
+            rows.push(props as u8);
+            rows.extend(std::iter::repeat_n(1u8, props));
+        }
+        let mut payload = ((entries + 1) as u32).to_be_bytes().to_vec();
+        payload.extend_from_slice(&rows);
+        let ipma = versioned_box(b"ipma", 0, 0, &payload);
+
+        let iprp = plain_box(b"iprp", &[ipco, ipma].concat());
+        let pitm = versioned_box(b"pitm", 0, 0, &1u16.to_be_bytes());
+        synthetic_avif(&[pitm, iprp].concat())
+    }
+
+    /// `ipma` は上限の手前なら普通に読めること。
+    ///
+    /// **上限のテストと対にしておく。** 断る側だけを見ていると、上限を
+    /// 下げすぎて現実のファイルを弾く変更が緑のまま通る。
+    #[test]
+    fn many_items_below_the_limit_are_still_read() {
+        let meta = probe(&avif_with_ipma(1_000, 8, false)).unwrap();
+        assert_eq!((meta.width, meta.height), (1600, 1600));
+        assert!(!meta.has_alpha);
+    }
+
+    /// `ipma` の量が上限を超えたら、時間をかけずに断る。
+    ///
+    /// 索引が無かった頃、`has_alpha` は item ごとに `ipma` 全体を走査して
+    /// いたので、要素数の二乗になっていた。**実測で 960KB / 26 秒、
+    /// 1.5MB（4000 件 × 255 プロパティ）で 31 秒・最大 RSS 2.4GB。**
+    /// どちらもエラーではなく `Ok` を返していた——だから「断ること」自体が
+    /// 退行の検出になる。時間の上限はその上に重ねた歯止めで、
+    /// 二乗に戻れば桁で超える
+    #[test]
+    fn an_ipma_beyond_the_limits_is_refused_without_burning_time() {
+        let cases = [
+            (
+                "要素数",
+                avif_with_ipma(MAX_ASSOCIATIONS, 0, false),
+                "ipma の割り当てが多すぎます",
+            ),
+            (
+                "プロパティ参照",
+                avif_with_ipma(5_000, 255, true),
+                "ipma のプロパティ参照が多すぎます",
+            ),
+        ];
+        for (label, bytes, want) in cases {
+            let began = std::time::Instant::now();
+            let err = probe(&bytes).unwrap_err();
+            let took = began.elapsed();
+            assert_eq!(err.code.as_str(), "INPUT_DECODE_FAILED", "{label}");
+            assert!(err.message.contains(want), "{label}: {}", err.message);
+            assert!(
+                took < std::time::Duration::from_secs(5),
+                "{label} に {took:?} かかった（{} バイト）",
+                bytes.len()
+            );
+        }
+    }
+
+    /// 幅がすべて 0 の `iloc` は、読み進めないと分かった時点で断る。
+    ///
+    /// `offset_size` / `length_size` / `index_size` が 0 だと extent の
+    /// ループは `at` を 1 バイトも進めないまま `extent_count` 回（u16 なので
+    /// 65535 回）まわり、`uint(_, _, 0)` が必ず `Some(0)` を返すので脱出も
+    /// しない。**実測で 360KB / 3.6 秒、36MB なら約 6 分。**
+    /// これも以前は `Ok`（色は `Unknown`）で返っていた。
+    #[test]
+    fn an_iloc_whose_extents_read_nothing_is_refused() {
+        // version 0 の item_count は 16bit なので、ここが詰められる上限
+        let entries = u16::MAX;
+        let av1c = plain_box(b"av1C", &[0x81, 0x00, 0x0c, 0x00]);
+        let ipco = plain_box(b"ipco", &[ispe_1600(), av1c].concat());
+        let ipma = versioned_box(b"ipma", 0, 0, &{
+            let mut v = 1u32.to_be_bytes().to_vec();
+            v.extend_from_slice(&1u16.to_be_bytes());
+            v.push(2);
+            v.extend_from_slice(&[1, 2]);
+            v
+        });
+        let iprp = plain_box(b"iprp", &[ipco, ipma].concat());
+        let pitm = versioned_box(b"pitm", 0, 0, &1u16.to_be_bytes());
+
+        // offset_size / length_size / base_offset_size をすべて 0 にする
+        let mut body = vec![0x00, 0x00];
+        body.extend_from_slice(&entries.to_be_bytes());
+        for _ in 0..entries - 1 {
+            body.extend_from_slice(&9u16.to_be_bytes()); // 主画像でない item
+            body.extend_from_slice(&0u16.to_be_bytes()); // data_reference_index
+            body.extend_from_slice(&u16::MAX.to_be_bytes()); // extent_count
+        }
+        body.extend_from_slice(&1u16.to_be_bytes()); // 主画像は最後に置く
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.extend_from_slice(&0u16.to_be_bytes());
+        let iloc = versioned_box(b"iloc", 0, 0, &body);
+
+        let bytes = synthetic_avif(&[pitm, iprp, iloc].concat());
+        let began = std::time::Instant::now();
+        let err = probe(&bytes).unwrap_err();
+        let took = began.elapsed();
+        assert_eq!(err.code.as_str(), "INPUT_DECODE_FAILED");
+        assert!(err.message.contains("iloc の extent"), "{}", err.message);
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "{took:?} かかった（{} バイト）",
+            bytes.len()
+        );
     }
 
     /// 配る文面に連続スペースを入れない（報告の整形が崩れる）。

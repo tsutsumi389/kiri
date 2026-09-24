@@ -13,6 +13,7 @@ use crate::cli::{
     BatchArgs, ColorOpts, CutoutArgs, OutputOpts, Polygon, SegmentOpts, parse_hex_color, parse_size,
 };
 use crate::commands::{cutout, output};
+use crate::compliance::FailOn;
 use crate::cutout::{BackgroundModel, CutoutOptions, DEFAULT_BORDER, Matting, OptimizeFixed};
 use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::OutputFormat;
@@ -21,6 +22,12 @@ use crate::report::{BatchItemReport, BatchReport, ErrorBody, ManifestItem, SCHEM
 use crate::segment::SegmentMode;
 use crate::transform::shadow::ShadowMode;
 use crate::warning::{Warning, WarningCode};
+
+/// 「処理は成功したが規格に達しなかった」項目の綴り。
+///
+/// `"ok"` / `"error"` の 2 値に足す 3 つ目で、**`succeeded` と `failed` の
+/// どちらの定義も動かさない。**
+pub const REJECTED: &str = "rejected";
 
 pub fn run(args: &BatchArgs) -> Result<BatchReport> {
     let started = Instant::now();
@@ -48,7 +55,12 @@ pub fn run(args: &BatchArgs) -> Result<BatchReport> {
             Ok(report) => BatchItemReport {
                 input: input.display().to_string(),
                 output: output.display().to_string(),
-                status: "ok",
+                // **不合格も `result` を通常どおり入れる。** 処理は成功していて
+                // 成果物も書かれているので、`status` の綴りだけで区別する
+                status: match report.compliance.as_ref() {
+                    Some(c) if !c.passed => REJECTED,
+                    _ => "ok",
+                },
                 result: Some(report),
                 error: None,
             },
@@ -74,6 +86,7 @@ pub fn run(args: &BatchArgs) -> Result<BatchReport> {
     };
 
     let failed = results.iter().filter(|r| r.status == "error").count();
+    let rejected = results.iter().filter(|r| r.status == REJECTED).count();
     let with_warnings = results
         .iter()
         .filter(|r| r.result.as_ref().is_some_and(|c| !c.warnings.is_empty()))
@@ -86,8 +99,12 @@ pub fn run(args: &BatchArgs) -> Result<BatchReport> {
         schema_version: SCHEMA_VERSION,
         spec: args.spec.display().to_string(),
         total: results.len(),
+        // **不合格は成功に数える。** 処理は通っていて成果物も書かれており、
+        // `succeeded` を「書けた件数」として読んでいる既存の読み手にとって
+        // それは今も正しい。人が見るべき件数は `rejected` が別に言う
         succeeded: results.len() - failed,
         failed,
+        rejected,
         with_warnings,
         dry_run: args.dry_run,
         warnings,
@@ -191,6 +208,20 @@ fn to_cutout_args(
 
     let max_bytes = max_bytes(settings.max_bytes.as_ref())?;
 
+    // **1 バイトも読む前に断る。** CLI では clap が同じ位置で解いている。
+    // 切り抜きを全部終えてから綴り違いに気づく形にしない
+    let fail_on = settings
+        .fail_on
+        .as_deref()
+        .map(|s| {
+            FailOn::parse(s).map_err(|e| {
+                Error::new(ErrorCode::InvalidFailOn, e).with_hint(
+                    "--fail-on とまったく同じ書式です（kiri cutout --help が綴りを配ります）",
+                )
+            })
+        })
+        .transpose()?;
+
     // **排他は CLI と同じ。** 2 つの組み立て方が混ざると「どちらが勝つか」と
     // いう覚える規則が増える。clap は `--derive` と `--sizes` を構造として
     // 弾くので、spec でも同じ形を断っておかないと片方だけが緩くなる
@@ -290,6 +321,7 @@ fn to_cutout_args(
         rotate: angle(settings.rotate, 0.0, "rotate")?,
         canvas,
         fill_ratio: settings.fill_ratio.unwrap_or(0.85),
+        fail_on,
         debug_mask: None,
         // バッチは JSON だけで回す。数百点でプレビューを吐くと無駄な I/O になる
         preview: None,

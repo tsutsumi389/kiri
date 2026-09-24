@@ -7,6 +7,7 @@ pub mod batch;
 pub mod cli;
 pub mod color;
 pub mod commands;
+pub mod compliance;
 pub mod cutout;
 pub mod error;
 pub mod image_io;

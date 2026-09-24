@@ -239,6 +239,23 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         &mut warnings,
     );
 
+    let mask = MaskReport {
+        foreground_ratio: round4(result.stats.foreground_ratio),
+        bbox: result.stats.bbox.map(|(x1, y1, x2, y2)| [x1, y1, x2, y2]),
+        touches_edge: result.stats.touches_edge,
+        separability: result.separability.map(round4),
+        halo_ratio: result.diagnostics.halo_ratio.map(round4),
+        edge_width: result.diagnostics.edge_width.map(round4),
+        contour_roughness: result.diagnostics.contour_roughness.map(round4),
+        rim_contamination: result.diagnostics.rim_contamination.map(round4),
+        debug_mask,
+    };
+    // **合否は最後に、報告する値そのものから出す。** `mask` を組み終えてから
+    // 見るので、`compliance.checks[].actual` と `mask.*` は必ず同じ数になる。
+    // 書式の検査はここではなく clap（CLI）と `to_cutout_args`（spec）で
+    // 済んでいる——切り抜きを回し切ってから綴り違いに気づく形にしない
+    let compliance = args.fail_on.as_ref().map(|f| f.evaluate(&mask, &warnings));
+
     Ok(CutoutReport {
         schema_version: SCHEMA_VERSION,
         input: args.input.display().to_string(),
@@ -309,17 +326,8 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         // 回した実行だけがこのブロックを持つ。`canvas` / `shadow` と同じ規約で、
         // 「回さなかった」と「回せない（古い版）」を `null` で混ぜない
         rotate: rotation,
-        mask: MaskReport {
-            foreground_ratio: round4(result.stats.foreground_ratio),
-            bbox: result.stats.bbox.map(|(x1, y1, x2, y2)| [x1, y1, x2, y2]),
-            touches_edge: result.stats.touches_edge,
-            separability: result.separability.map(round4),
-            halo_ratio: result.diagnostics.halo_ratio.map(round4),
-            edge_width: result.diagnostics.edge_width.map(round4),
-            contour_roughness: result.diagnostics.contour_roughness.map(round4),
-            rim_contamination: result.diagnostics.rim_contamination.map(round4),
-            debug_mask,
-        },
+        mask,
+        compliance,
         canvas,
         shadow,
         preview,

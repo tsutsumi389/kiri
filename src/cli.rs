@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+use crate::compliance::{DEFAULT_TOKEN, FAIL_ON_METRICS, FailOn};
 use crate::cutout::background::DEFAULT_BORDER;
 use crate::cutout::constraints::{
     ALPHA_BACKGROUND, ALPHA_FOREGROUND, MASK_THRESHOLD, TRIMAP_BACKGROUND, TRIMAP_FOREGROUND,
@@ -665,6 +666,69 @@ fn optimize_long_help() -> String {
     )
 }
 
+/// `--fail-on` の長いヘルプ。指標と演算子の綴りは実装から組む。
+///
+/// **AI エージェントは `--help` を読んで判断する**ので、「何が既定の条件か」
+/// 「測れなかったら落ちること」「不合格でも結果 JSON は返ること」の 3 つを
+/// ここで言う。どれも指定の前に知っていないと、返ってきた exit 5 を
+/// 「処理が失敗した」と読んで成果物を捨てることになる。
+///
+/// 指標の一覧を直書きしないのは `derive_long_help` と同じ理由である——
+/// `Metric` を動かしたときにヘルプだけが古い一覧を語ると、それがそのまま
+/// 誤った指定になる。
+fn fail_on_long_help() -> String {
+    use crate::compliance::{calibrated_gate_codes, flag_metrics, operators};
+    let codes: Vec<&str> = calibrated_gate_codes().iter().map(|c| c.as_str()).collect();
+    // 真偽の指標は裸のトークンで書く。綴りも意味も `Metric` から配る
+    let flags: Vec<String> = flag_metrics()
+        .into_iter()
+        .map(|(name, meaning)| format!("{name}（{meaning}）"))
+        .collect();
+    format!(
+        "指標がこの条件に触れたら exit {} で返す（既定 off）。カンマ区切りで、\n\
+         {DEFAULT_TOKEN} / <指標><演算子><値> / 真偽の指標の 3 種類を混ぜて書ける\n\
+         （例 --fail-on '{DEFAULT_TOKEN},halo_ratio>0.05'）。\n\
+         指標は結果 JSON の mask.* のキーそのまま: {}。\n\
+         演算子は {}。**これに触れたら不合格**である\
+         （halo_ratio>0.10 は「0.10 を超えたら落とす」）。\n\
+         **発火しえない条件は断る**（halo_ratio>1.0 は割合が 1 を超えないので\
+         永久に落ちない）。1 ちょうどを落とすなら halo_ratio>=1.0 と書く。\n\
+         真偽の指標は裸のトークンで書く: {}。**= は付けない**——\
+         向きを選べる形にすると、唯一意味のある向きがどちらか読めなくなる。\n\
+         {DEFAULT_TOKEN} は既定の合格条件で、次の警告のいずれかが出たら不合格にする: {}。\
+         これは --optimize が「きれい」と呼ぶ較正済みの集合に、測れなかった指標を\
+         足したものである。**同じ問いに 2 つの答えを持たせない**ためにこの集合を使う。\n\
+         **{DEFAULT_TOKEN} と明示が同じ指標に当たったら明示が勝つ**\
+         （--tolerance を明示したときに探索の軸から外れるのと同じ規約）。\
+         **勝つのは指標ごとである**——{DEFAULT_TOKEN},foreground_ratio>0.9 は \
+         FOREGROUND_TOO_SMALL の検査も一緒に置き換える（同じ指標の二重指定は\
+         断るので、書き足して取り戻すことはできない）。\n\
+         **測れなかった指標（null）は不合格**である。separability の null は\
+         「前景が無い」、halo_ratio の null は「測る境界が無い」で、どちらも\
+         黙って合格を出してよい状態ではない。status で fail と区別して名乗る。\n\
+         **不合格でも結果 JSON は通常どおり全部返る**（outputs[] も mask も \
+         background もある）。処理は成功していて成果物も存在するので、\
+         exit {} は「やり直せば直る失敗」ではなく「人が見る対象」である。\
+         判定の内訳は compliance.checks[] に、評価したものが全部（pass も）出る\
+         （{DEFAULT_TOKEN} では 1 つの指標が複数の行を持つので、**一意なのは code のほう**）。",
+        crate::error::ErrorKind::Compliance.exit_code(),
+        FAIL_ON_METRICS.join(" / "),
+        operators().join(" / "),
+        flags.join(" / "),
+        codes.join(" / "),
+        crate::error::ErrorKind::Compliance.exit_code(),
+    )
+}
+
+/// `--fail-on` を解く。
+///
+/// **入力を 1 バイトも読む前に通る。** clap の `value_parser` なので、綴り違いは
+/// 切り抜きを回し切る前に断られる（`INVALID_MAX_BYTES` / `INVALID_DERIVATION` と
+/// 同じく、CLI では code 無しの exit 2 になる）。
+pub fn parse_fail_on(s: &str) -> Result<FailOn, String> {
+    FailOn::parse(s)
+}
+
 /// `--trimap` のヘルプ。しきい値は `constraints.rs` の定数から組む。
 ///
 /// `edge_threshold_help` と同じ理由で直書きしない。**AI エージェントは
@@ -1156,6 +1220,19 @@ pub struct CutoutArgs {
     /// 既定の 0.85 は EC プラットフォームで広く求められる占有率に合わせている
     #[arg(long, default_value_t = 0.85)]
     pub fill_ratio: f64,
+
+    /// 指標がこの条件に触れたら exit 5 で返す。カンマ区切り (例 default,halo_ratio>0.05)
+    ///
+    /// ヘルプの本文は `fail_on_long_help` が指標と演算子の綴りから組む。
+    /// 既定の条件と「測れなかったら落ちる」規約は、指定の前に知っていないと
+    /// 返ってきた exit 5 を読み違える
+    #[arg(
+        long = "fail-on",
+        value_name = "SPEC",
+        value_parser = parse_fail_on,
+        long_help = fail_on_long_help()
+    )]
+    pub fail_on: Option<FailOn>,
 
     /// 生成したマスクを PNG として書き出す（目視確認用）
     #[arg(long, value_name = "PATH")]

@@ -1124,6 +1124,168 @@ public リポジトリなので GitHub 製の標準ランナーは分数無制�
         既存の `every_derivation_bound_warning_names_its_output` へ
         `kiri resize --allow-upscale` の枝を足して固定した
 
+- [x] Phase 21: `--fail-on` / exit 5 の新設（`SCHEMA_VERSION` は 2 のまま据え置き）
+  - [x] `ErrorKind` に 5 つ目 `Compliance`（exit 5）を足した。`meaning` は
+        「規格未達（成果物はある。人が見る対象で、結果 JSON は通常どおり返る）」
+        ——**exit 4 を流用しない。** 4 は「やり直せば直る失敗」で成果物が無く、
+        5 は処理が通って成果物も書かれた結果が規格に達しなかったことを言う。
+        この区別が無いと、エージェントは書けているファイルを捨てるか、落ちた
+        切り抜きをそのまま納品するかのどちらかになる
+  - [x] `--fail-on 'default,halo_ratio>0.05'`。カンマ区切りで `default` /
+        `<指標><演算子><値>` / 真偽の指標（裸の `touches_edge`）の 3 種類を
+        混ぜられる。演算子は `>` `<` `>=` `<=` で、**触れたら不合格**である。
+        指標の名前は**結果 JSON の `mask.*` のキーそのまま**（7 つ）で、
+        **短縮形は作らない**——JSON から読んだ語をそのまま書けることのほうが、
+        打鍵の短さより重い
+  - [x] `--fail-on default` は **`FATAL_CODES` ∪ `QUALITY_CODES` のいずれかが
+        出たら不合格**。これは `optimize.rs` の `Trial::clean()` が「きれい」と
+        呼ぶ**較正済みの集合に、測れなかった指標（`null`）を足したもの**である
+        （`clean()` は測れなかった指標を「きれい」と数えるが、`default` は
+        不合格にする。違うのはそこだけ）。別の集合を新しく定義すると、
+        `--optimize` が「きれいな候補が見つかった」と言った結果を
+        `--fail-on default` が落としうる。**同じ問いに 2 つの答えを持たせない**
+  - [x] 結果 JSON の `compliance` ブロック（`fail_on` / `passed` / `code` /
+        `checks[]`）。**`--fail-on` があるときだけ出す**（`optimize` / `segment` と
+        同じ規約でキーごと現れない）ので、**`SCHEMA_VERSION` は 2 のまま据え置いた**
+        ——加算だけの変更で、既存の読み方が誤読になる箇所が無い
+  - [x] batch は `results[].status` に 3 つ目の `"rejected"` を足し、
+        `BatchReport` に `rejected` を足した。実行全体の終了コードは
+        「1 件でも不合格なら 5。ただし `failed > 0` の 4 が優先」。
+        spec の `fail_on` は `batch.rs` の 3 箇所（`ItemSettings` / `pick!` /
+        `SETTING_KEYS`）へ同時に足した
+  - ※ **`--optimize` の順位関数には手を触れていない。** 探索の順位は 4 値の
+        辞書式で較正済みで、合わせると較正をやり直すことになる（§7.2 の ※）。
+        参照したのは `FATAL_CODES` / `QUALITY_CODES` という**集合の定義だけ**である
+  - ※ **exit 5 は `Err` 経路を通さない。** 処理は成功していて成果物も存在する
+        ので、結果 JSON を `ErrorReport` へ差し替えない。`outputs[]` も `mask` も
+        捨てると、利用者は「何が不合格だったか」も「何が書かれたか」も追えなく
+        なる——batch が数百枚書いた後に `BatchReport` を捨てていた Phase 20 の
+        失敗と同じ形である。batch が `failed > 0` で 4 を返しつつ `BatchReport` を
+        出している既存の形をそのまま踏襲した
+  - ※ **測れなかった指標（`null`）は不合格にした。** `separability` の `null` は
+        「前景が無い」、`halo_ratio` の `null` は「測る境界が無い」で、どちらも
+        黙って合格を出してよい状態ではない。ただし「しきい値を超えた」とは別の
+        事実なので `status` で `"unmeasurable"` と名乗って `"fail"` と区別する
+        ——次の一手が違う（前者は素材か指示、後者はしきい値か設定を見る）
+  - ※ **`checks[]` は指標ごとではなく code ごとに 1 行出す。** `default` の
+        `foreground_ratio` は `FOREGROUND_TOO_SMALL` と `FOREGROUND_TOO_LARGE` の
+        2 行、`touches_edge` は `SUBJECT_TOUCHES_EDGE` と `BBOX_RECOMMENDED` の
+        2 行になる。**そうすると `checks[].code` の集合がそのまま
+        `FATAL_CODES` ∪ `QUALITY_CODES` と突き合わせられる**ので、どちらかへ
+        code を足したときに落ちる検査が 1 本で書ける。並びは `Metric::ALL` の順で
+        決定的である
+  - ※ **`code` は向きによって変わる。** `halo_ratio>0.05` は「縁が残っている」を
+        厳しく見た指定なので `HALO_REMAINS` を名乗れるが、`halo_ratio<0.05` に
+        対応する警告は無い。**無い帰属をでっち上げない**——当てはまらないところは
+        `null` を出す（Phase 20 で `UPSCALED` の `data.output` について出した
+        結論と同じ）
+  - ※ **固定のしきい値を持たない 3 つは `threshold` を `null` にした。**
+        `NOT_SEPARABLE` は画像ごとの `background.residual.p50` と比べ、外周接触の
+        2 つは複合条件である。それらしい数字を載せた瞬間に、それが契約として
+        読まれる
+  - ※ **`QUALITY_GATE_FAILED` は `errors[]` ではなく `compliance.code` に出る。**
+        カタログに置くのは exit 5 の語彙を `kiri schema` が配るためで、
+        `ErrorBody` としては返さない。名乗る場所を結果の中に用意したのは、
+        exit 5 だけが「エラー本体を持たない終了コード」になるのを避けるため
+        ——エージェントは他の失敗とまったく同じ形（code を引いて分岐する）で
+        扱える
+  - ※ **同じ指標への二重指定は断る。** `halo_ratio>0.1,halo_ratio>0.2` は
+        どちらが勝つかという覚える規則を増やすだけで、意図した条件は 1 つに
+        書ける（Phase 20 の `a_derivation_key_written_twice_is_refused` と同じ扱い）
+  - ※ **値域だけでなく向きまで検査する。** `halo_ratio>2` は「2 を超えたら落とす」と
+        書いたつもりの指定だが、割合は 1 を超えないので**永久に発火しない門**に
+        なる。書いた本人は合格が出続けるのを見て「通っている」と読む。
+        **同じことが値域の端でも起こる**——`halo_ratio>1.0` は値域の中なのに
+        永久に落ちず、比率を % と取り違えた `foreground_ratio>1.0` は全件を黙って
+        通す。レビューで見つかったので、`>` は上限以上を、`<` は下限以下を断る
+        形にした。端ちょうどで発火しうる `>=1.0` / `<=0.0` は通す。逆向きの
+        「必ず発火する門」（`foreground_ratio>=0.0`）も通す——1 枚目の exit 5 で
+        気づくので黙って害を成さず、「どの画像でも落ちること」を確かめる使い方が
+        現にある
+  - ※ **真偽の指標は裸のトークンにした。** 当初は `touches_edge=true` /
+        `=false` と書けたが、実装は「書いた値と一致したら不合格」なので
+        `=false` は「接していなければ落とす」——外周に接していない良い画像が
+        exit 5 で落ち、しかも `default` の外周接触の検査を置き換えて消していた。
+        **方向を選べる形にした結果、唯一意味のある方向がどちらか読めなくなった**
+        ので、`=` を廃して裸の `touches_edge`（外周に接していたら不合格）だけを
+        受ける。`>` が「触れたら不合格」と読めるのと同じ素直さを真偽にも与える。
+        `operator` と `threshold` は `null` になり、`code` には
+        `SUBJECT_TOUCHES_EDGE` を当てる（`BBOX_RECOMMENDED` は「bbox で解ける」と
+        いう別の読み方なので、明示指定には素直なほうを当てる）。まだ配っていない
+        契約なので、簡単に直せるのは今だけだった
+  - ※ **書式の検査は入力を読む前に終わる。** CLI では clap の `value_parser` が、
+        spec では `to_cutout_args` が `cutout::run` の前に通す。切り抜きを全部
+        終えてから綴り違いに気づく形にしない（Phase 20 のレビューで
+        `output::plan_naming` を前倒ししたのと同じ位置）
+  - ※ **測れなかった実測値は `null` だけではない。** NaN や ∞ は JSON の数値に
+        できないので `actual` が `null` になるのに、`status` は `pass` に落ちて
+        いた（レビューで指摘）。`explicit_check` で `unmeasurable` に畳む——
+        指定側の NaN は値域の検査が既に断っているので、これで両側が揃う
+  - ※ **`QUALITY_GATE_FAILED` を `Error::new` で作れないようにした。** 「`ErrorBody`
+        としては返らない」はカタログのコメントが宣言するだけの約束で、構造は
+        何も禁じていなかった（レビューで指摘）。`Error::new` の
+        `debug_assert!(code.kind() != ErrorKind::Compliance)` で関門にする——
+        作れてしまうと結果 JSON が `ErrorReport` へ差し替わり、成果物があるのに
+        `outputs[]` も `mask` も消える。**絶対条件が壊れる形がちょうどこれである**
+  - ※ **人間向けの行は見た件数を言う。** 「8 件中 2 件不合格」という数をヘッダに
+        出す。pass の行を飛ばすだけだと「見た上で通った」が人間向け出力から
+        まるごと消えるためで、doc のほうを実装に合わせなかった。端末の行に
+        markdown の `**` を漏らしていたのも直した（`src/main.rs` の他の
+        `println!` に `**` を含むものは 1 つも無い）
+  - ※ **`compliance.code` と `compliance.fail_on` を `kiri schema` の `fields[]` へ
+        足した。** `code` の存在理由は「`errors[]` が配る語彙と結果を突き合わせ
+        られる場所がここ以外に無い」ことなのに、**その場所自体が schema から
+        引けなかった**（レビューで指摘）。`fail_on` は決まった選択肢を持たない
+        文字列なので `unit` に `text` を足してある（`enum` と分けるのは、受け手が
+        値を照合してよいかがそこで変わるため）
+  - ※ **`FAIL_ON_METRICS` は `Metric::ALL` から const fn で組む。** 手で書き写した
+        一覧を増やさないためで、`--fail-on` の長いヘルプも未知の指標を断るときの
+        一覧もここから出る。schema の `mask.*` の `path` と過不足なく一致することは
+        `the_fail_on_metrics_are_exactly_the_published_mask_fields` が固定する
+  - ※ テスト名: `every_metric_maps_a_threshold_to_an_exit_code`（受け入れ基準 (a)。
+        7 指標 × 触れる / 触れない を**実測値から組んだしきい値**で回すので、
+        較正で指標の出方が動いても表の意味が保たれる）/
+        `an_unmeasurable_metric_is_rejected_under_its_own_name`（(a) の 3 通り目）/
+        `no_fail_on_means_no_compliance_block_and_no_new_exit_code`（(b)。
+        `elapsed_ms` と `compliance` を落とした結果 JSON が 1 文字も変わらない）/
+        `a_rejected_cutout_still_returns_the_whole_result_json` /
+        `a_batch_rejection_exits_five_unless_something_actually_failed`（(c)）/
+        `the_default_gate_is_exactly_the_fatal_and_quality_codes` /
+        `the_readme_spells_the_real_default_gate`（README の囲みが実装の集合と
+        一致する。既存の警告表の検査は**表**しか見ないので、`default` の内訳は
+        素通りしていた）/
+        `the_fail_on_metrics_are_exactly_the_published_mask_fields` /
+        `an_explicit_threshold_beats_the_default_for_the_same_metric` /
+        `the_compliance_checks_are_in_a_deterministic_order` /
+        `a_malformed_fail_on_on_the_command_line_is_refused_by_the_parser` /
+        `a_malformed_fail_on_in_a_spec_is_refused_with_a_code` /
+        `a_spec_inherits_fail_on_from_the_defaults`。
+        レビューで足した分:
+        `a_gate_that_can_never_fire_is_refused_before_the_image_is_read`
+        （値域の端。`a_gate_that_can_never_fire_is_refused_even_inside_the_range` と
+        `a_boundary_gate_that_can_fire_is_accepted` が単体側で同じことを見る）/
+        `an_explicit_edge_token_keeps_the_default_verdict_for_a_clean_image`
+        （**良い画像が落ちない**ことと、置き換えるのが外周接触の 2 本だけである
+        ことを同時に固定する。旧 `=false` はその両方を破っていた）/
+        `a_bare_flag_token_fails_only_when_the_fact_is_true` /
+        `a_bare_flag_token_names_the_plain_warning_code` /
+        `the_old_equals_spelling_is_refused_with_the_bare_token_in_the_message` /
+        `a_non_finite_measurement_is_unmeasurable_not_a_pass` /
+        `a_compliance_code_cannot_be_built_as_an_error_body` /
+        `the_human_readable_compliance_line_counts_what_it_looked_at` /
+        `the_readme_exit_code_table_quotes_the_published_meanings`（`meaning()` の
+        doc が名乗っていた契約をテストで本物にする。**その契約を足した当の
+        コミットで 5 行目が破られていた**）。
+        `the_published_prose_has_no_stray_spaces` は**隙間を 1 文字と決め打ち
+        していた**ので、行継続の書き忘れ（空白 17 個）を 1 つも拾えなかった。
+        空白の連なりを 1 つの隙間として見る形に直し、日本語の直後に 2 つ以上
+        続くものは後ろが英数字でも咎める（列を揃える 2 連スペースは英数字の
+        後ろにしか現れない）。
+        既存の契約テストは `schema_returns_the_whole_contract`（出口に 5 を足した）と
+        `every_published_field_exists_in_the_result`（`--fail-on` を渡す実行を
+        1 つ足した）、`every_code_named_in_the_docs_exists`（計画書だけが先に
+        名指ししてよい code の表から 2 つ消した）が追随している
+
 ## 6. 残件の優先順位
 
 §5 の `[ ]` は 1 件だけになった（`※` は決定とその理由の記録であって作業では
@@ -1306,6 +1468,8 @@ N 個の派生」という内部型を通し、**N = 1 のときに 1 バイト�
   対象が増える
 
 #### Phase 21: `--fail-on`
+
+**済（§5 の Phase 21）。**
 
 **なぜここか。** 「不合格を exit code で返す」という契約の変更を、**最も面積の
 小さいところで 1 回だけ**行う。使う指標（`mask` の 7 項目）もしきい値
@@ -1559,8 +1723,10 @@ batch spec には `profile` / `max_bytes` / `derive` / `naming` / `fail_on` /
     `the_manifest_obeys_the_overwrite_rules_and_dry_run` と、既存の
     `the_readme_warning_table_lists_every_warning_in_the_contract` /
     `every_code_named_in_the_docs_exists` / `every_published_field_exists_in_the_result`）
-- **Phase 21** — (a) 各指標 × しきい値 → exit code の対応表。(b) `--fail-on` 無指定
-  なら exit code が 1 つも変わらない。(c) batch で「1 件不合格 + 0 件失敗 → 5」
+- **Phase 21**（済。結果は §5 の Phase 21 に、テスト名はそちらへ並べた）。
+  **受け入れ基準の letter はこの一覧が定義である** — (a) 各指標 × しきい値 →
+  exit code の対応表（触れる / 触れない / 測れない の 3 通り）。(b) `--fail-on` 無指定
+  なら exit code も結果 JSON も 1 つも変わらない。(c) batch で「1 件不合格 + 0 件失敗 → 5」
   「1 件失敗 + 1 件不合格 → 4」の優先順位
 - **Phase 22** — (a) `profiles[]` が実装の定数と一致する。(b) プリセットごとに
   「合格する合成画像」と「1 項目だけ外した合成画像」で合否と `checks[].name` を固定。

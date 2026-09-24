@@ -939,6 +939,7 @@ product.png  1600x2000  png  841.4 KB  (338 ms)
 | `--no-refine` | | 境界のアルファを色から推定し直さず、マスクの形から作る旧方式に戻す |
 | `--no-despill` | | 境界画素から背景色の寄与を取り除かない |
 | `--optimize` | | `tolerance` / `bbox` / `background-model` の組を総当たりし、指標で選ぶ（[探索を kiri に任せる](#探索を-kiri-に任せるoptimize)） |
+| `--fail-on SPEC` | — | 指標がこの条件に触れたら **exit 5** で返す（[合否を exit code で返す](#合否を-exit-code-で返すfail-on)） |
 | `--rotate` | 0 | 切り抜いた**後に**時計回りへ回す角度(度)。負値は反時計回り。90 の倍数のみ無劣化（[切り抜いた後に回す](#切り抜いた後に回すrotate)） |
 | `--canvas WxH` | — | 商品をこのサイズのキャンバス中央に配置する。`1000` と書けば正方形 |
 | `--fill-ratio` | 0.85 | 商品がキャンバスの何割を占めるか |
@@ -2362,6 +2363,118 @@ sRGB のまま比べると**ガンマぶんだけ暗い側へ偏る**（黒い�
 この表は `kiri schema --json` の `warnings[]` が同じものを返す。**README を読ませる
 代わりにそれを引けばよい。**
 
+#### 合否を exit code で返す（`--fail-on`）
+
+警告は出るが、そのままでは**合否にならない**。`--fail-on` は既にある判断を
+終了コードへ繋ぐ。**新しい指標もしきい値も増えていない。**
+
+```
+$ kiri cutout product.jpg -o out.png --fail-on 'default,halo_ratio>0.05'
+...
+  規格      **不合格**  (--fail-on default,halo_ratio>0.05)
+    x halo_ratio 0.1234 > 0.05  HALO_REMAINS
+$ echo $?
+5
+```
+
+書式はカンマ区切りで、3 種類のトークンを混ぜて書ける。
+
+| 形 | 意味 |
+|---|---|
+| `default` | 既定の合格条件（下記） |
+| `<指標><演算子><値>` | 数値の指標にしきい値を置く（`halo_ratio>0.10`） |
+| `touches_edge` | 真偽の指標。外周に接していたら不合格 |
+
+- 演算子は `>` `<` `>=` `<=` の 4 つ。**これに触れたら不合格**である
+  （`halo_ratio>0.10` は「0.10 を超えたら落とす」）
+- **発火しえない条件は断る。** `halo_ratio>1.0` は値域の中だが、割合は 1 を
+  超えないので永久に落ちない——`halo_ratio>2` を断るのと同じ理由で、書式の
+  誤りとして exit 2 になる。比率を % と取り違えた `foreground_ratio>1.0` が
+  黙って全件を通し続けるのを防ぐためである。`1` ちょうどを落とすなら
+  `halo_ratio>=1.0` と書く（逆向きの「必ず落ちる条件」は 1 枚目の exit 5 で
+  気づくので断らない）
+- **真偽の指標に `=` は付けない。** `touches_edge` とだけ書けば「外周に接して
+  いたら不合格」である。向きを選べる形（`=true` / `=false`）にすると、
+  **唯一意味のある向きがどちらか読めなくなる**——「接していないことを咎める」
+  指定を欲しがる利用者はいない。`>` が「触れたら不合格」と読めるのと同じ
+  素直さを真偽の指標にも与える
+- 指標の名前は**結果 JSON の `mask.*` のキーそのまま**である
+  （`foreground_ratio` / `separability` / `halo_ratio` / `edge_width` /
+  `contour_roughness` / `rim_contamination` / `touches_edge`）。短縮形は無い
+  ——JSON から読んだ語をそのまま書けることのほうが、打鍵の短さより重い
+- `default` は他と混ぜられる。同じ指標が `default` と明示の両方に現れたら
+  **明示が勝つ**（`--tolerance` を明示すると探索の軸から外れるのと同じ規約）。
+  **勝つのは指標ごとである**——`--fail-on 'default,foreground_ratio>0.9'` は
+  `FOREGROUND_TOO_LARGE` だけでなく `FOREGROUND_TOO_SMALL` の検査も置き換える。
+  同じ指標の二重指定は断るので、書き足して取り戻すことはできない
+- **測れなかった指標（`null`）は不合格**である。`separability` の `null` は
+  「前景が無い」、`halo_ratio` の `null` は「測る境界が無い」で、どちらも黙って
+  合格を出してよい状態ではない。ただし「しきい値を超えた」とは別の事実なので、
+  `status` は `unmeasurable` と名乗って `fail` と区別する
+- 書式や値の誤りは `INVALID_FAIL_ON`。**CLI では clap が先に断る**ので
+  code を伴わない exit 2 になり（`--max-bytes` / `--derive` と同じ）、
+  `INVALID_FAIL_ON` が出るのは `batch` の spec 経由だけである
+
+`default` は **`FATAL_CODES` ∪ `QUALITY_CODES` のいずれかが出たら不合格**とする。
+
+```
+NOT_SEPARABLE / FOREGROUND_TOO_SMALL / FOREGROUND_TOO_LARGE /
+SUBJECT_TOUCHES_EDGE / BBOX_RECOMMENDED / HALO_REMAINS /
+CONTOUR_ROUGH / RIM_CONTAMINATED
+```
+
+これは `--optimize` が「きれい」と呼ぶ**較正済みの集合に、測れなかった指標
+（`null`）を足したもの**である。`Trial::clean()` は測れなかった指標を「きれい」と
+数えるが、`--fail-on default` はそれを不合格にする——そこだけが違う。
+別の集合を定義すると、`--optimize` が「きれいな候補が見つかった」と言った結果を
+`--fail-on default` が落とす、という食い違いが起こりうる。同じ問い（この切り抜きは
+納品してよいか）に 2 つの答えを持たせない。
+
+判定の内訳は結果 JSON の `compliance` に出る。**`--fail-on` を渡したときだけ現れ、
+渡さない実行の結果は 1 バイトも変わらない**（`optimize` / `segment` と同じ規約）。
+
+```json
+"compliance": {
+  "fail_on": "default,halo_ratio>0.05",
+  "passed": false,
+  "code": "QUALITY_GATE_FAILED",
+  "checks": [
+    { "name": "halo_ratio", "status": "fail", "operator": "gt",
+      "threshold": 0.05, "actual": 0.1234, "code": "HALO_REMAINS" },
+    { "name": "separability", "status": "unmeasurable", "operator": null,
+      "threshold": null, "actual": null, "code": "NOT_SEPARABLE" },
+    { "name": "contour_roughness", "status": "pass", "operator": "gt",
+      "threshold": 0.16, "actual": 0.04, "code": "CONTOUR_ROUGH" }
+  ]
+}
+```
+
+- `fail_on` は利用者が書いた文字列そのまま。**何を頼んだかが結果だけで分かる**
+- `passed` は「`fail` も `unmeasurable` も 1 つも無い」こと
+- `checks[]` には**評価したものを全部載せる**（`pass` も）。落ちたものだけを
+  載せると、「見た上で通った」と「そもそも見ていない」が区別できない。
+  **並びは決定的**で、指定の順には依らない
+- **`name` は一意ではない。** `default` は指標ではなく code ごとに 1 行出すので、
+  `foreground_ratio` が 2 行、`touches_edge` が 2 行並ぶ。`name` をキーにして
+  畳むと片方が黙って消える——**一意なのは `code` のほう**である
+- **`default` の `status` と `actual` は出どころが違う。** 合否は実際に出た警告
+  （生の値で判定）から取り、`actual` は小数第 4 位で丸めた `mask.*` の値である。
+  4 桁目で両者がずれうるので、生の `halo_ratio` が 0.10003 なら
+  `{"status":"fail","threshold":0.1,"actual":0.1}` という、自分で
+  `actual > threshold` を確かめると食い違って見える行が出る（窓は 5e-5 幅）。
+  明示のしきい値にはこのずれが無い。また外周接触の 2 つは片方の警告しか出ないので、
+  `actual` が `true` なのに `status` が `pass` の行（もう片方の code）も並びうる
+- キーは常に出し、当てはまらないところは `null`。固定のしきい値を持たない条件
+  （`NOT_SEPARABLE` は画像ごとの `background.residual.p50` と比べ、外周接触の 2 つは
+  複合条件）と、真偽の指標では `operator` も `threshold` も `null` になる
+- `code` は不合格のときだけ `QUALITY_GATE_FAILED` を名乗る。**exit 5 は結果 JSON を
+  エラーに差し替えない**ので、`kiri schema --json` の `errors[]` が配る語彙と
+  結果を突き合わせられる場所がここになる
+
+**exit 5 でも結果 JSON は通常どおり全部返る。** 処理は成功していて成果物も
+書かれている——`outputs[]` も `mask` も `background` もそのままである。
+5 は「やり直せば直る失敗」（exit 4）ではなく、**人が見るべき結果**を指す。
+
 #### 「見切れ」と「bbox が要る」を取り違えないために
 
 `touches_edge` が `true` でも、それが**商品の見切れとは限らない**。
@@ -2567,6 +2680,34 @@ x broken.jpg  失敗
 `derive` と `sizes` / `formats` の同時指定は `INVALID_DERIVATION` でその項目を落とす
 （CLI と同じ排他）。未知のキーと読めない値も同じ code になる。
 
+`fail_on` は `--fail-on` とまったく同じ書式の文字列で書く
+（[合否を exit code で返す](#合否を-exit-code-で返すfail-on)）。読めない値は
+`INVALID_FAIL_ON` でその項目を落とす。
+
+```json
+{
+  "defaults": { "fail_on": "default" },
+  "items": [
+    { "input": "p1.jpg", "output": "out/p1.png" },
+    { "input": "p2.jpg", "output": "out/p2.png", "fail_on": "default,halo_ratio>0.05" }
+  ]
+}
+```
+
+条件に触れた項目は `results[].status` が `"rejected"` になり、`BatchReport` の
+`rejected` に数えられる。**`result` は通常どおり入る**（`CutoutReport` が
+`compliance` を持つ）。
+
+- **`rejected` はこの版で加わったキーで、`fail_on` を書かない実行でも常に出る**
+  （そのときは必ず 0）。`total` / `succeeded` / `failed` と同じく数え上げの一部なので、
+  条件を書いたときだけ現れる形にはしていない
+- **`succeeded` の定義は変えていない。** 不合格でも処理は成功しており、成果物は
+  書かれている。`succeeded` を「書けた件数」として読んでいるなら、それは今も正しい
+- 実行全体の終了コードは **1 件でも不合格なら 5**。ただし **`failed > 0` の 4 が
+  優先する**——両方あるときに 5 を返すと、成果物が 1 つも無い項目があることが
+  番号から消え、「見れば分かる結果」として扱われてしまう
+- 人間向けの出力では不合格の行に `R` が付く（警告の `!` とは別の印である）
+
 **マニフェストは実行全体で 1 つ**なので、spec のキーではなく `kiri batch --manifest`
 で渡す。数百点が同じパスへ順に書けば、最後の 1 件だけが残る目録になってしまう。
 
@@ -2605,7 +2746,9 @@ $ kiri batch spec.json --json
    `uniformity` が低い画像では `subject.confidence` を見て、`high` なら
    `subject.normalized_bbox` をその項目の `bbox` に入れる
 2. `kiri batch spec.json --json` で一括処理する
-3. 結果の `failed` / `with_warnings` と各項目の `mask.foreground_ratio` を検証する
+3. 結果の `failed` / `rejected` / `with_warnings` と各項目の
+   `mask.foreground_ratio` を検証する。`fail_on` を書いておけば、**終了コードだけで
+   「見るべき件があるか」が分かる**（4 なら失敗、5 なら不合格）
 4. 失敗した項目だけ `tolerance` や `bbox` を調整して再実行する。
    **探索は `--dry-run` で回す**（成功している他の項目の成果物を壊さないため）
 5. それでも直らない項目は `kiri cutout --preview` で画像を見て判断する。
@@ -2709,9 +2852,18 @@ sRGB へ変換するので、そこで色が転ぶことはない。
 | 2 | 引数不正（書式や値域の誤りは code を伴わず stderr にのみ出る） |
 | 3 | 入力ファイル異常 |
 | 4 | 処理失敗 |
+| 5 | 規格未達（成果物はある。人が見る対象で、結果 JSON は通常どおり返る） |
+
+この表の文言は `kiri schema --json` の `exit_codes[]` が同じものを返す。
+
+**5 は「0 以外は失敗」と読んでいる呼び出し側にとって新しい意味である。**
+5 が出るのは `--fail-on` を渡した実行だけで、4 が「やり直せば直る失敗」
+（成果物が無い）なのに対し、5 は処理が通って成果物も
+書かれた結果が規格に達しなかったことを言う。`ErrorReport` には差し替わらないので、
+`outputs[]` も `mask` も通常どおり読める（[合否を exit code で返す](#合否を-exit-code-で返すfail-on)）。
 
 `--json` 指定時はエラーも JSON で stdout に返る。**code と exit code の対応は
-`kiri schema --json` の `errors[]` が返す**（49 種ある）。
+`kiri schema --json` の `errors[]` が返す。**
 
 **ただし引数の書式や値域で落ちた場合は JSON が返らない。** 検証は clap が行い、
 kiri のエラー型を通らないため、`--json` を付けても **stdout は空のまま exit 2 で

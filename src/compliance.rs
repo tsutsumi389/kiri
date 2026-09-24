@@ -83,11 +83,43 @@ impl Metric {
         matches!(self, Metric::TouchesEdge)
     }
 
+    /// 裸のトークンで書く指標の意味。**ヘルプも誤りの案内もここから配る。**
+    ///
+    /// `>` が「触れたら不合格」と読めるのと同じ素直さを真偽の指標にも与える、
+    /// というのがこの綴りの理由である。意味を書き写した文面が増えると、
+    /// 向きを変えたときにヘルプだけが古い読み方を語る。
+    pub const fn flag_meaning(self) -> Option<&'static str> {
+        match self {
+            Metric::TouchesEdge => Some("外周に接していたら不合格"),
+            _ => None,
+        }
+    }
+
+    /// 裸のトークンで書いた真偽の指標に添える警告 code。
+    ///
+    /// 外周接触は `SUBJECT_TOUCHES_EDGE`（撮り直すしかない）と
+    /// `BBOX_RECOMMENDED`（bbox 一つで解ける）の 2 通りに読まれ、`default` は
+    /// 両方を数える。**明示指定には素直なほうを当てる**——「bbox で解ける」は
+    /// 救済の道筋の話で、`touches_edge` と書いた利用者が尋ねたのは
+    /// 「接しているか」そのものである。null にしないのは、同じ事実が書き方に
+    /// よって `checks[].code` で拾えたり拾えなかったりするのを避けるためで、
+    /// `--fail-on default` は同じ事実に code を添えている
+    const fn flag_code(self) -> Option<WarningCode> {
+        match self {
+            Metric::TouchesEdge => Some(WarningCode::SubjectTouchesEdge),
+            _ => None,
+        }
+    }
+
     /// 数値の指標が取りうる範囲。上限が無いものは `None`。
     ///
     /// 値域の検査に使う。`halo_ratio>2` は「2 を超えたら落とす」と書いたつもりの
     /// 指定だが、割合は 1 を超えないので**永久に発火しない門**になる。
     /// 書いた本人は合格が出続けるのを見て「通っている」と読む。
+    ///
+    /// **端ちょうども同じ理由で断る**（`check_range` が向きまで見る）。
+    /// 値域の外だけを見ていると `halo_ratio>1.0` が素通りし、断る理由として
+    /// ここに書いた話がそっくりそのまま当てはまる門が残る。
     const fn range(self) -> (f64, Option<f64>) {
         match self {
             Metric::ForegroundRatio | Metric::HaloRatio | Metric::RimContamination => {
@@ -95,6 +127,8 @@ impl Metric {
             }
             // ΔE も px も上限を持たない
             Metric::Separability | Metric::EdgeWidth | Metric::ContourRoughness => (0.0, None),
+            // 真偽の指標はしきい値を取らない（`parse_rule` が先に分岐するので
+            // ここへは来ない）。値を選べないことを 0 以上として表しておく
             Metric::TouchesEdge => (0.0, None),
         }
     }
@@ -146,6 +180,15 @@ impl Metric {
 
     /// 数値で報告される指標の実測値。**結果 JSON の `mask.*` をそのまま読む**
     /// ので、`checks[].actual` と `mask.*` は必ず同じ数になる。
+    ///
+    /// **`default` の `status` はこの数から出ていない。** 合否は
+    /// `collect_warnings` が**生値**で判定した結果（実際に出た警告）から取り、
+    /// ここが返すのは `round4` 済みの報告値である。両者は 4 桁目でずれうる——
+    /// 生の `halo_ratio` が 0.10003 なら
+    /// `{"status":"fail","threshold":0.1,"actual":0.1}` という、自分で
+    /// `actual > threshold` を確かめると食い違って見える行が出る（窓は 5e-5 幅）。
+    /// 明示のしきい値（`explicit_check`）にはこのずれが無い。判定も報告も
+    /// ここが返す同じ数を使う。
     ///
     /// 真偽の指標では `None` を返すが、`is_flag` で先に分岐しているので読まれない。
     fn number(self, mask: &MaskReport) -> Option<f64> {
@@ -234,17 +277,14 @@ impl Operator {
     }
 }
 
-/// 真偽の指標に置く条件の綴り。`checks[].operator` にも出る。
-const EQ: &str = "eq";
-
 /// 配った綴り（`gt`）を書式の記号（`>`）へ戻す。
 ///
 /// 人間向けの行は記号のほうが読みやすいが、**JSON の側の綴りは契約である**。
 /// 対応表を 2 箇所に置くと、演算子を足したときに片方だけが古くなる。
+///
+/// 真偽の指標に綴りは無い（裸のトークンで書き、`operator` は null になる）ので、
+/// ここが受けるのは `Operator` の 4 つだけである。
 pub fn symbol_of(operator: &str) -> &str {
-    if operator == EQ {
-        return "=";
-    }
     Operator::SPELLINGS
         .iter()
         .find(|(_, op)| op.as_str() == operator)
@@ -259,10 +299,8 @@ enum Rule {
         operator: Operator,
         threshold: f64,
     },
-    Flag {
-        metric: Metric,
-        threshold: bool,
-    },
+    /// 真偽の指標。**しきい値を持たない**——「その事実があったら不合格」である
+    Flag { metric: Metric },
 }
 
 impl Rule {
@@ -376,44 +414,63 @@ fn parse_rule(token: &str) -> Result<Rule, String> {
         };
         let metric = metric_named(name.trim())?;
         if metric.is_flag() {
-            return Err(format!(
-                "'{name}' は真偽の指標です（{name}=true / {name}=false と書きます）",
-                name = metric.as_str()
+            return Err(bare_token_hint(
+                metric,
+                "は真偽の指標で、演算子もしきい値も取りません",
             ));
         }
         let value = value.trim();
         let threshold: f64 = value
             .parse()
             .map_err(|_| format!("'{token}' の右辺 '{value}' が数値として読めません"))?;
-        check_range(metric, threshold)?;
+        check_range(metric, operator, threshold)?;
         return Ok(Rule::Number {
             metric,
             operator,
             threshold,
         });
     }
-    if let Some((name, value)) = token.split_once('=') {
+    // **`=` は廃止した。** `touches_edge=true` / `=false` は「書いた値と一致
+    // したら不合格」で、`=false` は「接していなければ落とす」という誰も欲しがら
+    // ない指定になる。方向を選べる形にした結果、**唯一意味のある方向がどちらか
+    // 読めなくなった**ので、裸のトークンだけを受ける。断るときに綴りを案内する
+    if let Some((name, _)) = token.split_once('=') {
         let metric = metric_named(name.trim())?;
-        if !metric.is_flag() {
-            return Err(format!(
-                "'{}' は数値の指標です（{} > 0.10 のように {} で書きます）",
-                metric.as_str(),
-                metric.as_str(),
-                operators().join(" / ")
-            ));
-        }
-        let value = value.trim();
-        let threshold = match value {
-            "true" => true,
-            "false" => false,
-            _ => return Err(format!("'{value}' は true か false である必要があります")),
-        };
-        return Ok(Rule::Flag { metric, threshold });
+        return Err(if metric.is_flag() {
+            bare_token_hint(metric, "に = は付けません")
+        } else {
+            numeric_token_hint(metric)
+        });
     }
-    Err(format!(
-        "'{token}' は {DEFAULT_TOKEN} でも <指標><演算子><値> でもありません（指標: {}）",
-        FAIL_ON_METRICS.join(" / ")
-    ))
+    match Metric::named(token) {
+        Some(metric) if metric.is_flag() => Ok(Rule::Flag { metric }),
+        Some(metric) => Err(numeric_token_hint(metric)),
+        None => Err(format!(
+            "'{token}' は {DEFAULT_TOKEN} でも <指標><演算子><値> でもありません（指標: {}）",
+            FAIL_ON_METRICS.join(" / ")
+        )),
+    }
+}
+
+/// 真偽の指標の綴りを案内する。
+///
+/// `=true` / `=false` を廃したので、誤った書き方はすべてここへ来る。
+/// **意味も一緒に言う**——裸の `touches_edge` がどちらの向きなのかは、綴りを
+/// 教わっただけでは分からない。
+fn bare_token_hint(metric: Metric, what: &str) -> String {
+    format!(
+        "'{name}' {what}（'{name}' とだけ書くと「{meaning}」になります）",
+        name = metric.as_str(),
+        meaning = metric.flag_meaning().unwrap_or_default(),
+    )
+}
+
+fn numeric_token_hint(metric: Metric) -> String {
+    format!(
+        "'{name}' は数値の指標です（{name} > 0.10 のように {} で書きます）",
+        operators().join(" / "),
+        name = metric.as_str(),
+    )
 }
 
 fn metric_named(name: &str) -> Result<Metric, String> {
@@ -425,25 +482,68 @@ fn metric_named(name: &str) -> Result<Metric, String> {
     })
 }
 
-fn check_range(metric: Metric, value: f64) -> Result<(), String> {
+/// 置けるしきい値か。**値域の外だけでなく、向きまで見る。**
+///
+/// `halo_ratio>1.0` は値域の中だが、割合は 1 を超えないので `halo_ratio>2` と
+/// まったく同じ**発火しえない門**である。比率を % と取り違えて
+/// `foreground_ratio>1.0` と書くのは典型的な誤りで、断らなければ kiri は何も
+/// 言わずに全件を通し続ける——書いた本人は合格が出続けるのを見て「見ている」と
+/// 読む。値域の外を断るなら端も断らないと、片方だけが閉じた関門になる。
+///
+/// **端ちょうどで発火しうる向き（`>=1.0` / `<=0.0`）は通す。** あれは
+/// 「1 になったら落とす」と読めて実際に落ちうるので、誤りではない。
+///
+/// **逆向きの「必ず発火する門」（`foreground_ratio>=0.0`）も通す。** こちらは
+/// 1 枚目の exit 5 で気づくので黙って通り続けることがなく、「どの画像でも
+/// 落ちること」を確かめる使い方もある（受け入れ基準のテストがそう書く）。
+fn check_range(metric: Metric, operator: Operator, value: f64) -> Result<(), String> {
     if !value.is_finite() {
         return Err(format!("'{value}' は有限な数値である必要があります"));
     }
     let (low, high) = metric.range();
-    let ok = value >= low && high.is_none_or(|h| value <= h);
-    if ok {
-        return Ok(());
+    if value < low || high.is_some_and(|h| value > h) {
+        return Err(match high {
+            Some(h) => format!(
+                "{} のしきい値は {low} 以上 {h} 以下である必要があります（{value} が指定されました）",
+                metric.as_str()
+            ),
+            None => format!(
+                "{} のしきい値は {low} 以上である必要があります（{value} が指定されました）",
+                metric.as_str()
+            ),
+        });
     }
-    Err(match high {
-        Some(h) => format!(
-            "{} のしきい値は {low} 以上 {h} 以下である必要があります（{value} が指定されました）",
-            metric.as_str()
-        ),
-        None => format!(
-            "{} のしきい値は {low} 以上である必要があります（{value} が指定されました）",
-            metric.as_str()
-        ),
-    })
+    let name = metric.as_str();
+    // **判定と文面を同じ場所で組む。** 断る向きは 2 つしかなく、`>=` / `<=` は
+    // 端ちょうどで発火しうる（値域の外へ出た分は上の検査が既に拾っている）ので、
+    // ここで断るものが残らない。2 つに分けて書くと、片方に当たらない向きへ
+    // もう片方の文面が付く形をいつでも作れてしまう
+    let unfireable = match operator {
+        Operator::Gt if high.is_some_and(|h| value >= h) => {
+            Some((format!("{name} は {value} を超えない"), ">="))
+        }
+        Operator::Lt if value <= low => Some((format!("{name} は {value} を下回らない"), "<=")),
+        _ => None,
+    };
+    let Some((never, inclusive)) = unfireable else {
+        return Ok(());
+    };
+    Err(format!(
+        "'{name}{}{value}' はどの値でも発火しません（{never}）。{value} ちょうどを落とすなら \
+         {name}{inclusive}{value} と書きます",
+        symbol_of(operator.as_str())
+    ))
+}
+
+/// 裸のトークンで書く指標と、その意味。ヘルプと文面がここから組む。
+///
+/// **一覧を手で書き写さない。** 真偽の指標を足したときにヘルプだけが古い
+/// 一覧を語ると、それがそのまま誤った指定になる（`FAIL_ON_METRICS` と同じ理由）。
+pub fn flag_metrics() -> Vec<(&'static str, &'static str)> {
+    Metric::ALL
+        .into_iter()
+        .filter_map(|m| m.flag_meaning().map(|meaning| (m.as_str(), meaning)))
+        .collect()
 }
 
 /// 演算子の綴りをヘルプ用に並べる。
@@ -469,6 +569,12 @@ fn explicit_check(rule: Rule, mask: &MaskReport) -> ComplianceCheck {
                 // 測れなかった。**`operator` と `threshold` は残す**——
                 // 利用者が何を頼んだかは、測れたかどうかに関わらず事実である
                 None => UNMEASURABLE,
+                // NaN や ∞ も測れていない。JSON の数値にできないので `actual` は
+                // どのみち null になり、`pass` と名乗ると「`actual` が null なら
+                // 測れていない」という `unmeasurable` の定義と食い違う行が残る。
+                // **指定側の NaN は `check_range` が既に断っている**ので、
+                // これで両側が同じ扱いになる
+                Some(v) if !v.is_finite() => UNMEASURABLE,
                 Some(v) if operator.touched(v, threshold) => FAIL,
                 Some(_) => PASS,
             };
@@ -481,17 +587,19 @@ fn explicit_check(rule: Rule, mask: &MaskReport) -> ComplianceCheck {
                 code: metric.code_beyond(operator.is_above()),
             }
         }
-        Rule::Flag { metric, threshold } => {
+        Rule::Flag { metric } => {
             let actual = metric.flag(mask);
             ComplianceCheck {
                 name: metric.as_str(),
-                status: if actual == threshold { FAIL } else { PASS },
-                operator: Some(EQ),
-                threshold: Some(Value::Bool(threshold)),
+                // **その事実があったら不合格**である（`>` が「触れたら不合格」
+                // なのと同じ向き）。向きを選ばせない理由は `parse_rule` に書いた
+                status: if actual { FAIL } else { PASS },
+                // 比べる相手が無いので綴りも数も出さない。`default` の外周接触も
+                // 同じ 2 つが null で、書き方によって形が変わらない
+                operator: None,
+                threshold: None,
                 actual: Some(Value::Bool(actual)),
-                // 「接している」を咎める警告はあるが、「接していない」を咎める
-                // ものは無い。`touches_edge=false` に code は添えない
-                code: threshold.then(|| metric.code_beyond(true)).flatten(),
+                code: metric.flag_code(),
             }
         }
     }
@@ -665,7 +773,7 @@ mod tests {
     /// 並びは指定の順ではなく `Metric::ALL` の順で決まる。
     #[test]
     fn the_checks_are_ordered_by_the_metric_table() {
-        let a = FailOn::parse("touches_edge=true,foreground_ratio>0.9")
+        let a = FailOn::parse("touches_edge,foreground_ratio>0.9")
             .unwrap()
             .evaluate(&mask(), &[]);
         let names: Vec<&str> = a.checks.iter().map(|c| c.name).collect();
@@ -720,18 +828,109 @@ mod tests {
         assert_eq!(sep.actual, number(40.0));
     }
 
+    /// 真偽の指標は裸のトークンで、**その事実があったときだけ落ちる。**
     #[test]
-    fn a_boolean_metric_takes_true_or_false() {
-        let hit = FailOn::parse("touches_edge=false")
+    fn a_bare_flag_token_fails_only_when_the_fact_is_true() {
+        let clear = FailOn::parse("touches_edge")
             .unwrap()
             .evaluate(&mask(), &[]);
-        assert!(!hit.passed, "接していないことを不合格にできる");
-        let miss = FailOn::parse("touches_edge=true")
+        assert!(clear.passed, "接していない画像は通る");
+        assert_eq!(clear.checks[0].status, PASS);
+        // 比べる相手が無いので綴りも数も出さない
+        assert!(clear.checks[0].operator.is_none());
+        assert!(clear.checks[0].threshold.is_none());
+        assert_eq!(clear.checks[0].actual, Some(Value::Bool(false)));
+
+        let mut touching = mask();
+        touching.touches_edge = true;
+        let hit = FailOn::parse("touches_edge")
+            .unwrap()
+            .evaluate(&touching, &[]);
+        assert!(!hit.passed);
+        assert_eq!(hit.checks[0].status, FAIL);
+        assert_eq!(hit.checks[0].actual, Some(Value::Bool(true)));
+    }
+
+    /// 明示の外周接触も `checks[].code` を名乗る。
+    ///
+    /// **同じ失敗が書き方によって拾えたり拾えなかったりしない**ことが要点で、
+    /// `default` は同じ事実に code を添えている。当てるのは素直なほう
+    /// （`BBOX_RECOMMENDED` は「bbox で解ける」という別の読み方）。
+    #[test]
+    fn a_bare_flag_token_names_the_plain_warning_code() {
+        let report = FailOn::parse("touches_edge")
             .unwrap()
             .evaluate(&mask(), &[]);
-        assert!(miss.passed);
-        assert_eq!(miss.checks[0].operator, Some("eq"));
-        assert_eq!(miss.checks[0].actual, Some(Value::Bool(false)));
+        assert_eq!(report.checks[0].code, Some(WarningCode::SubjectTouchesEdge));
+    }
+
+    /// `=` を書いたら断り、**裸の綴りを案内する。**
+    #[test]
+    fn the_old_equals_spelling_is_refused_with_the_bare_token_in_the_message() {
+        for spec in ["touches_edge=true", "touches_edge=false"] {
+            let message = FailOn::parse(spec).unwrap_err();
+            assert!(
+                message.contains("touches_edge") && message.contains("外周に接していたら不合格"),
+                "綴りを案内していない: {message}"
+            );
+        }
+    }
+
+    /// 値域の**端**で発火しえない門は断る。
+    ///
+    /// `halo_ratio>2` を断る理由（永久に発火せず、書いた本人は合格が出続けるのを
+    /// 見て「見ている」と読む）が `>1.0` にそっくり当てはまる。片方だけ閉じない。
+    #[test]
+    fn a_gate_that_can_never_fire_is_refused_even_inside_the_range() {
+        for spec in [
+            "halo_ratio>1.0",
+            "foreground_ratio>1.0",
+            "rim_contamination>1",
+            "halo_ratio<0.0",
+            "edge_width<0.0",
+            "separability<0",
+        ] {
+            let message = FailOn::parse(spec).unwrap_err();
+            assert!(
+                message.contains("発火しません"),
+                "'{spec}' が別の理由で断られた: {message}"
+            );
+        }
+    }
+
+    /// 端ちょうどで発火しうる向きは通す。
+    ///
+    /// `>=1.0` は「1 になったら落とす」で、実際に落ちうる。逆向きの
+    /// 「必ず発火する門」（`foreground_ratio>=0.0`）も、1 枚目の exit 5 で
+    /// 気づくので断らない。
+    #[test]
+    fn a_boundary_gate_that_can_fire_is_accepted() {
+        for spec in [
+            "halo_ratio>=1.0",
+            "halo_ratio<=0.0",
+            "foreground_ratio>=0.0",
+            "edge_width<=0",
+        ] {
+            assert!(FailOn::parse(spec).is_ok(), "'{spec}' が断られた");
+        }
+        let mut m = mask();
+        m.halo_ratio = Some(1.0);
+        let report = FailOn::parse("halo_ratio>=1.0").unwrap().evaluate(&m, &[]);
+        assert_eq!(report.checks[0].status, FAIL, "端ちょうどで発火する");
+    }
+
+    /// 実測が数として報告できない値なら、`pass` ではなく `unmeasurable`。
+    ///
+    /// `actual` は JSON にできず null になるので、`pass` と名乗ると
+    /// 「`actual` が null なら測れていない」という定義と食い違う行が出る。
+    #[test]
+    fn a_non_finite_measurement_is_unmeasurable_not_a_pass() {
+        let mut m = mask();
+        m.halo_ratio = Some(f64::NAN);
+        let report = FailOn::parse("halo_ratio>0.5").unwrap().evaluate(&m, &[]);
+        assert_eq!(report.checks[0].status, UNMEASURABLE);
+        assert!(report.checks[0].actual.is_none());
+        assert!(!report.passed);
     }
 
     #[test]
@@ -770,6 +969,10 @@ mod tests {
             "separability<-1",
             "touches_edge>0.5",
             "touches_edge=yes",
+            "touches_edge=true",
+            "touches_edge=false",
+            "halo_ratio>1.0",
+            "halo_ratio<0.0",
             "halo_ratio>0.1,halo_ratio>0.2",
         ] {
             assert!(FailOn::parse(spec).is_err(), "'{spec}' が通ってしまった");

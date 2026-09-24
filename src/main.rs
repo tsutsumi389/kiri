@@ -540,15 +540,22 @@ fn print_cutout(report: &CutoutReport) {
 ///
 /// 落ちた条件は 1 行に 1 つ、実測値としきい値を並べて出す。まとめて
 /// 「不合格です」とだけ言うと、次に何を直せばよいかが JSON を読むまで分からない。
-/// 通った条件は数だけを言う——**見た上で通ったこと**は伝わるが、20 行を
-/// 埋める価値は無い（内訳は `compliance.checks[]` が全部持っている）。
+/// **通った条件は行にせず、見た件数をヘッダで言う**——「見た上で通った」と
+/// 「そもそも見ていない」の区別は伝わるが、20 行を埋める価値は無い
+/// （内訳は `compliance.checks[]` が全部持っている）。
 fn print_compliance(compliance: Option<&ComplianceReport>) {
     let Some(c) = compliance else {
         return;
     };
+    let failed = c
+        .checks
+        .iter()
+        .filter(|check| check.status != compliance::PASS)
+        .count();
     println!(
-        "  規格      {}  (--fail-on {})",
-        if c.passed { "合格" } else { "**不合格**" },
+        "  規格      {}  {} 件中 {failed} 件不合格  (--fail-on {})",
+        if c.passed { "合格" } else { "不合格" },
+        c.checks.len(),
         c.fail_on
     );
     for check in &c.checks {

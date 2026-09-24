@@ -250,6 +250,17 @@ pub struct Error {
 
 impl Error {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        // **約束をコードにする。** `QUALITY_GATE_FAILED` は「`ErrorBody` として
+        // 返らない」とカタログが宣言しているが、宣言だけでは `Error::new` で
+        // 作ることを何も妨げない。作れてしまうと結果 JSON が `ErrorReport` に
+        // 差し替わり、成果物があるのに `outputs[]` も `mask` も消える——
+        // 絶対条件が壊れる形がちょうどこれである。exit 5 の名乗りは
+        // 結果 JSON の `compliance.code` が行う
+        debug_assert!(
+            code.kind() != ErrorKind::Compliance,
+            "{} は ErrorBody にならない（compliance.code で名乗る）",
+            code.as_str()
+        );
         Self {
             code,
             message: message.into(),
@@ -303,6 +314,18 @@ mod tests {
         assert_eq!(ErrorKind::Input.exit_code(), 3);
         assert_eq!(ErrorKind::Processing.exit_code(), 4);
         assert_eq!(ErrorKind::Compliance.exit_code(), 5);
+    }
+
+    /// exit 5 の code は `ErrorBody` として作れない。
+    ///
+    /// カタログのコメントが宣言しているだけだった約束を、関門として確かめる。
+    /// `debug_assert!` なので、`debug-assertions` を落とした build では関門が
+    /// 無い——そのときはこの検査も回さない（ci-test は有効にしてある）。
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "QUALITY_GATE_FAILED")]
+    fn a_compliance_code_cannot_be_built_as_an_error_body() {
+        let _ = Error::new(ErrorCode::QualityGateFailed, "これは返らない");
     }
 
     #[test]

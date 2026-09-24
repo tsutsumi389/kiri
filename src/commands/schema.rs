@@ -838,7 +838,10 @@ fn fields() -> Vec<FieldEntry> {
             gates: None,
             summary: "実際に適用した時計回りの角度",
             notes: Some(
-                "**指定値ではない。** -90 と 270 と 630 は同じ操作なので [0, 360) へ正規化した                  値が入る。回らない指定（0 と 360）では rotate ブロックごと現れない——                 渡した値は settings.rotate のほうが常に持つ。cutout では mask / background /                  subject の座標は**回す前**のものである",
+                "**指定値ではない。** -90 と 270 と 630 は同じ操作なので [0, 360) へ正規化した\
+                 値が入る。回らない指定（0 と 360）では rotate ブロックごと現れない——\
+                 渡した値は settings.rotate のほうが常に持つ。cutout では mask / background / \
+                 subject の座標は**回す前**のものである",
             ),
         },
         FieldEntry {
@@ -851,7 +854,8 @@ fn fields() -> Vec<FieldEntry> {
             gates: None,
             summary: "画素を補間し直したか",
             notes: Some(
-                "90 度単位なら false で、色は 1 バイトも変わらない（入れ替えだけで回る）。                 true なら Catmull-Rom で引き直しており、四隅に透過の余白が出る",
+                "90 度単位なら false で、色は 1 バイトも変わらない（入れ替えだけで回る）。\
+                 true なら Catmull-Rom で引き直しており、四隅に透過の余白が出る",
             ),
         },
         FieldEntry {
@@ -1119,6 +1123,22 @@ fn fields() -> Vec<FieldEntry> {
             ),
         },
         FieldEntry {
+            path: "compliance.fail_on",
+            appears_in: vec!["cutout"],
+            unit: "text",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "利用者が書いた --fail-on の文字列そのまま",
+            notes: Some(
+                "**何を頼んだかが結果だけで分かる。** 書式は default / <指標><演算子><値> / \
+                 真偽の指標（裸のトークン）をカンマで並べたもので、綴りは \
+                 kiri cutout --help の --fail-on が配る。解かずにそのまま返すので、\
+                 空白の入れ方も書いたとおりである",
+            ),
+        },
+        FieldEntry {
             path: "compliance.passed",
             appears_in: vec!["cutout"],
             unit: "bool",
@@ -1128,7 +1148,27 @@ fn fields() -> Vec<FieldEntry> {
             gates: None,
             summary: "--fail-on の条件をすべて満たしたか",
             notes: Some(
-                "--fail-on を渡したときだけブロックごと現れる。false なら終了コードは 5 で、                 **結果 JSON は通常どおり全部返る**（処理は成功していて成果物もある）。                 checks[] に fail も unmeasurable も 1 つも無いことが true の条件で、                 **測れなかった指標は合格にしない**——separability の null は「前景が無い」、                 halo_ratio の null は「測る境界が無い」で、どちらも黙って通してよい状態ではない",
+                "--fail-on を渡したときだけブロックごと現れる。false なら終了コードは 5 で、\
+                 **結果 JSON は通常どおり全部返る**（処理は成功していて成果物もある）。\
+                 checks[] に fail も unmeasurable も 1 つも無いことが true の条件で、\
+                 **測れなかった指標は合格にしない**——separability の null は「前景が無い」、\
+                 halo_ratio の null は「測る境界が無い」で、どちらも黙って通してよい状態ではない",
+            ),
+        },
+        FieldEntry {
+            path: "compliance.code",
+            appears_in: vec!["cutout"],
+            unit: "enum",
+            nullable: true,
+            null_means: Some("合格した（passed が true）"),
+            warns: vec![],
+            gates: None,
+            summary: "不合格のときだけ名乗る code。QUALITY_GATE_FAILED になる",
+            notes: Some(
+                "**exit 5 は errors[] を返さない**（成果物があるので結果 JSON を通常どおり\
+                 返す）ので、errors[] が配る語彙と結果を突き合わせられる場所がここ以外に無い。\
+                 exit 5 を見てここを引けば、他の失敗とまったく同じ形で分岐できる。\
+                 どの条件で落ちたかは checks[].code のほうが言う——**別の値である**",
             ),
         },
         FieldEntry {
@@ -1141,7 +1181,22 @@ fn fields() -> Vec<FieldEntry> {
             gates: None,
             summary: "評価した条件の内訳。{name, status, operator, threshold, actual, code}",
             notes: Some(
-                "**見たものを全部載せる**（pass も）。落ちたものだけだと「見た上で通った」と                 「そもそも見ていない」が区別できない。name は mask.* のキーそのままで、                 actual はその値と同じ数である。operator の綴りは fields[].warns[].operator と                 同じ（lt / lte / gt / gte）で、真偽の指標では eq になる。固定のしきい値を                 持たない条件（NOT_SEPARABLE は画像ごとの background.residual.p50 と比べ、                 外周接触の 2 つは複合条件）では operator も threshold も null。                 **並びは決定的**で、指定の順には依らない",
+                "**見たものを全部載せる**（pass も）。落ちたものだけだと「見た上で通った」と\
+                 「そもそも見ていない」が区別できない。name は mask.* のキーそのままで、\
+                 actual はその値と同じ数である。operator の綴りは fields[].warns[].operator と\
+                 同じ（lt / lte / gt / gte）。真偽の指標は裸のトークンで書くので（touches_edge）、\
+                 operator も threshold も null になる。固定のしきい値を持たない条件\
+                 （NOT_SEPARABLE は画像ごとの background.residual.p50 と比べ、外周接触の 2 つは\
+                 複合条件）でも同じく null。**並びは決定的**で、指定の順には依らない。\
+                 **name は一意ではない。** default は指標ではなく code ごとに 1 行出すので、\
+                 foreground_ratio が 2 行、touches_edge が 2 行並ぶ——name で畳むと片方が黙って\
+                 消える。**一意なのは code のほう**である。\
+                 **default の status は actual から出ていない。** 合否は実際に出た警告\
+                 （生値で判定）から取り、actual は報告値（小数第 4 位で丸めた mask.* の値）\
+                 なので、4 桁目で両者がずれうる（生の halo_ratio が 0.10003 なら \
+                 status=fail / threshold=0.1 / actual=0.1 という行が出る）。明示のしきい値には\
+                 このずれが無い。加えて外周接触の 2 つは片方しか警告が出ないので、\
+                 actual=true なのに status=pass の行（もう片方の code）が並びうる",
             ),
         },
         FieldEntry {
@@ -1154,7 +1209,9 @@ fn fields() -> Vec<FieldEntry> {
             gates: None,
             summary: "pass / fail / unmeasurable のいずれか",
             notes: Some(
-                "unmeasurable は「測れなかった」で、**合格ではない**。fail（しきい値に触れた）                 とは別の事実なので名前を分けてある——次の一手が違う（前者は素材か指示を、                 後者はしきい値か設定を見る）",
+                "unmeasurable は「測れなかった」で、**合格ではない**。fail（しきい値に触れた）\
+                 とは別の事実なので名前を分けてある——次の一手が違う（前者は素材か指示を、\
+                 後者はしきい値か設定を見る）",
             ),
         },
         FieldEntry {

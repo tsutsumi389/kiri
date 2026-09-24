@@ -8944,14 +8944,44 @@ fn the_published_prose_has_no_stray_spaces() {
     };
 
     let mut stray = Vec::new();
+    // **隙間は 1 文字とは限らない。** 3 文字の窓で「日本語・空白・日本語」を
+    // 探していた頃は、**行継続を書き忘れた箇所を 1 つも拾えなかった**——`\` の
+    // 無い文字列リテラルは改行と次行の字下げをそのまま抱えるので、隙間が
+    // 改行 1 つと空白 17 個になり、窓の 3 文字目が空白のままになる。
+    // 仕掛けた網が一番大きな獲物だけを通す形で、実際 `schema.rs` の 5 箇所が
+    // そうやって漏れていた。**空白の連なりを 1 つの隙間として見る。**
+    //
+    // 改行も隙間に含めるが、**空白を 1 つも含まない改行は咎めない**——
+    // `--fail-on` の長いヘルプのように、段落を分けるために意図して置いた `\n`
+    // は正しい書き方である。
     let mut check = |label: String, text: Option<&str>| {
         let Some(text) = text else { return };
         let chars: Vec<char> = text.chars().collect();
-        for window in chars.windows(3) {
-            if japanese(window[0]) && window[1] == ' ' && japanese(window[2]) {
+        let gap = |c: char| c == ' ' || c == '\n';
+        let mut i = 0;
+        while i < chars.len() {
+            if !gap(chars[i]) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < chars.len() && gap(chars[i]) {
+                i += 1;
+            }
+            let (Some(&before), Some(&after)) = (chars.get(start.wrapping_sub(1)), chars.get(i))
+            else {
+                continue;
+            };
+            let spaces = chars[start..i].iter().filter(|&&c| c == ' ').count();
+            // **日本語の直後に空白が 2 つ以上続いたら、後ろが何であれ書き損じ。**
+            // 行継続を書き忘れた箇所の半分は次の行が英数字で始まっており
+            // （「回る）。<空白>true なら」）、両隣が日本語であることを求めると
+            // そこを見逃す。列を揃えるための 2 連スペース（`off  … `）は
+            // 英数字の後ろにしか現れないので、これで取り違えない
+            if spaces > 0 && japanese(before) && (japanese(after) || spaces >= 2) {
                 stray.push(format!(
-                    "{label}: 「{}{}{}」",
-                    window[0], window[1], window[2]
+                    "{label}: 「{before}{}{after}」（空白 {spaces} 個）",
+                    " ".repeat(spaces),
                 ));
             }
         }
@@ -9034,6 +9064,32 @@ fn the_readme_warning_table_lists_every_warning_in_the_contract() {
     );
 }
 
+/// README の exit code の表は、`ErrorKind::meaning()` の文言をそのまま並べる。
+///
+/// `meaning()` の doc は「README の表と同じ文言をここから配る」と名乗っている。
+/// **名乗っただけでは守られない**——0〜4 行目は 1 文字違わず一致していたのに、
+/// **その契約を足した当のコミットで 5 行目が破られていた。** 片方だけを直すと
+/// ここが落ちる。exit code は「0 以外は失敗」と読んでいる呼び出し側にとって
+/// 意味の分かれ目なので、説明が 2 通りあってはならない。
+#[test]
+fn the_readme_exit_code_table_quotes_the_published_meanings() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
+    for kind in kiri::error::ErrorKind::ALL {
+        let prefix = format!("| {} | ", kind.exit_code());
+        let row = readme
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("README に exit {} の行が無い", kind.exit_code()));
+        assert!(
+            row.contains(kind.meaning()),
+            "exit {} の行が meaning() と食い違う\n  README : {row}\n  meaning: {}",
+            kind.exit_code(),
+            kind.meaning()
+        );
+    }
+}
+
 /// 梯子の段は、実装と配る文面で同じ綴りである。
 ///
 /// 同じ 7 つの数が `--max-bytes` の長いヘルプと `outputs[].quality_used` の
@@ -9101,6 +9157,9 @@ fn every_published_unit_is_in_the_known_vocabulary() {
         "bool",
         "enum",
         "path",
+        // 決まった選択肢を持たない文字列（`compliance.fail_on`）。`enum` と
+        // 分けるのは、受け手が値を照合してよいかがここで変わるため
+        "text",
         "list",
         "normalized_bbox",
     ];
@@ -10677,12 +10736,31 @@ fn check_of<'a>(v: &'a Value, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("{name} の判定が無い: {v}"))
 }
 
+/// 外周まで商品が伸びた素材。**`touches_edge` を true にするためだけに要る。**
+///
+/// 全面を商品にすると外周サンプルまで商品色になり、背景推定そのものが成立しない
+/// （`cutout_flags_a_product_running_off_the_frame` と同じ作り）。
+fn cropped_scene() -> image::RgbaImage {
+    let mut img = image::RgbaImage::from_pixel(120, 120, image::Rgba([250, 250, 249, 255]));
+    for y in 70..120 {
+        for x in 40..80 {
+            img.put_pixel(x, y, image::Rgba([40, 40, 40, 255]));
+        }
+    }
+    img
+}
+
 /// 受け入れ基準 (a)。**各指標 × しきい値 → exit code の対応表。**
 ///
-/// 7 指標それぞれを「触れる」「触れない」の 2 通りで回す。しきい値は実測値
+/// 7 指標それぞれを「触れる」「触れない」の 2 通りで回す。数値のしきい値は実測値
 /// そのものから組む——`halo_ratio>=<実測>` は必ず触れ、`halo_ratio<<実測>` は
 /// 必ず触れない。**定数を書き写さない**ので、較正で指標の出方が動いても
 /// この表は意味を保つ。
+///
+/// **真偽の指標だけは素材のほうを取り替える。** 裸のトークンは向きを持たない
+/// （「外周に接していたら不合格」の 1 通りしか書けない）ので、接している素材と
+/// 接していない素材の 2 枚で 2 通りを作る。向きを書けるようにすると
+/// 「接していないことを咎める」指定が書けてしまい、良い画像が落ちる。
 #[test]
 fn every_metric_maps_a_threshold_to_an_exit_code() {
     let dir = fixture_dir();
@@ -10691,6 +10769,7 @@ fn every_metric_maps_a_threshold_to_an_exit_code() {
         "product.jpg",
         &product_image(&ProductSpec::default()),
     );
+    let cropped = write_png(dir.path(), "cropped.png", &cropped_scene());
     let output = dir.path().join("out.png");
 
     let (code, base) = cutout_gated(&input, &output, &[]);
@@ -10699,8 +10778,31 @@ fn every_metric_maps_a_threshold_to_an_exit_code() {
     for metric in kiri::compliance::FAIL_ON_METRICS {
         let measured = &base["mask"][metric];
         let (touching, clear) = match measured {
-            Value::Bool(b) => (format!("{metric}={b}"), format!("{metric}={}", !b)),
-            Value::Number(n) => (format!("{metric}>={n}"), format!("{metric}<{n}")),
+            Value::Bool(false) => {
+                let (code, v) = cutout_gated(&input, &output, &["--fail-on", metric]);
+                assert_eq!(code, 0, "接していない素材が {metric} で落ちた: {v}");
+                assert_eq!(check_of(&v, metric)["status"], "pass");
+
+                let (code, v) = cutout_gated(&cropped, &output, &["--fail-on", metric]);
+                assert_eq!(code, 5, "接している素材が {metric} で落ちない: {v}");
+                assert_eq!(check_of(&v, metric)["status"], "fail");
+                // **明示でも code を名乗る。** 同じ失敗が書き方によって
+                // `checks[].code` で拾えたり拾えなかったりしない
+                assert_eq!(check_of(&v, metric)["code"], "SUBJECT_TOUCHES_EDGE");
+                continue;
+            }
+            Value::Bool(true) => panic!("{metric} の前提が崩れている: {}", base["mask"]),
+            // 実測が 0 なら「0 未満」は発火しえない門として断られるので、
+            // 触れない側は「0 を超えたら」で書く（どちらも落ちない条件である）
+            Value::Number(n) => {
+                let x = n.as_f64().unwrap();
+                let clear = if x > 0.0 {
+                    format!("{metric}<{x}")
+                } else {
+                    format!("{metric}>0")
+                };
+                (format!("{metric}>={x}"), clear)
+            }
             other => panic!("{metric} が測れていない: {other}"),
         };
 
@@ -10909,12 +11011,12 @@ fn the_compliance_checks_are_in_a_deterministic_order() {
     let (_, a) = cutout_gated(
         &input,
         &output,
-        &["--fail-on", "touches_edge=true,foreground_ratio>0.99"],
+        &["--fail-on", "touches_edge,foreground_ratio>0.99"],
     );
     let (_, b) = cutout_gated(
         &input,
         &output,
-        &["--fail-on", "foreground_ratio>0.99,touches_edge=true"],
+        &["--fail-on", "foreground_ratio>0.99,touches_edge"],
     );
     assert_eq!(names(&a), names(&b));
     assert_eq!(names(&a), vec!["foreground_ratio", "touches_edge"]);
@@ -11008,8 +11110,17 @@ fn a_malformed_fail_on_on_the_command_line_is_refused_by_the_parser() {
         "halo_ratio=0.1",
         "halo_ratio>abc",
         "halo_ratio>2",
+        // **値域の端で発火しえない門も断る。** 比率を % と取り違えた
+        // `foreground_ratio>1.0` は、断らなければ全件を黙って通し続ける
+        "halo_ratio>1.0",
+        "foreground_ratio>1.0",
+        "halo_ratio<0.0",
+        "edge_width<0.0",
         "touches_edge>0.5",
         "touches_edge=yes",
+        // 真偽の指標に `=` は付けない（向きを選べる形を廃した）
+        "touches_edge=true",
+        "touches_edge=false",
         "default,default",
         "halo_ratio>0.1,halo_ratio>0.2",
     ] {
@@ -11050,7 +11161,14 @@ fn a_malformed_fail_on_in_a_spec_is_refused_with_a_code() {
         }),
     );
 
-    for written in ["\"halo\"", "\"halo_ratio\"", "\"touches_edge=yes\"", "\"\""] {
+    for written in [
+        "\"halo\"",
+        "\"halo_ratio\"",
+        "\"touches_edge=yes\"",
+        "\"touches_edge=true\"",
+        "\"halo_ratio>1.0\"",
+        "\"\"",
+    ] {
         let spec = write_spec(
             dir.path(),
             &format!(
@@ -11149,12 +11267,14 @@ fn a_spec_inherits_fail_on_from_the_defaults() {
             ..Default::default()
         }),
     );
+    // 項目側は「必ず合格する条件」だが、**発火しうる値で書く**——`>1.0` は
+    // 割合が 1 を超えないので「永久に落ちない門」として断られる
     let spec = write_spec(
         dir.path(),
         r#"{"defaults":{"fail_on":"foreground_ratio>=0.0"},
              "items":[
                {"input":"p.jpg","output":"out/a.png"},
-               {"input":"p.jpg","output":"out/b.png","fail_on":"foreground_ratio>1.0"}
+               {"input":"p.jpg","output":"out/b.png","fail_on":"foreground_ratio>0.999"}
              ]}"#,
     );
     let out = run_batch(&spec, &[]);
@@ -11202,4 +11322,168 @@ fn the_readme_spells_the_real_default_gate() {
     listed.sort();
     want.sort();
     assert_eq!(listed, want);
+}
+
+/// 値域の**端**で発火しえない門は、入力を読む前に断る。
+///
+/// `halo_ratio>2` を断る理由（永久に発火せず、書いた本人は合格が出続けるのを
+/// 見て「見ている」と読む）が `>1.0` にそっくり当てはまる。**片方だけ閉じた
+/// 関門にしない。** 比率を % と取り違えた `foreground_ratio>1.0` は典型で、
+/// 断らなければ kiri は何も言わずに全件を通し続けた。
+///
+/// 端ちょうどで発火しうる向き（`>=1.0` / `<=0.0`）と、逆向きの「必ず発火する門」
+/// （`foreground_ratio>=0.0` は 1 枚目の exit 5 で気づく）は通す。
+#[test]
+fn a_gate_that_can_never_fire_is_refused_before_the_image_is_read() {
+    let dir = fixture_dir();
+    let input = write_jpeg(
+        dir.path(),
+        "product.jpg",
+        &product_image(&ProductSpec::default()),
+    );
+    let output = dir.path().join("out.png");
+
+    for spec in [
+        "halo_ratio>1.0",
+        "foreground_ratio>1.0",
+        "rim_contamination>1",
+        "halo_ratio<0.0",
+        "edge_width<0.0",
+        "separability<0",
+    ] {
+        let out = kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--dry-run",
+                "--json",
+                "--fail-on",
+                spec,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "'{spec}' が通ってしまった");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("発火しません"),
+            "'{spec}' が別の理由で断られた: {stderr}"
+        );
+    }
+
+    // 端ちょうどで落ちうる書き方は受けて、実際に評価する。**合否は素材しだい**
+    // （この素材の halo_ratio は 0 なので `<=0.0` は落ちる）で、ここで見るのは
+    // 「書式として断られない」ことと「見た結果が返る」ことである
+    for spec in ["halo_ratio>=1.0", "halo_ratio<=0.0", "edge_width<=0"] {
+        let (code, v) = cutout_gated(&input, &output, &["--fail-on", spec]);
+        assert!(code == 0 || code == 5, "'{spec}' が断られた: exit {code}");
+        assert_eq!(
+            v["compliance"]["checks"].as_array().unwrap().len(),
+            1,
+            "'{spec}' が評価されていない: {v}"
+        );
+    }
+}
+
+/// 明示した外周接触は、`default` とまったく同じ事実を同じ code で名乗る。
+///
+/// 旧 `touches_edge=true` は `code` が常に `null` で、`checks[].code` で分岐する
+/// エージェントは同じ失敗を書き方によって拾えたり拾えなかったりした。
+/// 旧 `=false` はさらに悪く、**外周に接していない良い画像を落としながら、
+/// 既定の外周接触の検査を消していた**（8 本が 7 本に減っていた）。
+#[test]
+fn an_explicit_edge_token_keeps_the_default_verdict_for_a_clean_image() {
+    let dir = fixture_dir();
+    let input = write_jpeg(
+        dir.path(),
+        "product.jpg",
+        &product_image(&ProductSpec::default()),
+    );
+    let output = dir.path().join("out.png");
+
+    let (code, plain) = cutout_gated(&input, &output, &["--fail-on", "default"]);
+    assert_eq!(code, 0, "素材そのものが通らない: {plain}");
+
+    // **良い画像は落ちない。** 明示を足しても答えが変わらないことが要点である
+    let (code, both) = cutout_gated(&input, &output, &["--fail-on", "default,touches_edge"]);
+    assert_eq!(code, 0, "外周に接していない画像が落ちた: {both}");
+    assert_eq!(both["compliance"]["passed"], Value::Bool(true));
+
+    // 明示は `default` のその指標の検査（2 つの code）を 1 本に置き換える
+    let edges: Vec<&Value> = both["compliance"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["name"] == "touches_edge")
+        .collect();
+    assert_eq!(edges.len(), 1, "明示が勝っていない: {both}");
+    assert_eq!(edges[0]["code"], "SUBJECT_TOUCHES_EDGE", "code が消えた");
+    assert!(edges[0]["operator"].is_null(), "比べる相手は無い");
+    assert!(edges[0]["threshold"].is_null());
+    assert_eq!(
+        both["compliance"]["checks"].as_array().unwrap().len(),
+        plain["compliance"]["checks"].as_array().unwrap().len() - 1,
+        "置き換えたのは外周接触の 2 本だけのはず"
+    );
+
+    // 接している画像では、明示も `default` も同じ code で落ちる
+    let cropped = write_png(dir.path(), "cropped.png", &cropped_scene());
+    let (code, v) = cutout_gated(&cropped, &output, &["--fail-on", "touches_edge"]);
+    assert_eq!(code, 5, "接している画像が落ちない: {v}");
+    assert_eq!(check_of(&v, "touches_edge")["code"], "SUBJECT_TOUCHES_EDGE");
+}
+
+/// 人間向けの行は**見た件数と落ちた件数**を言い、markdown を漏らさない。
+///
+/// 「不合格です」とだけ言うと「見た上で通った」が伝わらず、かといって pass を
+/// 全部並べると 20 行が埋まる。`**` は端末に出しても強調にならない——
+/// `src/main.rs` の他の `println!` に `**` を含むものは 1 つも無い。
+#[test]
+fn the_human_readable_compliance_line_counts_what_it_looked_at() {
+    let dir = fixture_dir();
+    let input = write_jpeg(
+        dir.path(),
+        "product.jpg",
+        &product_image(&ProductSpec::default()),
+    );
+    let output = dir.path().join("out.png");
+
+    let run = |spec: &str| -> String {
+        let out = kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--dry-run",
+                "--fail-on",
+                spec,
+            ])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    let passed = run("default");
+    let line = passed
+        .lines()
+        .find(|l| l.contains("規格"))
+        .unwrap_or_else(|| panic!("合否の行が無い:\n{passed}"));
+    assert!(line.contains("合格"), "{line}");
+    assert!(
+        line.contains("8 件中 0 件不合格"),
+        "見た件数が出ていない: {line}"
+    );
+
+    let rejected = run("foreground_ratio>=0.0");
+    let line = rejected
+        .lines()
+        .find(|l| l.contains("規格"))
+        .unwrap_or_else(|| panic!("合否の行が無い:\n{rejected}"));
+    assert!(line.contains("1 件中 1 件不合格"), "{line}");
+    assert!(
+        !rejected.contains("**"),
+        "markdown が漏れている:\n{rejected}"
+    );
 }

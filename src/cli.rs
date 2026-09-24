@@ -677,30 +677,44 @@ fn optimize_long_help() -> String {
 /// `Metric` を動かしたときにヘルプだけが古い一覧を語ると、それがそのまま
 /// 誤った指定になる。
 fn fail_on_long_help() -> String {
-    use crate::compliance::{calibrated_gate_codes, operators};
+    use crate::compliance::{calibrated_gate_codes, flag_metrics, operators};
     let codes: Vec<&str> = calibrated_gate_codes().iter().map(|c| c.as_str()).collect();
+    // 真偽の指標は裸のトークンで書く。綴りも意味も `Metric` から配る
+    let flags: Vec<String> = flag_metrics()
+        .into_iter()
+        .map(|(name, meaning)| format!("{name}（{meaning}）"))
+        .collect();
     format!(
         "指標がこの条件に触れたら exit {} で返す（既定 off）。カンマ区切りで、\n\
-         {DEFAULT_TOKEN} / <指標><演算子><値> / touches_edge=true の 3 種類を混ぜて書ける\n\
+         {DEFAULT_TOKEN} / <指標><演算子><値> / 真偽の指標の 3 種類を混ぜて書ける\n\
          （例 --fail-on '{DEFAULT_TOKEN},halo_ratio>0.05'）。\n\
          指標は結果 JSON の mask.* のキーそのまま: {}。\n\
          演算子は {}。**これに触れたら不合格**である\
          （halo_ratio>0.10 は「0.10 を超えたら落とす」）。\n\
+         **発火しえない条件は断る**（halo_ratio>1.0 は割合が 1 を超えないので\
+         永久に落ちない）。1 ちょうどを落とすなら halo_ratio>=1.0 と書く。\n\
+         真偽の指標は裸のトークンで書く: {}。**= は付けない**——\
+         向きを選べる形にすると、唯一意味のある向きがどちらか読めなくなる。\n\
          {DEFAULT_TOKEN} は既定の合格条件で、次の警告のいずれかが出たら不合格にする: {}。\
-         これは --optimize が「きれい」と呼ぶ条件そのもので、**同じ問いに 2 つの\
-         答えを持たせない**ためにこの集合を使う。\n\
+         これは --optimize が「きれい」と呼ぶ較正済みの集合に、測れなかった指標を\
+         足したものである。**同じ問いに 2 つの答えを持たせない**ためにこの集合を使う。\n\
          **{DEFAULT_TOKEN} と明示が同じ指標に当たったら明示が勝つ**\
-         （--tolerance を明示したときに探索の軸から外れるのと同じ規約）。\n\
+         （--tolerance を明示したときに探索の軸から外れるのと同じ規約）。\
+         **勝つのは指標ごとである**——{DEFAULT_TOKEN},foreground_ratio>0.9 は \
+         FOREGROUND_TOO_SMALL の検査も一緒に置き換える（同じ指標の二重指定は\
+         断るので、書き足して取り戻すことはできない）。\n\
          **測れなかった指標（null）は不合格**である。separability の null は\
          「前景が無い」、halo_ratio の null は「測る境界が無い」で、どちらも\
          黙って合格を出してよい状態ではない。status で fail と区別して名乗る。\n\
          **不合格でも結果 JSON は通常どおり全部返る**（outputs[] も mask も \
          background もある）。処理は成功していて成果物も存在するので、\
          exit {} は「やり直せば直る失敗」ではなく「人が見る対象」である。\
-         判定の内訳は compliance.checks[] に、評価したものが全部（pass も）出る。",
+         判定の内訳は compliance.checks[] に、評価したものが全部（pass も）出る\
+         （{DEFAULT_TOKEN} では 1 つの指標が複数の行を持つので、**一意なのは code のほう**）。",
         crate::error::ErrorKind::Compliance.exit_code(),
         FAIL_ON_METRICS.join(" / "),
         operators().join(" / "),
+        flags.join(" / "),
         codes.join(" / "),
         crate::error::ErrorKind::Compliance.exit_code(),
     )

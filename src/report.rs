@@ -803,12 +803,19 @@ pub struct ComplianceReport {
 /// 「報告していない」が同じ形になる。
 #[derive(Debug, Serialize)]
 pub struct ComplianceCheck {
-    /// 見た指標。結果 JSON の `mask.*` のキーそのまま
+    /// 見た指標。結果 JSON の `mask.*` のキーそのまま。
+    ///
+    /// **一意ではない。** `default` は指標ではなく code ごとに 1 行出すので、
+    /// 同じ名前が 2 行並ぶことがある（一意なのは `code` のほう）
     pub name: &'static str,
-    /// `"pass"` / `"fail"` / `"unmeasurable"`
+    /// `"pass"` / `"fail"` / `"unmeasurable"`。
+    ///
+    /// **`default` の判定はここと `actual` で出どころが違う。** 合否は実際に
+    /// 出た警告（生値で判定）から取り、`actual` は `round4` 済みの報告値なので、
+    /// 4 桁目で両者がずれうる。明示のしきい値にはこのずれが無い
     pub status: &'static str,
-    /// `lt` / `lte` / `gt` / `gte`（`fields[].warns[].operator` と同じ綴り）、
-    /// 真偽の指標では `eq`。固定のしきい値を持たない条件では null
+    /// `lt` / `lte` / `gt` / `gte`（`fields[].warns[].operator` と同じ綴り）。
+    /// 真偽の指標（裸のトークンで書く）と、固定のしきい値を持たない条件では null
     pub operator: Option<&'static str>,
     pub threshold: Option<Value>,
     /// 実測値。`mask.*` と同じ数である。測れなければ null
@@ -956,7 +963,10 @@ pub struct FieldEntry {
     pub appears_in: Vec<&'static str>,
     /// 値の種類。**語彙はこの一覧がすべてである**——`ratio` / `delta_e` /
     /// `gradient` / `px` / `px_at_1000` / `deg` / `ms` / `count` / `quality` /
-    /// `bool` / `enum` / `path` / `list` / `normalized_bbox`。
+    /// `bool` / `enum` / `path` / `text` / `list` / `normalized_bbox`。
+    ///
+    /// `text` は**決まった選択肢を持たない文字列**である（`compliance.fail_on`）。
+    /// `enum` と分けるのは、受け手が値を照合してよいかどうかがここで変わるため
     ///
     /// schema はこれをそのまま配るので、綴りも契約である。増やすときはここと
     /// `every_published_unit_is_in_the_known_vocabulary` の両方を直す。

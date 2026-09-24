@@ -4,6 +4,7 @@
 //! 次の手（座標やしきい値の調整）を打てるだけの情報を含める。
 
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::cutout::Confidence;
 use crate::error::{Error, ErrorCode};
@@ -709,6 +710,15 @@ pub struct CutoutReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rotate: Option<RotateReport>,
     pub mask: MaskReport,
+    /// `--fail-on` を渡したときだけ出る。`optimize` / `segment` と同じ規約で
+    /// キーごと現れない——**渡さない実行の結果 JSON は 1 バイトも変わらない。**
+    ///
+    /// 不合格でも結果 JSON は通常どおり全部返る（`outputs[]` も `mask` も
+    /// `background` もある）。処理は成功していて成果物も存在するので、
+    /// `ErrorReport` に差し替えると「何が不合格だったか」も「何が書かれたか」も
+    /// 追えなくなる
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compliance: Option<ComplianceReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canvas: Option<CanvasReport>,
     /// 落ち影を合成したときだけ出る。`--shadow off`（既定）ではキーごと無い
@@ -725,7 +735,8 @@ pub struct CutoutReport {
 pub struct BatchItemReport {
     pub input: String,
     pub output: String,
-    /// "ok" または "error"
+    /// `"ok"` / `"rejected"` / `"error"`。**`rejected` も処理としては成功**
+    /// している（成果物は書かれている）ので、`result` は通常どおり入る
     pub status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<CutoutReport>,
@@ -741,6 +752,13 @@ pub struct BatchReport {
     pub total: usize,
     pub succeeded: usize,
     pub failed: usize,
+    /// `--fail-on` の条件に触れた項目の数。
+    ///
+    /// **`succeeded` の定義は変えていない。** 不合格でも処理は成功しており、
+    /// 成果物は書かれている——`succeeded` を「書けた件数」として読んでいる
+    /// 既存の読み手にとって、それは今も正しい。ここは「書けたが人が見るべき
+    /// 件数」を別に数える
+    pub rejected: usize,
     /// 成功したが警告が付いた項目の数。目視確認の対象になる
     pub with_warnings: usize,
     /// この実行が実際に書き出したか。項目ごとの結果にも同じものが入る
@@ -754,6 +772,49 @@ pub struct BatchReport {
     pub warnings: Vec<Warning>,
     pub elapsed_ms: u128,
     pub results: Vec<BatchItemReport>,
+}
+
+/// `--fail-on` の判定。**`--fail-on` を指定したときだけ出る。**
+///
+/// **このブロックの形は Phase 22 の `LintReport` が再利用する。** そのために
+/// `expected` / `actual` を文字列へ畳まない——数値は数値のまま返す。
+/// エージェントに正規表現を書かせないための決めである。
+#[derive(Debug, Serialize)]
+pub struct ComplianceReport {
+    /// 利用者が書いた文字列をそのまま。**何を頼んだかが結果だけで分かる**
+    pub fail_on: String,
+    /// `checks[]` に `fail` も `unmeasurable` も 1 つも無いこと
+    pub passed: bool,
+    /// 不合格のときだけ名乗る code（`QUALITY_GATE_FAILED`）。合格なら null。
+    ///
+    /// **exit 5 は `ErrorReport` を返さない**ので、`kiri schema` の `errors[]` が
+    /// 配る語彙と結果を突き合わせられる場所がここ以外に無い。エージェントは
+    /// exit 5 を見てここを引けば、他の失敗とまったく同じ形で分岐できる
+    pub code: Option<ErrorCode>,
+    /// **評価したものを全部載せる**（`pass` も）。落ちたものだけを載せると、
+    /// 「見た上で通った」と「そもそも見ていない」が区別できない。
+    /// 並びは `compliance::Metric::ALL` の順で決定的
+    pub checks: Vec<ComplianceCheck>,
+}
+
+/// 1 つの条件とその判定。
+///
+/// **キーは常に出し、当てはまらないところは `null`。** 省くと「条件が無い」と
+/// 「報告していない」が同じ形になる。
+#[derive(Debug, Serialize)]
+pub struct ComplianceCheck {
+    /// 見た指標。結果 JSON の `mask.*` のキーそのまま
+    pub name: &'static str,
+    /// `"pass"` / `"fail"` / `"unmeasurable"`
+    pub status: &'static str,
+    /// `lt` / `lte` / `gt` / `gte`（`fields[].warns[].operator` と同じ綴り）、
+    /// 真偽の指標では `eq`。固定のしきい値を持たない条件では null
+    pub operator: Option<&'static str>,
+    pub threshold: Option<Value>,
+    /// 実測値。`mask.*` と同じ数である。測れなければ null
+    pub actual: Option<Value>,
+    /// 対応する警告 code。当てはまる警告が無ければ null
+    pub code: Option<WarningCode>,
 }
 
 /// `--manifest` が書く JSON。

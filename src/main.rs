@@ -12,11 +12,12 @@ use serde::Serialize;
 
 use kiri::cli::{Cli, Command};
 use kiri::commands;
+use kiri::compliance;
 use kiri::cutout::{Confidence, OptimizeFixed, bbox_argument};
 use kiri::error::{Error, ErrorCode, ErrorKind, Result};
 use kiri::report::{
-    BackgroundReport, BatchReport, CutoutReport, ErrorReport, InfoReport, ModelReport,
-    ProcessReport, SchemaReport, SegmentReport, SettingsReport, SubjectReport,
+    BackgroundReport, BatchReport, ComplianceReport, CutoutReport, ErrorReport, InfoReport,
+    ModelReport, ProcessReport, SchemaReport, SegmentReport, SettingsReport, SubjectReport,
 };
 use kiri::warning::Warning;
 
@@ -116,6 +117,14 @@ fn dispatch(cli: &Cli) -> Result<i32> {
             } else {
                 print_cutout(&report);
             }
+            // **`Err` 経路を通さない。** 処理は成功していて成果物も存在する。
+            // `ErrorReport` へ差し替えると `outputs[]` も `mask` も消え、
+            // 「何が不合格だったか」も「何が書かれたか」も追えなくなる。
+            // batch が `failed > 0` で 4 を返しつつ `BatchReport` を出している
+            // 既存の形をそのまま踏襲する
+            if report.compliance.as_ref().is_some_and(|c| !c.passed) {
+                return Ok(ErrorKind::Compliance.exit_code());
+            }
         }
         Command::Model(args) => {
             let report = commands::model::run(&args.command)?;
@@ -140,9 +149,15 @@ fn dispatch(cli: &Cli) -> Result<i32> {
             } else {
                 print_batch(&report);
             }
-            // 失敗した項目があれば処理失敗として知らせる。詳細は results[] にある
+            // 失敗した項目があれば処理失敗として知らせる。詳細は results[] にある。
+            // **4 が 5 に優先する。** 両方あるときに 5 を返すと、成果物が
+            // 1 つも無い項目があることが番号から消え、「見れば分かる結果」として
+            // 扱われてしまう
             if report.failed > 0 {
                 return Ok(ErrorKind::Processing.exit_code());
+            }
+            if report.rejected > 0 {
+                return Ok(ErrorKind::Compliance.exit_code());
             }
         }
     }
@@ -517,14 +532,68 @@ fn print_cutout(report: &CutoutReport) {
         println!("  プレビュー  {path}");
     }
     print_subject(report.subject.as_ref());
+    print_compliance(report.compliance.as_ref());
     print_warnings(&report.warnings);
+}
+
+/// 合否を人間向けに出す。**`--fail-on` を渡したときだけ 1 行以上増える。**
+///
+/// 落ちた条件は 1 行に 1 つ、実測値としきい値を並べて出す。まとめて
+/// 「不合格です」とだけ言うと、次に何を直せばよいかが JSON を読むまで分からない。
+/// 通った条件は数だけを言う——**見た上で通ったこと**は伝わるが、20 行を
+/// 埋める価値は無い（内訳は `compliance.checks[]` が全部持っている）。
+fn print_compliance(compliance: Option<&ComplianceReport>) {
+    let Some(c) = compliance else {
+        return;
+    };
+    println!(
+        "  規格      {}  (--fail-on {})",
+        if c.passed { "合格" } else { "**不合格**" },
+        c.fail_on
+    );
+    for check in &c.checks {
+        if check.status == compliance::PASS {
+            continue;
+        }
+        let detail = match (
+            check.status,
+            &check.actual,
+            check.operator,
+            &check.threshold,
+        ) {
+            (compliance::UNMEASURABLE, _, _, _) => "測れず".to_string(),
+            (_, Some(actual), Some(op), Some(threshold)) => {
+                format!("{actual} {} {threshold}", compliance::symbol_of(op))
+            }
+            // 固定のしきい値を持たない条件（NOT_SEPARABLE、外周接触）は
+            // 実測値だけを出す。比べた相手は警告の message が言う
+            (_, Some(actual), _, _) => actual.to_string(),
+            _ => String::new(),
+        };
+        println!(
+            "    x {} {}{}",
+            check.name,
+            detail,
+            match check.code {
+                Some(code) => format!("  {}", code.as_str()),
+                None => String::new(),
+            }
+        );
+    }
 }
 
 fn print_batch(report: &BatchReport) {
     for item in &report.results {
         match (&item.result, &item.error) {
             (Some(r), _) => {
-                let mark = if r.warnings.is_empty() { " " } else { "!" };
+                // **不合格は警告より強い印にする。** `!` は「目視で確かめて
+                // ほしい」で、`R` は「条件に照らして落ちた」である。同じ印に
+                // すると、数百行の中で仕分ける手がかりが 1 つ減る
+                let mark = match (item.status, r.warnings.is_empty()) {
+                    (kiri::commands::batch::REJECTED, _) => "R",
+                    (_, true) => " ",
+                    (_, false) => "!",
+                };
                 // **派生を全部並べる。** 1 本目だけを出していた頃は、
                 // `--sizes` を渡した実行で書かれたファイルの大半が画面から
                 // 消えていた。行そのものにも印を付けるのは、サマリが数百行の
@@ -567,11 +636,12 @@ fn print_batch(report: &BatchReport) {
     // 「どの項目の話か」に読めてしまう（`MANIFEST_PARTIAL` はどの項目の話でもない）
     print_warnings(&report.warnings);
     println!(
-        "\n{}{} 件中 {} 件成功、{} 件失敗、{} 件に警告  ({} ms)",
+        "\n{}{} 件中 {} 件成功、{} 件失敗、{} 件不合格、{} 件に警告  ({} ms)",
         dry_run_prefix(report.dry_run),
         report.total,
         report.succeeded,
         report.failed,
+        report.rejected,
         report.with_warnings,
         report.elapsed_ms
     );

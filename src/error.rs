@@ -18,6 +18,13 @@ pub enum ErrorKind {
     Input,
     /// 処理の失敗（背景を検出できない等）
     Processing,
+    /// 処理は成功し成果物もあるが、規格に達しなかった。
+    ///
+    /// **`Processing` を流用しない。** あちらは「やり直せば直る失敗」で、
+    /// こちらは「人が見るべき結果」である。同じ番号にすると、エージェントは
+    /// 2 つを分けられず、書けているファイルを失敗として捨てるか、
+    /// 落ちた切り抜きをそのまま納品するかのどちらかになる
+    Compliance,
 }
 
 impl ErrorKind {
@@ -27,6 +34,7 @@ impl ErrorKind {
         ErrorKind::Argument,
         ErrorKind::Input,
         ErrorKind::Processing,
+        ErrorKind::Compliance,
     ];
 
     /// exit code の意味。README の表と同じ文言をここから配る。
@@ -40,6 +48,12 @@ impl ErrorKind {
             ErrorKind::Argument => "引数不正（書式や値域の誤りは code を伴わず stderr にのみ出る）",
             ErrorKind::Input => "入力ファイル異常",
             ErrorKind::Processing => "処理失敗",
+            // **「0 以外は失敗」と読んでいる呼び出し側にとって 5 は新しい意味**
+            // なので、番号だけでなくこの一行で区別が付くようにする。成果物は
+            // 書かれていて、結果 JSON も通常どおり返っている
+            ErrorKind::Compliance => {
+                "規格未達（成果物はある。人が見る対象で、結果 JSON は通常どおり返る）"
+            }
         }
     }
 
@@ -49,6 +63,7 @@ impl ErrorKind {
             ErrorKind::Argument => 2,
             ErrorKind::Input => 3,
             ErrorKind::Processing => 4,
+            ErrorKind::Compliance => 5,
         }
     }
 }
@@ -149,6 +164,9 @@ error_catalog! {
     InvalidDerivation = "INVALID_DERIVATION", Argument
         => "--derive の書式か値が不正（未知のキー、読めない値、sizes / formats との同時指定）。\
             spec 経由でのみこの code で、CLI では clap が code 無しの exit 2 で断る",
+    InvalidFailOn = "INVALID_FAIL_ON", Argument
+        => "--fail-on の書式か値が不正（未知の指標、演算子の綴り違い、値域外、同じ指標への二重指定）。\
+            spec 経由でのみこの code で、CLI では clap が code 無しの exit 2 で断る",
     InvalidNamingTemplate = "INVALID_NAMING_TEMPLATE", Argument
         => "--naming のテンプレートが不正（未知の置換子、閉じていない括弧、role を持たない派生への {role}）",
     OutputNameCollision = "OUTPUT_NAME_COLLISION", Argument
@@ -203,6 +221,18 @@ error_catalog! {
         => "モデルは読めたが推論が通らなかった",
     OptimizeNoCandidate = "OPTIMIZE_NO_CANDIDATE", Processing
         => "--optimize が試せる候補を 1 つも組めなかった（3 つの軸には必ず値があるため通常は起こらない）",
+
+    // 規格 (exit 5)
+    //
+    // **この code は `ErrorBody` としては返らない。** 処理は成功していて
+    // 成果物もあるので、結果 JSON を `ErrorReport` に差し替えてはいけない
+    // （`outputs[]` も `mask` も捨てると、何が不合格で何が書かれたのかを
+    // 利用者が追えなくなる）。カタログに置くのは **exit 5 の語彙を
+    // `kiri schema` が配るため**で、実際の名乗りは結果 JSON の
+    // `compliance.code` が行う
+    QualityGateFailed = "QUALITY_GATE_FAILED", Compliance
+        => "--fail-on の条件に触れた。**結果 JSON は通常どおり返る**（成果物はある）。\
+            この code は errors[] ではなく compliance.code に出る",
 }
 
 impl Serialize for ErrorCode {
@@ -272,6 +302,7 @@ mod tests {
         assert_eq!(ErrorKind::Argument.exit_code(), 2);
         assert_eq!(ErrorKind::Input.exit_code(), 3);
         assert_eq!(ErrorKind::Processing.exit_code(), 4);
+        assert_eq!(ErrorKind::Compliance.exit_code(), 5);
     }
 
     #[test]

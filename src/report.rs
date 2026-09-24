@@ -18,7 +18,21 @@ use crate::warning::{Warning, WarningCode};
 ///
 /// 版を名乗らないと、契約が動いたときに古い読み手が黙って誤読する。
 /// **黙って間違えるのが最も高くつく**ので、成功にも失敗にも必ず添える。
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// # 2 へ上げた理由（Phase 20）
+///
+/// **`outputs[]` が常に 1 要素だという前提が崩れた。** 型は `Vec<OutputReport>`
+/// のままなので、`outputs[0]` を読むコードはコンパイルも実行も通る——通ったうえで
+/// 2 本目以降を黙って捨てる。キーが増えただけなら上げないのは、古い読み手が
+/// 知らないキーを無視しても誤読にならないからである。ここは無視した結果が
+/// 「成果物が 1 つしか無い」という誤った事実になるので、版で断る。
+///
+/// 同じ版で入った変更が 2 つある。どちらも単独では上げる理由にならないが、
+/// **上げる回は 1 回だけにする**という決め（計画 7.2）に従ってここへ寄せた。
+/// - `outputs[].role`（キーの追加）
+/// - 派生に紐づく警告の `data.output`。`DRY_RUN_OUTPUT_EXISTS` の `data.path` は
+///   この `output` へ**改名した**（同じ意味のキーが 2 つ並ぶのを避けた）
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Serialize)]
 pub struct ErrorReport {
@@ -297,7 +311,12 @@ pub fn quality_number(quality: f32) -> f64 {
     (quality as f64 * 100.0).round() / 100.0
 }
 
-#[derive(Debug, Serialize)]
+/// 書き出した 1 本の素性。
+///
+/// **`outputs[]` は派生ごとに 1 要素である**（`SCHEMA_VERSION` 2）。`--derive` /
+/// `--sizes` / `--formats` / `--naming` のどれも渡さない実行では 1 要素のままで、
+/// そのときのパスは `--output` そのものになる。
+#[derive(Debug, Clone, Serialize)]
 pub struct OutputReport {
     pub path: String,
     pub format: String,
@@ -317,6 +336,11 @@ pub struct OutputReport {
     pub quality_used: Option<f64>,
     /// エンコードした回数。`--max-bytes` が無ければ必ず 1
     pub attempts: u32,
+    /// この派生の役目（`--derive` の `role`）。指定が無ければ null。
+    ///
+    /// **キーは常に出す**（`icc` / `quality_used` と同じ規約）。省くと
+    /// 「古い版で走った」と「役目を付けなかった」が同じ形になる
+    pub role: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -721,8 +745,45 @@ pub struct BatchReport {
     pub with_warnings: usize,
     /// この実行が実際に書き出したか。項目ごとの結果にも同じものが入る
     pub dry_run: bool,
+    /// 実行**全体**に掛かる警告。項目ごとの警告は `results[].result.warnings`。
+    ///
+    /// **加算だけの変更である。** ここが空なのは今までどおりの実行で、いま入りうる
+    /// のは `MANIFEST_PARTIAL` の 1 つだけ——batch は 1 件の失敗で全体を止めない
+    /// 規約なので、失敗した項目があるのにマニフェストを書いたら、成功分だけを
+    /// 載せたことをここで言う。**項目の警告に混ぜない**——どの項目の話でもない
+    pub warnings: Vec<Warning>,
     pub elapsed_ms: u128,
     pub results: Vec<BatchItemReport>,
+}
+
+/// `--manifest` が書く JSON。
+///
+/// **時刻も所要時間も入れない。** 同じ入力から同じバイト列が出ることは kiri の
+/// 中核の約束で、マニフェストは成果物と並べて版管理されうるものである。
+/// `elapsed_ms` を持つ結果 JSON とは役目が違う——あちらは 1 回の実行の記録で、
+/// こちらは**何が出来上がったか**の目録になる。
+///
+/// **パスは受け取った文字列をそのまま載せる。** 相対パスで呼べば相対パスが載り、
+/// 成果物と並べて版管理できる。絶対パスで呼べば絶対パスが載る——ここで書き換えて
+/// 相対へ寄せる実装にはしていない。`--output` も `--base-dir` も利用者が絶対パスで
+/// 指せる以上、「何を基準に相対化するか」に正しい答えが無く、推測で畳めば
+/// **目録のパスが実在しない場所を指す**ことになるためである。決定的な出力が
+/// 欲しければ、kiri を相対パスで呼ぶ
+#[derive(Debug, Serialize)]
+pub struct Manifest {
+    /// 契約の版。結果 JSON と同じ `SCHEMA_VERSION` を名乗る
+    pub schema_version: u32,
+    pub kiri_version: &'static str,
+    /// convert / resize / rotate / cutout では必ず 1 要素。batch では
+    /// **成功した項目 1 件につき 1 要素**（失敗分は載らず `MANIFEST_PARTIAL` が出る）
+    pub items: Vec<ManifestItem>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ManifestItem {
+    pub input: String,
+    /// 結果 JSON の `outputs[]` と同じ形・同じ順序
+    pub outputs: Vec<OutputReport>,
 }
 
 /// `kiri schema` が返す契約そのもの。

@@ -712,6 +712,53 @@ fn fields() -> Vec<FieldEntry> {
             ),
         },
         FieldEntry {
+            path: "outputs[].path",
+            appears_in: vec!["convert", "resize", "rotate", "cutout"],
+            unit: "path",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "この派生を書き出した先（--dry-run ならファイルは無い）",
+            notes: Some(
+                "**outputs[] は派生ごとに 1 要素である**（schema_version 2）。--derive / \
+                 --sizes / --formats / --naming のどれも渡さない実行では 1 要素で、値は \
+                 --output そのものになる。順序は指定した順で、--sizes と --formats を\
+                 併せたときは size が外・format が内の直積になる（--naming の {index} と\
+                 同じ番号）。\
+                 **派生ごとに出うる警告は、どれも data.output で「どの出力の話か」を名乗る**\
+                 ——ALPHA_FLATTENED / QUALITY_REDUCED / MAX_BYTES_UNREACHABLE / \
+                 ICC_NOT_EMBEDDED / UPSCALED / DRY_RUN_OUTPUT_EXISTS の 6 つで、\
+                 1 実行に複数回出うるので、どの出力の話かはその値で引く。\
+                 値は outputs[].path か、--manifest のパスである——目録も\
+                 上書きの規約に従うので、--dry-run で既にあれば \
+                 DRY_RUN_OUTPUT_EXISTS がそのパスを名乗る。\
+                 UPSCALED だけは data.output を持たないことがある。\
+                 **持たないものは出どころが違う**——kiri resize --allow-upscale \
+                 そのものの拡大は最終画像に起きたことで、派生ごとの事象ではない。\
+                 派生のリサイズで出たものは持つので、data.output の有無が\
+                 そのまま出どころの区別になる",
+            ),
+        },
+        FieldEntry {
+            path: "outputs[].role",
+            appears_in: vec!["convert", "resize", "rotate", "cutout"],
+            unit: "enum",
+            nullable: true,
+            null_means: Some("この派生に --derive の role を書かなかった（役目を付けていない）"),
+            warns: vec![],
+            gates: None,
+            summary: "この派生の役目（--derive の role にそのまま書いた文字列）",
+            notes: Some(
+                "kiri は中身を解釈しない。配信側が outputs[] のどれを使うかを選ぶための札で、\
+                 thumb / hero のような綴りを自由に置ける。--naming の {role} で\
+                 ファイル名にも使える（役目を持たない派生があるのに書くと \
+                 INVALID_NAMING_TEMPLATE で断る）。**キーは常に出す**ので、null は\
+                 「役目を付けなかった」を意味し、キーが無ければ schema_version 1 の\
+                 古い kiri で走ったことを意味する",
+            ),
+        },
+        FieldEntry {
             path: "outputs[].icc",
             appears_in: vec!["convert", "resize", "rotate", "cutout"],
             unit: "enum",
@@ -721,7 +768,9 @@ fn fields() -> Vec<FieldEntry> {
             gates: None,
             summary: "出力が色空間をどう名乗っているか（embedded / nclx / none）",
             notes: Some(
-                "embedded は PNG の iCCP か JPEG の APP2 に sRGB の ICC を埋めた。nclx は AVIF で、\
+                "**outputs[] は派生ごとに 1 要素である**（schema_version 2）。名乗りは形式で\
+                 変わるので、AVIF と PNG を同時に書く実行ではここが要素ごとに違う。\
+                 embedded は PNG の iCCP か JPEG の APP2 に sRGB の ICC を埋めた。nclx は AVIF で、\
                  ICC ではなく AV1 の色情報（BT.709 の原色と sRGB の転送特性）で sRGB を名乗る——\
                  colr ボックスは既定値と同じなので省かれ、コンテナには現れない。none は何も名乗って\
                  いない。--no-color-convert で画素を sRGB へ変換しなかったときだけこうなり、\
@@ -745,7 +794,9 @@ fn fields() -> Vec<FieldEntry> {
             gates: None,
             summary: "実際に使った品質（--quality の指定値、--max-bytes で落としたならその段）",
             notes: Some(
-                "--max-bytes が無ければ --quality の指定値がそのまま出る。収まらなかったときは\
+                "**outputs[] は派生ごとに 1 要素である**（schema_version 2）。--derive で\
+                 派生ごとに quality / max_bytes を変えれば、ここも要素ごとに違う値になる。\
+                 --max-bytes が無ければ --quality の指定値がそのまま出る。収まらなかったときは\
                  固定の梯子 85 / 75 / 65 / 55 / 45 / 35 / 25 のうち --quality より小さい段を\
                  上から試し、最初に収まった段がここに出て QUALITY_REDUCED が落とした事実を言う。\
                  **下限まで降りても届かなければ要求品質のものを書く**ので、ここは --quality の\
@@ -764,7 +815,9 @@ fn fields() -> Vec<FieldEntry> {
             gates: None,
             summary: "この出力をエンコードした回数",
             notes: Some(
-                "--max-bytes が無ければ必ず 1 である。探索が走ると、要求品質の 1 回に\
+                "**outputs[] は派生ごとに 1 要素で、ここはその 1 本ぶんの回数である**\
+                 （schema_version 2）。実行全体の費用を見るなら全要素の和を取ること。\
+                 --max-bytes が無ければ必ず 1 である。探索が走ると、要求品質の 1 回に\
                  降りた段の数が積む（既定の --quality 75 なら降りる段は 5 つで最大 6 回、\
                  --quality 100 でも最大 8 回）。PNG は品質を持たず\
                  段を降りないので --max-bytes を渡しても 1 のまま。**時間の見積もりに使える\

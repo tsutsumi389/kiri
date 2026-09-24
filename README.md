@@ -39,7 +39,7 @@ cargo install --path .
 ```
 $ kiri schema --json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "kiri_version": "0.1.0",
   "exit_codes": [{ "code": 0, "meaning": "成功" }, ...],
   "errors":   [{ "code": "OUTPUT_EXISTS",  "exit_code": 2, "summary": "出力先が既に存在する。--force が要る" }, ...],
@@ -138,12 +138,30 @@ $ kiri schema --json | jq '.commands[] | select(.name == "cutout") | .options'
 結果 JSON はすべて `schema_version` を名乗る。**失敗の JSON も同じ。**
 
 ```json
-{ "schema_version": 1, "error": { "code": "INPUT_UNREADABLE", "message": "..." } }
+{ "schema_version": 2, "error": { "code": "INPUT_UNREADABLE", "message": "..." } }
 ```
 
 **キーが増えただけでは上げない。** 既存のキーの意味や型が変わったとき、つまり
 今までの読み方が誤読になるときだけ上げる。版を名乗らなければ、契約が動いたときに
 古い読み手が黙って誤読する。**黙って間違えるのが最も高くつく。**
+
+##### 2 になった理由
+
+**`outputs[]` が常に 1 要素だという前提が崩れた。** 1 回の実行で複数の派生を書ける
+ようになった（[複数のサイズと形式をまとめて書く](#複数のサイズと形式をまとめて書くderive)）。
+型は今までと同じ配列なので、`outputs[0]` を読むコードはコンパイルも実行も通る
+——**通ったうえで 2 本目以降を黙って捨てる。** 無視した結果が「成果物が 1 つしか
+無い」という誤った事実になるので、版で断る。
+
+同じ版で入った変更が 2 つある。どちらも単独では上げる理由にならないが、**版を
+上げる回は 1 回だけにする**という方針でここへ寄せた。
+
+- `outputs[].role` が増えた（キーの追加）
+- 派生に紐づく警告が `data.output` で「どの出力の話か」を名乗るようになった。
+  `DRY_RUN_OUTPUT_EXISTS` の `data.path` はこの `output` へ**改名した**
+
+`--derive` などを渡さない実行では、`outputs[]` は今までどおり 1 要素で、
+出力バイト列も出力パスも 1 バイトも変わらない。
 
 ### kiri info
 
@@ -552,6 +570,161 @@ PNG は無損失で品質を持たないため効かない。1 回のエンコ�
 `--dry-run` でも実際にエンコードするので、`bytes` / `quality_used` / `attempts` は見積もり
 ではなく実測値である。
 
+#### 複数のサイズと形式をまとめて書く（`--derive`）
+
+1 回の実行で複数の派生を書き出せる。**切り抜きも読み込みも 1 回だけ**で、派生は
+最終画像からのリサイズと再エンコードになる。`convert` / `resize` / `rotate` /
+`cutout` の 4 つすべてで同じように使える。
+
+```
+$ kiri cutout product.jpg -o out/product.png \
+    --sizes 400,800,1600 --formats avif,jpeg \
+    --manifest out/product.json --json
+```
+
+| オプション | 既定値 | 説明 |
+|---|---|---|
+| `--derive SPEC` | — | 派生を 1 本ずつ指定する。複数回指定可。`--sizes` / `--formats` とは併用不可 |
+| `--sizes N,N,N` | — | 幅の並び。`--formats` との直積になる |
+| `--formats f,f` | — | 形式の並び。`avif` / `png` / `jpeg` / `jpg` |
+| `--naming TEMPLATE` | `{stem}_{width}.{ext}` | 派生のファイル名の付け方 |
+| `--manifest PATH` | — | 書いたものを列挙する JSON |
+
+**どれも渡さなければ、今までとまったく同じ 1 本になる。** 出力バイト列も出力パスも
+変わらず、`outputs[]` は 1 要素のままである。
+
+##### `--derive` のキー
+
+```
+--derive 'width=1600,format=jpeg,quality=82,max_bytes=500k,role=hero'
+```
+
+| キー | 値 | 説明 |
+|---|---|---|
+| `width` / `height` | 1 以上の整数 | 出力寸法(px)。**どちらも書かなければリサイズしない** |
+| `fit` | `contain`（既定） / `cover` | 両方書いたときの当てはめ方 |
+| `allow_upscale` | `true` / `false`（既定） | 元画像より大きくすることを許す |
+| `format` | `avif` / `png` / `jpeg` / `jpg` | 出力形式 |
+| `quality` | 0-100 | 品質 |
+| `effort` | 1-10 | AVIF のエンコード速度 |
+| `max_bytes` | `500k` など | 出力の上限バイト数（`--max-bytes` と同じ書式） |
+| `role` | 自由な文字列 | この派生の役目。`outputs[].role` に出る |
+
+**省いたキーは `--format` / `--quality` / `--effort` / `--max-bytes` を継ぐ。**
+`format` を省いて `--format` も無ければ `--output` の拡張子から決まる。
+
+**同じキーを 2 回書いたら断る。** `width=100,width=250` を後勝ちで通すと、
+「書いたのに効かない」指定が 1 つだけ残ることになる（未知のキーは断っているのだから、
+ここだけ緩める理由が無い）。
+
+`--sizes` と `--formats` は直積の糖衣で、**size が外・format が内**の順に並ぶ。
+`--sizes` だけなら形式は 1 つ、`--formats` だけなら幅は最終画像のまま（リサイズ
+しない）。2 つの組み立て方が混ざると「どちらが勝つか」という覚える規則が増えるので、
+`--derive` との併用は構造として断っている。
+
+##### 名前の付け方（`--naming`）
+
+置換子は `{stem}` / `{index}` / `{width}` / `{height}` / `{ext}` / `{role}` の 6 つ。
+
+- `{stem}` は `--output` のファイル名から拡張子を除いたもの。**書き出し先の
+  ディレクトリも `--output` の親**になる
+- `{index}` は 0 起点の通し番号（`outputs[]` の添字と一致する）
+- `{width}` / `{height}` はその派生が実際に書き出す寸法
+- `{ext}` は形式の拡張子で `avif` / `png` / `jpg`。`outputs[].format` は従来どおり
+  `"jpeg"` のままで、これは今日の `--output out.jpg` と同じ不揃いである
+- `{role}` を書いたのに役目を持たない派生があれば `INVALID_NAMING_TEMPLATE` で断る
+
+**綴った名前がファイル名 1 つでなければ断る。** 区切り文字（`/`）や `..`、絶対パスを
+含む名前は `INVALID_NAMING_TEMPLATE` になる（`role` の値も同じ関門を通る）。書き出し先が
+`--output` の親に限られるという上の約束は、これで初めて保証される——`batch` の
+`output` は `--base-dir` の下へ寄せる規約になっているが、spec の `naming` /
+`derive[].role` はその関門を通らないので、素通しにすると spec の 1 行で境界を越えられる。
+
+**`--output` をディレクトリとしては読まない。** そう読むと「出力先が既にあるなら
+`--force` が要る」という `OUTPUT_EXISTS` の規約と両立しなくなる。`--output` は
+書き出し先そのもの（派生が 1 本のとき）か、名前の雛形（2 本以上のとき）である。
+
+明示した `--naming` は派生が 1 本でも効く。明示しなければ、2 本以上で既定の
+`{stem}_{width}.{ext}`、1 本なら `--output` そのままになる。
+
+##### 書き始める前に全部検査する
+
+**1 枚でも書いた後に落ちると、半端な成果物が残る。** 派生のパスは重いエンコードの
+前にすべて決めて、3 つを検査する。
+
+| 検査 | 落ちたときの code |
+|---|---|
+| 2 本以上の派生が同じパスになる（大文字小文字だけの違いも含む） | `OUTPUT_NAME_COLLISION` |
+| 派生のパスが `--preview` / `--debug-mask` / `--manifest` と重なる | `SIDE_OUTPUT_CONFLICT` |
+| 派生のパスが既にあり `--force` が無い | `OUTPUT_EXISTS`（`--dry-run` なら `DRY_RUN_OUTPUT_EXISTS`） |
+
+どれで落ちてもファイルは 1 つも書かれない。`OUTPUT_NAME_COLLISION` は `--force` でも
+許さない——上書きの可否は「利用者の既存のファイルを壊してよいか」の話で、こちらは
+1 回の実行が自分の成果物を自分で潰す指定だからである。**大文字小文字だけが違う
+2 本も断る**——macOS や Windows の既定では区別されないので同じ 1 ファイルへ落ち、
+通せば「JSON は 2 本書いたと報告し、ディスクには 1 本しか無い」ことになる。
+
+**ピークメモリは派生の数に比例しない。** 1 本ずつ「リサイズ → エンコード →
+書き出し → 解放」を回すので、24.5MP × N を同時には持たない。並列は `batch` の
+項目単位に任せている。
+
+##### 派生ごとの警告
+
+1 実行で複数の派生を書く以上、「どの出力の話か」が分からない警告は分岐の材料に
+ならない。**派生ごとに出うる警告は、どれも `data.output` で「どの出力の話か」を
+名乗る。**
+
+`ALPHA_FLATTENED` / `QUALITY_REDUCED` / `MAX_BYTES_UNREACHABLE` /
+`ICC_NOT_EMBEDDED` / `UPSCALED` / `DRY_RUN_OUTPUT_EXISTS` の 6 つで、値は
+`outputs[].path` か、`--manifest` のパスである。背景やマスクの診断のように派生と
+関係のない警告には付かない。
+
+書き分けが 2 つある。
+
+- **`DRY_RUN_OUTPUT_EXISTS` は目録にも出る。** `--manifest` も本出力と同じ上書きの
+  規約に従うので、`--dry-run` で既にあればそのパスを `data.output` に載せる。
+  この 1 本だけが `outputs[]` に現れない値になる
+- **`UPSCALED` には出どころが 2 つある。** 派生のリサイズで拡大したものは
+  `data.output` を持つ。`kiri resize --allow-upscale` 自身の拡大は**持たない**
+  ——それは派生ごとの事象ではなく、**最終画像そのもの**に起きたことだからである。
+  無い帰属をでっち上げて `output` を付けるほうが嘘になる。`data.output` の有無が
+  そのまま出どころの区別になる（持たない `UPSCALED` は resize 段のもの）
+
+##### マニフェスト（`--manifest`）
+
+書いたものを列挙する JSON を残す。
+
+```json
+{
+  "schema_version": 2,
+  "kiri_version": "0.1.0",
+  "items": [
+    {
+      "input": "product.jpg",
+      "outputs": [
+        { "path": "out/product_400.avif", "format": "avif", "width": 400, "height": 500,
+          "bytes": 12048, "icc": "nclx", "quality_used": 75.0, "attempts": 1, "role": null }
+      ]
+    }
+  ]
+}
+```
+
+`outputs[]` は結果 JSON とまったく同じ要素である。**時刻も所要時間も入れない**ので、
+同じ入力からは同じバイト列が出て、成果物と並べて版管理できる。
+
+- `convert` / `resize` / `rotate` / `cutout` では `items` は必ず 1 要素
+- `batch` では実行全体で 1 つのファイルになり、**成功した項目 1 件につき 1 要素**。
+  失敗した項目があれば `MANIFEST_PARTIAL` が「成功分だけを載せた」ことを言う
+  （`data.failed` が件数）
+- 一時ファイルへ書いてから `rename` するので、途中で落ちても半端な JSON は残らない。
+  書けなければ `MANIFEST_WRITE_FAILED`（exit 1）
+- 上書きの可否は**1 枚も書く前に**問う。`batch` でも同じで、`--force` の無い
+  `--manifest` が既存なら 1 件も処理せずに `OUTPUT_EXISTS` で止まる——数百点を
+  書き切ってから断ると、何が書けてどれが失敗したのかを返す手段が無くなる
+- `--dry-run` では書かない。パスが既にあれば他の出力と同じく
+  `DRY_RUN_OUTPUT_EXISTS` で知らせる
+
 ### kiri convert
 
 形式変換のみを行う。
@@ -567,9 +740,17 @@ $ kiri convert product.jpg -o product.avif --json
 | `--effort` | 6 | AVIFのエンコード速度 1-10。小さいほど高品質・低速 |
 | `--max-bytes` | — | 出力の上限バイト数（例 `500k`）。収まるまで品質を梯子状に落とす |
 | `--background` | `#FFFFFF` | 透過を保持できない形式へ出力する際の合成色 |
+| `--derive SPEC` | — | 派生を 1 本ずつ指定する（[複数のサイズと形式](#複数のサイズと形式をまとめて書くderive)） |
+| `--sizes N,N,N` | — | 幅の並び。`--formats` との直積になる |
+| `--formats f,f` | — | 形式の並び |
+| `--naming TEMPLATE` | `{stem}_{width}.{ext}` | 派生のファイル名の付け方 |
+| `--manifest PATH` | — | 書いたものを列挙する JSON |
 | `--no-color-convert` | | 埋め込み ICC を解釈せず、画素の値をそのまま使う |
 | `--force` | | 出力先が既に存在する場合に上書きする |
 | `--dry-run` | | 書き出さずに結果だけ返す |
+
+`--derive` / `--sizes` / `--formats` / `--naming` / `--manifest` は `resize` /
+`rotate` / `cutout` でも同じように使える。
 
 ### kiri resize
 
@@ -767,6 +948,11 @@ product.png  1600x2000  png  841.4 KB  (338 ms)
 | `--preview PATH` | — | 「元画像 \| マスク \| 結果」を1枚に並べた検証用画像を書き出す |
 | `--preview-size` | 512 | プレビューのパネル1枚あたりの長辺(px) |
 | `--no-preview-grid` | | プレビューの元画像に座標グリッドを重ねない |
+| `--derive SPEC` | — | 派生を 1 本ずつ指定する（[複数のサイズと形式](#複数のサイズと形式をまとめて書くderive)） |
+| `--sizes N,N,N` | — | 幅の並び。`--formats` との直積になる |
+| `--formats f,f` | — | 形式の並び |
+| `--naming TEMPLATE` | `{stem}_{width}.{ext}` | 派生のファイル名の付け方 |
+| `--manifest PATH` | — | 書いたものを列挙する JSON |
 | `--force` | | 出力先が既に存在する場合に上書きする |
 | `--dry-run` | | 書き出さずに結果だけ返す |
 
@@ -1246,7 +1432,7 @@ EXIF Orientation も適用しない。**180 度（3）や鏡像（2/4）は寸�
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "error": {
     "code": "CONSTRAINT_CONFLICT",
     "message": "確定前景と確定背景が 100 画素で重なっています（重なりの範囲 50,50 - 59,59）",
@@ -2162,7 +2348,7 @@ sRGB のまま比べると**ガンマぶんだけ暗い側へ偏る**（黒い�
 | `MODEL_DIGEST_UNEXPECTED` | `--model-path` のファイルのダイジェストが既知のモデルと違う（指定を尊重してそのまま読んだ） |
 | `CANVAS_UPSCALED` | キャンバス配置で商品を拡大した |
 | `DRY_RUN_OUTPUT_EXISTS` | `--dry-run` の出力先が既にある。本番実行には `--force` が要る |
-| `UPSCALED` | `resize` で拡大した |
+| `UPSCALED` | `resize` / 派生で元画像より大きくした |
 | `ALPHA_FLATTENED` | 出力形式が透過を保持できないので合成した |
 | `QUALITY_REDUCED` | `--max-bytes` に収めるため要求品質から品質を落とした |
 | `MAX_BYTES_UNREACHABLE` | 下限品質でも `--max-bytes` に届かなかった（要求品質のまま書いた） |
@@ -2171,6 +2357,7 @@ sRGB のまま比べると**ガンマぶんだけ暗い側へ偏る**（黒い�
 | `COLOR_PROFILE_UNSUPPORTED` | ICC が LUT 型などで sRGB へ変換できなかった |
 | `COLOR_CONVERSION_SKIPPED` | `--no-color-convert` により変換していない |
 | `COLOR_SPACE_UNCALIBRATED` | EXIF が uncalibrated で ICC も無い |
+| `MANIFEST_PARTIAL` | 一部の項目が失敗したまま `--manifest` を書いた（成功分だけが載っている） |
 
 この表は `kiri schema --json` の `warnings[]` が同じものを返す。**README を読ませる
 代わりにそれを引けばよい。**
@@ -2326,7 +2513,8 @@ x broken.jpg  失敗
 `color_convert` / `edge_threshold` /
 `step_tolerance` / `shadow_tolerance` / `shadow` / `shadow_offset` / `shadow_blur` /
 `shadow_color` / `shadow_opacity` / `seal` / `rotate` / `canvas` / `fill_ratio` /
-`format` / `quality` / `effort` / `max_bytes` / `background` / `flatten`）。
+`format` / `quality` / `effort` / `max_bytes` / `background` / `flatten` /
+`derive` / `sizes` / `formats` / `naming`）。
 
 `trimap` / `alpha_trimap` / `fg_mask` / `bg_mask` は画像のパスで、`input` と同じく
 **仕様ファイルの場所**を基準に解決する。`fg_polygons` / `bg_polygons` は `[[x1,y1,x2,y2,...], ...]` で、
@@ -2358,10 +2546,35 @@ x broken.jpg  失敗
 落とすと、その項目だけ黙って別の設定で処理され、数百点を回した後に仕上がりを
 見るまで気づけない。
 
+`derive` / `sizes` / `formats` / `naming` は項目ごとに派生を組む
+（[複数のサイズと形式](#複数のサイズと形式をまとめて書くderive)）。`derive` は
+`--derive` と同じキーを持つオブジェクトの配列で、値は数値でも文字列でも書ける。
+
+```json
+{
+  "defaults": { "sizes": [400, 800, 1600], "formats": ["avif", "jpeg"] },
+  "items": [
+    { "input": "p1.jpg", "output": "out/p1.png" },
+    { "input": "p2.jpg", "output": "out/p2.png",
+      "derive": [
+        { "width": 1600, "format": "jpeg", "quality": 82, "max_bytes": "500k", "role": "hero" },
+        { "width": 400, "format": "avif", "role": "thumb" }
+      ] }
+  ]
+}
+```
+
+`derive` と `sizes` / `formats` の同時指定は `INVALID_DERIVATION` でその項目を落とす
+（CLI と同じ排他）。未知のキーと読めない値も同じ code になる。
+
+**マニフェストは実行全体で 1 つ**なので、spec のキーではなく `kiri batch --manifest`
+で渡す。数百点が同じパスへ順に書けば、最後の 1 件だけが残る目録になってしまう。
+
 | オプション | 既定値 | 説明 |
 |---|---|---|
 | `--base-dir DIR` | 仕様ファイルの場所 | 相対パスの基準ディレクトリ |
 | `--jobs N` | CPU数 | 並列実行数 |
+| `--manifest PATH` | — | 書いたものを列挙する JSON。成功した項目だけが載る |
 | `--force` | | 全項目で上書きを許可する |
 | `--dry-run` | | 1 件も書き出さずに全項目の結果だけ返す |
 
@@ -2498,7 +2711,7 @@ sRGB へ変換するので、そこで色が転ぶことはない。
 | 4 | 処理失敗 |
 
 `--json` 指定時はエラーも JSON で stdout に返る。**code と exit code の対応は
-`kiri schema --json` の `errors[]` が返す**（44 種ある）。
+`kiri schema --json` の `errors[]` が返す**（49 種ある）。
 
 **ただし引数の書式や値域で落ちた場合は JSON が返らない。** 検証は clap が行い、
 kiri のエラー型を通らないため、`--json` を付けても **stdout は空のまま exit 2 で
@@ -2511,7 +2724,7 @@ error: invalid value 'sideways' for '--angle <ANGLE>': 'sideways' は有限な�
 ```
 
 ```json
-{ "schema_version": 1, "error": { "code": "OUTPUT_EXISTS", "message": "...", "hint": "--force を付けると上書きします" } }
+{ "schema_version": 2, "error": { "code": "OUTPUT_EXISTS", "message": "...", "hint": "--force を付けると上書きします" } }
 ```
 
 ## ドキュメント

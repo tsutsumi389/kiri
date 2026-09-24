@@ -13,6 +13,8 @@ use crate::cutout::constraints::{
 };
 use crate::cutout::{BackgroundModel, DEFAULT_EDGE_THRESHOLD, Matting, OptimizeFixed};
 use crate::image_io::OutputFormat;
+use crate::image_io::derive::{DERIVE_KEYS, DeriveSpec};
+use crate::image_io::naming::DEFAULT_TEMPLATE;
 use crate::preview::DEFAULT_PANEL;
 use crate::segment::SegmentMode;
 use crate::transform::FitMode;
@@ -248,6 +250,50 @@ pub struct OutputOpts {
     #[arg(long)]
     pub flatten: bool,
 
+    /// 書き出す派生を 1 本ずつ指定する。複数回指定できる (例 width=1600,format=jpeg,quality=82)
+    ///
+    /// ヘルプの本文は `DERIVE_HELP` に置く。キーの一覧と継承の規則は、
+    /// 指定の前に知っていないと「書いたのに効かない」に気づけない
+    #[arg(
+        long,
+        value_name = "SPEC",
+        value_parser = parse_derive,
+        conflicts_with_all = ["sizes", "formats"],
+        long_help = derive_long_help()
+    )]
+    pub derive: Vec<DeriveSpec>,
+
+    /// 幅の並び。--formats との直積で派生を組む (例 400,800,1600)
+    #[arg(
+        long,
+        value_name = "WIDTHS",
+        value_delimiter = ',',
+        value_parser = clap::value_parser!(u32).range(1..),
+        long_help = PRODUCT_HELP
+    )]
+    pub sizes: Vec<u32>,
+
+    /// 形式の並び。--sizes との直積で派生を組む (例 avif,jpeg)
+    #[arg(
+        long,
+        value_name = "FORMATS",
+        value_delimiter = ',',
+        value_parser = format_name_parser(),
+        long_help = PRODUCT_HELP
+    )]
+    pub formats: Vec<OutputFormat>,
+
+    /// 派生の名前の付け方。既定 {stem}_{width}.{ext}
+    ///
+    /// ヘルプの本文は `NAMING_HELP` に置く。置換子の綴りと、--output を
+    /// ディレクトリとして読まないことは、指定の前に知っていないと選びようがない
+    #[arg(long, value_name = "TEMPLATE", long_help = naming_long_help())]
+    pub naming: Option<String>,
+
+    /// 書いたものを列挙する JSON の出力先
+    #[arg(long, value_name = "PATH", long_help = MANIFEST_HELP)]
+    pub manifest: Option<PathBuf>,
+
     /// 出力先が既に存在する場合に上書きする
     #[arg(long)]
     pub force: bool,
@@ -255,6 +301,48 @@ pub struct OutputOpts {
     /// 書き出さずに結果だけ返す
     #[arg(long, long_help = DRY_RUN_HELP)]
     pub dry_run: bool,
+}
+
+/// `--formats` の値を読む。**候補を clap に持たせる**ために
+/// `PossibleValuesParser` を通す。
+///
+/// 自前の `value_parser` にすると `kiri schema` の `accepts` が空になり、
+/// **綴りを外したときに code 無しの exit 2 で落ちる項目の候補を、呼ぶ前に
+/// 知る手段が無くなる**。`jpg` を候補へ入れているのは `--derive` の `format` と
+/// `OutputFormat::from_name` に合わせたためで、`{ext}` の綴りとも揃う
+fn format_name_parser() -> impl clap::builder::TypedValueParser<Value = OutputFormat> {
+    use clap::builder::TypedValueParser;
+    clap::builder::PossibleValuesParser::new(["avif", "png", "jpeg", "jpg"])
+        .map(|name| OutputFormat::from_name(&name).expect("候補は from_name が読める綴りだけ"))
+}
+
+/// `k=v,k=v` を 1 本の派生指定として読む。
+///
+/// **CLI と spec は同じ関門（`DeriveSpec::set`）を通す。** 片方だけ緩いと、
+/// spec 経由でだけ綴り違いのキーが黙って無視され、数百点を書き出した後に
+/// 仕上がりで気づくことになる。
+///
+/// ここが返す誤りは clap が受けて **code 無しの exit 2** になる
+/// （`--max-bytes` の `INVALID_MAX_BYTES` と同じ前例）。spec 経由では
+/// `commands::batch` が `INVALID_DERIVATION` を被せる
+pub fn parse_derive(s: &str) -> Result<DeriveSpec, String> {
+    let mut spec = DeriveSpec::default();
+    for pair in s.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            return Err(format!(
+                "'{s}' に空の項目があります（key=value をカンマで並べてください）"
+            ));
+        }
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| format!("'{pair}' は key=value の形ではありません（例 width=1600）"))?;
+        spec.set(key.trim(), value.trim())?;
+    }
+    if spec == DeriveSpec::default() {
+        return Err("--derive に空の指定は書けません".to_string());
+    }
+    Ok(spec)
 }
 
 #[derive(Args, Debug)]
@@ -386,6 +474,92 @@ const MAX_BYTES_HELP: &str = "出力の上限バイト数。10 進の整数に�
      その数秒 × 段数が探索の後ろに足されると見ればよい。\n\
      --dry-run でも実際にエンコードするので、bytes / quality_used / attempts は\
      見積もりではなく実測値である";
+
+/// `--derive` の長いヘルプ。キーの一覧は定数から組む。
+///
+/// **AI エージェントは `--help` を読んで判断する**ので、「省いたキーが何を継ぐか」
+/// 「寸法を書かなければリサイズしないこと」「`--sizes` / `--formats` とは
+/// 混ぜられないこと」の 3 つをここで言う。どれも指定の前に知っていないと、
+/// 書いたつもりの設定が効いていないことに結果を見るまで気づけない。
+///
+/// キーの綴りを直書きしないのは `edge_threshold_help` と同じ理由である——
+/// `DERIVE_KEYS` を動かしたときにヘルプだけが古い一覧を語ると、それがそのまま
+/// 誤った指定になる。
+fn derive_long_help() -> String {
+    format!(
+        "書き出す派生を 1 本ずつ指定する。複数回指定でき、書いた順が outputs[] の順になる。\n\
+         書式は key=value をカンマで並べたもの\
+         （例 --derive 'width=1600,format=jpeg,quality=82,max_bytes=500k'）。\n\
+         指定できるキー: {}。\n\
+         width / height … 出力寸法(px)。**どちらも書かなければリサイズしない**\
+         （最終画像をそのまま書く）。片方だけなら縦横比を保つ。\n\
+         fit … 両方書いたときの当てはめ方（contain / cover、既定 contain）。\n\
+         allow_upscale … 元画像より大きくすることを許す（true / false、既定 false）。\
+         許した拡大は UPSCALED が言い、許していない拡大は UPSCALE_NOT_ALLOWED で断る。\n\
+         format … avif / png / jpeg / jpg。quality … 0-100。effort … 1-10。\
+         max_bytes … --max-bytes と同じ書式（500k など）。\n\
+         role … この派生の役目を表す自由な短い文字列。outputs[].role に出て、\
+         --naming の {{role}} で名前にも使える。\n\
+         **省いたキーは --format / --quality / --effort / --max-bytes を継ぐ。**\
+         format を省いて --format も無ければ --output の拡張子から決まる。\n\
+         --sizes / --formats とは併用できない。組み立て方が 2 つ混ざると\
+         「どちらが勝つか」という覚える規則が増えるためで、直積が欲しいなら\
+         そちらだけを使う。\n\
+         **書き始める前に全派生のパスを決めて検査する。** 同じパスになる 2 本が\
+         あれば OUTPUT_NAME_COLLISION で断り、ファイルは 1 つも書かない",
+        DERIVE_KEYS.join(" / ")
+    )
+}
+
+/// `--sizes` / `--formats` の長いヘルプ。2 つで 1 つの指定なので文面も共有する。
+const PRODUCT_HELP: &str = "--sizes と --formats の直積で派生を組む糖衣\
+     （例 --sizes 400,800,1600 --formats avif,jpeg で 6 本）。\n\
+     **並びは size が外、format が内**である——400.avif / 400.jpg / 800.avif …\
+     の順に並び、その順が outputs[] の添字（{index}）になる。\n\
+     --sizes だけなら形式は 1 つ（--format か --output の拡張子で決まったもの）、\
+     --formats だけなら幅は最終画像のまま（リサイズしない）。\n\
+     縦横比は保ち、拡大はしない。元より大きい幅を書くと UPSCALE_NOT_ALLOWED で\
+     断る——拡大が要るなら --derive の allow_upscale を使う。\n\
+     --derive とは併用できない";
+
+/// `--naming` の長いヘルプ。既定のテンプレートは定数から組む。
+///
+/// **AI エージェントは `--help` を読んで判断する**ので、「`--output` を
+/// ディレクトリとして読まないこと」をここで言い切る。ディレクトリのつもりで
+/// 渡されると、書かれる場所が指定と 1 段ずれる。
+fn naming_long_help() -> String {
+    format!(
+        "派生のファイル名の付け方。置換子は {{stem}} / {{index}} / {{width}} / \
+         {{height}} / {{ext}} / {{role}} の 6 つ。\n\
+         {{stem}} は --output のファイル名から拡張子を除いたもので、**書き出し先の\
+         ディレクトリも --output の親になる**。--output をディレクトリとしては\
+         読まない——そう読むと「出力先が既にあれば --force が要る」という \
+         OUTPUT_EXISTS の規約と両立しない。\n\
+         {{index}} は 0 起点の通し番号（outputs[] の添字と一致する）。\
+         {{width}} / {{height}} はその派生が実際に書き出す寸法。\
+         {{ext}} は形式の拡張子で avif / png / jpg（outputs[].format は従来どおり \
+         \"jpeg\" のまま）。\n\
+         {{role}} を書いたのに役目を持たない派生があれば INVALID_NAMING_TEMPLATE で\
+         断る。未知の置換子と閉じていない括弧も同じで、どれも書き始める前に断る。\n\
+         **明示したら派生が 1 本でも適用する**（予測可能性を優先した）。明示せずに\
+         派生が 2 本以上なら既定の {DEFAULT_TEMPLATE} が効き、明示せずに 1 本なら \
+         --output をそのまま使う"
+    )
+}
+
+/// `--manifest` の長いヘルプ。
+const MANIFEST_HELP: &str = "書いたものを列挙する JSON の出力先。\n\
+     { schema_version, kiri_version, items: [{ input, outputs: [...] }] } の形で、\
+     outputs[] は結果 JSON とまったく同じ要素である。\n\
+     **時刻も所要時間も入れない。** 同じ入力からは同じバイト列が出るので、\
+     成果物と並べて版管理できる。\n\
+     convert / resize / rotate / cutout では items は必ず 1 要素。batch では\
+     成功した項目 1 件につき 1 要素で、失敗した項目があれば MANIFEST_PARTIAL が\
+     「成功分だけを載せた」ことを言う。\n\
+     tmp ファイルへ書いてから rename するので、途中で失敗しても半端な JSON は\
+     残らない。書けなければ MANIFEST_WRITE_FAILED（exit 1）。\n\
+     --dry-run では書かない（1 バイトも書かない約束を崩さない）。パスが既に\
+     あれば他の出力と同じく DRY_RUN_OUTPUT_EXISTS で知らせる";
 
 /// `--dry-run` の長いヘルプ。
 ///
@@ -1035,6 +1209,13 @@ pub struct BatchArgs {
     /// 出力先が既に存在する場合に上書きする
     #[arg(long)]
     pub force: bool,
+
+    /// 書いたものを列挙する JSON の出力先
+    ///
+    /// 実行全体で 1 つ。成功した項目だけが載り、失敗した項目があれば
+    /// MANIFEST_PARTIAL が出る
+    #[arg(long, value_name = "PATH", long_help = MANIFEST_HELP)]
+    pub manifest: Option<PathBuf>,
 
     /// 1 件も書き出さずに全項目の結果だけ返す
     #[arg(long, long_help = BATCH_DRY_RUN_HELP)]

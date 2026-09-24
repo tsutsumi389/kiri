@@ -110,6 +110,8 @@ error_catalog! {
         => "結果を JSON にできなかった",
     ThreadPoolFailed = "THREAD_POOL_FAILED", General
         => "並列実行の準備に失敗した",
+    ManifestWriteFailed = "MANIFEST_WRITE_FAILED", General
+        => "マニフェストを書き出せなかった",
 
     // 引数 (exit 2)
     InvalidAngle = "INVALID_ANGLE", Argument
@@ -144,6 +146,13 @@ error_catalog! {
         => "--max-bytes の値がバイト数として読めない（0、小数、単位の綴り違い、桁あふれ）。\
             spec 経由でのみこの code で、CLI では clap が code 無しの exit 2 で断る。\
             batch は 1 件の失敗で全体を止めないので、この code が出る実行の終了コードは 4 になる",
+    InvalidDerivation = "INVALID_DERIVATION", Argument
+        => "--derive の書式か値が不正（未知のキー、読めない値、sizes / formats との同時指定）。\
+            spec 経由でのみこの code で、CLI では clap が code 無しの exit 2 で断る",
+    InvalidNamingTemplate = "INVALID_NAMING_TEMPLATE", Argument
+        => "--naming のテンプレートが不正（未知の置換子、閉じていない括弧、role を持たない派生への {role}）",
+    OutputNameCollision = "OUTPUT_NAME_COLLISION", Argument
+        => "2 つ以上の派生が同じ出力パスになる（書き始める前に断るので、成果物は 1 つも書かれない）",
     InvalidSetting = "INVALID_SETTING", Argument
         => "spec の設定値が不正（負値・nan・上限超過）",
     MissingDimension = "MISSING_DIMENSION", Argument
@@ -153,7 +162,7 @@ error_catalog! {
     OutputExists = "OUTPUT_EXISTS", Argument
         => "出力先が既に存在する。--force が要る",
     SideOutputConflict = "SIDE_OUTPUT_CONFLICT", Argument
-        => "--preview / --debug-mask のパスが本出力や互いと衝突している",
+        => "--preview / --debug-mask / --manifest のパスが本出力や互いと衝突している",
     UnknownOutputFormat = "UNKNOWN_OUTPUT_FORMAT", Argument
         => "出力形式を判別できない（拡張子、または spec の format 名）",
     SpecEmpty = "SPEC_EMPTY", Argument

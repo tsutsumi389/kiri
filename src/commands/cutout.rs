@@ -33,7 +33,19 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     let started = Instant::now();
     let format = output::resolve_format(&args.out)?;
     let overwrite_warning = output::ensure_writable(&args.out)?;
+    let manifest_warning = output::ensure_manifest_writable(
+        args.out.manifest.as_deref(),
+        args.out.force,
+        args.out.dry_run,
+    )?;
     let preview_format = check_side_outputs(args)?;
+    // **切り抜きより前に解く。** テンプレートの構文も {role} の有無も最終画像の
+    // 寸法を 1 つも見ないのに、書き出しの直前で解くと --optimize 込みで数秒〜
+    // 十数秒を回し切ってから綴り違いに気づくことになる
+    let output_plan = output::OutputPlan {
+        format,
+        naming: output::plan_naming(&args.out)?,
+    };
 
     let loaded = load::load_with(&args.input, &args.color.to_load_options())?;
     let (w, h) = (loaded.width(), loaded.height());
@@ -112,10 +124,9 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     };
     let bbox = opts.bbox;
 
-    let debug_mask = write_debug_mask(args.debug_mask.as_ref(), &result.mask)?;
-
     let mut warnings = loaded.warnings();
     warnings.extend(overwrite_warning);
+    warnings.extend(manifest_warning);
     // 指示についての警告は結果の警告より先に出す。渡したものがそのまま
     // 効いていないなら、その後の数値をどう読むかが変わる
     warnings.extend(constraint_warnings);
@@ -184,9 +195,39 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     };
     let final_image = placed.as_ref().unwrap_or(&result.image);
 
-    let (output_report, save_warnings) =
-        output::write_image(final_image, &loaded, &args.out, format)?;
+    // 付随出力は本出力の後に書かれるので、派生のパスと重なっていないかを
+    // 書き始める前に見る（`check_side_outputs` は `--output` との重なりしか
+    // 見られない——多派生のパスは最終画像の寸法が決まるまで綴れない）
+    let mut reserved = Vec::new();
+    for (path, flag) in [
+        (args.preview.as_deref(), "--preview"),
+        (args.debug_mask.as_deref(), "--debug-mask"),
+        (args.out.manifest.as_deref(), "--manifest"),
+    ] {
+        if let Some(path) = path {
+            reserved.push(output::Reserved { path, flag });
+        }
+    }
+    let (output_reports, save_warnings) =
+        output::write_images(final_image, &loaded, &args.out, &output_plan, &reserved)?;
     warnings.extend(save_warnings);
+
+    // **マスクは本出力の後に書く。** 先に書くと、命名や衝突の検査で落ちる実行でも
+    // マスクだけが残り、「どれで落ちてもファイルは 1 つも書かれない」という
+    // README の宣言が cutout でだけ破れる。マスクは `result.mask` から後でも書ける
+    let debug_mask = write_debug_mask(args.debug_mask.as_ref(), &result.mask)?;
+
+    if !args.out.dry_run {
+        if let Some(path) = args.out.manifest.as_deref() {
+            output::write_manifest(
+                path,
+                vec![crate::report::ManifestItem {
+                    input: args.input.display().to_string(),
+                    outputs: output_reports.clone(),
+                }],
+            )?;
+        }
+    }
 
     let preview = write_preview(
         args,
@@ -205,7 +246,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             width: w,
             height: h,
         },
-        outputs: vec![output_report],
+        outputs: output_reports,
         color_space: loaded.color_space.clone(),
         color_profile: loaded.color_profile.clone(),
         color_converted: loaded.color_converted,
@@ -516,9 +557,17 @@ fn place_on_canvas(
 ///
 /// プレビューの出力形式もここで確定させる。拡張子が解釈できないまま処理を
 /// 進めて最後に落ちるより、着手前に断るほうが無駄がない。
+///
+/// **`--manifest` もここで見る。** 目録は成果物と並ぶものなので、プレビューや
+/// マスクで踏み潰してよいものではない。
+///
+/// `--output` との重なりを見るのは、派生の指定が無いとき——つまり `--output`
+/// がそのまま書き出し先になるとき——だけである。多派生では実際のパスが最終画像の
+/// 寸法が決まるまで綴れないので、その検査は `output::write_images` が担う
 fn check_side_outputs(args: &CutoutArgs) -> Result<Option<OutputFormat>> {
+    let against_output = !output::has_derivations(&args.out);
     let conflict = |path: &PathBuf, flag: &str| -> Result<()> {
-        if path == &args.out.output {
+        if against_output && path == &args.out.output {
             return Err(Error::new(
                 ErrorCode::SideOutputConflict,
                 format!("{flag} と --output に同じパスは指定できません"),
@@ -528,22 +577,36 @@ fn check_side_outputs(args: &CutoutArgs) -> Result<Option<OutputFormat>> {
         output::ensure_path_writable(path, args.out.force)
     };
 
+    // 付随出力どうしの重なりも断る。3 つのうち 2 つが同じパスなら、後に書いた
+    // ほうだけが残り、結果 JSON は 2 つとも書いたと報告する
+    let side: Vec<(&PathBuf, &str)> = [
+        (args.debug_mask.as_ref(), "--debug-mask"),
+        (args.preview.as_ref(), "--preview"),
+        (args.out.manifest.as_ref(), "--manifest"),
+    ]
+    .into_iter()
+    .filter_map(|(path, flag)| path.map(|p| (p, flag)))
+    .collect();
+    for (i, (path, flag)) in side.iter().enumerate() {
+        for (other, other_flag) in &side[..i] {
+            if path == other {
+                return Err(Error::new(
+                    ErrorCode::SideOutputConflict,
+                    format!("{other_flag} と {flag} に同じパスは指定できません"),
+                ));
+            }
+        }
+    }
+
     if let Some(mask) = args.debug_mask.as_ref() {
         conflict(mask, "--debug-mask")?;
     }
-
+    // マニフェストの上書き検査は本出力と同じ規約（dry-run では警告）なので、
+    // `ensure_manifest_writable` が別に持つ。ここでは衝突だけを見る
     let Some(preview) = args.preview.as_ref() else {
         return Ok(None);
     };
     conflict(preview, "--preview")?;
-    if let Some(mask) = args.debug_mask.as_ref() {
-        if preview == mask {
-            return Err(Error::new(
-                ErrorCode::SideOutputConflict,
-                "--preview と --debug-mask に同じパスは指定できません",
-            ));
-        }
-    }
 
     // 本出力と同じ規約で拡張子から決める。--output は解釈できない拡張子を
     // エラーにするので、こちらだけ黙って PNG にすると契約が不揃いになる

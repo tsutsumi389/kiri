@@ -3,24 +3,203 @@
 //! Phase 19（--max-bytes）と Phase 20（多派生）はどちらも「エンコードして書く」を
 //! 奪い合う。先に 1 本の道へ畳み、N = 1 で ICC を付けない（`IccPolicy::None`）とき
 //! Phase 17 と同じバイト列になることを固定してから、その上へ機能を載せる。既定の
-//! `Embed` との差は iCCP / APP2 の 1 つだけで、それは `save.rs` のテストが見ている
+//! `Embed` との差は iCCP / APP2 の 1 つだけで、それは `save.rs` のテストが見ている。
+//!
+//! Phase 20 で派生が N 本になったが、**N = 1 の道は 1 バイトも変わっていない。**
+//! 指定が無ければ `DeriveSpec::default()` が 1 本だけ立ち、`resize` は `None`、
+//! パスは `--output` そのものになる。増えたのは `outputs[].role` の 1 キーだけで、
+//! それは `SCHEMA_VERSION` 2 の側で名乗る
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use image::RgbaImage;
 
 use super::save::{IccPolicy, OutputFormat, SaveOptions, encode_prepared, prepare, write_encoded};
 use crate::error::Result;
 use crate::report::{OutputReport, quality_number};
+use crate::transform::resize::{FitMode, ResizeSpec, apply as resize_apply, plan as resize_plan};
 use crate::warning::{Warning, WarningCode};
 
-/// 書き出す 1 本。
+/// 利用者が書いた 1 本ぶんの指定。**まだ何も解決していない。**
 ///
-/// 計画 7.2 が挙げた `role` / `width` / `height` / `fit` は、それを読むフェーズで足す。
-/// **読まれないフィールドを先に置くと「指定したのに効かない」が型として作れて
-/// しまう。** `max_bytes` はこの Phase 19 で読む側が揃ったので入った。寸法は
-/// Phase 20 で `transform::resize::ResizeSpec` を 1 つ足す形にする
-/// （`allow_upscale` を落とさないため）
+/// `Derivation` と分けているのは、省いたキーが `OutputOpts` の対応する値を継ぐ
+/// からである。継ぐ前の「書かなかった」を `None` として持てないと、
+/// 「`--quality 82` を書いた」と「既定の 75 が効いた」が同じ形になり、
+/// **`--derive` を 1 本だけ書いた実行が既定値を上書きしてしまう**。
+///
+/// CLI（`k=v,k=v` の文字列）と spec（JSON のオブジェクト）は同じ `set` を通る。
+/// 片方だけ緩いと、spec 経由でだけ綴り違いのキーが黙って無視される
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DeriveSpec {
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub fit: Option<FitMode>,
+    pub allow_upscale: Option<bool>,
+    pub format: Option<OutputFormat>,
+    pub quality: Option<f32>,
+    pub effort: Option<u8>,
+    pub max_bytes: Option<u64>,
+    /// この派生の役目（`{role}` と `outputs[].role` に出る自由な短い文字列）
+    pub role: Option<String>,
+}
+
+/// `--derive` と spec の `derive[]` が受け付けるキー。
+///
+/// **綴り違いの候補を出すために一覧で持つ。** 未知のキーを黙って捨てると、
+/// 指定したはずの上限や役目が効かないまま数百点が書き出される
+pub const DERIVE_KEYS: &[&str] = &[
+    "width",
+    "height",
+    "fit",
+    "allow_upscale",
+    "format",
+    "quality",
+    "effort",
+    "max_bytes",
+    "role",
+];
+
+impl DeriveSpec {
+    /// キーと値を 1 組だけ読む。**値はどちらの入口でも文字列で渡す。**
+    ///
+    /// spec の JSON は数値や真偽値で書かれるが、呼ぶ側が綴り直して渡すことで
+    /// 解釈の規則が 1 箇所になる——`max_bytes` の `"500k"` も `512000` も
+    /// CLI と同じ `parse_max_bytes` が読む。
+    ///
+    /// 返すのは `String` の誤り文面である。CLI では clap の `value_parser` が
+    /// これを受けて code 無しの exit 2 にし、spec では呼ぶ側が
+    /// `INVALID_DERIVATION` を被せる（`INVALID_MAX_BYTES` と同じ前例）
+    pub fn set(&mut self, key: &str, value: &str) -> std::result::Result<(), String> {
+        let number = |what: &str| format!("{key} には{what}を指定してください（'{value}'）");
+        // **同じキーを 2 度書いたら断る。** 黙って後勝ちにすると
+        // `--derive 'width=100,width=250'` で 250 だけが効き、「書いたのに効かない」が
+        // ここにだけ残る——未知のキーをきちんと断っているのと食い違う。
+        // JSON のオブジェクトは serde_json の時点で重複が潰れるので、塞ぐのは CLI の穴
+        if self.already_has(key) {
+            return Err(format!(
+                "{key} が 2 回指定されています（後の値だけが黙って効くのを避けるため断ります）"
+            ));
+        }
+        match key {
+            "width" => self.width = Some(dimension(value, key)?),
+            "height" => self.height = Some(dimension(value, key)?),
+            "fit" => {
+                self.fit = Some(match value.to_ascii_lowercase().as_str() {
+                    "contain" => FitMode::Contain,
+                    "cover" => FitMode::Cover,
+                    // **exact は受けない。** 縦横比を無視して枠へ変形するのは
+                    // 商品画像では事故でしかなく、`kiri resize --fit exact` という
+                    // 明示の入口が別にある
+                    _ => {
+                        return Err(format!(
+                            "fit には contain / cover を指定してください（'{value}'）"
+                        ));
+                    }
+                })
+            }
+            "allow_upscale" => {
+                self.allow_upscale = Some(match value.to_ascii_lowercase().as_str() {
+                    "true" => true,
+                    "false" => false,
+                    _ => {
+                        return Err(format!(
+                            "allow_upscale には true / false を指定してください（'{value}'）"
+                        ));
+                    }
+                })
+            }
+            "format" => {
+                self.format = Some(OutputFormat::from_name(value).ok_or_else(|| {
+                    format!("format には avif / png / jpeg / jpg を指定してください（'{value}'）")
+                })?)
+            }
+            "quality" => {
+                let q: f32 = value.parse().map_err(|_| number("数値"))?;
+                if !q.is_finite() || !(0.0..=100.0).contains(&q) {
+                    return Err(number("0 から 100 の数値"));
+                }
+                self.quality = Some(q);
+            }
+            "effort" => {
+                let e: u8 = value.parse().map_err(|_| number("1 から 10 の整数"))?;
+                if !(1..=10).contains(&e) {
+                    return Err(number("1 から 10 の整数"));
+                }
+                self.effort = Some(e);
+            }
+            "max_bytes" => self.max_bytes = Some(crate::cli::parse_max_bytes(value)?),
+            "role" => {
+                if value.is_empty() {
+                    return Err("role に空文字は指定できません".to_string());
+                }
+                // **役目の札にパスを書かせない。** `{role}` はそのまま
+                // ファイル名の一部になるので、区切りや `..` を通すと
+                // `--output` の親の外へ書ける。断るのは `naming::beside` でも
+                // 同じだが、ここで断るほうが原因（どの派生の role か）が読める
+                if value.contains('/') || value.contains('\\') || value == "." || value == ".." {
+                    return Err(format!(
+                        "role にディレクトリの区切りや '..' は指定できません（'{value}'）"
+                    ));
+                }
+                self.role = Some(value.to_string());
+            }
+            _ => {
+                return Err(format!(
+                    "'{key}' は --derive の知らないキーです（指定できるキー: {}）",
+                    DERIVE_KEYS.join(" / ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// そのキーに既に値が入っているか。**キーの綴りは `set` の `match` と同じ
+    /// 並びで持つ**——ここに書き忘れたキーだけが黙って後勝ちに戻る。
+    /// 未知のキーは `false` を返し、`set` の側の「知らないキーです」へ落とす
+    fn already_has(&self, key: &str) -> bool {
+        match key {
+            "width" => self.width.is_some(),
+            "height" => self.height.is_some(),
+            "fit" => self.fit.is_some(),
+            "allow_upscale" => self.allow_upscale.is_some(),
+            "format" => self.format.is_some(),
+            "quality" => self.quality.is_some(),
+            "effort" => self.effort.is_some(),
+            "max_bytes" => self.max_bytes.is_some(),
+            "role" => self.role.is_some(),
+            _ => false,
+        }
+    }
+
+    /// 寸法の指定があるか。**無ければリサイズしない**（最終画像そのまま）
+    pub fn resizes(&self) -> bool {
+        self.width.is_some() || self.height.is_some()
+    }
+
+    /// この派生のリサイズ指定。寸法を 1 つも書いていなければ `None`
+    pub fn resize(&self) -> Option<ResizeSpec> {
+        self.resizes().then(|| ResizeSpec {
+            width: self.width,
+            height: self.height,
+            fit: self.fit.unwrap_or(FitMode::Contain),
+            allow_upscale: self.allow_upscale.unwrap_or(false),
+        })
+    }
+}
+
+fn dimension(value: &str, key: &str) -> std::result::Result<u32, String> {
+    match value.parse::<u32>() {
+        Ok(0) | Err(_) => Err(format!(
+            "{key} には 1 以上の整数を指定してください（'{value}'）"
+        )),
+        Ok(v) => Ok(v),
+    }
+}
+
+/// 書き出す 1 本。**パスも寸法もここへ来る前に解決してある。**
+///
+/// 命名と衝突の検査を `render` より前に済ませる理由は、1 枚でも書いた後に
+/// 落ちると半端な成果物が残るためである（計画 7.2）。
 #[derive(Debug, Clone)]
 pub struct Derivation {
     /// 解決済みの書き出し先。命名や衝突の検査は render より前に済ませる
@@ -34,6 +213,15 @@ pub struct Derivation {
     /// 出力の上限バイト数。品質を梯子状に落として収める（`QUALITY_LADDER`）。
     /// `None` なら 1 回エンコードして終わりで、Phase 18 と 1 バイトも変わらない
     pub max_bytes: Option<u64>,
+    /// この派生だけのリサイズ。`None` なら最終画像をそのまま書く。
+    ///
+    /// **計画（`ResizePlan`）ではなく指定を持つ。** `plan` は寸法と指定だけの
+    /// 純関数なので、パスを決めた側と `render` が別々に呼んでも同じ答えになる。
+    /// 計画を持ち回ると「どの寸法で名前を付けたか」と「どの寸法で書いたか」が
+    /// 2 つの値になり、食い違っても型は何も言わない
+    pub resize: Option<ResizeSpec>,
+    /// この派生の役目（`--derive` の `role`）。指定が無ければ `None`
+    pub role: Option<String>,
 }
 
 impl Derivation {
@@ -45,6 +233,15 @@ impl Derivation {
             background: self.background,
             flatten: self.flatten,
             icc: self.icc,
+        }
+    }
+
+    /// この派生が実際に書き出す寸法。命名（`{width}` / `{height}`）と
+    /// `outputs[].width` が同じ 1 つの答えを引くための入口である
+    pub fn dimensions(&self, source: (u32, u32)) -> Result<(u32, u32)> {
+        match &self.resize {
+            Some(spec) => Ok(resize_plan(source, spec)?.output),
+            None => Ok(source),
         }
     }
 }
@@ -79,11 +276,23 @@ struct Encoded {
     warnings: Vec<Warning>,
 }
 
-/// 派生を順にエンコードし、`dry_run` でなければ書く。
+/// 派生を順にリサイズ・エンコードし、`dry_run` でなければ書く。
 ///
 /// **ICC はエンコーダの内側で埋まる**ので、`report.bytes` は ICC 込みの大きさで
 /// ある（Phase 19 の探索はこの値だけを見ればよい）。dry-run でもエンコードまでは
-/// 同じ道を通る。最初の失敗で止まる——部分失敗を扱うのは Phase 20 の仕事
+/// 同じ道を通る。
+///
+/// **1 本ずつ「リサイズ → エンコード → 書き出し → 解放」を回す。** リサイズ済みの
+/// 画像もバイト列も、そのイテレーションを抜けるまでしか生きていない。N 本ぶんを
+/// 同時に持つと 24.5MP × N のピークになり、**派生を増やすほど落ちやすい道具**に
+/// なる（計画 7.2 の「逐次処理して都度解放する」）。並列は batch の項目単位に任せる。
+///
+/// リサイズの要らない派生（`resize` が `None`、または計画寸法が元と同じ）では
+/// 元画像を借りる。無駄な複製をしないのは Phase 18 から変わらない約束である。
+///
+/// **最初の失敗でそこから先を書かない。** 1 入力の中の派生は部分失敗を許さない
+/// ——黙って 1 枚落とすと成果物の欠けに気づけない。部分失敗を扱うのは batch の
+/// 側（`MANIFEST_PARTIAL`）だけである
 pub fn render(
     image: &RgbaImage,
     derivations: &[Derivation],
@@ -92,12 +301,27 @@ pub fn render(
     derivations
         .iter()
         .map(|d| {
+            let plan = d
+                .resize
+                .as_ref()
+                .map(|spec| resize_plan((image.width(), image.height()), spec))
+                .transpose()?;
+            // 計画寸法が元と同じなら借りる。`apply` も同寸では複製するので、
+            // ここで分けないと「リサイズしない派生」が 1 枚ぶん余計に積む
+            let resized = match &plan {
+                Some(plan) if plan.output != (image.width(), image.height()) => {
+                    Some(resize_apply(image, plan)?)
+                }
+                _ => None,
+            };
+            let target = resized.as_ref().unwrap_or(image);
+
             let Encoded {
                 bytes,
                 quality_used,
                 attempts,
                 warnings,
-            } = encode_within_budget(image, d)?;
+            } = encode_within_budget(target, d)?;
             if !dry_run {
                 write_encoded(&d.path, &bytes)?;
             }
@@ -105,17 +329,30 @@ pub fn render(
                 report: OutputReport {
                     path: d.path.display().to_string(),
                     format: d.format.as_str().to_string(),
-                    width: image.width(),
-                    height: image.height(),
+                    width: target.width(),
+                    height: target.height(),
                     bytes: bytes.len() as u64,
                     icc: d.icc.signal(d.format),
                     quality_used: quality_used.map(quality_number),
                     attempts,
+                    role: d.role.clone(),
                 },
-                warnings,
+                // **ここを通った警告は必ず「どの派生か」を名乗る。** 1 実行で
+                // 複数の派生を書くようになった以上、`ALPHA_FLATTENED` が
+                // どの出力の話なのか分からない報告は分岐の材料にならない
+                warnings: warnings.into_iter().map(|w| tag(w, &d.path)).collect(),
             })
+            // ここで `resized` と `bytes` が落ちる。次の派生へ持ち越さない
         })
         .collect()
+}
+
+/// 派生に紐づく警告へ「どの派生か」を書き込む。
+///
+/// キーを `output` に揃えるのは、`outputs[].path` と同じ文字列を指すためである。
+/// 受け手は `warnings[].data.output` で `outputs[]` を引ける
+pub fn tag(warning: Warning, path: &Path) -> Warning {
+    warning.with_data("output", path.display().to_string())
 }
 
 /// `max_bytes` に収まるバイト列を探す。
@@ -306,6 +543,8 @@ mod tests {
             flatten: false,
             icc,
             max_bytes: None,
+            resize: None,
+            role: None,
         }
     }
 
@@ -322,6 +561,59 @@ mod tests {
             };
             image::Rgba([next(), next(), next(), 255])
         })
+    }
+
+    /// `DERIVE_KEYS` のどのキーも、2 度目の値を断る。
+    ///
+    /// **`already_has` への書き忘れはコンパイラが何も言わない。** 落ちたキーだけが
+    /// 黙って後勝ちに戻るので、一覧と突き合わせて総当たりする
+    #[test]
+    fn every_derive_key_refuses_a_second_value() {
+        let samples = [
+            ("width", "100"),
+            ("height", "100"),
+            ("fit", "cover"),
+            ("allow_upscale", "true"),
+            ("format", "png"),
+            ("quality", "50"),
+            ("effort", "3"),
+            ("max_bytes", "500k"),
+            ("role", "hero"),
+        ];
+        let covered: Vec<&str> = samples.iter().map(|(k, _)| *k).collect();
+        assert_eq!(covered, DERIVE_KEYS, "一覧に載ったキーを試していない");
+        for (key, value) in samples {
+            let mut spec = DeriveSpec::default();
+            spec.set(key, value).unwrap();
+            let err = spec.set(key, value).unwrap_err();
+            assert!(err.contains("2 回"), "{key}: {err}");
+        }
+    }
+
+    /// 後勝ちを断った側の値は残らない。
+    ///
+    /// 「書いたのに効かない」を 1 つも残さないための検査である
+    #[test]
+    fn the_first_value_survives_when_a_duplicate_is_refused() {
+        let mut spec = DeriveSpec::default();
+        spec.set("width", "100").unwrap();
+        assert!(spec.set("width", "250").is_err());
+        assert_eq!(spec.width, Some(100));
+    }
+
+    /// 役目の札にパスは書けない。`{role}` はそのままファイル名の一部になる
+    #[test]
+    fn a_role_that_spells_a_path_is_refused() {
+        for value in ["/tmp/kiri_escape_test", "../escaped", "a/b", "..", "."] {
+            let mut spec = DeriveSpec::default();
+            assert!(
+                spec.set("role", value).is_err(),
+                "通してはいけない: '{value}'"
+            );
+        }
+        let mut spec = DeriveSpec::default();
+        spec.set("role", "hero-2x").unwrap();
+        assert_eq!(spec.role.as_deref(), Some("hero-2x"));
     }
 
     fn codes(warnings: &[Warning]) -> Vec<WarningCode> {

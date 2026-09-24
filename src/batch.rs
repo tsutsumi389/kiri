@@ -97,6 +97,11 @@ pub struct ItemSettings {
     pub format: Option<String>,
     pub quality: Option<f32>,
     pub effort: Option<u8>,
+    /// 合否の条件。`--fail-on` とまったく同じ書式の文字列
+    /// （`"default,halo_ratio>0.05"`）。**読めない値は `INVALID_FAIL_ON` で
+    /// その項目を落とす**——解くのは `commands::batch` で、CLI と同じ
+    /// `FailOn::parse` を通る
+    pub fail_on: Option<String>,
     /// 出力の上限バイト数。**数値でも文字列でも書ける**（`512000` と `"500k"`）。
     ///
     /// 型を `u64` に決めないのは、エージェントが書く JSON に両方が現れるため
@@ -172,6 +177,7 @@ impl ItemSettings {
             format,
             quality,
             effort,
+            fail_on,
             max_bytes,
             background,
             flatten,
@@ -223,6 +229,7 @@ const SETTING_KEYS: &[&str] = &[
     "format",
     "quality",
     "effort",
+    "fail_on",
     "max_bytes",
     "background",
     "flatten",

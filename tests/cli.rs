@@ -8260,14 +8260,15 @@ fn schema_returns_the_whole_contract() {
     assert!(v["schema_version"].as_u64().unwrap() >= 1, "{v}");
     assert_eq!(v["kiri_version"], env!("CARGO_PKG_VERSION"));
 
-    // 出口の 5 通りが揃っている
+    // 出口が揃っている。**5 は「成果物はあるが人が見るべき」**で、
+    // 「0 以外は失敗」と読んでいる呼び出し側にとって新しい意味である
     let exits: Vec<u64> = v["exit_codes"]
         .as_array()
         .unwrap()
         .iter()
         .map(|e| e["code"].as_u64().unwrap())
         .collect();
-    assert_eq!(exits, vec![0, 1, 2, 3, 4], "{v}");
+    assert_eq!(exits, vec![0, 1, 2, 3, 4, 5], "{v}");
 
     // 説明のない code を配らない。code だけ渡されても次の一手は決まらない
     for section in ["warnings", "errors"] {
@@ -8574,8 +8575,6 @@ const PLANNED_CODES: &[&str] = &[
     "WHITE_BALANCE_SKIPPED",
     "REFLECT_CLIPPED",
     "UNKNOWN_PROFILE",
-    "INVALID_FAIL_ON",
-    "QUALITY_GATE_FAILED",
     "PROFILE_VIOLATION",
 ];
 
@@ -9274,6 +9273,19 @@ fn every_published_field_exists_in_the_result() {
         "--dry-run",
         "--json",
     ]);
+    // **`compliance` も `--fail-on` を渡したときだけ現れる。** 条件は必ず通る
+    // ものを選ぶ——`run` は成功を要求するので、ここで不合格にすると exit 5 で
+    // 落ちる（それ自体は別の検査が固定している）
+    let gated = run(&[
+        "cutout",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--dry-run",
+        "--json",
+        "--fail-on",
+        "foreground_ratio>0.99",
+    ]);
     // **`shadow` も合成したときだけ現れる。** 既定の実行で探すと「配った path が
     // 存在しない」になるので、影を足した実行も用意する（`constraints` と同じ扱い）
     let shadowed = run(&[
@@ -9335,6 +9347,7 @@ fn every_published_field_exists_in_the_result() {
                 "cutout" if path.starts_with("constraints.") => &constrained,
                 "cutout" if path.starts_with("optimize.") => &optimized,
                 "cutout" if path.starts_with("shadow.") => &shadowed,
+                "cutout" if path.starts_with("compliance.") => &gated,
                 "cutout" if path.starts_with("rotate.") => &rotated,
                 "rotate" => &turned,
                 "convert" => &converted,
@@ -10623,4 +10636,570 @@ fn the_subject_reports_the_band_it_measured() {
         // `info` の JSON には `settings` が無い（切り抜きの設定を持たない）ので、
         // 食い違いは `subject.border` と渡した値を並べて読む
     }
+}
+
+// --- --fail-on / exit 5 ---
+
+/// 前景の無い素材。**測れない指標を作るためだけに要る。**
+///
+/// `separability` / `halo_ratio` / `edge_width` / `contour_roughness` /
+/// `rim_contamination` の 5 つは、測る境界が 1 本も無ければ `null` になる。
+/// 商品を描いた素材ではその状態を作れない。
+fn featureless_scene() -> image::RgbaImage {
+    image::RgbaImage::from_pixel(200, 200, image::Rgba([250, 250, 249, 255]))
+}
+
+/// `cutout --dry-run --json` を走らせ、終了コードと結果 JSON を返す。
+///
+/// **`--dry-run` で回す。** 合否は書き出しの前に決まる値（`mask`）だけから
+/// 出るので、ファイルを書く必要が無い。
+fn cutout_gated(input: &Path, output: &Path, extra: &[&str]) -> (i32, Value) {
+    let mut args = vec![
+        "cutout",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--dry-run",
+        "--json",
+    ];
+    args.extend_from_slice(extra);
+    let out = kiri().args(&args).output().unwrap();
+    (out.status.code().unwrap(), json_stdout(&out))
+}
+
+/// `compliance.checks[]` から 1 つの指標の判定を引く。
+fn check_of<'a>(v: &'a Value, name: &str) -> &'a Value {
+    v["compliance"]["checks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("checks が配列ではない: {v}"))
+        .iter()
+        .find(|c| c["name"] == name)
+        .unwrap_or_else(|| panic!("{name} の判定が無い: {v}"))
+}
+
+/// 受け入れ基準 (a)。**各指標 × しきい値 → exit code の対応表。**
+///
+/// 7 指標それぞれを「触れる」「触れない」の 2 通りで回す。しきい値は実測値
+/// そのものから組む——`halo_ratio>=<実測>` は必ず触れ、`halo_ratio<<実測>` は
+/// 必ず触れない。**定数を書き写さない**ので、較正で指標の出方が動いても
+/// この表は意味を保つ。
+#[test]
+fn every_metric_maps_a_threshold_to_an_exit_code() {
+    let dir = fixture_dir();
+    let input = write_jpeg(
+        dir.path(),
+        "product.jpg",
+        &product_image(&ProductSpec::default()),
+    );
+    let output = dir.path().join("out.png");
+
+    let (code, base) = cutout_gated(&input, &output, &[]);
+    assert_eq!(code, 0, "素材そのものが通らない: {base}");
+
+    for metric in kiri::compliance::FAIL_ON_METRICS {
+        let measured = &base["mask"][metric];
+        let (touching, clear) = match measured {
+            Value::Bool(b) => (format!("{metric}={b}"), format!("{metric}={}", !b)),
+            Value::Number(n) => (format!("{metric}>={n}"), format!("{metric}<{n}")),
+            other => panic!("{metric} が測れていない: {other}"),
+        };
+
+        let (code, v) = cutout_gated(&input, &output, &["--fail-on", &touching]);
+        assert_eq!(code, 5, "{touching} が落ちない: {v}");
+        assert_eq!(check_of(&v, metric)["status"], "fail", "{touching}");
+        assert_eq!(v["compliance"]["passed"], Value::Bool(false), "{touching}");
+        assert_eq!(
+            v["compliance"]["code"], "QUALITY_GATE_FAILED",
+            "不合格は code を名乗る: {touching}"
+        );
+
+        let (code, v) = cutout_gated(&input, &output, &["--fail-on", &clear]);
+        assert_eq!(code, 0, "{clear} が落ちた: {v}");
+        assert_eq!(check_of(&v, metric)["status"], "pass", "{clear}");
+        assert_eq!(v["compliance"]["passed"], Value::Bool(true), "{clear}");
+        assert!(
+            v["compliance"]["code"].is_null(),
+            "合格で code を名乗っている: {v}"
+        );
+    }
+}
+
+/// 受け入れ基準 (a) の 3 通り目。**測れなかったものは合格にしない。**
+///
+/// `separability` の null は「前景が無い」、`halo_ratio` の null は「測る境界が
+/// 無い」である。0 と報告するのと同じで、黙って通すと最も知りたい失敗が
+/// 合格として返る。**`fail` とは別の名前で名乗る**——次の一手が違う
+/// （測れなかったのは素材か指示の問題で、しきい値をいじっても動かない）。
+#[test]
+fn an_unmeasurable_metric_is_rejected_under_its_own_name() {
+    let dir = fixture_dir();
+    let input = write_png(dir.path(), "flat.png", &featureless_scene());
+    let output = dir.path().join("out.png");
+
+    let (_, base) = cutout_gated(&input, &output, &[]);
+    let nullable: Vec<&str> = kiri::compliance::FAIL_ON_METRICS
+        .into_iter()
+        .filter(|m| base["mask"][m].is_null())
+        .collect();
+    assert_eq!(
+        nullable.len(),
+        5,
+        "測れない指標が 5 つ揃っていない: {}",
+        base["mask"]
+    );
+
+    for metric in nullable {
+        let spec = format!("{metric}>0.5");
+        let (code, v) = cutout_gated(&input, &output, &["--fail-on", &spec]);
+        assert_eq!(code, 5, "{spec} が通ってしまった: {v}");
+        let check = check_of(&v, metric);
+        assert_eq!(check["status"], "unmeasurable", "{spec}");
+        assert!(check["actual"].is_null(), "{spec}");
+        // 頼んだ条件は残す。測れたかどうかに関わらず事実である
+        assert_eq!(check["operator"], "gt", "{spec}");
+    }
+}
+
+/// 受け入れ基準 (b)。**`--fail-on` を指定しない実行は 1 バイトも変わらない。**
+///
+/// 既存のテストを 1 本も書き換えずに通すことが第一の証拠だが、それは
+/// 「変わっていない」を直接は言わない。ここでは同じ実行の結果 JSON を
+/// `compliance` ごと突き合わせる——所要時間だけが実行ごとに動くので落とす。
+#[test]
+fn no_fail_on_means_no_compliance_block_and_no_new_exit_code() {
+    let dir = fixture_dir();
+    let input = write_jpeg(
+        dir.path(),
+        "product.jpg",
+        &product_image(&ProductSpec::default()),
+    );
+    let output = dir.path().join("out.png");
+
+    let (code, plain) = cutout_gated(&input, &output, &[]);
+    assert_eq!(code, 0);
+    assert!(
+        plain.get("compliance").is_none(),
+        "--fail-on 無しで compliance が現れた: {plain}"
+    );
+
+    let (code, gated) = cutout_gated(&input, &output, &["--fail-on", "foreground_ratio>0.99"]);
+    assert_eq!(code, 0);
+
+    let strip = |v: &Value| {
+        let mut o = v.as_object().unwrap().clone();
+        o.remove("compliance");
+        o.remove("elapsed_ms");
+        Value::Object(o)
+    };
+    assert_eq!(
+        strip(&plain),
+        strip(&gated),
+        "--fail-on が結果の他の部分を動かしている"
+    );
+}
+
+/// 受け入れ基準 (b) の裏。**exit 5 でも結果 JSON は通常どおり全部返る。**
+///
+/// 処理は成功していて成果物も存在する。`ErrorReport` へ差し替えると
+/// 「何が不合格だったか」も「何が書かれたか」も追えなくなる——batch が
+/// 数百枚書いた後に `BatchReport` を捨てていた Phase 20 の失敗と同じ形である。
+#[test]
+fn a_rejected_cutout_still_returns_the_whole_result_json() {
+    let dir = fixture_dir();
+    let input = write_jpeg(
+        dir.path(),
+        "product.jpg",
+        &product_image(&ProductSpec::default()),
+    );
+    let written = dir.path().join("out.png");
+
+    // **本当に書かせる。** dry-run では「成果物がある」ことを確かめられない
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            written.to_str().unwrap(),
+            "--json",
+            "--fail-on",
+            "foreground_ratio>=0.0",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(5));
+    let v = json_stdout(&out);
+
+    assert!(
+        v.get("error").is_none(),
+        "エラー本体に差し替わっている: {v}"
+    );
+    assert_eq!(v["schema_version"], 2);
+    assert!(!v["outputs"].as_array().unwrap().is_empty(), "{v}");
+    assert!(!v["mask"]["foreground_ratio"].is_null(), "{v}");
+    assert!(!v["background"]["uniformity"].is_null(), "{v}");
+    assert!(written.is_file(), "成果物が書かれていない");
+    assert_eq!(
+        v["outputs"][0]["bytes"].as_u64().unwrap(),
+        std::fs::metadata(&written).unwrap().len(),
+        "報告したバイト数と実ファイルが食い違う"
+    );
+}
+
+/// `default` と明示が同じ指標に当たったら**明示が勝つ。**
+///
+/// 利用者が書いた値のほうが強い、という `--optimize` の規約と同じ。同じ指標を
+/// 2 通りに測って 2 つの答えを持たせない。
+#[test]
+fn an_explicit_threshold_beats_the_default_for_the_same_metric() {
+    let dir = fixture_dir();
+    let input = write_jpeg(
+        dir.path(),
+        "product.jpg",
+        &product_image(&ProductSpec::default()),
+    );
+    let output = dir.path().join("out.png");
+
+    let (code, v) = cutout_gated(&input, &output, &["--fail-on", "default,halo_ratio>=0.0"]);
+    assert_eq!(code, 5, "明示のほうが厳しいのに通った: {v}");
+
+    let halo: Vec<&Value> = v["compliance"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["name"] == "halo_ratio")
+        .collect();
+    assert_eq!(halo.len(), 1, "同じ指標が 2 度出ている: {v}");
+    assert_eq!(halo[0]["threshold"], 0.0);
+    assert_eq!(halo[0]["status"], "fail");
+    // `default` の他の指標はそのまま残る
+    assert!(
+        v["compliance"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["code"] == "NOT_SEPARABLE"),
+        "{v}"
+    );
+}
+
+/// `checks[]` の並びは決定的である。
+///
+/// 指定の順にも `HashMap` の順にも依らない。並びが動くと、結果の差分で
+/// 品質を見張れなくなる。
+#[test]
+fn the_compliance_checks_are_in_a_deterministic_order() {
+    let dir = fixture_dir();
+    let input = write_jpeg(
+        dir.path(),
+        "product.jpg",
+        &product_image(&ProductSpec::default()),
+    );
+    let output = dir.path().join("out.png");
+
+    let names = |v: &Value| -> Vec<String> {
+        v["compliance"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    // 指定の順を逆にしても同じ並びになる
+    let (_, a) = cutout_gated(
+        &input,
+        &output,
+        &["--fail-on", "touches_edge=true,foreground_ratio>0.99"],
+    );
+    let (_, b) = cutout_gated(
+        &input,
+        &output,
+        &["--fail-on", "foreground_ratio>0.99,touches_edge=true"],
+    );
+    assert_eq!(names(&a), names(&b));
+    assert_eq!(names(&a), vec!["foreground_ratio", "touches_edge"]);
+
+    // 2 回走らせても同じ
+    let (_, first) = cutout_gated(&input, &output, &["--fail-on", "default"]);
+    let (_, second) = cutout_gated(&input, &output, &["--fail-on", "default"]);
+    assert_eq!(first["compliance"], second["compliance"]);
+    // 並びは FAIL_ON_METRICS の順で、指標ごとにまとまっている
+    let order: Vec<usize> = names(&first)
+        .iter()
+        .map(|n| {
+            kiri::compliance::FAIL_ON_METRICS
+                .iter()
+                .position(|m| m == n)
+                .unwrap()
+        })
+        .collect();
+    assert!(order.windows(2).all(|w| w[0] <= w[1]), "{order:?}");
+}
+
+/// `--fail-on` が受ける指標と、schema が配る `mask.*` は**過不足なく一致する。**
+///
+/// 片方に足してもう片方を忘れる、を構造的に防ぐ。忘れると「JSON に出ている
+/// 値の名前を書いたのに指標ではないと断られる」という、綴りを疑いようのない
+/// 失敗になる。
+#[test]
+fn the_fail_on_metrics_are_exactly_the_published_mask_fields() {
+    let mut published: Vec<String> = fields_of(&schema_json())
+        .into_iter()
+        .filter_map(|f| f["path"].as_str().map(str::to_string))
+        .filter_map(|p| p.strip_prefix("mask.").map(str::to_string))
+        .collect();
+    let mut ours: Vec<String> = kiri::compliance::FAIL_ON_METRICS
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    published.sort();
+    ours.sort();
+    assert_eq!(ours, published);
+}
+
+/// `--fail-on default` の集合は `FATAL_CODES` ∪ `QUALITY_CODES` と一致する。
+///
+/// どちらかへ code を足したときにここが落ちる。別の集合を新しく定義すると、
+/// **`--optimize` が「きれい」と言った結果を `--fail-on default` が落とす**
+/// という食い違いが起こりうる。
+#[test]
+fn the_default_gate_is_exactly_the_fatal_and_quality_codes() {
+    let dir = fixture_dir();
+    let input = write_jpeg(
+        dir.path(),
+        "product.jpg",
+        &product_image(&ProductSpec::default()),
+    );
+    let output = dir.path().join("out.png");
+    let (_, v) = cutout_gated(&input, &output, &["--fail-on", "default"]);
+
+    let mut seen: Vec<String> = v["compliance"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["code"].as_str().unwrap().to_string())
+        .collect();
+    let mut want: Vec<String> = kiri::cutout::optimize::FATAL_CODES
+        .iter()
+        .chain(kiri::cutout::optimize::QUALITY_CODES.iter())
+        .map(|c| c.as_str().to_string())
+        .collect();
+    seen.sort();
+    want.sort();
+    assert_eq!(seen, want);
+}
+
+/// CLI 側の書式違いは clap が断る。**code は伴わない**（`INVALID_MAX_BYTES` /
+/// `INVALID_DERIVATION` と同じ前例）ので、stdout は空のままになる。
+///
+/// **入力を読む前に断る。** 切り抜きを回し切ってから綴り違いに気づく形だと、
+/// `--optimize` 込みの 1 枚で十数秒を捨てることになる。
+#[test]
+fn a_malformed_fail_on_on_the_command_line_is_refused_by_the_parser() {
+    let dir = fixture_dir();
+    let input = dir.path().join("does-not-exist.jpg");
+    let output = dir.path().join("out.png");
+
+    for spec in [
+        "",
+        "halo",
+        "halo_ration>0.1",
+        "halo_ratio",
+        "halo_ratio=0.1",
+        "halo_ratio>abc",
+        "halo_ratio>2",
+        "touches_edge>0.5",
+        "touches_edge=yes",
+        "default,default",
+        "halo_ratio>0.1,halo_ratio>0.2",
+    ] {
+        let out = kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--json",
+                "--fail-on",
+                spec,
+            ])
+            .output()
+            .unwrap();
+        // **入力が存在しないのに exit 3 にならない**ことが、引数の検査が
+        // 先に走っている証拠である
+        assert_eq!(out.status.code(), Some(2), "--fail-on '{spec}'");
+        assert!(out.stdout.is_empty(), "--fail-on '{spec}' で stdout が出た");
+        assert!(!out.stderr.is_empty(), "--fail-on '{spec}' で stderr が空");
+    }
+}
+
+/// spec 経由の書式違いは `INVALID_FAIL_ON` でその項目を落とす。
+///
+/// clap を通らないので、CLI と同じ関門（`FailOn::parse`）を `commands::batch`
+/// が通す。抜けていると、CLI では断る書き方が spec でだけ通る。
+#[test]
+fn a_malformed_fail_on_in_a_spec_is_refused_with_a_code() {
+    let dir = fixture_dir();
+    write_jpeg(
+        dir.path(),
+        "p.jpg",
+        &product_image(&ProductSpec {
+            width: 60,
+            height: 60,
+            ..Default::default()
+        }),
+    );
+
+    for written in ["\"halo\"", "\"halo_ratio\"", "\"touches_edge=yes\"", "\"\""] {
+        let spec = write_spec(
+            dir.path(),
+            &format!(
+                r#"{{"items":[{{"input":"p.jpg","output":"out/x.png","fail_on":{written}}}]}}"#
+            ),
+        );
+        let out = run_batch(&spec, &[]);
+        assert_eq!(out.status.code(), Some(4), "fail_on:{written}");
+        let v = json_stdout(&out);
+        assert_eq!(
+            v["results"][0]["error"]["code"], "INVALID_FAIL_ON",
+            "fail_on:{written}"
+        );
+    }
+}
+
+/// 受け入れ基準 (c)。**1 件でも不合格なら 5。ただし `failed > 0` の 4 が優先。**
+///
+/// 両方あるときに 5 を返すと、成果物が 1 つも無い項目があることが番号から
+/// 消え、「見れば分かる結果」として扱われてしまう。
+#[test]
+fn a_batch_rejection_exits_five_unless_something_actually_failed() {
+    let dir = fixture_dir();
+    write_jpeg(
+        dir.path(),
+        "p.jpg",
+        &product_image(&ProductSpec {
+            width: 60,
+            height: 60,
+            ..Default::default()
+        }),
+    );
+
+    // 1 件不合格 + 0 件失敗 → 5
+    let spec = write_spec(
+        dir.path(),
+        r#"{"items":[
+             {"input":"p.jpg","output":"out/a.png"},
+             {"input":"p.jpg","output":"out/b.png","fail_on":"foreground_ratio>=0.0"}
+           ]}"#,
+    );
+    let out = run_batch(&spec, &[]);
+    assert_eq!(out.status.code(), Some(5));
+    let v = json_stdout(&out);
+    assert_eq!(v["total"], 2);
+    assert_eq!(v["failed"], 0);
+    assert_eq!(v["rejected"], 1);
+    // **`succeeded` の定義は変えていない。** 不合格でも処理は成功しており、
+    // 成果物は書かれている
+    assert_eq!(v["succeeded"], 2);
+    assert_eq!(v["results"][0]["status"], "ok");
+    assert_eq!(v["results"][1]["status"], "rejected");
+    // 不合格の項目も `result` を通常どおり持つ
+    assert!(
+        !v["results"][1]["result"]["outputs"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{v}"
+    );
+    assert_eq!(
+        v["results"][1]["result"]["compliance"]["passed"],
+        Value::Bool(false)
+    );
+    assert!(dir.path().join("out/b.png").is_file(), "成果物が無い");
+
+    // 1 件失敗 + 1 件不合格 → 4
+    let spec = write_spec(
+        dir.path(),
+        r#"{"items":[
+             {"input":"missing.jpg","output":"out/c.png"},
+             {"input":"p.jpg","output":"out/d.png","fail_on":"foreground_ratio>=0.0"}
+           ]}"#,
+    );
+    let out = run_batch(&spec, &[]);
+    assert_eq!(out.status.code(), Some(4), "4 が 5 に優先する");
+    let v = json_stdout(&out);
+    assert_eq!(v["failed"], 1);
+    assert_eq!(v["rejected"], 1);
+}
+
+/// spec の `fail_on` は `defaults` から継げる。
+///
+/// **`batch.rs` の 3 箇所（`ItemSettings` / `pick!` / `SETTING_KEYS`）が
+/// 揃っていること**を実行で確かめる。綴りの揃いそのものは
+/// `setting_keys_are_exactly_what_serde_reads` が構造で守る。
+#[test]
+fn a_spec_inherits_fail_on_from_the_defaults() {
+    let dir = fixture_dir();
+    write_jpeg(
+        dir.path(),
+        "p.jpg",
+        &product_image(&ProductSpec {
+            width: 60,
+            height: 60,
+            ..Default::default()
+        }),
+    );
+    let spec = write_spec(
+        dir.path(),
+        r#"{"defaults":{"fail_on":"foreground_ratio>=0.0"},
+             "items":[
+               {"input":"p.jpg","output":"out/a.png"},
+               {"input":"p.jpg","output":"out/b.png","fail_on":"foreground_ratio>1.0"}
+             ]}"#,
+    );
+    let out = run_batch(&spec, &[]);
+    assert_eq!(out.status.code(), Some(5));
+    let v = json_stdout(&out);
+    assert_eq!(v["results"][0]["status"], "rejected", "既定が効いていない");
+    assert_eq!(v["results"][1]["status"], "ok", "項目の指定が勝つべき");
+    assert_eq!(v["rejected"], 1);
+}
+
+/// README が並べる `--fail-on default` の code は、実装の集合と一致する。
+///
+/// `the_readme_warning_table_lists_every_warning_in_the_contract` は
+/// **表**しか見ない。`default` の内訳は表とは別の場所にあるので、`FATAL_CODES` /
+/// `QUALITY_CODES` へ code を足して README を直し忘れると素通りする——そして
+/// その表は「この条件で落ちる」と名乗っているので、外れたまま読まれると
+/// **落ちない条件を落ちると信じて運用される。**
+#[test]
+fn the_readme_spells_the_real_default_gate() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
+    // `default` の説明の直後にある囲みだけを見る
+    let after = readme
+        .split_once("いずれかが出たら不合格**とする。")
+        .expect("README が default の集合を説明していない")
+        .1;
+    let block = after
+        .split_once("```")
+        .expect("囲みが無い")
+        .1
+        .split_once("```")
+        .expect("囲みが閉じていない")
+        .0;
+
+    let mut listed: Vec<String> = block
+        .split(|c: char| !(c.is_ascii_uppercase() || c == '_'))
+        .filter(|w| w.contains('_'))
+        .map(str::to_string)
+        .collect();
+    let mut want: Vec<String> = kiri::cutout::optimize::FATAL_CODES
+        .iter()
+        .chain(kiri::cutout::optimize::QUALITY_CODES.iter())
+        .map(|c| c.as_str().to_string())
+        .collect();
+    listed.sort();
+    want.sort();
+    assert_eq!(listed, want);
 }

@@ -564,6 +564,31 @@ pub struct SettingsReport {
     /// 実際にモデルが走ったか。**`auto` では指定値から読めない**——
     /// 色で解けると判断すれば走らない。`off` なら必ず false
     pub segment_ran: bool,
+    /// `--profile` を渡したときだけ出る。渡さない実行の結果 JSON は
+    /// **1 バイトも変わらない**ので `SCHEMA_VERSION` は据え置きである
+    /// （Phase 21 の `compliance` ブロックとまったく同じ論法。キーが増えるのは
+    /// 新しい指定を書いた実行だけで、既存の読み手が見ている形は動かない）。
+    ///
+    /// **ここは指定値である。** profile が実際に何を決めたかは、同じ
+    /// `settings` の `tolerance` や `canvas` ブロックが効いた値として語り、
+    /// 明示指定に上書きされた項目は `PROFILE_OVERRIDDEN` が 1 件ずつ言う
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<ProfileRef>,
+}
+
+/// 効いた profile の名乗り。
+///
+/// **版を必ず添える。** モール規格は変わるので、名前だけでは「どの時点の規格で
+/// 通ったのか」が結果から読めない。古い kiri が古い規格で合格を出すこと自体は
+/// 避けられない以上、せめて鮮度を呼び出し側が判断できる形にしておく。
+///
+/// 条件そのもの（長辺・背景・占有率と出典の URL）は載せない。**同じ表を
+/// 結果ごとに配ると、1 つの規格が実行の数だけ複製される**——表は
+/// `kiri schema` の `profiles[]` が 1 度だけ配り、ここはその表のどの行かを指す。
+#[derive(Debug, Serialize)]
+pub struct ProfileRef {
+    pub name: &'static str,
+    pub revision: &'static str,
 }
 
 /// `--optimize` が何を試し、どう選んだか。**走ったときだけ出る。**
@@ -824,6 +849,82 @@ pub struct ComplianceCheck {
     pub code: Option<WarningCode>,
 }
 
+/// `kiri lint` の結果。**既にあるファイルを規格に照らしただけで、何も書かない。**
+///
+/// 形は `ComplianceReport` を写し取っている（`ComplianceReport` の doc が
+/// 「このブロックの形は Phase 22 の `LintReport` が再利用する」と宣言している）。
+/// **同じ問い（この成果物は納品してよいか）に 2 つの形を持たせない**ためで、
+/// `--fail-on` の結果を読める受け手は lint の結果もそのまま読める。
+/// `expected` / `actual` を文字列へ畳まないのも同じ約束である。
+///
+/// `ComplianceReport` と違って `fail_on` の代わりに `profile` を持ち、検査した
+/// ファイルそのものの事実（寸法・形式・バイト数）を並べる。lint には
+/// `outputs[]` も `mask` も無いので、**ここが唯一それを言う場所**である。
+#[derive(Debug, Serialize)]
+pub struct LintReport {
+    /// 契約の版。`SCHEMA_VERSION` を参照
+    pub schema_version: u32,
+    pub input: String,
+    /// 照らした規格。条件そのものは `kiri schema` の `profiles[]` が配る
+    pub profile: ProfileRef,
+    pub file_size: u64,
+    pub width: u32,
+    pub height: u32,
+    /// 実ファイルの形式（`jpeg` / `png` / `avif`）。**拡張子ではない**
+    pub format: String,
+    /// `checks[]` が**すべて `pass`** であること。
+    ///
+    /// `fail` も `unmeasurable` も `skipped` も合格ではない
+    /// （`compliance::FailOn::evaluate` とまったく同じ定義）。**exit 5 の意味は
+    /// 「成果物はある。人が見る対象」**で、「検査できなかったので人が見てほしい」は
+    /// まさにそれである。検査できなかったものを合格として数えると、AVIF を
+    /// 渡した実行だけが構図を見ずに通り、利用者はそれを「見た上で通った」と読む
+    pub passed: bool,
+    /// 不合格のときだけ名乗る code（`PROFILE_VIOLATION`）。合格なら null。
+    ///
+    /// **exit 5 は `ErrorReport` を返さない**（検査は成功していて、対象の
+    /// ファイルもそのままある）ので、`kiri schema` の `errors[]` が配る語彙と
+    /// 結果を突き合わせられる場所がここ以外に無い。`compliance.code` と同じ役目
+    pub code: Option<ErrorCode>,
+    /// 検査したものを全部載せる（`pass` も）。落ちたものだけを載せると、
+    /// 「見た上で通った」と「そもそも見ていない」が区別できない。
+    /// **並びは決定的**で、`commands::lint::Check::ALL` の順に決まる
+    pub checks: Vec<LintCheck>,
+    pub warnings: Vec<Warning>,
+}
+
+/// 1 つの条件とその判定。
+///
+/// **キーは常に出し、当てはまらないところは `null`。** 省くと「条件が無い」と
+/// 「報告していない」が同じ形になる（`ComplianceCheck` と同じ作法）。
+#[derive(Debug, Serialize)]
+pub struct LintCheck {
+    /// 見た条件。`commands::lint::Check::as_str` の綴りで、**`checks[]` の中で
+    /// 一意である**（`ComplianceCheck::name` とはそこが違う——あちらは
+    /// `--fail-on default` が code ごとに行を出すので同じ名前が並ぶ）
+    pub name: &'static str,
+    /// `"pass"` / `"fail"` / `"unmeasurable"` / `"skipped"`。
+    ///
+    /// `unmeasurable` は「この画像では測れなかった」（主体を 1 つも検出できない）、
+    /// `skipped` は「この形式では構造的に測れない」（AVIF の画素）。**次の一手が
+    /// 違う**ので名前を分ける——前者は素材を、後者は形式を見ることになる
+    pub status: &'static str,
+    /// 規格が求めた値。条件ごとに形が違う（数値・真偽・許容する形式の配列・
+    /// 上下限の組）。**文字列へ畳まない**
+    pub expected: Option<Value>,
+    /// 実測値。**測れなかったときだけ null** で、`skipped` は必ず null になる。
+    ///
+    /// `unmeasurable` でも値が入ることがある——AVIF の `color_space` は
+    /// 「CICP は読めたが unspecified と書いてあった」という状態を取り、
+    /// **読めた事実は返しつつ合否は名乗れない**。`status` を見ずに
+    /// `actual` の有無で合否を読まないこと。
+    ///
+    /// **測り方が 1 通りでない条件は、どう測ったかをここで名乗る**
+    /// （`fill_ratio` の `source`）。並べた数だけでは、同じ 0.80 が
+    /// アルファの外接矩形から出たのか色で見立てた主体から出たのか分からない
+    pub actual: Option<Value>,
+}
+
 /// `--manifest` が書く JSON。
 ///
 /// **時刻も所要時間も入れない。** 同じ入力から同じバイト列が出ることは kiri の
@@ -877,11 +978,69 @@ pub struct SchemaReport {
     pub warnings: Vec<WarningCodeEntry>,
     /// 結果の値をどう読むか。しきい値と `null` の意味を配る
     pub fields: Vec<FieldEntry>,
+    /// `--profile` / `kiri lint` が見る規格の表。**実装の定数から組む。**
+    ///
+    /// 並びは `profile::ALL` の順で決定的。ここが無いと、不合格の根拠
+    /// （どの条件に触れたのか、その条件はどこの規定なのか）を利用者が
+    /// 辿れる場所が kiri の外に 1 つも無い
+    pub profiles: Vec<ProfileEntry>,
     /// どのサブコマンドでも受けるオプション。**コマンド側には重複させない。**
     /// clap のグローバル引数はサブコマンドの引数一覧に現れないので、
     /// 素直に組むと schema から丸ごと落ちる
     pub global_options: Vec<ArgEntry>,
     pub commands: Vec<CommandEntry>,
+}
+
+/// 1 つのプリセット。**`profile::ALL` をそのまま機械可読にしたものである。**
+///
+/// 散文（`summary`）と出典（`source`）を除いて、中身は全部 `rules` の側にある。
+/// 「長辺 500px 以上」のような条件を散文でだけ配ると、受け手はそれを正規表現で
+/// 読むか、自分で書き写すことになる——**書き写した表は必ず実装から離れる**という、
+/// `kiri schema` そのものが避けている失敗をここで作ることになる。
+#[derive(Debug, Serialize)]
+pub struct ProfileEntry {
+    pub name: &'static str,
+    /// kiri がこの規格を写し取った時点。結果 JSON の `settings.profile.revision`
+    /// と同じ値で、呼び出し側はこれで鮮度を判断する
+    pub revision: &'static str,
+    pub summary: &'static str,
+    /// この表が主張する規格の根拠。モール規格なら一次情報の URL、
+    /// kiri 自身の定義ならそう名乗る文字列
+    pub source: &'static str,
+    pub rules: ProfileRules,
+}
+
+/// **触れたら不合格**になる条件。`null` は「規定なし」で、検査もしない。
+///
+/// `null` と 0 を混ぜないのがここの要点である。`longest_side_min` の 0 は
+/// 「どんなに小さくても通る」という条件であり、「下限の規定が無い」とは別の
+/// ことを言っている——受け手が両者を区別できないと、規定の無い項目に対して
+/// 検査を書いてしまう。
+#[derive(Debug, Serialize)]
+pub struct ProfileRules {
+    pub longest_side_min: Option<u32>,
+    pub longest_side_max: Option<u32>,
+    /// 総画素数の上限。**長辺の上限とは別の条件である**——5000x5000 は
+    /// 長辺 5000 を満たしながら 25MP を超える
+    pub max_pixels: Option<u64>,
+    pub square: bool,
+    /// 要求される背景色。綴りは `background.rgb` と同じ `[r, g, b]` にしてある
+    /// ——`"#FFFFFF"` で配ると、受け手は結果の側と突き合わせる前に綴りを
+    /// 変換することになる
+    pub background: Option<[u8; 3]>,
+    pub fill_ratio_min: Option<f64>,
+    /// ファイルサイズの上限。**これ以下が合格**である（「未満」で書かれた規格は
+    /// 1 バイト引いた値がここに入る）
+    pub max_bytes: Option<u64>,
+    /// 許される出力形式。**空なら規定なし。** 綴りは `outputs[].format` と
+    /// 同じ（"jpeg" / "png" / "avif"）にしてあるので、書いたものが許容の中に
+    /// あるかを綴りの変換なしに突き合わせられる。
+    ///
+    /// **kiri が書けない形式は並べない。** 規格が TIFF を許していても、
+    /// 「この形式なら通る」と言った先に kiri の出口が無ければ案内にならない
+    pub formats: Vec<&'static str>,
+    pub alpha_allowed: bool,
+    pub srgb_required: bool,
 }
 
 #[derive(Debug, Serialize)]

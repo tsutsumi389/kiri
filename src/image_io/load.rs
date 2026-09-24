@@ -39,6 +39,20 @@ impl Default for LoadOptions {
     }
 }
 
+/// `LoadedImage::color_space` が sRGB を名乗るときの綴り。
+///
+/// **定数にしてあるのは `kiri lint` が照合するためである。** 綴りを
+/// 書き写した側が `"srgb"` と打った日から、lint は sRGB の画像を
+/// 「別の色空間を名乗っている」として落とし続ける——しかも落ちるのは
+/// 実行してみたときだけで、型は何も言わない。
+pub const COLOR_SPACE_SRGB: &str = "sRGB";
+
+/// ICC も EXIF の申告も無く、色空間を名乗っていないときの綴り。
+///
+/// **「別の色空間」ではなく「名乗っていない」である。** `kiri lint` は
+/// この 2 つを別の `status` で返す（前者は `fail`、こちらは `unmeasurable`）。
+pub const COLOR_SPACE_UNCALIBRATED: &str = "uncalibrated";
+
 pub struct LoadedImage {
     /// EXIF Orientation 適用済み・必要なら sRGB へ変換済みの RGBA 画像
     pub image: RgbaImage,
@@ -187,7 +201,7 @@ fn normalize_color(
     let Some(bytes) = icc else {
         return match exif_color_space {
             Some(0xFFFF) => ColorOutcome {
-                name: "uncalibrated".into(),
+                name: COLOR_SPACE_UNCALIBRATED.into(),
                 profile: None,
                 converted: false,
                 srgb: true,
@@ -205,7 +219,7 @@ fn normalize_color(
                 ],
             },
             _ => ColorOutcome {
-                name: "sRGB".into(),
+                name: COLOR_SPACE_SRGB.into(),
                 profile: None,
                 converted: false,
                 srgb: true,
@@ -229,7 +243,7 @@ fn normalize_color(
         // 揃えつつ、名乗りは残す。片方だけでは「sRGB と出たが、そう名乗って
         // いただけなのか実体もそうなのか」を後から追えない
         Interpretation::Srgb => ColorOutcome {
-            name: "sRGB".into(),
+            name: COLOR_SPACE_SRGB.into(),
             profile,
             converted: false,
             srgb: true,

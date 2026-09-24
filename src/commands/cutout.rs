@@ -7,6 +7,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use serde_json::{Value, json};
+
 use crate::cli::{CutoutArgs, Polygon};
 use crate::commands::output::{self, round4};
 use crate::commands::segment;
@@ -20,9 +22,11 @@ use crate::cutout::{
 use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::{IccPolicy, LoadOptions, OutputFormat, SaveOptions, load, save};
 use crate::preview::{PreviewSpec, contact_sheet};
+use crate::profile;
 use crate::report::{
     CanvasReport, ConstraintsReport, CutoutReport, Dimensions, MaskReport, OptimizeCandidate,
-    OptimizeReport, OptimizeScore, RotateReport, SCHEMA_VERSION, SettingsReport, ShadowReport,
+    OptimizeReport, OptimizeScore, ProfileRef, RotateReport, SCHEMA_VERSION, SettingsReport,
+    ShadowReport,
 };
 use crate::transform::canvas::{CanvasSpec, apply as canvas_apply, composite, plan as canvas_plan};
 use crate::transform::rotate::{self, RotateSpec};
@@ -31,6 +35,17 @@ use crate::warning::{Warning, WarningCode};
 
 pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     let started = Instant::now();
+    // **profile はここで当てる。** 設定が確定する場所が 1 つしかないのが
+    // 要点で、CLI と spec のどちらから来た指定も同じ 1 行を通る。`parse()` や
+    // `to_cutout_args` の側で当てると、上書きの事実（`PROFILE_OVERRIDDEN`）を
+    // 結果 JSON の `warnings[]` へ運ぶ道が無くなる——警告を運ぶためだけに
+    // `CutoutArgs` へ袋を足すことになり、「引数ではないもの」が 2 つ目になる
+    let mut profile_warnings = Vec::new();
+    let profiled = apply_profile(args, &mut profile_warnings);
+    // **profile を渡さない実行では複製すら起きない。** `apply_profile` が
+    // `None` を返すので、以降は受け取った `args` をそのまま読む
+    let args: &CutoutArgs = profiled.as_ref().unwrap_or(args);
+
     let format = output::resolve_format(&args.out)?;
     let overwrite_warning = output::ensure_writable(&args.out)?;
     let manifest_warning = output::ensure_manifest_writable(
@@ -124,7 +139,13 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     };
     let bbox = opts.bbox;
 
-    let mut warnings = loaded.warnings();
+    // **指定がどう解釈されたかを最初に言う。** 以降に並ぶ警告はすべて
+    // 「その設定で切り抜いた結果」についてのもので、どの設定が効いたのかを
+    // 知らずに読むと、数値の読み方そのものが変わる（指示についての警告を
+    // 結果の警告より先に出しているのと同じ理由で、profile はそれより更に前
+    // ——指示の値そのものを決めた側である）
+    let mut warnings = profile_warnings;
+    warnings.extend(loaded.warnings());
     warnings.extend(overwrite_warning);
     warnings.extend(manifest_warning);
     // 指示についての警告は結果の警告より先に出す。渡したものがそのまま
@@ -318,6 +339,14 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             // 指定値。`auto` が走らせたかどうかは次の行が言う
             segment: decision.mode.as_str(),
             segment_ran: decision.ran(),
+            // **指定値である。** profile が実際に何を決めたかは、同じ
+            // settings の他の項目と canvas ブロックが効いた値として語る。
+            // 条件そのもの（長辺・背景・占有率と出典）は載せない——同じ表が
+            // 結果の数だけ複製されるので、表は kiri schema が 1 度だけ配る
+            profile: args.profile.map(|p| ProfileRef {
+                name: p.name,
+                revision: p.revision,
+            }),
         },
         applied_bbox: bbox.map(|(x1, y1, x2, y2)| [x1, y1, x2, y2]),
         constraints: opts.constraints.as_ref().map(constraints_report),
@@ -334,6 +363,241 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         elapsed_ms: started.elapsed().as_millis(),
         warnings,
     })
+}
+
+/// profile の値を設定へ当てる。**優先順位は「明示指定 > profile > 既定」の 1 本。**
+///
+/// 返すのは当て終えた `CutoutArgs` で、`--profile` を渡していなければ `None`
+/// ——そのときは複製も起きず、結果 JSON も 1 バイト変わらない。
+///
+/// **当てるのは `write_defaults` が返した項目だけである。** 何を書くかは
+/// `profile::Rules` が唯一の定義で、ここは写し取るだけ——この関数に
+/// 「amazon なら 1600」のような数が 1 つでも現れたら、表が 2 つになっている。
+///
+/// **上書きは項目ごとに 1 件ずつ報せる。** まとめて 1 件にすると、どの指定が
+/// profile を押しのけたのかを `message` の散文から抜き直すことになる。
+fn apply_profile(args: &CutoutArgs, warnings: &mut Vec<Warning>) -> Option<CutoutArgs> {
+    let profile = args.profile?;
+    let want = profile.write_defaults();
+    let explicit = args.explicit;
+    let mut out = args.clone();
+
+    if let Some((cw, ch)) = want.canvas {
+        if explicit.canvas {
+            let used = args.canvas.map_or(Value::Null, |(w, h)| json!([w, h]));
+            warnings.extend(overridden(
+                profile,
+                "canvas",
+                "--canvas",
+                json!([cw, ch]),
+                used,
+            ));
+        } else {
+            out.canvas = Some((cw, ch));
+        }
+    }
+
+    if let Some(ratio) = want.fill_ratio {
+        if explicit.fill_ratio {
+            warnings.extend(overridden(
+                profile,
+                "fill_ratio",
+                "--fill-ratio",
+                json!(round4(ratio)),
+                json!(round4(args.fill_ratio)),
+            ));
+        } else {
+            out.fill_ratio = ratio;
+        }
+    }
+
+    // **出力先の拡張子は「形式の明示指定」として扱う。** 優先順位は
+    // `--format` > `--output` の拡張子 > profile > 既定 の 4 段になる。
+    //
+    // 拡張子を「未指定なら」の推論（＝既定の振る舞い）と読むと、優先順位の
+    // 1 本に素直に従って profile が勝ち、`-o out.png --profile amazon` が
+    // **`.png` という名前のファイルに JPEG を書く**。拡張子と中身が食い違う
+    // ファイルは `outputs[].path` が嘘をつくことになり、配信側も他のツールも
+    // 拡張子で形式を判断するので、その嘘は kiri の外まで運ばれる。
+    // **綴った名前のほうが profile より具体的な指示である**と読むのが、
+    // 「指定したのに効かない」を作らないという `cli.rs` 全体の姿勢に合う。
+    //
+    // profile の形式で書きたいなら拡張子をそちらに揃える。押しのけたことは
+    // `--format` で押しのけたときとまったく同じ `PROFILE_OVERRIDDEN` で言う
+    // ——「profile が求めた値」と「実際に効いた値」が要るという理由は、
+    // どちらが押しのけたかで 1 つも変わらない
+    if let Some(wanted) = want.format {
+        let by_flag = explicit.format.then_some(args.out.format).flatten();
+        match (by_flag, OutputFormat::from_path(&args.out.output)) {
+            (Some(used), _) => warnings.extend(overridden(
+                profile,
+                "format",
+                "--format",
+                json!(wanted.as_str()),
+                json!(used.as_str()),
+            )),
+            (None, Some(used)) => warnings.extend(overridden_by_extension(
+                profile,
+                &args.out.output,
+                wanted,
+                used,
+            )),
+            // 拡張子からも形式を読めない（`--naming` の雛形など）。
+            // ここで初めて profile が形式を決める
+            (None, None) => out.out.format = Some(wanted),
+        }
+    }
+
+    if let Some(color) = want.background {
+        if explicit.background {
+            warnings.extend(overridden(
+                profile,
+                "background",
+                "--background",
+                json!(color),
+                json!(args.out.background),
+            ));
+        } else {
+            out.out.background = color;
+        }
+    }
+
+    // `--flatten` は真偽のフラグなので、明示できるのは真だけである
+    // （`--flatten false` とは書けない）。profile が求めるのも真なので、
+    // ここが上書きとして報せることは今のところ無い——それでも分岐を
+    // 置いておくのは、**明示を黙って無視する枝を 1 つも作らない**ためで、
+    // 偽を求める規格が入った日に書き足す場所を探さずに済む
+    if let Some(flatten) = want.flatten {
+        if explicit.flatten {
+            warnings.extend(overridden(
+                profile,
+                "flatten",
+                "--flatten",
+                json!(flatten),
+                json!(args.out.flatten),
+            ));
+        } else {
+            out.out.flatten = flatten;
+        }
+    }
+
+    if let Some(bytes) = want.max_bytes {
+        if explicit.max_bytes {
+            let used = args.out.max_bytes.map_or(Value::Null, Value::from);
+            warnings.extend(overridden(
+                profile,
+                "max_bytes",
+                "--max-bytes",
+                json!(bytes),
+                used,
+            ));
+        } else {
+            out.out.max_bytes = Some(bytes);
+        }
+    }
+
+    Some(out)
+}
+
+/// 明示指定が profile の値を押しのけたことを報せる。
+///
+/// **同じ値なら黙っている。** この警告が答えているのは「profile を指定したのに
+/// 効かなかった項目はどれか」であり、同じ値に落ち着いた項目について
+/// `profile` と `used` に同じ数を並べても、読む側の次の一手は 1 つも変わらない。
+///
+/// `data` のキーは spec の綴り（`fill_ratio` / `max_bytes`）に合わせる。
+/// 結果 JSON の他のキーがすべて snake_case なので、ここだけ `--fill-ratio` と
+/// 綴ると受け手はどちらでも拾える分岐を書かされる。CLI の綴りは `message` が言う。
+///
+/// **`profile` と `used` の両方を入れる。** 片方だけでは、規格が求めた値から
+/// どれだけ外したのかを呼び出し側が測れない。
+fn overridden(
+    profile: &profile::Profile,
+    key: &str,
+    flag: &str,
+    wanted: Value,
+    used: Value,
+) -> Option<Warning> {
+    let message = format!(
+        "--profile {} は {flag} {} を求めましたが、明示した {} が効きます",
+        profile.name,
+        spell(&wanted),
+        spell(&used)
+    );
+    let hint = format!(
+        "profile の値で書くなら {flag} を外してください（規格の条件と出典は kiri schema の profiles[] にあります）"
+    );
+    overridden_with(key, wanted, used, message, hint)
+}
+
+/// 出力先の拡張子が profile の求めた形式を押しのけたことを報せる。
+///
+/// **`--format` で押しのけたときと同じ `code` / 同じ `data` の形にする。**
+/// 呼び出し側が答えたいのは「profile を指定したのに効かなかった項目はどれか」
+/// であり、押しのけた主が指定だったか綴った名前だったかで分岐を増やす理由は
+/// 無い（その違いは `message` と `hint` が言う）。
+fn overridden_by_extension(
+    profile: &profile::Profile,
+    path: &Path,
+    wanted: OutputFormat,
+    used: OutputFormat,
+) -> Option<Warning> {
+    let message = format!(
+        "--profile {} は --format {} を求めましたが、出力先 {} の拡張子が示す {} で書きます",
+        profile.name,
+        wanted.as_str(),
+        path.display(),
+        used.as_str()
+    );
+    let hint = format!(
+        "profile の形式で書くなら出力先の拡張子を .{} にしてください\
+         （拡張子と中身が食い違うファイルを作らないため、拡張子は形式の明示指定として扱います）",
+        wanted.as_str()
+    );
+    overridden_with(
+        "format",
+        json!(wanted.as_str()),
+        json!(used.as_str()),
+        message,
+        hint,
+    )
+}
+
+/// 上書き 1 件を警告へ組む。**「同じ値なら黙る」規則はここ 1 箇所にしか無い。**
+///
+/// `data` の形（`key` / `profile` / `used`）もここが決める。押しのけた主ごとに
+/// 組み立てを分けると、片方にだけキーを足したときに受け手が両方を読める分岐を
+/// 書かされる。
+fn overridden_with(
+    key: &str,
+    wanted: Value,
+    used: Value,
+    message: String,
+    hint: String,
+) -> Option<Warning> {
+    if wanted == used {
+        return None;
+    }
+    Some(
+        Warning::new(WarningCode::ProfileOverridden, message)
+            .with_hint(hint)
+            .with_data("key", key)
+            .with_data("profile", wanted)
+            .with_data("used", used),
+    )
+}
+
+/// 値を人間向けの 1 行へ綴る。
+///
+/// **文字列の引用符を外すだけ。** `Value` の `Display` は `"jpeg"` と綴るので、
+/// そのまま文へ埋めると `--format "jpeg" を求めました` になり、利用者が
+/// **引用符ごと書き写せる指定だと読む**。`data` の側は JSON のまま返るので、
+/// 機械可読な値はそちらが持つ。
+fn spell(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
 }
 
 /// 探索の記録を結果 JSON へ落とす。

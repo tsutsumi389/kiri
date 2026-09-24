@@ -92,6 +92,14 @@ pub struct ItemSettings {
     /// 切り抜いた後に時計回りへ回す角度(度)。**負値に意味がある**
     /// （反時計回り）ので、他の数値と違って 0 以上の検査は掛けない
     pub rotate: Option<f64>,
+    /// 規格の複合指定に名前を付けたもの（"amazon" など）。**未知の名前は
+    /// `UNKNOWN_PROFILE` でその項目を落とす**——解くのは `commands::batch` で、
+    /// CLI と同じ `profile::named` を通る。
+    ///
+    /// **`canvas` / `fill_ratio` / `format` / `background` / `flatten` /
+    /// `max_bytes` を書いた項目では、書いたほうが勝つ**（CLI で明示したときと
+    /// 同じ規約）。上書きが起きたら `PROFILE_OVERRIDDEN` が言う
+    pub profile: Option<String>,
     pub canvas: Option<String>,
     pub fill_ratio: Option<f64>,
     pub format: Option<String>,
@@ -172,6 +180,7 @@ impl ItemSettings {
             shadow_opacity,
             seal,
             rotate,
+            profile,
             canvas,
             fill_ratio,
             format,
@@ -224,6 +233,7 @@ const SETTING_KEYS: &[&str] = &[
     "shadow_opacity",
     "seal",
     "rotate",
+    "profile",
     "canvas",
     "fill_ratio",
     "format",

@@ -8568,14 +8568,10 @@ fn a_parser_level_failure_returns_no_json() {
 /// **実装したら必ずここから消す**——実装済みのまま残っていると下の検査が落ちる。
 /// README / design.md には許さない（エージェントが写し取る場所だから）
 const PLANNED_CODES: &[&str] = &[
-    "PROFILE_OVERRIDDEN",
-    "PROFILE_UNCHECKABLE",
     "ROTATE_AUTO_SKIPPED",
     "SET_SCALE_CLAMPED",
     "WHITE_BALANCE_SKIPPED",
     "REFLECT_CLIPPED",
-    "UNKNOWN_PROFILE",
-    "PROFILE_VIOLATION",
 ];
 
 /// ドキュメントが名指しする code は、実在する code か実在する定数のどちらかである。
@@ -9345,6 +9341,30 @@ fn every_published_field_exists_in_the_result() {
         "--fail-on",
         "foreground_ratio>0.99",
     ]);
+    // **`settings.profile` も `--profile` を渡したときだけ現れる。** 渡さない実行の
+    // 結果 JSON は `--profile` を足す前と 1 バイトも変わらない、というのが
+    // そのブロックの約束なので、`compliance.` / `optimize.` と同じく専用の実行が要る
+    let profiled = run(&[
+        "cutout",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--dry-run",
+        "--json",
+        "--profile",
+        "amazon",
+    ]);
+    // **lint の結果 JSON は `LintReport` そのもの**なので、path に接頭辞が無い
+    // （`passed` / `code` / `checks`）。`run` は成功を要求するので、**必ず通る
+    // profile を選ぶ**——不合格は exit 5 で落ちる（それ自体は別の検査が固定する）。
+    // shopify は寸法とバイト数しか規定しないので、合成した小さい JPEG は素通りする
+    let linted = run(&[
+        "lint",
+        input.to_str().unwrap(),
+        "--profile",
+        "shopify",
+        "--json",
+    ]);
     // **`shadow` も合成したときだけ現れる。** 既定の実行で探すと「配った path が
     // 存在しない」になるので、影を足した実行も用意する（`constraints` と同じ扱い）
     let shadowed = run(&[
@@ -9407,7 +9427,9 @@ fn every_published_field_exists_in_the_result() {
                 "cutout" if path.starts_with("optimize.") => &optimized,
                 "cutout" if path.starts_with("shadow.") => &shadowed,
                 "cutout" if path.starts_with("compliance.") => &gated,
+                "cutout" if path.starts_with("settings.") => &profiled,
                 "cutout" if path.starts_with("rotate.") => &rotated,
+                "lint" => &linted,
                 "rotate" => &turned,
                 "convert" => &converted,
                 "resize" => &resized,

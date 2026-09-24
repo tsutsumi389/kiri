@@ -1,3 +1,4 @@
+pub mod avif_meta;
 pub mod derive;
 pub mod heif;
 pub mod load;

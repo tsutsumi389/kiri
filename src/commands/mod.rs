@@ -2,6 +2,7 @@ pub mod batch;
 pub mod convert;
 pub mod cutout;
 pub mod info;
+pub mod lint;
 pub mod model;
 pub mod output;
 pub mod resize;

@@ -167,6 +167,10 @@ error_catalog! {
     InvalidFailOn = "INVALID_FAIL_ON", Argument
         => "--fail-on の書式か値が不正（未知の指標、演算子の綴り違い、値域外、同じ指標への二重指定）。\
             spec 経由でのみこの code で、CLI では clap が code 無しの exit 2 で断る",
+    UnknownProfile = "UNKNOWN_PROFILE", Argument
+        => "--profile の名前が表に無い（綴り違い、または kiri がまだ持っていない規格）。\
+            spec 経由でのみこの code で、CLI では clap が code 無しの exit 2 で断る。\
+            既知の名前は kiri schema の profiles[] と kiri cutout --help の --profile が配る",
     InvalidNamingTemplate = "INVALID_NAMING_TEMPLATE", Argument
         => "--naming のテンプレートが不正（未知の置換子、閉じていない括弧、role を持たない派生への {role}）",
     OutputNameCollision = "OUTPUT_NAME_COLLISION", Argument
@@ -233,6 +237,15 @@ error_catalog! {
     QualityGateFailed = "QUALITY_GATE_FAILED", Compliance
         => "--fail-on の条件に触れた。**結果 JSON は通常どおり返る**（成果物はある）。\
             この code は errors[] ではなく compliance.code に出る",
+    // `QualityGateFailed` の直後に置く。**同じ性質の code を離すと、
+    // exit 5 が 2 種類あることが表の見た目から読めなくなる。** こちらも
+    // `ErrorBody` としては返らない——`kiri lint` は検査の結果であって
+    // 失敗ではないので、結果 JSON（`LintReport`）を通常どおり返し、
+    // その `code` でこの語を名乗る
+    ProfileViolation = "PROFILE_VIOLATION", Compliance
+        => "kiri lint が --profile の条件に触れた。**結果 JSON は通常どおり返る**\
+            （検査した対象のファイルはそのまま）。この code は errors[] ではなく \
+            lint の結果 JSON の code に出る",
 }
 
 impl Serialize for ErrorCode {

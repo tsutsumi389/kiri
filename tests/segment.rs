@@ -277,7 +277,9 @@ fn model_list_publishes_everything_needed_to_fetch_it() {
         String::from_utf8_lossy(&result.stderr)
     );
     let v = json_stdout(&result);
-    assert_eq!(v["schema_version"], 1);
+    // **版は実装から引く。** 手で綴ると、契約が動いたときにここだけが
+    // 古い版を名乗る（Phase 20 で 2 へ上げたとき実際にそうなった）
+    assert_eq!(v["schema_version"], kiri::report::SCHEMA_VERSION);
     assert_eq!(v["segment_available"], cfg!(feature = "segment"));
 
     let isnet = v["models"]

@@ -106,6 +106,21 @@ pub struct ItemSettings {
     pub max_bytes: Option<serde_json::Value>,
     pub background: Option<String>,
     pub flatten: Option<bool>,
+    /// 書き出す派生の並び。各要素は `--derive` と同じキーを持つオブジェクト
+    /// （`{"width":1600,"format":"jpeg","quality":82,"max_bytes":"500k"}`）。
+    ///
+    /// **値は数値でも文字列でも読める。** `max_bytes` と同じ理由で、エージェントが
+    /// 書く JSON には両方が現れる。解くのは `commands::batch`——CLI と同じ
+    /// `DeriveSpec::set` を通し、読めない値は INVALID_DERIVATION にする。
+    ///
+    /// `sizes` / `formats` との同時指定は CLI と同じく断る
+    pub derive: Option<Vec<serde_json::Value>>,
+    /// 幅の並び。`formats` との直積で派生を組む
+    pub sizes: Option<Vec<u32>>,
+    /// 形式の並び（"avif" / "png" / "jpeg" / "jpg"）
+    pub formats: Option<Vec<String>>,
+    /// 派生のファイル名の付け方。既定は `{stem}_{width}.{ext}`
+    pub naming: Option<String>,
 }
 
 impl ItemSettings {
@@ -160,6 +175,10 @@ impl ItemSettings {
             max_bytes,
             background,
             flatten,
+            derive,
+            sizes,
+            formats,
+            naming,
         )
     }
 }
@@ -207,6 +226,10 @@ const SETTING_KEYS: &[&str] = &[
     "max_bytes",
     "background",
     "flatten",
+    "derive",
+    "sizes",
+    "formats",
+    "naming",
 ];
 const ROOT_KEYS: &[&str] = &["defaults", "items"];
 

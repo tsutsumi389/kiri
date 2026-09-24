@@ -1601,6 +1601,808 @@ fn a_malformed_budget_on_the_command_line_is_refused_by_the_parser() {
     }
 }
 
+// --- 多派生出力とマニフェスト（Phase 20）---
+
+/// 圧縮しにくいノイズ。単色だと PNG が数 KB まで縮み、リサイズも符号化も
+/// 常駐量を語らなくなる（`image_io::derive` の同名の道具と同じ理由）
+fn noisy_image(width: u32, height: u32) -> image::RgbaImage {
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    image::RgbaImage::from_fn(width, height, |_, _| {
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 33) as u8
+        };
+        image::Rgba([next(), next(), next(), 255])
+    })
+}
+
+/// 受け入れ基準 (a)。**派生が 1 本の実行は Phase 19 と 1 バイトも変わらない。**
+///
+/// ここが崩れたら設計を間違えている。既存の md5 / 決定性テスト
+/// （`convert_is_deterministic` / `png_and_jpeg_outputs_are_deterministic_with_icc`
+/// ほか 228 本）を 1 本も書き換えずに通すことが第一の証拠で、この 1 本は
+/// **`--derive` を 1 つ渡した実行も同じバイト列・同じパスになる**ことまで固定する。
+/// 「派生の仕組みを通ったかどうか」で出力が動かないのは、多派生を後から足すうえで
+/// 最も守りたい性質である
+#[test]
+fn a_single_derivation_writes_the_same_bytes_to_the_same_path() {
+    let dir = fixture_dir();
+    let input = write_jpeg(dir.path(), "p.jpg", &product_image(&ProductSpec::default()));
+
+    for ext in ["png", "jpg", "avif"] {
+        let plain = dir.path().join(format!("plain.{ext}"));
+        let derived = dir.path().join(format!("derived.{ext}"));
+        let a = convert_json(&input, &plain, &[]);
+        // role だけを足した 1 本。寸法も形式も品質も何ひとつ上書きしない
+        let b = convert_json(&input, &derived, &["--derive", "role=main"]);
+
+        assert_eq!(
+            std::fs::read(&plain).unwrap(),
+            std::fs::read(&derived).unwrap(),
+            "{ext}: 派生を 1 本渡しただけでバイト列が動いた"
+        );
+        assert_eq!(a["outputs"].as_array().unwrap().len(), 1, "{a}");
+        assert_eq!(
+            a["outputs"][0]["path"],
+            plain.to_str().unwrap(),
+            "--output がそのまま出力パスでない: {a}"
+        );
+        assert_eq!(a["outputs"][0]["role"], Value::Null, "{a}");
+        assert_eq!(b["outputs"][0]["role"], "main", "{b}");
+        for key in ["format", "width", "height", "bytes", "icc", "attempts"] {
+            assert_eq!(a["outputs"][0][key], b["outputs"][0][key], "{ext}/{key}");
+        }
+    }
+}
+
+/// 派生を増やしても、1 本目のバイト列は 1 本だけ書いたときと同じである。
+///
+/// **同じ最終画像から作る以上、隣に何本あるかで符号化が変わってはいけない。**
+/// 派生ごとにリサイズ済み画像を作り直す実装では、借りるか複製するかの分岐が
+/// ここに現れうる
+#[test]
+fn adding_derivations_does_not_disturb_the_ones_already_there() {
+    let dir = fixture_dir();
+    let input = write_jpeg(dir.path(), "p.jpg", &product_image(&ProductSpec::default()));
+    let alone = dir.path().join("alone.png");
+    let many = dir.path().join("many.png");
+
+    // 片方は幅 100 の 1 本だけ、もう片方は同じ幅を含む 3 本
+    let one = convert_json(&input, &alone, &["--sizes", "100"]);
+    let five = convert_json(&input, &many, &["--sizes", "100,80,60"]);
+    assert_eq!(five["outputs"].as_array().unwrap().len(), 3, "{five}");
+
+    let bytes =
+        |v: &Value, i: usize| std::fs::read(v["outputs"][i]["path"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        bytes(&one, 0),
+        bytes(&five, 0),
+        "隣に何本あるかで 1 本目の符号化が変わっている"
+    );
+    assert_eq!(one["outputs"][0]["bytes"], five["outputs"][0]["bytes"]);
+}
+
+/// 直積の並びは size が外・format が内で、`{index}` は `outputs[]` の添字と一致する。
+#[test]
+fn the_product_of_sizes_and_formats_keeps_size_outside() {
+    let dir = fixture_dir();
+    let input = write_jpeg(dir.path(), "p.jpg", &product_image(&ProductSpec::default()));
+    let v = convert_json(
+        &input,
+        &dir.path().join("p.png"),
+        &[
+            "--sizes",
+            "100,50",
+            "--formats",
+            "png,jpeg",
+            "--naming",
+            "{index}-{width}.{ext}",
+        ],
+    );
+    let names: Vec<String> = v["outputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| {
+            Path::new(o["path"].as_str().unwrap())
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        names,
+        ["0-100.png", "1-100.jpg", "2-50.png", "3-50.jpg"],
+        "{v}"
+    );
+    for name in &names {
+        assert!(dir.path().join(name).is_file(), "{name} が書かれていない");
+    }
+}
+
+/// 受け入れ基準 (b)。マニフェストのゴールデンと、2 回走らせたときの同一性。
+///
+/// **キーの並びまで丸ごと突き合わせる。** マニフェストは成果物と並べて版管理
+/// されうるものなので、時刻や所要時間が混ざれば毎回差分が出る。決定性を
+/// 「同じバイト列」で固定しておかないと、混ざったことに気づけない
+#[test]
+fn the_manifest_is_a_byte_for_byte_golden() {
+    let dir = fixture_dir();
+    let input = write_png(dir.path(), "p.png", &noisy_image(40, 30));
+    let output = dir.path().join("out.png");
+    let manifest = dir.path().join("m.json");
+
+    let run = || {
+        convert_json(
+            &input,
+            &output,
+            &[
+                "--sizes",
+                "20",
+                "--formats",
+                "png,jpeg",
+                "--manifest",
+                manifest.to_str().unwrap(),
+            ],
+        )
+    };
+    let report = run();
+    let first = std::fs::read(&manifest).unwrap();
+    run();
+    let second = std::fs::read(&manifest).unwrap();
+    assert_eq!(first, second, "2 回走らせて同じバイト列にならない");
+
+    let v: Value = serde_json::from_slice(&first).unwrap();
+    assert_eq!(v["schema_version"], 2);
+    assert_eq!(v["kiri_version"], env!("CARGO_PKG_VERSION"));
+    let items = v["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "convert の items は必ず 1 要素: {v}");
+    assert_eq!(items[0]["input"], input.to_str().unwrap());
+    // **結果 JSON の outputs[] とまったく同じ要素である。** 2 つの綴りを
+    // 持たせると、受け手はどちらを信じるかを決めなければならなくなる
+    assert_eq!(items[0]["outputs"], report["outputs"]);
+
+    // **キーの並びも契約である。** 書いたバイト列そのものを見る——
+    // `serde_json::Value` へ読み直すと `Map` が綴りで並べ替えてしまい、
+    // ファイルの中で何番目に出ているかは分からなくなる
+    let text = String::from_utf8(first).unwrap();
+    let mut at = 0;
+    for key in [
+        "\"path\"",
+        "\"format\"",
+        "\"width\"",
+        "\"height\"",
+        "\"bytes\"",
+        "\"icc\"",
+        "\"quality_used\"",
+        "\"attempts\"",
+        "\"role\"",
+    ] {
+        let found = text[at..]
+            .find(key)
+            .unwrap_or_else(|| panic!("{key} が順番どおりに出てこない:\n{text}"));
+        at += found + key.len();
+    }
+    // 時刻の類が 1 つも混ざっていない
+    for banned in ["elapsed", "time", "date", "generated"] {
+        assert!(!text.contains(banned), "{banned} がマニフェストに混ざった");
+    }
+}
+
+/// 受け入れ基準 (c)。**命名の衝突は書き始める前に捕まえる。**
+///
+/// 1 枚でも書いた後に落ちると半端な成果物が残り、しかも結果 JSON は返らないので
+/// 何が書けたのかを追う手段が無い。出力ディレクトリに 1 ファイルも増えていない
+/// ことまで見る
+#[test]
+fn a_name_collision_is_caught_before_anything_is_written() {
+    let dir = fixture_dir();
+    let input = write_jpeg(dir.path(), "p.jpg", &product_image(&ProductSpec::default()));
+    let out = TempDir::new().unwrap();
+    let output = out.path().join("p.jpg");
+
+    // 幅が同じ 2 本は既定のテンプレート（{stem}_{width}.{ext}）で同じ名前になる
+    for extra in [
+        vec!["--derive", "width=100", "--derive", "width=100,quality=50"],
+        // --naming が寸法も番号も持たなければ、どんな派生でも必ず潰れる
+        vec!["--sizes", "100,50", "--naming", "{stem}.{ext}"],
+    ] {
+        let mut args = vec![
+            "convert",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--json",
+        ];
+        args.extend_from_slice(&extra);
+        let result = kiri().args(&args).output().unwrap();
+        assert_eq!(result.status.code(), Some(2), "{extra:?}");
+        let v = json_stdout(&result);
+        assert_eq!(v["error"]["code"], "OUTPUT_NAME_COLLISION", "{v}");
+        assert_eq!(
+            std::fs::read_dir(out.path()).unwrap().count(),
+            0,
+            "{extra:?}: 断る前にファイルを書いている"
+        );
+    }
+}
+
+/// `--force` でも衝突は許さない。
+///
+/// 上書きの可否は「利用者の既存のファイルを壊してよいか」の話で、こちらは
+/// **1 回の実行が自分の成果物を自分で潰す**指定である。通せば結果 JSON は
+/// 2 本とも書いたと報告し、実際には後の 1 本しか残らない
+#[test]
+fn force_does_not_excuse_two_derivations_sharing_a_path() {
+    let dir = fixture_dir();
+    let input = write_jpeg(dir.path(), "p.jpg", &product_image(&ProductSpec::default()));
+    let out = kiri()
+        .args([
+            "convert",
+            input.to_str().unwrap(),
+            "-o",
+            dir.path().join("q.jpg").to_str().unwrap(),
+            "--force",
+            "--json",
+            "--derive",
+            "width=100",
+            "--derive",
+            "width=100,format=jpeg",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(json_stdout(&out)["error"]["code"], "OUTPUT_NAME_COLLISION");
+}
+
+/// 子プロセスのピーク RSS(KB)。`tests/edge_quality.rs` の `resident_kb()` と
+/// 同じ手法（`ps -o rss=`）を、走っている子へ向けたもの。
+///
+/// **同一プロセス内では測れない。** アロケータは解放したページを OS へ返さない
+/// ので、N=1 の後に N=5 を回すと「確保済みの空き」を使い回して差が 0 としか
+/// 出ない（edge_quality.rs の同じ注意書き）。新しいプロセスを毎回立てる
+fn peak_child_kb(args: &[&str]) -> i64 {
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_kiri"))
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id().to_string();
+    let mut peak = 0i64;
+    loop {
+        let sample = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+        peak = peak.max(sample);
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "{args:?} が失敗した");
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(peak > 0, "{args:?} のピークを 1 度も採れなかった");
+    peak
+}
+
+/// 受け入れ基準 (d)。**ピークメモリが派生の数に比例しない。**
+///
+/// 1 本ずつ「リサイズ → エンコード → 書き出し → 解放」を回しているかを、
+/// 外から見える唯一の形で固定する。比例する実装なら N=5 は 1 本ぶんの作業領域を
+/// 4 つ余分に抱えるので、増分は 1 本ぶんの実行全体と同じ桁になる。
+///
+/// **絶対値は書かない。** 機械によって基礎の常駐量が何倍も違ううえ、画像の
+/// 大きさを変えれば数値も動く。見るのは「増分が N=1 のピークに対して十分小さい」
+/// ことだけで、比例していれば桁で外れる。
+///
+/// # なぜ JPEG で測るか
+///
+/// **PNG の符号化はアロケータが 1 回あたり十数 MB を抱え込む。** 1400x1400 の
+/// ノイズを PNG で 5 本書くと RSS は 48MB から 95MB へ伸びるが、これは派生の
+/// 実装とは無関係で（同じ寸法の 5 本でも同じだけ伸びる）、`kiri batch` で同じ
+/// 画像を 5 件並べても同じように伸びる。ここで確かめたいのは「リサイズ済み画像と
+/// 符号化バッファを N 本ぶん同時に抱えていないか」なので、アロケータの癖が
+/// 乗らない JPEG で測る。同じ条件の JPEG では 5 本と 1 本の差が 1MB を切る
+#[test]
+fn five_derivations_do_not_cost_five_times_the_peak_memory() {
+    let dir = fixture_dir();
+    // 1 本あたりの作業領域（リサイズ済み RGBA 7.8MB + 符号化バッファ）が
+    // 基礎の常駐量に対して無視できない大きさになるようにしてある
+    let input = write_png(dir.path(), "noise.png", &noisy_image(1400, 1400));
+    let out = dir.path().join("out.jpg");
+
+    let run = |widths: &[u32]| {
+        let mut args: Vec<String> = vec![
+            "convert".into(),
+            input.display().to_string(),
+            "-o".into(),
+            out.display().to_string(),
+            "--force".into(),
+            "--naming".into(),
+            "{index}.jpg".into(),
+        ];
+        for width in widths {
+            args.push("--derive".into());
+            args.push(format!("width={width},format=jpeg"));
+        }
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        peak_child_kb(&borrowed)
+    };
+    let one = run(&[1399]);
+    let five = run(&[1399, 1398, 1397, 1396, 1395]);
+
+    assert!(
+        five - one < one / 2,
+        "派生 5 本のピーク {five}KB が 1 本 {one}KB に対して増えすぎている\
+         （比例していれば 1 本ぶんの作業領域が 4 つ積む）"
+    );
+}
+
+/// 派生に紐づく警告は、必ず `data.output` で「どの出力の話か」を名乗る。
+///
+/// **1 実行で同じ code が複数回出るようになった。** どの派生の話かが分からない
+/// 警告は分岐の材料にならないので、6 つそれぞれを実際に鳴らして確かめる。
+/// 値は `outputs[].path` と同じ文字列でなければならない——別の綴りだと、
+/// 受け手は突き合わせのために正規化を書くことになる
+#[test]
+fn every_derivation_bound_warning_names_its_output() {
+    let dir = fixture_dir();
+    let input = write_png(dir.path(), "p.png", &transparent_product(120, 120));
+    let noisy = write_png(dir.path(), "n.png", &noisy_image(80, 80));
+    let out = dir.path().join("o.png");
+
+    let bound = |v: &Value, code: &str| {
+        let paths: Vec<String> = v["outputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["path"].as_str().unwrap().to_string())
+            .collect();
+        let found: Vec<&Value> = v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|w| w["code"] == code)
+            .collect();
+        assert!(!found.is_empty(), "{code} が出ていない: {v}");
+        for w in found {
+            let named = w["data"]["output"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{code} が data.output を持たない: {w}"));
+            assert!(
+                paths.iter().any(|p| p == named),
+                "{code} の data.output '{named}' が outputs[].path のどれとも一致しない: {v}"
+            );
+        }
+    };
+
+    // ALPHA_FLATTENED — 透過を JPEG へ書く
+    bound(
+        &convert_json(&input, &out, &["--sizes", "60", "--formats", "jpeg"]),
+        "ALPHA_FLATTENED",
+    );
+    // QUALITY_REDUCED / MAX_BYTES_UNREACHABLE — 届く上限と届かない上限
+    bound(
+        &convert_json(
+            &noisy,
+            &out,
+            &[
+                "--derive",
+                "format=jpeg,max_bytes=6k",
+                "--naming",
+                "{stem}_a.{ext}",
+            ],
+        ),
+        "QUALITY_REDUCED",
+    );
+    bound(
+        &convert_json(
+            &noisy,
+            &out,
+            &[
+                "--derive",
+                "format=jpeg,max_bytes=64",
+                "--naming",
+                "{stem}_b.{ext}",
+            ],
+        ),
+        "MAX_BYTES_UNREACHABLE",
+    );
+    // UPSCALED — 派生のリサイズで拡大した
+    bound(
+        &convert_json(
+            &input,
+            &out,
+            &[
+                "--derive",
+                "width=200,allow_upscale=true",
+                "--naming",
+                "{stem}_c.{ext}",
+            ],
+        ),
+        "UPSCALED",
+    );
+    // ICC_NOT_EMBEDDED — sRGB でない画素を書いた
+    let wide = write_jpeg_with_icc(
+        dir.path(),
+        "wide.jpg",
+        &product_image(&ProductSpec {
+            width: 80,
+            height: 80,
+            ..Default::default()
+        }),
+        swapped_primaries_icc(),
+    );
+    bound(
+        &convert_json(
+            &wide,
+            &out,
+            &["--no-color-convert", "--sizes", "40,20", "--formats", "png"],
+        ),
+        "ICC_NOT_EMBEDDED",
+    );
+    // DRY_RUN_OUTPUT_EXISTS — 派生ごとに 1 回ずつ出る。**--force は付けない**
+    // （付けると知らせるものが無くなる）
+    let existing = convert_json(&input, &out, &["--sizes", "40,20", "--formats", "png"]);
+    let dry = json_stdout(
+        &kiri()
+            .args([
+                "convert",
+                input.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+                "--json",
+                "--sizes",
+                "40,20",
+                "--formats",
+                "png",
+                "--dry-run",
+            ])
+            .output()
+            .unwrap(),
+    );
+    bound(&dry, "DRY_RUN_OUTPUT_EXISTS");
+    assert_eq!(
+        warning_codes(&dry)
+            .iter()
+            .filter(|c| *c == "DRY_RUN_OUTPUT_EXISTS")
+            .count(),
+        existing["outputs"].as_array().unwrap().len(),
+        "派生ごとに 1 回ずつ出ていない: {dry}"
+    );
+}
+
+/// `--derive` と `--sizes` は構造として混ぜられない。
+///
+/// 2 つの組み立て方が同時に効くと「どちらが勝つか」という覚える規則が増える。
+/// **clap が弾くので code 無しの exit 2 になる**（`--max-bytes` の書式違いと
+/// 同じ前例で、stdout は空のまま）
+#[test]
+fn derive_and_the_product_flags_cannot_be_mixed() {
+    let dir = fixture_dir();
+    let input = write_jpeg(dir.path(), "p.jpg", &product_image(&ProductSpec::default()));
+    for other in [["--sizes", "100"], ["--formats", "png"]] {
+        let out = kiri()
+            .args([
+                "convert",
+                input.to_str().unwrap(),
+                "-o",
+                dir.path().join("q.png").to_str().unwrap(),
+                "--json",
+                "--derive",
+                "width=100",
+                other[0],
+                other[1],
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{other:?}");
+        assert!(out.stdout.is_empty(), "{other:?} で stdout が出た");
+    }
+}
+
+/// `--derive` の綴り違いと読めない値は、clap が code 無しの exit 2 で断る。
+#[test]
+fn a_malformed_derivation_on_the_command_line_is_refused_by_the_parser() {
+    let dir = fixture_dir();
+    let input = write_jpeg(dir.path(), "p.jpg", &product_image(&ProductSpec::default()));
+    for spec in [
+        "widht=100",
+        "width=0",
+        "width",
+        "quality=200",
+        "effort=0",
+        "fit=exact",
+        "format=webp",
+        "max_bytes=1.5m",
+        "",
+    ] {
+        let out = kiri()
+            .args([
+                "convert",
+                input.to_str().unwrap(),
+                "-o",
+                dir.path().join("q.png").to_str().unwrap(),
+                "--json",
+                "--derive",
+                spec,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "--derive '{spec}' が通った");
+        assert!(out.stdout.is_empty(), "--derive '{spec}' で stdout が出た");
+    }
+}
+
+/// `--naming` の綴り違いは、重い処理の前に `INVALID_NAMING_TEMPLATE` で断る。
+#[test]
+fn a_malformed_naming_template_is_refused_with_a_code() {
+    let dir = fixture_dir();
+    let input = write_jpeg(dir.path(), "p.jpg", &product_image(&ProductSpec::default()));
+    let out_dir = TempDir::new().unwrap();
+    for template in ["{stem}_{wdith}.{ext}", "{stem}.{ext", "{stem}-{role}.{ext}"] {
+        let out = kiri()
+            .args([
+                "convert",
+                input.to_str().unwrap(),
+                "-o",
+                out_dir.path().join("q.png").to_str().unwrap(),
+                "--json",
+                "--naming",
+                template,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{template}");
+        let v = json_stdout(&out);
+        assert_eq!(v["error"]["code"], "INVALID_NAMING_TEMPLATE", "{v}");
+        assert_eq!(
+            std::fs::read_dir(out_dir.path()).unwrap().count(),
+            0,
+            "{template}: 断る前にファイルを書いている"
+        );
+    }
+}
+
+/// 派生のパスが付随出力と重なったら `SIDE_OUTPUT_CONFLICT` で断る。
+#[test]
+fn a_derivation_that_lands_on_a_side_output_is_refused() {
+    let dir = fixture_dir();
+    let input = write_jpeg(dir.path(), "p.jpg", &product_image(&ProductSpec::default()));
+    let out_dir = TempDir::new().unwrap();
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            out_dir.path().join("p.png").to_str().unwrap(),
+            "--json",
+            "--naming",
+            "{stem}.{ext}",
+            "--preview",
+            out_dir.path().join("p.png").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        json_stdout(&out)["error"]["code"],
+        "SIDE_OUTPUT_CONFLICT",
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// `--manifest` は本出力と同じ上書きの規約に従い、`--dry-run` では 1 バイトも書かない。
+#[test]
+fn the_manifest_obeys_the_overwrite_rules_and_dry_run() {
+    let dir = fixture_dir();
+    let input = write_jpeg(dir.path(), "p.jpg", &product_image(&ProductSpec::default()));
+    let output = dir.path().join("out.png");
+    let manifest = dir.path().join("m.json");
+
+    // **--force を足さずに回す。** 上書きの規約そのものを見る検査なので、
+    // 検査を黙らせる指定を付けたままでは何も確かめられない
+    let run = |extra: &[&str]| -> std::process::Output {
+        let mut args = vec![
+            "convert",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--json",
+            "--manifest",
+            manifest.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        kiri().args(&args).output().unwrap()
+    };
+
+    // dry-run では書かない。まだ無いのだから警告も出ない
+    let out = run(&["--dry-run"]);
+    assert!(out.status.success());
+    assert!(!manifest.exists(), "dry-run でマニフェストを書いた");
+    assert!(!has_warning(&json_stdout(&out), "DRY_RUN_OUTPUT_EXISTS"));
+
+    let out = run(&[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(manifest.is_file());
+
+    // 既にあるなら dry-run は先に知らせる
+    let v = json_stdout(&run(&["--dry-run", "--force"]));
+    assert!(
+        !has_warning(&v, "DRY_RUN_OUTPUT_EXISTS"),
+        "--force なら知らせるものが無い: {v}"
+    );
+    std::fs::remove_file(&output).unwrap();
+    let v = json_stdout(&run(&["--dry-run"]));
+    let named: Vec<&Value> = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|w| w["code"] == "DRY_RUN_OUTPUT_EXISTS")
+        .collect();
+    assert_eq!(named.len(), 1, "本出力は消したので残るのは目録の 1 本: {v}");
+    assert_eq!(
+        named[0]["data"]["output"],
+        manifest.to_str().unwrap(),
+        "{v}"
+    );
+
+    // 本番実行は --force が無ければ断る（本出力と同じ規約）
+    let out = run(&[]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(json_stdout(&out)["error"]["code"], "OUTPUT_EXISTS");
+    assert!(run(&["--force"]).status.success(), "--force なら上書きする");
+}
+
+/// batch は失敗した項目を目録へ載せず、`MANIFEST_PARTIAL` で欠けを言う。
+///
+/// **目録だけを見て「これで全部だ」と読まれるのが最も高くつく。** 件数まで
+/// 添えて、受け手が分岐を書ける形にしてある
+#[test]
+fn a_partial_batch_says_so_in_the_manifest_warning() {
+    let dir = fixture_dir();
+    let good = write_jpeg(
+        dir.path(),
+        "good.jpg",
+        &product_image(&ProductSpec::default()),
+    );
+    let spec = dir.path().join("spec.json");
+    let manifest = dir.path().join("m.json");
+    std::fs::write(
+        &spec,
+        format!(
+            r#"{{"items":[
+                {{"input":"{}","output":"out/a.png"}},
+                {{"input":"missing.jpg","output":"out/b.png"}}
+            ]}}"#,
+            good.file_name().unwrap().to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    let out = kiri()
+        .args([
+            "batch",
+            spec.to_str().unwrap(),
+            "--json",
+            "--manifest",
+            manifest.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4), "1 件失敗したら exit 4");
+    let v = json_stdout(&out);
+    assert_eq!(v["failed"], 1, "{v}");
+    let partial: Vec<&Value> = v["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("batch が warnings を持たない: {v}"))
+        .iter()
+        .filter(|w| w["code"] == "MANIFEST_PARTIAL")
+        .collect();
+    assert_eq!(partial.len(), 1, "{v}");
+    assert_eq!(partial[0]["data"]["failed"], 1, "{v}");
+    assert_eq!(partial[0]["data"]["manifest"], manifest.to_str().unwrap());
+
+    let written: Value = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    assert_eq!(
+        written["items"].as_array().unwrap().len(),
+        1,
+        "失敗した項目が目録に載っている: {written}"
+    );
+}
+
+/// spec の `derive` / `sizes` / `formats` / `naming` が CLI と同じ関門を通る。
+#[test]
+fn a_spec_builds_derivations_through_the_same_gate() {
+    let dir = fixture_dir();
+    let input = write_jpeg(dir.path(), "p.jpg", &product_image(&ProductSpec::default()));
+    let name = input.file_name().unwrap().to_str().unwrap().to_string();
+    let spec = dir.path().join("spec.json");
+
+    let run = |body: &str| -> std::process::Output {
+        std::fs::write(&spec, body).unwrap();
+        kiri()
+            .args(["batch", spec.to_str().unwrap(), "--json", "--force"])
+            .output()
+            .unwrap()
+    };
+
+    let out = run(&format!(
+        r#"{{"items":[{{"input":"{name}","output":"out/p.png",
+             "derive":[{{"width":60,"format":"jpeg","quality":82,"max_bytes":"500k","role":"hero"}},
+                       {{"width":30,"role":"thumb"}}],
+             "naming":"{{stem}}-{{role}}.{{ext}}"}}]}}"#
+    ));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    let outputs = v["results"][0]["result"]["outputs"].as_array().unwrap();
+    assert_eq!(outputs.len(), 2, "{v}");
+    assert_eq!(outputs[0]["role"], "hero");
+    assert_eq!(outputs[0]["format"], "jpeg");
+    assert_eq!(outputs[0]["quality_used"], 82.0);
+    assert!(outputs[0]["path"].as_str().unwrap().ends_with("p-hero.jpg"));
+    assert_eq!(outputs[1]["role"], "thumb");
+    assert!(
+        outputs[1]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("p-thumb.png")
+    );
+
+    // 未知のキーと同時指定は INVALID_DERIVATION でその項目を落とす
+    for body in [
+        format!(
+            r#"{{"items":[{{"input":"{name}","output":"out/q.png","derive":[{{"widht":60}}]}}]}}"#
+        ),
+        format!(
+            r#"{{"items":[{{"input":"{name}","output":"out/q.png","derive":[{{"width":60}}],"sizes":[20]}}]}}"#
+        ),
+    ] {
+        let out = run(&body);
+        let v = json_stdout(&out);
+        assert_eq!(
+            v["results"][0]["error"]["code"], "INVALID_DERIVATION",
+            "{v}"
+        );
+    }
+}
+
+/// 成功と失敗の両方の JSON が `schema_version` 2 を名乗る。
+///
+/// **`outputs[]` が常に 1 要素という前提が崩れた版である。** 古い読み手が
+/// `outputs[0]` だけを読んで 2 本目以降を捨てるのを、版で断つ
+#[test]
+fn the_schema_version_is_two_everywhere() {
+    let dir = fixture_dir();
+    let input = write_jpeg(dir.path(), "p.jpg", &product_image(&ProductSpec::default()));
+    let ok = convert_json(&input, &dir.path().join("o.png"), &[]);
+    assert_eq!(ok["schema_version"], 2, "{ok}");
+    assert_eq!(schema_json()["schema_version"], 2);
+
+    let bad = kiri()
+        .args(["convert", "/nonexistent/nope.jpg", "-o", "x.png", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(json_stdout(&bad)["schema_version"], 2);
+}
+
 // --- エラー処理 ---
 
 #[test]
@@ -7458,19 +8260,14 @@ fn a_parser_level_failure_returns_no_json() {
 /// **実装したら必ずここから消す**——実装済みのまま残っていると下の検査が落ちる。
 /// README / design.md には許さない（エージェントが写し取る場所だから）
 const PLANNED_CODES: &[&str] = &[
-    "MANIFEST_PARTIAL",
     "PROFILE_OVERRIDDEN",
     "PROFILE_UNCHECKABLE",
     "ROTATE_AUTO_SKIPPED",
     "SET_SCALE_CLAMPED",
     "WHITE_BALANCE_SKIPPED",
     "REFLECT_CLIPPED",
-    "INVALID_DERIVATION",
-    "INVALID_NAMING_TEMPLATE",
-    "OUTPUT_NAME_COLLISION",
     "UNKNOWN_PROFILE",
     "INVALID_FAIL_ON",
-    "MANIFEST_WRITE_FAILED",
     "QUALITY_GATE_FAILED",
     "PROFILE_VIOLATION",
 ];

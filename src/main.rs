@@ -524,18 +524,23 @@ fn print_batch(report: &BatchReport) {
     for item in &report.results {
         match (&item.result, &item.error) {
             (Some(r), _) => {
-                let out = &r.outputs[0];
                 let mark = if r.warnings.is_empty() { " " } else { "!" };
-                // 行そのものにも印を付ける。サマリは数百行の後ろにあり、
-                // 途中の 1 行だけを見た目には成果物が出来ているように読める
-                println!(
-                    "{mark} {}{}  {}x{}  {}",
-                    dry_run_prefix(r.dry_run),
-                    item.output,
-                    out.width,
-                    out.height,
-                    human_bytes(out.bytes)
-                );
+                // **派生を全部並べる。** 1 本目だけを出していた頃は、
+                // `--sizes` を渡した実行で書かれたファイルの大半が画面から
+                // 消えていた。行そのものにも印を付けるのは、サマリが数百行の
+                // 後ろにあり、途中の 1 行だけを見た目には成果物が出来ている
+                // ように読めるためである。**行頭の印は項目ごとの警告を指す**
+                // ので、同じ項目の派生には同じ印が並ぶ
+                for out in &r.outputs {
+                    println!(
+                        "{mark} {}{}  {}x{}  {}",
+                        dry_run_prefix(r.dry_run),
+                        out.path,
+                        out.width,
+                        out.height,
+                        human_bytes(out.bytes)
+                    );
+                }
                 // hint も出す。単体実行では出るのに batch でだけ消えると、
                 // **同じ画像の同じ失敗が、呼び方によって回復できたりできなかったり
                 // する。** 行頭に入力名を置く体裁だけを揃えて、中身は落とさない
@@ -558,6 +563,9 @@ fn print_batch(report: &BatchReport) {
             _ => {}
         }
     }
+    // 実行全体に掛かる警告はサマリの直前に出す。項目の行に混ぜると
+    // 「どの項目の話か」に読めてしまう（`MANIFEST_PARTIAL` はどの項目の話でもない）
+    print_warnings(&report.warnings);
     println!(
         "\n{}{} 件中 {} 件成功、{} 件失敗、{} 件に警告  ({} ms)",
         dry_run_prefix(report.dry_run),

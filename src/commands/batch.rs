@@ -12,13 +12,15 @@ use crate::batch::{self, BatchItem, ItemSettings};
 use crate::cli::{
     BatchArgs, ColorOpts, CutoutArgs, OutputOpts, Polygon, SegmentOpts, parse_hex_color, parse_size,
 };
-use crate::commands::cutout;
+use crate::commands::{cutout, output};
 use crate::cutout::{BackgroundModel, CutoutOptions, DEFAULT_BORDER, Matting, OptimizeFixed};
 use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::OutputFormat;
-use crate::report::{BatchItemReport, BatchReport, ErrorBody, SCHEMA_VERSION};
+use crate::image_io::derive::DeriveSpec;
+use crate::report::{BatchItemReport, BatchReport, ErrorBody, ManifestItem, SCHEMA_VERSION};
 use crate::segment::SegmentMode;
 use crate::transform::shadow::ShadowMode;
+use crate::warning::{Warning, WarningCode};
 
 pub fn run(args: &BatchArgs) -> Result<BatchReport> {
     let started = Instant::now();
@@ -68,6 +70,8 @@ pub fn run(args: &BatchArgs) -> Result<BatchReport> {
         .filter(|r| r.result.as_ref().is_some_and(|c| !c.warnings.is_empty()))
         .count();
 
+    let warnings = write_manifest(args, &results, failed)?;
+
     Ok(BatchReport {
         schema_version: SCHEMA_VERSION,
         spec: args.spec.display().to_string(),
@@ -76,9 +80,64 @@ pub fn run(args: &BatchArgs) -> Result<BatchReport> {
         failed,
         with_warnings,
         dry_run: args.dry_run,
+        warnings,
         elapsed_ms: started.elapsed().as_millis(),
         results,
     })
+}
+
+/// 実行全体で 1 つのマニフェストを書く。
+///
+/// **成功した項目だけを載せる。** batch は 1 件の失敗で全体を止めない規約なので、
+/// 失敗を「書いたもの」の目録へ混ぜようがない。かわりに `MANIFEST_PARTIAL` が
+/// 「欠けている」ことを言う——目録だけを見て「これで全部だ」と読まれるのが
+/// 最も高くつく誤りで、件数（`data.failed`）まで添えて分岐できる形にする。
+///
+/// `--dry-run` では 1 バイトも書かない。書く前の検査は項目ごとの
+/// `ensure_manifest_writable` ではなくここが担う——項目は自分の `--manifest` を
+/// 持たないためである
+fn write_manifest(
+    args: &BatchArgs,
+    results: &[BatchItemReport],
+    failed: usize,
+) -> Result<Vec<Warning>> {
+    let Some(path) = args.manifest.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let mut warnings: Vec<Warning> = Vec::new();
+    warnings.extend(output::ensure_manifest_writable(
+        Some(path),
+        args.force,
+        args.dry_run,
+    )?);
+    if failed > 0 {
+        warnings.push(
+            Warning::new(
+                WarningCode::ManifestPartial,
+                format!(
+                    "{failed} 件が失敗したため、成功した {} 件だけをマニフェストに載せました",
+                    results.len() - failed
+                ),
+            )
+            .with_hint("失敗した項目は results[] の status が error のものです")
+            .with_data("failed", failed)
+            .with_data("manifest", path.display().to_string()),
+        );
+    }
+    if args.dry_run {
+        return Ok(warnings);
+    }
+    let items = results
+        .iter()
+        .filter_map(|r| {
+            r.result.as_ref().map(|c| ManifestItem {
+                input: r.input.clone(),
+                outputs: c.outputs.clone(),
+            })
+        })
+        .collect();
+    output::write_manifest(path, items)?;
+    Ok(warnings)
 }
 
 /// 仕様の 1 項目を cutout の引数へ落とす。
@@ -125,6 +184,21 @@ fn to_cutout_args(
         .unwrap_or([255, 255, 255]);
 
     let max_bytes = max_bytes(settings.max_bytes.as_ref())?;
+
+    // **排他は CLI と同じ。** 2 つの組み立て方が混ざると「どちらが勝つか」と
+    // いう覚える規則が増える。clap は `--derive` と `--sizes` を構造として
+    // 弾くので、spec でも同じ形を断っておかないと片方だけが緩くなる
+    if settings.derive.is_some() && (settings.sizes.is_some() || settings.formats.is_some()) {
+        return Err(Error::new(
+            ErrorCode::InvalidDerivation,
+            "derive と sizes / formats は同時に指定できません",
+        )
+        .with_hint(
+            "直積が欲しいなら sizes / formats だけを、1 本ずつ書くなら derive だけを使ってください",
+        ));
+    }
+    let derive = derive(settings.derive.as_deref())?;
+    let formats = formats(settings.formats.as_deref())?;
 
     let seal = capped(settings.seal, 1, crate::cli::MAX_SEAL, "seal")?;
     let cleanup = capped(settings.cleanup, 2, crate::cli::MAX_CLEANUP, "cleanup")?;
@@ -223,10 +297,86 @@ fn to_cutout_args(
             max_bytes,
             background,
             flatten: settings.flatten.unwrap_or(false),
+            derive,
+            sizes: settings.sizes.clone().unwrap_or_default(),
+            formats,
+            naming: settings.naming.clone(),
+            // **マニフェストは項目ごとではなく実行全体で 1 つ。** 数百点が
+            // 同じパスへ順に書けば、最後の 1 件だけが残る目録になる。
+            // spec のキーにもしていないのはそのためで、入口は
+            // `kiri batch --manifest` だけにしてある
+            manifest: None,
             force,
             dry_run,
         },
     })
+}
+
+/// spec の `derive[]` を 1 本ずつ解く。
+///
+/// **CLI と同じ関門（`DeriveSpec::set`）を通す。** 値は JSON の素の型
+/// （数値・文字列・真偽値）で書かれるので、綴り直してから渡す——そうすることで
+/// `"500k"` も `512000` も CLI とまったく同じ規則で読まれる。
+///
+/// 断るときの code は `INVALID_DERIVATION` である。`INVALID_SETTING` に
+/// まとめないのは、**直し方が他の設定と違う**ためで、`INVALID_MAX_BYTES` を
+/// 分けたのと同じ理由になる
+fn derive(values: Option<&[serde_json::Value]>) -> Result<Vec<DeriveSpec>> {
+    let invalid = |message: String| {
+        Error::new(ErrorCode::InvalidDerivation, message).with_hint(
+            "derive は [{\"width\":1600,\"format\":\"jpeg\"}] のようなオブジェクトの配列です",
+        )
+    };
+    values
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .map(|(i, value)| {
+            let object = value
+                .as_object()
+                .ok_or_else(|| invalid(format!("derive[{i}] はオブジェクトではありません")))?;
+            let mut spec = DeriveSpec::default();
+            for (key, raw) in object {
+                let spelled = match raw {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    serde_json::Value::Bool(b) => b.to_string(),
+                    other => {
+                        return Err(invalid(format!(
+                            "derive[{i}].{key} を値として読めません（{other} が指定されました）"
+                        )));
+                    }
+                };
+                spec.set(key, &spelled)
+                    .map_err(|e| invalid(format!("derive[{i}]: {e}")))?;
+            }
+            if spec == DeriveSpec::default() {
+                return Err(invalid(format!("derive[{i}] が空です")));
+            }
+            Ok(spec)
+        })
+        .collect()
+}
+
+/// spec の `formats` を形式の並びへ落とす。
+///
+/// 綴り違いの code は `format` と同じ `UNKNOWN_OUTPUT_FORMAT` にする。
+/// **直し方が同じ種類の誤り**——避けるべきは「どの形式が書けるか」を 2 つの
+/// code で言うことで、受け手はそのどちらにも同じ分岐を書くことになる
+fn formats(names: Option<&[String]>) -> Result<Vec<OutputFormat>> {
+    names
+        .unwrap_or_default()
+        .iter()
+        .map(|name| {
+            OutputFormat::from_name(name).ok_or_else(|| {
+                Error::new(
+                    ErrorCode::UnknownOutputFormat,
+                    format!("formats に未対応の形式 '{name}' があります"),
+                )
+                .with_hint("avif / png / jpeg / jpg のいずれかを指定してください")
+            })
+        })
+        .collect()
 }
 
 /// spec の `matting` を解き方へ落とす。

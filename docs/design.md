@@ -3101,7 +3101,7 @@ AI エージェントが `--allow-upscale` を付けるか元素材を見直す�
 エラー時も `--json` 指定時は JSON で返す。
 
 ```json
-{ "schema_version": 1, "error": { "code": "NO_FOREGROUND", "message": "...", "hint": "..." } }
+{ "schema_version": 2, "error": { "code": "NO_FOREGROUND", "message": "...", "hint": "..." } }
 ```
 
 ## 6. AIエージェントとの分担

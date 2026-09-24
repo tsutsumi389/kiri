@@ -64,6 +64,23 @@ impl OutputFormat {
         self.effective_quality(0.0).is_some()
     }
 
+    /// ファイル名に付ける拡張子。**`as_str()` とは別物である。**
+    ///
+    /// `as_str()` は報告の `outputs[].format` に出る名乗りで、JPEG は `"jpeg"`。
+    /// 一方ファイル名の慣習は `.jpg` なので、`--naming` の `{ext}` はこちらを使う。
+    /// 2 つが食い違って見えるのは今日の `--output out.jpg` も同じで
+    /// （`format` は `"jpeg"` を返している）、**新しい不揃いを作ってはいない**。
+    ///
+    /// `from_path(extension())` が必ず自分へ戻ることは
+    /// `the_extension_round_trips_through_from_path` が固定する
+    pub fn extension(self) -> &'static str {
+        match self {
+            OutputFormat::Avif => "avif",
+            OutputFormat::Png => "png",
+            OutputFormat::Jpeg => "jpg",
+        }
+    }
+
     /// 名前から出力形式を得る。仕様ファイルの "format" 用。
     pub fn from_name(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
@@ -390,6 +407,25 @@ mod tests {
         );
         assert_eq!(OutputFormat::from_path(Path::new("a.webp")), None);
         assert_eq!(OutputFormat::from_path(Path::new("noext")), None);
+    }
+
+    /// `{ext}` で綴った拡張子は、読み戻すと同じ形式になる。
+    ///
+    /// **ここが割れると `--naming` が嘘のファイル名を作る。** `{ext}` を
+    /// `as_str()` から取ると JPEG が `.jpeg` になり、`--output` の拡張子から
+    /// 形式を決める既存の規約と綴りが揃わない
+    #[test]
+    fn the_extension_round_trips_through_from_path() {
+        for format in [OutputFormat::Avif, OutputFormat::Png, OutputFormat::Jpeg] {
+            let name = format!("out.{}", format.extension());
+            assert_eq!(
+                OutputFormat::from_path(Path::new(&name)),
+                Some(format),
+                "{name}"
+            );
+        }
+        assert_eq!(OutputFormat::Jpeg.extension(), "jpg", "慣習は .jpg");
+        assert_eq!(OutputFormat::Jpeg.as_str(), "jpeg", "名乗りは jpeg のまま");
     }
 
     #[test]

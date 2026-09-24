@@ -90,7 +90,9 @@ warning_catalog! {
     CanvasUpscaled = "CANVAS_UPSCALED"
         => "キャンバス配置で商品を拡大した",
     Upscaled = "UPSCALED"
-        => "resize で元画像より大きくした",
+        => "resize / 派生で元画像より大きくした",
+    ManifestPartial = "MANIFEST_PARTIAL"
+        => "一部の項目が失敗したままマニフェストを書いた",
     AlphaFlattened = "ALPHA_FLATTENED"
         => "出力形式が透過を保持できないので背景色で合成した",
     QualityReduced = "QUALITY_REDUCED"

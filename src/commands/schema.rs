@@ -726,10 +726,18 @@ fn fields() -> Vec<FieldEntry> {
                  --output そのものになる。順序は指定した順で、--sizes と --formats を\
                  併せたときは size が外・format が内の直積になる（--naming の {index} と\
                  同じ番号）。\
-                 **派生ごとに出うる警告は、どれも data.output にこの文字列を持つ**\
+                 **派生ごとに出うる警告は、どれも data.output で「どの出力の話か」を名乗る**\
                  ——ALPHA_FLATTENED / QUALITY_REDUCED / MAX_BYTES_UNREACHABLE / \
                  ICC_NOT_EMBEDDED / UPSCALED / DRY_RUN_OUTPUT_EXISTS の 6 つで、\
-                 1 実行に複数回出うるので、どの出力の話かはその値で引く",
+                 1 実行に複数回出うるので、どの出力の話かはその値で引く。\
+                 値は outputs[].path か、--manifest のパスである——目録も\
+                 上書きの規約に従うので、--dry-run で既にあれば \
+                 DRY_RUN_OUTPUT_EXISTS がそのパスを名乗る。\
+                 UPSCALED だけは data.output を持たないことがある。\
+                 **持たないものは出どころが違う**——kiri resize --allow-upscale \
+                 そのものの拡大は最終画像に起きたことで、派生ごとの事象ではない。\
+                 派生のリサイズで出たものは持つので、data.output の有無が\
+                 そのまま出どころの区別になる",
             ),
         },
         FieldEntry {

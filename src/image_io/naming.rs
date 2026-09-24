@@ -57,49 +57,48 @@ pub struct Name<'a> {
 
 impl Naming {
     /// テンプレートを解く。未知の置換子も閉じていない括弧も、ここで断る。
+    ///
+    /// **1 文字ずつ状態で読む。** 「`{` を探して、その後ろの `}` を探す」形だと、
+    /// 最後の置換子より前にある対応しない `}` を一度も見ないまま通してしまう
+    /// ——`stem}_{width}.{ext}` が「`stem}_` で始まる名前」として書き出される。
+    /// 括弧の外に `}` が出た時点で断れるのは、状態を持って走査したときだけである
     pub fn parse(template: &str) -> Result<Self> {
         let mut pieces = Vec::new();
         let mut literal = String::new();
-        let mut rest = template;
+        // `Some` なら置換子の中を読んでいる（`{` を見てから `}` を見るまで）
+        let mut placeholder: Option<String> = None;
 
-        while let Some(open) = rest.find('{') {
-            literal.push_str(&rest[..open]);
-            let after = &rest[open + 1..];
-            let close = after.find('}').ok_or_else(|| {
-                invalid(format!(
-                    "'{template}' の '{{' が閉じていません（置換子は {{stem}} のように書きます）"
-                ))
-            })?;
-            let name = &after[..close];
-            let piece = match name {
-                "stem" => Piece::Stem,
-                "index" => Piece::Index,
-                "width" => Piece::Width,
-                "height" => Piece::Height,
-                "ext" => Piece::Ext,
-                "role" => Piece::Role,
-                other => {
+        for ch in template.chars() {
+            match (&mut placeholder, ch) {
+                (None, '{') => {
+                    if !literal.is_empty() {
+                        pieces.push(Piece::Literal(std::mem::take(&mut literal)));
+                    }
+                    placeholder = Some(String::new());
+                }
+                (None, '}') => {
                     return Err(invalid(format!(
-                        "'{{{other}}}' は --naming の知らない置換子です（使えるのは \
-                         {{stem}} / {{index}} / {{width}} / {{height}} / {{ext}} / {{role}}）"
+                        "'{template}' に対応する '{{' の無い '}}' があります"
                     )));
                 }
-            };
-            if !literal.is_empty() {
-                pieces.push(Piece::Literal(std::mem::take(&mut literal)));
+                (None, ch) => literal.push(ch),
+                (Some(_), '{') => {
+                    return Err(invalid(format!(
+                        "'{template}' の '{{' が閉じていません（置換子は {{stem}} のように書きます）"
+                    )));
+                }
+                (Some(name), '}') => {
+                    pieces.push(placeholder_piece(name, template)?);
+                    placeholder = None;
+                }
+                (Some(name), ch) => name.push(ch),
             }
-            pieces.push(piece);
-            rest = &after[close + 1..];
         }
-        // 閉じ括弧だけが残っていたら、開き括弧の綴り忘れである。
-        // 黙って文字として通すと、`stem}_{width}.{ext}` が
-        // 「`stem}_` で始まる名前」として書き出されてしまう
-        if rest.contains('}') || literal.contains('}') {
+        if placeholder.is_some() {
             return Err(invalid(format!(
-                "'{template}' に対応する '{{' の無い '}}' があります"
+                "'{template}' の '{{' が閉じていません（置換子は {{stem}} のように書きます）"
             )));
         }
-        literal.push_str(rest);
         if !literal.is_empty() {
             pieces.push(Piece::Literal(literal));
         }
@@ -137,6 +136,22 @@ impl Naming {
     }
 }
 
+/// 置換子の綴りを 1 片へ落とす。綴り違いはここで断る。
+fn placeholder_piece(name: &str, template: &str) -> Result<Piece> {
+    match name {
+        "stem" => Ok(Piece::Stem),
+        "index" => Ok(Piece::Index),
+        "width" => Ok(Piece::Width),
+        "height" => Ok(Piece::Height),
+        "ext" => Ok(Piece::Ext),
+        "role" => Ok(Piece::Role),
+        other => Err(invalid(format!(
+            "'{template}' の '{{{other}}}' は --naming の知らない置換子です（使えるのは \
+             {{stem}} / {{index}} / {{width}} / {{height}} / {{ext}} / {{role}}）"
+        ))),
+    }
+}
+
 /// `--output` から `{stem}` を取り出す。
 ///
 /// 拡張子を持たない `--output` もありうる（`--format` で形式を明示した場合）。
@@ -149,11 +164,39 @@ pub fn stem_of(output: &Path) -> &str {
 }
 
 /// 綴った名前を `--output` と同じディレクトリへ置く。
-pub fn beside(output: &Path, name: &str) -> PathBuf {
-    match output.parent() {
+///
+/// **綴った結果がファイル名 1 つであることを確かめてから繋ぐ。** `Path::join` は
+/// 引数が絶対パスなら基底を捨てるのが Rust の仕様なので、`{role}` や `--naming`
+/// に `/tmp/x` と書けば `--output` の親を無視してそこへ書けてしまい、`..` なら
+/// 親を遡れる。しかも `write_encoded` は無い階層を作るので、道を空けるところまで
+/// やってしまう。
+///
+/// **「利用者が `--output` を自由に書けるのだから同じ」では済まない。** batch の
+/// `output` は `batch::resolve` で `--base-dir` の下へ寄せる規約になっているが、
+/// spec の `naming` / `derive[].role` はこの関門を通らない。spec はエージェントや
+/// 他人が生成しうる**データファイル**なので、1 行で `--base-dir` の境界を越えられる
+/// 形にはできない。README の「書き出し先のディレクトリも `--output` の親になる」も
+/// ここで初めて保証される
+pub fn beside(output: &Path, name: &str) -> Result<PathBuf> {
+    let single = !name.is_empty()
+        && !name.contains('/')
+        && !name.contains('\\')
+        && name != "."
+        && name != "..";
+    if !single {
+        return Err(Error::new(
+            ErrorCode::InvalidNamingTemplate,
+            format!(
+                "--naming が綴った '{name}' はファイル名 1 つではありません（書き出し先は \
+                 --output の親ディレクトリに限ります）"
+            ),
+        )
+        .with_hint("{role} や --naming にディレクトリの区切りや '..' は書けません"));
+    }
+    Ok(match output.parent() {
         Some(dir) => dir.join(name),
         None => PathBuf::from(name),
-    }
+    })
 }
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -216,6 +259,11 @@ mod tests {
             "{stem}_{width}.{ext",
             "{}",
             "{stem}}",
+            // 最後の置換子より**前**にある対応しない '}'。走査が「'{' を見つけて
+            // からその後ろの '}' を探す」形だと、ここを一度も見ないまま
+            // `stem}_200.jpg` を書き出してしまう
+            "stem}_{width}.{ext}",
+            "}{stem}.{ext}",
             "",
         ] {
             let err = Naming::parse(template).unwrap_err();
@@ -233,13 +281,37 @@ mod tests {
         assert_eq!(stem_of(Path::new("/work/product.jpg")), "product");
         assert_eq!(stem_of(Path::new("product")), "product");
         assert_eq!(
-            beside(Path::new("/work/product.jpg"), "product_800.avif"),
+            beside(Path::new("/work/product.jpg"), "product_800.avif").unwrap(),
             PathBuf::from("/work/product_800.avif")
         );
         assert_eq!(
-            beside(Path::new("product.jpg"), "product_800.avif"),
+            beside(Path::new("product.jpg"), "product_800.avif").unwrap(),
             PathBuf::from("product_800.avif"),
             "親を持たない --output でも相対のまま並べる"
         );
+    }
+
+    /// 綴った名前が `--output` の親から出ていくなら断る。
+    ///
+    /// `Path::join` は引数が絶対パスなら基底を捨てるので、素通しにすると
+    /// `{role}` の 1 語で任意の場所へ書けてしまう
+    #[test]
+    fn a_name_that_leaves_the_output_directory_is_refused() {
+        for name in [
+            "/tmp/kiri_escape_test.jpg",
+            "../escaped.jpg",
+            "sub/product.jpg",
+            "..",
+            ".",
+            "",
+        ] {
+            let err = beside(Path::new("/work/product.jpg"), name).unwrap_err();
+            assert_eq!(
+                err.code.as_str(),
+                "INVALID_NAMING_TEMPLATE",
+                "通してはいけない: '{name}'"
+            );
+            assert_eq!(err.exit_code(), 2, "'{name}'");
+        }
     }
 }

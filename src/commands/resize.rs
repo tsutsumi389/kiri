@@ -22,6 +22,11 @@ pub fn run(args: &ResizeArgs) -> Result<ProcessReport> {
         args.out.force,
         args.out.dry_run,
     )?;
+    // 命名は寸法を 1 つも見ないので、読み込みとリサイズより前に解く
+    let output_plan = output::OutputPlan {
+        format,
+        naming: output::plan_naming(&args.out)?,
+    };
 
     let loaded = load::load_with(&args.input, &args.color.to_load_options())?;
     let source = (loaded.width(), loaded.height());
@@ -57,7 +62,7 @@ pub fn run(args: &ResizeArgs) -> Result<ProcessReport> {
         &loaded,
         &resized,
         &args.out,
-        format,
+        &output_plan,
         started,
         warnings,
     )

@@ -241,22 +241,29 @@ fn specs(opts: &OutputOpts) -> Vec<DeriveSpec> {
     out
 }
 
-/// 書き始める前に、全派生のパスと寸法を決めて検査する。
+/// 重い処理より前に決まる、出力の計画。
 ///
-/// **ここを通り抜けたら、あとは書くだけである。** 1 枚でも書いた後にエラーで
-/// 落ちると半端な成果物が残り、しかも結果 JSON は返らないので何が書けたのかを
-/// 追う手段が無い（計画 7.2）。検査は 3 つ——派生どうしの衝突、付随出力との衝突、
-/// 上書きの可否——で、どれも重いエンコードの前に済ませる。
+/// 出力形式と、解いた `--naming` の 2 つ。**どちらも最終画像の寸法を 1 つも
+/// 見ない**ので、読み込みや切り抜きより前に決まる。1 つの値にまとめて持ち回るのは、
+/// 「形式は解いたが命名はまだ」という中途半端な状態を下流へ渡せなくするためである
+pub struct OutputPlan {
+    pub format: OutputFormat,
+    pub naming: Option<Naming>,
+}
+
+/// `--naming` のうち、**寸法に依存しない検査だけ**を先に済ませる。
 ///
-/// `source` は最終画像の寸法である。`{width}` も `outputs[].width` も
-/// `Derivation::dimensions` という 1 つの答えを引くので、名前と報告が食い違わない
-fn resolve(
-    opts: &OutputOpts,
-    format: OutputFormat,
-    icc: IccPolicy,
-    source: (u32, u32),
-    reserved: &[Reserved],
-) -> Result<(Vec<Derivation>, Vec<Warning>)> {
+/// テンプレートの構文解析も `{role}` × 役目を持たない派生の検査も、最終画像の
+/// 寸法を 1 つも見ない。にもかかわらず `resolve` の中でやると、切り抜き本体
+/// （`--optimize` 込みなら数秒〜十数秒）を回し切った後にようやく綴り違いへ
+/// 気づくことになる。しかも cutout では `--debug-mask` がその前に書かれるので、
+/// 「どれで落ちてもファイルは 1 つも書かれない」という README の宣言まで破れる。
+///
+/// **各コマンドの `run()` の先頭で呼び、結果を `write_images` / `finish` へ渡す。**
+/// 解いた `Naming` を持ち回るのは、同じテンプレートを 2 度解いて片方だけが
+/// 通る状態を作らないためである。`{width}` に依存する衝突の検査は、寸法が
+/// 決まらないと綴れないので `resolve` に残る
+pub fn plan_naming(opts: &OutputOpts) -> Result<Option<Naming>> {
     let specs = specs(opts);
     // 明示した --naming は派生が 1 本でも効かせる。**予測可能性を優先した**
     // ——「2 本以上のときだけ効く」にすると、同じテンプレートが派生の数で
@@ -275,13 +282,33 @@ fn resolve(
             .with_hint("すべての --derive に role を書くか、{role} を外してください"));
         }
     }
+    Ok(naming)
+}
 
+/// 書き始める前に、全派生のパスと寸法を決めて検査する。
+///
+/// **ここを通り抜けたら、あとは書くだけである。** 1 枚でも書いた後にエラーで
+/// 落ちると半端な成果物が残り、しかも結果 JSON は返らないので何が書けたのかを
+/// 追う手段が無い（計画 7.2）。検査は 3 つ——派生どうしの衝突、付随出力との衝突、
+/// 上書きの可否——で、どれも重いエンコードの前に済ませる。
+///
+/// `source` は最終画像の寸法である。`{width}` も `outputs[].width` も
+/// `Derivation::dimensions` という 1 つの答えを引くので、名前と報告が食い違わない
+fn resolve(
+    opts: &OutputOpts,
+    plan: &OutputPlan,
+    icc: IccPolicy,
+    source: (u32, u32),
+    reserved: &[Reserved],
+) -> Result<(Vec<Derivation>, Vec<Warning>)> {
+    let specs = specs(opts);
+    let naming = plan.naming.as_ref();
     let stem = naming::stem_of(&opts.output).to_string();
     let mut derivations = Vec::with_capacity(specs.len());
     let mut warnings = Vec::new();
 
     for (index, spec) in specs.iter().enumerate() {
-        let format = spec.format.unwrap_or(format);
+        let format = spec.format.unwrap_or(plan.format);
         let derivation = Derivation {
             // 仮の置き場。寸法が決まらないと名前を綴れないので、下で入れ替える
             path: opts.output.clone(),
@@ -296,7 +323,7 @@ fn resolve(
             role: spec.role.clone(),
         };
         let (width, height) = derivation.dimensions(source)?;
-        let path = match &naming {
+        let path = match naming {
             Some(naming) => naming::beside(
                 &opts.output,
                 &naming.render(&naming::Name {
@@ -307,7 +334,7 @@ fn resolve(
                     ext: format.extension(),
                     role: spec.role.as_deref(),
                 }),
-            ),
+            )?,
             None => opts.output.clone(),
         };
         // 許した拡大だけをここで言う。許していない拡大は `dimensions` が
@@ -336,23 +363,38 @@ fn resolve(
 ///
 /// **`--force` では許さない。** 上書きの可否は「利用者の既存のファイルを壊して
 /// よいか」の話で、こちらは 1 回の実行が自分の成果物を自分で潰す指定である。
-/// 後に書いたほうだけが残り、結果 JSON は 2 本とも書いたと報告する
+/// 後に書いたほうだけが残り、結果 JSON は 2 本とも書いたと報告する。
+///
+/// **厳密一致と、大文字小文字を畳んだキーの 2 本で見る。** パスのバイト列だけを
+/// 比べると、`role=Hero` と `role=hero` が macOS の既定（APFS の case-insensitive）や
+/// Windows では同じ 1 ファイルへ落ちるのに素通りする。通した先で起きるのは
+/// 「JSON は 2 本書いたと報告し、ディスクには 1 本しか無い」という状態で、
+/// **機械可読なレポートが嘘をつく**のはこのコードベースで最も重い失敗である
 fn check_collisions(derivations: &[Derivation]) -> Result<()> {
-    let mut seen: Vec<(&Path, usize)> = Vec::with_capacity(derivations.len());
+    let hint = "--naming に {index} か {role} を入れると、幅や形式が同じ派生でも名前が分かれます";
+    let mut seen: Vec<(String, String, usize)> = Vec::with_capacity(derivations.len());
     for (index, d) in derivations.iter().enumerate() {
-        if let Some((_, first)) = seen.iter().find(|(path, _)| *path == d.path.as_path()) {
+        let spelled = d.path.display().to_string();
+        let folded = spelled.to_lowercase();
+        if let Some((_, _, first)) = seen.iter().find(|(other, _, _)| *other == spelled) {
+            return Err(Error::new(
+                ErrorCode::OutputNameCollision,
+                format!("派生 {first} と {index} がどちらも {spelled} になります"),
+            )
+            .with_hint(hint));
+        }
+        if let Some((other, _, first)) = seen.iter().find(|(_, other, _)| *other == folded) {
             return Err(Error::new(
                 ErrorCode::OutputNameCollision,
                 format!(
-                    "派生 {first} と {index} がどちらも {} になります",
-                    d.path.display()
+                    "派生 {first} の {other} と派生 {index} の {spelled} は大文字小文字だけが\
+                     違います。区別しないファイルシステム（macOS や Windows の既定）では\
+                     同じ 1 ファイルになります"
                 ),
             )
-            .with_hint(
-                "--naming に {index} か {role} を入れると、幅や形式が同じ派生でも名前が分かれます",
-            ));
+            .with_hint(hint));
         }
-        seen.push((d.path.as_path(), index));
+        seen.push((spelled, folded, index));
     }
     Ok(())
 }
@@ -400,12 +442,16 @@ fn upscaled(from: (u32, u32), to: (u32, u32)) -> Warning {
 /// `--no-color-convert` で変換しなかった画素に sRGB の ICC を付けると、名乗りが嘘になる。
 ///
 /// 派生を 1 つも指定しなければ戻りは 1 要素で、そのバイト列も出力パスも
-/// Phase 19 と 1 バイトも変わらない
+/// Phase 19 と 1 バイトも変わらない。
+///
+/// `plan` の `naming` は `plan_naming` が**重い処理の前に**解いたものである。
+/// ここで解き直さないのは、同じテンプレートを 2 度解いて片方だけが通る状態を
+/// 作らないためである
 pub fn write_images(
     image: &RgbaImage,
     loaded: &LoadedImage,
     opts: &OutputOpts,
-    format: OutputFormat,
+    plan: &OutputPlan,
     reserved: &[Reserved],
 ) -> Result<(Vec<OutputReport>, Vec<Warning>)> {
     let icc = if loaded.srgb_pixels {
@@ -414,7 +460,7 @@ pub fn write_images(
         IccPolicy::None
     };
     let source = (image.width(), image.height());
-    let (derivations, mut warnings) = resolve(opts, format, icc, source, reserved)?;
+    let (derivations, mut warnings) = resolve(opts, plan, icc, source, reserved)?;
 
     let rendered = render(image, &derivations, opts.dry_run)?;
     let mut reports = Vec::with_capacity(rendered.len());
@@ -471,8 +517,14 @@ pub fn write_manifest(path: &Path, items: Vec<ManifestItem>) -> Result<()> {
             .unwrap_or("manifest"),
         std::process::id()
     ));
-    std::fs::write(&temp, &json)
-        .map_err(|e| failed(format!("{} を書き出せません: {e}", temp.display())))?;
+    std::fs::write(&temp, &json).map_err(|e| {
+        // **書き出しの失敗でも一時ファイルを残さない。** `fs::write` は
+        // create + write なので、容量が尽きたときは**ファイルが作られた状態で**
+        // 失敗する。ここを置き換え側だけにしておくと、`.m.json.12345.tmp` が
+        // 成果物の隣に残り、しかも誰も拾わないごみになる
+        let _ = std::fs::remove_file(&temp);
+        failed(format!("{} を書き出せません: {e}", temp.display()))
+    })?;
     std::fs::rename(&temp, path).map_err(|e| {
         // 置き換えに失敗したら一時ファイルを残さない。次の実行が古い中身を
         // 拾うことは無いが、成果物の隣にごみが積む
@@ -519,7 +571,7 @@ pub fn finish(
     loaded: &LoadedImage,
     image: &RgbaImage,
     opts: &OutputOpts,
-    format: OutputFormat,
+    plan: &OutputPlan,
     started: Instant,
     mut warnings: Vec<Warning>,
 ) -> Result<ProcessReport> {
@@ -534,7 +586,7 @@ pub fn finish(
         })
         .into_iter()
         .collect();
-    let (outputs, save_warnings) = write_images(image, loaded, opts, format, &reserved)?;
+    let (outputs, save_warnings) = write_images(image, loaded, opts, plan, &reserved)?;
     warnings.extend(save_warnings);
 
     // **書き出しが全部済んでから書く。** 目録が先にできると、途中で落ちた実行の
@@ -595,6 +647,14 @@ mod tests {
         }
     }
 
+    /// 派生も --naming も使わない、Phase 19 と同じ 1 本の計画
+    fn plan(format: OutputFormat) -> OutputPlan {
+        OutputPlan {
+            format,
+            naming: None,
+        }
+    }
+
     fn not_embedded(warnings: &[Warning]) -> Vec<&Warning> {
         warnings
             .iter()
@@ -634,8 +694,14 @@ mod tests {
         ];
         for (format, signal) in cases {
             let out = dir.path().join(format!("out.{}", format.as_str()));
-            let (reports, warnings) =
-                write_images(&raw_pixels.image, &raw_pixels, &opts(out), format, &[]).unwrap();
+            let (reports, warnings) = write_images(
+                &raw_pixels.image,
+                &raw_pixels,
+                &opts(out),
+                &plan(format),
+                &[],
+            )
+            .unwrap();
             let report = &reports[0];
             assert_eq!(report.icc, signal, "{format:?}");
             let found = not_embedded(&warnings);
@@ -650,7 +716,7 @@ mod tests {
         for format in [OutputFormat::Png, OutputFormat::Jpeg, OutputFormat::Avif] {
             let out = dir.path().join(format!("out.{}", format.as_str()));
             let (reports, warnings) =
-                write_images(&converted.image, &converted, &opts(out), format, &[]).unwrap();
+                write_images(&converted.image, &converted, &opts(out), &plan(format), &[]).unwrap();
             assert!(not_embedded(&warnings).is_empty(), "{format:?}");
             assert_eq!(
                 reports[0].icc,
@@ -658,5 +724,32 @@ mod tests {
                 "{format:?}"
             );
         }
+    }
+
+    /// 書き出しに失敗した一時ファイルを残さない。
+    ///
+    /// `fs::write` は create + write なので、容量が尽きた場合は**ファイルが
+    /// 作られた状態で**失敗する。ここが漏れると `.m.json.12345.tmp` が成果物の
+    /// 隣に残る。容量切れは作れないので、同じ「開けずに失敗する」経路を
+    /// 読み取り専用の一時ファイルで作る——一時ファイルの名前は自プロセスの
+    /// ID を含むので、この経路で消すのは必ず kiri 自身のものである
+    #[test]
+    fn a_failed_manifest_write_leaves_no_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.json");
+        let temp = path.with_file_name(format!(".m.json.{}.tmp", std::process::id()));
+        std::fs::write(&temp, b"leftover").unwrap();
+        let mut perms = std::fs::metadata(&temp).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&temp, perms).unwrap();
+        // root で走らせると読み取り専用が効かず、失敗する経路そのものを作れない
+        if std::fs::OpenOptions::new().write(true).open(&temp).is_ok() {
+            return;
+        }
+
+        let err = write_manifest(&path, Vec::new()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::ManifestWriteFailed);
+        assert!(!temp.exists(), "書き出しに失敗した一時ファイルが残った");
+        assert!(!path.exists(), "置き換えていないのに目録ができている");
     }
 }

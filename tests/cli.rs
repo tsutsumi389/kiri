@@ -2078,6 +2078,48 @@ fn every_derivation_bound_warning_names_its_output() {
         existing["outputs"].as_array().unwrap().len(),
         "派生ごとに 1 回ずつ出ていない: {dry}"
     );
+
+    // **`UPSCALED` だけは `data.output` を持たない枝がある。** `kiri resize` 自身の
+    // 拡大は**最終画像そのもの**に起きたことで、派生ごとの事象ではない。無い帰属を
+    // でっち上げて `output` を付けるほうが嘘になるので、持たないことを固定する
+    // （`data.output` の有無がそのまま出どころの区別になる、と契約が言っている）
+    let resized = kiri()
+        .args([
+            "resize",
+            input.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--json",
+            "--force",
+            "--width",
+            "200",
+            "--allow-upscale",
+            "--sizes",
+            "160,200",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        resized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resized.stderr)
+    );
+    let v = json_stdout(&resized);
+    let upscaled: Vec<&Value> = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|w| w["code"] == "UPSCALED")
+        .collect();
+    assert_eq!(
+        upscaled.len(),
+        1,
+        "resize 段の UPSCALED が 1 本だけ出る: {v}"
+    );
+    assert!(
+        upscaled[0]["data"].get("output").is_none(),
+        "resize 自身の拡大に出力を帰属させている: {v}"
+    );
 }
 
 /// `--derive` と `--sizes` は構造として混ぜられない。
@@ -2322,6 +2364,271 @@ fn a_partial_batch_says_so_in_the_manifest_warning() {
         1,
         "失敗した項目が目録に載っている: {written}"
     );
+}
+
+/// batch は**1 件も処理する前に**目録の上書き可否を問う。
+///
+/// 書き終えてから断ると、`OUTPUT_EXISTS` が `Err` として返って `BatchReport` が
+/// 丸ごと捨てられる。利用者に残るのはエラー 1 行だけで、**数百枚が書かれた事実も、
+/// どれが成功しどれが失敗したかも一切返らない**。成果物が 1 つも増えていないこと
+/// まで見る
+#[test]
+fn the_batch_manifest_overwrite_check_runs_before_any_item_is_written() {
+    let dir = fixture_dir();
+    let input = write_jpeg(dir.path(), "p.jpg", &product_image(&ProductSpec::default()));
+    let name = input.file_name().unwrap().to_str().unwrap().to_string();
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        format!(
+            r#"{{"items":[
+                {{"input":"{name}","output":"out/o1.png"}},
+                {{"input":"{name}","output":"out/o2.png"}}
+            ]}}"#
+        ),
+    )
+    .unwrap();
+    let manifest = dir.path().join("m.json");
+    std::fs::write(&manifest, b"{\"stale\":true}").unwrap();
+
+    let out = kiri()
+        .args([
+            "batch",
+            spec.to_str().unwrap(),
+            "--json",
+            "--manifest",
+            manifest.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(json_stdout(&out)["error"]["code"], "OUTPUT_EXISTS");
+
+    let written = dir.path().join("out");
+    assert!(
+        !written.exists() || std::fs::read_dir(&written).unwrap().count() == 0,
+        "断る前に項目を書いている"
+    );
+    assert_eq!(
+        std::fs::read(&manifest).unwrap(),
+        b"{\"stale\":true}",
+        "既存の目録を壊している"
+    );
+}
+
+/// `--debug-mask` は命名の検査より後に書かれる。
+///
+/// README の「どれで落ちてもファイルは 1 つも書かれない」は cutout でも成り立つ。
+/// **綴り違いは切り抜き本体より前に捕まえる**——テンプレートの解析も `{role}` の
+/// 検査も寸法に一切依存しないのに、書き出しの直前でやると `--optimize` 込みで
+/// 数秒〜十数秒を捨てることになる
+#[test]
+fn a_cutout_that_fails_the_naming_check_writes_no_debug_mask() {
+    let dir = fixture_dir();
+    let input = write_jpeg(dir.path(), "p.jpg", &product_image(&ProductSpec::default()));
+    let out_dir = TempDir::new().unwrap();
+    let result = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            out_dir.path().join("out.png").to_str().unwrap(),
+            "--json",
+            "--debug-mask",
+            out_dir.path().join("mask.png").to_str().unwrap(),
+            "--sizes",
+            "200,400",
+            "--naming",
+            "{stem}_{dpi}.{ext}",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(2));
+    assert_eq!(
+        json_stdout(&result)["error"]["code"],
+        "INVALID_NAMING_TEMPLATE"
+    );
+    assert_eq!(
+        std::fs::read_dir(out_dir.path()).unwrap().count(),
+        0,
+        "断る前にマスクを書いている"
+    );
+}
+
+/// 綴った名前が `--output` の親から出ていく指定は断る。
+///
+/// `Path::join` は引数が絶対パスなら基底を捨てるので、素通しにすると `{role}` や
+/// `--naming` の 1 語で任意の場所へ書ける。**spec はエージェントや他人が生成しうる
+/// データファイル**なので、`--base-dir` の境界をこの 1 行で越えられてはならない
+#[test]
+fn a_name_that_leaves_the_output_directory_is_refused() {
+    let dir = fixture_dir();
+    let input = write_jpeg(dir.path(), "p.jpg", &product_image(&ProductSpec::default()));
+    let out_dir = TempDir::new().unwrap();
+    let escape = std::env::temp_dir().join("kiri_escape_test.png");
+    let _ = std::fs::remove_file(&escape);
+
+    for template in [
+        escape.with_extension("{ext}").to_str().unwrap().to_string(),
+        "../escaped.{ext}".to_string(),
+        "sub/{stem}.{ext}".to_string(),
+    ] {
+        let out = kiri()
+            .args([
+                "convert",
+                input.to_str().unwrap(),
+                "-o",
+                out_dir.path().join("q.png").to_str().unwrap(),
+                "--json",
+                "--naming",
+                &template,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{template}");
+        assert_eq!(
+            json_stdout(&out)["error"]["code"],
+            "INVALID_NAMING_TEMPLATE",
+            "{template}"
+        );
+    }
+    assert!(!escape.exists(), "--output の親の外へ書いた");
+    assert_eq!(
+        std::fs::read_dir(out_dir.path()).unwrap().count(),
+        0,
+        "断る前にファイルを書いている"
+    );
+
+    // `role` は `outputs[].role` にも出る札なので、もっと早い段で断る
+    // （clap の value_parser が読むので code 無しの exit 2 になる）
+    for spec in ["width=60,role=/tmp/kiri_escape_test", "width=60,role=../x"] {
+        let out = kiri()
+            .args([
+                "convert",
+                input.to_str().unwrap(),
+                "-o",
+                out_dir.path().join("q.png").to_str().unwrap(),
+                "--json",
+                "--derive",
+                spec,
+                "--naming",
+                "{role}.{ext}",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{spec}");
+        assert!(out.stdout.is_empty(), "{spec} で stdout が出た");
+    }
+}
+
+/// 大文字小文字だけが違う 2 本も衝突として断る。
+///
+/// macOS（APFS の既定）や Windows では区別されないので同じ 1 ファイルへ落ちる。
+/// 通せば **JSON は 2 本書いたと報告し、ディスクには 1 本しか無い**——機械可読な
+/// レポートが嘘をつくのはこのコードベースで最も重い失敗である
+#[test]
+fn two_derivations_differing_only_in_case_are_a_collision() {
+    let dir = fixture_dir();
+    let input = write_jpeg(dir.path(), "p.jpg", &product_image(&ProductSpec::default()));
+    let out_dir = TempDir::new().unwrap();
+    let out = kiri()
+        .args([
+            "convert",
+            input.to_str().unwrap(),
+            "-o",
+            out_dir.path().join("x.jpg").to_str().unwrap(),
+            "--json",
+            "--derive",
+            "width=60,role=Hero",
+            "--derive",
+            "width=60,role=hero",
+            "--naming",
+            "{stem}_{role}.{ext}",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let v = json_stdout(&out);
+    assert_eq!(v["error"]["code"], "OUTPUT_NAME_COLLISION", "{v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("大文字小文字"),
+        "なぜ衝突なのかを言っていない: {v}"
+    );
+    assert_eq!(
+        std::fs::read_dir(out_dir.path()).unwrap().count(),
+        0,
+        "断る前にファイルを書いている"
+    );
+}
+
+/// 対応する `{` の無い `}` は、テンプレートのどこにあっても断る。
+///
+/// 「`{` を探してその後ろの `}` を探す」形の走査では、**最後の置換子より前に
+/// ある** `}` を一度も見ない。`stem}_{width}.{ext}` が「`stem}_` で始まる名前」
+/// として書き出されるのは、まさに実装コメントが挙げていた反例である
+#[test]
+fn an_unmatched_closing_brace_is_refused_anywhere_in_the_template() {
+    let dir = fixture_dir();
+    let input = write_jpeg(dir.path(), "p.jpg", &product_image(&ProductSpec::default()));
+    let out_dir = TempDir::new().unwrap();
+    for template in ["stem}_{width}.{ext}", "}{stem}.{ext}"] {
+        let out = kiri()
+            .args([
+                "convert",
+                input.to_str().unwrap(),
+                "-o",
+                out_dir.path().join("q.png").to_str().unwrap(),
+                "--json",
+                "--sizes",
+                "60,80",
+                "--naming",
+                template,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{template}");
+        let v = json_stdout(&out);
+        assert_eq!(v["error"]["code"], "INVALID_NAMING_TEMPLATE", "{v}");
+        assert_eq!(
+            std::fs::read_dir(out_dir.path()).unwrap().count(),
+            0,
+            "{template}: 断る前にファイルを書いている"
+        );
+    }
+}
+
+/// `--derive` の同じキーを 2 回書いたら断る。
+///
+/// 黙って後勝ちにすると「書いたのに効かない」指定がここにだけ残る。未知のキーを
+/// きちんと断っているのだから、緩める理由が無い。**clap が弾くので code 無しの
+/// exit 2 になる**（`--max-bytes` の書式違いと同じ前例）
+#[test]
+fn a_derivation_key_written_twice_is_refused() {
+    let dir = fixture_dir();
+    let input = write_jpeg(dir.path(), "p.jpg", &product_image(&ProductSpec::default()));
+    for spec in [
+        "width=100,width=250",
+        "format=png,format=jpeg",
+        "role=a,role=b",
+    ] {
+        let out = kiri()
+            .args([
+                "convert",
+                input.to_str().unwrap(),
+                "-o",
+                dir.path().join("q.png").to_str().unwrap(),
+                "--json",
+                "--derive",
+                spec,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "--derive '{spec}' が通った");
+        assert!(out.stdout.is_empty(), "--derive '{spec}' で stdout が出た");
+    }
 }
 
 /// spec の `derive` / `sizes` / `formats` / `naming` が CLI と同じ関門を通る。

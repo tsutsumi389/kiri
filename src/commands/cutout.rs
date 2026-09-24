@@ -39,6 +39,13 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         args.out.dry_run,
     )?;
     let preview_format = check_side_outputs(args)?;
+    // **切り抜きより前に解く。** テンプレートの構文も {role} の有無も最終画像の
+    // 寸法を 1 つも見ないのに、書き出しの直前で解くと --optimize 込みで数秒〜
+    // 十数秒を回し切ってから綴り違いに気づくことになる
+    let output_plan = output::OutputPlan {
+        format,
+        naming: output::plan_naming(&args.out)?,
+    };
 
     let loaded = load::load_with(&args.input, &args.color.to_load_options())?;
     let (w, h) = (loaded.width(), loaded.height());
@@ -116,8 +123,6 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         (cutout_seen(&loaded.image, &opts, seen), None, None)
     };
     let bbox = opts.bbox;
-
-    let debug_mask = write_debug_mask(args.debug_mask.as_ref(), &result.mask)?;
 
     let mut warnings = loaded.warnings();
     warnings.extend(overwrite_warning);
@@ -204,8 +209,13 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         }
     }
     let (output_reports, save_warnings) =
-        output::write_images(final_image, &loaded, &args.out, format, &reserved)?;
+        output::write_images(final_image, &loaded, &args.out, &output_plan, &reserved)?;
     warnings.extend(save_warnings);
+
+    // **マスクは本出力の後に書く。** 先に書くと、命名や衝突の検査で落ちる実行でも
+    // マスクだけが残り、「どれで落ちてもファイルは 1 つも書かれない」という
+    // README の宣言が cutout でだけ破れる。マスクは `result.mask` から後でも書ける
+    let debug_mask = write_debug_mask(args.debug_mask.as_ref(), &result.mask)?;
 
     if !args.out.dry_run {
         if let Some(path) = args.out.manifest.as_deref() {

@@ -26,6 +26,15 @@ pub fn run(args: &BatchArgs) -> Result<BatchReport> {
     let started = Instant::now();
     let spec = batch::load(&args.spec)?;
     let base = batch::base_dir(&args.spec, args.base_dir.as_deref());
+    // **1 件も処理する前に目録の上書き可否を問う。** 書き終えてから断ると、
+    // 数百点を書いた後に `OUTPUT_EXISTS` が `Err` として返り、`BatchReport` が
+    // 丸ごと捨てられる——利用者に残るのはエラー 1 行だけで、何枚書かれたのかも
+    // どれが成功したのかも返らない。convert / resize / rotate / cutout の 4 つが
+    // `run()` の先頭で問うているのと同じ位置に揃える
+    let manifest_warnings: Vec<Warning> =
+        output::ensure_manifest_writable(args.manifest.as_deref(), args.force, args.dry_run)?
+            .into_iter()
+            .collect();
 
     let process = |item: &BatchItem| -> BatchItemReport {
         let input = batch::resolve(&base, &item.input);
@@ -70,7 +79,8 @@ pub fn run(args: &BatchArgs) -> Result<BatchReport> {
         .filter(|r| r.result.as_ref().is_some_and(|c| !c.warnings.is_empty()))
         .count();
 
-    let warnings = write_manifest(args, &results, failed)?;
+    let mut warnings = manifest_warnings;
+    warnings.extend(write_manifest(args, &results, failed)?);
 
     Ok(BatchReport {
         schema_version: SCHEMA_VERSION,
@@ -93,9 +103,10 @@ pub fn run(args: &BatchArgs) -> Result<BatchReport> {
 /// 「欠けている」ことを言う——目録だけを見て「これで全部だ」と読まれるのが
 /// 最も高くつく誤りで、件数（`data.failed`）まで添えて分岐できる形にする。
 ///
-/// `--dry-run` では 1 バイトも書かない。書く前の検査は項目ごとの
-/// `ensure_manifest_writable` ではなくここが担う——項目は自分の `--manifest` を
-/// 持たないためである
+/// `--dry-run` では 1 バイトも書かない。
+///
+/// **上書きの可否はここでは問わない。** 検査は `run()` の先頭で済ませてある
+/// ——ここまで来た時点で全項目が書き終わっているので、断っても手遅れになる
 fn write_manifest(
     args: &BatchArgs,
     results: &[BatchItemReport],
@@ -105,11 +116,6 @@ fn write_manifest(
         return Ok(Vec::new());
     };
     let mut warnings: Vec<Warning> = Vec::new();
-    warnings.extend(output::ensure_manifest_writable(
-        Some(path),
-        args.force,
-        args.dry_run,
-    )?);
     if failed > 0 {
         warnings.push(
             Warning::new(

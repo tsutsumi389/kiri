@@ -148,7 +148,7 @@ $ kiri schema --json | jq '.commands[] | select(.name == "cutout") | .options'
 ##### 2 になった理由
 
 **`outputs[]` が常に 1 要素だという前提が崩れた。** 1 回の実行で複数の派生を書ける
-ようになった（[複数のサイズ・形式をまとめて書く](#複数のサイズ形式をまとめて書くderive)）。
+ようになった（[複数のサイズと形式をまとめて書く](#複数のサイズと形式をまとめて書くderive)）。
 型は今までと同じ配列なので、`outputs[0]` を読むコードはコンパイルも実行も通る
 ——**通ったうえで 2 本目以降を黙って捨てる。** 無視した結果が「成果物が 1 つしか
 無い」という誤った事実になるので、版で断る。
@@ -613,6 +613,10 @@ $ kiri cutout product.jpg -o out/product.png \
 **省いたキーは `--format` / `--quality` / `--effort` / `--max-bytes` を継ぐ。**
 `format` を省いて `--format` も無ければ `--output` の拡張子から決まる。
 
+**同じキーを 2 回書いたら断る。** `width=100,width=250` を後勝ちで通すと、
+「書いたのに効かない」指定が 1 つだけ残ることになる（未知のキーは断っているのだから、
+ここだけ緩める理由が無い）。
+
 `--sizes` と `--formats` は直積の糖衣で、**size が外・format が内**の順に並ぶ。
 `--sizes` だけなら形式は 1 つ、`--formats` だけなら幅は最終画像のまま（リサイズ
 しない）。2 つの組み立て方が混ざると「どちらが勝つか」という覚える規則が増えるので、
@@ -630,6 +634,12 @@ $ kiri cutout product.jpg -o out/product.png \
   `"jpeg"` のままで、これは今日の `--output out.jpg` と同じ不揃いである
 - `{role}` を書いたのに役目を持たない派生があれば `INVALID_NAMING_TEMPLATE` で断る
 
+**綴った名前がファイル名 1 つでなければ断る。** 区切り文字（`/`）や `..`、絶対パスを
+含む名前は `INVALID_NAMING_TEMPLATE` になる（`role` の値も同じ関門を通る）。書き出し先が
+`--output` の親に限られるという上の約束は、これで初めて保証される——`batch` の
+`output` は `--base-dir` の下へ寄せる規約になっているが、spec の `naming` /
+`derive[].role` はその関門を通らないので、素通しにすると spec の 1 行で境界を越えられる。
+
 **`--output` をディレクトリとしては読まない。** そう読むと「出力先が既にあるなら
 `--force` が要る」という `OUTPUT_EXISTS` の規約と両立しなくなる。`--output` は
 書き出し先そのもの（派生が 1 本のとき）か、名前の雛形（2 本以上のとき）である。
@@ -644,13 +654,15 @@ $ kiri cutout product.jpg -o out/product.png \
 
 | 検査 | 落ちたときの code |
 |---|---|
-| 2 本以上の派生が同じパスになる | `OUTPUT_NAME_COLLISION` |
+| 2 本以上の派生が同じパスになる（大文字小文字だけの違いも含む） | `OUTPUT_NAME_COLLISION` |
 | 派生のパスが `--preview` / `--debug-mask` / `--manifest` と重なる | `SIDE_OUTPUT_CONFLICT` |
 | 派生のパスが既にあり `--force` が無い | `OUTPUT_EXISTS`（`--dry-run` なら `DRY_RUN_OUTPUT_EXISTS`） |
 
 どれで落ちてもファイルは 1 つも書かれない。`OUTPUT_NAME_COLLISION` は `--force` でも
 許さない——上書きの可否は「利用者の既存のファイルを壊してよいか」の話で、こちらは
-1 回の実行が自分の成果物を自分で潰す指定だからである。
+1 回の実行が自分の成果物を自分で潰す指定だからである。**大文字小文字だけが違う
+2 本も断る**——macOS や Windows の既定では区別されないので同じ 1 ファイルへ落ち、
+通せば「JSON は 2 本書いたと報告し、ディスクには 1 本しか無い」ことになる。
 
 **ピークメモリは派生の数に比例しない。** 1 本ずつ「リサイズ → エンコード →
 書き出し → 解放」を回すので、24.5MP × N を同時には持たない。並列は `batch` の
@@ -659,12 +671,24 @@ $ kiri cutout product.jpg -o out/product.png \
 ##### 派生ごとの警告
 
 1 実行で複数の派生を書く以上、「どの出力の話か」が分からない警告は分岐の材料に
-ならない。**派生ごとに出うる警告は、どれも `data.output` にその出力のパスを持つ。**
+ならない。**派生ごとに出うる警告は、どれも `data.output` で「どの出力の話か」を
+名乗る。**
 
 `ALPHA_FLATTENED` / `QUALITY_REDUCED` / `MAX_BYTES_UNREACHABLE` /
 `ICC_NOT_EMBEDDED` / `UPSCALED` / `DRY_RUN_OUTPUT_EXISTS` の 6 つで、値は
-`outputs[].path` と同じ文字列である。背景やマスクの診断のように派生と関係のない
-警告には付かない。
+`outputs[].path` か、`--manifest` のパスである。背景やマスクの診断のように派生と
+関係のない警告には付かない。
+
+書き分けが 2 つある。
+
+- **`DRY_RUN_OUTPUT_EXISTS` は目録にも出る。** `--manifest` も本出力と同じ上書きの
+  規約に従うので、`--dry-run` で既にあればそのパスを `data.output` に載せる。
+  この 1 本だけが `outputs[]` に現れない値になる
+- **`UPSCALED` には出どころが 2 つある。** 派生のリサイズで拡大したものは
+  `data.output` を持つ。`kiri resize --allow-upscale` 自身の拡大は**持たない**
+  ——それは派生ごとの事象ではなく、**最終画像そのもの**に起きたことだからである。
+  無い帰属をでっち上げて `output` を付けるほうが嘘になる。`data.output` の有無が
+  そのまま出どころの区別になる（持たない `UPSCALED` は resize 段のもの）
 
 ##### マニフェスト（`--manifest`）
 
@@ -695,6 +719,9 @@ $ kiri cutout product.jpg -o out/product.png \
   （`data.failed` が件数）
 - 一時ファイルへ書いてから `rename` するので、途中で落ちても半端な JSON は残らない。
   書けなければ `MANIFEST_WRITE_FAILED`（exit 1）
+- 上書きの可否は**1 枚も書く前に**問う。`batch` でも同じで、`--force` の無い
+  `--manifest` が既存なら 1 件も処理せずに `OUTPUT_EXISTS` で止まる——数百点を
+  書き切ってから断ると、何が書けてどれが失敗したのかを返す手段が無くなる
 - `--dry-run` では書かない。パスが既にあれば他の出力と同じく
   `DRY_RUN_OUTPUT_EXISTS` で知らせる
 

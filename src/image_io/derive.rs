@@ -71,6 +71,15 @@ impl DeriveSpec {
     /// `INVALID_DERIVATION` を被せる（`INVALID_MAX_BYTES` と同じ前例）
     pub fn set(&mut self, key: &str, value: &str) -> std::result::Result<(), String> {
         let number = |what: &str| format!("{key} には{what}を指定してください（'{value}'）");
+        // **同じキーを 2 度書いたら断る。** 黙って後勝ちにすると
+        // `--derive 'width=100,width=250'` で 250 だけが効き、「書いたのに効かない」が
+        // ここにだけ残る——未知のキーをきちんと断っているのと食い違う。
+        // JSON のオブジェクトは serde_json の時点で重複が潰れるので、塞ぐのは CLI の穴
+        if self.already_has(key) {
+            return Err(format!(
+                "{key} が 2 回指定されています（後の値だけが黙って効くのを避けるため断ります）"
+            ));
+        }
         match key {
             "width" => self.width = Some(dimension(value, key)?),
             "height" => self.height = Some(dimension(value, key)?),
@@ -123,6 +132,15 @@ impl DeriveSpec {
                 if value.is_empty() {
                     return Err("role に空文字は指定できません".to_string());
                 }
+                // **役目の札にパスを書かせない。** `{role}` はそのまま
+                // ファイル名の一部になるので、区切りや `..` を通すと
+                // `--output` の親の外へ書ける。断るのは `naming::beside` でも
+                // 同じだが、ここで断るほうが原因（どの派生の role か）が読める
+                if value.contains('/') || value.contains('\\') || value == "." || value == ".." {
+                    return Err(format!(
+                        "role にディレクトリの区切りや '..' は指定できません（'{value}'）"
+                    ));
+                }
                 self.role = Some(value.to_string());
             }
             _ => {
@@ -133,6 +151,24 @@ impl DeriveSpec {
             }
         }
         Ok(())
+    }
+
+    /// そのキーに既に値が入っているか。**キーの綴りは `set` の `match` と同じ
+    /// 並びで持つ**——ここに書き忘れたキーだけが黙って後勝ちに戻る。
+    /// 未知のキーは `false` を返し、`set` の側の「知らないキーです」へ落とす
+    fn already_has(&self, key: &str) -> bool {
+        match key {
+            "width" => self.width.is_some(),
+            "height" => self.height.is_some(),
+            "fit" => self.fit.is_some(),
+            "allow_upscale" => self.allow_upscale.is_some(),
+            "format" => self.format.is_some(),
+            "quality" => self.quality.is_some(),
+            "effort" => self.effort.is_some(),
+            "max_bytes" => self.max_bytes.is_some(),
+            "role" => self.role.is_some(),
+            _ => false,
+        }
     }
 
     /// 寸法の指定があるか。**無ければリサイズしない**（最終画像そのまま）
@@ -525,6 +561,59 @@ mod tests {
             };
             image::Rgba([next(), next(), next(), 255])
         })
+    }
+
+    /// `DERIVE_KEYS` のどのキーも、2 度目の値を断る。
+    ///
+    /// **`already_has` への書き忘れはコンパイラが何も言わない。** 落ちたキーだけが
+    /// 黙って後勝ちに戻るので、一覧と突き合わせて総当たりする
+    #[test]
+    fn every_derive_key_refuses_a_second_value() {
+        let samples = [
+            ("width", "100"),
+            ("height", "100"),
+            ("fit", "cover"),
+            ("allow_upscale", "true"),
+            ("format", "png"),
+            ("quality", "50"),
+            ("effort", "3"),
+            ("max_bytes", "500k"),
+            ("role", "hero"),
+        ];
+        let covered: Vec<&str> = samples.iter().map(|(k, _)| *k).collect();
+        assert_eq!(covered, DERIVE_KEYS, "一覧に載ったキーを試していない");
+        for (key, value) in samples {
+            let mut spec = DeriveSpec::default();
+            spec.set(key, value).unwrap();
+            let err = spec.set(key, value).unwrap_err();
+            assert!(err.contains("2 回"), "{key}: {err}");
+        }
+    }
+
+    /// 後勝ちを断った側の値は残らない。
+    ///
+    /// 「書いたのに効かない」を 1 つも残さないための検査である
+    #[test]
+    fn the_first_value_survives_when_a_duplicate_is_refused() {
+        let mut spec = DeriveSpec::default();
+        spec.set("width", "100").unwrap();
+        assert!(spec.set("width", "250").is_err());
+        assert_eq!(spec.width, Some(100));
+    }
+
+    /// 役目の札にパスは書けない。`{role}` はそのままファイル名の一部になる
+    #[test]
+    fn a_role_that_spells_a_path_is_refused() {
+        for value in ["/tmp/kiri_escape_test", "../escaped", "a/b", "..", "."] {
+            let mut spec = DeriveSpec::default();
+            assert!(
+                spec.set("role", value).is_err(),
+                "通してはいけない: '{value}'"
+            );
+        }
+        let mut spec = DeriveSpec::default();
+        spec.set("role", "hero-2x").unwrap();
+        assert_eq!(spec.role.as_deref(), Some("hero-2x"));
     }
 
     fn codes(warnings: &[Warning]) -> Vec<WarningCode> {

@@ -1074,6 +1074,55 @@ public リポジトリなので GitHub 製の標準ランナーは分数無制�
         画像を 5 件並べても同じように伸びる（`image` の PNG エンコーダの
         確保・解放がそのまま常駐に残る）。同条件の JPEG では 5 本と 1 本の差が
         1MB を切る
+  - ※ **レビューで出た 11 件を直した。** どれも実機で再現したもので、設計に
+        触れたのは次の 5 つである（残りは一時ファイルの後始末・文書の綴り・
+        重複キーの扱い）:
+    - **寸法に依存しない命名の検査を `output::plan_naming` へ前倒しした。**
+          テンプレートの解析も `{role}` の検査も最終画像の寸法を 1 つも見ないのに、
+          `resolve` の中でやると `cutout --optimize` を回し切ってから綴り違いに
+          気づくことになる。解いた `Naming` は `OutputPlan`（形式と命名の 2 つ）に
+          まとめて `write_images` / `finish` へ渡す——2 度解いて片方だけが通る
+          状態を作らないため。`{width}` に依存する衝突の検査は `resolve` に残る。
+          併せて cutout の `--debug-mask` を `write_images` の後ろへ移した
+          （先に書くと「どれで落ちてもファイルは 1 つも書かれない」が破れる）
+    - **`naming::beside` を `Result` にし、綴った名前がファイル名 1 つで
+          あることを検査する。** `Path::join` は引数が絶対パスなら基底を捨てるので、
+          `{role}` や `--naming` の 1 語で `--output` の親の外へ書けていた。
+          batch の `output` は `--base-dir` の下へ寄せる規約なのに、spec の
+          `naming` / `derive[].role` はその関門を通らない——**spec は他人が
+          生成しうるデータファイル**なので、ここは実装で閉じるしかない
+    - **衝突の検査を `to_lowercase` で畳んだキーでも見る。** macOS の既定
+          （APFS の case-insensitive）では `x_Hero.jpg` と `x_hero.jpg` が
+          同じ 1 ファイルになり、通すと **JSON は 2 本書いたと報告し、ディスクには
+          1 本しか無い**。機械可読なレポートが嘘をつくので MEDIUM ではなく HIGH
+          として直した
+    - **`--naming` の走査を 1 文字ずつのステートマシンにした。** 「`{` を探して
+          その後ろの `}` を探す」形では最後の置換子より前の `}` を一度も見ず、
+          `stem}_{width}.{ext}` が `stem}_200.jpg` として書き出されていた
+          ——実装コメント自身が挙げていた反例である
+    - **`UPSCALED` は契約の文面のほうを直した**（実装は据え置き）。resize 段の
+          拡大は**最終画像そのもの**に起きたことで、派生ごとの事象ではない。
+          無い帰属をでっち上げて `data.output` を付けるほうが嘘になるので、
+          README と `kiri schema` に出どころが 2 つあることを書き分け、
+          `data.output` の有無がそのまま区別になると明示した。
+          `DRY_RUN_OUTPUT_EXISTS` が `--manifest` のパスを名乗る枝も同じ理由で
+          文面の側を正した
+  - ※ **batch の `--manifest` の上書き検査を `run()` の先頭へ移した。**
+        `write_manifest` の中で問うていたので、検査が数百点を書き切った後になり、
+        `OUTPUT_EXISTS` が `Err` として返って `BatchReport` が丸ごと捨てられていた
+        ——利用者に残るのはエラー 1 行だけで、**何枚書かれたのかも、どれが成功し
+        どれが失敗したかも返らない**。convert / resize / rotate / cutout の 4 つは
+        最初から `run()` の先頭で問うており、batch だけが例外になっていた
+  - ※ テスト名: `the_batch_manifest_overwrite_check_runs_before_any_item_is_written` /
+        `a_cutout_that_fails_the_naming_check_writes_no_debug_mask` /
+        `a_name_that_leaves_the_output_directory_is_refused` /
+        `two_derivations_differing_only_in_case_are_a_collision` /
+        `an_unmatched_closing_brace_is_refused_anywhere_in_the_template` /
+        `a_derivation_key_written_twice_is_refused` /
+        `a_failed_manifest_write_leaves_no_temporary_file` /
+        `every_derive_key_refuses_a_second_value`。`UPSCALED` の書き分けは
+        既存の `every_derivation_bound_warning_names_its_output` へ
+        `kiri resize --allow-upscale` の枝を足して固定した
 
 ## 6. 残件の優先順位
 

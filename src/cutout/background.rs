@@ -61,6 +61,19 @@ pub struct BackgroundEstimate {
     /// 外周サンプルのうち、推定背景色から ΔE<=5 に収まる割合 (0.0-1.0)
     pub uniformity: f64,
     pub samples: usize,
+    /// `rgb` が**不透明な外周画素から出たか。**
+    ///
+    /// `collect_border_pixels` は不透明な外周画素を優先し、1 つも無いときだけ
+    /// やむなく全件（＝透明な画素の RGB）を使う。**後者で出た `rgb` は
+    /// 「その色の背景があった」ことを意味しない**——アルファ 0 の画素が持つ
+    /// RGB は表示に使われず、書いたエンコーダが何を詰めたかで決まる。
+    ///
+    /// 切り抜きは「背景に近い画素を透かす」ためにこの色を使うので、外周が
+    /// 全部透明なら既に透けていて実害が無い。**害が出るのは、この色を
+    /// 測定値として配る側**である（`kiri lint` の `background`）——そこが
+    /// 「測った色」と「やむなく置いた色」を見分けられるように、推定した側が
+    /// 自分の拠りどころを名乗る。
+    pub from_opaque: bool,
     /// 外周サンプルの推定背景色からの ΔE 分布
     pub delta_e: DeltaEQuantiles,
     /// 外周の帯で測った勾配強度（1px あたりの輝度変化量）の分布。
@@ -90,12 +103,14 @@ impl BackgroundEstimate {
 /// 中央値を使うのは、外周に商品がわずかに掛かっている場合に平均だと引きずられるため。
 pub fn estimate_background(image: &RgbaImage, border: u32) -> BackgroundEstimate {
     let texture = border_gradient_quantiles(image, texture_band(image, border));
-    let samples = collect_border_pixels(image, border);
+    let Sampled { samples, opaque } = collect_border_pixels(image, border);
     if samples.is_empty() {
         return BackgroundEstimate {
             rgb: [255, 255, 255],
             uniformity: 0.0,
             samples: 0,
+            // 標本が 1 つも無いので、255,255,255 は測った色ではなく置いた色である
+            from_opaque: false,
             delta_e: quantiles(&[]),
             texture,
         };
@@ -110,6 +125,7 @@ pub fn estimate_background(image: &RgbaImage, border: u32) -> BackgroundEstimate
         rgb,
         uniformity: within as f64 / samples.len() as f64,
         samples: samples.len(),
+        from_opaque: opaque,
         delta_e: quantiles(&deltas),
         texture,
     }
@@ -1034,11 +1050,22 @@ fn quantiles(sorted: &[f64]) -> DeltaEQuantiles {
     }
 }
 
+/// 集めた外周サンプルと、**それが不透明画素だったか**。
+///
+/// 真偽を戻り値へ混ぜるのは、「どちらの枝を通ったか」を呼び出し側が
+/// 標本の中身から当て直せないためである（透明画素の RGB がたまたま
+/// 背景色と同じこともある）。
+struct Sampled {
+    samples: Vec<[u8; 3]>,
+    opaque: bool,
+}
+
 /// 外周 `border` px の帯にあるピクセルを集める。
 ///
 /// 既に透過している画像（切り抜き済みの再処理など）では透明ピクセルは背景色の
-/// 情報を持たないため除外する。全て透明だった場合のみ、やむなく全件を使う。
-fn collect_border_pixels(image: &RgbaImage, border: u32) -> Vec<[u8; 3]> {
+/// 情報を持たないため除外する。全て透明だった場合のみ、やむなく全件を使う
+/// ——**そのことは `Sampled::opaque` が偽で名乗る**（`BackgroundEstimate::from_opaque`）。
+fn collect_border_pixels(image: &RgbaImage, border: u32) -> Sampled {
     let mut opaque = Vec::new();
     let mut all = Vec::new();
     for_each_border_pixel(image, border, |_, _, rgb, is_opaque| {
@@ -1047,7 +1074,17 @@ fn collect_border_pixels(image: &RgbaImage, border: u32) -> Vec<[u8; 3]> {
             opaque.push(rgb);
         }
     });
-    if opaque.is_empty() { all } else { opaque }
+    if opaque.is_empty() {
+        Sampled {
+            samples: all,
+            opaque: false,
+        }
+    } else {
+        Sampled {
+            samples: opaque,
+            opaque: true,
+        }
+    }
 }
 
 fn median_rgb(samples: &[[u8; 3]]) -> [u8; 3] {
@@ -1223,6 +1260,7 @@ mod tests {
             rgb,
             uniformity: 1.0,
             samples: 100,
+            from_opaque: true,
             delta_e: quantiles(&[]),
             texture: GradientQuantiles::default(),
         }

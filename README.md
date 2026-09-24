@@ -44,6 +44,8 @@ $ kiri schema --json
   "exit_codes": [{ "code": 0, "meaning": "成功" }, ...],
   "errors":   [{ "code": "OUTPUT_EXISTS",  "exit_code": 2, "summary": "出力先が既に存在する。--force が要る" }, ...],
   "warnings": [{ "code": "LOW_UNIFORMITY", "summary": "背景の均一度が低い（単色背景ではない）" }, ...],
+  "profiles":  [{ "name": "amazon", "revision": "2026-09", "rules": { ... } }, ...],
+  "lint_checks": [{ "name": "format", "needs_pixels": false }, ...],
   "global_options": [{ "name": "--json", "global": true, "takes_value": false, ... }],
   "commands": [
     {
@@ -73,6 +75,11 @@ $ kiri schema --json
 - `warnings[]` / `errors[]` は実装と同じ表から生成される。警告もエラーもそこへ足す以外に
   作る方法が無いので、**載っていない code が飛んでくることは構造的に起こらない**
 - `fields[]` は結果の値の読み方（しきい値と `null` の意味）。後述
+- `profiles[]` は `--profile` / `kiri lint` が見る規格の表（条件・出典・版）、
+  `lint_checks[]` は `kiri lint` が見る条件の一覧（`{name, needs_pixels}`）。
+  **`checks[].name` の綴りを散文から抜き直さずに済ませる**ためで、
+  `needs_pixels` が真の項目は AVIF では必ず `skipped` になる——渡す前に
+  どれが飛ぶかを予測できる
 - `accepts` は受け付ける値の一覧（`--format` なら avif / png / jpeg）。**綴りを外すと
   clap が code 無しの exit 2 で落ちる**ので、呼ぶ前に知れる必要がある。自由な値を取る
   項目ではキーごと消える。数値の範囲は clap から読めないため、必要なものは `summary`
@@ -2360,7 +2367,7 @@ sRGB のまま比べると**ガンマぶんだけ暗い側へ偏る**（黒い�
 | `COLOR_CONVERSION_SKIPPED` | `--no-color-convert` により変換していない |
 | `COLOR_SPACE_UNCALIBRATED` | EXIF が uncalibrated で ICC も無い |
 | `MANIFEST_PARTIAL` | 一部の項目が失敗したまま `--manifest` を書いた（成功分だけが載っている） |
-| `PROFILE_OVERRIDDEN` | `--profile` が求めた値を明示指定が押しのけた（`--output` の拡張子を含む）。項目ごとに 1 件出る |
+| `PROFILE_OVERRIDDEN` | `--profile` が求めた値を明示指定が押しのけた（`--output` の拡張子と、`--derive` / `--formats` が書いた形式を含む）。項目ごと・派生ごとに 1 件出る |
 | `PROFILE_UNCHECKABLE` | 画素を読まないと測れない項目を `kiri lint` が検査していない（AVIF）。飛ばした項目は `data.checks` にある |
 
 この表は `kiri schema --json` の `warnings[]` が同じものを返す。**README を読ませる
@@ -2553,6 +2560,30 @@ out2.png  1600x1600  png  52.4 KB  (644 ms)
 指定したのに効かなかった項目はどれか」であり、`-o out.png --profile shopify`
 （shopify は PNG を第一候補にする）のように同じ値なら、並べても読む側の次の一手は
 1 つも変わらない。
+
+**拡張子が未知の綴りなら、profile を付けても断る。** `-o out.xyz` は `--profile` の
+有無に関わらず `UNKNOWN_OUTPUT_FORMAT`（exit 2）である。ここで profile に形式を
+決めさせると、`--profile` を付けただけで `.xyz` という名前の JPEG が黙って書かれる
+——拡張子と中身を食い違わせないという上の判断を、同じ指定の別の綴りで破ることに
+なる。拡張子を**綴っていない**パス（`--naming` の雛形）では今までどおり profile が
+形式を決める。
+
+**`--derive` / `--formats` が書いた形式は、上の 4 段を 1 つも通らない。** 派生は
+自分の `format` を持てるので、`--profile amazon --derive 'format=avif'` は profile の
+形式指定を丸ごと迂回する。**そのまま黙って通すと、amazon で書いたものが同じ
+amazon の `kiri lint` で落ちる**ので、許容の外へ出た派生ごとに 1 件ずつ報せる。
+
+```json
+{ "code": "PROFILE_OVERRIDDEN",
+  "data": { "key": "format", "profile": ["jpeg", "png"], "used": "avif",
+            "derive": 0, "role": "hero" } }
+```
+
+パスはまだ綴れない（多派生の名前は最終画像の寸法が決まってから決まる）ので、
+`derive`（`outputs[]` と同じ並びの添字）と、書いてあれば `role` でどの出力かを指す。
+**`format` を書かなかった派生には profile の形式が継承される**——派生は
+`--output` の解決結果（`--format` > 拡張子 > profile）を継ぐので、迂回しうるのは
+形式を自分で書いた派生だけである。
 
 **`--profile` を渡さない実行は 1 バイトも変わらない。** 結果 JSON に
 `settings.profile` は現れず、成果物も profile を足す前と同じである
@@ -2871,8 +2902,8 @@ product_amazon.jpg
     o format        "jpeg"  (要求 ["jpeg","png"])
     o longest_side  1600  (要求 {"max":10000,"min":500})
     o alpha         false  (要求 false)
-    o color_space   {"color_converted":false,"color_space":"sRGB","icc_profile":true}  (要求 "sRGB")
-    o background    {"delta_e":0.0,"rgb":[255,255,255]}  (要求 {"delta_e_max":2.0,"rgb":[255,255,255]})
+    o color_space   {"color_converted":false,"color_named":true,"color_space":"sRGB","icc_profile":true}  (要求 "sRGB")
+    o background    {"border_px":48,"delta_e":0.0,"rgb":[255,255,255],"uniformity":1.0}  (要求 {"delta_e_max":2.0,"rgb":[255,255,255]})
     o fill_ratio    {"bbox":[92,233,1507,1366],"source":"colour","value":0.885}  (要求 0.85)
 ```
 
@@ -2925,6 +2956,7 @@ $ kiri lint product_amazon.jpg --profile amazon --json
       "expected": "sRGB",
       "actual": {
         "color_converted": false,
+        "color_named": true,
         "color_space": "sRGB",
         "icc_profile": true
       }
@@ -2941,12 +2973,14 @@ $ kiri lint product_amazon.jpg --profile amazon --json
         ]
       },
       "actual": {
+        "border_px": 48,
         "delta_e": 0.0,
         "rgb": [
           255,
           255,
           255
-        ]
+        ],
+        "uniformity": 1.0
       }
     },
     {
@@ -2984,6 +3018,23 @@ $ kiri lint product_amazon.jpg --profile amazon --json
 - `fill_ratio` は**どう測ったか**を `actual.source` が名乗る。切り抜き済みの
   成果物ではアルファの外接矩形（`alpha`）が、不透明な画像では色から見立てた主体
   （`colour`）が正解になる
+- `background` は**どれだけの幅を見た数なのか**を `actual.border_px` が名乗る。
+  外周の中央値がそのまま合否になるので、帯は `--border` そのものではなく
+  `max(短辺/33, --border)`（1600px なら 48px）である。既定の `--border 2` は
+  切り抜きのための値で、そこだけを見ると**白い縁 1 本で灰色一面の画像が
+  「背景は純白」になる**。`--border` は下限として効き、広げる向きにだけ働く。
+  `kiri info --border <border_px>` を走らせれば、lint が見たのと同じ背景色が出る
+- **測れないものは `pass` と言わない。** 外周に不透明な画素が 1 つも無ければ
+  （透過 PNG）`background` は `unmeasurable` で `actual` は `null` になる
+  ——アルファ 0 の画素が持つ RGB は表示に使われない値なので、それを「測った
+  背景色」として配ると作り話になる。外周が単色として扱えないとき
+  （`uniformity` が 0.90 を切る）も `unmeasurable` で、そのときは `rgb` を出さず
+  `border_px` と `uniformity` だけを返す
+- `color_space` は**ファイルが名乗っているか**を `actual.color_named` が言う。
+  ICC も EXIF ColorSpace も無いファイルは何も名乗っていないので `unmeasurable`
+  である（AVIF の CICP が `unspecified` のときとまったく同じ扱い）。`kiri info` が
+  同じファイルに `"sRGB"` と答えるのは「kiri がその画素を sRGB として扱った」と
+  いう別の事実で、**規格が問うているのはファイルの名乗りのほう**である
 
 `status` は 4 つ。**合格は `pass` だけである。**
 
@@ -2992,7 +3043,7 @@ $ kiri lint product_amazon.jpg --profile amazon --json
 | `pass` | 見た上で規格を満たしている | — |
 | `fail` | 規格に触れている | その項目を直す |
 | `skipped` | **この形式では構造的に測れない**（AVIF の画素） | JPEG か PNG で渡し直す |
-| `unmeasurable` | 測ろうとしたが、この画像からは出なかった（主体が見つからない、色空間を名乗っていない） | 素材を見る。形式を変えても同じ結果になる |
+| `unmeasurable` | 測ろうとしたが、この画像からは出なかった（主体が見つからない、外周に不透明な画素が 1 つも無い、背景が単色でない、色空間を何も名乗っていない） | 素材を見る。形式を変えても同じ結果になる |
 
 不合格なら **exit 5**、`code` は `PROFILE_VIOLATION`。処理そのものは成功していて
 検査対象のファイルもそのままあるので、**結果 JSON は `ErrorReport` に差し替わらない**

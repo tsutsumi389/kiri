@@ -978,6 +978,16 @@ pub struct SchemaReport {
     pub warnings: Vec<WarningCodeEntry>,
     /// 結果の値をどう読むか。しきい値と `null` の意味を配る
     pub fields: Vec<FieldEntry>,
+    /// `kiri lint` が見る条件の一覧。**`lint::Check::ALL` から組む。**
+    ///
+    /// `checks[].name` の綴りをエージェントが日本語の散文から抜き直さずに
+    /// 済ませるために要る（`--fail-on` の指標が `accepts` で配られているのと
+    /// 同じ役目である）。並びは `checks[]` に出る順そのもので決定的。
+    ///
+    /// **条件そのものは `profiles[]` が配る。** ここにあるのは「kiri が見る
+    /// 項目の一覧」で、どの規格がどれを規定するかとは別である——規定の無い
+    /// 条件は `checks[]` に 1 行も出ない
+    pub lint_checks: Vec<LintCheckEntry>,
     /// `--profile` / `kiri lint` が見る規格の表。**実装の定数から組む。**
     ///
     /// 並びは `profile::ALL` の順で決定的。ここが無いと、不合格の根拠
@@ -989,6 +999,19 @@ pub struct SchemaReport {
     /// 素直に組むと schema から丸ごと落ちる
     pub global_options: Vec<ArgEntry>,
     pub commands: Vec<CommandEntry>,
+}
+
+/// `kiri lint` が見る条件 1 つ。
+#[derive(Debug, Serialize)]
+pub struct LintCheckEntry {
+    /// `checks[].name` に出る綴り。**`checks[]` の中で一意である**
+    pub name: &'static str,
+    /// 画素を読まないと測れない条件か。
+    ///
+    /// **真なら AVIF では必ず `skipped` になる**（kiri は AVIF をデコード
+    /// できない）。渡す前にどの項目が飛ぶかを予測できるので、構図まで見たい
+    /// 呼び出し側は JPEG / PNG を選び直せる
+    pub needs_pixels: bool,
 }
 
 /// 1 つのプリセット。**`profile::ALL` をそのまま機械可読にしたものである。**
@@ -1020,8 +1043,10 @@ pub struct ProfileEntry {
 pub struct ProfileRules {
     pub longest_side_min: Option<u32>,
     pub longest_side_max: Option<u32>,
-    /// 総画素数の上限。**長辺の上限とは別の条件である**——5000x5000 は
-    /// 長辺 5000 を満たしながら 25MP を超える
+    /// 総画素数の上限。**長辺の上限とは別の条件である**——長辺 20000px まで
+    /// 許して 25MP で頭を打つ規格なら、20000x2000 は長辺を満たしたまま
+    /// ここで落ちる。いまの shopify では長辺の上限（5000）から出る
+    /// 25,000,000 がこの値と一致するので、**単独では落ちない**
     pub max_pixels: Option<u64>,
     pub square: bool,
     /// 要求される背景色。綴りは `background.rgb` と同じ `[r, g, b]` にしてある

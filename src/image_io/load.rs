@@ -62,6 +62,19 @@ pub struct LoadedImage {
     /// 実際に回転・反転を適用したか
     pub orientation_applied: bool,
     pub icc_profile: bool,
+    /// ファイルが色空間を**1 つでも名乗っていたか**（ICC か EXIF ColorSpace）。
+    ///
+    /// **`color_space` からは読めない事実である。** ICC も EXIF の申告も無い
+    /// 入力に対して `color_space` は `COLOR_SPACE_SRGB` を返す——kiri がその
+    /// 画素を sRGB として扱うのは正しく、`info` の出力はそのままでよい。
+    /// だが「sRGB として扱った」と「ファイルが sRGB を名乗っていた」は
+    /// 別の事実で、**規格が sRGB を要求しているかを検査する側が要るのは
+    /// 後者**である（`kiri lint` の `color_space`）。
+    ///
+    /// ここが偽なら kiri には材料が 1 つも無い。AVIF の CICP が unspecified の
+    /// ときに `unmeasurable` を返すのとまったく同じ状態で、**形式が違うだけで
+    /// 合否が変わる枝を作らない**ためにこの 1 つを持つ。
+    pub color_named: bool,
     /// 検出した色空間の名前（"sRGB" / "Display P3" / "uncalibrated" など）
     pub color_space: String,
     /// 埋め込み ICC 自身の名乗り。sRGB 相当と判定して素通ししたときも、
@@ -168,6 +181,10 @@ pub fn load_with(path: &Path, opts: &LoadOptions) -> Result<LoadedImage> {
         exif_orientation,
         orientation_applied,
         icc_profile,
+        // **名乗りの有無は「何があったか」だけで決まる。** ICC が付いていれば
+        // 中身が何であれ名乗っており、EXIF ColorSpace はその値（1 = sRGB、
+        // 0xFFFF = uncalibrated）が何であれ申告そのものである
+        color_named: icc_profile || exif_color_space.is_some(),
         color_space: color.name,
         color_profile: color.profile,
         color_converted: color.converted,

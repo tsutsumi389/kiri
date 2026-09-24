@@ -1298,6 +1298,41 @@ public リポジトリなので GitHub 製の標準ランナーは分数無制�
         まったく同じ経路（`load_with` → `see_background` → `analyse_background_seen`）で
         測る——lint だけが別の測り方を持つと、`kiri info` が返した背景色と lint が
         照らした背景色が食い違い、**どちらが本当かを利用者が確かめる手段が無くなる**
+  - [x] レビュー指摘（実際に動かして見つかったもの）を直した。
+        - **合否を分ける帯を `field_band`（`max(短辺/33, --border)`）にした。**
+          既定の `--border 2` は切り抜きのための値で、cutout ではそこから取った色が
+          閾値の種にしかならないが、lint では外周の中央値が**そのまま合否になる**。
+          1600px の画像の縁 0.125% を見て「背景は純白」と答えていたため、外周 2px
+          だけ白い灰色一面の画像が全項目 pass / exit 0 になっていた。新しい定数は
+          置かず、「場の推定でここは背景だと信じてよい帯」として既にあるものを
+          使う。`--border` は下限として効き、使った幅は `checks[].actual.border_px`
+          が名乗る（`kiri info --border <その値>` で同じ数を再現できる）
+        - **測れていないものを `pass` と言わない。** 外周に不透明な画素が 1 つも
+          無ければ `background` は `unmeasurable`（`actual` は `null`）——透過 PNG に
+          `rgb: [0,0,0]` / `delta_e: 100.0` を配っていた。外周が単色として扱えない
+          （`is_uniform` が偽）ときも `unmeasurable` で、しきい値は `cutout` が
+          `LOW_UNIFORMITY` を出すのに使っているものをそのまま通す
+        - **色空間を 1 つも名乗っていないファイルを `pass` にしない。**
+          `LoadedImage::color_named`（ICC か EXIF ColorSpace があったか）を足し、
+          偽なら `unmeasurable`。**AVIF の CICP が unspecified のときと同じ扱い**で、
+          形式で合否が変わる枝を作らない。`kiri info` の `color_space` は 1 文字も
+          動かない（あちらが答えているのは「画素をどう扱ったか」である）
+        - **画素を要する条件を規定しない規格では見立てを走らせない**
+          （`regulates_composition`）。判定は `Check::needs_pixels` から組むので、
+          `checks[]` に出ない項目のためだけに 25MP の背景推定を払うことが無い。
+          出力は 1 バイトも変わらない（5.29MP の shopify で 0.03s → 0.01s）
+        - `kiri schema` に `lint_checks[]`（`{name, needs_pixels}`）を足し、
+          散文に書き写してあった `checks[].name` と `status` の一覧を定数から
+          組むようにした（`PROFILE_NAMES` / `FAIL_ON_METRICS` と同じ作法）
+  - [x] `--profile` が形式を決めてよい場面を絞った。**拡張子はあるが kiri の
+        知らない綴り**（`-o out.xyz`）では profile の有無に関わらず
+        `UNKNOWN_OUTPUT_FORMAT` で断る——`OutputFormat::from_path` の `None` が
+        「拡張子が無い」と「未知の拡張子」を兼ねていたため、`--profile` を
+        付けるだけで `.xyz` という名前の JPEG が書けていた。また
+        `--derive` / `--formats` が自分で書いた形式は優先順位の 4 段を 1 つも
+        通らないので、profile の `formats` の外へ出た派生ごとに
+        `PROFILE_OVERRIDDEN` を 1 件出す（`data` の `derive` / `role` でどの出力かを
+        名乗る）——黙って通すと**amazon で書いたものが同じ amazon の lint で落ちる**
   - [x] batch の spec に `profile` キーを足した（`ItemSettings` / `pick!` /
         `SETTING_KEYS` の 3 箇所）。未知の名前は CLI と同じ関門（`profile::named`）で
         `UNKNOWN_PROFILE` として断る。spec でだけ黙って既定へ落ちると、**数百点を

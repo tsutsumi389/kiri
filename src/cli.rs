@@ -151,7 +151,11 @@ pub struct LintArgs {
     #[command(flatten)]
     pub color: ColorOpts,
 
-    /// 背景色推定に使う外周の幅(px)
+    /// 背景色推定に使う外周の幅(px)。lint では**下限**として効く
+    ///
+    /// lint が背景と主体を測る帯は max(短辺/33, --border) である。既定の 2 は切り抜きのための値で、そこから取った色は cutout では閾値の種にしかならないが、lint では外周の中央値がそのまま合否になる——1600px の画像の外周 2px は縁の 0.125% しかなく、白い縁 1 本で「背景は純白」と答えてしまう。広げる向きには効き、狭める向きには効かない。
+    ///
+    /// 実際に使った幅は checks[].actual.border_px が名乗る。kiri info --border にその値を渡せば、lint が見たのと同じ背景色が出る。
     #[arg(long, default_value_t = DEFAULT_BORDER)]
     pub border: u32,
 }
@@ -173,9 +177,11 @@ fn lint_profile_long_help() -> String {
          checks[] に出ない（shopify は構図を規定しないので background も \
          fill_ratio も検査しない）。表そのもの（条件・出典の URL・版）は \
          kiri schema の profiles[] が配る。\n\
-         **checks[] が全部 pass のときだけ合格である。** fail（条件に触れた）も \
-         unmeasurable（この画像では測れなかった）も skipped（この形式では\
-         構造的に測れない）も合格ではない。不合格なら終了コードは {} で、\
+         **checks[] が全部 pass のときだけ合格である。** status は {} の 4 語で、\
+         pass 以外はどれも合格ではない——fail（条件に触れた）、\
+         unmeasurable（この画像では測れなかった）、skipped（この形式では\
+         構造的に測れない）。検査する項目の綴りは kiri schema の lint_checks[] が\
+         機械可読で配る。不合格なら終了コードは {} で、\
          結果 JSON は通常どおり返る（検査した対象のファイルはそのまま）。\
          code には {} が出る。\n\
          **AVIF は画素を検査できない。** kiri は AVIF をデコードできないので、\
@@ -183,16 +189,26 @@ fn lint_profile_long_help() -> String {
          fill_ratio は skipped になり {} が飛ばした項目を並べて出る。\
          **黙って合格にはしない**——skipped があれば passed は false である。\n\
          **背景色に完全一致は求めない。** JPEG の量子化とセンサーノイズで\
-         純白は 255 のまま揃わないので、ΔE76 {} 以内を同じ色として扱う。\
-         測った RGB と ΔE は checks[].actual が両方とも返す。\n\
+         純白は 255 のまま揃わないので、ΔE76 {} 以内を同じ色として扱う\
+         （結果 JSON の checks[].expected.delta_e_max と同じ 1 つの値である）。\
+         測った RGB と ΔE、そして測定に使った外周の帯幅 border_px は \
+         checks[].actual がまとめて返す。**帯は --border そのものではなく \
+         max(短辺/33, --border)** で、--border は下限として効く——1600px の\
+         画像の外周 2px は縁の 0.125% しかなく、そこだけを見た合否を\
+         「背景は純白だった」と名乗るわけにいかないためである。\n\
          **規格は変わる。** 版は kiri がその規格を写し取った時点であり、\
          古い kiri が古い規格で合格を出すことは避けられない。\
          profile.revision で鮮度を判断すること。",
         names.join(" / "),
+        crate::commands::lint::CHECK_STATUSES.join(" / "),
         crate::error::ErrorKind::Compliance.exit_code(),
         crate::error::ErrorCode::ProfileViolation.as_str(),
         crate::warning::WarningCode::ProfileUncheckable.as_str(),
-        profile::BACKGROUND_DELTA_E_TOLERANCE,
+        // **結果 JSON と同じ綴りにする。** f64 の Display は 2.0 を "2" に
+        // 落とすので、そのまま埋めるとヘルプが「2」と言い、結果の
+        // expected.delta_e_max は 2.0 と出る——同じ 1 つの値を 2 通りに綴ると、
+        // 読み手はそれが同じ値なのかを確かめる術を持たない
+        serde_json::json!(profile::BACKGROUND_DELTA_E_TOLERANCE),
     )
 }
 

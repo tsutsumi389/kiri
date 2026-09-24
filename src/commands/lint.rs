@@ -12,6 +12,12 @@
 //! `kiri info` が返した背景色と lint が照らした背景色が食い違い、
 //! **どちらが本当かを利用者が確かめる手段が無くなる。**
 //!
+//! **違うのは帯幅だけである。** `info` は `--border` そのもので測り、lint は
+//! `field_band`（`max(短辺/33, --border)`）で測る——外周の中央値が
+//! **そのまま合否になる**のは lint だけだからで、理由は `measure_pixels` の
+//! doc に書いた。測り方が同じなので、`checks[].actual.border_px` の値を
+//! `kiri info --border` へ渡せば同じ数が出る。
+//!
 //! # 何を合格と呼ぶか
 //!
 //! `checks[]` がすべて `pass` であることだけが合格である。`fail` も
@@ -25,6 +31,7 @@ use crate::cli::LintArgs;
 use crate::color::lab::delta_e_rgb;
 use crate::commands::output::{SUBJECT_FROM_COLOUR, round4};
 use crate::compliance::{FAIL, PASS, UNMEASURABLE};
+use crate::cutout::background::field_band;
 use crate::cutout::{BackgroundModel, analyse_background_seen, see_background};
 use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::avif_meta::{self, ColorNaming};
@@ -42,6 +49,17 @@ use crate::warning::{Warning, WarningCode};
 /// 3 つの綴りはそのまま使い、ここが足すのはこの 1 つだけ——同じ語彙を
 /// 2 箇所で定義すると、片方に綴り違いが入っても型は何も言わない。
 pub const SKIPPED: &str = "skipped";
+
+/// `checks[].status` が取りうる語のすべて。
+///
+/// **4 語が揃うのはここだけである。** `compliance.rs` は 3 語しか知らず、
+/// lint だけが `SKIPPED` を足す。`kiri schema` の散文も `--profile` の長い
+/// ヘルプもこの並びから組む——同じ 4 語を散文の側で打ち直すと、語を 1 つ
+/// 足した日にヘルプと schema のどちらかが古いままになる。
+///
+/// 並びは「合格」「触れた」「測れなかった」「この形式では測れない」の順で、
+/// **読み手が次の一手を選ぶ順**に並べてある。
+pub const CHECK_STATUSES: [&str; 4] = [PASS, FAIL, UNMEASURABLE, SKIPPED];
 
 /// `fill_ratio` を**アルファの外接矩形**から測ったことを表す綴り。
 ///
@@ -99,8 +117,35 @@ impl Check {
         }
     }
 
+    /// `ALL` の綴りを並べたもの。
+    ///
+    /// `kiri schema` の散文も、長いヘルプの一覧もここから組む。**手で書き
+    /// 写した一覧を増やさない**——`Check` へ 1 つ足したときに、散文だけが
+    /// 古い一覧を語る状態を構造的に作らないためである
+    /// （`profile::PROFILE_NAMES` / `compliance::FAIL_ON_METRICS` と同じ作法）。
+    ///
+    /// 機械可読な一覧は `kiri schema` の `lint_checks[]` が配る——そちらは
+    /// 綴りに加えて `needs_pixels` を持つので、AVIF で何が `skipped` に
+    /// なるかを渡す前に予測できる。
+    pub const NAMES: [&'static str; Check::ALL.len()] = Check::spellings();
+
+    const fn spellings() -> [&'static str; Check::ALL.len()] {
+        let mut out = [""; Check::ALL.len()];
+        let mut i = 0;
+        while i < Check::ALL.len() {
+            out[i] = Check::ALL[i].as_str();
+            i += 1;
+        }
+        out
+    }
+
     /// 画素を読まないと測れない条件か。**AVIF ではここが `skipped` になる。**
-    const fn needs_pixels(self) -> bool {
+    ///
+    /// 読み手も同じ判断ができるように `kiri schema` の `lint_checks[]` が
+    /// この値を配る（AVIF を渡す前に、どの項目が飛ぶかを予測できる）。
+    /// `regulates_composition` も同じ 1 つを見る——画素を要する条件を
+    /// 足したときに、測定を走らせる側だけが古くなることが無い。
+    pub const fn needs_pixels(self) -> bool {
         matches!(self, Check::Background | Check::FillRatio)
     }
 
@@ -190,6 +235,20 @@ struct Facts {
 struct Pixels {
     /// 外周から推定した背景色
     background: [u8; 3],
+    /// 背景を測った外周の帯の幅(px)。**`--border` そのものとは限らない**
+    /// （`measure_pixels` の doc を参照）。`checks[].actual` に載せて、
+    /// 何を測った数なのかを結果だけで読めるようにする
+    border: u32,
+    /// 外周サンプルが推定背景色から ΔE<=5 に収まる割合。
+    /// `BackgroundEstimate::uniformity` そのもの
+    uniformity: f64,
+    /// 背景色が**不透明な外周画素から出たか**
+    /// （`BackgroundEstimate::from_opaque` そのもの）
+    background_from_opaque: bool,
+    /// 単色の背景として扱えるか。**判定は `cutout` が `LOW_UNIFORMITY` を
+    /// 出すのに使っているもの（`BackgroundEstimate::is_uniform`）をそのまま
+    /// 通した結果である**——同じ「均一かどうか」に 2 つ目のしきい値を置かない
+    background_uniform: bool,
     /// 占有率。**主体を 1 つも検出できなければ `None`**（`unmeasurable`）
     fill: Option<Fill>,
 }
@@ -310,6 +369,31 @@ fn measure(args: &LintArgs) -> Result<(Facts, Vec<Warning>)> {
     }
 }
 
+/// この規格が**構図まで見るか**。偽なら背景推定も主体検出も走らせない。
+///
+/// # なぜ「lint は自前の測り方を持たない」と両立するか
+///
+/// その宣言（モジュール冒頭）が禁じているのは**別の測り方を持つこと**で、
+/// 呼ぶかどうかではない。ここが偽になるのは `checks[]` に `background` も
+/// `fill_ratio` も 1 行も出ない実行だけなので、**走らせても結果 JSON の
+/// どのバイトにも現れない**——`skipped` が増えることもない（`judge` が
+/// `skipped` を返すのは `regulated` が真だった項目に限られ、
+/// `uncheckable` はその `checks[]` から数える）。
+///
+/// # なぜ判定を `Check::needs_pixels` から組むか
+///
+/// 条件を 1 つ足したときに、**ここと `judge` のどちらか片方だけが古くなる**
+/// のを構造的に防ぐためである。画素を要する条件を足せば `needs_pixels` が
+/// 真を返し、その規格では自動的に測定が走る。
+///
+/// shopify（形式・長辺・総画素数・バイト数だけ）では 5.29MP で 0.08s を
+/// 丸ごと落とせる。1 枚なら安いが、数百点の一括検査では効く。
+fn regulates_composition(rules: &Rules) -> bool {
+    Check::ALL
+        .into_iter()
+        .any(|c| c.needs_pixels() && c.regulated(rules))
+}
+
 /// JPEG / PNG を画素まで読んで測る。
 ///
 /// **バイト列を 2 度読むことになる**（`measure` が AVIF の判別のために
@@ -318,30 +402,119 @@ fn measure(args: &LintArgs) -> Result<(Facts, Vec<Warning>)> {
 /// 判定——が `info` / `cutout` と 1 バイトも違わないことのほうが、
 /// 1 回分の読み出しより重いためである。25MP の背景推定に比べれば、
 /// 数 MB の再読み込みは測れるほどの差にならない。
+///
+/// # 合否を分ける帯は `--border` そのものではない
+///
+/// **`--border` の既定（2px）は切り抜きのための値である。** `cutout` は
+/// そこから「背景色の種」を取って画像全体を閾値で分けるので、種が 2px から
+/// 出ていても最後に見るのは全画素である。lint にはその後段が無く、外周の
+/// 中央値が**そのまま合否になる**——1600px の画像の外周 2px は縁の 0.125% で、
+/// 額装の白枠やレタッチの縁 1 本がそこを占めているだけで「背景は純白」と
+/// 答えてしまう（灰色一面の画像が全項目 pass になる実例があった）。
+///
+/// そこで背景と主体は `field_band`（`max(短辺/33, --border)`）の帯で測る。
+/// **新しい定数は置かない**——これは「場の推定で『ここは背景だ』と信じて
+/// よい外周の帯」として `background.rs` が既に答えを出している幅で、
+/// 織り目を何周期ぶんも含む広さとして選ばれている。`--border` はその
+/// **下限**として効く（`texture` / `field` の帯と同じ規約で、狭める向きには
+/// 働かない）。
+///
+/// # `kiri info` と食い違わせない
+///
+/// `info` は `--border` そのもので測るので、既定では lint と別の帯になる。
+/// **測り方は 1 つのまま**（同じ `see_background` → `analyse_background_seen`）で、
+/// 違うのは帯幅だけである。lint は使った帯幅を `checks[].actual.border_px` で
+/// 名乗るので、`kiri info --border <その値>` を走らせれば同じ数が出る——
+/// 「どちらが本当かを確かめる手段が無くなる」ことにはならない。
 fn measure_pixels(args: &LintArgs, file_size: u64) -> Result<(Facts, Vec<Warning>)> {
     let loaded = load::load_with(&args.input, &args.color.to_load_options())?;
 
+    let naming = Naming {
+        status: if !loaded.color_named {
+            // **名乗りが 1 つも無い。** ICC も EXIF ColorSpace も無いファイルで、
+            // 「sRGB である」とも「sRGB ではない」とも言う材料が kiri に無い。
+            // `load_with` の `color_space` はこの入力にも "sRGB" を返すが、
+            // それは**画素をどう扱ったか**であって、ファイルが何を名乗って
+            // いるかではない（`LoadedImage::color_named` の doc を参照）。
+            //
+            // **AVIF の CICP が unspecified のときと同じ扱いにする。** 同じ
+            // 「名乗っていない」が PNG では合格で AVIF では未測定になると、
+            // 形式で合否が変わる枝を `Facts` の doc に反して作ることになる
+            UNMEASURABLE
+        } else {
+            match loaded.color_space.as_str() {
+                COLOR_SPACE_SRGB => PASS,
+                // EXIF が 0xFFFF を**明示**した。「別の色空間かもしれない」と
+                // ファイル自身が言っているので、`fail` にすると素材を規格違反
+                // として落とし、`pass` にすると見ていないものを見たことにする
+                COLOR_SPACE_UNCALIBRATED => UNMEASURABLE,
+                // 別の色空間をはっきり名乗っている（Display P3 など）。
+                // **LUT 型の ICC（`COLOR_PROFILE_UNSUPPORTED`）もここへ来る**
+                // ——kiri はその中身を読めないので名前だけが残る。なぜ落ちたかは
+                // 同時に出るその警告が言う
+                _ => FAIL,
+            }
+        },
+        actual: Some(json!({
+            "color_space": loaded.color_space,
+            "icc_profile": loaded.icc_profile,
+            // **`color_space` からは読めない事実である。** 名乗りの無い
+            // ファイルにも `color_space` は "sRGB" が出るので、これが無いと
+            // 「EXIF が sRGB と申告した」と「誰も何も言っていない」が
+            // 結果の上で同じ形になる
+            "color_named": loaded.color_named,
+            // **検査したのはファイルの名乗りであって、読み込んだ画素では
+            // ない。** kiri が sRGB へ変換して測ったことは、ファイルが
+            // sRGB を名乗っているかという問いに何の影響も与えない
+            "color_converted": loaded.color_converted,
+        })),
+    };
+
+    let width = loaded.width();
+    let height = loaded.height();
+    let format = match loaded.format {
+        image::ImageFormat::Png => OutputFormat::Png,
+        // `load_with` が通すのは JPEG と PNG だけである
+        // （それ以外は `UNSUPPORTED_FORMAT` で断られてここへ来ない）
+        _ => OutputFormat::Jpeg,
+    };
+    // **構図を規定しない規格では 1 画素も見立てない**（`regulates_composition`）。
+    // 出力は 1 バイトも変わらず、5.29MP で 0.08s を落とせる
+    if !regulates_composition(&args.profile.rules) {
+        return Ok((
+            Facts {
+                width,
+                height,
+                file_size,
+                format,
+                has_alpha: loaded.has_alpha,
+                naming,
+                pixels: None,
+            },
+            loaded.warnings(),
+        ));
+    }
+
     // **`info` とまったく同じ経路で見立てる。** 1 度だけ測って両方に使う
     // （`info::run` が `seen` を持ち回しているのと同じ理由で、24.5MP の
-    // 測定を 2 度払わない）。
+    // 測定を 2 度払わない）。帯幅を `--border` から広げた理由は上の doc に書いた。
     //
     // **モデルは `Auto`（`cutout` の既定）を渡す。** lint が読むのは
     // `estimate`（外周の中央値）と `subject` の 2 つで、どちらも照明場の
     // 当てはめとは無関係なので、どのモデルでも同じ数になる。それでも
     // `analyse_background_seen` を通すのは、**lint が自前の測り方を
     // 持たない**ことを構造で示すためである
-    let seen = see_background(&loaded.image, args.border);
+    let border = field_band(&loaded.image, args.border);
+    let seen = see_background(&loaded.image, border);
     let analysis = analyse_background_seen(
         &loaded.image,
         Some(&seen),
-        args.border,
+        border,
         BackgroundModel::Auto,
         None,
         None,
     );
 
-    let width = loaded.width();
-    let height = loaded.height();
     // **アルファがあるならアルファが正解である。** 切り抜き済みの成果物で
     // 色の見立てを使うと、透明な余白を「背景」として測り直すことになり、
     // 書いた側（`canvas::plan` はアルファ付きの内容をそのまま置く）と
@@ -360,46 +533,21 @@ fn measure_pixels(args: &LintArgs, file_size: u64) -> Result<(Facts, Vec<Warning
         })
     };
 
-    let naming = Naming {
-        status: match loaded.color_space.as_str() {
-            COLOR_SPACE_SRGB => PASS,
-            // **名乗っていない。** ICC も EXIF の申告も無い状態で、
-            // 「sRGB ではない」と断じる材料が 1 つも無い。`fail` にすると
-            // 名乗りの無い素材を規格違反として落とすことになり、`pass` に
-            // すると見ていないものを見たことにする——`unmeasurable` だけが
-            // 事実に合う（合格ではないので `passed` は落ちる）
-            COLOR_SPACE_UNCALIBRATED => UNMEASURABLE,
-            // 別の色空間をはっきり名乗っている（Display P3 など）。
-            // **LUT 型の ICC（`COLOR_PROFILE_UNSUPPORTED`）もここへ来る**
-            // ——kiri はその中身を読めないので名前だけが残る。なぜ落ちたかは
-            // 同時に出るその警告が言う
-            _ => FAIL,
-        },
-        actual: Some(json!({
-            "color_space": loaded.color_space,
-            "icc_profile": loaded.icc_profile,
-            // **検査したのはファイルの名乗りであって、読み込んだ画素では
-            // ない。** kiri が sRGB へ変換して測ったことは、ファイルが
-            // sRGB を名乗っているかという問いに何の影響も与えない
-            "color_converted": loaded.color_converted,
-        })),
-    };
-
     Ok((
         Facts {
             width,
             height,
             file_size,
-            format: match loaded.format {
-                image::ImageFormat::Png => OutputFormat::Png,
-                // `load_with` が通すのは JPEG と PNG だけである
-                // （それ以外は `UNSUPPORTED_FORMAT` で断られてここへ来ない）
-                _ => OutputFormat::Jpeg,
-            },
+            format,
             has_alpha: loaded.has_alpha,
             naming,
             pixels: Some(Pixels {
                 background: analysis.estimate.rgb,
+                border,
+                uniformity: analysis.estimate.uniformity,
+                background_from_opaque: analysis.estimate.from_opaque,
+                // `cutout` が `LOW_UNIFORMITY` を出すのに使っている判定そのもの
+                background_uniform: analysis.estimate.is_uniform(),
                 fill,
             }),
         },
@@ -450,16 +598,71 @@ fn judge(check: Check, rules: &Rules, facts: &Facts) -> LintCheck {
         Check::ColorSpace => (facts.naming.status, facts.naming.actual.clone()),
         Check::Background => {
             // `regulated` が `Some` を確かめてからここへ来る
-            let (want, seen) = match (rules.background, facts.pixels.as_ref()) {
-                (Some(want), Some(pixels)) => (want, pixels.background),
+            let (want, pixels) = match (rules.background, facts.pixels.as_ref()) {
+                (Some(want), Some(pixels)) => (want, pixels),
                 _ => return unregulated(check, expected),
             };
+            // **外周に不透明な画素が 1 つも無い。** `estimate_background` は
+            // そのときだけ透明画素の RGB をやむなく使う（`from_opaque` が偽）。
+            // アルファ 0 の画素が持つ RGB は表示に使われず、書いたエンコーダが
+            // 何を詰めたかで決まる値なので、**それを「測った背景色」として
+            // 配るのは作り話である**——透過 PNG に対して `rgb: [0,0,0]` /
+            // `delta_e: 100.0` を返していたのがこれだった。
+            //
+            // **不透明な外周画素だけで中央値を取り直す道は採らない。** それは
+            // lint が `info` と別の測り方を持つことで、モジュール冒頭の宣言に
+            // 反する。しかもこの状態で残る不透明画素は主体の縁であって背景では
+            // ないので、取り直したところで「背景色」にはならない。
+            // 合否そのものは `alpha` が `fail` で言う（背景色を要求する規格は
+            // どれも透過を許さない——`Profile::flatten_color` がその対応に
+            // 依っている）ので、ここが黙っても見逃しにはならない
+            if !pixels.background_from_opaque {
+                return LintCheck {
+                    name: check.as_str(),
+                    status: UNMEASURABLE,
+                    expected,
+                    // 帯の中に背景と呼べる画素が 1 つも無かった。
+                    // **何も測っていないので値も出さない**
+                    actual: None,
+                };
+            }
+            // **単色の背景ではない。** 中央値は出るが、それを「この画像の
+            // 背景色」と名乗るには外周が揃っていなければならない。揃って
+            // いない帯の中央値を `delta_e: 0.0` のような確信のある数で配ると、
+            // 読み手はそれを画像全体の背景についての測定だと読む
+            // （`lint.rs` 冒頭の「測れていないものを pass と言わない」）。
+            //
+            // しきい値は `BackgroundEstimate::is_uniform`——`cutout` が
+            // `LOW_UNIFORMITY` を出すのに使っているものそのままで、
+            // 同じ問いに 2 つ目の数を置かない
+            if !pixels.background_uniform {
+                return LintCheck {
+                    name: check.as_str(),
+                    status: UNMEASURABLE,
+                    expected,
+                    // **測れなかった理由は測定値である。** `rgb` を出さないのは
+                    // 信用していない数を配らないため、`uniformity` を出すのは
+                    // 「なぜ測れないのか」を散文から抜き直させないためである
+                    actual: Some(json!({
+                        "border_px": pixels.border,
+                        "uniformity": round4(pixels.uniformity),
+                    })),
+                };
+            }
+            let seen = pixels.background;
             let delta_e = delta_e_rgb(seen, want);
             (
                 flag(delta_e <= BACKGROUND_DELTA_E_TOLERANCE),
                 // **測った色と色差の両方を返す。** 色だけでは規格からどれだけ
-                // 外れたのかが測れず、色差だけではどちらへ外れたのかが分からない
-                Some(json!({ "rgb": seen, "delta_e": round4(delta_e) })),
+                // 外れたのかが測れず、色差だけではどちらへ外れたのかが分からない。
+                // **帯幅も一緒に返す**——同じ `delta_e: 0.0` でも、外周 2px を
+                // 見た 0.0 と外周 48px を見た 0.0 は別のことを言っている
+                Some(json!({
+                    "rgb": seen,
+                    "delta_e": round4(delta_e),
+                    "border_px": pixels.border,
+                    "uniformity": round4(pixels.uniformity),
+                })),
             )
         }
         Check::FillRatio => {
@@ -672,6 +875,10 @@ mod tests {
             },
             pixels: Some(Pixels {
                 background: [255, 255, 255],
+                border: 48,
+                uniformity: 1.0,
+                background_from_opaque: true,
+                background_uniform: true,
                 fill: Some(Fill {
                     ratio: 0.86,
                     source: SUBJECT_FROM_COLOUR,
@@ -714,6 +921,124 @@ mod tests {
             .collect();
         assert_eq!(names, want);
         assert!(names.windows(2).all(|w| w[0] != w[1]), "name は一意である");
+    }
+
+    /// 配る一覧は表そのものである。
+    ///
+    /// `kiri schema` の散文も `--profile` の長いヘルプもここから組むので、
+    /// ずれると「schema が案内した name が結果に出ない」が起こりうる
+    /// （`profile::the_published_names_are_the_table` と同じ表明）。
+    #[test]
+    fn the_published_check_names_are_the_table() {
+        let from_table: Vec<&str> = Check::ALL.into_iter().map(Check::as_str).collect();
+        assert_eq!(Check::NAMES.to_vec(), from_table);
+
+        let mut sorted = from_table.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), from_table.len(), "綴りが重複している");
+        assert!(from_table.iter().all(|n| !n.is_empty()));
+    }
+
+    /// `status` の語彙も表そのものである。
+    ///
+    /// **4 語が揃うのは `CHECK_STATUSES` だけ**で、`compliance.rs` は 3 語しか
+    /// 持たない。ここが `judge` の返しうる値を全部含んでいなければ、schema が
+    /// 配った語彙の外の値が結果に出る。
+    #[test]
+    fn every_status_a_check_can_take_is_published() {
+        assert_eq!(CHECK_STATUSES.len(), 4);
+        for status in [PASS, FAIL, UNMEASURABLE, SKIPPED] {
+            assert!(CHECK_STATUSES.contains(&status), "{status} が一覧に無い");
+        }
+    }
+
+    /// **画素を要する条件を規定しない規格では、見立てを 1 度も走らせない。**
+    ///
+    /// 判定は `Check::needs_pixels` から組むので、画素を要する条件を足せば
+    /// その規格では自動的に測定が走る。ここが偽になる規格では `checks[]` に
+    /// `background` も `fill_ratio` も出ないので、**走らせないことが出力の
+    /// どのバイトにも現れない**——`skipped` が増えることもない。
+    #[test]
+    fn a_profile_without_pixel_rules_never_asks_for_pixels() {
+        assert!(
+            !regulates_composition(&profile::named("shopify").unwrap().rules),
+            "shopify は構図を規定しない"
+        );
+        for name in ["amazon", "square-white"] {
+            assert!(
+                regulates_composition(&profile::named(name).unwrap().rules),
+                "{name} は構図を規定する"
+            );
+        }
+        // 走らせなかった規格では、画素を要する条件が 1 行も出ない
+        // （出ていれば `skipped` になり、`PROFILE_UNCHECKABLE` まで出てしまう）
+        let mut f = facts();
+        f.pixels = None;
+        let checks = run_checks(&f, "shopify");
+        assert!(checks.iter().all(|c| c.status != SKIPPED), "{checks:?}");
+        assert!(uncheckable(&[], f.format).is_none());
+    }
+
+    /// **外周に不透明な画素が 1 つも無ければ、背景色は測れていない。**
+    ///
+    /// 透過 PNG で `rgb: [0,0,0]` / `delta_e: 100.0` を配っていたのがこれで、
+    /// アルファ 0 の画素が持つ RGB は表示に使われない値である。合否はたまたま
+    /// 正しくても、`actual` は機械可読な値として配る契約なので作り話は置けない。
+    #[test]
+    fn a_transparent_perimeter_has_no_background_colour_to_report() {
+        let mut f = facts();
+        {
+            let p = f.pixels.as_mut().unwrap();
+            p.background_from_opaque = false;
+            p.background = [0, 0, 0];
+        }
+        let checks = run_checks(&f, "square-white");
+        let check = checks.iter().find(|c| c.name == "background").unwrap();
+        assert_eq!(check.status, UNMEASURABLE);
+        assert!(check.actual.is_none(), "測っていない色を配った: {check:?}");
+        // 求められていた値は返す（`skipped` と同じ規約）
+        assert!(check.expected.is_some());
+    }
+
+    /// **単色でない背景の中央値を「測った背景色」として配らない。**
+    ///
+    /// しきい値は `cutout` が `LOW_UNIFORMITY` を出すのに使っている
+    /// `BackgroundEstimate::is_uniform` そのもので、2 つ目の数を置かない。
+    #[test]
+    fn a_background_that_is_not_one_colour_is_unmeasurable() {
+        let mut f = facts();
+        {
+            let p = f.pixels.as_mut().unwrap();
+            p.background_uniform = false;
+            p.uniformity = 0.62;
+        }
+        let checks = run_checks(&f, "amazon");
+        let check = checks.iter().find(|c| c.name == "background").unwrap();
+        assert_eq!(check.status, UNMEASURABLE);
+        let actual = check.actual.clone().unwrap();
+        // 信用していない色は配らない。測れなかった理由は測定値で言う
+        assert!(actual.get("rgb").is_none(), "{actual}");
+        assert_eq!(actual["uniformity"], json!(0.62));
+        assert_eq!(actual["border_px"], json!(48));
+    }
+
+    /// 合否を出した行は**何を測ったのかを名乗る。**
+    ///
+    /// 同じ `delta_e: 0.0` でも、外周 2px を見た 0.0 と 48px を見た 0.0 は
+    /// 別のことを言っている。
+    #[test]
+    fn a_measured_background_names_the_band_it_was_measured_on() {
+        let checks = run_checks(&facts(), "amazon");
+        let actual = checks
+            .iter()
+            .find(|c| c.name == "background")
+            .unwrap()
+            .actual
+            .clone()
+            .unwrap();
+        assert_eq!(actual["border_px"], json!(48));
+        assert_eq!(actual["rgb"], json!([255, 255, 255]));
     }
 
     /// 規定の無い条件は `checks[]` に 1 行も出さない。
@@ -950,6 +1275,13 @@ mod tests {
                 pixels: Some(Pixels {
                     // 書いた背景色そのまま。色差 0 で通る
                     background: w.background.unwrap_or([255, 255, 255]),
+                    border: crate::cutout::background::field_band(
+                        &image::RgbaImage::new(cw, ch),
+                        crate::cutout::background::DEFAULT_BORDER,
+                    ),
+                    uniformity: 1.0,
+                    background_from_opaque: true,
+                    background_uniform: true,
                     fill: Some(Fill {
                         ratio: fill_ratio(
                             [margin, margin, margin + side - 1, margin + side - 1],

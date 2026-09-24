@@ -442,9 +442,21 @@ fn apply_profile(args: &CutoutArgs, warnings: &mut Vec<Warning>) -> Option<Cutou
                 wanted,
                 used,
             )),
-            // 拡張子からも形式を読めない（`--naming` の雛形など）。
+            // 拡張子を綴っていない（`--naming` の雛形など）。
             // ここで初めて profile が形式を決める
-            (None, None) => out.out.format = Some(wanted),
+            (None, None) if !spells_an_extension(&args.out.output) => out.out.format = Some(wanted),
+            // **拡張子はあるが kiri の知らない綴りである。** ここで profile に
+            // 決めさせると、`-o out.xyz --profile amazon` が `.xyz` という
+            // 名前の JPEG を黙って書く——`--profile` を付けたかどうかだけで
+            // `UNKNOWN_OUTPUT_FORMAT` が消えることになり、すぐ上のコメントが
+            // 宣言している「拡張子と中身が食い違うファイルを作らない」を
+            // 同じ if 式の最後の枝が破る。
+            //
+            // 何もせずに抜けると `out.out.format` は `None` のままなので、
+            // `output::resolve_format` が profile の有無に関わらず同じ
+            // `UNKNOWN_OUTPUT_FORMAT` で断る。**断る場所を増やさない**のは、
+            // 同じ失敗の文面と code を 2 箇所で綴らないためである
+            (None, None) => {}
         }
     }
 
@@ -462,11 +474,13 @@ fn apply_profile(args: &CutoutArgs, warnings: &mut Vec<Warning>) -> Option<Cutou
         }
     }
 
-    // `--flatten` は真偽のフラグなので、明示できるのは真だけである
-    // （`--flatten false` とは書けない）。profile が求めるのも真なので、
-    // ここが上書きとして報せることは今のところ無い——それでも分岐を
-    // 置いておくのは、**明示を黙って無視する枝を 1 つも作らない**ためで、
-    // 偽を求める規格が入った日に書き足す場所を探さずに済む
+    // `--flatten` は CLI では真偽のフラグなので、コマンドラインから明示できる
+    // のは真だけである（`--flatten false` とは書けない）。**spec は偽も書ける**
+    // ——`ItemSettings.flatten` は `Option<bool>` なので、
+    // `{"profile":"amazon","flatten":false}` は「偽を明示した」として届き、
+    // profile が求める真を押しのけて `PROFILE_OVERRIDDEN {key: flatten}` が
+    // 実際に出る。**明示を黙って無視する枝を 1 つも作らない**という規約が、
+    // ここでは spec 経由で現に効いている
     if let Some(flatten) = want.flatten {
         if explicit.flatten {
             warnings.extend(overridden(
@@ -478,6 +492,27 @@ fn apply_profile(args: &CutoutArgs, warnings: &mut Vec<Warning>) -> Option<Cutou
             ));
         } else {
             out.out.flatten = flatten;
+        }
+    }
+
+    // **派生が自分で書いた形式は、上の 3 段（`--format` > 拡張子 > profile）を
+    // 1 つも通らない。** 通らないものを黙って通すと、`--profile amazon` で
+    // 書いた AVIF が同じ amazon の `kiri lint` で落ちる。押しのけたことを
+    // 派生ごとに名乗らせる理由は `derivation_overridden` の doc に書いた。
+    //
+    // **`formats` が空（＝形式の規定なし）の規格では 1 件も出ない。** 規定が
+    // 無いものを上書きと呼ぶと、`PROFILE_OVERRIDDEN` が「profile を指定した
+    // のに効かなかった項目」以外を語り始める
+    if !profile.rules.formats.is_empty() {
+        for (index, spec) in output::specs(&args.out).iter().enumerate() {
+            match spec.format {
+                Some(used) if !profile.rules.formats.contains(&used) => warnings.push(
+                    derivation_overridden(profile, index, spec.role.as_deref(), used),
+                ),
+                // 形式を書かなかった派生は `--output` の解決結果を継ぐので、
+                // profile の形式はそこから届く（`derivation_overridden` の doc）
+                _ => {}
+            }
         }
     }
 
@@ -511,6 +546,84 @@ fn apply_profile(args: &CutoutArgs, warnings: &mut Vec<Warning>) -> Option<Cutou
 ///
 /// **`profile` と `used` の両方を入れる。** 片方だけでは、規格が求めた値から
 /// どれだけ外したのかを呼び出し側が測れない。
+/// 出力先が**拡張子を綴っているか**。
+///
+/// **`OutputFormat::from_path` の `None` は 2 つの意味を持つ。** 「拡張子が
+/// 無い」（`--naming` の雛形や、これから綴る名前）と「拡張子はあるが kiri の
+/// 知らない綴り」で、前者は profile が形式を決めてよく、後者は誰が決めても
+/// 拡張子と中身が食い違う。`from_path` の戻り値だけを見ていると 2 つが同じ形に
+/// なるので、ここで割る。
+///
+/// UTF-8 でない拡張子も「綴っている」側に数える。kiri は形式として読めないが、
+/// 綴られている以上それは名前の一部であり、**断る向きが安全側**である。
+fn spells_an_extension(path: &Path) -> bool {
+    path.extension().is_some()
+}
+
+/// 派生が profile の許す形式の外へ出たことを報せる。
+///
+/// # なぜ派生ごとに 1 件出すか
+///
+/// `--derive 'format=avif'` や `--formats` は `--output` の拡張子も `--format`
+/// も通らないので、**profile の形式指定を丸ごと迂回する**。黙って通すと
+/// `--profile amazon` で書いたものが同じ amazon の `kiri lint` で落ちる——
+/// `FILL_RATIO_MARGIN` の doc が「最も高くつく失敗」と名指ししているものである。
+/// まとめて 1 件にすると、どの出力が規格の外なのかを散文から抜き直すことになる
+/// （`apply_profile` が項目ごとに 1 件出すのと同じ理由）。
+///
+/// # どの出力の話かを名乗る
+///
+/// **パスはまだ綴れない。** 多派生のパスは最終画像の寸法が決まってから
+/// `output::resolve` が決める（`{width}` を含む雛形があるため）ので、ここでは
+/// `derive`（`specs()` の並びの添字＝ `outputs[]` の並びの添字）と、書いて
+/// あれば `role`（`outputs[].role` と同じ文字列）で指す。書き出した後の
+/// 警告が `data.output` でパスを名乗るのと役目は同じで、指せるものが違うだけ
+/// である。
+///
+/// # 形式を書かなかった派生
+///
+/// `output::resolve` は `spec.format.unwrap_or(plan.format)` で継ぐ。
+/// `plan.format` は `--format` > `--output` の拡張子 > profile の順に解決した
+/// 1 つなので、**profile の形式はそこから派生へ届く**。つまり迂回しうるのは
+/// 形式を自分で書いた派生だけで、ここが見るのもそれだけでよい。
+fn derivation_overridden(
+    profile: &profile::Profile,
+    index: usize,
+    role: Option<&str>,
+    used: OutputFormat,
+) -> Warning {
+    let allowed: Vec<&str> = profile.rules.formats.iter().map(|f| f.as_str()).collect();
+    let which = match role {
+        Some(role) => format!("派生 {index}（role {role}）"),
+        None => format!("派生 {index}"),
+    };
+    let warning = Warning::new(
+        WarningCode::ProfileOverridden,
+        format!(
+            "--profile {} が許すのは {} ですが、{} は {} で書きます",
+            profile.name,
+            allowed.join(" / "),
+            which,
+            used.as_str()
+        ),
+    )
+    .with_hint(format!(
+        "この出力は同じ --profile {} の kiri lint で format が fail になります。         規格の内側で書くなら派生の format を外すか {} のどれかにしてください",
+        profile.name,
+        allowed.join(" / ")
+    ))
+    .with_data("key", "format")
+    // **求めた値は許容の並びそのものである。** 第一候補 1 つを出すと
+    // 「png でも通る」ことが結果から読めなくなる
+    .with_data("profile", json!(allowed))
+    .with_data("used", used.as_str())
+    .with_data("derive", index);
+    match role {
+        Some(role) => warning.with_data("role", role),
+        None => warning,
+    }
+}
+
 fn overridden(
     profile: &profile::Profile,
     key: &str,

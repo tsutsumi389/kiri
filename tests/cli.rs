@@ -11,7 +11,7 @@ use assert_cmd::Command;
 use common::{
     ProductSpec, bleeding_product_scene, dense_key_grid, product_image, shadow_band_scene,
     split_background_scene, transparent_product, woven_background_image, woven_poisoned_scene,
-    write_jpeg, write_png,
+    write_jpeg, write_png, write_srgb_png,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -11588,13 +11588,33 @@ fn conforming_side(rules: &Value) -> u32 {
 }
 
 /// その規格を素直に満たす画像を書く。
+///
+/// **sRGB の ICC を埋める。** `srgb_required` を持つ規格（amazon /
+/// square-white）では「色空間を 1 つも名乗っていない」は `pass` ではなく
+/// `unmeasurable` なので、名乗りの無いファイルでは「素直に満たす」画像に
+/// ならない（`write_srgb_png` の doc を参照）。
 fn write_conforming(dir: &Path, name: &str, rules: &Value) -> PathBuf {
     let side = conforming_side(rules);
-    write_png(
+    write_srgb_png(
         dir,
         name,
         &flat_product(side, side, conforming_fill(rules), [255, 255, 255], 255),
     )
+}
+
+/// 商品だけが半透明で、外周は不透明な白のままの素材。
+///
+/// **`alpha` の 1 項目だけを外すために要る。** `flat_product` の
+/// `background_alpha` を 0 にすると外周まで透明になり、背景色を測れる画素が
+/// 1 つも無くなる（`background` が `unmeasurable` に落ちる）。
+fn semi_transparent_product(side: u32, fill: f64) -> image::RgbaImage {
+    let mut img = flat_product(side, side, fill, [255, 255, 255], 255);
+    for pixel in img.pixels_mut() {
+        if pixel.0 != [255, 255, 255, 255] {
+            pixel.0[3] = 200;
+        }
+    }
+    img
 }
 
 /// `kiri lint` を走らせ、終了コードと結果 JSON を返す。
@@ -11835,9 +11855,16 @@ fn breaking_one_rule_fails_exactly_that_check() {
         (
             "amazon",
             "alpha.png",
-            // **背景の RGB は白のまま、アルファだけ 0 にする。** 透明部分を
-            // 黒で埋めると背景の検査まで一緒に落ち、「1 項目だけ」でなくなる
-            flat_product(a_side, a_side, a_fill, [255, 255, 255], 0),
+            // **透かすのは商品のほうで、外周は不透明な白のまま置く。**
+            // 外周まで透明にすると背景の検査も道連れになり（外周に不透明な
+            // 画素が 1 つも無いので `background` は `unmeasurable`）、
+            // 「1 項目だけ」でなくなる。外周が透明な画像で「背景は白だった」と
+            // 答えるほうが誤りなので、道連れは lint 側の取りこぼしではない
+            // ——アルファ 0 の画素が持つ RGB は表示に使われない値である。
+            //
+            // 占有率はアルファの外接矩形から測るが、外周が不透明なので矩形は
+            // 画像全体になり、下限（0.85）を割らない
+            semi_transparent_product(a_side, a_fill),
             "alpha",
         ),
         (
@@ -11858,7 +11885,10 @@ fn breaking_one_rule_fails_exactly_that_check() {
     ];
 
     for (profile, file, image, broken) in cases {
-        let input = write_png(dir.path(), file, &image);
+        // **外した 1 項目以外は素直に合格させる。** 名乗りの無い PNG では
+        // `color_space` が `unmeasurable` になり、「落ちたのはちょうど 1 項目」
+        // が言えなくなる（`write_conforming` と同じ理由）
+        let input = write_srgb_png(dir.path(), file, &image);
         let (code, v) = lint(&input, profile);
         assert_eq!(code, 5, "{file}: 外したのに exit 5 でない: {v}");
         assert_eq!(v["passed"], Value::Bool(false), "{file}");
@@ -11873,7 +11903,7 @@ fn breaking_one_rule_fails_exactly_that_check() {
     // 背景だけは、許容そのものが結果に載っているので実測で確かめられる。
     // **完全一致を求めていないこと**と、それでも 200 は外れていることの両方を
     // 1 つの行から読む
-    let input = write_png(
+    let input = write_srgb_png(
         dir.path(),
         "gray2.png",
         &flat_product(a_side, a_side, a_fill, [200, 200, 200], 255),
@@ -11888,6 +11918,169 @@ fn breaking_one_rule_fails_exactly_that_check() {
         check["actual"]["delta_e"].as_f64().unwrap() > tolerance,
         "許容の内側なのに落ちた: {check}"
     );
+}
+
+/// **外周 2px の白い縁だけを見て「背景は純白」と答えない。**
+///
+/// `--border` の既定（2）は切り抜きのための値で、そこから取った色は cutout では
+/// 閾値の種にしかならない。lint では外周の中央値が**そのまま合否になる**ので、
+/// 1600px の画像の縁 0.125% を見た結果を「この画像の背景」と名乗るわけにいかない
+/// ——灰色一面の画像が全項目 pass / exit 0 になっていたのがこれだった。
+///
+/// **測った帯幅を結果から読めることまで見る。** 同じ delta_e でも、どれだけの
+/// 幅を見た数なのかが分からなければ、読み手はそれを検算できない。
+#[test]
+fn a_thin_white_rim_does_not_make_a_grey_image_white() {
+    let dir = fixture_dir();
+    let side = 1600u32;
+    // 外周 2px だけ白、その内側は一面の灰色、中央に被写体
+    let mut img = flat_product(side, side, 0.5, [170, 170, 170], 255);
+    for (x, y, p) in img.enumerate_pixels_mut() {
+        if x < 2 || y < 2 || x >= side - 2 || y >= side - 2 {
+            *p = image::Rgba([255, 255, 255, 255]);
+        }
+    }
+    let input = write_srgb_png(dir.path(), "rim.png", &img);
+
+    let (code, v) = lint(&input, "amazon");
+    assert_eq!(code, 5, "灰色一面の画像が amazon を通った: {v}");
+    let check = lint_check(&v, "background");
+    assert_eq!(check["status"], "fail", "{v}");
+    assert_eq!(check["actual"]["rgb"], serde_json::json!([170, 170, 170]));
+    assert!(
+        check["actual"]["delta_e"].as_f64().unwrap()
+            > check["expected"]["delta_e_max"].as_f64().unwrap()
+    );
+
+    // **何を測った数なのかを名乗る。** 帯は --border そのものではない
+    let band = check["actual"]["border_px"].as_u64().expect("帯幅が無い");
+    assert!(band > 2, "外周 2px のままで判定している: {check}");
+
+    // **`kiri info` に同じ帯幅を渡せば同じ色が出る。** 測り方は 1 つのままで、
+    // 違うのは帯幅だけである——どちらが本当かを確かめる手段が残っている
+    let out = kiri()
+        .args([
+            "info",
+            input.to_str().unwrap(),
+            "--border",
+            &band.to_string(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let info = json_stdout(&out);
+    assert_eq!(info["background"]["rgb"], check["actual"]["rgb"], "{info}");
+}
+
+/// **色空間を 1 つも名乗っていないファイルを `pass` と言わない。**
+///
+/// ICC も EXIF ColorSpace も無い入力に対して `kiri info` は色空間 "sRGB" を
+/// 返す——kiri がその画素を sRGB として扱うのは正しく、その出力は動かさない。
+/// だが「sRGB として扱った」と「ファイルが sRGB を名乗っていた」は別の事実で、
+/// `srgb_required` が問うているのは後者である。
+///
+/// **AVIF と同じ扱いにすることまで見る。** AVIF の CICP が unspecified なら
+/// `unmeasurable` になるので、同じ「名乗っていない」が PNG でだけ合格すると
+/// 形式で合否が変わる枝ができる。
+#[test]
+fn a_file_that_names_no_colour_space_is_unmeasurable_not_a_pass() {
+    let dir = fixture_dir();
+    let rules = profile_rules("amazon");
+    let side = conforming_side(&rules);
+    let img = flat_product(side, side, conforming_fill(&rules), [255, 255, 255], 255);
+
+    // 名乗りが 1 つも無い PNG（image クレートが素で書くもの）
+    let bare = write_png(dir.path(), "bare.png", &img);
+    let (code, v) = lint(&bare, "amazon");
+    assert_eq!(code, 5, "名乗りの無いファイルが合格した: {v}");
+    let check = lint_check(&v, "color_space");
+    assert_eq!(check["status"], "unmeasurable", "{v}");
+    assert_eq!(check["actual"]["color_named"], false);
+    assert_eq!(check["actual"]["icc_profile"], false);
+    // **落としてはいない。** 「sRGB ではない」と断じる材料も 1 つも無い
+    assert_ne!(check["status"], "fail");
+    // 名乗り以外は素直に合格している（外したのはちょうど 1 項目）
+    assert_eq!(not_passing(&v), vec!["color_space=\"unmeasurable\""], "{v}");
+
+    // **`kiri info` の出力は 1 文字も動かさない。** 画素を sRGB として扱った
+    // ことは事実であり、`info` が答えているのはそちらの問いである
+    let out = kiri()
+        .args(["info", bare.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(json_stdout(&out)["color_space"], "sRGB");
+
+    // 同じ画素でも、sRGB の ICC を埋めれば名乗りがあるので pass になる
+    let named = write_srgb_png(dir.path(), "named.png", &img);
+    let (code, v) = lint(&named, "amazon");
+    assert_eq!(code, 0, "{v}");
+    let check = lint_check(&v, "color_space");
+    assert_eq!(check["status"], "pass");
+    assert_eq!(check["actual"]["color_named"], true);
+}
+
+/// **`checks[].name` の綴りは機械可読で配られる。**
+///
+/// `--fail-on` の指標が `accepts` で配られるのと同じ役目である。ここが無いと、
+/// エージェントは日本語の散文から名前を抜くことになる——**書き写した表は必ず
+/// 実装から離れる**という、`kiri schema` そのものが避けている失敗である。
+///
+/// `needs_pixels` まで配るのは、AVIF を渡す前にどの項目が `skipped` になるかを
+/// 予測できるようにするためで、**実際に AVIF を lint した結果と突き合わせる**。
+#[test]
+fn the_published_lint_checks_are_the_ones_that_appear() {
+    let schema = schema_json();
+    let published = schema["lint_checks"]
+        .as_array()
+        .expect("lint_checks[] が無い");
+    assert!(!published.is_empty());
+
+    let names: Vec<&str> = published
+        .iter()
+        .map(|c| c["name"].as_str().expect("name が文字列でない"))
+        .collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), names.len(), "name が重複している: {names:?}");
+
+    // **どの規格の checks[] も、配った一覧の内側に収まる。**
+    let dir = fixture_dir();
+    for profile in ["amazon", "shopify", "square-white"] {
+        let rules = profile_rules(profile);
+        let input = write_conforming(dir.path(), &format!("{profile}-published.png"), &rules);
+        let (_, v) = lint(&input, profile);
+        for name in lint_names(&v) {
+            assert!(
+                names.contains(&name.as_str()),
+                "{name} が lint_checks[] に無い"
+            );
+        }
+    }
+
+    // **needs_pixels が真の項目だけが AVIF で skipped になる。**
+    let source = write_conforming(dir.path(), "published-source.png", &profile_rules("amazon"));
+    let avif = dir.path().join("published.avif");
+    convert_json(&source, &avif, &[]);
+    let (_, v) = lint(&avif, "amazon");
+    let skipped: Vec<String> = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["status"] == "skipped")
+        .map(|c| c["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(!skipped.is_empty(), "AVIF で 1 つも飛んでいない: {v}");
+    for name in &skipped {
+        let entry = published
+            .iter()
+            .find(|c| c["name"] == name.as_str())
+            .unwrap();
+        assert_eq!(
+            entry["needs_pixels"], true,
+            "{name} は画素を要さないのに飛ばされた"
+        );
+    }
 }
 
 /// **規定の無い項目は検査もしない。** shopify は構図を 1 つも規定していない。
@@ -12202,6 +12395,169 @@ fn the_output_extension_overrides_the_profile_format() {
         !has_warning(&v, "PROFILE_OVERRIDDEN"),
         "同じ値で押しのけたと言っている: {v}"
     );
+}
+
+/// **`--profile` を付けただけで `UNKNOWN_OUTPUT_FORMAT` が消えない。**
+///
+/// `OutputFormat::from_path` の `None` は「拡張子が無い」と「拡張子はあるが
+/// 未知」の 2 つを兼ねている。後者で profile に形式を決めさせると
+/// `-o out.xyz --profile amazon` が `.xyz` という名前の JPEG を黙って書く
+/// ——`the_output_extension_overrides_the_profile_format` が守っている
+/// 「拡張子と中身を食い違わせない」を、同じ指定の別の綴りで破ることになる。
+///
+/// **profile の有無で結果が変わらないことまで見る。** 片方だけを見ても
+/// 「断った」としか言えず、`--profile` が判断を動かしていないことは言えない。
+#[test]
+fn an_unknown_extension_is_refused_with_or_without_a_profile() {
+    let dir = fixture_dir();
+    let input = write_jpeg(
+        dir.path(),
+        "product.jpg",
+        &product_image(&ProductSpec {
+            width: 300,
+            height: 300,
+            ..Default::default()
+        }),
+    );
+    let output = dir.path().join("out.xyz");
+
+    for profile in [None, Some("amazon")] {
+        let mut args = vec![
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--dry-run",
+            "--json",
+        ];
+        if let Some(name) = profile {
+            args.extend(["--profile", name]);
+        }
+        let out = kiri().args(&args).output().unwrap();
+        let v = json_stdout(&out);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "profile={profile:?}: 未知の拡張子を通した: {v}"
+        );
+        assert_eq!(v["error"]["code"], "UNKNOWN_OUTPUT_FORMAT", "{v}");
+    }
+
+    // **拡張子を綴っていないパスは今までどおり profile が決めてよい。**
+    // `--naming` の雛形がそれで、そこでは拡張子は雛形の `{ext}` が供給する
+    let stem = dir.path().join("named");
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            stem.to_str().unwrap(),
+            "--naming",
+            "{stem}_{width}.{ext}",
+            "--dry-run",
+            "--json",
+            "--profile",
+            "amazon",
+        ])
+        .output()
+        .unwrap();
+    let v = json_stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{v}");
+    assert_eq!(
+        v["outputs"][0]["format"],
+        profile_rules("amazon")["formats"][0],
+        "拡張子の無いパスで profile が形式を決めていない: {v}"
+    );
+}
+
+/// **派生が自分で書いた形式が profile の外へ出たら、派生ごとに 1 件報せる。**
+///
+/// `--derive 'format=avif'` は `--format` も `--output` の拡張子も通らないので、
+/// profile の形式指定を丸ごと迂回する。黙って通すと **amazon で書いたものが
+/// 同じ amazon の `kiri lint` で落ちる**——`FILL_RATIO_MARGIN` の doc が
+/// 「最も高くつく失敗」と名指ししているものである。
+///
+/// **許容の内側にある派生では黙る。** amazon は PNG も許すので、
+/// `format=png` の派生に警告を出すと `PROFILE_OVERRIDDEN` が
+/// 「profile を指定したのに効かなかった項目」以外を語り始める。
+#[test]
+fn a_derivation_that_leaves_the_profile_formats_says_so_one_by_one() {
+    let dir = fixture_dir();
+    let input = write_jpeg(
+        dir.path(),
+        "product.jpg",
+        &product_image(&ProductSpec {
+            width: 300,
+            height: 300,
+            ..Default::default()
+        }),
+    );
+    let output = dir.path().join("e.jpg");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--profile",
+            "amazon",
+            "--derive",
+            "width=800,format=avif,role=hero",
+            "--derive",
+            "width=400,format=png,role=thumb",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let v = json_stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{v}");
+
+    let overridden: Vec<&Value> = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|w| w["code"] == "PROFILE_OVERRIDDEN" && w["data"]["key"] == "format")
+        .collect();
+    assert_eq!(
+        overridden.len(),
+        1,
+        "許容の外へ出た派生はちょうど 1 本のはず: {v}"
+    );
+    let warning = overridden[0];
+    assert_eq!(warning["data"]["used"], "avif");
+    // **どの出力の話かを名乗る。** パスはまだ綴れないので、並びの添字と role で指す
+    assert_eq!(warning["data"]["derive"], 0);
+    assert_eq!(warning["data"]["role"], "hero");
+    // 求めた値は許容の並びそのもの——第一候補 1 つでは「png でも通る」が読めない
+    assert_eq!(
+        warning["data"]["profile"],
+        profile_rules("amazon")["formats"]
+    );
+
+    // **その出力は実際に同じ profile の lint で落ちる。** 警告が指している
+    // のがまさにこれであることを、作り話ではなく実測で固定する
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--profile",
+            "amazon",
+            "--derive",
+            "width=800,format=avif,role=hero",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let v = json_stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{v}");
+    let written = Path::new(v["outputs"][0]["path"].as_str().unwrap()).to_path_buf();
+    let (code, lint_result) = lint(&written, "amazon");
+    assert_eq!(code, 5, "amazon で書いた AVIF が amazon の lint を通った");
+    assert_eq!(lint_check(&lint_result, "format")["status"], "fail");
 }
 
 /// **`--profile` を渡さない実行は 1 バイトも変わらない。**

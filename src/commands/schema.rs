@@ -10,15 +10,18 @@
 //! 実装から離れ、離れた一覧は「指定したのに効かない」という最も追いにくい
 //! 失敗をそのまま招く。ここに書き写す余地を残さないことが要点である。
 
+use std::sync::LazyLock;
+
 use clap::{ArgAction, CommandFactory};
 
 use crate::cli::Cli;
+use crate::commands::lint::{CHECK_STATUSES, Check};
 use crate::cutout::{MAX_FOREGROUND_RATIO, MIN_FOREGROUND_RATIO, background, diagnostics, subject};
 use crate::error::{ErrorCode, ErrorKind};
 use crate::profile;
 use crate::report::{
     ArgEntry, CommandEntry, ErrorCodeEntry, ExitCodeEntry, FieldEntry, FieldGate, FieldThreshold,
-    ProfileEntry, ProfileRules, SCHEMA_VERSION, SchemaReport, WarningCodeEntry,
+    LintCheckEntry, ProfileEntry, ProfileRules, SCHEMA_VERSION, SchemaReport, WarningCodeEntry,
 };
 use crate::warning::WarningCode;
 
@@ -47,6 +50,7 @@ pub fn run() -> SchemaReport {
             })
             .collect(),
         fields: fields(),
+        lint_checks: lint_checks(),
         profiles: profiles(),
         global_options: global_options(),
         commands: commands(),
@@ -80,6 +84,69 @@ fn exit_codes() -> Vec<ExitCodeEntry> {
     }));
     codes
 }
+
+/// `kiri lint` が見る条件の一覧を配る。
+///
+/// **`Check::ALL` から組む。書き写さない**（`profiles` / `exit_codes` と同じ
+/// 作法）。ここへ手で一覧を書くと、`Check` を 1 つ足したときに **lint が実際に
+/// 並べる項目と、schema が「これが出る」と配った一覧が食い違う**——受け手は
+/// 知らない `name` を受け取るか、来ない `name` を待つことになる。
+///
+/// `regulated`（どの規格がこれを規定するか）は載せない。それは条件の側では
+/// なく規格の側の事実で、`profiles[].rules` が既に機械可読で配っている。
+fn lint_checks() -> Vec<LintCheckEntry> {
+    Check::ALL
+        .into_iter()
+        .map(|c| LintCheckEntry {
+            name: c.as_str(),
+            needs_pixels: c.needs_pixels(),
+        })
+        .collect()
+}
+
+/// `checks[].name` の綴りを定数から並べたもの。
+///
+/// **散文の中に一覧を打ち直さない。** `LazyLock` を通すのは `FieldEntry` の
+/// 散文が `&'static str` だからで、静的に生きる `String` を借りれば同じ
+/// 寿命になる——語を足せば散文のほうが自動で追随する。
+static LINT_CHECK_NAMES: LazyLock<String> = LazyLock::new(|| Check::NAMES.join(" / "));
+
+/// `checks[]` の読み方。名前の一覧だけを定数から差し込む。
+static LINT_CHECKS_NOTE: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "**規格が規定している条件だけが並ぶ。** 規定の無い条件は 1 行も出ない\
+                 （shopify は構図を規定しないので background も fill_ratio も現れない）\
+                 ——「規定なし」を pass として並べると、見ていないものを見たことにする。\
+                 **見たものは全部載せる**（pass も）。name は {} で、**checks[] の中で\
+                 一意である**（compliance.checks[] とはそこが違う）。綴りと、画素を要するか\
+                 どうかの別は lint_checks[] が機械可読で配る。**並びは決定的**で、\
+                 指定にも入力にも依らない。\
+                 expected / actual は条件ごとに形が違う（数値・真偽・許容する形式の配列・\
+                 上下限の組・測定値と出所の組）——**文字列へ畳まないので、数値は数値の\
+                 まま読める**。expected は status が skipped でも出る（検査できなかった\
+                 ことと、何を求められていたかは別の事実である）。actual は skipped では\
+                 必ず null になるが、**unmeasurable でも値が入ることがある**——AVIF の \
+                 color_space は「CICP は読めたが unspecified と書いてあった」を取り、\
+                 background は「測った帯幅と均一度は出たが、外周が揃っていないので\
+                 背景色とは呼べない」を取るので、合否は actual の有無ではなく status で\
+                 読むこと。\
+                 background の actual は測った rgb と規格の色からの色差 delta_e に加えて、\
+                 **測定に使った外周の帯幅 border_px** を返す——同じ delta_e 0.0 でも、\
+                 2px を見た 0.0 と 48px を見た 0.0 は別のことを言っている。\
+                 **完全一致は求めない**（JPEG の量子化で 255 は揃わない）。\
+                 color_space の actual は color_named を返す——**偽なら ICC も EXIF の\
+                 申告も無く、ファイルは何も名乗っていない**（このとき status は\
+                 unmeasurable で、AVIF の CICP unspecified と同じ扱いである）。\
+                 fill_ratio の actual は value と source を返す——source は \
+                 alpha（透過の外接矩形。切り抜き済みの成果物ではこれが正しい）か \
+                 colour（色で見立てた主体）で、**同じ 0.80 でも意味が違う**",
+        *LINT_CHECK_NAMES
+    )
+});
+
+/// `checks[].status` の語彙。4 語は `CHECK_STATUSES` が唯一の定義である。
+static LINT_STATUS_SUMMARY: LazyLock<String> =
+    LazyLock::new(|| format!("{} のいずれか", CHECK_STATUSES.join(" / ")));
 
 /// 規格の表を配る。
 ///
@@ -1343,27 +1410,7 @@ fn fields() -> Vec<FieldEntry> {
             warns: vec![],
             gates: None,
             summary: "検査した条件の内訳。{name, status, expected, actual}",
-            notes: Some(
-                "**規格が規定している条件だけが並ぶ。** 規定の無い条件は 1 行も出ない\
-                 （shopify は構図を規定しないので background も fill_ratio も現れない）\
-                 ——「規定なし」を pass として並べると、見ていないものを見たことにする。\
-                 **見たものは全部載せる**（pass も）。name は format / longest_side / \
-                 max_pixels / square / file_size / alpha / color_space / background / \
-                 fill_ratio で、**checks[] の中で一意である**（compliance.checks[] とは\
-                 そこが違う）。**並びは決定的**で、指定にも入力にも依らない。\
-                 expected / actual は条件ごとに形が違う（数値・真偽・許容する形式の配列・\
-                 上下限の組・測定値と出所の組）——**文字列へ畳まないので、数値は数値の\
-                 まま読める**。expected は status が skipped でも出る（検査できなかった\
-                 ことと、何を求められていたかは別の事実である）。actual は skipped では\
-                 必ず null になるが、**unmeasurable でも値が入ることがある**——AVIF の \
-                 color_space は「CICP は読めたが unspecified と書いてあった」を取るので、\
-                 合否は actual の有無ではなく status で読むこと。\
-                 background の actual は測った rgb と規格の色からの色差 delta_e を両方返し、\
-                 **完全一致は求めない**（JPEG の量子化で 255 は揃わない）。\
-                 fill_ratio の actual は value と source を返す——source は \
-                 alpha（透過の外接矩形。切り抜き済みの成果物ではこれが正しい）か \
-                 colour（色で見立てた主体）で、**同じ 0.80 でも意味が違う**",
-            ),
+            notes: Some(&LINT_CHECKS_NOTE),
         },
         FieldEntry {
             path: "checks[].status",
@@ -1373,12 +1420,14 @@ fn fields() -> Vec<FieldEntry> {
             null_means: None,
             warns: vec![],
             gates: None,
-            summary: "pass / fail / unmeasurable / skipped のいずれか",
+            summary: &LINT_STATUS_SUMMARY,
             notes: Some(
                 "pass 以外は**すべて合格ではない**。3 つを分けてあるのは次の一手が違う\
                  ためで、fail は条件に触れた（素材か規格の選び直し）、unmeasurable は\
-                 この画像では測れなかった（主体を 1 つも検出できない）、skipped は\
-                 この形式では構造的に測れない（AVIF の画素）。**skipped が 1 つでもあれば \
+                 この画像では測れなかった（主体を 1 つも検出できない、外周に不透明な\
+                 画素が 1 つも無い、背景が単色ではない、色空間を何も名乗っていない）、\
+                 skipped はこの形式では構造的に測れない（AVIF の画素）。\
+                 **skipped が 1 つでもあれば \
                  PROFILE_UNCHECKABLE が出て、飛ばした項目を data.checks に配列で並べる**\
                  ——黙って合格にはしていない。skipped を消したければ JPEG か PNG を渡す",
             ),

@@ -1011,9 +1011,73 @@ public リポジトリなので GitHub 製の標準ランナーは分数無制�
         乗るので、品質 25 まで落としても半分には届かない。**梯子の下限で実際に
         何バイトになるかを測ってから上限を決める**形に直した（`reachable_budget`）
 
+- [x] Phase 20: 多派生出力 ＋ マニフェスト（`SCHEMA_VERSION` を 2 へ）
+  - [x] `--derive 'width=1600,format=jpeg,quality=82,max_bytes=500k,role=hero'` を繰り返し
+        指定できる。糖衣として `--sizes 400,800,1600` × `--formats avif,jpeg` の直積
+        （**size が外・format が内**）。2 つは clap の `conflicts_with` で排他にした
+        ——組み立て方が混ざると「どちらが勝つか」という覚える規則が増える
+  - [x] 命名は `--naming '{stem}_{index}_{width}.{ext}'`。置換子は
+        `{stem}` / `{index}` / `{width}` / `{height}` / `{ext}` / `{role}` の 6 つで、
+        既定は `{stem}_{width}.{ext}`。**明示したら派生が 1 本でも効かせる**
+        （予測可能性を優先した。数で効いたり効かなかったりするテンプレートは読めない）
+  - [x] **書き始める前に全派生のパスを決め、3 つを検査する。** 派生どうしの衝突
+        （`OUTPUT_NAME_COLLISION`）、付随出力との衝突（`SIDE_OUTPUT_CONFLICT`、
+        `--manifest` も対象に入れた）、上書きの可否（`OUTPUT_EXISTS` /
+        `DRY_RUN_OUTPUT_EXISTS`）。どれで落ちてもファイルは 1 つも書かれない
+        （`a_name_collision_is_caught_before_anything_is_written` が
+        出力ディレクトリの中身が 0 件のままであることまで見る）
+  - [x] `--manifest path.json` は tmp + rename で書く。`{ schema_version,
+        kiri_version, items: [{ input, outputs }] }` で、**時刻も所要時間も入れない**
+        （成果物と並べて版管理できる）。cutout などは 1 要素、batch は実行全体で
+        1 ファイル・成功した項目ごとに 1 要素
+  - [x] `BatchReport` に `warnings` を足し、失敗した項目があるのに目録を書いたら
+        `MANIFEST_PARTIAL`（`data.failed` に件数）。**1 入力の中の派生は部分失敗を
+        許さない**——最初の失敗でその実行を止める（既存 `render` の挙動のまま）
+  - [x] `batch.rs` の 3 箇所（`ItemSettings` / `pick!` / `SETTING_KEYS`）へ
+        `derive` / `sizes` / `formats` / `naming` を同時に足した。値は数値でも
+        文字列でも読め、CLI と同じ `DeriveSpec::set` を通る
+  - ※ **`SCHEMA_VERSION` を 2 へ上げた唯一の根拠は `outputs[]` である。**
+        型は `Vec<OutputReport>` のままなので、`outputs[0]` を読むコードは
+        コンパイルも実行も通る——**通ったうえで 2 本目以降を黙って捨てる**。
+        キーの追加（`outputs[].role`）と警告の `data.output` は単独では上げる理由に
+        ならないが、上げる回を 1 回だけにするという決め（§7.2）に従ってここへ寄せた
+  - ※ **`DRY_RUN_OUTPUT_EXISTS` の `data.path` は `output` へ改名した。** 派生に
+        紐づく 6 つの警告（`ALPHA_FLATTENED` / `QUALITY_REDUCED` /
+        `MAX_BYTES_UNREACHABLE` / `ICC_NOT_EMBEDDED` / `UPSCALED` /
+        `DRY_RUN_OUTPUT_EXISTS`）が揃って `data.output` で「どの出力の話か」を
+        名乗る規約にしたので、同じ意味のキーを 2 つ並べるより改名のほうが害が小さい。
+        版を上げる回でなければやらない変更である
+  - ※ **`Derivation` は `ResizePlan` ではなく `ResizeSpec` を持つ。** `plan` は
+        寸法と指定だけの純関数なので、パスを決めた側と `render` が別々に呼んでも
+        同じ答えになる。計画を持ち回ると「どの寸法で名前を付けたか」と「どの寸法で
+        書いたか」が 2 つの値になり、食い違っても型は何も言わない
+  - ※ **`--output` をディレクトリとしては読まない**（§7.2 の ※ のとおり）。
+        `--output` は書き出し先そのもの（派生が 1 本のとき）か、`{stem}` と親
+        ディレクトリを供給する名前の雛形（2 本以上のとき）になる
+  - ※ **`OutputFormat::extension()` を足した。** `{ext}` は JPEG で `jpg` を返し、
+        `outputs[].format` は従来どおり `"jpeg"` のままである。今日の
+        `--output out.jpg` も同じ不揃いなので、**新しい不揃いを作ってはいない**
+        （`the_extension_round_trips_through_from_path` が往復を固定する）
+  - ※ **`--derive` の `fit` は `contain` / `cover` だけを受ける。** `exact` は
+        縦横比を無視して枠へ変形するので、商品画像では事故でしかない。明示の入口は
+        `kiri resize --fit exact` に残してある
+  - ※ **`OUTPUT_NAME_COLLISION` は `--force` でも許さない。** 上書きの可否は
+        「利用者の既存のファイルを壊してよいか」の話で、こちらは 1 回の実行が
+        自分の成果物を自分で潰す指定である。通せば結果 JSON は 2 本とも書いたと
+        報告し、実際には後の 1 本しか残らない
+  - ※ **マニフェストは batch の spec のキーにしていない。** 実行全体で 1 つの
+        ファイルなので、数百点が同じパスへ順に書けば最後の 1 件だけが残る目録に
+        なる。入口は `kiri batch --manifest` だけにした
+  - ※ **ピークの計測は JPEG で行う。** PNG の符号化はアロケータが 1 回あたり
+        十数 MB を抱え込み、1400x1400 を 5 本書くと RSS が 48MB から 95MB へ伸びる。
+        **これは派生の実装とは無関係**で、同じ寸法の 5 本でも `kiri batch` で同じ
+        画像を 5 件並べても同じように伸びる（`image` の PNG エンコーダの
+        確保・解放がそのまま常駐に残る）。同条件の JPEG では 5 本と 1 本の差が
+        1MB を切る
+
 ## 6. 残件の優先順位
 
-§5 の `[ ]` は 1 件だけになった（`※` の 42 件は作業ではないので数えない）。
+§5 の `[ ]` は 1 件だけになった（`※` の 51 件は作業ではないので数えない）。
 
 ここに並ぶのは**いまの kiri を完成させるための残件**である。EC 特化のために
 **足す**ものは [7. EC 特化のロードマップ](#7-ec-特化のロードマップphase-1725)
@@ -1162,6 +1226,8 @@ N 個の派生」という内部型を通し、**N = 1 のときに 1 バイト�
 （§5 の Phase 19 の `※`）。
 
 #### Phase 20: 多派生出力 ＋ マニフェスト
+
+**済（§5 の Phase 20）。**
 
 **なぜここか。** この 2 つは同じデータ構造の表と裏（何を書いたかを列挙するのが
 マニフェスト）で、別フェーズにすると `OutputReport` を 2 回設計し直すことになる。
@@ -1407,10 +1473,41 @@ batch spec には `profile` / `max_bytes` / `derive` / `naming` / `fail_on` /
     `the_readme_warning_table_lists_every_warning_in_the_contract` /
     `the_published_prose_spells_the_real_ladder` /
     `every_published_unit_is_in_the_known_vocabulary` が持つ
-- **Phase 20** — (a) 派生 1 個のときの完全一致（最重要の回帰）。(b) マニフェスト
-  JSON のゴールデン。(c) 命名衝突を**書き始める前に**検出する。(d) 派生 N 個でも
-  ピークメモリが N に比例しない（[3.2b](#32b-境界品質の回帰テストtestsedge_qualityrs)
-  の計測手法を流用）
+- **Phase 20**（済。結果は §5 の Phase 20 に、テスト名はここに並べた）。
+  **受け入れ基準の letter はこの一覧が定義である**——テストの doc コメントが
+  `受け入れ基準 (a)` のように引くので、参照先をここに置く。
+  - **(a) 派生 1 個のときの完全一致**（最重要の回帰。
+    `a_single_derivation_writes_the_same_bytes_to_the_same_path` /
+    `adding_derivations_does_not_disturb_the_ones_already_there`）。**既存の
+    md5 / 決定性テストを 1 本も書き換えずに通した**ことが第一の証拠で、244 本の
+    うち Phase 20 で足したもの以外は 1 行も触っていない
+  - **(b) マニフェスト JSON のゴールデン**（`the_manifest_is_a_byte_for_byte_golden`）。
+    2 回走らせて同じバイト列になることと、キーの並び・結果 JSON の `outputs[]` との
+    一致まで見る。**並びは書いたバイト列で見る**——`serde_json::Value` へ読み直すと
+    `Map` が綴りで並べ替えてしまい、ファイルの中の順序は分からなくなる
+  - **(c) 命名衝突を書き始める前に検出する**
+    （`a_name_collision_is_caught_before_anything_is_written` /
+    `force_does_not_excuse_two_derivations_sharing_a_path` /
+    `a_malformed_naming_template_is_refused_with_a_code`）。**出力ディレクトリに
+    1 ファイルも増えていない**ことまで assert する
+  - **(d) ピークメモリが N に比例しない**
+    （`five_derivations_do_not_cost_five_times_the_peak_memory`。
+    [3.2b](#32b-境界品質の回帰テストtestsedge_qualityrs) の `resident_kb()` と
+    同じ `ps -o rss=` を、走っている子プロセスへ向けた）。**絶対値は書かない**——
+    N=1 と N=5 のピークの増分が N=1 のピークの半分を切ることだけを見る
+  - **(e) 派生に紐づく警告が `data.output` を持つ**
+    （`every_derivation_bound_warning_names_its_output`）。6 つすべてを実際に
+    鳴らし、値が `outputs[].path` のどれかと一致することまで見る
+  - **(f) 排他と書式**（`derive_and_the_product_flags_cannot_be_mixed` /
+    `a_malformed_derivation_on_the_command_line_is_refused_by_the_parser` /
+    `the_product_of_sizes_and_formats_keeps_size_outside` /
+    `the_extension_round_trips_through_from_path`）
+  - **(g) spec 経由**（`a_spec_builds_derivations_through_the_same_gate` /
+    `a_partial_batch_says_so_in_the_manifest_warning`）
+  - **(h) 契約そのもの**（`the_schema_version_is_two_everywhere` /
+    `the_manifest_obeys_the_overwrite_rules_and_dry_run` と、既存の
+    `the_readme_warning_table_lists_every_warning_in_the_contract` /
+    `every_code_named_in_the_docs_exists` / `every_published_field_exists_in_the_result`）
 - **Phase 21** — (a) 各指標 × しきい値 → exit code の対応表。(b) `--fail-on` 無指定
   なら exit code が 1 つも変わらない。(c) batch で「1 件不合格 + 0 件失敗 → 5」
   「1 件失敗 + 1 件不合格 → 4」の優先順位

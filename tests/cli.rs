@@ -12560,6 +12560,87 @@ fn a_derivation_that_leaves_the_profile_formats_says_so_one_by_one() {
     assert_eq!(lint_check(&lint_result, "format")["status"], "fail");
 }
 
+/// **派生の寸法が profile の外へ出たら、派生ごとに 1 件報せる。**
+///
+/// 形式と同じ形の迂回である。`--sizes 400` は `--canvas` も `--longest-side` も
+/// 通らないので、profile が決めた寸法を丸ごと素通りする。**黙って通すと
+/// `--profile amazon` で書いた 400x400 が同じ amazon の `kiri lint` で
+/// `longest_side` fail になる**——形式の迂回と違って出力が実際に規格違反に
+/// なるので、実害はこちらのほうが直接的である。
+///
+/// **規格の内側に収まる派生では黙る**（`--sizes 800`）。そこで警告を出すと
+/// `PROFILE_OVERRIDDEN` が「profile を指定したのに効かなかった項目」以外を
+/// 語り始める（形式の側とまったく同じ規約）。
+#[test]
+fn a_derivation_that_leaves_the_profile_dimensions_says_so_one_by_one() {
+    let dir = fixture_dir();
+    let input = write_jpeg(
+        dir.path(),
+        "product.jpg",
+        &product_image(&ProductSpec {
+            width: 2000,
+            height: 2000,
+            ..Default::default()
+        }),
+    );
+    let output = dir.path().join("w.jpg");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--profile",
+            "amazon",
+            "--sizes",
+            "400,800",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let v = json_stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{v}");
+
+    let overridden: Vec<&Value> = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|w| w["code"] == "PROFILE_OVERRIDDEN" && w["data"]["key"] == "longest_side")
+        .collect();
+    assert_eq!(
+        overridden.len(),
+        1,
+        "規格の外へ出た派生はちょうど 1 本のはず: {v}"
+    );
+    let warning = overridden[0];
+    // **どの出力の話かを名乗る。** 並びの添字は `outputs[]` の添字と同じ
+    assert_eq!(warning["data"]["derive"], 0);
+    // 求めた値は上下限の組、効いた値は実際に書く長辺
+    assert_eq!(
+        warning["data"]["profile"],
+        serde_json::json!({
+            "min": profile_rules("amazon")["longest_side_min"],
+            "max": profile_rules("amazon")["longest_side_max"],
+        })
+    );
+    assert_eq!(warning["data"]["used"], 400);
+
+    // **その出力は実際に同じ profile の lint で落ちる。** 警告が指している
+    // のがまさにこれであることを、作り話ではなく実測で固定する
+    let small = Path::new(v["outputs"][0]["path"].as_str().unwrap()).to_path_buf();
+    assert_eq!(v["outputs"][0]["width"], 400, "{v}");
+    let (code, lint_result) = lint(&small, "amazon");
+    assert_eq!(code, 5, "amazon で書いた 400px が amazon の lint を通った");
+    assert_eq!(lint_check(&lint_result, "longest_side")["status"], "fail");
+
+    // 規格の内側の派生は黙って書かれる
+    let big = Path::new(v["outputs"][1]["path"].as_str().unwrap()).to_path_buf();
+    assert_eq!(v["outputs"][1]["width"], 800, "{v}");
+    let (_, big_result) = lint(&big, "amazon");
+    assert_eq!(lint_check(&big_result, "longest_side")["status"], "pass");
+}
+
 /// **`--profile` を渡さない実行は 1 バイトも変わらない。**
 ///
 /// Phase 21 の `no_fail_on_means_no_compliance_block_and_no_new_exit_code` と
@@ -12742,6 +12823,95 @@ fn what_a_profile_writes_passes_the_same_profiles_lint_end_to_end() {
             not_passing(&v)
         );
         assert_eq!(v["passed"], Value::Bool(true), "{name}: {v}");
+    }
+}
+
+/// **占有率を極端に寄せて書いたものも、同じ profile の lint を通る。**
+///
+/// 上の往復は `--fill-ratio` を profile の既定（0.85）に任せているので、
+/// **主体が外周の帯に入る領域を 1 度も踏まない。** `conforming_fill` が
+/// `fill_ratio_min + 0.03` を採っているのも同じで、下限のすぐ上しか見ない。
+///
+/// lint は背景を短辺の 3% の帯で測るので、占有率が `1 - 2/33 ≒ 0.939` を
+/// 超えると**主体そのものがその帯に入る**。そこで落ちた `uniformity` を
+/// 「背景が単色でない」と読んで `unmeasurable` を返していたことがあり、
+/// **`kiri cutout --profile amazon --fill-ratio 0.95` で書いた純白背景の
+/// 正方形が、同じ amazon の `kiri lint` で落ちていた**（0.94 は通る）。
+///
+/// どの profile にも占有率の**上限**は無い。寄りのトリミングは全規格で
+/// 合法なので、規格が許す構図で書いたものが規格で落ちること自体が誤りである。
+///
+/// **背景を規定する規格だけを回す。** 規定の無い規格（shopify）では
+/// `background` の行がそもそも出ないので、この往復で守れるものが無い。
+#[test]
+fn a_tightly_cropped_profile_output_still_passes_the_same_profiles_lint() {
+    let dir = fixture_dir();
+    let input = write_jpeg(
+        dir.path(),
+        "tight.jpg",
+        &product_image(&ProductSpec {
+            width: 2000,
+            height: 2000,
+            ..Default::default()
+        }),
+    );
+
+    for name in ["amazon", "square-white"] {
+        let rules = profile_rules(name);
+        if rules["background"].is_null() {
+            continue;
+        }
+        let ext = rules["formats"][0].as_str().unwrap();
+        // 回帰した帯（0.95 以上）と、当時も通っていた 0.94 の両方を踏む。
+        // **通っていた側を残す**のは、直した結果として広いほうの帯が
+        // 使われなくなっていないかを同じテストで見るためである
+        for fill in ["0.94", "0.95", "0.96", "0.97", "0.98"] {
+            let output = dir.path().join(format!("{name}_{fill}.{ext}"));
+            let out = kiri()
+                .args([
+                    "cutout",
+                    input.to_str().unwrap(),
+                    "-o",
+                    output.to_str().unwrap(),
+                    "--json",
+                    "--profile",
+                    name,
+                    "--fill-ratio",
+                    fill,
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "{name} / fill {fill}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+
+            let (code, v) = lint(&output, name);
+            assert_eq!(
+                code,
+                0,
+                "{name} / fill {fill}: profile で書いたものが同じ profile の lint で落ちた: {:?}",
+                not_passing(&v)
+            );
+            // **測れた帯と色まで見る。** exit 0 だけでは、`background` の行が
+            // 出ていない実行（規定なしの規格を取り違えた）でも緑になる
+            let check = lint_check(&v, "background");
+            assert_eq!(check["status"], "pass", "{name} / fill {fill}: {check}");
+            assert_eq!(
+                check["actual"]["rgb"], rules["background"],
+                "{name} / fill {fill}: 測った背景色が規格の色と違う: {check}"
+            );
+            // 帯は主体の手前で止まる。**`--border` の既定 2 まで落ちていない**
+            // ——そこまで狭めると、外周 2px の縁 1 本で「背景は純白」と
+            // 答える側の穴が開く
+            let band = check["actual"]["border_px"].as_u64().expect("帯幅が無い");
+            assert!(
+                band > 2,
+                "{name} / fill {fill}: 外周 2px で判定している: {check}"
+            );
+        }
     }
 }
 

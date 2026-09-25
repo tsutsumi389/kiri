@@ -25,7 +25,8 @@
 //!
 //! 落ちないだけでは足りない。**入力の大きさに対して素直に効かない数には
 //! 上限を置く**——`MAX_BOXES`（1 階層のボックス数）、`MAX_ASSOCIATIONS` と
-//! `MAX_PROPERTY_REFS`（`ipma` の量）がそれで、どれも現実の AVIF が届かない
+//! `MAX_PROPERTY_REFS`（`ipma` の量）、`MAX_AUXL_LINKS`（`iref` の `auxl` の
+//! 対応の数）がそれで、どれも現実の AVIF が届かない
 //! 水準に取ってある。ここを空けておくと、数百 KB のファイルが数十秒と
 //! 数 GB を要求できてしまう。
 
@@ -47,26 +48,54 @@ const MAX_BOXES: usize = 4096;
 ///
 /// item がいちばん増えるのは grid である。ISO/IEC 23008-12 の `grid` は行数と
 /// 列数をそれぞれ 8bit で持つので、タイルは多くても 256 × 256 = 65536 枚。
-/// これに grid 本体・アルファ・Exif・XMP などが少し足される。**その倍の
-/// 131072 を上限に置く**——現実の AVIF が届く見込みのない水準で、かつ
-/// `ipma` の 1 要素は最小 3 バイトなので、ここへ届くには 393KB の `ipma` が要る。
+/// **アルファも grid なら同じだけ増える**ので、タイルで 65536 × 2、これに
+/// grid 本体 2 つを足した **131074 が理論上の最大**である（Exif / XMP が
+/// 数個乗る）。
+///
+/// **その倍に届かない最小の 2 冪として 262144 を上限に置く。** かつて
+/// `1 << 17`（131072）を置いていたが、それは「65536 の倍」という数え方から
+/// 出た数で、**アルファ側の grid を数え落としていた**——上の 131074 は
+/// そのすぐ上にあり、理論上の最大構成をちょうど弾く位置に上限があった。
+/// 現実の AVIF が届く見込みが無いことは変わらず、かつ `ipma` の 1 要素は
+/// 最小 3 バイトなので、ここへ届くには 786KB の `ipma` が要る。
 ///
 /// 上限が要るのは、`ipma` の `entry_count` が 32bit で、ファイルの大きさに
 /// 対して要素数がいくらでも増やせるため。`MAX_BOXES` と同じ思想で、
 /// **正常なファイルを弾かない水準で「際限なく伸ばさない」ことだけを保証する。**
-const MAX_ASSOCIATIONS: usize = 1 << 17;
+const MAX_ASSOCIATIONS: usize = 1 << 18;
 
 /// `ipma` が並べられるプロパティ番号の総数の上限。
 ///
 /// 1 つの item に付くプロパティは実ファイルで `ispe` / `av1C` / `pixi` /
-/// `colr` / `irot` / `auxC` など十数個まで。上の 131072 item すべてに 8 個ずつ
-/// 付いても 1048576 に収まるので、そこを上限にする。
+/// `colr` / `irot` / `auxC` など十数個まで。**上限まで item が並ぶのは grid の
+/// タイルだけで、タイルが名乗るのは `ispe` / `av1C` / `pixi` の 3 つ程度**
+/// である。262144 item すべてに 4 個ずつ付いても 1048576 に収まるので、
+/// そこを上限にする。
 ///
 /// 要素数とは別に数える必要がある。`ipma` の 1 要素が持てるプロパティ数は
-/// 8bit（255）なので、要素数だけを見ていると 131072 × 255 = 3300 万本の
+/// 8bit（255）なので、要素数だけを見ていると 262144 × 255 = 6600 万本の
 /// 参照が素通りする。**実測ではそれが 1.5MB の入力で 31 秒 / RSS 2.4GB
 /// になっていた。**
 const MAX_PROPERTY_REFS: usize = 1 << 20;
+
+/// `iref` の `auxl` が並べられる対応（from → to）の総数の上限。
+///
+/// **`MAX_ASSOCIATIONS` と同じ数を使う。** `auxl` が結ぶ先は item であり、
+/// item の数は `ipma` の側で既にその数に押さえてある——同じ量に 2 つ目の数を
+/// 置くと、片方だけを直した日に「何件までの AVIF を読むのか」が 2 通りになる。
+/// 現実の上限も同じ理屈で出る（65536 枚のタイルにアルファが 1 対 1 で付いて
+/// 65536 対応、grid 本体の 1 対応を足して 65537）。
+///
+/// 上限が要るのは、`auxl` の `reference_count` が 16bit なうえに `iref` の中へ
+/// `auxl` ボックスをいくつでも並べられるためで、**ファイルの大きさに対して
+/// 素直に効かない**（`MAX_PROPERTY_REFS` と同じ形）。1 対応は最小 2 バイト
+/// （version 0）なので、ここへ届くには 256KB の `iref` が要る。
+///
+/// **実測**（`auxl` を 4000 箱 × 10000 対応、524MB の入力）では、上限が無いと
+/// `kiri lint` が 8.85 秒 / 最大 RSS 3.68GB を使っていた。`BTreeSet` で
+/// item ごとの線形探索を潰したのは正しい変更だが、**潰した先の集合そのものに
+/// 際限が無かった**ので、時間もメモリも入力の大きさに比例して伸び続けていた。
+const MAX_AUXL_LINKS: usize = MAX_ASSOCIATIONS;
 
 /// コンテナから読み取れた事実。
 ///
@@ -464,9 +493,14 @@ fn aux_urn(payload: &[u8]) -> Option<&str> {
 }
 
 /// `iref` の `auxl` を (from_item, to_item) の並びにする。
+///
+/// 量には `MAX_AUXL_LINKS` で上限を置く。`reference_count` は 16bit だが
+/// `auxl` ボックス自体を何個でも並べられるので、**総数はファイルの大きさに
+/// 対して素直に効かない**（`item_properties` の 2 つの上限と同じ形）。
 fn auxl_links(iref: &[u8]) -> Result<Vec<(u32, u32)>> {
     let (version, _, body) = full_box(iref)?;
     let mut out = Vec::new();
+    let mut links = 0usize;
     for reference in children(body)? {
         if reference.kind != *b"auxl" {
             continue;
@@ -479,6 +513,12 @@ fn auxl_links(iref: &[u8]) -> Result<Vec<(u32, u32)>> {
             be16(reference.payload, 0)? as u32
         };
         let count = be16(reference.payload, step)?;
+        // **読む前に数える。** 1 箱ぶんを読み切ってから足すと、`auxl` を
+        // 何万箱も並べた入力で「1 箱ずつは上限の内側」のまま総量だけが伸びる
+        links = add(links, usize::from(count))?;
+        if links > MAX_AUXL_LINKS {
+            return Err(broken("iref の auxl 対応が多すぎます"));
+        }
         let mut at = add(step, 2)?;
         for _ in 0..count {
             let to = if wide {
@@ -620,7 +660,7 @@ fn find<'a>(children: &[Child<'a>], kind: &[u8; 4]) -> Option<&'a [u8]> {
 /// 置いてあったが、深さは呼び出し側が定数で渡していたので一度も効かず、
 /// 「上限がある」という見かけだけが残っていた。入力の量に効く関門は
 /// `MAX_BOXES`（1 階層の数）と `MAX_ASSOCIATIONS` / `MAX_PROPERTY_REFS`
-/// （`ipma` の量）が持つ。
+/// （`ipma` の量）、`MAX_AUXL_LINKS`（`iref` の `auxl` の量）が持つ。
 fn children(data: &[u8]) -> Result<Vec<Child<'_>>> {
     let mut out = Vec::new();
     let mut at = 0usize;
@@ -1335,6 +1375,79 @@ mod tests {
                 bytes.len()
             );
         }
+    }
+
+    /// `iref` に `auxl` を並べた AVIF。
+    ///
+    /// `boxes` 個の `auxl` が `refs` 件ずつ対応を書く。**1 箱あたりの
+    /// `reference_count` は 16bit に収まっていても、箱を並べれば総数は
+    /// いくらでも増やせる**——上限を 1 箱ぶんで数えていると素通りする形である。
+    fn avif_with_auxl(boxes: usize, refs: usize) -> Vec<u8> {
+        let ipco = plain_box(b"ipco", &ispe_1600());
+        let mut ipma_payload = 1u32.to_be_bytes().to_vec();
+        ipma_payload.extend_from_slice(&1u16.to_be_bytes());
+        ipma_payload.push(1);
+        ipma_payload.push(1);
+        let iprp = plain_box(
+            b"iprp",
+            &[ipco, versioned_box(b"ipma", 0, 0, &ipma_payload)].concat(),
+        );
+        let pitm = versioned_box(b"pitm", 0, 0, &1u16.to_be_bytes());
+
+        let mut auxl = Vec::new();
+        for i in 0..boxes {
+            let mut payload = ((i as u16).wrapping_add(2)).to_be_bytes().to_vec();
+            payload.extend_from_slice(&(refs as u16).to_be_bytes());
+            for _ in 0..refs {
+                payload.extend_from_slice(&1u16.to_be_bytes());
+            }
+            auxl.extend_from_slice(&plain_box(b"auxl", &payload));
+        }
+        let iref = versioned_box(b"iref", 0, 0, &auxl);
+        synthetic_avif(&[pitm, iprp, iref].concat())
+    }
+
+    /// `auxl` は上限の手前なら普通に読めること。
+    ///
+    /// **断る側と対にしておく**（`many_items_below_the_limit_are_still_read`
+    /// と同じ理由）。上限を下げすぎて現実のファイルを弾く変更が緑のまま
+    /// 通らないようにする。
+    #[test]
+    fn many_auxl_links_below_the_limit_are_still_read() {
+        let meta = probe(&avif_with_auxl(64, 1_000)).unwrap();
+        assert_eq!((meta.width, meta.height), (1600, 1600));
+        // アルファの `auxC` を持つ item が 1 つも無いので偽。**対応の数が
+        // 判断を変えないこと**まで言う
+        assert!(!meta.has_alpha);
+    }
+
+    /// `iref` の `auxl` が上限を超えたら、時間もメモリも使わずに断る。
+    ///
+    /// `has_alpha` が対応を `BTreeSet` にしたことで item ごとの線形探索は
+    /// 消えたが、**集合そのものの大きさに上限が無かった。** 実測（`auxl` を
+    /// 4000 箱 × 10000 対応、524MB の入力）で 8.85 秒・最大 RSS 3.68GB で、
+    /// しかもエラーではなく `Ok` が返っていた——だから「断ること」自体が
+    /// 退行の検出になる。
+    ///
+    /// **1 箱あたりは上限の内側**（10000 < `MAX_AUXL_LINKS`）にしてある。
+    /// 箱ごとにしか数えない実装ではここが素通りする。
+    #[test]
+    fn an_iref_beyond_the_auxl_limit_is_refused_without_burning_time() {
+        let bytes = avif_with_auxl(64, 10_000);
+        let began = std::time::Instant::now();
+        let err = probe(&bytes).unwrap_err();
+        let took = began.elapsed();
+        assert_eq!(err.code.as_str(), "INPUT_DECODE_FAILED");
+        assert!(
+            err.message.contains("iref の auxl 対応が多すぎます"),
+            "{}",
+            err.message
+        );
+        assert!(
+            took < std::time::Duration::from_secs(5),
+            "{took:?} かかった（{} バイト）",
+            bytes.len()
+        );
     }
 
     /// 幅がすべて 0 の `iloc` は、読み進めないと分かった時点で断る。

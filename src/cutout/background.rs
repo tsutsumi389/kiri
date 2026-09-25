@@ -148,6 +148,96 @@ pub fn field_band(image: &RgbaImage, border: u32) -> u32 {
     texture_band(image, border)
 }
 
+/// `settled_band` が帯を狭められる下限を、`field_band` の何分の一に置くか。
+///
+/// **1/4 まで。** 半分ずつ 2 回で、それ以上は狭めない。短辺で言えば
+/// `1/33 / 4 = 1/132`（1600px の画像で 12px）である。
+///
+/// なぜここで止めるかは、狭める理由と広げた理由の両方から決まる。
+///
+/// - **広げた理由**（`kiri lint` の `measure_pixels` を参照）は「細い縁の
+///   中央値は背景を代表しない」ことだった。1600px の外周 2px（短辺の 0.125%）
+///   を見て「背景は純白」と答えていたのがそれで、1/132（0.76%）はその 6 倍ある。
+/// - **狭める理由**は「主体が帯に入ったなら、その画素は背景ではない」ことで、
+///   帯 `1/132` は占有率 `1 - 2/132 ≒ 0.985` までの構図に対応する。これより
+///   寄せた画像（占有率 0.99）に残る縁は、まさに上で「代表しない」と断じた
+///   幅であり、**そこの中央値を背景と名乗るくらいなら測れないと言う。**
+const SETTLE_FLOOR_DIVISOR: u32 = 4;
+
+/// **合否を決める帯**の幅(px)。`kiri lint` だけが使う。
+///
+/// `field_band` から始めて、均一（`BackgroundEstimate::is_uniform`）と言える
+/// まで半分ずつ狭め、言えた最も広い帯を返す。どこまで狭めても言えなければ
+/// `field_band` をそのまま返す——**「測れなかった」は最も広い帯について言う。**
+///
+/// # なぜ固定幅ではいけないか
+///
+/// `field_band`（短辺の 3%）は**主体が帯に入りうる**幅である。1600px なら
+/// 48px で、占有率が `1 - 2/33 ≒ 0.939` を超えると主体そのものが帯に入る。
+/// そうなると外周サンプルの半分近くが商品の色になり、`uniformity` は落ちる
+/// ——が、それは「背景が単色でない」ことではない。**主体が混ざった標本で
+/// 測った均一度**であって、背景についての測定ですらない。
+///
+/// 実測（1600px 正方形・純白背景・`cutout --profile amazon` の成果物）:
+///
+/// | 占有率 | `field_band` の均一度 | ここが返す帯 | その帯の均一度 |
+/// |---|---|---|---|
+/// | 0.94 | 1.0 | 48 | 1.0 |
+/// | 0.95 | 0.8376 | 24 | 1.0 |
+/// | 0.97 | 0.5077 | 24 | 1.0 |
+/// | 0.98 | 0.6598 | 12 | 1.0 |
+///
+/// どの profile にも占有率の**上限**は無いので、寄りのトリミングは全規格で
+/// 合法である。固定幅のままでは、`kiri cutout --profile amazon` が書いたものを
+/// 同じ amazon の `kiri lint` が「背景を測れない」と言って落としていた。
+///
+/// # なぜ主体の外接矩形を標本から除く形にしないか
+///
+/// 除く形でも同じ画像は通るが、**返す `border_px` が「帯の幅」ではなくなる。**
+/// `kiri lint` は測った帯幅を結果に載せ、「`kiri info --border <その値>` を
+/// 走らせれば同じ背景色が出る」ことを契約として書いている（`lint.rs` 冒頭）。
+/// 矩形を抜いた標本はその 1 つの数で言い表せないので、契約のほうを失う。
+///
+/// 加えて、主体は背景の推定値に対して検出される（`detect_subject`）。帯が
+/// 主体で汚れていると推定値そのものが商品の色へ倒れ、**主体が 1 つも
+/// 検出されなくなる**（上の表の 0.98 が実際にそれで、`fill_ratio` まで
+/// `unmeasurable` になっていた）。除く対象が消えるので、除く形では直らない。
+///
+/// # 細い縁で「純白」と答え直さないか
+///
+/// 狭めるのは `SETTLE_FLOOR_DIVISOR` までで、しかも**広いほうから先に採る。**
+/// 外周 2px だけ白・残り一面が灰色の画像では `field_band` がそのまま均一
+/// （灰色の均一度 0.957）なので 48px で確定し、白い縁は 1 度も主役にならない。
+/// # `wide` を受け取る理由
+///
+/// 呼ぶ側は `field_band` の見立てを既に持っている（`see_background` を
+/// 通しているので）。それが均一ならこの関数は**測らずにその幅を返す**ので、
+/// **合格する画像では測定が 1 度も増えない。** 探索に入るのは
+/// `field_band` が均一でなかった画像だけで、そこでも増えるのは 2 回
+/// （1/2 と 1/4 の帯）である。実測（25MP）: 均一な画像 0.29s のまま、
+/// 実写の不織布（どの幅でも均一でない）で 0.95s → 1.15s。
+pub fn settled_band(image: &RgbaImage, border: u32, wide: &BackgroundEstimate) -> u32 {
+    let widest = field_band(image, border);
+    if wide.is_uniform() {
+        return widest;
+    }
+    let floor = (widest / SETTLE_FLOOR_DIVISOR).max(border).max(1);
+    let mut band = widest;
+    loop {
+        let next = (band / 2).max(floor);
+        if next >= band {
+            // これ以上狭められない。**測れなかったことは最も広い帯で言う**
+            // ——狭めた末の帯で「測れない」と言うと、`border_px` が
+            // 「どこまで狭めたか」という探索の途中経過を名乗ることになる
+            return widest;
+        }
+        band = next;
+        if estimate_background(image, band).is_uniform() {
+            return band;
+        }
+    }
+}
+
 /// 背景をどうモデル化するか。
 ///
 /// **`Auto` の既定は「均一なら 1 色、そうでなければ場」**である。均一な背景で
@@ -1137,6 +1227,100 @@ mod tests {
         let est = estimate_background(&img, DEFAULT_BORDER);
         assert_eq!(est.rgb, [255, 255, 255]);
         assert_eq!(est.uniformity, 1.0);
+    }
+
+    /// **主体が `field_band` に入った画像では、帯を主体の手前まで狭める。**
+    ///
+    /// 1600px の `field_band` は 48px で、占有率が `1 - 2/33 ≒ 0.939` を
+    /// 超えると主体そのものが帯に入る。そこで落ちた `uniformity` は背景に
+    /// ついての測定ではないので、狭めた帯で測り直す。
+    #[test]
+    fn the_band_stops_before_the_subject_when_the_wide_band_is_not_uniform() {
+        let side = 1600u32;
+        // 余白 24px（占有率 0.97）。`field_band` の 48px では半分が商品になる
+        let mut img = solid(side, side, [255, 255, 255, 255]);
+        for y in 24..side - 24 {
+            for x in 24..side - 24 {
+                img.put_pixel(x, y, Rgba([190, 70, 55, 255]));
+            }
+        }
+        let wide = field_band(&img, DEFAULT_BORDER);
+        assert_eq!(wide, 48);
+        let at_wide = estimate_background(&img, wide);
+        assert!(!at_wide.is_uniform(), "{}", at_wide.uniformity);
+
+        let band = settled_band(&img, DEFAULT_BORDER, &at_wide);
+        assert_eq!(band, 24, "主体の手前で止まっていない");
+        let settled = estimate_background(&img, band);
+        assert_eq!(settled.rgb, [255, 255, 255]);
+        assert!(settled.is_uniform());
+    }
+
+    /// **広い帯がそのまま均一なら、狭めない。**
+    ///
+    /// 外周 2px だけ白・残り一面が灰色の画像がこれである。狭める側から先に
+    /// 見ると白い 2px が主役になり、「灰色一面の画像の背景は純白」という
+    /// もとの穴が開く。
+    #[test]
+    fn a_uniform_wide_band_is_never_narrowed() {
+        let side = 1600u32;
+        let mut img = solid(side, side, [170, 170, 170, 255]);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            if x < 2 || y < 2 || x >= side - 2 || y >= side - 2 {
+                *p = Rgba([255, 255, 255, 255]);
+            }
+        }
+        let wide = field_band(&img, DEFAULT_BORDER);
+        let at_wide = estimate_background(&img, wide);
+        assert!(at_wide.is_uniform(), "{}", at_wide.uniformity);
+        assert_eq!(at_wide.rgb, [170, 170, 170]);
+        assert_eq!(settled_band(&img, DEFAULT_BORDER, &at_wide), wide);
+    }
+
+    /// **どこまで狭めても均一でなければ、最も広い帯を返す。**
+    ///
+    /// 織り目のある実写背景がこれで、そこで狭めた末の幅を名乗ると、
+    /// `border_px` が「どこまで狭めたか」という探索の途中経過になる。
+    #[test]
+    fn a_band_that_never_settles_reports_the_widest_one() {
+        let side = 400u32;
+        // 1 画素ごとに大きく振れる帯。どの幅でも均一にならない
+        let img = RgbaImage::from_fn(side, side, |x, y| {
+            if (x + y) % 2 == 0 {
+                Rgba([230, 220, 200, 255])
+            } else {
+                Rgba([120, 110, 90, 255])
+            }
+        });
+        let wide = field_band(&img, DEFAULT_BORDER);
+        let at_wide = estimate_background(&img, wide);
+        assert!(!at_wide.is_uniform());
+        assert_eq!(settled_band(&img, DEFAULT_BORDER, &at_wide), wide);
+    }
+
+    /// **`--border` は下限としてしか効かない。** 狭める向きに効かせると、
+    /// `--border 2` と書くだけで「外周 2px は純白です」と言わせられる。
+    #[test]
+    fn an_explicit_border_raises_the_floor_of_the_search() {
+        let side = 1600u32;
+        let mut img = solid(side, side, [255, 255, 255, 255]);
+        for y in 24..side - 24 {
+            for x in 24..side - 24 {
+                img.put_pixel(x, y, Rgba([190, 70, 55, 255]));
+            }
+        }
+        let at_wide = estimate_background(&img, field_band(&img, 40));
+        // 40px を要求されたら 24px まで狭めない——測れないと言うほうを採る
+        assert_eq!(settled_band(&img, 40, &at_wide), field_band(&img, 40));
+        // 下限を下げる向きには 1px も動かない（既定の 2 と同じ答え）
+        assert_eq!(
+            settled_band(&img, 1, &estimate_background(&img, field_band(&img, 1))),
+            settled_band(
+                &img,
+                DEFAULT_BORDER,
+                &estimate_background(&img, field_band(&img, DEFAULT_BORDER))
+            )
+        );
     }
 
     #[test]

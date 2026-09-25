@@ -13,10 +13,12 @@
 //! **どちらが本当かを利用者が確かめる手段が無くなる。**
 //!
 //! **違うのは帯幅だけである。** `info` は `--border` そのもので測り、lint は
-//! `field_band`（`max(短辺/33, --border)`）で測る——外周の中央値が
-//! **そのまま合否になる**のは lint だけだからで、理由は `measure_pixels` の
-//! doc に書いた。測り方が同じなので、`checks[].actual.border_px` の値を
-//! `kiri info --border` へ渡せば同じ数が出る。
+//! `settled_band`（`max(短辺/33, --border)` から、均一と言えるまで半分ずつ
+//! 狭めた幅）で測る——外周の中央値が**そのまま合否になる**のは lint だけ
+//! だからで、理由は `measure_pixels` の doc に書いた。測り方が同じなので、
+//! `checks[].actual.border_px` の値を `kiri info --border` へ渡せば同じ数が出る。
+//! **帯幅を 1 つの数で返せることがこの契約の前提**なので、標本から矩形を
+//! 抜く形は採っていない（`settled_band` の doc を参照）。
 //!
 //! # 何を合格と呼ぶか
 //!
@@ -31,7 +33,7 @@ use crate::cli::LintArgs;
 use crate::color::lab::delta_e_rgb;
 use crate::commands::output::{SUBJECT_FROM_COLOUR, round4};
 use crate::compliance::{FAIL, PASS, UNMEASURABLE};
-use crate::cutout::background::field_band;
+use crate::cutout::background::{field_band, settled_band};
 use crate::cutout::{BackgroundModel, analyse_background_seen, see_background};
 use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::avif_meta::{self, ColorNaming};
@@ -412,12 +414,34 @@ fn regulates_composition(rules: &Rules) -> bool {
 /// 額装の白枠やレタッチの縁 1 本がそこを占めているだけで「背景は純白」と
 /// 答えてしまう（灰色一面の画像が全項目 pass になる実例があった）。
 ///
-/// そこで背景と主体は `field_band`（`max(短辺/33, --border)`）の帯で測る。
+/// そこで背景と主体は `field_band`（`max(短辺/33, --border)`）の帯**から**測る。
 /// **新しい定数は置かない**——これは「場の推定で『ここは背景だ』と信じて
 /// よい外周の帯」として `background.rs` が既に答えを出している幅で、
 /// 織り目を何周期ぶんも含む広さとして選ばれている。`--border` はその
 /// **下限**として効く（`texture` / `field` の帯と同じ規約で、狭める向きには
 /// 働かない）。
+///
+/// # 広いだけの帯もまた合否を狂わせる
+///
+/// `field_band` は**主体が入りうる**幅である。1600px なら 48px なので、
+/// 占有率が `1 - 2/33 ≒ 0.939` を超えると主体そのものが帯に入り、外周
+/// サンプルの半分近くが商品の色になる。そこで落ちた `uniformity` は
+/// 「背景が単色でない」ではなく「背景でないものを混ぜて測った」であり、
+/// **同じレポートの `fill_ratio` が主体と背景を分離できていると言っている
+/// 横で、`background` だけが「測れない」と言う**矛盾になっていた。
+///
+/// そこで帯は `settled_band` が決める——`field_band` から始めて、均一と
+/// 言えるまで半分ずつ（`field_band` の 1/4 まで）狭め、言えた最も広い帯を
+/// 採る。広いほうから先に採るので、上の「細い縁で純白と答える」は起きない
+/// （どちらの向きに外れるかの根拠は `settled_band` の doc にまとめてある）。
+///
+/// # `--border` を上書きとして受けない理由
+///
+/// 帯を狭める道を `--border` に持たせれば逃げ道にはなるが、それは
+/// **`--border 2` と書けば「外周 2px は純白です」と言わせられる**ということ
+/// である。この doc の冒頭が塞いだ穴をオプション 1 つで開け直すことになるので
+/// 採らない。占有率を寄せた画像が測れないという実害のほうは `settled_band` が
+/// 直したので、逃げ道そのものが要らなくなった。
 ///
 /// # `kiri info` と食い違わせない
 ///
@@ -497,15 +521,26 @@ fn measure_pixels(args: &LintArgs, file_size: u64) -> Result<(Facts, Vec<Warning
 
     // **`info` とまったく同じ経路で見立てる。** 1 度だけ測って両方に使う
     // （`info::run` が `seen` を持ち回しているのと同じ理由で、24.5MP の
-    // 測定を 2 度払わない）。帯幅を `--border` から広げた理由は上の doc に書いた。
+    // 測定を 2 度払わない）。帯幅を `--border` そのものにしない理由も、
+    // `field_band` のままにしない理由も上の doc に書いた。
+    //
+    // **まず最も広い帯で見立て、それが均一ならそこで決まる。** 見立てを
+    // `settled_band` へ渡すのはそのためで、合格する画像では測定が 1 度も
+    // 増えない（`settled_band` の doc に実測を置いた）。
     //
     // **モデルは `Auto`（`cutout` の既定）を渡す。** lint が読むのは
     // `estimate`（外周の中央値）と `subject` の 2 つで、どちらも照明場の
     // 当てはめとは無関係なので、どのモデルでも同じ数になる。それでも
     // `analyse_background_seen` を通すのは、**lint が自前の測り方を
     // 持たない**ことを構造で示すためである
-    let border = field_band(&loaded.image, args.border);
-    let seen = see_background(&loaded.image, border);
+    let widest = field_band(&loaded.image, args.border);
+    let seen = see_background(&loaded.image, widest);
+    let border = settled_band(&loaded.image, args.border, &seen.estimate);
+    let seen = if border == widest {
+        seen
+    } else {
+        see_background(&loaded.image, border)
+    };
     let analysis = analyse_background_seen(
         &loaded.image,
         Some(&seen),
@@ -626,44 +661,45 @@ fn judge(check: Check, rules: &Rules, facts: &Facts) -> LintCheck {
                     actual: None,
                 };
             }
+            let seen = pixels.background;
+            let delta_e = delta_e_rgb(seen, want);
+            // **測った色と色差の両方を返す。** 色だけでは規格からどれだけ
+            // 外れたのかが測れず、色差だけではどちらへ外れたのかが分からない。
+            // **帯幅も一緒に返す**——同じ `delta_e: 0.0` でも、外周 2px を
+            // 見た 0.0 と外周 48px を見た 0.0 は別のことを言っている
+            let actual = json!({
+                "rgb": seen,
+                "delta_e": round4(delta_e),
+                "border_px": pixels.border,
+                "uniformity": round4(pixels.uniformity),
+            });
             // **単色の背景ではない。** 中央値は出るが、それを「この画像の
             // 背景色」と名乗るには外周が揃っていなければならない。揃って
-            // いない帯の中央値を `delta_e: 0.0` のような確信のある数で配ると、
-            // 読み手はそれを画像全体の背景についての測定だと読む
-            // （`lint.rs` 冒頭の「測れていないものを pass と言わない」）。
+            // いない帯で `pass` を出すと、読み手はそれを画像全体の背景に
+            // ついての測定だと読む（`lint.rs` 冒頭の「測れていないものを
+            // pass と言わない」）。
             //
             // しきい値は `BackgroundEstimate::is_uniform`——`cutout` が
             // `LOW_UNIFORMITY` を出すのに使っているものそのままで、
-            // 同じ問いに 2 つ目の数を置かない
+            // 同じ問いに 2 つ目の数を置かない。
+            //
+            // **`status` が `unmeasurable` でも `actual` は同じ形で返す。**
+            // 合否に使わない数と、人が次の一手を選ぶのに要る数は別である
+            // ——「背景がベージュで、白から ΔE 40 外れている」は、均一で
+            // なかろうと結果に残っていなければならない（`color_space` の
+            // `unmeasurable` が CICP を残しているのと同じ作法で、
+            // `LintCheck::actual` の doc が既にそう宣言している）。
+            // 合格ではないことは `status` が言い切っているので、
+            // 数を添えても「測れたことにする」ことにはならない
             if !pixels.background_uniform {
                 return LintCheck {
                     name: check.as_str(),
                     status: UNMEASURABLE,
                     expected,
-                    // **測れなかった理由は測定値である。** `rgb` を出さないのは
-                    // 信用していない数を配らないため、`uniformity` を出すのは
-                    // 「なぜ測れないのか」を散文から抜き直させないためである
-                    actual: Some(json!({
-                        "border_px": pixels.border,
-                        "uniformity": round4(pixels.uniformity),
-                    })),
+                    actual: Some(actual),
                 };
             }
-            let seen = pixels.background;
-            let delta_e = delta_e_rgb(seen, want);
-            (
-                flag(delta_e <= BACKGROUND_DELTA_E_TOLERANCE),
-                // **測った色と色差の両方を返す。** 色だけでは規格からどれだけ
-                // 外れたのかが測れず、色差だけではどちらへ外れたのかが分からない。
-                // **帯幅も一緒に返す**——同じ `delta_e: 0.0` でも、外周 2px を
-                // 見た 0.0 と外周 48px を見た 0.0 は別のことを言っている
-                Some(json!({
-                    "rgb": seen,
-                    "delta_e": round4(delta_e),
-                    "border_px": pixels.border,
-                    "uniformity": round4(pixels.uniformity),
-                })),
-            )
+            (flag(delta_e <= BACKGROUND_DELTA_E_TOLERANCE), Some(actual))
         }
         Check::FillRatio => {
             let min = match rules.fill_ratio_min {
@@ -1001,24 +1037,36 @@ mod tests {
         assert!(check.expected.is_some());
     }
 
-    /// **単色でない背景の中央値を「測った背景色」として配らない。**
+    /// **単色でない背景を `pass` と言わない。それでも測った値は全部返す。**
     ///
     /// しきい値は `cutout` が `LOW_UNIFORMITY` を出すのに使っている
     /// `BackgroundEstimate::is_uniform` そのもので、2 つ目の数を置かない。
+    ///
+    /// **`rgb` と `delta_e` を落とさない。** 落としていたときは、実写の
+    /// ベージュの布を検査した人の手元に「測れませんでした」だけが残り、
+    /// 「白から ΔE 40 外れている」という**次の一手を決める唯一の数**が
+    /// 結果から消えていた。合格でないことは `status` が言い切っているので、
+    /// 数を添えても「測れたことにする」ことにはならない
+    /// （`LintCheck::actual` の doc と、`color_space` の `unmeasurable` が
+    /// CICP を残しているのと同じ作法である）。
     #[test]
-    fn a_background_that_is_not_one_colour_is_unmeasurable() {
+    fn a_background_that_is_not_one_colour_is_unmeasurable_but_still_reports_the_colour() {
         let mut f = facts();
         {
             let p = f.pixels.as_mut().unwrap();
             p.background_uniform = false;
             p.uniformity = 0.62;
+            p.background = [214, 199, 168];
         }
         let checks = run_checks(&f, "amazon");
         let check = checks.iter().find(|c| c.name == "background").unwrap();
         assert_eq!(check.status, UNMEASURABLE);
         let actual = check.actual.clone().unwrap();
-        // 信用していない色は配らない。測れなかった理由は測定値で言う
-        assert!(actual.get("rgb").is_none(), "{actual}");
+        assert_eq!(actual["rgb"], json!([214, 199, 168]));
+        // 規格の白からどれだけ外れているか。**合否に使わない数だが、
+        // 素材を撮り直すかレタッチするかはこれで決まる**
+        let delta_e = actual["delta_e"].as_f64().expect("色差が無い: {actual}");
+        assert!(delta_e > BACKGROUND_DELTA_E_TOLERANCE, "{actual}");
         assert_eq!(actual["uniformity"], json!(0.62));
         assert_eq!(actual["border_px"], json!(48));
     }

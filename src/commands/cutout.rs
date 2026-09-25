@@ -229,6 +229,17 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             reserved.push(output::Reserved { path, flag });
         }
     }
+    // **派生の寸法を照らせるのはここが最初である。** 形式と違って、派生が
+    // 実際に何 px になるかは最終画像の縦横比が決まるまで 1 つに定まらない
+    // （`derivation_size_warnings` の doc）。書き出しの前に出すので、文面は
+    // 形式の警告と同じ「で書きます」のままでよい
+    if let Some(profile) = args.profile {
+        warnings.extend(derivation_size_warnings(
+            profile,
+            &args.out,
+            final_image.dimensions(),
+        ));
+    }
     let (output_reports, save_warnings) =
         output::write_images(final_image, &loaded, &args.out, &output_plan, &reserved)?;
     warnings.extend(save_warnings);
@@ -534,18 +545,6 @@ fn apply_profile(args: &CutoutArgs, warnings: &mut Vec<Warning>) -> Option<Cutou
     Some(out)
 }
 
-/// 明示指定が profile の値を押しのけたことを報せる。
-///
-/// **同じ値なら黙っている。** この警告が答えているのは「profile を指定したのに
-/// 効かなかった項目はどれか」であり、同じ値に落ち着いた項目について
-/// `profile` と `used` に同じ数を並べても、読む側の次の一手は 1 つも変わらない。
-///
-/// `data` のキーは spec の綴り（`fill_ratio` / `max_bytes`）に合わせる。
-/// 結果 JSON の他のキーがすべて snake_case なので、ここだけ `--fill-ratio` と
-/// 綴ると受け手はどちらでも拾える分岐を書かされる。CLI の綴りは `message` が言う。
-///
-/// **`profile` と `used` の両方を入れる。** 片方だけでは、規格が求めた値から
-/// どれだけ外したのかを呼び出し側が測れない。
 /// 出力先が**拡張子を綴っているか**。
 ///
 /// **`OutputFormat::from_path` の `None` は 2 つの意味を持つ。** 「拡張子が
@@ -593,22 +592,19 @@ fn derivation_overridden(
     used: OutputFormat,
 ) -> Warning {
     let allowed: Vec<&str> = profile.rules.formats.iter().map(|f| f.as_str()).collect();
-    let which = match role {
-        Some(role) => format!("派生 {index}（role {role}）"),
-        None => format!("派生 {index}"),
-    };
     let warning = Warning::new(
         WarningCode::ProfileOverridden,
         format!(
-            "--profile {} が許すのは {} ですが、{} は {} で書きます",
+            "--profile {} が許すのは {} ですが、{} {} で書きます",
             profile.name,
             allowed.join(" / "),
-            which,
+            which_derivation(index, role),
             used.as_str()
         ),
     )
     .with_hint(format!(
-        "この出力は同じ --profile {} の kiri lint で format が fail になります。         規格の内側で書くなら派生の format を外すか {} のどれかにしてください",
+        "この出力は同じ --profile {} の kiri lint で format が fail になります。\
+         規格の内側で書くなら派生の format を外すか {} のどれかにしてください",
         profile.name,
         allowed.join(" / ")
     ))
@@ -618,12 +614,188 @@ fn derivation_overridden(
     .with_data("profile", json!(allowed))
     .with_data("used", used.as_str())
     .with_data("derive", index);
+    tag_derivation(warning, role)
+}
+
+/// 文面の中でその派生を指す語。**係助詞まで含めて返す。**
+///
+/// 役目を書いた派生では `（role thumb）` が付くので、呼ぶ側が
+/// `「{} は」` と綴ると全角の `）` の後に半角スペースが 1 つ残る
+/// （`派生 1（role thumb） は avif で書きます`）。**配る文面に
+/// 連続スペースや浮いたスペースを入れない**という規約なので、区切りの
+/// 有無をここで吸収する——呼ぶ側は `{}` の後に半角スペースを 1 つ置いて
+/// 次の語を続ければ、どちらの形でも正しい間隔になる。
+fn which_derivation(index: usize, role: Option<&str>) -> String {
+    match role {
+        Some(role) => format!("派生 {index}（role {role}）は"),
+        None => format!("派生 {index} は"),
+    }
+}
+
+/// 派生を指す警告に `role` を添える。**役目を書いていない派生には足さない。**
+///
+/// 派生を必ず指せるのは `data.derive`（並びの添字）で、`role` はそれを人が
+/// 読めるようにする添え物である。**形式の警告と寸法の警告で同じ足し方をする**
+/// ——片方だけが `role` を落とすと、受け手は警告の `key` ごとに別の当て方を
+/// 書かされる。
+fn tag_derivation(warning: Warning, role: Option<&str>) -> Warning {
     match role {
         Some(role) => warning.with_data("role", role),
         None => warning,
     }
 }
 
+/// 派生が profile の**寸法**の外へ出たことを報せる。
+///
+/// # なぜ形式と同じ場所で出さないか
+///
+/// 形式は最終画像の寸法を 1 つも見ないので `apply_profile`（設定が確定する
+/// 場所）で決まる。**寸法はそうはいかない**——`--derive 'width=800'` が
+/// 実際に何 px になるかは、元の縦横比・`fit`・`allow_upscale` で決まるので、
+/// 最終画像ができるまで 1 つに定まらない。`--sizes 400` を「長辺 400」と
+/// 決めつけて報せると、縦長の素材で長辺が 1200 になる実行にまで
+/// 「規格の外です」と言うことになる——**測っていないものを測ったと言わない。**
+///
+/// そこで書き出しの直前に `resize::plan`（`output::resolve` と `render` が
+/// 使うのと同じ純関数）で出力寸法を出してから照らす。同じ関数を通すので、
+/// ここが言う寸法と `outputs[].width` / `height` が食い違うことはない。
+///
+/// # 寸法を書かなかった派生
+///
+/// `DeriveSpec::resize()` が `None` を返す派生（`width` も `height` も無い）は
+/// **最終画像をそのまま書く**。最終画像は `--canvas` / `--fill-ratio` /
+/// `--longest-side` を profile が決めた結果なので、規格の寸法はそこから
+/// 届いている——形式を書かなかった派生が `--output` の解決結果を継ぐのと
+/// まったく同じ関係である。だからここは見ない。
+///
+/// # 何を照らすか
+///
+/// `longest_side_min` / `longest_side_max` / `max_pixels` の 3 つで、これは
+/// `Rules` のうち**寸法だけで決まる条件のすべて**である（`square` は
+/// `Check::Square` が見るが、縦横比を変える派生は `fit exact` だけで、
+/// `--derive` はそれを受け付けない）。`lint` が見る条件を 2 箇所で数え直す
+/// ことになるが、照らす値そのものは `Rules` の 1 つの表から読む。
+fn derivation_size_warnings(
+    profile: &profile::Profile,
+    opts: &crate::cli::OutputOpts,
+    source: (u32, u32),
+) -> Vec<Warning> {
+    let rules = &profile.rules;
+    let mut out = Vec::new();
+    for (index, spec) in output::specs(opts).iter().enumerate() {
+        let Some(resize) = spec.resize() else {
+            continue;
+        };
+        // **断られる指定はここでは黙る。** `--allow-upscale` を付けずに
+        // 拡大を求めた派生は `output::resolve` が同じ `plan` で断るので、
+        // ここが先に「規格の外です」と言うと、実際には 1 枚も書かれない
+        // 出力について警告だけが残る
+        let Ok(plan) = crate::transform::resize::plan(source, &resize) else {
+            continue;
+        };
+        let (w, h) = plan.output;
+        let long = u64::from(w.max(h));
+        let pixels = u64::from(w) * u64::from(h);
+        let size = format!("{w}x{h}");
+
+        let below = rules
+            .longest_side_min
+            .is_some_and(|min| long < u64::from(min));
+        let above = rules
+            .longest_side_max
+            .is_some_and(|max| long > u64::from(max));
+        if below || above {
+            out.push(derivation_size_overridden(
+                profile,
+                index,
+                spec.role.as_deref(),
+                "longest_side",
+                json!({ "min": rules.longest_side_min, "max": rules.longest_side_max }),
+                json!(long),
+                &spell_longest_side(rules.longest_side_min, rules.longest_side_max),
+                &format!("{size}（長辺 {long}）"),
+            ));
+        }
+        if rules.max_pixels.is_some_and(|max| pixels > max) {
+            out.push(derivation_size_overridden(
+                profile,
+                index,
+                spec.role.as_deref(),
+                "max_pixels",
+                json!(rules.max_pixels),
+                json!(pixels),
+                &format!("総画素数 {} 以下", rules.max_pixels.unwrap_or_default()),
+                &format!("{size}（{pixels} 画素）"),
+            ));
+        }
+    }
+    out
+}
+
+/// 長辺の規定を人が読む 1 つの語にする。**片方しか無い規格でもそう名乗る。**
+///
+/// `500〜10000 の範囲` と `5000 以下` を同じ形へ畳むと、上限だけの規格
+/// （shopify）に下限があるように読める。**語尾は必ず日本語で終える**
+/// ——呼ぶ側が `{demand}ですが` と続けるので、`10000` で終わると
+/// 数字と仮名が地続きになる。
+fn spell_longest_side(min: Option<u32>, max: Option<u32>) -> String {
+    match (min, max) {
+        (Some(min), Some(max)) => format!("長辺 {min}〜{max} の範囲"),
+        (Some(min), None) => format!("長辺 {min} 以上"),
+        (None, Some(max)) => format!("長辺 {max} 以下"),
+        // 規定が無ければ呼ばれない（`below` も `above` も偽になる）
+        (None, None) => String::new(),
+    }
+}
+
+/// 寸法の `PROFILE_OVERRIDDEN` を 1 件組む。
+///
+/// **`data` の形は形式の警告と同じ**（`key` / `profile` / `used` / `derive` /
+/// `role`）にする。受け手が答えたいのは「profile を指定したのに効かなかった
+/// 項目はどれか」で、効かなかったのが形式か寸法かで拾い方を変える理由が無い。
+#[expect(clippy::too_many_arguments, reason = "文面と data を 1 箇所で組むため")]
+fn derivation_size_overridden(
+    profile: &profile::Profile,
+    index: usize,
+    role: Option<&str>,
+    key: &'static str,
+    wanted: Value,
+    used: Value,
+    demand: &str,
+    written: &str,
+) -> Warning {
+    let warning = Warning::new(
+        WarningCode::ProfileOverridden,
+        format!(
+            "--profile {} が求めるのは{demand}ですが、{} {written}で書きます",
+            profile.name,
+            which_derivation(index, role),
+        ),
+    )
+    .with_hint(format!(
+        "この出力は同じ --profile {} の kiri lint で {key} が fail になります。\
+         規格の内側で書くなら派生の width / height を{demand}に収まる値にしてください",
+        profile.name,
+    ))
+    .with_data("key", key)
+    .with_data("profile", wanted)
+    .with_data("used", used)
+    .with_data("derive", index);
+    tag_derivation(warning, role)
+}
+
+/// 明示指定が profile の値を押しのけたことを報せる。
+///
+/// **同じ値なら黙っている。** この警告が答えているのは「profile を指定したのに
+/// 効かなかった項目はどれか」であり、同じ値に落ち着いた項目について
+/// `profile` と `used` に同じ数を並べても、読む側の次の一手は 1 つも変わらない。
+///
+/// `data` のキーは spec の綴り（`fill_ratio` / `max_bytes`）に合わせる。
+/// 結果 JSON の他のキーがすべて snake_case なので、ここだけ `--fill-ratio` と
+/// 綴ると受け手はどちらでも拾える分岐を書かされる。CLI の綴りは `message` が言う。
+///
+/// **`profile` と `used` の両方を入れる。** 片方だけでは、規格が求めた値から
+/// どれだけ外したのかを呼び出し側が測れない。
 fn overridden(
     profile: &profile::Profile,
     key: &str,

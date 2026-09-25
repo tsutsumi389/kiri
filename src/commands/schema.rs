@@ -127,9 +127,9 @@ static LINT_CHECKS_NOTE: LazyLock<String> = LazyLock::new(|| {
                  ことと、何を求められていたかは別の事実である）。actual は skipped では\
                  必ず null になるが、**unmeasurable でも値が入ることがある**——AVIF の \
                  color_space は「CICP は読めたが unspecified と書いてあった」を取り、\
-                 background は「測った帯幅と均一度は出たが、外周が揃っていないので\
-                 背景色とは呼べない」を取るので、合否は actual の有無ではなく status で\
-                 読むこと。\
+                 background は「色も色差も測れたが、外周が揃っていないので\
+                 『この画像の背景色』とは呼べない」を取るので、合否は actual の\
+                 有無ではなく status で読むこと。\
                  background の actual は測った rgb と規格の色からの色差 delta_e に加えて、\
                  **測定に使った外周の帯幅 border_px** を返す——同じ delta_e 0.0 でも、\
                  2px を見た 0.0 と 48px を見た 0.0 は別のことを言っている。\

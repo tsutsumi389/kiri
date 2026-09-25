@@ -620,6 +620,14 @@ $ kiri cutout product.jpg -o out/product.png \
 **省いたキーは `--format` / `--quality` / `--effort` / `--max-bytes` を継ぐ。**
 `format` を省いて `--format` も無ければ `--output` の拡張子から決まる。
 
+**`--profile` と併せて使うときは、派生が規格の外へ出る。** 派生は自分の `format` と
+`width` / `height` を持てるので、profile が決めた形式も寸法も迂回する
+（`--profile amazon --sizes 400` は amazon が求める長辺 500 を下回る 400x400 を
+書く）。迂回した派生ごとに `PROFILE_OVERRIDDEN` が 1 件出る——詳しくは
+[規格をプリセットで指定する](#規格をプリセットで指定するprofile)を参照。**`format` を書かなかった
+派生には `--output` の解決結果が、`width` も `height` も書かなかった派生には
+最終画像の寸法が継承される**ので、迂回しうるのは自分で書いた派生だけである。
+
 **同じキーを 2 回書いたら断る。** `width=100,width=250` を後勝ちで通すと、
 「書いたのに効かない」指定が 1 つだけ残ることになる（未知のキーは断っているのだから、
 ここだけ緩める理由が無い）。
@@ -2367,7 +2375,7 @@ sRGB のまま比べると**ガンマぶんだけ暗い側へ偏る**（黒い�
 | `COLOR_CONVERSION_SKIPPED` | `--no-color-convert` により変換していない |
 | `COLOR_SPACE_UNCALIBRATED` | EXIF が uncalibrated で ICC も無い |
 | `MANIFEST_PARTIAL` | 一部の項目が失敗したまま `--manifest` を書いた（成功分だけが載っている） |
-| `PROFILE_OVERRIDDEN` | `--profile` が求めた値を明示指定が押しのけた（`--output` の拡張子と、`--derive` / `--formats` が書いた形式を含む）。項目ごと・派生ごとに 1 件出る |
+| `PROFILE_OVERRIDDEN` | `--profile` が求めた値を明示指定が押しのけた（`--output` の拡張子と、`--derive` / `--sizes` / `--formats` が書いた形式・寸法を含む）。項目ごと・派生ごとに 1 件出る |
 | `PROFILE_UNCHECKABLE` | 画素を読まないと測れない項目を `kiri lint` が検査していない（AVIF）。飛ばした項目は `data.checks` にある |
 
 この表は `kiri schema --json` の `warnings[]` が同じものを返す。**README を読ませる
@@ -2584,6 +2592,29 @@ amazon の `kiri lint` で落ちる**ので、許容の外へ出た派生ごと�
 **`format` を書かなかった派生には profile の形式が継承される**——派生は
 `--output` の解決結果（`--format` > 拡張子 > profile）を継ぐので、迂回しうるのは
 形式を自分で書いた派生だけである。
+
+**寸法も同じように迂回する。** `--derive 'width=400'` / `--sizes 400` は
+`--canvas` も `--longest-side` も通らないので、`--profile amazon --sizes 400` は
+400x400 を書く——amazon は長辺 500 以上を求めるので、**その出力は同じ amazon の
+`kiri lint` で `longest_side` が fail になる**。形式の迂回と違って出力が実際に
+規格違反になるので、こちらは同じ形で派生ごとに 1 件ずつ報せる。
+
+```json
+{ "code": "PROFILE_OVERRIDDEN",
+  "data": { "key": "longest_side", "profile": { "min": 500, "max": 10000 },
+            "used": 400, "derive": 0 } }
+```
+
+照らすのは `longest_side_min` / `longest_side_max` / `max_pixels` の 3 つ
+（`key` はそれぞれ `longest_side` / `max_pixels`）で、**実際に書く寸法で照らす。**
+`width` だけを書いた派生が何 px になるかは最終画像の縦横比・`fit` ・
+`allow_upscale` で決まるので、指定した数をそのまま規格に当てると、縦長の素材で
+長辺 1200 になる実行にまで「規格の外です」と言うことになる。
+
+**`width` も `height` も書かなかった派生は対象外である**——その派生は最終画像を
+そのまま書き、最終画像の寸法は profile が `--canvas` / `--fill-ratio` /
+`--longest-side` を決めた結果なので、規格の寸法はそこから継承されている
+（`format` を書かなかった派生が `--output` の解決結果を継ぐのと同じ関係）。
 
 **`--profile` を渡さない実行は 1 バイトも変わらない。** 結果 JSON に
 `settings.profile` は現れず、成果物も profile を足す前と同じである
@@ -3019,17 +3050,27 @@ $ kiri lint product_amazon.jpg --profile amazon --json
   成果物ではアルファの外接矩形（`alpha`）が、不透明な画像では色から見立てた主体
   （`colour`）が正解になる
 - `background` は**どれだけの幅を見た数なのか**を `actual.border_px` が名乗る。
-  外周の中央値がそのまま合否になるので、帯は `--border` そのものではなく
-  `max(短辺/33, --border)`（1600px なら 48px）である。既定の `--border 2` は
-  切り抜きのための値で、そこだけを見ると**白い縁 1 本で灰色一面の画像が
-  「背景は純白」になる**。`--border` は下限として効き、広げる向きにだけ働く。
+  外周の中央値がそのまま合否になるので、帯は `--border` そのものではない。
+  `max(短辺/33, --border)`（1600px なら 48px）から始めて、**その帯が単色と
+  言えるまで半分ずつ狭め**、言えた最も広い帯で測る（狭められるのは
+  1/4 まで。1600px なら 48 → 24 → 12）。既定の `--border 2` は切り抜きの
+  ための値で、そこだけを見ると**白い縁 1 本で灰色一面の画像が「背景は純白」に
+  なる**。`--border` は下限として効き、広げる向きにだけ働く。
   `kiri info --border <border_px>` を走らせれば、lint が見たのと同じ背景色が出る
+- **帯を狭めるのは、主体が帯に入ったときに背景でない画素で測らないためである。**
+  占有率が `1 - 2/33 ≒ 0.939` を超えると主体そのものが外周 48px に入る。どの
+  規格にも占有率の上限は無い（寄りのトリミングは合法）ので、`cutout --profile
+  amazon --fill-ratio 0.97` で書いた純白背景の画像はここを通る。占有率が
+  0.985 を超えて残る縁が短辺の 1/132 を切ると、狭める側の下限に当たって
+  `unmeasurable` になる——そこまで細い縁の中央値は背景を代表しない
 - **測れないものは `pass` と言わない。** 外周に不透明な画素が 1 つも無ければ
   （透過 PNG）`background` は `unmeasurable` で `actual` は `null` になる
   ——アルファ 0 の画素が持つ RGB は表示に使われない値なので、それを「測った
   背景色」として配ると作り話になる。外周が単色として扱えないとき
-  （`uniformity` が 0.90 を切る）も `unmeasurable` で、そのときは `rgb` を出さず
-  `border_px` と `uniformity` だけを返す
+  （`uniformity` が 0.90 を切る）も `unmeasurable` だが、**そのときも `rgb` と
+  `delta_e` は返す**——「背景がベージュで、白から ΔE 33 外れている」は合否に
+  使わない数でも、素材を撮り直すかレタッチするかを決めるのはその数である
+  （`status` が合格でないことを言い切っているので、添えても嘘にはならない）
 - `color_space` は**ファイルが名乗っているか**を `actual.color_named` が言う。
   ICC も EXIF ColorSpace も無いファイルは何も名乗っていないので `unmeasurable`
   である（AVIF の CICP が `unspecified` のときとまったく同じ扱い）。`kiri info` が

@@ -18,6 +18,7 @@ use crate::cutout::{BackgroundModel, CutoutOptions, DEFAULT_BORDER, Matting, Opt
 use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::OutputFormat;
 use crate::image_io::derive::DeriveSpec;
+use crate::profile::{self, ExplicitOptions, PROFILE_NAMES};
 use crate::report::{BatchItemReport, BatchReport, ErrorBody, ManifestItem, SCHEMA_VERSION};
 use crate::segment::SegmentMode;
 use crate::transform::shadow::ShadowMode;
@@ -222,6 +223,28 @@ fn to_cutout_args(
         })
         .transpose()?;
 
+    // **1 バイトも読む前に断る。** CLI では clap の候補が同じ位置で断っている
+    // （綴りを外せば code 無しの exit 2）。spec 経由だけが、数百点を切り抜いた
+    // 後に「そんな profile は無い」と言う形にはしない。CLI と同じ関門
+    // （`profile::named`）を通すので、片方だけが未知の名前を黙って既定へ
+    // 落とすこともない
+    let profile = settings
+        .profile
+        .as_deref()
+        .map(|name| {
+            profile::named(name).ok_or_else(|| {
+                Error::new(
+                    ErrorCode::UnknownProfile,
+                    format!("'{name}' は既知の profile ではありません"),
+                )
+                .with_hint(format!(
+                    "指定できるのは {}（条件と出典は kiri schema の profiles[] が配ります）",
+                    PROFILE_NAMES.join(" / ")
+                ))
+            })
+        })
+        .transpose()?;
+
     // **排他は CLI と同じ。** 2 つの組み立て方が混ざると「どちらが勝つか」と
     // いう覚える規則が増える。clap は `--derive` と `--sizes` を構造として
     // 弾くので、spec でも同じ形を断っておかないと片方だけが緩くなる
@@ -319,6 +342,21 @@ fn to_cutout_args(
         // **角度だけは負値を通す。** 反時計回りの指定であり、他の設定の
         // ように「負値は機能が黙って消える」種類の誤りではない
         rotate: angle(settings.rotate, 0.0, "rotate")?,
+        profile,
+        // spec では `Some` がそのまま「明示した」である。CLI 側が clap の
+        // `ValueSource` を見て解いているのと同じ問いに、JSON では素直に
+        // 答えられる（`fixed` とまったく同じ作り）。**`OutputOpts` の側で
+        // `unwrap_or` して既定を埋めた後では区別が付かない**ので、
+        // 埋める前の `settings` を見る
+        explicit: ExplicitOptions {
+            canvas: settings.canvas.is_some(),
+            fill_ratio: settings.fill_ratio.is_some(),
+            format: settings.format.is_some(),
+            background: settings.background.is_some(),
+            flatten: settings.flatten.is_some(),
+            max_bytes: settings.max_bytes.is_some(),
+            quality: settings.quality.is_some(),
+        },
         canvas,
         fill_ratio: settings.fill_ratio.unwrap_or(0.85),
         fail_on,

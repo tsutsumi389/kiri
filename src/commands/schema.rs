@@ -10,14 +10,18 @@
 //! 実装から離れ、離れた一覧は「指定したのに効かない」という最も追いにくい
 //! 失敗をそのまま招く。ここに書き写す余地を残さないことが要点である。
 
+use std::sync::LazyLock;
+
 use clap::{ArgAction, CommandFactory};
 
 use crate::cli::Cli;
+use crate::commands::lint::{CHECK_STATUSES, Check};
 use crate::cutout::{MAX_FOREGROUND_RATIO, MIN_FOREGROUND_RATIO, background, diagnostics, subject};
 use crate::error::{ErrorCode, ErrorKind};
+use crate::profile;
 use crate::report::{
     ArgEntry, CommandEntry, ErrorCodeEntry, ExitCodeEntry, FieldEntry, FieldGate, FieldThreshold,
-    SCHEMA_VERSION, SchemaReport, WarningCodeEntry,
+    LintCheckEntry, ProfileEntry, ProfileRules, SCHEMA_VERSION, SchemaReport, WarningCodeEntry,
 };
 use crate::warning::WarningCode;
 
@@ -46,6 +50,8 @@ pub fn run() -> SchemaReport {
             })
             .collect(),
         fields: fields(),
+        lint_checks: lint_checks(),
+        profiles: profiles(),
         global_options: global_options(),
         commands: commands(),
     }
@@ -77,6 +83,103 @@ fn exit_codes() -> Vec<ExitCodeEntry> {
         meaning: kind.meaning(),
     }));
     codes
+}
+
+/// `kiri lint` が見る条件の一覧を配る。
+///
+/// **`Check::ALL` から組む。書き写さない**（`profiles` / `exit_codes` と同じ
+/// 作法）。ここへ手で一覧を書くと、`Check` を 1 つ足したときに **lint が実際に
+/// 並べる項目と、schema が「これが出る」と配った一覧が食い違う**——受け手は
+/// 知らない `name` を受け取るか、来ない `name` を待つことになる。
+///
+/// `regulated`（どの規格がこれを規定するか）は載せない。それは条件の側では
+/// なく規格の側の事実で、`profiles[].rules` が既に機械可読で配っている。
+fn lint_checks() -> Vec<LintCheckEntry> {
+    Check::ALL
+        .into_iter()
+        .map(|c| LintCheckEntry {
+            name: c.as_str(),
+            needs_pixels: c.needs_pixels(),
+        })
+        .collect()
+}
+
+/// `checks[].name` の綴りを定数から並べたもの。
+///
+/// **散文の中に一覧を打ち直さない。** `LazyLock` を通すのは `FieldEntry` の
+/// 散文が `&'static str` だからで、静的に生きる `String` を借りれば同じ
+/// 寿命になる——語を足せば散文のほうが自動で追随する。
+static LINT_CHECK_NAMES: LazyLock<String> = LazyLock::new(|| Check::NAMES.join(" / "));
+
+/// `checks[]` の読み方。名前の一覧だけを定数から差し込む。
+static LINT_CHECKS_NOTE: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "**規格が規定している条件だけが並ぶ。** 規定の無い条件は 1 行も出ない\
+                 （shopify は構図を規定しないので background も fill_ratio も現れない）\
+                 ——「規定なし」を pass として並べると、見ていないものを見たことにする。\
+                 **見たものは全部載せる**（pass も）。name は {} で、**checks[] の中で\
+                 一意である**（compliance.checks[] とはそこが違う）。綴りと、画素を要するか\
+                 どうかの別は lint_checks[] が機械可読で配る。**並びは決定的**で、\
+                 指定にも入力にも依らない。\
+                 expected / actual は条件ごとに形が違う（数値・真偽・許容する形式の配列・\
+                 上下限の組・測定値と出所の組）——**文字列へ畳まないので、数値は数値の\
+                 まま読める**。expected は status が skipped でも出る（検査できなかった\
+                 ことと、何を求められていたかは別の事実である）。actual は skipped では\
+                 必ず null になるが、**unmeasurable でも値が入ることがある**——AVIF の \
+                 color_space は「CICP は読めたが unspecified と書いてあった」を取り、\
+                 background は「色も色差も測れたが、外周が揃っていないので\
+                 『この画像の背景色』とは呼べない」を取るので、合否は actual の\
+                 有無ではなく status で読むこと。\
+                 background の actual は測った rgb と規格の色からの色差 delta_e に加えて、\
+                 **測定に使った外周の帯幅 border_px** を返す——同じ delta_e 0.0 でも、\
+                 2px を見た 0.0 と 48px を見た 0.0 は別のことを言っている。\
+                 **完全一致は求めない**（JPEG の量子化で 255 は揃わない）。\
+                 color_space の actual は color_named を返す——**偽なら ICC も EXIF の\
+                 申告も無く、ファイルは何も名乗っていない**（このとき status は\
+                 unmeasurable で、AVIF の CICP unspecified と同じ扱いである）。\
+                 fill_ratio の actual は value と source を返す——source は \
+                 alpha（透過の外接矩形。切り抜き済みの成果物ではこれが正しい）か \
+                 colour（色で見立てた主体）で、**同じ 0.80 でも意味が違う**",
+        *LINT_CHECK_NAMES
+    )
+});
+
+/// `checks[].status` の語彙。4 語は `CHECK_STATUSES` が唯一の定義である。
+static LINT_STATUS_SUMMARY: LazyLock<String> =
+    LazyLock::new(|| format!("{} のいずれか", CHECK_STATUSES.join(" / ")));
+
+/// 規格の表を配る。
+///
+/// **`profile::ALL` から組む。書き写さない**（`exit_codes` / `fields` と同じ作法）。
+/// ここへ手で表を書くと、`--profile` が使う表と `kiri lint` が使う表と `kiri schema`
+/// が配る表の 3 つが並ぶことになり、**不合格の根拠として配った条件が、実際に
+/// 効いた条件と違う**という一番高くつく食い違いを作れてしまう。
+///
+/// `write_defaults`（profile が書く側で何を決めるか）は載せない。あれは規格
+/// そのものではなく kiri の判断で、同じ表に並べると規定と好みが見分けられなく
+/// なる——`Rules` に推奨を入れないのとまったく同じ線引きである。
+fn profiles() -> Vec<ProfileEntry> {
+    profile::ALL
+        .iter()
+        .map(|p| ProfileEntry {
+            name: p.name,
+            revision: p.revision,
+            summary: p.summary,
+            source: p.source,
+            rules: ProfileRules {
+                longest_side_min: p.rules.longest_side_min,
+                longest_side_max: p.rules.longest_side_max,
+                max_pixels: p.rules.max_pixels,
+                square: p.rules.square,
+                background: p.rules.background,
+                fill_ratio_min: p.rules.fill_ratio_min,
+                max_bytes: p.rules.max_bytes,
+                formats: p.rules.formats.iter().map(|f| f.as_str()).collect(),
+                alpha_allowed: p.rules.alpha_allowed,
+                srgb_required: p.rules.srgb_required,
+            },
+        })
+        .collect()
 }
 
 /// 実際に呼べるコマンドだけを並べる。
@@ -539,6 +642,32 @@ fn fields() -> Vec<FieldEntry> {
                  必ず false で、そのときの成果物の画素は --segment を足す前と 1 バイトも\
                  変わらない（報告 JSON には subject.source / settings.segment / \
                  settings.segment_ran の 3 つが増える。schema_version は据え置き）",
+            ),
+        },
+        FieldEntry {
+            path: "settings.profile",
+            appears_in: vec!["cutout"],
+            // 値は {name, revision} の組だが、**この項目が答えているのは
+            // 「どの profile か」の 1 つである**（revision はその行を一意に
+            // する版であって、別の測定値ではない）。list にすると受け手は
+            // 要素の並びを数えにきて、text にすると照合してよいものを
+            // 照合できないと読む
+            unit: "enum",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "効いた profile の名前と版 {name, revision}",
+            notes: Some(
+                "--profile を渡したときだけキーごと現れる。渡さない実行の結果 JSON は \
+                 --profile を足す前と 1 バイトも変わらない（schema_version は据え置き）。\
+                 **条件そのものはここに無い**——長辺・背景・占有率・出典の URL は \
+                 kiri schema の profiles[] が name で引ける形で 1 度だけ配る。\
+                 **これは指定値である。** profile が実際に決めた値は settings の他の項目と \
+                 canvas ブロックが効いた値として語り、明示指定が上書きした項目は \
+                 PROFILE_OVERRIDDEN が 1 件ずつ「profile が求めた値」と「実際に効いた値」を\
+                 並べて言う。revision は kiri がその規格を写し取った時点で、\
+                 **規格が変わっても古い kiri は古い条件で合格を出す**——鮮度はここで判断する",
             ),
         },
         FieldEntry {
@@ -1212,6 +1341,95 @@ fn fields() -> Vec<FieldEntry> {
                 "unmeasurable は「測れなかった」で、**合格ではない**。fail（しきい値に触れた）\
                  とは別の事実なので名前を分けてある——次の一手が違う（前者は素材か指示を、\
                  後者はしきい値か設定を見る）",
+            ),
+        },
+        // kiri lint の結果。**`LintReport` が結果 JSON の根そのもの**なので、
+        // path にコマンド名の接頭辞は付かない（`compliance.*` は `CutoutReport`
+        // の中のブロックだった、という違いである）。どのコマンドの話かは
+        // `appears_in` が言う
+        FieldEntry {
+            path: "profile",
+            appears_in: vec!["lint"],
+            // 値は {name, revision} の組だが、この項目が答えているのは
+            // 「どの規格に照らしたか」の 1 つである（`settings.profile` と
+            // まったく同じ理由で enum を採る）
+            unit: "enum",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "照らした規格の名前と版 {name, revision}",
+            notes: Some(
+                "lint では --profile が必須なので必ず出る。**条件そのものはここに無い**\
+                 ——長辺・背景・占有率・出典の URL は kiri schema の profiles[] が name で\
+                 引ける形で 1 度だけ配る。revision は kiri がその規格を写し取った時点で、\
+                 **規格が変わっても古い kiri は古い条件で合格を出す**——鮮度はここで判断する。\
+                 書く側（cutout --profile）が返す settings.profile と同じ形である",
+            ),
+        },
+        FieldEntry {
+            path: "passed",
+            appears_in: vec!["lint"],
+            unit: "bool",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "--profile の条件をすべて満たしたか",
+            notes: Some(
+                "**checks[] が全部 pass のときだけ true** である。fail も unmeasurable も \
+                 skipped も合格ではない（compliance.passed とまったく同じ定義）。false なら\
+                 終了コードは 5 で、**結果 JSON は通常どおり全部返る**（検査は成功していて、\
+                 対象のファイルもそのままある）。**測れなかった項目を合格に数えない**のは、\
+                 exit 5 の意味が「成果物はある。人が見る対象」だからで、\
+                 「検査できなかったので人が見てほしい」はまさにそれである",
+            ),
+        },
+        FieldEntry {
+            path: "code",
+            appears_in: vec!["lint"],
+            unit: "enum",
+            nullable: true,
+            null_means: Some("合格した（passed が true）"),
+            warns: vec![],
+            gates: None,
+            summary: "不合格のときだけ名乗る code。PROFILE_VIOLATION になる",
+            notes: Some(
+                "**exit 5 は errors[] を返さない**ので、errors[] が配る語彙と結果を\
+                 突き合わせられる場所がここ以外に無い。exit 5 を見てここを引けば、\
+                 他の失敗とまったく同じ形で分岐できる（compliance.code と同じ役目）。\
+                 どの条件で落ちたかは checks[] のほうが言う",
+            ),
+        },
+        FieldEntry {
+            path: "checks",
+            appears_in: vec!["lint"],
+            unit: "list",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "検査した条件の内訳。{name, status, expected, actual}",
+            notes: Some(&LINT_CHECKS_NOTE),
+        },
+        FieldEntry {
+            path: "checks[].status",
+            appears_in: vec!["lint"],
+            unit: "enum",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: &LINT_STATUS_SUMMARY,
+            notes: Some(
+                "pass 以外は**すべて合格ではない**。3 つを分けてあるのは次の一手が違う\
+                 ためで、fail は条件に触れた（素材か規格の選び直し）、unmeasurable は\
+                 この画像では測れなかった（主体を 1 つも検出できない、外周に不透明な\
+                 画素が 1 つも無い、背景が単色ではない、色空間を何も名乗っていない）、\
+                 skipped はこの形式では構造的に測れない（AVIF の画素）。\
+                 **skipped が 1 つでもあれば \
+                 PROFILE_UNCHECKABLE が出て、飛ばした項目を data.checks に配列で並べる**\
+                 ——黙って合格にはしていない。skipped を消したければ JPEG か PNG を渡す",
             ),
         },
         FieldEntry {

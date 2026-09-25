@@ -1206,6 +1206,7 @@ mod tests {
             rgb: [250, 250, 250],
             uniformity,
             samples: 100,
+            from_opaque: true,
             delta_e: DeltaEQuantiles {
                 p50: spread,
                 p90: spread * 2.0,

@@ -11,7 +11,7 @@ use assert_cmd::Command;
 use common::{
     ProductSpec, bleeding_product_scene, dense_key_grid, product_image, shadow_band_scene,
     split_background_scene, transparent_product, woven_background_image, woven_poisoned_scene,
-    write_jpeg, write_png,
+    write_jpeg, write_png, write_srgb_png,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -8568,14 +8568,10 @@ fn a_parser_level_failure_returns_no_json() {
 /// **実装したら必ずここから消す**——実装済みのまま残っていると下の検査が落ちる。
 /// README / design.md には許さない（エージェントが写し取る場所だから）
 const PLANNED_CODES: &[&str] = &[
-    "PROFILE_OVERRIDDEN",
-    "PROFILE_UNCHECKABLE",
     "ROTATE_AUTO_SKIPPED",
     "SET_SCALE_CLAMPED",
     "WHITE_BALANCE_SKIPPED",
     "REFLECT_CLIPPED",
-    "UNKNOWN_PROFILE",
-    "PROFILE_VIOLATION",
 ];
 
 /// ドキュメントが名指しする code は、実在する code か実在する定数のどちらかである。
@@ -9345,6 +9341,30 @@ fn every_published_field_exists_in_the_result() {
         "--fail-on",
         "foreground_ratio>0.99",
     ]);
+    // **`settings.profile` も `--profile` を渡したときだけ現れる。** 渡さない実行の
+    // 結果 JSON は `--profile` を足す前と 1 バイトも変わらない、というのが
+    // そのブロックの約束なので、`compliance.` / `optimize.` と同じく専用の実行が要る
+    let profiled = run(&[
+        "cutout",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--dry-run",
+        "--json",
+        "--profile",
+        "amazon",
+    ]);
+    // **lint の結果 JSON は `LintReport` そのもの**なので、path に接頭辞が無い
+    // （`passed` / `code` / `checks`）。`run` は成功を要求するので、**必ず通る
+    // profile を選ぶ**——不合格は exit 5 で落ちる（それ自体は別の検査が固定する）。
+    // shopify は寸法とバイト数しか規定しないので、合成した小さい JPEG は素通りする
+    let linted = run(&[
+        "lint",
+        input.to_str().unwrap(),
+        "--profile",
+        "shopify",
+        "--json",
+    ]);
     // **`shadow` も合成したときだけ現れる。** 既定の実行で探すと「配った path が
     // 存在しない」になるので、影を足した実行も用意する（`constraints` と同じ扱い）
     let shadowed = run(&[
@@ -9407,7 +9427,9 @@ fn every_published_field_exists_in_the_result() {
                 "cutout" if path.starts_with("optimize.") => &optimized,
                 "cutout" if path.starts_with("shadow.") => &shadowed,
                 "cutout" if path.starts_with("compliance.") => &gated,
+                "cutout" if path.starts_with("settings.") => &profiled,
                 "cutout" if path.starts_with("rotate.") => &rotated,
+                "lint" => &linted,
                 "rotate" => &turned,
                 "convert" => &converted,
                 "resize" => &resized,
@@ -11485,5 +11507,1693 @@ fn the_human_readable_compliance_line_counts_what_it_looked_at() {
     assert!(
         !rejected.contains("**"),
         "markdown が漏れている:\n{rejected}"
+    );
+}
+
+// --- --profile / kiri lint（Phase 22）---
+
+/// `kiri schema` が配る `profiles[]` から 1 つの規格の `rules` を引く。
+///
+/// **Rust 側の定数を 1 つも書き写さないための入口である。** しきい値を
+/// テストへ写すと、較正や規格の改訂で表が動いたときに**テストだけが古い世界を
+/// 語る**——しかも緑のまま語るので、誰も気づかない。ここを通しておけば、
+/// 表が動いた瞬間に素材の寸法も期待値も一緒に動く。
+fn profile_rules(name: &str) -> Value {
+    schema_json()["profiles"]
+        .as_array()
+        .unwrap_or_else(|| panic!("profiles が配列ではない"))
+        .iter()
+        .find(|p| p["name"] == name)
+        .unwrap_or_else(|| panic!("{name} が profiles[] に無い"))
+        .clone()["rules"]
+        .clone()
+}
+
+/// 単色の枠に矩形を 1 つ置いただけの素材。**規格の項目を 1 つずつ動かすために要る。**
+///
+/// `tests/common` の `product_image` は角丸・陰影・センサーノイズを持ち、外接矩形は
+/// 常に幅の 0.56 / 高さの 0.68 になる。背景も 248,248,247 で純白ではない——
+/// つまり `fill_ratio_min` 0.85 と「純白背景」を同時に満たせない。
+///
+/// **「1 項目だけ外した画像」は、外した項目以外が確実に合格していなければ
+/// 意味を持たない。** ここでは矩形を 1 つ置くだけにして、`kiri lint` が測る
+/// 外接矩形が置いた矩形そのものになるようにする。角も陰影もノイズも無いので、
+/// 実測とのずれは主体検出のにじみ（数 px）だけに収まる。
+fn flat_product(
+    width: u32,
+    height: u32,
+    fill: f64,
+    background: [u8; 3],
+    background_alpha: u8,
+) -> image::RgbaImage {
+    let pw = (f64::from(width) * fill).round().max(1.0) as u32;
+    let ph = (f64::from(height) * fill).round().max(1.0) as u32;
+    let (x0, y0) = ((width - pw) / 2, (height - ph) / 2);
+    image::RgbaImage::from_fn(width, height, |x, y| {
+        if (x0..x0 + pw).contains(&x) && (y0..y0 + ph).contains(&y) {
+            image::Rgba([190, 70, 55, 255])
+        } else {
+            image::Rgba([
+                background[0],
+                background[1],
+                background[2],
+                background_alpha,
+            ])
+        }
+    })
+}
+
+/// その規格を素直に満たす占有率。**公開された下限から組む。**
+///
+/// 下限ちょうどに置かないのは、`kiri lint` が測るのが**色から見立てた主体の
+/// 外接矩形**で、置いた矩形より数 px 広く出るためである（にじみは外側へ転ぶ）。
+/// 余裕は合格の側へ寄せる——外したい項目以外で落ちると、テストが何を固定して
+/// いるのか読めなくなる。規定の無い規格では、どの規格の下限も超える値を採る。
+fn conforming_fill(rules: &Value) -> f64 {
+    rules["fill_ratio_min"].as_f64().unwrap_or(0.85) + 0.03
+}
+
+/// その規格を素直に満たす 1 辺(px)。**上下限の間から採る。**
+///
+/// 下限ちょうどに置くと、「下限を 1px 下回る」という外し方との差が 1px しか
+/// 無くなり、どちらの画像も境目の上に乗る。規定が無い側は、他の規格の下限も
+/// 上限も気にしなくてよい大きさで埋める。
+fn conforming_side(rules: &Value) -> u32 {
+    let min = rules["longest_side_min"].as_u64().unwrap_or(600) as u32;
+    let side = min + 200;
+    match rules["longest_side_max"].as_u64() {
+        Some(max) => side.min(max as u32),
+        None => side,
+    }
+}
+
+/// その規格を素直に満たす画像を書く。
+///
+/// **sRGB の ICC を埋める。** `srgb_required` を持つ規格（amazon /
+/// square-white）では「色空間を 1 つも名乗っていない」は `pass` ではなく
+/// `unmeasurable` なので、名乗りの無いファイルでは「素直に満たす」画像に
+/// ならない（`write_srgb_png` の doc を参照）。
+fn write_conforming(dir: &Path, name: &str, rules: &Value) -> PathBuf {
+    let side = conforming_side(rules);
+    write_srgb_png(
+        dir,
+        name,
+        &flat_product(side, side, conforming_fill(rules), [255, 255, 255], 255),
+    )
+}
+
+/// 商品だけが半透明で、外周は不透明な白のままの素材。
+///
+/// **`alpha` の 1 項目だけを外すために要る。** `flat_product` の
+/// `background_alpha` を 0 にすると外周まで透明になり、背景色を測れる画素が
+/// 1 つも無くなる（`background` が `unmeasurable` に落ちる）。
+fn semi_transparent_product(side: u32, fill: f64) -> image::RgbaImage {
+    let mut img = flat_product(side, side, fill, [255, 255, 255], 255);
+    for pixel in img.pixels_mut() {
+        if pixel.0 != [255, 255, 255, 255] {
+            pixel.0[3] = 200;
+        }
+    }
+    img
+}
+
+/// `kiri lint` を走らせ、終了コードと結果 JSON を返す。
+fn lint(input: &Path, profile: &str) -> (i32, Value) {
+    let out = kiri()
+        .args([
+            "lint",
+            input.to_str().unwrap(),
+            "--profile",
+            profile,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    (out.status.code().unwrap(), json_stdout(&out))
+}
+
+/// `checks[]` の名前を並びのまま返す。
+fn lint_names(v: &Value) -> Vec<String> {
+    v["checks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("checks が配列ではない: {v}"))
+        .iter()
+        .map(|c| c["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// `pass` ではなかった項目の名前。**`fail` だけを拾わない**——`skipped` も
+/// `unmeasurable` も合格ではないので、「ちょうどその 1 項目だけが落ちた」を
+/// 言うにはここで一緒に数えるしかない。
+fn not_passing(v: &Value) -> Vec<String> {
+    v["checks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("checks が配列ではない: {v}"))
+        .iter()
+        .filter(|c| c["status"] != "pass")
+        .map(|c| format!("{}={}", c["name"].as_str().unwrap(), c["status"]))
+        .collect()
+}
+
+/// 1 つの項目の判定。
+fn lint_check<'a>(v: &'a Value, name: &str) -> &'a Value {
+    v["checks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("checks が配列ではない: {v}"))
+        .iter()
+        .find(|c| c["name"] == name)
+        .unwrap_or_else(|| panic!("{name} の判定が無い: {v}"))
+}
+
+/// 受け入れ基準 (a)。**配る表と、解釈器が実際に受ける名前が一致する。**
+///
+/// `profiles[]` を `profile::ALL` と直に突き合わせると、表を 2 度書いた検査に
+/// なる（同じ定数を左右に置いても、食い違いようがないので何も守らない）。
+/// ここが見るのは**表の形**である——配っている名前で本当に呼べるか、名前が
+/// 一意か、どの行も `revision` と `source` を名乗るか、`rules` の各項目が
+/// 約束した型で出ているか。`accepts` は clap の候補（`--help` が
+/// `[possible values: ...]` として印字するもの）なので、これが一致していれば
+/// 「候補として案内した名前が引けない」は起こりえない。
+#[test]
+fn the_published_profiles_are_the_names_the_parser_accepts() {
+    let schema = schema_json();
+    let profiles = schema["profiles"].as_array().expect("profiles が無い");
+    assert!(!profiles.is_empty(), "profiles[] が空");
+
+    let names: Vec<&str> = profiles
+        .iter()
+        .map(|p| p["name"].as_str().expect("name が文字列でない"))
+        .collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), names.len(), "name が重複している: {names:?}");
+
+    // `--profile` を持つコマンドはどれも同じ表から候補を組む。片方だけが
+    // 古い一覧を語ると、「書く側では通る名前が lint では通らない」になる
+    for command in ["cutout", "lint"] {
+        let accepts: Vec<String> = schema["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == command)
+            .unwrap_or_else(|| panic!("{command} が commands[] に無い"))["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["name"] == "--profile")
+            .unwrap_or_else(|| panic!("{command} に --profile が無い"))["accepts"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{command}/--profile が候補を配っていない"))
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(accepts, names, "{command} の候補が表と違う");
+    }
+
+    for p in profiles {
+        let name = p["name"].as_str().unwrap();
+        assert!(
+            p["revision"].as_str().is_some_and(|s| !s.is_empty()),
+            "{name}: revision が無い"
+        );
+        assert!(
+            p["source"].as_str().is_some_and(|s| !s.is_empty()),
+            "{name}: source が無い"
+        );
+        assert!(
+            p["summary"].as_str().is_some_and(|s| !s.is_empty()),
+            "{name}: summary が無い"
+        );
+
+        // **`null` は「規定なし」である。** 0 や巨大な数で代用されていたら、
+        // 「検査しない」と「必ず落ちる」が同じ形になっている
+        let rules = &p["rules"];
+        for key in ["longest_side_min", "longest_side_max", "max_pixels"] {
+            assert!(
+                rules[key].is_null() || rules[key].as_u64().is_some_and(|n| n > 0),
+                "{name}/{key}: 数としても規定なしとしても読めない: {}",
+                rules[key]
+            );
+        }
+        let ratio = &rules["fill_ratio_min"];
+        assert!(
+            ratio.is_null() || ratio.as_f64().is_some_and(|r| r > 0.0 && r <= 1.0),
+            "{name}/fill_ratio_min: 値域の外: {ratio}"
+        );
+        for key in ["square", "alpha_allowed", "srgb_required"] {
+            assert!(rules[key].is_boolean(), "{name}/{key} が真偽でない");
+        }
+        assert!(
+            rules["background"].is_null()
+                || rules["background"]
+                    .as_array()
+                    .is_some_and(|rgb| rgb.len() == 3 && rgb.iter().all(|c| c.as_u64().is_some())),
+            "{name}/background が RGB 3 つでない"
+        );
+        let formats = rules["formats"].as_array().expect("formats が配列でない");
+        assert!(
+            formats.iter().all(|f| f.as_str().is_some()),
+            "{name}/formats に形式名でないものがある"
+        );
+
+        // **配った名前で本当に呼べる。** 合否は素材しだい（ここでは通らない）
+        // なので、見るのは「書式として断られない」ことだけである
+        let dir = fixture_dir();
+        let input = write_png(
+            dir.path(),
+            "p.png",
+            &flat_product(64, 64, 0.5, [9, 9, 9], 255),
+        );
+        let (code, _) = lint(&input, name);
+        assert_ne!(code, 2, "{name}: 配った名前が引数として断られた");
+    }
+}
+
+/// 受け入れ基準 (b) の前半。**規格を満たす画像は全項目 `pass` で exit 0。**
+///
+/// プリセットを全部回すのは、1 つ足したときに**その 1 つだけが検査されない**
+/// 状態を構造的に作らないためである（`profile.rs` の単体テストと同じ作法）。
+/// 素材の寸法も占有率も `kiri schema` が配った下限から組むので、規格が改訂
+/// されれば素材のほうが追随する。
+#[test]
+fn a_conforming_image_passes_every_check_of_its_profile() {
+    let dir = fixture_dir();
+    for name in ["amazon", "shopify", "square-white"] {
+        let rules = profile_rules(name);
+        let input = write_conforming(dir.path(), &format!("{name}.png"), &rules);
+        let (code, v) = lint(&input, name);
+        assert_eq!(
+            code,
+            0,
+            "{name}: 規格を満たす画像が落ちた: {:?}",
+            not_passing(&v)
+        );
+        assert_eq!(v["passed"], Value::Bool(true), "{name}: {v}");
+        assert!(v["code"].is_null(), "{name}: 合格で code を名乗った: {v}");
+        assert!(!lint_names(&v).is_empty(), "{name}: 1 項目も検査していない");
+        assert_eq!(v["profile"]["name"], name);
+        assert_eq!(
+            v["profile"]["revision"],
+            schema_json()["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["name"] == name)
+                .unwrap()["revision"]
+        );
+    }
+}
+
+/// 受け入れ基準 (b) の後半。**1 項目だけ外した画像は、ちょうどその 1 項目で落ちる。**
+///
+/// 「不合格になった」だけでは何も固定できない——外した項目と違うところが
+/// 落ちていても赤にならないし、全項目が落ちていても赤にならない。
+/// `checks[].name` を**ちょうど 1 つ**に固定して初めて、「この規格のこの条件を
+/// kiri が見ている」と言える。
+///
+/// 外す値はすべて `kiri schema` が配った数から組む（下限の 1px 下、下限の半分、
+/// 上限の 200px 上）。**灰色だけは実測で確かめる**——ΔE の許容は schema では
+/// なく結果の `expected.delta_e_max` が配るので、その値を実測の `delta_e` と
+/// 並べて「許容を超えている」ことまで assert する。
+#[test]
+fn breaking_one_rule_fails_exactly_that_check() {
+    let dir = fixture_dir();
+
+    let amazon = profile_rules("amazon");
+    let a_side = conforming_side(&amazon);
+    let a_fill = conforming_fill(&amazon);
+    let a_min = amazon["longest_side_min"].as_u64().unwrap() as u32;
+    let square = profile_rules("square-white");
+    let w_side = conforming_side(&square);
+    let w_fill = conforming_fill(&square);
+    let shopify = profile_rules("shopify");
+    let s_max = shopify["longest_side_max"].as_u64().unwrap() as u32;
+
+    let cases: Vec<(&str, &str, image::RgbaImage, &str)> = vec![
+        (
+            "amazon",
+            "short.png",
+            // 下限を 1px 下回る。他は素直に合格する寸法のまま
+            flat_product(a_min - 1, a_min - 1, a_fill, [255, 255, 255], 255),
+            "longest_side",
+        ),
+        (
+            "amazon",
+            "gray.png",
+            // **目で見ても灰色と分かる値を採る。** 250 は JPEG の白背景として
+            // 普通にありうる（ΔE 1.7）ので、境目の内側では外したことにならない
+            flat_product(a_side, a_side, a_fill, [200, 200, 200], 255),
+            "background",
+        ),
+        (
+            "amazon",
+            "small-subject.png",
+            flat_product(a_side, a_side, a_fill / 2.0, [255, 255, 255], 255),
+            "fill_ratio",
+        ),
+        (
+            "amazon",
+            "alpha.png",
+            // **透かすのは商品のほうで、外周は不透明な白のまま置く。**
+            // 外周まで透明にすると背景の検査も道連れになり（外周に不透明な
+            // 画素が 1 つも無いので `background` は `unmeasurable`）、
+            // 「1 項目だけ」でなくなる。外周が透明な画像で「背景は白だった」と
+            // 答えるほうが誤りなので、道連れは lint 側の取りこぼしではない
+            // ——アルファ 0 の画素が持つ RGB は表示に使われない値である。
+            //
+            // 占有率はアルファの外接矩形から測るが、外周が不透明なので矩形は
+            // 画像全体になり、下限（0.85）を割らない
+            semi_transparent_product(a_side, a_fill),
+            "alpha",
+        ),
+        (
+            "square-white",
+            "oblong.png",
+            // 長辺は下限のまま。正方形でないことだけが変わる
+            flat_product(w_side, w_side - w_side / 8, w_fill, [255, 255, 255], 255),
+            "square",
+        ),
+        (
+            "shopify",
+            "too-wide.png",
+            // 上限を超えた長辺。**総画素数は上限の内側に留める**——短辺を
+            // 小さく採るので、max_pixels は道連れにならない
+            flat_product(s_max + 200, 100, 0.8, [255, 255, 255], 255),
+            "longest_side",
+        ),
+    ];
+
+    for (profile, file, image, broken) in cases {
+        // **外した 1 項目以外は素直に合格させる。** 名乗りの無い PNG では
+        // `color_space` が `unmeasurable` になり、「落ちたのはちょうど 1 項目」
+        // が言えなくなる（`write_conforming` と同じ理由）
+        let input = write_srgb_png(dir.path(), file, &image);
+        let (code, v) = lint(&input, profile);
+        assert_eq!(code, 5, "{file}: 外したのに exit 5 でない: {v}");
+        assert_eq!(v["passed"], Value::Bool(false), "{file}");
+        assert_eq!(v["code"], "PROFILE_VIOLATION", "{file}");
+        assert_eq!(
+            not_passing(&v),
+            vec![format!("{broken}=\"fail\"")],
+            "{file}: 落ちたのが {broken} ちょうどではない: {v}"
+        );
+    }
+
+    // 背景だけは、許容そのものが結果に載っているので実測で確かめられる。
+    // **完全一致を求めていないこと**と、それでも 200 は外れていることの両方を
+    // 1 つの行から読む
+    let input = write_srgb_png(
+        dir.path(),
+        "gray2.png",
+        &flat_product(a_side, a_side, a_fill, [200, 200, 200], 255),
+    );
+    let (_, v) = lint(&input, "amazon");
+    let check = lint_check(&v, "background");
+    let tolerance = check["expected"]["delta_e_max"]
+        .as_f64()
+        .expect("許容が無い");
+    assert!(tolerance > 0.0, "完全一致を求めている: {check}");
+    assert!(
+        check["actual"]["delta_e"].as_f64().unwrap() > tolerance,
+        "許容の内側なのに落ちた: {check}"
+    );
+}
+
+/// **外周 2px の白い縁だけを見て「背景は純白」と答えない。**
+///
+/// `--border` の既定（2）は切り抜きのための値で、そこから取った色は cutout では
+/// 閾値の種にしかならない。lint では外周の中央値が**そのまま合否になる**ので、
+/// 1600px の画像の縁 0.125% を見た結果を「この画像の背景」と名乗るわけにいかない
+/// ——灰色一面の画像が全項目 pass / exit 0 になっていたのがこれだった。
+///
+/// **測った帯幅を結果から読めることまで見る。** 同じ delta_e でも、どれだけの
+/// 幅を見た数なのかが分からなければ、読み手はそれを検算できない。
+#[test]
+fn a_thin_white_rim_does_not_make_a_grey_image_white() {
+    let dir = fixture_dir();
+    let side = 1600u32;
+    // 外周 2px だけ白、その内側は一面の灰色、中央に被写体
+    let mut img = flat_product(side, side, 0.5, [170, 170, 170], 255);
+    for (x, y, p) in img.enumerate_pixels_mut() {
+        if x < 2 || y < 2 || x >= side - 2 || y >= side - 2 {
+            *p = image::Rgba([255, 255, 255, 255]);
+        }
+    }
+    let input = write_srgb_png(dir.path(), "rim.png", &img);
+
+    let (code, v) = lint(&input, "amazon");
+    assert_eq!(code, 5, "灰色一面の画像が amazon を通った: {v}");
+    let check = lint_check(&v, "background");
+    assert_eq!(check["status"], "fail", "{v}");
+    assert_eq!(check["actual"]["rgb"], serde_json::json!([170, 170, 170]));
+    assert!(
+        check["actual"]["delta_e"].as_f64().unwrap()
+            > check["expected"]["delta_e_max"].as_f64().unwrap()
+    );
+
+    // **何を測った数なのかを名乗る。** 帯は --border そのものではない
+    let band = check["actual"]["border_px"].as_u64().expect("帯幅が無い");
+    assert!(band > 2, "外周 2px のままで判定している: {check}");
+
+    // **`kiri info` に同じ帯幅を渡せば同じ色が出る。** 測り方は 1 つのままで、
+    // 違うのは帯幅だけである——どちらが本当かを確かめる手段が残っている
+    let out = kiri()
+        .args([
+            "info",
+            input.to_str().unwrap(),
+            "--border",
+            &band.to_string(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let info = json_stdout(&out);
+    assert_eq!(info["background"]["rgb"], check["actual"]["rgb"], "{info}");
+}
+
+/// **色空間を 1 つも名乗っていないファイルを `pass` と言わない。**
+///
+/// ICC も EXIF ColorSpace も無い入力に対して `kiri info` は色空間 "sRGB" を
+/// 返す——kiri がその画素を sRGB として扱うのは正しく、その出力は動かさない。
+/// だが「sRGB として扱った」と「ファイルが sRGB を名乗っていた」は別の事実で、
+/// `srgb_required` が問うているのは後者である。
+///
+/// **AVIF と同じ扱いにすることまで見る。** AVIF の CICP が unspecified なら
+/// `unmeasurable` になるので、同じ「名乗っていない」が PNG でだけ合格すると
+/// 形式で合否が変わる枝ができる。
+#[test]
+fn a_file_that_names_no_colour_space_is_unmeasurable_not_a_pass() {
+    let dir = fixture_dir();
+    let rules = profile_rules("amazon");
+    let side = conforming_side(&rules);
+    let img = flat_product(side, side, conforming_fill(&rules), [255, 255, 255], 255);
+
+    // 名乗りが 1 つも無い PNG（image クレートが素で書くもの）
+    let bare = write_png(dir.path(), "bare.png", &img);
+    let (code, v) = lint(&bare, "amazon");
+    assert_eq!(code, 5, "名乗りの無いファイルが合格した: {v}");
+    let check = lint_check(&v, "color_space");
+    assert_eq!(check["status"], "unmeasurable", "{v}");
+    assert_eq!(check["actual"]["color_named"], false);
+    assert_eq!(check["actual"]["icc_profile"], false);
+    // **落としてはいない。** 「sRGB ではない」と断じる材料も 1 つも無い
+    assert_ne!(check["status"], "fail");
+    // 名乗り以外は素直に合格している（外したのはちょうど 1 項目）
+    assert_eq!(not_passing(&v), vec!["color_space=\"unmeasurable\""], "{v}");
+
+    // **`kiri info` の出力は 1 文字も動かさない。** 画素を sRGB として扱った
+    // ことは事実であり、`info` が答えているのはそちらの問いである
+    let out = kiri()
+        .args(["info", bare.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(json_stdout(&out)["color_space"], "sRGB");
+
+    // 同じ画素でも、sRGB の ICC を埋めれば名乗りがあるので pass になる
+    let named = write_srgb_png(dir.path(), "named.png", &img);
+    let (code, v) = lint(&named, "amazon");
+    assert_eq!(code, 0, "{v}");
+    let check = lint_check(&v, "color_space");
+    assert_eq!(check["status"], "pass");
+    assert_eq!(check["actual"]["color_named"], true);
+}
+
+/// **`checks[].name` の綴りは機械可読で配られる。**
+///
+/// `--fail-on` の指標が `accepts` で配られるのと同じ役目である。ここが無いと、
+/// エージェントは日本語の散文から名前を抜くことになる——**書き写した表は必ず
+/// 実装から離れる**という、`kiri schema` そのものが避けている失敗である。
+///
+/// `needs_pixels` まで配るのは、AVIF を渡す前にどの項目が `skipped` になるかを
+/// 予測できるようにするためで、**実際に AVIF を lint した結果と突き合わせる**。
+#[test]
+fn the_published_lint_checks_are_the_ones_that_appear() {
+    let schema = schema_json();
+    let published = schema["lint_checks"]
+        .as_array()
+        .expect("lint_checks[] が無い");
+    assert!(!published.is_empty());
+
+    let names: Vec<&str> = published
+        .iter()
+        .map(|c| c["name"].as_str().expect("name が文字列でない"))
+        .collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), names.len(), "name が重複している: {names:?}");
+
+    // **どの規格の checks[] も、配った一覧の内側に収まる。**
+    let dir = fixture_dir();
+    for profile in ["amazon", "shopify", "square-white"] {
+        let rules = profile_rules(profile);
+        let input = write_conforming(dir.path(), &format!("{profile}-published.png"), &rules);
+        let (_, v) = lint(&input, profile);
+        for name in lint_names(&v) {
+            assert!(
+                names.contains(&name.as_str()),
+                "{name} が lint_checks[] に無い"
+            );
+        }
+    }
+
+    // **needs_pixels が真の項目だけが AVIF で skipped になる。**
+    let source = write_conforming(dir.path(), "published-source.png", &profile_rules("amazon"));
+    let avif = dir.path().join("published.avif");
+    convert_json(&source, &avif, &[]);
+    let (_, v) = lint(&avif, "amazon");
+    let skipped: Vec<String> = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["status"] == "skipped")
+        .map(|c| c["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(!skipped.is_empty(), "AVIF で 1 つも飛んでいない: {v}");
+    for name in &skipped {
+        let entry = published
+            .iter()
+            .find(|c| c["name"] == name.as_str())
+            .unwrap();
+        assert_eq!(
+            entry["needs_pixels"], true,
+            "{name} は画素を要さないのに飛ばされた"
+        );
+    }
+}
+
+/// **規定の無い項目は検査もしない。** shopify は構図を 1 つも規定していない。
+///
+/// 背景を灰色にしても占有率を落としても透過を残しても**落ちない**——これは
+/// 取りこぼしではなく規格の内容である。`Rules` の `None` を「どんな値でも
+/// 合格」として `checks[]` に `pass` で並べると、shopify が構図を見ていない
+/// ことが結果から読めなくなる（`pass` は「見た上で通った」を意味する語である）。
+#[test]
+fn a_profile_that_regulates_no_composition_checks_none_of_it() {
+    let dir = fixture_dir();
+    let rules = profile_rules("shopify");
+    let side = conforming_side(&rules);
+
+    // amazon なら 4 項目が落ちる作り（灰色・低占有率・透過）
+    let input = write_png(
+        dir.path(),
+        "loose.png",
+        &flat_product(side, side, 0.2, [128, 128, 128], 0),
+    );
+
+    let (code, v) = lint(&input, "shopify");
+    assert_eq!(
+        code,
+        0,
+        "構図を規定しない規格で落ちた: {:?}",
+        not_passing(&v)
+    );
+    let names = lint_names(&v);
+    for absent in ["background", "fill_ratio", "square", "alpha", "color_space"] {
+        assert!(
+            !names.contains(&absent.to_string()),
+            "規定の無い {absent} を検査している: {names:?}"
+        );
+    }
+    assert!(names.contains(&"longest_side".to_string()), "{names:?}");
+
+    // 同じ画像が amazon では落ちる。**規格ごとに見るものが違う**ことの裏取り
+    // ——shopify が通したのは kiri が見落としたからではない
+    let (code, amazon) = lint(&input, "amazon");
+    assert_eq!(code, 5, "同じ画像が amazon でも通った: {amazon}");
+    assert!(not_passing(&amazon).len() >= 3, "{amazon}");
+}
+
+/// 受け入れ基準 (c)。**AVIF では画素の検査が `skipped` になり、黙って合格にしない。**
+///
+/// AVIF のフィクスチャは `kiri convert` で**実際に書く**。`tests/common` に
+/// AVIF を書く道具は無いし、手で組んだバイト列だと「kiri が書いた AVIF を
+/// kiri が読めるか」という肝心の往復が抜ける。
+#[test]
+fn an_avif_skips_the_pixel_checks_and_says_which() {
+    let dir = fixture_dir();
+    let rules = profile_rules("amazon");
+    let source = write_conforming(dir.path(), "source.png", &rules);
+    let avif = dir.path().join("out.avif");
+    convert_json(&source, &avif, &[]);
+
+    for profile in ["amazon", "square-white"] {
+        let (code, v) = lint(&avif, profile);
+        assert_eq!(v["format"], "avif", "{profile}: {v}");
+        assert_eq!(
+            lint_check(&v, "background")["status"],
+            "skipped",
+            "{profile}"
+        );
+        assert_eq!(
+            lint_check(&v, "fill_ratio")["status"],
+            "skipped",
+            "{profile}"
+        );
+        // **求められていた値は飛ばしても返す。** 検査できなかったことと、
+        // 何を求められていたかは別の事実である
+        assert!(
+            !lint_check(&v, "background")["expected"].is_null(),
+            "{profile}: 飛ばした項目が期待値を落とした: {v}"
+        );
+        // 飛ばした項目も合格ではない
+        assert_eq!(v["passed"], Value::Bool(false), "{profile}");
+        assert_eq!(code, 5, "{profile}: 飛ばしたのに exit 0 で返した: {v}");
+
+        let warning = v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["code"] == "PROFILE_UNCHECKABLE")
+            .unwrap_or_else(|| panic!("{profile}: PROFILE_UNCHECKABLE が無い: {v}"));
+        // **どれを飛ばしたかは配列で受け取れる。** 文面から項目名を抜き直さない
+        let skipped: Vec<String> = v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["status"] == "skipped")
+            .map(|c| c["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(warning["data"]["checks"], Value::from(skipped), "{profile}");
+        assert_eq!(warning["data"]["format"], "avif", "{profile}");
+
+        // コンテナだけで分かる項目はちゃんと見ている。amazon も square-white も
+        // AVIF を許容に並べていない（kiri が書ける形式であっても、規格が
+        // 受けると確かめられていないものは載せない）
+        assert_eq!(lint_check(&v, "format")["status"], "fail", "{profile}");
+    }
+}
+
+/// 受け入れ基準 (c) の裏。**画素を要求しない規格なら AVIF でも素直に検査が終わる。**
+///
+/// `skipped` は「この形式では構造的に測れない」であって「AVIF だから諦めた」
+/// ではない。shopify は寸法とバイト数と形式しか規定していないので、飛ばす項目は
+/// 1 つも無く、`PROFILE_UNCHECKABLE` も出ない——**飛ばした項目が無いときに
+/// 警告が出ないこと**は、警告が `checks[]` から数えられている証拠でもある。
+#[test]
+fn a_profile_without_pixel_rules_skips_nothing_in_an_avif() {
+    let dir = fixture_dir();
+    let source = write_conforming(dir.path(), "source.png", &profile_rules("shopify"));
+    let avif = dir.path().join("out.avif");
+    convert_json(&source, &avif, &[]);
+
+    let (_, v) = lint(&avif, "shopify");
+    assert_eq!(v["format"], "avif", "{v}");
+    let skipped: Vec<&Value> = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["status"] == "skipped")
+        .collect();
+    assert!(skipped.is_empty(), "飛ばした項目がある: {skipped:?}");
+    assert!(
+        !has_warning(&v, "PROFILE_UNCHECKABLE"),
+        "飛ばしていないのに警告が出た: {v}"
+    );
+    // 寸法とバイト数は AVIF でも測れている
+    assert_eq!(lint_check(&v, "longest_side")["status"], "pass", "{v}");
+    assert_eq!(lint_check(&v, "file_size")["status"], "pass", "{v}");
+}
+
+/// 受け入れ基準 (d)。**明示指定が profile を押しのけ、押しのけた値が実際に効く。**
+///
+/// ※ 計画書の当初の基準は `--profile amazon --quality 60` だったが、**これは
+/// 成立しない。** 品質を規定しているモール規格が無いので `Rules` にも
+/// `write_defaults` にも品質の項目が無く、profile は quality を一度も求めない
+/// ——求めていない値を「押しのけた」とは言えない。**profile が実際に求める
+/// 項目**（canvas / fill_ratio / format）で書き換えた。
+///
+/// **警告が出ることだけを見ない。** 「指定したのに効かない」を防ぐのが
+/// `PROFILE_OVERRIDDEN` の用件なので、押しのけた値が成果物に現れていることを
+/// 結果 JSON か書いたファイルから確かめる。警告だけを見ると、**警告を出しながら
+/// profile の値で書く**という最悪の形を通してしまう。
+#[test]
+fn an_explicit_option_beats_the_profile_and_actually_takes_effect() {
+    let dir = fixture_dir();
+    let input = write_jpeg(
+        dir.path(),
+        "product.jpg",
+        &product_image(&ProductSpec {
+            width: 300,
+            height: 300,
+            ..Default::default()
+        }),
+    );
+
+    let run = |output: &Path, extra: &[&str]| -> Value {
+        let mut args = vec![
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--json",
+            "--profile",
+            "amazon",
+        ];
+        args.extend_from_slice(extra);
+        let out = kiri().args(&args).output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        json_stdout(&out)
+    };
+    let overridden = |v: &Value, key: &str| -> Value {
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["code"] == "PROFILE_OVERRIDDEN" && w["data"]["key"] == key)
+            .unwrap_or_else(|| panic!("{key} の PROFILE_OVERRIDDEN が無い: {v}"))
+            .clone()
+    };
+
+    // profile が求める値を先に控える。**押しのけたことを言うには、押しのけ
+    // られた側の値が要る**——警告の `data.profile` がそれを名乗っているかまで見る
+    let rules = profile_rules("amazon");
+
+    // 1. --format で押しのける。profile は JPEG を求める
+    let png = dir.path().join("forced.png");
+    let v = run(&png, &["--format", "png"]);
+    assert_eq!(v["outputs"][0]["format"], "png", "{v}");
+    assert_eq!(overridden(&v, "format")["data"]["used"], "png");
+    assert_eq!(
+        overridden(&v, "format")["data"]["profile"],
+        rules["formats"][0],
+        "profile が求めた形式を名乗っていない"
+    );
+
+    // 2. --canvas で押しのける
+    let sized = dir.path().join("sized.jpg");
+    let v = run(&sized, &["--canvas", "640x480"]);
+    assert_eq!(v["outputs"][0]["width"], 640, "{v}");
+    assert_eq!(v["outputs"][0]["height"], 480, "{v}");
+    assert_eq!(
+        overridden(&v, "canvas")["data"]["used"],
+        Value::from(vec![640, 480])
+    );
+
+    // 3. --fill-ratio で押しのける。**効いたかどうかは成果物を測って言う**
+    //    ——`settings` は指示の写しなので、書いたものが本当にそうなっている
+    //    ことの証拠にならない
+    let loose = dir.path().join("loose.jpg");
+    let want_ratio = rules["fill_ratio_min"].as_f64().unwrap();
+    let half = format!("{:.2}", want_ratio / 2.0);
+    let v = run(&loose, &["--fill-ratio", &half]);
+    assert_eq!(
+        overridden(&v, "fill_ratio")["data"]["used"],
+        half.parse::<f64>().unwrap()
+    );
+    let (code, linted) = lint(&loose, "amazon");
+    assert_eq!(code, 5, "半分の占有率で書いたのに規格を満たした: {linted}");
+    let measured = lint_check(&linted, "fill_ratio")["actual"]["value"]
+        .as_f64()
+        .unwrap();
+    assert!(
+        measured < want_ratio,
+        "明示した占有率が効いていない: {measured} >= {want_ratio}"
+    );
+}
+
+/// 受け入れ基準 (d) の 4 通り目。**出力先の拡張子も形式の明示指定として数える。**
+///
+/// 優先順位に素直に従って profile が勝つと、`-o out.png --profile amazon` が
+/// **`.png` という名前のファイルに JPEG を書く。** 拡張子と中身が食い違えば
+/// `outputs[].path` が嘘をつき、配信側も他のツールも拡張子で形式を判断するので、
+/// その嘘は kiri の外まで運ばれる。**書いたファイルの先頭バイトまで見る**のは、
+/// `outputs[].format` が同じ嘘をついても気づけるようにするためである。
+#[test]
+fn the_output_extension_overrides_the_profile_format() {
+    let dir = fixture_dir();
+    let input = write_jpeg(
+        dir.path(),
+        "product.jpg",
+        &product_image(&ProductSpec {
+            width: 300,
+            height: 300,
+            ..Default::default()
+        }),
+    );
+    let output = dir.path().join("out.png");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--json",
+            "--profile",
+            "amazon",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let v = json_stdout(&out);
+
+    assert_eq!(v["outputs"][0]["format"], "png", "{v}");
+    let bytes = std::fs::read(&output).unwrap();
+    assert_eq!(
+        &bytes[..8],
+        b"\x89PNG\r\n\x1a\n",
+        ".png という名前のファイルの中身が PNG でない"
+    );
+
+    let warning = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "PROFILE_OVERRIDDEN" && w["data"]["key"] == "format")
+        .unwrap_or_else(|| panic!("拡張子が押しのけたことを言っていない: {v}"));
+    assert_eq!(warning["data"]["used"], "png");
+    assert_eq!(
+        warning["data"]["profile"],
+        profile_rules("amazon")["formats"][0]
+    );
+
+    // **同じ値なら黙っている。** shopify は PNG を第一候補にするので、
+    // 同じ `-o out.png` でも押しのけたことにはならない——「profile を指定した
+    // のに効かなかった項目はどれか」という問いに、同じ値の行は答えを足さない
+    let same = dir.path().join("same.png");
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            same.to_str().unwrap(),
+            "--json",
+            "--profile",
+            "shopify",
+        ])
+        .output()
+        .unwrap();
+    let v = json_stdout(&out);
+    assert!(
+        !has_warning(&v, "PROFILE_OVERRIDDEN"),
+        "同じ値で押しのけたと言っている: {v}"
+    );
+}
+
+/// **`--profile` を付けただけで `UNKNOWN_OUTPUT_FORMAT` が消えない。**
+///
+/// `OutputFormat::from_path` の `None` は「拡張子が無い」と「拡張子はあるが
+/// 未知」の 2 つを兼ねている。後者で profile に形式を決めさせると
+/// `-o out.xyz --profile amazon` が `.xyz` という名前の JPEG を黙って書く
+/// ——`the_output_extension_overrides_the_profile_format` が守っている
+/// 「拡張子と中身を食い違わせない」を、同じ指定の別の綴りで破ることになる。
+///
+/// **profile の有無で結果が変わらないことまで見る。** 片方だけを見ても
+/// 「断った」としか言えず、`--profile` が判断を動かしていないことは言えない。
+#[test]
+fn an_unknown_extension_is_refused_with_or_without_a_profile() {
+    let dir = fixture_dir();
+    let input = write_jpeg(
+        dir.path(),
+        "product.jpg",
+        &product_image(&ProductSpec {
+            width: 300,
+            height: 300,
+            ..Default::default()
+        }),
+    );
+    let output = dir.path().join("out.xyz");
+
+    for profile in [None, Some("amazon")] {
+        let mut args = vec![
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--dry-run",
+            "--json",
+        ];
+        if let Some(name) = profile {
+            args.extend(["--profile", name]);
+        }
+        let out = kiri().args(&args).output().unwrap();
+        let v = json_stdout(&out);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "profile={profile:?}: 未知の拡張子を通した: {v}"
+        );
+        assert_eq!(v["error"]["code"], "UNKNOWN_OUTPUT_FORMAT", "{v}");
+    }
+
+    // **拡張子を綴っていないパスは今までどおり profile が決めてよい。**
+    // `--naming` の雛形がそれで、そこでは拡張子は雛形の `{ext}` が供給する
+    let stem = dir.path().join("named");
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            stem.to_str().unwrap(),
+            "--naming",
+            "{stem}_{width}.{ext}",
+            "--dry-run",
+            "--json",
+            "--profile",
+            "amazon",
+        ])
+        .output()
+        .unwrap();
+    let v = json_stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{v}");
+    assert_eq!(
+        v["outputs"][0]["format"],
+        profile_rules("amazon")["formats"][0],
+        "拡張子の無いパスで profile が形式を決めていない: {v}"
+    );
+}
+
+/// **派生が自分で書いた形式が profile の外へ出たら、派生ごとに 1 件報せる。**
+///
+/// `--derive 'format=avif'` は `--format` も `--output` の拡張子も通らないので、
+/// profile の形式指定を丸ごと迂回する。黙って通すと **amazon で書いたものが
+/// 同じ amazon の `kiri lint` で落ちる**——`FILL_RATIO_MARGIN` の doc が
+/// 「最も高くつく失敗」と名指ししているものである。
+///
+/// **許容の内側にある派生では黙る。** amazon は PNG も許すので、
+/// `format=png` の派生に警告を出すと `PROFILE_OVERRIDDEN` が
+/// 「profile を指定したのに効かなかった項目」以外を語り始める。
+#[test]
+fn a_derivation_that_leaves_the_profile_formats_says_so_one_by_one() {
+    let dir = fixture_dir();
+    let input = write_jpeg(
+        dir.path(),
+        "product.jpg",
+        &product_image(&ProductSpec {
+            width: 300,
+            height: 300,
+            ..Default::default()
+        }),
+    );
+    let output = dir.path().join("e.jpg");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--profile",
+            "amazon",
+            "--derive",
+            "width=800,format=avif,role=hero",
+            "--derive",
+            "width=400,format=png,role=thumb",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let v = json_stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{v}");
+
+    let overridden: Vec<&Value> = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|w| w["code"] == "PROFILE_OVERRIDDEN" && w["data"]["key"] == "format")
+        .collect();
+    assert_eq!(
+        overridden.len(),
+        1,
+        "許容の外へ出た派生はちょうど 1 本のはず: {v}"
+    );
+    let warning = overridden[0];
+    assert_eq!(warning["data"]["used"], "avif");
+    // **どの出力の話かを名乗る。** パスはまだ綴れないので、並びの添字と role で指す
+    assert_eq!(warning["data"]["derive"], 0);
+    assert_eq!(warning["data"]["role"], "hero");
+    // 求めた値は許容の並びそのもの——第一候補 1 つでは「png でも通る」が読めない
+    assert_eq!(
+        warning["data"]["profile"],
+        profile_rules("amazon")["formats"]
+    );
+
+    // **その出力は実際に同じ profile の lint で落ちる。** 警告が指している
+    // のがまさにこれであることを、作り話ではなく実測で固定する
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--profile",
+            "amazon",
+            "--derive",
+            "width=800,format=avif,role=hero",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let v = json_stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{v}");
+    let written = Path::new(v["outputs"][0]["path"].as_str().unwrap()).to_path_buf();
+    let (code, lint_result) = lint(&written, "amazon");
+    assert_eq!(code, 5, "amazon で書いた AVIF が amazon の lint を通った");
+    assert_eq!(lint_check(&lint_result, "format")["status"], "fail");
+}
+
+/// **派生の寸法が profile の外へ出たら、派生ごとに 1 件報せる。**
+///
+/// 形式と同じ形の迂回である。`--sizes 400` は `--canvas` も `--longest-side` も
+/// 通らないので、profile が決めた寸法を丸ごと素通りする。**黙って通すと
+/// `--profile amazon` で書いた 400x400 が同じ amazon の `kiri lint` で
+/// `longest_side` fail になる**——形式の迂回と違って出力が実際に規格違反に
+/// なるので、実害はこちらのほうが直接的である。
+///
+/// **規格の内側に収まる派生では黙る**（`--sizes 800`）。そこで警告を出すと
+/// `PROFILE_OVERRIDDEN` が「profile を指定したのに効かなかった項目」以外を
+/// 語り始める（形式の側とまったく同じ規約）。
+#[test]
+fn a_derivation_that_leaves_the_profile_dimensions_says_so_one_by_one() {
+    let dir = fixture_dir();
+    let input = write_jpeg(
+        dir.path(),
+        "product.jpg",
+        &product_image(&ProductSpec {
+            width: 2000,
+            height: 2000,
+            ..Default::default()
+        }),
+    );
+    let output = dir.path().join("w.jpg");
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--profile",
+            "amazon",
+            "--sizes",
+            "400,800",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let v = json_stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{v}");
+
+    let overridden: Vec<&Value> = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|w| w["code"] == "PROFILE_OVERRIDDEN" && w["data"]["key"] == "longest_side")
+        .collect();
+    assert_eq!(
+        overridden.len(),
+        1,
+        "規格の外へ出た派生はちょうど 1 本のはず: {v}"
+    );
+    let warning = overridden[0];
+    // **どの出力の話かを名乗る。** 並びの添字は `outputs[]` の添字と同じ
+    assert_eq!(warning["data"]["derive"], 0);
+    // 求めた値は上下限の組、効いた値は実際に書く長辺
+    assert_eq!(
+        warning["data"]["profile"],
+        serde_json::json!({
+            "min": profile_rules("amazon")["longest_side_min"],
+            "max": profile_rules("amazon")["longest_side_max"],
+        })
+    );
+    assert_eq!(warning["data"]["used"], 400);
+
+    // **その出力は実際に同じ profile の lint で落ちる。** 警告が指している
+    // のがまさにこれであることを、作り話ではなく実測で固定する
+    let small = Path::new(v["outputs"][0]["path"].as_str().unwrap()).to_path_buf();
+    assert_eq!(v["outputs"][0]["width"], 400, "{v}");
+    let (code, lint_result) = lint(&small, "amazon");
+    assert_eq!(code, 5, "amazon で書いた 400px が amazon の lint を通った");
+    assert_eq!(lint_check(&lint_result, "longest_side")["status"], "fail");
+
+    // 規格の内側の派生は黙って書かれる
+    let big = Path::new(v["outputs"][1]["path"].as_str().unwrap()).to_path_buf();
+    assert_eq!(v["outputs"][1]["width"], 800, "{v}");
+    let (_, big_result) = lint(&big, "amazon");
+    assert_eq!(lint_check(&big_result, "longest_side")["status"], "pass");
+}
+
+/// **`--profile` を渡さない実行は 1 バイトも変わらない。**
+///
+/// Phase 21 の `no_fail_on_means_no_compliance_block_and_no_new_exit_code` と
+/// 同じ位置づけの検査である。既存のテストを 1 本も書き換えずに通すことが第一の
+/// 証拠だが、それは「変わっていない」を直接は言わない。
+///
+/// **`--profile` を渡した実行との比較にはしない。** profile は canvas を必ず
+/// 決めるので、明示で打ち消そうにも「canvas を指定しない」とは書けず、
+/// 両者が同じバイト列になる指定は存在しない。代わりに、profile が触ると
+/// 宣言している項目を**全部明示した**実行を 2 通り（profile あり / なし）
+/// 走らせる——このとき profile は 1 つの値も決められないので、**成果物が
+/// 1 バイトでも違えば、profile が宣言の外へ手を伸ばしている**ことになる。
+#[test]
+fn a_profile_decides_nothing_outside_the_items_it_declares() {
+    let dir = fixture_dir();
+    let input = write_jpeg(
+        dir.path(),
+        "product.jpg",
+        &product_image(&ProductSpec {
+            width: 300,
+            height: 300,
+            ..Default::default()
+        }),
+    );
+
+    // profile が触ると名乗る 6 項目をすべて明示する
+    // （`--flatten` と `--max-bytes` は amazon では同じ値・規定なしに落ち着くので
+    //   警告にならないが、明示そのものは効いている）
+    let explicit = [
+        "--canvas",
+        "480x480",
+        "--fill-ratio",
+        "0.7",
+        "--format",
+        "png",
+        "--background",
+        "#FAFAFA",
+        "--flatten",
+        "--max-bytes",
+        "5M",
+    ];
+    let run = |output: &Path, extra: &[&str]| -> Value {
+        let mut args = vec![
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--json",
+        ];
+        args.extend_from_slice(&explicit);
+        args.extend_from_slice(extra);
+        let out = kiri().args(&args).output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        json_stdout(&out)
+    };
+
+    let plain_path = dir.path().join("plain.png");
+    let profiled_path = dir.path().join("profiled.png");
+    let plain = run(&plain_path, &[]);
+    let profiled = run(&profiled_path, &["--profile", "amazon"]);
+
+    assert_eq!(
+        std::fs::read(&plain_path).unwrap(),
+        std::fs::read(&profiled_path).unwrap(),
+        "明示で埋めたのに profile がバイト列を動かした"
+    );
+    assert!(
+        plain["settings"].get("profile").is_none(),
+        "--profile 無しで settings.profile が現れた: {}",
+        plain["settings"]
+    );
+    assert_eq!(
+        profiled["settings"]["profile"]["name"], "amazon",
+        "効いた profile を名乗っていない: {profiled}"
+    );
+    assert!(
+        !has_warning(&plain, "PROFILE_OVERRIDDEN"),
+        "--profile 無しで profile の警告が出た: {plain}"
+    );
+
+    // 結果 JSON も `settings.profile` と `PROFILE_OVERRIDDEN` 以外は動かない。
+    // 所要時間とパスだけが実行ごとに違う
+    let strip = |v: &Value| -> Value {
+        let mut o = v.as_object().unwrap().clone();
+        o.remove("elapsed_ms");
+        let mut settings = o["settings"].as_object().unwrap().clone();
+        settings.remove("profile");
+        o.insert("settings".into(), Value::Object(settings));
+        let warnings: Vec<Value> = v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|w| w["code"] != "PROFILE_OVERRIDDEN")
+            .cloned()
+            .collect();
+        o.insert("warnings".into(), Value::Array(warnings));
+        let outputs: Vec<Value> = v["outputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                let mut e = entry.as_object().unwrap().clone();
+                e.remove("path");
+                Value::Object(e)
+            })
+            .collect();
+        o.insert("outputs".into(), Value::Array(outputs));
+        Value::Object(o)
+    };
+    assert_eq!(
+        strip(&plain),
+        strip(&profiled),
+        "profile が結果の他の部分を動かしている"
+    );
+}
+
+/// **書いた側と検査する側が同じ規格を指していることの、唯一の実行による保証。**
+///
+/// `profile.rs` と `lint.rs` の単体テストは、どちらも組み立てた `Facts` の上で
+/// 表と設定の整合を見る。実際に書いた画素を通していないので、JPEG の量子化も
+/// キャンバス配置の丸めも `--feather` のにじみも 1 つも乗らない。
+/// **profile で書いたものが同じ profile の lint で落ちるのが Phase 22 で
+/// 最も高くつく失敗**なので、ここだけは本物のファイルで往復させる。
+#[test]
+fn what_a_profile_writes_passes_the_same_profiles_lint_end_to_end() {
+    let dir = fixture_dir();
+    // 拡大を避けるために大きめの素材を採る。`CANVAS_UPSCALED` が出ても合否には
+    // 関わらないが、拡大したものを検査すると「規格を満たしたのは拡大のおかげ」
+    // という読み方が混ざる
+    let input = write_jpeg(
+        dir.path(),
+        "product.jpg",
+        &product_image(&ProductSpec {
+            width: 2000,
+            height: 2000,
+            ..Default::default()
+        }),
+    );
+
+    for name in ["amazon", "shopify", "square-white"] {
+        let rules = profile_rules(name);
+        // **出力先の拡張子を profile の第一候補に揃える。** 揃えないと拡張子が
+        // 形式を押しのけ、検査しているものが profile の決めた形式でなくなる
+        let ext = rules["formats"][0].as_str().unwrap();
+        let output = dir.path().join(format!("{name}.{ext}"));
+        let out = kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--json",
+                "--profile",
+                name,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let written = json_stdout(&out);
+        assert!(
+            !has_warning(&written, "PROFILE_OVERRIDDEN"),
+            "{name}: 何も明示していないのに押しのけが起きた: {written}"
+        );
+
+        let (code, v) = lint(&output, name);
+        assert_eq!(
+            code,
+            0,
+            "{name}: profile で書いたものが同じ profile の lint で落ちた: {:?}",
+            not_passing(&v)
+        );
+        assert_eq!(v["passed"], Value::Bool(true), "{name}: {v}");
+    }
+}
+
+/// **占有率を極端に寄せて書いたものも、同じ profile の lint を通る。**
+///
+/// 上の往復は `--fill-ratio` を profile の既定（0.85）に任せているので、
+/// **主体が外周の帯に入る領域を 1 度も踏まない。** `conforming_fill` が
+/// `fill_ratio_min + 0.03` を採っているのも同じで、下限のすぐ上しか見ない。
+///
+/// lint は背景を短辺の 3% の帯で測るので、占有率が `1 - 2/33 ≒ 0.939` を
+/// 超えると**主体そのものがその帯に入る**。そこで落ちた `uniformity` を
+/// 「背景が単色でない」と読んで `unmeasurable` を返していたことがあり、
+/// **`kiri cutout --profile amazon --fill-ratio 0.95` で書いた純白背景の
+/// 正方形が、同じ amazon の `kiri lint` で落ちていた**（0.94 は通る）。
+///
+/// どの profile にも占有率の**上限**は無い。寄りのトリミングは全規格で
+/// 合法なので、規格が許す構図で書いたものが規格で落ちること自体が誤りである。
+///
+/// **背景を規定する規格だけを回す。** 規定の無い規格（shopify）では
+/// `background` の行がそもそも出ないので、この往復で守れるものが無い。
+#[test]
+fn a_tightly_cropped_profile_output_still_passes_the_same_profiles_lint() {
+    let dir = fixture_dir();
+    let input = write_jpeg(
+        dir.path(),
+        "tight.jpg",
+        &product_image(&ProductSpec {
+            width: 2000,
+            height: 2000,
+            ..Default::default()
+        }),
+    );
+
+    for name in ["amazon", "square-white"] {
+        let rules = profile_rules(name);
+        if rules["background"].is_null() {
+            continue;
+        }
+        let ext = rules["formats"][0].as_str().unwrap();
+        // 回帰した帯（0.95 以上）と、当時も通っていた 0.94 の両方を踏む。
+        // **通っていた側を残す**のは、直した結果として広いほうの帯が
+        // 使われなくなっていないかを同じテストで見るためである
+        for fill in ["0.94", "0.95", "0.96", "0.97", "0.98"] {
+            let output = dir.path().join(format!("{name}_{fill}.{ext}"));
+            let out = kiri()
+                .args([
+                    "cutout",
+                    input.to_str().unwrap(),
+                    "-o",
+                    output.to_str().unwrap(),
+                    "--json",
+                    "--profile",
+                    name,
+                    "--fill-ratio",
+                    fill,
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "{name} / fill {fill}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+
+            let (code, v) = lint(&output, name);
+            assert_eq!(
+                code,
+                0,
+                "{name} / fill {fill}: profile で書いたものが同じ profile の lint で落ちた: {:?}",
+                not_passing(&v)
+            );
+            // **測れた帯と色まで見る。** exit 0 だけでは、`background` の行が
+            // 出ていない実行（規定なしの規格を取り違えた）でも緑になる
+            let check = lint_check(&v, "background");
+            assert_eq!(check["status"], "pass", "{name} / fill {fill}: {check}");
+            assert_eq!(
+                check["actual"]["rgb"], rules["background"],
+                "{name} / fill {fill}: 測った背景色が規格の色と違う: {check}"
+            );
+            // 帯は主体の手前で止まる。**`--border` の既定 2 まで落ちていない**
+            // ——そこまで狭めると、外周 2px の縁 1 本で「背景は純白」と
+            // 答える側の穴が開く
+            let band = check["actual"]["border_px"].as_u64().expect("帯幅が無い");
+            assert!(
+                band > 2,
+                "{name} / fill {fill}: 外周 2px で判定している: {check}"
+            );
+        }
+    }
+}
+
+/// **同じ入力を 2 回検査した結果はバイト列として一致する。**
+///
+/// `checks[]` の並びが指定や `HashMap` の順に依れば、結果の差分で納品物を
+/// 見張れなくなる（`compliance::Metric::ALL` と同じ理由）。文字列として
+/// 比べるのは、`serde_json::Value` へ読み直すと `Map` が綴りで並べ替えてしまい、
+/// **ファイルの中の順序が分からなくなる**ためである（Phase 20 のマニフェストの
+/// ゴールデンと同じ作法）。
+#[test]
+fn two_lint_runs_agree_byte_for_byte() {
+    let dir = fixture_dir();
+    // 合格と不合格の両方で見る。**不合格の側は `code` と `actual` が増える**ので、
+    // 決定性を崩す余地も合格の側より広い
+    let ok = write_conforming(dir.path(), "ok.png", &profile_rules("amazon"));
+    let bad = write_png(
+        dir.path(),
+        "bad.png",
+        &flat_product(600, 600, 0.3, [200, 200, 200], 255),
+    );
+
+    for input in [&ok, &bad] {
+        let run = || {
+            kiri()
+                .args([
+                    "lint",
+                    input.to_str().unwrap(),
+                    "--profile",
+                    "amazon",
+                    "--json",
+                ])
+                .output()
+                .unwrap()
+                .stdout
+        };
+        let first = run();
+        assert_eq!(first, run(), "{}: 2 回の結果が違う", input.display());
+
+        // 並びが `checks[]` の中で決定的であることまで見る（同じバイト列なら
+        // 自明だが、**何を約束しているか**を名前で残す）
+        let v: Value = serde_json::from_slice(&first).unwrap();
+        let names = lint_names(&v);
+        assert!(
+            names.windows(2).all(|w| w[0] != w[1]),
+            "name が重複: {names:?}"
+        );
+        assert!(!names.is_empty());
+    }
+}
+
+/// **`kiri lint` は 1 バイトも書かない。**
+///
+/// 検査の道具が対象を書き換えたら、「検査に通ったもの」と「納品するもの」が
+/// 別物になりうる。`--dry-run` のような打ち消しの指定が無いので、**書かない
+/// ことそのものが契約**である。
+#[test]
+fn lint_writes_nothing_at_all() {
+    let dir = fixture_dir();
+    let input = write_png(
+        dir.path(),
+        "subject.png",
+        &flat_product(600, 600, 0.3, [200, 200, 200], 255),
+    );
+    let before = std::fs::read(&input).unwrap();
+    let listing = |dir: &Path| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    let files = listing(dir.path());
+
+    for profile in ["amazon", "shopify", "square-white"] {
+        lint(&input, profile);
+    }
+
+    assert_eq!(
+        before,
+        std::fs::read(&input).unwrap(),
+        "検査対象のバイト列が変わった"
+    );
+    assert_eq!(files, listing(dir.path()), "ディレクトリにファイルが増えた");
+}
+
+/// spec の `profile` は CLI と同じ関門を通り、`defaults` から継げる。
+///
+/// **`batch.rs` の 3 箇所（`ItemSettings` / `pick!` / `SETTING_KEYS`）が揃って
+/// いること**を実行で確かめる（Phase 21 の `fail_on` と同じ作法）。
+/// 未知の名前を spec でだけ黙って既定へ落とすと、**数百点を書き切った後に
+/// 「規格に収めたはずのものが収まっていない」**という最も遅い気づき方になる。
+#[test]
+fn a_spec_names_a_profile_and_inherits_it_from_the_defaults() {
+    let dir = fixture_dir();
+    write_jpeg(
+        dir.path(),
+        "p.jpg",
+        &product_image(&ProductSpec {
+            width: 300,
+            height: 300,
+            ..Default::default()
+        }),
+    );
+
+    let spec = write_spec(
+        dir.path(),
+        r#"{"defaults":{"profile":"square-white"},
+             "items":[
+               {"input":"p.jpg","output":"out/a.jpg"},
+               {"input":"p.jpg","output":"out/b.jpg","profile":"amazon"},
+               {"input":"p.jpg","output":"out/c.jpg","canvas":"320x320"}
+             ]}"#,
+    );
+    let out = run_batch(&spec, &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+
+    // 既定が効く / 項目の指定が勝つ
+    assert_eq!(
+        v["results"][0]["result"]["settings"]["profile"]["name"],
+        "square-white"
+    );
+    assert_eq!(
+        v["results"][1]["result"]["settings"]["profile"]["name"],
+        "amazon"
+    );
+    // **明示 > profile は spec 経由でも同じ。** `canvas` を書いた項目では
+    // profile の canvas が押しのけられ、PROFILE_OVERRIDDEN が出る
+    assert_eq!(v["results"][2]["result"]["outputs"][0]["width"], 320);
+    let codes: Vec<&str> = v["results"][2]["result"]["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["code"].as_str().unwrap())
+        .collect();
+    assert!(codes.contains(&"PROFILE_OVERRIDDEN"), "{codes:?}");
+
+    // 継いだ項目は規格の寸法で書かれている（square-white は正方形を求める）
+    let written = v["results"][0]["result"]["outputs"][0].clone();
+    assert_eq!(written["width"], written["height"], "{written}");
+}
+
+/// spec の未知の profile 名は `UNKNOWN_PROFILE` でその項目を落とす。
+///
+/// clap を通らないので、CLI と同じ関門（`profile::named`）を
+/// `commands::batch` が通す。抜けていると、**CLI では断る名前が spec でだけ
+/// 黙って既定へ落ちる**——規格へ収めたつもりの納品物が素のまま出ていく。
+#[test]
+fn an_unknown_profile_in_a_spec_is_refused_with_a_code() {
+    let dir = fixture_dir();
+    write_jpeg(
+        dir.path(),
+        "p.jpg",
+        &product_image(&ProductSpec {
+            width: 60,
+            height: 60,
+            ..Default::default()
+        }),
+    );
+
+    // **載せていない規格の名前**と、綴り違いと、空。どれも「近いから通す」を
+    // してはいけない（`rakuten` は載せていないだけで実在する規格の名前である）
+    for written in ["\"rakuten\"", "\"Amazon\"", "\"amazon \"", "\"\""] {
+        let spec = write_spec(
+            dir.path(),
+            &format!(
+                r#"{{"items":[{{"input":"p.jpg","output":"out/x.png","profile":{written}}}]}}"#
+            ),
+        );
+        let out = run_batch(&spec, &[]);
+        assert_eq!(out.status.code(), Some(4), "profile:{written}");
+        let v = json_stdout(&out);
+        assert_eq!(
+            v["results"][0]["error"]["code"], "UNKNOWN_PROFILE",
+            "profile:{written}"
+        );
+        // 候補を必ず添える。**綴りを疑いようのない失敗**にしない
+        assert!(
+            v["results"][0]["error"]["hint"]
+                .as_str()
+                .is_some_and(|h| h.contains("amazon")),
+            "候補を案内していない: {v}"
+        );
+    }
+}
+
+/// `kiri lint` の断り方。**引数の誤りと入力の誤りを取り違えない。**
+///
+/// `--profile` は必須なので、渡さない実行は clap が断る（exit 2、code 無し、
+/// stdout は空）。未知の名前も同じ段で落ちる——**入力を 1 バイトも読む前**に
+/// 断ることが、数百点を回す呼び出し側にとっての速さそのものである。
+/// 一方、読めないファイルと辿れないファイルは exit 3 で、**結果 JSON では
+/// なく `ErrorReport` が返る**（検査が成立していないので `checks[]` を組めない）。
+#[test]
+fn lint_separates_a_bad_request_from_a_bad_input() {
+    let dir = fixture_dir();
+    let ok = write_conforming(dir.path(), "ok.png", &profile_rules("amazon"));
+    let broken = dir.path().join("broken.jpg");
+    std::fs::write(&broken, b"this is not an image").unwrap();
+    let missing = dir.path().join("does-not-exist.png");
+
+    // --profile を渡さない / 未知の名前 → exit 2、stdout は空
+    for args in [
+        vec!["lint", ok.to_str().unwrap(), "--json"],
+        vec![
+            "lint",
+            // **入力が存在しなくても exit 3 にならない**ことが、引数の検査が
+            // 先に走っている証拠である
+            missing.to_str().unwrap(),
+            "--profile",
+            "rakuten",
+            "--json",
+        ],
+    ] {
+        let out = kiri().args(&args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?} で stdout が出た");
+        assert!(!out.stderr.is_empty(), "{args:?} で stderr が空");
+    }
+
+    // 読めない / 辿れない → exit 3。code を名乗る JSON が返る
+    for (input, code) in [
+        (&missing, "INPUT_UNREADABLE"),
+        (&broken, "UNSUPPORTED_FORMAT"),
+    ] {
+        let (exit, v) = lint(input, "amazon");
+        assert_eq!(exit, 3, "{}", input.display());
+        assert_eq!(v["error"]["code"], code, "{v}");
+        assert!(
+            v.get("checks").is_none(),
+            "検査が成立していないのに checks を返した: {v}"
+        );
+    }
+}
+
+/// 上限バイト数を超えたファイルは、**サイズの項目だけで落ちる。**
+///
+/// `breaking_one_rule_fails_exactly_that_check` と同じ形だが、素材が 20MB 近く
+/// あるので 1 本に分けた。寸法は**公開された上限から組む**——上限を 4 バイト
+/// （RGBA 1 画素）で割った平方根が、圧縮の効かない画素で上限に届く 1 辺である。
+/// 数を書き写すと、規格が改訂されたときに素材だけが古い上限を狙い続ける。
+///
+/// **単色では作れない。** 単色の PNG は数 KB まで縮むので、上限に届かせるには
+/// 圧縮しにくいノイズが要る（`noisy_image` を置いた理由そのものである）。
+#[test]
+fn a_file_over_the_byte_budget_fails_only_the_size_check() {
+    let dir = fixture_dir();
+    let rules = profile_rules("shopify");
+    let limit = rules["max_bytes"].as_u64().expect("上限バイト数が無い");
+    // RGBA 1 画素 4 バイト。正方形なので 1 辺は √(上限 ÷ 4)。余白を足して確実に超す
+    let side = (limit as f64 / 4.0).sqrt().ceil() as u32 + 100;
+    let input = write_png(dir.path(), "heavy.png", &noisy_image(side, side));
+    let size = std::fs::metadata(&input).unwrap().len();
+    assert!(size > limit, "素材が上限を超えていない: {size} <= {limit}");
+
+    let (code, v) = lint(&input, "shopify");
+    assert_eq!(code, 5, "上限を超えたのに通った: {v}");
+    assert_eq!(
+        not_passing(&v),
+        vec!["file_size=\"fail\"".to_string()],
+        "落ちたのが file_size ちょうどではない: {v}"
+    );
+    // **求めた上限は結果が名乗る。** 読む側が README を引かずに、どれだけ
+    // 超えたかをその場で測れる
+    let check = lint_check(&v, "file_size");
+    assert_eq!(check["expected"], Value::from(limit));
+    assert_eq!(check["actual"], Value::from(size));
+
+    // 同じ規格で上限の内側にあるものは通る。**「以下が合格」である**ことを、
+    // 上限を跨いだ 2 枚で挟んで言う
+    let light = write_conforming(dir.path(), "light.png", &rules);
+    let (code, v) = lint(&light, "shopify");
+    assert_eq!(code, 0, "{v}");
+    assert!(
+        lint_check(&v, "file_size")["actual"].as_u64().unwrap() <= limit,
+        "{v}"
     );
 }

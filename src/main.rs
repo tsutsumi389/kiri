@@ -17,7 +17,8 @@ use kiri::cutout::{Confidence, OptimizeFixed, bbox_argument};
 use kiri::error::{Error, ErrorCode, ErrorKind, Result};
 use kiri::report::{
     BackgroundReport, BatchReport, ComplianceReport, CutoutReport, ErrorReport, InfoReport,
-    ModelReport, ProcessReport, SchemaReport, SegmentReport, SettingsReport, SubjectReport,
+    LintReport, ModelReport, ProcessReport, SchemaReport, SegmentReport, SettingsReport,
+    SubjectReport,
 };
 use kiri::warning::Warning;
 
@@ -66,6 +67,14 @@ fn parse() -> Cli {
             bbox: from_command_line(sub, "bbox"),
             background_model: from_command_line(sub, "background_model"),
         };
+        // **`--profile` が触りうる項目も同じ問いを立てる。** `--fill-ratio` の
+        // 0.85 も `--background` の白も `default_value_t` なので、値だけでは
+        // 「明示した」と「既定のまま」を区別できない。区別できなければ
+        // 「明示指定 > profile > 既定」が成立しない——既定値が profile を
+        // 常に押しのけるか、明示が常に黙殺されるかのどちらかになる。
+        // **読み取りそのものは `cli.rs` にある**——引数の綴りを知っている
+        // 場所に置かないと、id の綴り違いを単体テストで見張れない
+        args.explicit = kiri::cli::explicit_options(sub);
     }
     cli
 }
@@ -123,6 +132,21 @@ fn dispatch(cli: &Cli) -> Result<i32> {
             // batch が `failed > 0` で 4 を返しつつ `BatchReport` を出している
             // 既存の形をそのまま踏襲する
             if report.compliance.as_ref().is_some_and(|c| !c.passed) {
+                return Ok(ErrorKind::Compliance.exit_code());
+            }
+        }
+        Command::Lint(args) => {
+            let report = commands::lint::run(args)?;
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                print_lint(&report);
+            }
+            // **`Err` 経路を通さない。** 検査は成功していて、対象のファイルも
+            // そのままある。`ProfileViolation` を `Error::new` で作ると
+            // `debug_assert!` で panic する設計になっている（exit 5 の code は
+            // `ErrorBody` にならない）ので、名乗りは `LintReport.code` で行う
+            if !report.passed {
                 return Ok(ErrorKind::Compliance.exit_code());
             }
         }
@@ -199,6 +223,19 @@ fn print_schema(report: &SchemaReport) {
             e.summary,
             w = w
         );
+    }
+
+    // **オプション一覧を出さない方針に反しない。** ここに並ぶのは指定の綴りでは
+    // なく**規格そのもの**で、性質としては上の 2 つの表と同じ「何が返りうるか /
+    // 何を根拠に落ちるか」である。加えて `revision` と出典 URL は `--help` の
+    // どこにも無い——`--profile` の候補は clap が配るが、「いつ時点の、誰の規定か」
+    // はここでしか読めない。行数も表の大きさで決まり（1 プリセット 2 行）、
+    // 7 コマンド分のオプションのように膨らまない
+    println!("\nプロファイル ({})", report.profiles.len());
+    let w = width(report.profiles.iter().map(|p| p.name).collect());
+    for p in &report.profiles {
+        println!("  {:<w$}  {}  {}", p.name, p.revision, p.summary, w = w);
+        println!("  {:<w$}  出典 {}", "", p.source, w = w);
     }
 
     if !report.global_options.is_empty() {
@@ -587,6 +624,46 @@ fn print_compliance(compliance: Option<&ComplianceReport>) {
             }
         );
     }
+}
+
+/// `kiri lint` の結果を人間向けに出す。
+///
+/// `print_compliance` を手本にしつつ、**通った条件も 1 行ずつ出す。**
+/// あちらが通った条件を畳むのは、`--fail-on default` が 20 行近くを埋めて
+/// 切り抜きの要約を押し流すからである。lint は検査そのものが用件で、
+/// 行数も規格の条件の数（多くても 9）で決まるので、押し流すものが無い。
+/// **何を見て何を見ていないかが一目で分かること**のほうがここでは重い。
+fn print_lint(report: &LintReport) {
+    println!("{}", report.input);
+    println!(
+        "  規格      {} ({})  {}",
+        report.profile.name,
+        report.profile.revision,
+        if report.passed { "合格" } else { "不合格" }
+    );
+    println!(
+        "  対象      {} {} x {}  {} バイト",
+        report.format, report.width, report.height, report.file_size
+    );
+    for check in &report.checks {
+        // 印は 3 通りに分ける。`-` は「見ていない」で、`x` の
+        // 「見た上で落ちた」とは次の一手が違う
+        let mark = match check.status {
+            kiri::compliance::PASS => "o",
+            kiri::compliance::FAIL => "x",
+            _ => "-",
+        };
+        let detail = match (&check.expected, &check.actual) {
+            (Some(expected), Some(actual)) => format!("{actual}  (要求 {expected})"),
+            (Some(expected), None) => format!("{}  (要求 {expected})", check.status),
+            _ => check.status.to_string(),
+        };
+        println!("    {mark} {:<13} {detail}", check.name);
+    }
+    if let Some(code) = report.code {
+        println!("  code      {}", code.as_str());
+    }
+    print_warnings(&report.warnings);
 }
 
 fn print_batch(report: &BatchReport) {

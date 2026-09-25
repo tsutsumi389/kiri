@@ -77,7 +77,7 @@ src/
 | 19 | 目標バイト数へ品質を自動探索する | `--max-bytes` / `outputs[].quality_used` | 1日 |
 | 20 | 1 枚から複数サイズ・複数形式を書き、書いたものを列挙する | `--derive` / `--sizes` / `--formats` / `--manifest` | 2日 |
 | 21 | 品質指標を合否に畳み、exit code で仕分けられるようにする | `--fail-on` / exit 5 / `BatchReport.rejected` | 1日 |
-| 22 | モール規格をプリセットとして持ち、既存画像を検査する | `--profile` / `kiri lint` / `schema.profiles[]` | 2日 |
+| 22 | モール規格をプリセットとして持ち、既存画像を検査する（**済**。§5 の Phase 22） | `--profile` / `kiri lint` / `schema.profiles[]` | 2日 |
 | 23 | 主体の傾きを畳み、セット内で大きさと余白を揃える | `--rotate auto` / batch の `set` | 1.5日 |
 | 24 | 背景が中性だという前提と照明場から白点と露出を直す | `--white-balance` / `--exposure` | 2日 |
 | 25 | 反射を合成する | `--reflect` | 1日 |
@@ -1286,6 +1286,262 @@ public リポジトリなので GitHub 製の標準ランナーは分数無制�
         1 つ足した）、`every_code_named_in_the_docs_exists`（計画書だけが先に
         名指ししてよい code の表から 2 つ消した）が追随している
 
+- [x] Phase 22: `--profile` ＋ `kiri lint`（`SCHEMA_VERSION` は 2 のまま据え置き）
+  - [x] 規格の表を `src/profile.rs` に置いた。**唯一の定義は `Rules`** で、書く側の値
+        （`--canvas` / `--fill-ratio` / `--format` / `--background` / `--flatten` /
+        `--max-bytes` の 6 つ）は `write_defaults` がそこから計算する。同じ規格を
+        書く側と見る側の 2 通りに書き下すと、片方を直したときにもう片方が古い規格の
+        まま残る。プリセットは `amazon` / `shopify` / `square-white` の 3 つで、
+        どれも `revision`（`"2026-09"`）と `source` を持ち、`kiri schema` の新ブロック
+        `profiles[]` と結果 JSON の `settings.profile` に出る
+  - [x] `kiri lint <file> --profile <name>`。**書かない。** 背景も主体も `info` と
+        まったく同じ経路（`load_with` → `see_background` → `analyse_background_seen`）で
+        測る——lint だけが別の測り方を持つと、`kiri info` が返した背景色と lint が
+        照らした背景色が食い違い、**どちらが本当かを利用者が確かめる手段が無くなる**
+  - [x] レビュー指摘（実際に動かして見つかったもの）を直した。
+        - **合否を分ける帯を `field_band`（`max(短辺/33, --border)`）にした。**
+          既定の `--border 2` は切り抜きのための値で、cutout ではそこから取った色が
+          閾値の種にしかならないが、lint では外周の中央値が**そのまま合否になる**。
+          1600px の画像の縁 0.125% を見て「背景は純白」と答えていたため、外周 2px
+          だけ白い灰色一面の画像が全項目 pass / exit 0 になっていた。新しい定数は
+          置かず、「場の推定でここは背景だと信じてよい帯」として既にあるものを
+          使う。`--border` は下限として効き、使った幅は `checks[].actual.border_px`
+          が名乗る（`kiri info --border <その値>` で同じ数を再現できる）
+        - **測れていないものを `pass` と言わない。** 外周に不透明な画素が 1 つも
+          無ければ `background` は `unmeasurable`（`actual` は `null`）——透過 PNG に
+          `rgb: [0,0,0]` / `delta_e: 100.0` を配っていた。外周が単色として扱えない
+          （`is_uniform` が偽）ときも `unmeasurable` で、しきい値は `cutout` が
+          `LOW_UNIFORMITY` を出すのに使っているものをそのまま通す
+        - **色空間を 1 つも名乗っていないファイルを `pass` にしない。**
+          `LoadedImage::color_named`（ICC か EXIF ColorSpace があったか）を足し、
+          偽なら `unmeasurable`。**AVIF の CICP が unspecified のときと同じ扱い**で、
+          形式で合否が変わる枝を作らない。`kiri info` の `color_space` は 1 文字も
+          動かない（あちらが答えているのは「画素をどう扱ったか」である）
+        - **画素を要する条件を規定しない規格では見立てを走らせない**
+          （`regulates_composition`）。判定は `Check::needs_pixels` から組むので、
+          `checks[]` に出ない項目のためだけに 25MP の背景推定を払うことが無い。
+          出力は 1 バイトも変わらない（5.29MP の shopify で 0.03s → 0.01s）
+        - `kiri schema` に `lint_checks[]`（`{name, needs_pixels}`）を足し、
+          散文に書き写してあった `checks[].name` と `status` の一覧を定数から
+          組むようにした（`PROFILE_NAMES` / `FAIL_ON_METRICS` と同じ作法）
+  - [x] 再レビュー（実測）が見つけた回帰を直した。
+        - **帯を広げたことで、規格を満たす画像が落ちるようになっていた。**
+          `field_band` は固定幅（1600px で 48px）なので、占有率が
+          `1 - 2/33 ≒ 0.939` を超えると**主体そのものが帯に入る**。そこで落ちた
+          `uniformity` を「背景が単色でない」と読んで `unmeasurable` を返して
+          いたため、`cutout --profile amazon --fill-ratio 0.95` で書いた
+          純白背景・正方形・sRGB ICC 付きの画像が、同じ amazon の lint で
+          exit 5 になっていた（0.94 は通る）。どの profile にも占有率の上限は
+          無く、寄りのトリミングは全規格で合法なので、これは**規格が許す構図で
+          書いたものを規格で落とす**誤りである。`settled_band` を置き、
+          `field_band` から**単色と言えるまで半分ずつ（1/4 まで）狭めて**
+          最も広い帯を採るようにした。実測（1600px）: 0.95 → 帯 24、
+          0.96 → 24、0.97 → 24、0.98 → 12 で、どれも `uniformity` 1.0 / pass。
+          0.94 は帯 48 のまま 1 バイトも変わらない
+        - **主体の外接矩形を標本から除く形は採らなかった。** lint は測った帯幅を
+          `checks[].actual.border_px` で名乗り、「`kiri info --border <その値>`
+          で同じ背景色が出る」ことを契約にしている。矩形を抜いた標本は 1 つの数で
+          言い表せないので、契約のほうを失う。加えて主体は背景の推定値に対して
+          検出されるので、帯が主体で汚れていると**主体が 1 つも検出されなくなる**
+          （占有率 0.98 が実際にそれで、`fill_ratio` まで `unmeasurable` だった）
+          ——除く対象が消えるため、除く形では直らない
+        - **`--border` を上書き（狭める向き）として受ける案も採らなかった。**
+          逃げ道にはなるが、`--border 2` と書けば「外周 2px は純白です」と
+          言わせられるということであり、上の H3（外周 2px だけ白い灰色一面）を
+          オプション 1 つで開け直すことになる。実害のほうは `settled_band` が
+          直したので、逃げ道そのものが要らない
+        - **`unmeasurable` でも `rgb` と `delta_e` を返すようにした。** 均一度の
+          検査を色差の計算より前に置いていたため、実写のベージュの布を検査した
+          人の手元に「測れませんでした」しか残らず、**「白から ΔE 33 外れている」
+          という次の一手を決める唯一の数**が結果から消えていた。`color_space` の
+          `unmeasurable` が CICP を残しているのと同じ作法で、合格でないことは
+          `status` が言い切っている
+        - **`--derive` / `--sizes` の寸法も profile を迂回していた。**
+          直前の修正は `spec.format` しか見ておらず、`--profile amazon --sizes 400`
+          は警告を 1 件も出さずに 400x400 を書き、その出力は同じ amazon の lint で
+          `longest_side` が fail になっていた。形式の迂回と違って**出力が実際に
+          規格違反になる**ので実害は直接的である。`longest_side_min` /
+          `longest_side_max` / `max_pixels` に照らし、派生ごとに
+          `PROFILE_OVERRIDDEN` を出す。**照らすのは実際に書く寸法**で、
+          `resize::plan`（`output::resolve` と `render` が使うのと同じ純関数）に
+          最終画像を渡してから当てる——指定した数をそのまま規格に当てると、
+          縦長の素材で長辺 1200 になる実行にまで「規格の外です」と言うことになる。
+          寸法を 1 つも書かなかった派生は最終画像をそのまま書くので対象外
+          （形式を書かなかった派生が `--output` の解決結果を継ぐのと同じ関係）
+        - **`iref` の `auxl` に上限が無かった。** `BTreeSet` 化で item ごとの
+          線形探索は消えたが、集合そのものの大きさが入力に比例して伸び続けて
+          いた。`MAX_PROPERTY_REFS` と同じ要領のカウンタ（`MAX_AUXL_LINKS`、
+          値は `MAX_ASSOCIATIONS` と同じ）を置いた。実測（`auxl` 4000 箱 ×
+          65535 対応、524MB）で 0.86s / RSS 2506MB → 0.05s / RSS 506MB
+        - **`MAX_ASSOCIATIONS` の根拠が事実と合っていなかった。** 「256×256 =
+          65536 枚の倍」で 131072 を置いていたが、**アルファも grid なら
+          65536×2 + 2 = 131074** で、理論上の最大構成をちょうど弾く位置に上限が
+          あった。`1 << 18`（262144）へ上げ、doc の計算を事実に合わせた
+  - [x] `--profile` が形式を決めてよい場面を絞った。**拡張子はあるが kiri の
+        知らない綴り**（`-o out.xyz`）では profile の有無に関わらず
+        `UNKNOWN_OUTPUT_FORMAT` で断る——`OutputFormat::from_path` の `None` が
+        「拡張子が無い」と「未知の拡張子」を兼ねていたため、`--profile` を
+        付けるだけで `.xyz` という名前の JPEG が書けていた。また
+        `--derive` / `--formats` が自分で書いた形式は優先順位の 4 段を 1 つも
+        通らないので、profile の `formats` の外へ出た派生ごとに
+        `PROFILE_OVERRIDDEN` を 1 件出す（`data` の `derive` / `role` でどの出力かを
+        名乗る）——黙って通すと**amazon で書いたものが同じ amazon の lint で落ちる**
+  - [x] batch の spec に `profile` キーを足した（`ItemSettings` / `pick!` /
+        `SETTING_KEYS` の 3 箇所）。未知の名前は CLI と同じ関門（`profile::named`）で
+        `UNKNOWN_PROFILE` として断る。spec でだけ黙って既定へ落ちると、**数百点を
+        書き切った後に「規格へ収めたはずのものが収まっていない」**という最も遅い
+        気づき方になる
+  - [x] `--fill-ratio` の既定 0.85 の doc から「EC プラットフォームで広く求められる
+        占有率」という**規格の主張を外した**。規格が求める占有率は profile の表が
+        持つ。同じ主張を 2 箇所に置くと、片方を直したときにもう片方が残る
+  - ※ **外部 JSON で表を差し替える口は作らなかった。** kiri は契約を自分で配る設計
+        （`kiri schema`）で、同じ版の kiri が同じ入力から同じ結果を出すことを約束して
+        いる。表を外から差し替えられると、`kiri schema` が配った `profiles[]` と実際に
+        効く規格が食い違いうるし、`revision` が指すものが実行環境ごとに変わる。
+        規格が変わったら kiri の版を上げる、というのがここでの答えである
+  - ※ **楽天と Yahoo! ショッピングは載せなかった。** 両社のガイドライン本文は
+        ログインの内側にあり、**一次情報として読めない。** 出典の無い数値を
+        `kiri schema` が配ると、不合格の根拠を利用者が辿れない——「kiri がそう言うから」
+        以上のことが言えない合否に、納品を止める重みは無い。`revision` を持つ設計
+        なので、一次情報が手に入った時点で足せる。**推測で埋めて後から直す**のは、
+        一度配った契約を引っ込めることになるので採らない。同じ理由で `amazon` の
+        ファイルサイズ上限も入れていない（二次情報では 10MB と書かれることが多いが、
+        `source` の URL から辿れない）
+  - ※ **`Rules` には「触れたら不合格」になる条件だけを置いた。** 推奨（1000px 以上なら
+        ズームが効く、など）を混ぜると `kiri lint` が推奨違反で落とすことになり、
+        規格と kiri の好みが同じ表の中で見分けられなくなる。kiri の判断は
+        `write_defaults` 側（`PREFERRED_LONG_SIDE` = 1600）に置き、そこでは必ず根拠を
+        述べる
+  - ※ **`Option` の `None` は「規定なし」で、「どんな値でも合格」ではない。**
+        規定していない条件は `checks[]` に 1 行も出さない——`pass` として並べると、
+        `shopify` が構図（背景色・占有率）を見ていないことが結果から読めなくなる。
+        `pass` は「見た上で通った」を意味する語である。真偽で持つ 3 つ
+        （`square` / `alpha_allowed` / `srgb_required`）も同じ扱いで、**偽の側が
+        「規定なし」**である
+  - ※ **形式の優先順位を「`--format` > `--output` の拡張子 > profile > 既定」の
+        4 段にした。** 優先順位の 1 本（明示指定 > profile > 既定）に素直に従って
+        拡張子を「未指定なら」の推論（＝既定の振る舞い）と読むと、profile が勝って
+        **`-o out.png --profile amazon` が `.png` という名前のファイルに JPEG を書く**。
+        拡張子と中身が食い違うファイルは `outputs[].path` が嘘をつくことになり、
+        配信側も他のツールも拡張子で形式を判断するので、その嘘は kiri の外まで
+        運ばれる。**綴った名前のほうが profile より具体的な指示である**と読むのが、
+        「指定したのに効かない」を作らないという `cli.rs` 全体の姿勢に合う。
+        押しのけたことは `--format` で押しのけたときとまったく同じ
+        `PROFILE_OVERRIDDEN` / 同じ `data` の形で言う（押しのけた主が指定だったか
+        綴った名前だったかで、読む側の分岐を増やす理由は無い）
+  - ※ **`PROFILE_OVERRIDDEN` は項目ごとに 1 件出し、同じ値なら黙る。** まとめて
+        1 件にすると、どの指定が profile を押しのけたのかを `message` の散文から
+        抜き直すことになる。逆に同じ値に落ち着いた項目（`-o out.png --profile shopify`）
+        まで出すと、「profile を指定したのに効かなかった項目はどれか」という問いに
+        答えを足さない行が並ぶ
+  - ※ **`passed` は「全項目 `pass`」である。** `fail` も `unmeasurable` も `skipped` も
+        合格ではない（`compliance::FailOn::evaluate` と同じ定義）。**exit 5 の意味は
+        「成果物はある。人が見る対象」**で、「検査できなかったので人が見てほしい」は
+        まさにそれである。3 つを分けるのは**次の一手が違う**ためで、そこだけが
+        名前を分ける理由である——`fail` はその項目を直す、`skipped` は形式を変えれば
+        必ず測れるようになる（JPEG か PNG で渡し直す）、`unmeasurable` は形式を
+        変えても同じ結果になるので素材を見る。`skipped` を `unmeasurable` に畳むと、
+        「JPEG で出し直せば答えが出る」という最も安い次の一手が消える
+  - ※ **AVIF の画素は 1 つも読めない。** pure Rust の AVIF デコーダが実質存在せず、
+        dav1d（C）は `Cargo.toml` が立てた基準を崩す。コンテナから読める事実
+        （寸法・`has_alpha`・色の名乗り）だけで判定し、`background` と `fill_ratio` を
+        `skipped` ＋ `PROFILE_UNCHECKABLE` で明示する。**どれを飛ばしたかは
+        `data.checks` に配列で必ず入れる**——文面から項目名を抜き直させない。
+        警告は `checks[]` から数える（別に数え上げると、条件を 1 つ足したときに
+        `checks[]` と警告が食い違いうる）
+  - ※ **実測: kiri が書く AVIF の `av1C` は `configOBUs` を持たない。** ペイロードは
+        ちょうど 4 バイト（`81 3f 40 00`）で、シーケンスヘッダを 1 バイトも含まない
+        （`an_av1c_box_from_kiri_carries_no_config_obus`）。したがって CICP は
+        `iloc` を辿って **mdat 側の主画像のシーケンスヘッダ**から読んでいる。
+        これは Phase 18 の節の記述（「ravif が AV1 シーケンスヘッダの CICP
+        （1 / 13 / 6 / full）で sRGB を名乗る」「`colr` ボックスは出ない」）と
+        矛盾しないが、**どこにシーケンスヘッダがあるかはそこに書かれていなかった**
+        ——`av1C` の中だけを見る読み方では `ColorNaming::Unknown` になり、
+        `srgb_required` を持つ規格の `color_space` が全部の AVIF で
+        `unmeasurable` に落ちる
+  - ※ **CICP の「未指定」（2）は `fail` ではなく `unmeasurable` にした。**
+        `AvifMeta` は埋め込み ICC の有無を持たないので、`fail` と断じると
+        **実際には sRGB を名乗っているファイルを規格違反として落とす**。落とすほうへ
+        外すのは、合否に納品を止める重みがある以上いちばん高くつく誤りである。
+        `unmeasurable` は合格ではない（`passed` は落ちる）ので黙って通すことにも
+        ならない
+  - ※ **書いたものが同じ規格の lint で落ちないよう、余裕は書く側へ寄せた。**
+        `FILL_RATIO_MARGIN` = 0.01（`canvas::plan` の `round()` で最大 0.5px、
+        JPEG の縁のにじみと `--feather` のぶんを飲む）と
+        `BACKGROUND_DELTA_E_TOLERANCE` = 2.0（JPEG は 8x8 の量子化で純白を 255 の
+        まま揃えない。**CIE76 の ΔE 2.0 は kiri が独自に決めた数ではない**ことに
+        意味がある——規格の合否を分ける線に、根拠を辿れない数を置かない）。
+        占有率は**書く側とまったく同じ測り方**で出す（`max(bbox_w/W, bbox_h/H)`。
+        面積比にすると、正方形のキャンバスに正方形の商品を 0.86 で置いた画像が
+        0.74 と出て、余裕をいくら積んでも防げない形で落ちる）
+  - ※ **`kiri lint` は AVIF を先に判別する。** `load::load_with` は AVIF に対して
+        必ず `UNSUPPORTED_FORMAT` を返すので、そちらを先に呼ぶと「失敗したので
+        次を試す」という形になる。エラーを握り潰して次へ進む経路を作ると、
+        本当に壊れた JPEG まで AVIF の判定へ流れ、利用者が受け取るのは
+        「AVIF として辿れません」という的外れな文面になる
+  - ※ **統合テストは実装の定数を 1 つも書き写さない。** 素材の寸法も占有率も
+        上限バイト数も `kiri schema` が配る `profiles[]` から組む（下限 + 200px、
+        下限 + 0.03、√(上限 ÷ 4) + 100）。書き写すと、規格が改訂されたときに
+        **テストだけが古い世界を緑のまま語る**。素材も `tests/common` の
+        `product_image` ではなく矩形 1 つの `flat_product` を新設した——角丸・陰影・
+        ノイズを持つ素材では外接矩形が常に高さの 0.68 になり、`fill_ratio_min` 0.85 と
+        純白背景を同時に満たせないので、**「1 項目だけ外した画像」が作れない**
+  - ※ テスト名: `the_published_profiles_are_the_names_the_parser_accepts`
+        （受け入れ基準 (a)。`profiles[]` を `profile::ALL` と直に突き合わせると
+        同じ定数を左右に置くだけで何も守らないので、**表の形**——配った名前で
+        本当に呼べるか、名前が一意か、`revision` / `source` を名乗るか、`rules` の
+        各項目が約束した型で出ているか——を固定する。`accepts` は clap の候補
+        そのものなので、「候補として案内した名前が引けない」が起こりえない）/
+        `a_conforming_image_passes_every_check_of_its_profile`（(b) の前半。
+        3 プリセットすべてを回す）/ `breaking_one_rule_fails_exactly_that_check`
+        （(b) の後半。`longest_side` / `background` / `fill_ratio` / `alpha` /
+        `square` の 5 通りを、**落ちた `checks[].name` がちょうど 1 つ**であることで
+        固定する。透過は「背景の RGB は白のまま、アルファだけ 0」にする——黒で
+        埋めると背景の検査まで一緒に落ち、「1 項目だけ」でなくなる）/
+        `a_file_over_the_byte_budget_fails_only_the_size_check`（(b) の
+        `file_size`。単色の PNG は数 KB まで縮むので `noisy_image` が要る）/
+        `a_profile_that_regulates_no_composition_checks_none_of_it`
+        （**規定の無い項目は検査もしない。** 同じ画像が amazon では落ちることまで
+        見て、shopify が通したのが見落としでないことを言う）/
+        `an_avif_skips_the_pixel_checks_and_says_which`（(c)）/
+        `a_profile_without_pixel_rules_skips_nothing_in_an_avif`（(c) の裏。
+        飛ばした項目が無いときに警告が出ないことは、警告が `checks[]` から
+        数えられている証拠でもある）/
+        `an_explicit_option_beats_the_profile_and_actually_takes_effect`（(d)。
+        **警告が出ることだけを見ない**——押しのけた値が成果物に現れていることを
+        結果 JSON と `kiri lint` の実測から確かめる。警告だけを見ると「警告を
+        出しながら profile の値で書く」という最悪の形を通す）/
+        `the_output_extension_overrides_the_profile_format`（(d) の 4 通り目。
+        書いたファイルの先頭 8 バイトが PNG の署名であることまで見る——
+        `outputs[].format` が同じ嘘をついても気づけるようにするため）/
+        `a_profile_decides_nothing_outside_the_items_it_declares`
+        （**無害性の回帰。** `--profile` を渡した実行との単純な比較にはできない
+        ——profile は canvas を必ず決めるので、明示で打ち消そうにも「canvas を
+        指定しない」とは書けず、両者が同じバイト列になる指定は存在しない。
+        代わりに profile が触ると宣言した 6 項目を**全部明示した**実行を
+        profile あり / なしで走らせる。このとき profile は 1 つの値も決められない
+        ので、**成果物が 1 バイトでも違えば宣言の外へ手を伸ばしている**）/
+        `what_a_profile_writes_passes_the_same_profiles_lint_end_to_end`
+        （**書く側と検査する側が同じ規格を指していることの、唯一の実行による
+        保証。** `profile.rs` と `lint.rs` の単体テストは組み立てた `Facts` の上で
+        見るので、JPEG の量子化もキャンバス配置の丸めも 1 つも乗らない）/
+        `two_lint_runs_agree_byte_for_byte`（並びを含む決定性。**バイト列で
+        比べる**——`Value` へ読み直すと `Map` が綴りで並べ替える）/
+        `lint_writes_nothing_at_all`（`--dry-run` のような打ち消しが無いので、
+        書かないことそのものが契約）/
+        `a_spec_names_a_profile_and_inherits_it_from_the_defaults` /
+        `an_unknown_profile_in_a_spec_is_refused_with_a_code`（`rakuten` /
+        `Amazon` / 末尾空白 / 空。**近いから通すをしない**——`rakuten` は載せて
+        いないだけで実在する規格の名前である）/
+        `lint_separates_a_bad_request_from_a_bad_input`（`--profile` 無しと未知の
+        名前は exit 2 で stdout が空、読めない / 辿れないファイルは exit 3 で
+        `ErrorReport`。**入力が存在しなくても exit 3 にならない**ことが、引数の
+        検査が先に走っている証拠である）。
+        既存の契約テストは `the_readme_warning_table_lists_every_warning_in_the_contract`
+        （`PROFILE_OVERRIDDEN` / `PROFILE_UNCHECKABLE` の 2 行を README へ足した）と
+        `every_published_field_exists_in_the_result`（`--profile` を渡す実行と
+        `kiri lint` の実行が既に足されていた）が追随している
+
 ## 6. 残件の優先順位
 
 §5 の `[ ]` は 1 件だけになった（`※` は決定とその理由の記録であって作業では
@@ -1493,6 +1749,8 @@ Phase 22 が同じ exit code の語彙を使うので、その前に置く。
 対象」と書く。
 
 #### Phase 22: `--profile` ＋ `kiri lint`
+
+**済（§5 の Phase 22）。**
 
 **なぜここか。** profile の実体は「1600px の JPEG を白背景で、占有率 85%、1MB 以内」
 のような**複合指定の別名**であり、Phase 19 / 20 / 21 が揃って初めて片肺でなくなる。
@@ -1728,10 +1986,16 @@ batch spec には `profile` / `max_bytes` / `derive` / `naming` / `fail_on` /
   exit code の対応表（触れる / 触れない / 測れない の 3 通り）。(b) `--fail-on` 無指定
   なら exit code も結果 JSON も 1 つも変わらない。(c) batch で「1 件不合格 + 0 件失敗 → 5」
   「1 件失敗 + 1 件不合格 → 4」の優先順位
-- **Phase 22** — (a) `profiles[]` が実装の定数と一致する。(b) プリセットごとに
+- **Phase 22**（済。結果は §5 の Phase 22 に、テスト名はそちらへ並べた）。
+  (a) `profiles[]` が実装の定数と一致する。(b) プリセットごとに
   「合格する合成画像」と「1 項目だけ外した合成画像」で合否と `checks[].name` を固定。
   (c) AVIF の lint で画素検査が `skipped` になり `PROFILE_UNCHECKABLE` が出る。
-  (d) `--profile amazon --quality 60` で `PROFILE_OVERRIDDEN` が出て 60 が効く
+  (d) **profile が実際に求める項目**（`--format` / `--canvas` / `--fill-ratio` /
+  `--output` の拡張子）で `PROFILE_OVERRIDDEN` が出て、**明示した値が成果物に
+  現れる**。※ 当初は `--profile amazon --quality 60` と書いていたが、**これは
+  成立しない**——品質を定めているモール規格が無く、出典の無い数値を `Rules` に
+  入れない方針を採ったので、`write_defaults` は quality を一度も求めない
+  （求めていない値は押しのけようがない）
 - **Phase 23** — `auto` を適用した画像へもう一度 `info` を掛けると `level_rotation`
   が 0 に近い（許容 0.5 度）。セット統一は「同じ商品を 3 通りの距離で撮った合成
   セット → 出力上の商品高さが ±1px で揃う」「`set` 無しの結果が 1 バイトも

@@ -17,6 +17,7 @@ use crate::image_io::OutputFormat;
 use crate::image_io::derive::{DERIVE_KEYS, DeriveSpec};
 use crate::image_io::naming::DEFAULT_TEMPLATE;
 use crate::preview::DEFAULT_PANEL;
+use crate::profile::{self, ExplicitOptions, PROFILE_NAMES, Profile};
 use crate::segment::SegmentMode;
 use crate::transform::FitMode;
 use crate::transform::shadow::ShadowMode;
@@ -59,6 +60,15 @@ pub enum Command {
     Cutout(Box<CutoutArgs>),
     /// 仕様ファイルに従って複数の画像を一括処理する
     Batch(BatchArgs),
+
+    /// 既にある画像が --profile の規格を満たすか検査する
+    ///
+    /// **何も書かない。** 満たしていなければ終了コード 5 で、内訳は checks[] に
+    /// 出る（評価したものが全部、pass も）。書く側は cutout --profile が受け持つ
+    //
+    // **`Box` に入れない。** `Cutout` を箱に入れているのは他のサブコマンドの
+    // 4 倍という大きさのためで、`LintArgs` は 4 つしか持たない
+    Lint(LintArgs),
 
     /// セグメンテーションモデルの素性と置き場所を扱う
     ///
@@ -114,8 +124,102 @@ pub struct InfoArgs {
     pub color: ColorOpts,
 }
 
+/// `kiri lint` の引数。
+///
+/// **書き出しに関わる指定を 1 つも持たない。** lint は既にあるファイルを見る
+/// だけで、`--output` も `--dry-run` も意味を持たない。測り方に関わる指定
+/// （`--border` / `--no-color-convert`）だけを `info` と同じ綴りで受ける
+/// ——同じ画像について `info` が言う背景色と lint が照らす背景色は、
+/// 同じ指定で同じ数になっていなければならない。
+#[derive(Args, Debug)]
+pub struct LintArgs {
+    /// 検査する画像（JPEG / PNG / AVIF）
+    pub input: PathBuf,
+
+    /// 照らす規格。**必須**
+    ///
+    /// ヘルプの本文は `lint_profile_long_help` が表から組む
+    #[arg(
+        long,
+        required = true,
+        value_name = "NAME",
+        value_parser = profile_parser(),
+        long_help = lint_profile_long_help()
+    )]
+    pub profile: &'static Profile,
+
+    #[command(flatten)]
+    pub color: ColorOpts,
+
+    /// 背景色推定に使う外周の幅(px)。lint では**下限**として効く
+    ///
+    /// lint が背景と主体を測る帯は max(短辺/33, --border) から始まり、その帯が単色と言えるまで半分ずつ（1/4 まで）狭めた幅になる。既定の 2 は切り抜きのための値で、そこから取った色は cutout では閾値の種にしかならないが、lint では外周の中央値がそのまま合否になる——1600px の画像の外周 2px は縁の 0.125% しかなく、白い縁 1 本で「背景は純白」と答えてしまう。広げる向きには効き、狭める向きには効かない（狭める向きに効かせると、その穴を指定 1 つで開け直せてしまう）。
+    ///
+    /// 実際に使った幅は checks[].actual.border_px が名乗る。kiri info --border にその値を渡せば、lint が見たのと同じ背景色が出る。
+    #[arg(long, default_value_t = DEFAULT_BORDER)]
+    pub border: u32,
+}
+
+/// `kiri lint --profile` の長いヘルプ。
+///
+/// **`profile_long_help` を使い回さない。** あちらが言っているのは「何を書くか」
+/// で、ここが答えるのは「何を検査するか」である。同じ表を指しているが、
+/// 指定の前に知っておくべきことが違う——特に **AVIF では画素の検査が飛ぶ**こと
+/// は、lint を呼ぶ前に知らないと結果を読み違える。
+fn lint_profile_long_help() -> String {
+    let names: Vec<String> = profile::ALL
+        .iter()
+        .map(|p| format!("{}（{}、{}）", p.name, p.revision, p.summary))
+        .collect();
+    format!(
+        "照らす規格（必須）。指定できるのは {}。\n\
+         検査するのは規格が**規定している項目だけ**である。規定の無い項目は \
+         checks[] に出ない（shopify は構図を規定しないので background も \
+         fill_ratio も検査しない）。表そのもの（条件・出典の URL・版）は \
+         kiri schema の profiles[] が配る。\n\
+         **checks[] が全部 pass のときだけ合格である。** status は {} の 4 語で、\
+         pass 以外はどれも合格ではない——fail（条件に触れた）、\
+         unmeasurable（この画像では測れなかった）、skipped（この形式では\
+         構造的に測れない）。検査する項目の綴りは kiri schema の lint_checks[] が\
+         機械可読で配る。不合格なら終了コードは {} で、\
+         結果 JSON は通常どおり返る（検査した対象のファイルはそのまま）。\
+         code には {} が出る。\n\
+         **AVIF は画素を検査できない。** kiri は AVIF をデコードできないので、\
+         コンテナから読める寸法・形式・透過・色の名乗りまでで、background と \
+         fill_ratio は skipped になり {} が飛ばした項目を並べて出る。\
+         **黙って合格にはしない**——skipped があれば passed は false である。\n\
+         **背景色に完全一致は求めない。** JPEG の量子化とセンサーノイズで\
+         純白は 255 のまま揃わないので、ΔE76 {} 以内を同じ色として扱う\
+         （結果 JSON の checks[].expected.delta_e_max と同じ 1 つの値である）。\
+         測った RGB と ΔE、そして測定に使った外周の帯幅 border_px は \
+         checks[].actual がまとめて返す。**帯は --border そのものではなく \
+         max(短辺/33, --border) から単色と言えるまで半分ずつ（1/4 まで）\
+         狭めた幅**で、--border は下限として効く——1600px の\
+         画像の外周 2px は縁の 0.125% しかなく、そこだけを見た合否を\
+         「背景は純白だった」と名乗るわけにいかないためである。\
+         狭めるのは逆の誤りを塞ぐためで、占有率が 0.939 を超えると主体が\
+         その帯に入り、背景でない画素で背景の均一度を測ることになる。\n\
+         **単色と言えなかったときも rgb と delta_e は返す。** status が \
+         unmeasurable なので合格ではないが、白からどれだけ外れているかは\
+         素材をどうするかを決める材料である。\n\
+         **規格は変わる。** 版は kiri がその規格を写し取った時点であり、\
+         古い kiri が古い規格で合格を出すことは避けられない。\
+         profile.revision で鮮度を判断すること。",
+        names.join(" / "),
+        crate::commands::lint::CHECK_STATUSES.join(" / "),
+        crate::error::ErrorKind::Compliance.exit_code(),
+        crate::error::ErrorCode::ProfileViolation.as_str(),
+        crate::warning::WarningCode::ProfileUncheckable.as_str(),
+        // **結果 JSON と同じ綴りにする。** f64 の Display は 2.0 を "2" に
+        // 落とすので、そのまま埋めるとヘルプが「2」と言い、結果の
+        // expected.delta_e_max は 2.0 と出る——同じ 1 つの値を 2 通りに綴ると、
+        // 読み手はそれが同じ値なのかを確かめる術を持たない
+        serde_json::json!(profile::BACKGROUND_DELTA_E_TOLERANCE),
+    )
+}
+
 /// 入力の色の扱い。読み込みを伴うコマンドすべてで同じものを使う。
-#[derive(Args, Debug, Default)]
+#[derive(Args, Debug, Default, Clone)]
 pub struct ColorOpts {
     /// 埋め込み ICC を解釈せず、画素の値をそのまま使う
     ///
@@ -138,7 +242,7 @@ impl ColorOpts {
 /// **片方にしか無いと、`info` の助言と `cutout` の挙動が食い違う。**
 /// `info --segment isnet` が返す矩形はモデルが見たものなので、同じモデルを
 /// 使わない `cutout` に渡しても前提が揃わない。
-#[derive(Args, Debug, Default)]
+#[derive(Args, Debug, Default, Clone)]
 pub struct SegmentOpts {
     /// セグメンテーションモデルを粗マスクの供給源として使うか
     ///
@@ -221,7 +325,7 @@ fn shadow_long_help() -> String {
 }
 
 /// 出力に関する共通オプション。convert と resize で同じものを使う。
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 pub struct OutputOpts {
     /// 出力先。拡張子から形式を推論する
     #[arg(short, long)]
@@ -720,6 +824,89 @@ fn fail_on_long_help() -> String {
     )
 }
 
+/// `--profile` の長いヘルプ。名前の一覧も版も表から組む。
+///
+/// **AI エージェントは `--help` を読んで判断する**ので、「何を決める指定か」
+/// 「明示した値とどちらが勝つか」「これは書く側だけで、合否は別に見ること」の
+/// 3 つをここで言う。どれも指定の前に知っていないと、profile を渡した実行の
+/// 結果を読み違える。
+///
+/// 一覧を直書きしないのは `derive_long_help` と同じ理由である——表へ 1 つ
+/// 足したときにヘルプだけが古い一覧を語ると、それがそのまま誤った指定になる。
+fn profile_long_help() -> String {
+    let names: Vec<String> = profile::ALL
+        .iter()
+        .map(|p| format!("{}（{}、{}）", p.name, p.revision, p.summary))
+        .collect();
+    format!(
+        "規格の複合指定に名前を付けたもの（既定 off）。指定できるのは {}。\n\
+         profile が決めるのは --canvas / --fill-ratio / --format / --background / \
+         --flatten / --max-bytes の 6 つで、値は規格の表から計算する。\
+         表そのもの（条件・出典の URL・版）は kiri schema の profiles[] が配り、\
+         効いた profile は結果の settings.profile が名前と版で言う。\n\
+         **優先順位は「明示指定 > profile > 既定」の 1 本だけ**である。\
+         明示した項目は profile より強く、上書きが起きた項目ごとに {} が\
+         「profile が求めた値」と「実際に効いた値」を並べて出る\
+         （--profile {} --format png のように、規格の中で選び直すための形である）。\n\
+         **形式だけは --output の拡張子も明示指定として数える**ので、優先順位は\
+         「--format > --output の拡張子 > profile > 既定」の 4 段になる。\
+         -o out.png --profile {} が .png という名前のファイルに JPEG を書かないための\
+         決めで、拡張子と中身が食い違うファイルは outputs[].path が嘘をつくことになり、\
+         配信側も他のツールも拡張子で形式を判断する。profile の形式で書くなら\
+         拡張子をそちらへ揃えること（押しのけたことは同じ {} が言う）。\n\
+         **cutout にしかない。** profile は占有率（--fill-ratio と --canvas）を含む\
+         複合指定で、convert / resize / rotate には占有率を実現する手段が無い。\
+         半分だけ効く指定は「指定したのに効かない」を作るので、受け付けない。\n\
+         **これは書く側だけである。** 出来上がったファイルが規格を満たしているかは \
+         kiri lint が同じ表を見て答える。profile で書いたものが同じ profile の lint で\
+         落ちないよう、占有率は下限ちょうどではなく少しだけ余裕を取ってある。\n\
+         **規格は変わる。** 版は kiri がその規格を写し取った時点であり、\
+         古い kiri が古い規格で合格を出すことは避けられない。\
+         settings.profile.revision で鮮度を判断すること。",
+        names.join(" / "),
+        crate::warning::WarningCode::ProfileOverridden.as_str(),
+        PROFILE_NAMES[0],
+        PROFILE_NAMES[0],
+        crate::warning::WarningCode::ProfileOverridden.as_str(),
+    )
+}
+
+/// 利用者が明示した項目を clap の `ValueSource` から読む。
+///
+/// **`main.rs` には置かない。** 置くと binary の中に閉じて単体テストから
+/// 触れなくなり、**綴りを外しても誰も気づかない**——`value_source` は知らない
+/// id に対して `None` を返すだけなので、`fill_ratio` を `fill-ratio` と書いた
+/// 日から「明示しても profile が勝つ」が静かに始まる。引数の綴りを知って
+/// いるのはここ（`CutoutArgs` の定義がある場所）なので、読み取りもここに置く。
+///
+/// **`OutputOpts` は `#[command(flatten)]` なので同じ `ArgMatches` にいる。**
+/// `--format` などを親の `matches` から引くと、どの実行でも `None` になる。
+pub fn explicit_options(matches: &clap::ArgMatches) -> ExplicitOptions {
+    let said = |id: &str| matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine);
+    ExplicitOptions {
+        canvas: said("canvas"),
+        fill_ratio: said("fill_ratio"),
+        format: said("format"),
+        background: said("background"),
+        flatten: said("flatten"),
+        max_bytes: said("max_bytes"),
+        quality: said("quality"),
+    }
+}
+
+/// `--profile` の値を読む。**候補を clap に持たせる**ために
+/// `PossibleValuesParser` を通す。
+///
+/// 自前の `value_parser` にすると `kiri schema` の `accepts` が空になり、
+/// **綴りを外したときに code 無しの exit 2 で落ちる項目の候補を、呼ぶ前に知る
+/// 手段が無くなる**（`format_name_parser` とまったく同じ事情）。名前の表は
+/// `PROFILE_NAMES` が配るので、候補とここの解決が離れることはない。
+fn profile_parser() -> impl clap::builder::TypedValueParser<Value = &'static Profile> {
+    use clap::builder::TypedValueParser;
+    clap::builder::PossibleValuesParser::new(PROFILE_NAMES)
+        .map(|name| profile::named(&name).expect("候補は named が引ける綴りだけ"))
+}
+
 /// `--fail-on` を解く。
 ///
 /// **入力を 1 バイトも読む前に通る。** clap の `value_parser` なので、綴り違いは
@@ -977,7 +1164,7 @@ pub fn finite(s: &str) -> Result<f64, String> {
     Ok(v)
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 pub struct CutoutArgs {
     /// 入力画像（JPEG または PNG）
     pub input: PathBuf,
@@ -1209,6 +1396,35 @@ pub struct CutoutArgs {
     )]
     pub rotate: f64,
 
+    /// 規格の複合指定に名前を付けたもの（既定 off）。--canvas / --fill-ratio / --format / --background / --flatten / --max-bytes をまとめて決める
+    ///
+    /// ヘルプの本文は `profile_long_help` が表から組む。何を決めるかと
+    /// 明示指定との勝ち負けは、指定の前に知っていないと結果を読み違える。
+    ///
+    /// **`convert` / `resize` / `rotate` には足さない。** profile は占有率
+    /// （`--fill-ratio` と `--canvas`）を含む複合指定であり、それらのコマンドには
+    /// 占有率を実現する手段が無い。受け付けて 6 項目のうち 4 つだけを効かせると、
+    /// 「指定したのに効かない」が成果物を見るまで分からない形で残る——`cli.rs`
+    /// 全体が避けてきた失敗そのものなので、入口ごと持たせない
+    #[arg(
+        long,
+        value_name = "NAME",
+        value_parser = profile_parser(),
+        long_help = profile_long_help()
+    )]
+    pub profile: Option<&'static Profile>,
+
+    /// 利用者が明示した項目。**引数ではない**——`main.rs` が clap の
+    /// `ValueSource` を見て埋める。
+    ///
+    /// `fixed` とまったく同じ事情である。`--fill-ratio` は `default_value_t` を
+    /// 持つので、解いた後の値からは「0.85 を明示した」と「既定のまま」を
+    /// 区別できない。区別できなければ「明示 > profile」が成立しない——profile が
+    /// 求めた 0.86 を既定の 0.85 が常に上書きするか、明示した 0.85 が常に
+    /// 黙殺されるかのどちらかになる
+    #[arg(skip)]
+    pub explicit: ExplicitOptions,
+
     /// 切り抜いた商品を指定サイズのキャンバス中央に配置する
     ///
     /// 1000x1000 または 1000（正方形）の形式
@@ -1217,7 +1433,7 @@ pub struct CutoutArgs {
 
     /// 商品がキャンバスの何割を占めるか (0.0-1.0)。--canvas 指定時のみ有効
     ///
-    /// 既定の 0.85 は EC プラットフォームで広く求められる占有率に合わせている
+    /// 既定の 0.85 は kiri が選んだ値で、規格の主張ではない。規格が求める占有率は --profile の表が持ち、条件と出典は kiri schema の profiles[] が配る
     #[arg(long, default_value_t = 0.85)]
     pub fill_ratio: f64,
 
@@ -1711,5 +1927,88 @@ mod tests {
     fn verifies_the_cli_definition() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    /// `ExplicitOptions` の 1 項目ずつが、実際の引数列から拾えること。
+    ///
+    /// **引数の id を直接書いた表明にしない。** `value_source("fill-ratio")` は
+    /// 綴りを外しても誤りにならず、ただ `None` を返す——つまり「明示しても
+    /// profile が勝つ」が静かに始まる。**その綴りで clap を実際に通して、
+    /// 対応する 1 つだけが立つことを見る**のが、id の誤りを捕まえる唯一の形で
+    /// ある。`--flatten` を混ぜてあるのは、真偽のフラグでも `value_source` が
+    /// 同じように効くことを一緒に固定するためで、ここが落ちると `--flatten` を
+    /// 明示した実行が profile に黙って書き換えられる。
+    #[test]
+    fn every_explicit_option_is_detected_from_the_command_line() {
+        use clap::CommandFactory;
+        /// 引数列の断片と、それが立てるはずの 1 項目。
+        type Case = (&'static [&'static str], fn(&ExplicitOptions) -> bool);
+        let cases: [Case; 7] = [
+            (&["--canvas", "1000"], |e| e.canvas),
+            (&["--fill-ratio", "0.7"], |e| e.fill_ratio),
+            (&["--format", "png"], |e| e.format),
+            (&["--background", "#000000"], |e| e.background),
+            (&["--flatten"], |e| e.flatten),
+            (&["--max-bytes", "500k"], |e| e.max_bytes),
+            (&["--quality", "60"], |e| e.quality),
+        ];
+        for (extra, said) in cases {
+            let mut argv = vec!["kiri", "cutout", "a.jpg", "-o", "b.jpg"];
+            argv.extend_from_slice(extra);
+            let matches = Cli::command().get_matches_from(argv);
+            let explicit = explicit_options(matches.subcommand_matches("cutout").unwrap());
+            assert!(said(&explicit), "{extra:?} を明示として拾えていない");
+        }
+    }
+
+    /// 何も書かなければ 1 つも立たない。
+    ///
+    /// **既定値を明示と取り違えないこと**が「明示指定 > profile > 既定」の
+    /// 半分である。ここが崩れると、`--fill-ratio` の既定 0.85 が profile の
+    /// 求める値を毎回押しのけ、`--profile` を渡した実行で PROFILE_OVERRIDDEN が
+    /// 全項目に出る（そして profile は何も決められない）。
+    #[test]
+    fn a_default_run_says_nothing_was_explicit() {
+        use clap::CommandFactory;
+        let matches = Cli::command().get_matches_from(["kiri", "cutout", "a.jpg", "-o", "b.jpg"]);
+        let explicit = explicit_options(matches.subcommand_matches("cutout").unwrap());
+        assert_eq!(explicit, ExplicitOptions::default());
+    }
+
+    /// `--profile` は名前を表の行そのものへ解く。
+    ///
+    /// 綴りを外した指定は clap が候補を添えて断る（code 無しの exit 2）。
+    /// spec 経由だけが `UNKNOWN_PROFILE` を名乗るという `error.rs` の宣言と、
+    /// CLI 側の実際の振る舞いをここで突き合わせる。
+    #[test]
+    fn a_profile_name_resolves_to_the_row_in_the_table() {
+        use clap::CommandFactory;
+        let matches = Cli::command().get_matches_from([
+            "kiri",
+            "cutout",
+            "a.jpg",
+            "-o",
+            "b.jpg",
+            "--profile",
+            PROFILE_NAMES[0],
+        ]);
+        let sub = matches.subcommand_matches("cutout").unwrap();
+        let chosen = sub.get_one::<&'static Profile>("profile").unwrap();
+        assert_eq!(chosen.name, PROFILE_NAMES[0]);
+
+        assert!(
+            Cli::command()
+                .try_get_matches_from([
+                    "kiri",
+                    "cutout",
+                    "a.jpg",
+                    "-o",
+                    "b.jpg",
+                    "--profile",
+                    "rakuten"
+                ])
+                .is_err(),
+            "表に無い名前が通ってしまった"
+        );
     }
 }

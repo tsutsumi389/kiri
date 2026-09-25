@@ -209,7 +209,11 @@ pub struct Reserved<'a> {
 /// どれも無ければ「何も上書きしない 1 本」になる。最後の枝が Phase 19 までと
 /// 同じ道で、**`DeriveSpec::default()` は 1 つも値を持たない**ので、下流は
 /// すべて `OutputOpts` の値をそのまま継ぐ
-fn specs(opts: &OutputOpts) -> Vec<DeriveSpec> {
+///
+/// **`cutout::apply_profile` もこれを呼ぶ。** profile の許す形式の外へ出た
+/// 派生を数えるのに、直積の組み方を書き写した 2 つ目の並びを持たせない
+/// （`--sizes 2 つ × --formats 2 つ` が 4 本になることを 2 箇所で決めない）。
+pub(crate) fn specs(opts: &OutputOpts) -> Vec<DeriveSpec> {
     if !opts.derive.is_empty() {
         return opts.derive.clone();
     }

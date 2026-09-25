@@ -282,6 +282,7 @@ mod tests {
             rgb: [175, 171, 163],
             uniformity,
             samples: 100,
+            from_opaque: true,
             delta_e: DeltaEQuantiles {
                 p50,
                 p90: p50 * 2.0,

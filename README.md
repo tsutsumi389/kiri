@@ -17,7 +17,7 @@ AIエージェントから使われることを前提とした、EC商品画像�
 - **色で解けないものはモデルに聞ける** — 任意の `--segment` でセグメンテーションモデルを**粗マスクの供給源**として使う。既定では走らず、モデルは別ファイル。[意味の事前知識](#意味の事前知識モデルに何を聞くか)を参照
 - **設定の探索を kiri に任せられる** — `--optimize` は `info` → `cutout` → 調整という 3 手のループを 1 コマンドへ畳む。[探索を kiri に任せる](#探索を-kiri-に任せるoptimize)を参照
 - **仕上げまで 1 本で** — キャンバス配置、[落ち影の合成](#落ち影を合成する)（`--shadow synth`）、回転、Web配信形式への変換
-- **結果を自分で採点する** — `mask` が返す 7 項目（前景比率・ハロー・境界の色差・遷移幅・輪郭の粗さ・縁の汚染・外周接触）と、機械可読な 28 の警告
+- **結果を自分で採点する** — `mask` が返す 7 項目（前景比率・ハロー・境界の色差・遷移幅・輪郭の粗さ・縁の汚染・外周接触）と、機械可読な 33 の警告
 - **AIエージェント向けの構造化I/O** — `--json` で結果を返し、stdout はJSONのみ、ログは stderr に分離
 - **契約を自分で配る** — `kiri schema` がオプションと警告・エラー code の一覧を返す。README を読ませなくてよい
 - **書かずに試せる** — `--dry-run` は成果物を 1 バイトも変えずに、書いたときと同じ結果を返す
@@ -44,6 +44,8 @@ $ kiri schema --json
   "exit_codes": [{ "code": 0, "meaning": "成功" }, ...],
   "errors":   [{ "code": "OUTPUT_EXISTS",  "exit_code": 2, "summary": "出力先が既に存在する。--force が要る" }, ...],
   "warnings": [{ "code": "LOW_UNIFORMITY", "summary": "背景の均一度が低い（単色背景ではない）" }, ...],
+  "profiles":  [{ "name": "amazon", "revision": "2026-09", "rules": { ... } }, ...],
+  "lint_checks": [{ "name": "format", "needs_pixels": false }, ...],
   "global_options": [{ "name": "--json", "global": true, "takes_value": false, ... }],
   "commands": [
     {
@@ -73,6 +75,11 @@ $ kiri schema --json
 - `warnings[]` / `errors[]` は実装と同じ表から生成される。警告もエラーもそこへ足す以外に
   作る方法が無いので、**載っていない code が飛んでくることは構造的に起こらない**
 - `fields[]` は結果の値の読み方（しきい値と `null` の意味）。後述
+- `profiles[]` は `--profile` / `kiri lint` が見る規格の表（条件・出典・版）、
+  `lint_checks[]` は `kiri lint` が見る条件の一覧（`{name, needs_pixels}`）。
+  **`checks[].name` の綴りを散文から抜き直さずに済ませる**ためで、
+  `needs_pixels` が真の項目は AVIF では必ず `skipped` になる——渡す前に
+  どれが飛ぶかを予測できる
 - `accepts` は受け付ける値の一覧（`--format` なら avif / png / jpeg）。**綴りを外すと
   clap が code 無しの exit 2 で落ちる**ので、呼ぶ前に知れる必要がある。自由な値を取る
   項目ではキーごと消える。数値の範囲は clap から読めないため、必要なものは `summary`
@@ -613,6 +620,14 @@ $ kiri cutout product.jpg -o out/product.png \
 **省いたキーは `--format` / `--quality` / `--effort` / `--max-bytes` を継ぐ。**
 `format` を省いて `--format` も無ければ `--output` の拡張子から決まる。
 
+**`--profile` と併せて使うときは、派生が規格の外へ出る。** 派生は自分の `format` と
+`width` / `height` を持てるので、profile が決めた形式も寸法も迂回する
+（`--profile amazon --sizes 400` は amazon が求める長辺 500 を下回る 400x400 を
+書く）。迂回した派生ごとに `PROFILE_OVERRIDDEN` が 1 件出る——詳しくは
+[規格をプリセットで指定する](#規格をプリセットで指定するprofile)を参照。**`format` を書かなかった
+派生には `--output` の解決結果が、`width` も `height` も書かなかった派生には
+最終画像の寸法が継承される**ので、迂回しうるのは自分で書いた派生だけである。
+
 **同じキーを 2 回書いたら断る。** `width=100,width=250` を後勝ちで通すと、
 「書いたのに効かない」指定が 1 つだけ残ることになる（未知のキーは断っているのだから、
 ここだけ緩める理由が無い）。
@@ -941,6 +956,7 @@ product.png  1600x2000  png  841.4 KB  (338 ms)
 | `--optimize` | | `tolerance` / `bbox` / `background-model` の組を総当たりし、指標で選ぶ（[探索を kiri に任せる](#探索を-kiri-に任せるoptimize)） |
 | `--fail-on SPEC` | — | 指標がこの条件に触れたら **exit 5** で返す（[合否を exit code で返す](#合否を-exit-code-で返すfail-on)） |
 | `--rotate` | 0 | 切り抜いた**後に**時計回りへ回す角度(度)。負値は反時計回り。90 の倍数のみ無劣化（[切り抜いた後に回す](#切り抜いた後に回すrotate)） |
+| `--profile NAME` | — | モール規格のプリセット。`--canvas` / `--fill-ratio` / `--format` / `--background` / `--flatten` / `--max-bytes` をまとめて決める（[規格をプリセットで指定する](#規格をプリセットで指定するprofile)） |
 | `--canvas WxH` | — | 商品をこのサイズのキャンバス中央に配置する。`1000` と書けば正方形 |
 | `--fill-ratio` | 0.85 | 商品がキャンバスの何割を占めるか |
 | `--flatten` | | 透過を残さず `--background` の色で塗り潰す |
@@ -2359,6 +2375,8 @@ sRGB のまま比べると**ガンマぶんだけ暗い側へ偏る**（黒い�
 | `COLOR_CONVERSION_SKIPPED` | `--no-color-convert` により変換していない |
 | `COLOR_SPACE_UNCALIBRATED` | EXIF が uncalibrated で ICC も無い |
 | `MANIFEST_PARTIAL` | 一部の項目が失敗したまま `--manifest` を書いた（成功分だけが載っている） |
+| `PROFILE_OVERRIDDEN` | `--profile` が求めた値を明示指定が押しのけた（`--output` の拡張子と、`--derive` / `--sizes` / `--formats` が書いた形式・寸法を含む）。項目ごと・派生ごとに 1 件出る |
+| `PROFILE_UNCHECKABLE` | 画素を読まないと測れない項目を `kiri lint` が検査していない（AVIF）。飛ばした項目は `data.checks` にある |
 
 この表は `kiri schema --json` の `warnings[]` が同じものを返す。**README を読ませる
 代わりにそれを引けばよい。**
@@ -2474,6 +2492,145 @@ CONTOUR_ROUGH / RIM_CONTAMINATED
 **exit 5 でも結果 JSON は通常どおり全部返る。** 処理は成功していて成果物も
 書かれている——`outputs[]` も `mask` も `background` もそのままである。
 5 は「やり直せば直る失敗」（exit 4）ではなく、**人が見るべき結果**を指す。
+
+#### 規格をプリセットで指定する（`--profile`）
+
+モール規格は「1600px の JPEG を白背景で、占有率 85%」のような**複合指定**である。
+`--profile` はそれに名前を付けたもので、`--canvas` / `--fill-ratio` / `--format` /
+`--background` / `--flatten` / `--max-bytes` の 6 つをまとめて決める。
+
+```
+$ kiri cutout product.png -o out.jpg --profile amazon
+out.jpg  1600x1600  jpeg  74.4 KB  (671 ms)
+  背景色    #F9F9F7  (均一度 1.00, tolerance 12)
+  外周ΔE    p50 0.0  p90 0.0  max 0.0
+  外周勾配  p50 0.0  p90 0.0
+  前景比率  64.0%
+  境界色差  ΔE 77.7  (tolerance 12)
+  輪郭粗さ  0.01 px  (1000px 換算, 警告 0.16 超)
+  縁の汚染  0.0%  (警告 2.0% 超)
+  前景範囲  240,190 - 2159,1709
+  キャンバス 1600x1600  占有率 86%  配置 1376x1089 @ 112,255  (倍率 0.72)
+  主体候補  0.09,0.086,0.91,0.914  (面積 64.6%, 信頼度 high, colour 由来)
+  傾き      --rotate 0 で水平になる
+```
+
+| name | revision | 何を要求するか | 出典 |
+|---|---|---|---|
+| `amazon` | 2026-09 | 長辺 500〜10000px／純白背景（ΔE76 2.0 以内）／占有率 85% 以上／JPEG・PNG／透過なし／sRGB | [Amazon Seller Central](https://sellercentral.amazon.com/help/hub/reference/external/G1881) |
+| `shopify` | 2026-09 | 長辺 5000px 以下／25MP 以下／20MB 未満／PNG・JPEG（構図の規定なし） | [Shopify Help Center](https://help.shopify.com/en/manual/products/product-media/product-media-types) |
+| `square-white` | 2026-09 | 正方形／長辺 1000px 以上／純白背景／占有率 85% 以上／JPEG・PNG／透過なし／sRGB | kiri 自身の定義（モール規格ではない） |
+
+条件そのもの（数値・出典・版）は `kiri schema --json` の `profiles[]` が機械可読で
+配る。**この表を読ませる代わりにそれを引けばよい。**
+
+- **`revision` は kiri がその規格を写し取った時点である。** モール規格は変わるので、
+  古い kiri が古い規格で合格を出すことは避けられない。効いた profile は結果の
+  `settings.profile` が名前と版で言うので、**鮮度は呼び出し側が判断する**
+- **`shopify` は構図を規定しない。** 背景色も占有率も検査せず、書く側でも決めない
+  ——ストアの見せ方は出店者が決めるもので、kiri の好み（白背景・占有率 85%）を
+  規格の顔をして押し付けない。透過もそのまま残る
+- **書く側だけである。** 出来上がったファイルが規格を満たしているかは
+  [`kiri lint`](#kiri-lint) が同じ表を見て答える
+- **`cutout` にしかない。** profile は占有率（`--fill-ratio` と `--canvas`）を含む
+  複合指定で、`convert` / `resize` / `rotate` には占有率を実現する手段が無い。
+  半分だけ効く指定は「指定したのに効かない」を作る
+
+**優先順位は「明示指定 > profile > 既定」の 1 本だけ**である。明示した項目は
+profile より強く、押しのけが起きた項目ごとに `PROFILE_OVERRIDDEN` が
+「profile が求めた値」と「実際に効いた値」を並べて出す。
+
+```
+$ kiri cutout product.png -o out2.png --profile amazon
+out2.png  1600x1600  png  52.4 KB  (644 ms)
+  背景色    #F9F9F7  (均一度 1.00, tolerance 12)
+  ...
+  キャンバス 1600x1600  占有率 86%  配置 1376x1089 @ 112,255  (倍率 0.72)
+警告: --profile amazon は --format jpeg を求めましたが、出力先 out2.png の拡張子が示す png で書きます
+      profile の形式で書くなら出力先の拡張子を .jpeg にしてください（拡張子と中身が食い違うファイルを作らないため、拡張子は形式の明示指定として扱います）
+```
+
+**形式だけは `--output` の拡張子も明示指定として数える**ので、そこだけ
+「`--format` > `--output` の拡張子 > profile > 既定」の 4 段になる。優先順位に
+素直に従って profile が勝つと、`-o out.png --profile amazon` が **`.png` という
+名前のファイルに JPEG を書く**。拡張子と中身が食い違えば `outputs[].path` が
+嘘をつき、配信側も他のツールも拡張子で形式を判断するので、その嘘は kiri の外まで
+運ばれる。profile の形式で書くなら拡張子をそちらへ揃えること。
+
+`PROFILE_OVERRIDDEN` の `data` は spec の綴りで項目を名乗る。
+
+```json
+{ "code": "PROFILE_OVERRIDDEN",
+  "data": { "key": "format", "profile": "jpeg", "used": "png" } }
+```
+
+**同じ値に落ち着いた項目では黙っている。** この警告が答えているのは「profile を
+指定したのに効かなかった項目はどれか」であり、`-o out.png --profile shopify`
+（shopify は PNG を第一候補にする）のように同じ値なら、並べても読む側の次の一手は
+1 つも変わらない。
+
+**拡張子が未知の綴りなら、profile を付けても断る。** `-o out.xyz` は `--profile` の
+有無に関わらず `UNKNOWN_OUTPUT_FORMAT`（exit 2）である。ここで profile に形式を
+決めさせると、`--profile` を付けただけで `.xyz` という名前の JPEG が黙って書かれる
+——拡張子と中身を食い違わせないという上の判断を、同じ指定の別の綴りで破ることに
+なる。拡張子を**綴っていない**パス（`--naming` の雛形）では今までどおり profile が
+形式を決める。
+
+**`--derive` / `--formats` が書いた形式は、上の 4 段を 1 つも通らない。** 派生は
+自分の `format` を持てるので、`--profile amazon --derive 'format=avif'` は profile の
+形式指定を丸ごと迂回する。**そのまま黙って通すと、amazon で書いたものが同じ
+amazon の `kiri lint` で落ちる**ので、許容の外へ出た派生ごとに 1 件ずつ報せる。
+
+```json
+{ "code": "PROFILE_OVERRIDDEN",
+  "data": { "key": "format", "profile": ["jpeg", "png"], "used": "avif",
+            "derive": 0, "role": "hero" } }
+```
+
+パスはまだ綴れない（多派生の名前は最終画像の寸法が決まってから決まる）ので、
+`derive`（`outputs[]` と同じ並びの添字）と、書いてあれば `role` でどの出力かを指す。
+**`format` を書かなかった派生には profile の形式が継承される**——派生は
+`--output` の解決結果（`--format` > 拡張子 > profile）を継ぐので、迂回しうるのは
+形式を自分で書いた派生だけである。
+
+**寸法も同じように迂回する。** `--derive 'width=400'` / `--sizes 400` は
+`--canvas` も `--longest-side` も通らないので、`--profile amazon --sizes 400` は
+400x400 を書く——amazon は長辺 500 以上を求めるので、**その出力は同じ amazon の
+`kiri lint` で `longest_side` が fail になる**。形式の迂回と違って出力が実際に
+規格違反になるので、こちらは同じ形で派生ごとに 1 件ずつ報せる。
+
+```json
+{ "code": "PROFILE_OVERRIDDEN",
+  "data": { "key": "longest_side", "profile": { "min": 500, "max": 10000 },
+            "used": 400, "derive": 0 } }
+```
+
+照らすのは `longest_side_min` / `longest_side_max` / `max_pixels` の 3 つ
+（`key` はそれぞれ `longest_side` / `max_pixels`）で、**実際に書く寸法で照らす。**
+`width` だけを書いた派生が何 px になるかは最終画像の縦横比・`fit` ・
+`allow_upscale` で決まるので、指定した数をそのまま規格に当てると、縦長の素材で
+長辺 1200 になる実行にまで「規格の外です」と言うことになる。
+
+**`width` も `height` も書かなかった派生は対象外である**——その派生は最終画像を
+そのまま書き、最終画像の寸法は profile が `--canvas` / `--fill-ratio` /
+`--longest-side` を決めた結果なので、規格の寸法はそこから継承されている
+（`format` を書かなかった派生が `--output` の解決結果を継ぐのと同じ関係）。
+
+**`--profile` を渡さない実行は 1 バイトも変わらない。** 結果 JSON に
+`settings.profile` は現れず、成果物も profile を足す前と同じである
+（`optimize` / `compliance` と同じ規約）。
+
+##### 楽天と Yahoo! ショッピングを載せていない理由
+
+両社のガイドライン本文は**ログインの内側にあり、一次情報として読めない。**
+出典の無い数値を `kiri schema` が配ると、不合格の根拠を利用者が辿れない
+——「kiri がそう言うから」以上のことが言えない合否に、納品を止める重みは無い。
+`revision` を持つ設計なので、一次情報が手に入った時点で足せる。**推測で埋めて
+後から直す**のは、一度配った契約を引っ込めることになるので採らない。
+
+同じ理由で、`amazon` にはファイルサイズの上限が入っていない。二次情報では
+10MB と書かれていることが多いが、`source` の URL から辿れない。**規定なしとして
+検査もしない**——黙って通すのではなく、そもそも条件が無い。
 
 #### 「見切れ」と「bbox が要る」を取り違えないために
 
@@ -2762,6 +2919,209 @@ $ kiri batch spec.json --json
 全件の座標を AI が出す必要はない。単色背景では自動判定が成立するため、AI の仕事は
 「結果を見て、うまくいかなかった数枚を救済する」ことに絞られる。
 
+### kiri lint
+
+既にあるファイルが `--profile` の規格を満たすかを**検査する。書かない。**
+`cutout --profile` が「規格へ収めて書く」側で、こちらは「収まっているかを見る」側
+である。**表は 1 つ**（`kiri schema --json` の `profiles[]`）で、両側がそれを読む。
+
+```
+$ kiri lint product_amazon.jpg --profile amazon
+product_amazon.jpg
+  規格      amazon (2026-09)  合格
+  対象      jpeg 1600 x 1600  76182 バイト
+    o format        "jpeg"  (要求 ["jpeg","png"])
+    o longest_side  1600  (要求 {"max":10000,"min":500})
+    o alpha         false  (要求 false)
+    o color_space   {"color_converted":false,"color_named":true,"color_space":"sRGB","icc_profile":true}  (要求 "sRGB")
+    o background    {"border_px":48,"delta_e":0.0,"rgb":[255,255,255],"uniformity":1.0}  (要求 {"delta_e_max":2.0,"rgb":[255,255,255]})
+    o fill_ratio    {"bbox":[92,233,1507,1366],"source":"colour","value":0.885}  (要求 0.85)
+```
+
+`--profile` は**必須**である。既定の規格を置くと、`kiri lint out.jpg` が何の規格で
+答えたのかを結果から読み直すことになる。
+
+```json
+$ kiri lint product_amazon.jpg --profile amazon --json
+{
+  "schema_version": 2,
+  "input": "product_amazon.jpg",
+  "profile": {
+    "name": "amazon",
+    "revision": "2026-09"
+  },
+  "file_size": 76182,
+  "width": 1600,
+  "height": 1600,
+  "format": "jpeg",
+  "passed": true,
+  "code": null,
+  "checks": [
+    {
+      "name": "format",
+      "status": "pass",
+      "expected": [
+        "jpeg",
+        "png"
+      ],
+      "actual": "jpeg"
+    },
+    {
+      "name": "longest_side",
+      "status": "pass",
+      "expected": {
+        "max": 10000,
+        "min": 500
+      },
+      "actual": 1600
+    },
+    {
+      "name": "alpha",
+      "status": "pass",
+      "expected": false,
+      "actual": false
+    },
+    {
+      "name": "color_space",
+      "status": "pass",
+      "expected": "sRGB",
+      "actual": {
+        "color_converted": false,
+        "color_named": true,
+        "color_space": "sRGB",
+        "icc_profile": true
+      }
+    },
+    {
+      "name": "background",
+      "status": "pass",
+      "expected": {
+        "delta_e_max": 2.0,
+        "rgb": [
+          255,
+          255,
+          255
+        ]
+      },
+      "actual": {
+        "border_px": 48,
+        "delta_e": 0.0,
+        "rgb": [
+          255,
+          255,
+          255
+        ],
+        "uniformity": 1.0
+      }
+    },
+    {
+      "name": "fill_ratio",
+      "status": "pass",
+      "expected": 0.85,
+      "actual": {
+        "bbox": [
+          92,
+          233,
+          1507,
+          1366
+        ],
+        "source": "colour",
+        "value": 0.885
+      }
+    }
+  ],
+  "warnings": []
+}
+```
+
+- `checks[]` には**評価したものを全部載せる**（`pass` も）。落ちたものだけを
+  載せると、「見た上で通った」と「そもそも見ていない」が区別できない。
+  **並びは決定的**で、同じ入力を 2 回検査した結果はバイト列として一致する
+- **`name` は一意である**（`compliance.checks[]` とはそこが違う）
+- **規定の無い条件は 1 行も出さない。** `shopify` に `background` や `fill_ratio` の
+  行が無いのは取りこぼしではなく、その規格が構図を規定していないからである。
+  「どんな値でも合格」として `pass` で並べると、そのことが結果から読めなくなる
+- `expected` は規格が求めた値。**飛ばした項目でも返す**——検査できなかったことと、
+  何を求められていたかは別の事実である
+- **背景に完全一致は求めない。** JPEG は 8x8 のブロックごとに量子化するので、
+  純白で塗った面でも書き出した画素は 255 のまま揃わない。許容する色差は
+  `expected.delta_e_max` が一緒に配るので、読む側が自分で `!=` を書かずに済む
+- `fill_ratio` は**どう測ったか**を `actual.source` が名乗る。切り抜き済みの
+  成果物ではアルファの外接矩形（`alpha`）が、不透明な画像では色から見立てた主体
+  （`colour`）が正解になる
+- `background` は**どれだけの幅を見た数なのか**を `actual.border_px` が名乗る。
+  外周の中央値がそのまま合否になるので、帯は `--border` そのものではない。
+  `max(短辺/33, --border)`（1600px なら 48px）から始めて、**その帯が単色と
+  言えるまで半分ずつ狭め**、言えた最も広い帯で測る（狭められるのは
+  1/4 まで。1600px なら 48 → 24 → 12）。既定の `--border 2` は切り抜きの
+  ための値で、そこだけを見ると**白い縁 1 本で灰色一面の画像が「背景は純白」に
+  なる**。`--border` は下限として効き、広げる向きにだけ働く。
+  `kiri info --border <border_px>` を走らせれば、lint が見たのと同じ背景色が出る
+- **帯を狭めるのは、主体が帯に入ったときに背景でない画素で測らないためである。**
+  占有率が `1 - 2/33 ≒ 0.939` を超えると主体そのものが外周 48px に入る。どの
+  規格にも占有率の上限は無い（寄りのトリミングは合法）ので、`cutout --profile
+  amazon --fill-ratio 0.97` で書いた純白背景の画像はここを通る。占有率が
+  0.985 を超えて残る縁が短辺の 1/132 を切ると、狭める側の下限に当たって
+  `unmeasurable` になる——そこまで細い縁の中央値は背景を代表しない
+- **測れないものは `pass` と言わない。** 外周に不透明な画素が 1 つも無ければ
+  （透過 PNG）`background` は `unmeasurable` で `actual` は `null` になる
+  ——アルファ 0 の画素が持つ RGB は表示に使われない値なので、それを「測った
+  背景色」として配ると作り話になる。外周が単色として扱えないとき
+  （`uniformity` が 0.90 を切る）も `unmeasurable` だが、**そのときも `rgb` と
+  `delta_e` は返す**——「背景がベージュで、白から ΔE 33 外れている」は合否に
+  使わない数でも、素材を撮り直すかレタッチするかを決めるのはその数である
+  （`status` が合格でないことを言い切っているので、添えても嘘にはならない）
+- `color_space` は**ファイルが名乗っているか**を `actual.color_named` が言う。
+  ICC も EXIF ColorSpace も無いファイルは何も名乗っていないので `unmeasurable`
+  である（AVIF の CICP が `unspecified` のときとまったく同じ扱い）。`kiri info` が
+  同じファイルに `"sRGB"` と答えるのは「kiri がその画素を sRGB として扱った」と
+  いう別の事実で、**規格が問うているのはファイルの名乗りのほう**である
+
+`status` は 4 つ。**合格は `pass` だけである。**
+
+| status | 意味 | 次の一手 |
+|---|---|---|
+| `pass` | 見た上で規格を満たしている | — |
+| `fail` | 規格に触れている | その項目を直す |
+| `skipped` | **この形式では構造的に測れない**（AVIF の画素） | JPEG か PNG で渡し直す |
+| `unmeasurable` | 測ろうとしたが、この画像からは出なかった（主体が見つからない、外周に不透明な画素が 1 つも無い、背景が単色でない、色空間を何も名乗っていない） | 素材を見る。形式を変えても同じ結果になる |
+
+不合格なら **exit 5**、`code` は `PROFILE_VIOLATION`。処理そのものは成功していて
+検査対象のファイルもそのままあるので、**結果 JSON は `ErrorReport` に差し替わらない**
+（[exit code](#exit-code)）。引数の誤り（`--profile` の綴り違いや指定漏れ）は
+exit 2、読めない・辿れないファイルは exit 3 である。
+
+#### AVIF は画素まで見られない
+
+kiri は AVIF をデコードできない（dav1d は C のライブラリで、依存ゼロを崩す）。
+**コンテナから読める事実だけで判定し、画素を読まないと測れない項目は飛ばす。**
+
+```
+$ kiri lint product.avif --profile square-white
+product.avif
+  規格      square-white (2026-09)  不合格
+  対象      avif 1600 x 1600  1812 バイト
+    x format        "avif"  (要求 ["jpeg","png"])
+    o longest_side  1600  (要求 {"max":null,"min":1000})
+    o square        true  (要求 true)
+    o alpha         false  (要求 false)
+    o color_space   {"full_range":true,"matrix":6,"primaries":1,"source":"sequence_header","transfer":13}  (要求 "sRGB")
+    - background    skipped  (要求 {"delta_e_max":2.0,"rgb":[255,255,255]})
+    - fill_ratio    skipped  (要求 0.85)
+  code      PROFILE_VIOLATION
+警告: background / fill_ratio は画素を読まないと測れないため検査していません（kiri は avif をデコードできないので、コンテナから読める事実だけで判定しました）
+      飛ばした項目も合格ではないので passed は false です。構図まで見るなら JPEG か PNG を渡してください
+```
+
+**黙って合格にしない。** 飛ばした項目は `pass` ではないので `passed` は落ち、
+`PROFILE_UNCHECKABLE` がどれを飛ばしたかを `data.checks` に配列で入れる
+（文面から項目名を抜き直さずに済む）。寸法・透過・色の名乗りはコンテナから読める
+ので、そちらは AVIF でも普通に検査する——色は `colr` があればそれを、無ければ
+AV1 シーケンスヘッダの CICP を読む。
+
+**画素を要求しない規格なら、AVIF でも飛ばす項目は 1 つも無い。** `shopify` は寸法と
+バイト数と形式しか規定していないので、`PROFILE_UNCHECKABLE` も出ない。
+
 ### kiri model
 
 セグメンテーションモデルの素性と置き場所を返す。**kiri はネットワークを触らない**
@@ -2857,10 +3217,13 @@ sRGB へ変換するので、そこで色が転ぶことはない。
 この表の文言は `kiri schema --json` の `exit_codes[]` が同じものを返す。
 
 **5 は「0 以外は失敗」と読んでいる呼び出し側にとって新しい意味である。**
-5 が出るのは `--fail-on` を渡した実行だけで、4 が「やり直せば直る失敗」
-（成果物が無い）なのに対し、5 は処理が通って成果物も
+5 が出るのは `--fail-on` を渡した実行と `kiri lint` の 2 つだけで、
+4 が「やり直せば直る失敗」（成果物が無い）なのに対し、5 は処理が通って成果物も
 書かれた結果が規格に達しなかったことを言う。`ErrorReport` には差し替わらないので、
-`outputs[]` も `mask` も通常どおり読める（[合否を exit code で返す](#合否を-exit-code-で返すfail-on)）。
+`outputs[]` も `mask` も、`kiri lint` なら `checks[]` も通常どおり読める。
+**名乗る code は出どころで違う**——`--fail-on` は結果 JSON の
+`compliance.code` に `QUALITY_GATE_FAILED`（[合否を exit code で返す](#合否を-exit-code-で返すfail-on)）、
+`kiri lint` は `LintReport.code` に `PROFILE_VIOLATION`（[kiri lint](#kiri-lint)）を置く。
 
 `--json` 指定時はエラーも JSON で stdout に返る。**code と exit code の対応は
 `kiri schema --json` の `errors[]` が返す。**

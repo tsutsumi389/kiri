@@ -7,6 +7,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use serde_json::{Value, json};
+
 use crate::cli::{CutoutArgs, Polygon};
 use crate::commands::output::{self, round4};
 use crate::commands::segment;
@@ -20,9 +22,11 @@ use crate::cutout::{
 use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::{IccPolicy, LoadOptions, OutputFormat, SaveOptions, load, save};
 use crate::preview::{PreviewSpec, contact_sheet};
+use crate::profile;
 use crate::report::{
     CanvasReport, ConstraintsReport, CutoutReport, Dimensions, MaskReport, OptimizeCandidate,
-    OptimizeReport, OptimizeScore, RotateReport, SCHEMA_VERSION, SettingsReport, ShadowReport,
+    OptimizeReport, OptimizeScore, ProfileRef, RotateReport, SCHEMA_VERSION, SettingsReport,
+    ShadowReport,
 };
 use crate::transform::canvas::{CanvasSpec, apply as canvas_apply, composite, plan as canvas_plan};
 use crate::transform::rotate::{self, RotateSpec};
@@ -31,6 +35,17 @@ use crate::warning::{Warning, WarningCode};
 
 pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     let started = Instant::now();
+    // **profile はここで当てる。** 設定が確定する場所が 1 つしかないのが
+    // 要点で、CLI と spec のどちらから来た指定も同じ 1 行を通る。`parse()` や
+    // `to_cutout_args` の側で当てると、上書きの事実（`PROFILE_OVERRIDDEN`）を
+    // 結果 JSON の `warnings[]` へ運ぶ道が無くなる——警告を運ぶためだけに
+    // `CutoutArgs` へ袋を足すことになり、「引数ではないもの」が 2 つ目になる
+    let mut profile_warnings = Vec::new();
+    let profiled = apply_profile(args, &mut profile_warnings);
+    // **profile を渡さない実行では複製すら起きない。** `apply_profile` が
+    // `None` を返すので、以降は受け取った `args` をそのまま読む
+    let args: &CutoutArgs = profiled.as_ref().unwrap_or(args);
+
     let format = output::resolve_format(&args.out)?;
     let overwrite_warning = output::ensure_writable(&args.out)?;
     let manifest_warning = output::ensure_manifest_writable(
@@ -124,7 +139,13 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     };
     let bbox = opts.bbox;
 
-    let mut warnings = loaded.warnings();
+    // **指定がどう解釈されたかを最初に言う。** 以降に並ぶ警告はすべて
+    // 「その設定で切り抜いた結果」についてのもので、どの設定が効いたのかを
+    // 知らずに読むと、数値の読み方そのものが変わる（指示についての警告を
+    // 結果の警告より先に出しているのと同じ理由で、profile はそれより更に前
+    // ——指示の値そのものを決めた側である）
+    let mut warnings = profile_warnings;
+    warnings.extend(loaded.warnings());
     warnings.extend(overwrite_warning);
     warnings.extend(manifest_warning);
     // 指示についての警告は結果の警告より先に出す。渡したものがそのまま
@@ -207,6 +228,17 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         if let Some(path) = path {
             reserved.push(output::Reserved { path, flag });
         }
+    }
+    // **派生の寸法を照らせるのはここが最初である。** 形式と違って、派生が
+    // 実際に何 px になるかは最終画像の縦横比が決まるまで 1 つに定まらない
+    // （`derivation_size_warnings` の doc）。書き出しの前に出すので、文面は
+    // 形式の警告と同じ「で書きます」のままでよい
+    if let Some(profile) = args.profile {
+        warnings.extend(derivation_size_warnings(
+            profile,
+            &args.out,
+            final_image.dimensions(),
+        ));
     }
     let (output_reports, save_warnings) =
         output::write_images(final_image, &loaded, &args.out, &output_plan, &reserved)?;
@@ -318,6 +350,14 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             // 指定値。`auto` が走らせたかどうかは次の行が言う
             segment: decision.mode.as_str(),
             segment_ran: decision.ran(),
+            // **指定値である。** profile が実際に何を決めたかは、同じ
+            // settings の他の項目と canvas ブロックが効いた値として語る。
+            // 条件そのもの（長辺・背景・占有率と出典）は載せない——同じ表が
+            // 結果の数だけ複製されるので、表は kiri schema が 1 度だけ配る
+            profile: args.profile.map(|p| ProfileRef {
+                name: p.name,
+                revision: p.revision,
+            }),
         },
         applied_bbox: bbox.map(|(x1, y1, x2, y2)| [x1, y1, x2, y2]),
         constraints: opts.constraints.as_ref().map(constraints_report),
@@ -334,6 +374,515 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         elapsed_ms: started.elapsed().as_millis(),
         warnings,
     })
+}
+
+/// profile の値を設定へ当てる。**優先順位は「明示指定 > profile > 既定」の 1 本。**
+///
+/// 返すのは当て終えた `CutoutArgs` で、`--profile` を渡していなければ `None`
+/// ——そのときは複製も起きず、結果 JSON も 1 バイト変わらない。
+///
+/// **当てるのは `write_defaults` が返した項目だけである。** 何を書くかは
+/// `profile::Rules` が唯一の定義で、ここは写し取るだけ——この関数に
+/// 「amazon なら 1600」のような数が 1 つでも現れたら、表が 2 つになっている。
+///
+/// **上書きは項目ごとに 1 件ずつ報せる。** まとめて 1 件にすると、どの指定が
+/// profile を押しのけたのかを `message` の散文から抜き直すことになる。
+fn apply_profile(args: &CutoutArgs, warnings: &mut Vec<Warning>) -> Option<CutoutArgs> {
+    let profile = args.profile?;
+    let want = profile.write_defaults();
+    let explicit = args.explicit;
+    let mut out = args.clone();
+
+    if let Some((cw, ch)) = want.canvas {
+        if explicit.canvas {
+            let used = args.canvas.map_or(Value::Null, |(w, h)| json!([w, h]));
+            warnings.extend(overridden(
+                profile,
+                "canvas",
+                "--canvas",
+                json!([cw, ch]),
+                used,
+            ));
+        } else {
+            out.canvas = Some((cw, ch));
+        }
+    }
+
+    if let Some(ratio) = want.fill_ratio {
+        if explicit.fill_ratio {
+            warnings.extend(overridden(
+                profile,
+                "fill_ratio",
+                "--fill-ratio",
+                json!(round4(ratio)),
+                json!(round4(args.fill_ratio)),
+            ));
+        } else {
+            out.fill_ratio = ratio;
+        }
+    }
+
+    // **出力先の拡張子は「形式の明示指定」として扱う。** 優先順位は
+    // `--format` > `--output` の拡張子 > profile > 既定 の 4 段になる。
+    //
+    // 拡張子を「未指定なら」の推論（＝既定の振る舞い）と読むと、優先順位の
+    // 1 本に素直に従って profile が勝ち、`-o out.png --profile amazon` が
+    // **`.png` という名前のファイルに JPEG を書く**。拡張子と中身が食い違う
+    // ファイルは `outputs[].path` が嘘をつくことになり、配信側も他のツールも
+    // 拡張子で形式を判断するので、その嘘は kiri の外まで運ばれる。
+    // **綴った名前のほうが profile より具体的な指示である**と読むのが、
+    // 「指定したのに効かない」を作らないという `cli.rs` 全体の姿勢に合う。
+    //
+    // profile の形式で書きたいなら拡張子をそちらに揃える。押しのけたことは
+    // `--format` で押しのけたときとまったく同じ `PROFILE_OVERRIDDEN` で言う
+    // ——「profile が求めた値」と「実際に効いた値」が要るという理由は、
+    // どちらが押しのけたかで 1 つも変わらない
+    if let Some(wanted) = want.format {
+        let by_flag = explicit.format.then_some(args.out.format).flatten();
+        match (by_flag, OutputFormat::from_path(&args.out.output)) {
+            (Some(used), _) => warnings.extend(overridden(
+                profile,
+                "format",
+                "--format",
+                json!(wanted.as_str()),
+                json!(used.as_str()),
+            )),
+            (None, Some(used)) => warnings.extend(overridden_by_extension(
+                profile,
+                &args.out.output,
+                wanted,
+                used,
+            )),
+            // 拡張子を綴っていない（`--naming` の雛形など）。
+            // ここで初めて profile が形式を決める
+            (None, None) if !spells_an_extension(&args.out.output) => out.out.format = Some(wanted),
+            // **拡張子はあるが kiri の知らない綴りである。** ここで profile に
+            // 決めさせると、`-o out.xyz --profile amazon` が `.xyz` という
+            // 名前の JPEG を黙って書く——`--profile` を付けたかどうかだけで
+            // `UNKNOWN_OUTPUT_FORMAT` が消えることになり、すぐ上のコメントが
+            // 宣言している「拡張子と中身が食い違うファイルを作らない」を
+            // 同じ if 式の最後の枝が破る。
+            //
+            // 何もせずに抜けると `out.out.format` は `None` のままなので、
+            // `output::resolve_format` が profile の有無に関わらず同じ
+            // `UNKNOWN_OUTPUT_FORMAT` で断る。**断る場所を増やさない**のは、
+            // 同じ失敗の文面と code を 2 箇所で綴らないためである
+            (None, None) => {}
+        }
+    }
+
+    if let Some(color) = want.background {
+        if explicit.background {
+            warnings.extend(overridden(
+                profile,
+                "background",
+                "--background",
+                json!(color),
+                json!(args.out.background),
+            ));
+        } else {
+            out.out.background = color;
+        }
+    }
+
+    // `--flatten` は CLI では真偽のフラグなので、コマンドラインから明示できる
+    // のは真だけである（`--flatten false` とは書けない）。**spec は偽も書ける**
+    // ——`ItemSettings.flatten` は `Option<bool>` なので、
+    // `{"profile":"amazon","flatten":false}` は「偽を明示した」として届き、
+    // profile が求める真を押しのけて `PROFILE_OVERRIDDEN {key: flatten}` が
+    // 実際に出る。**明示を黙って無視する枝を 1 つも作らない**という規約が、
+    // ここでは spec 経由で現に効いている
+    if let Some(flatten) = want.flatten {
+        if explicit.flatten {
+            warnings.extend(overridden(
+                profile,
+                "flatten",
+                "--flatten",
+                json!(flatten),
+                json!(args.out.flatten),
+            ));
+        } else {
+            out.out.flatten = flatten;
+        }
+    }
+
+    // **派生が自分で書いた形式は、上の 3 段（`--format` > 拡張子 > profile）を
+    // 1 つも通らない。** 通らないものを黙って通すと、`--profile amazon` で
+    // 書いた AVIF が同じ amazon の `kiri lint` で落ちる。押しのけたことを
+    // 派生ごとに名乗らせる理由は `derivation_overridden` の doc に書いた。
+    //
+    // **`formats` が空（＝形式の規定なし）の規格では 1 件も出ない。** 規定が
+    // 無いものを上書きと呼ぶと、`PROFILE_OVERRIDDEN` が「profile を指定した
+    // のに効かなかった項目」以外を語り始める
+    if !profile.rules.formats.is_empty() {
+        for (index, spec) in output::specs(&args.out).iter().enumerate() {
+            match spec.format {
+                Some(used) if !profile.rules.formats.contains(&used) => warnings.push(
+                    derivation_overridden(profile, index, spec.role.as_deref(), used),
+                ),
+                // 形式を書かなかった派生は `--output` の解決結果を継ぐので、
+                // profile の形式はそこから届く（`derivation_overridden` の doc）
+                _ => {}
+            }
+        }
+    }
+
+    if let Some(bytes) = want.max_bytes {
+        if explicit.max_bytes {
+            let used = args.out.max_bytes.map_or(Value::Null, Value::from);
+            warnings.extend(overridden(
+                profile,
+                "max_bytes",
+                "--max-bytes",
+                json!(bytes),
+                used,
+            ));
+        } else {
+            out.out.max_bytes = Some(bytes);
+        }
+    }
+
+    Some(out)
+}
+
+/// 出力先が**拡張子を綴っているか**。
+///
+/// **`OutputFormat::from_path` の `None` は 2 つの意味を持つ。** 「拡張子が
+/// 無い」（`--naming` の雛形や、これから綴る名前）と「拡張子はあるが kiri の
+/// 知らない綴り」で、前者は profile が形式を決めてよく、後者は誰が決めても
+/// 拡張子と中身が食い違う。`from_path` の戻り値だけを見ていると 2 つが同じ形に
+/// なるので、ここで割る。
+///
+/// UTF-8 でない拡張子も「綴っている」側に数える。kiri は形式として読めないが、
+/// 綴られている以上それは名前の一部であり、**断る向きが安全側**である。
+fn spells_an_extension(path: &Path) -> bool {
+    path.extension().is_some()
+}
+
+/// 派生が profile の許す形式の外へ出たことを報せる。
+///
+/// # なぜ派生ごとに 1 件出すか
+///
+/// `--derive 'format=avif'` や `--formats` は `--output` の拡張子も `--format`
+/// も通らないので、**profile の形式指定を丸ごと迂回する**。黙って通すと
+/// `--profile amazon` で書いたものが同じ amazon の `kiri lint` で落ちる——
+/// `FILL_RATIO_MARGIN` の doc が「最も高くつく失敗」と名指ししているものである。
+/// まとめて 1 件にすると、どの出力が規格の外なのかを散文から抜き直すことになる
+/// （`apply_profile` が項目ごとに 1 件出すのと同じ理由）。
+///
+/// # どの出力の話かを名乗る
+///
+/// **パスはまだ綴れない。** 多派生のパスは最終画像の寸法が決まってから
+/// `output::resolve` が決める（`{width}` を含む雛形があるため）ので、ここでは
+/// `derive`（`specs()` の並びの添字＝ `outputs[]` の並びの添字）と、書いて
+/// あれば `role`（`outputs[].role` と同じ文字列）で指す。書き出した後の
+/// 警告が `data.output` でパスを名乗るのと役目は同じで、指せるものが違うだけ
+/// である。
+///
+/// # 形式を書かなかった派生
+///
+/// `output::resolve` は `spec.format.unwrap_or(plan.format)` で継ぐ。
+/// `plan.format` は `--format` > `--output` の拡張子 > profile の順に解決した
+/// 1 つなので、**profile の形式はそこから派生へ届く**。つまり迂回しうるのは
+/// 形式を自分で書いた派生だけで、ここが見るのもそれだけでよい。
+fn derivation_overridden(
+    profile: &profile::Profile,
+    index: usize,
+    role: Option<&str>,
+    used: OutputFormat,
+) -> Warning {
+    let allowed: Vec<&str> = profile.rules.formats.iter().map(|f| f.as_str()).collect();
+    let warning = Warning::new(
+        WarningCode::ProfileOverridden,
+        format!(
+            "--profile {} が許すのは {} ですが、{} {} で書きます",
+            profile.name,
+            allowed.join(" / "),
+            which_derivation(index, role),
+            used.as_str()
+        ),
+    )
+    .with_hint(format!(
+        "この出力は同じ --profile {} の kiri lint で format が fail になります。\
+         規格の内側で書くなら派生の format を外すか {} のどれかにしてください",
+        profile.name,
+        allowed.join(" / ")
+    ))
+    .with_data("key", "format")
+    // **求めた値は許容の並びそのものである。** 第一候補 1 つを出すと
+    // 「png でも通る」ことが結果から読めなくなる
+    .with_data("profile", json!(allowed))
+    .with_data("used", used.as_str())
+    .with_data("derive", index);
+    tag_derivation(warning, role)
+}
+
+/// 文面の中でその派生を指す語。**係助詞まで含めて返す。**
+///
+/// 役目を書いた派生では `（role thumb）` が付くので、呼ぶ側が
+/// `「{} は」` と綴ると全角の `）` の後に半角スペースが 1 つ残る
+/// （`派生 1（role thumb） は avif で書きます`）。**配る文面に
+/// 連続スペースや浮いたスペースを入れない**という規約なので、区切りの
+/// 有無をここで吸収する——呼ぶ側は `{}` の後に半角スペースを 1 つ置いて
+/// 次の語を続ければ、どちらの形でも正しい間隔になる。
+fn which_derivation(index: usize, role: Option<&str>) -> String {
+    match role {
+        Some(role) => format!("派生 {index}（role {role}）は"),
+        None => format!("派生 {index} は"),
+    }
+}
+
+/// 派生を指す警告に `role` を添える。**役目を書いていない派生には足さない。**
+///
+/// 派生を必ず指せるのは `data.derive`（並びの添字）で、`role` はそれを人が
+/// 読めるようにする添え物である。**形式の警告と寸法の警告で同じ足し方をする**
+/// ——片方だけが `role` を落とすと、受け手は警告の `key` ごとに別の当て方を
+/// 書かされる。
+fn tag_derivation(warning: Warning, role: Option<&str>) -> Warning {
+    match role {
+        Some(role) => warning.with_data("role", role),
+        None => warning,
+    }
+}
+
+/// 派生が profile の**寸法**の外へ出たことを報せる。
+///
+/// # なぜ形式と同じ場所で出さないか
+///
+/// 形式は最終画像の寸法を 1 つも見ないので `apply_profile`（設定が確定する
+/// 場所）で決まる。**寸法はそうはいかない**——`--derive 'width=800'` が
+/// 実際に何 px になるかは、元の縦横比・`fit`・`allow_upscale` で決まるので、
+/// 最終画像ができるまで 1 つに定まらない。`--sizes 400` を「長辺 400」と
+/// 決めつけて報せると、縦長の素材で長辺が 1200 になる実行にまで
+/// 「規格の外です」と言うことになる——**測っていないものを測ったと言わない。**
+///
+/// そこで書き出しの直前に `resize::plan`（`output::resolve` と `render` が
+/// 使うのと同じ純関数）で出力寸法を出してから照らす。同じ関数を通すので、
+/// ここが言う寸法と `outputs[].width` / `height` が食い違うことはない。
+///
+/// # 寸法を書かなかった派生
+///
+/// `DeriveSpec::resize()` が `None` を返す派生（`width` も `height` も無い）は
+/// **最終画像をそのまま書く**。最終画像は `--canvas` / `--fill-ratio` /
+/// `--longest-side` を profile が決めた結果なので、規格の寸法はそこから
+/// 届いている——形式を書かなかった派生が `--output` の解決結果を継ぐのと
+/// まったく同じ関係である。だからここは見ない。
+///
+/// # 何を照らすか
+///
+/// `longest_side_min` / `longest_side_max` / `max_pixels` の 3 つで、これは
+/// `Rules` のうち**寸法だけで決まる条件のすべて**である（`square` は
+/// `Check::Square` が見るが、縦横比を変える派生は `fit exact` だけで、
+/// `--derive` はそれを受け付けない）。`lint` が見る条件を 2 箇所で数え直す
+/// ことになるが、照らす値そのものは `Rules` の 1 つの表から読む。
+fn derivation_size_warnings(
+    profile: &profile::Profile,
+    opts: &crate::cli::OutputOpts,
+    source: (u32, u32),
+) -> Vec<Warning> {
+    let rules = &profile.rules;
+    let mut out = Vec::new();
+    for (index, spec) in output::specs(opts).iter().enumerate() {
+        let Some(resize) = spec.resize() else {
+            continue;
+        };
+        // **断られる指定はここでは黙る。** `--allow-upscale` を付けずに
+        // 拡大を求めた派生は `output::resolve` が同じ `plan` で断るので、
+        // ここが先に「規格の外です」と言うと、実際には 1 枚も書かれない
+        // 出力について警告だけが残る
+        let Ok(plan) = crate::transform::resize::plan(source, &resize) else {
+            continue;
+        };
+        let (w, h) = plan.output;
+        let long = u64::from(w.max(h));
+        let pixels = u64::from(w) * u64::from(h);
+        let size = format!("{w}x{h}");
+
+        let below = rules
+            .longest_side_min
+            .is_some_and(|min| long < u64::from(min));
+        let above = rules
+            .longest_side_max
+            .is_some_and(|max| long > u64::from(max));
+        if below || above {
+            out.push(derivation_size_overridden(
+                profile,
+                index,
+                spec.role.as_deref(),
+                "longest_side",
+                json!({ "min": rules.longest_side_min, "max": rules.longest_side_max }),
+                json!(long),
+                &spell_longest_side(rules.longest_side_min, rules.longest_side_max),
+                &format!("{size}（長辺 {long}）"),
+            ));
+        }
+        if rules.max_pixels.is_some_and(|max| pixels > max) {
+            out.push(derivation_size_overridden(
+                profile,
+                index,
+                spec.role.as_deref(),
+                "max_pixels",
+                json!(rules.max_pixels),
+                json!(pixels),
+                &format!("総画素数 {} 以下", rules.max_pixels.unwrap_or_default()),
+                &format!("{size}（{pixels} 画素）"),
+            ));
+        }
+    }
+    out
+}
+
+/// 長辺の規定を人が読む 1 つの語にする。**片方しか無い規格でもそう名乗る。**
+///
+/// `500〜10000 の範囲` と `5000 以下` を同じ形へ畳むと、上限だけの規格
+/// （shopify）に下限があるように読める。**語尾は必ず日本語で終える**
+/// ——呼ぶ側が `{demand}ですが` と続けるので、`10000` で終わると
+/// 数字と仮名が地続きになる。
+fn spell_longest_side(min: Option<u32>, max: Option<u32>) -> String {
+    match (min, max) {
+        (Some(min), Some(max)) => format!("長辺 {min}〜{max} の範囲"),
+        (Some(min), None) => format!("長辺 {min} 以上"),
+        (None, Some(max)) => format!("長辺 {max} 以下"),
+        // 規定が無ければ呼ばれない（`below` も `above` も偽になる）
+        (None, None) => String::new(),
+    }
+}
+
+/// 寸法の `PROFILE_OVERRIDDEN` を 1 件組む。
+///
+/// **`data` の形は形式の警告と同じ**（`key` / `profile` / `used` / `derive` /
+/// `role`）にする。受け手が答えたいのは「profile を指定したのに効かなかった
+/// 項目はどれか」で、効かなかったのが形式か寸法かで拾い方を変える理由が無い。
+#[expect(clippy::too_many_arguments, reason = "文面と data を 1 箇所で組むため")]
+fn derivation_size_overridden(
+    profile: &profile::Profile,
+    index: usize,
+    role: Option<&str>,
+    key: &'static str,
+    wanted: Value,
+    used: Value,
+    demand: &str,
+    written: &str,
+) -> Warning {
+    let warning = Warning::new(
+        WarningCode::ProfileOverridden,
+        format!(
+            "--profile {} が求めるのは{demand}ですが、{} {written}で書きます",
+            profile.name,
+            which_derivation(index, role),
+        ),
+    )
+    .with_hint(format!(
+        "この出力は同じ --profile {} の kiri lint で {key} が fail になります。\
+         規格の内側で書くなら派生の width / height を{demand}に収まる値にしてください",
+        profile.name,
+    ))
+    .with_data("key", key)
+    .with_data("profile", wanted)
+    .with_data("used", used)
+    .with_data("derive", index);
+    tag_derivation(warning, role)
+}
+
+/// 明示指定が profile の値を押しのけたことを報せる。
+///
+/// **同じ値なら黙っている。** この警告が答えているのは「profile を指定したのに
+/// 効かなかった項目はどれか」であり、同じ値に落ち着いた項目について
+/// `profile` と `used` に同じ数を並べても、読む側の次の一手は 1 つも変わらない。
+///
+/// `data` のキーは spec の綴り（`fill_ratio` / `max_bytes`）に合わせる。
+/// 結果 JSON の他のキーがすべて snake_case なので、ここだけ `--fill-ratio` と
+/// 綴ると受け手はどちらでも拾える分岐を書かされる。CLI の綴りは `message` が言う。
+///
+/// **`profile` と `used` の両方を入れる。** 片方だけでは、規格が求めた値から
+/// どれだけ外したのかを呼び出し側が測れない。
+fn overridden(
+    profile: &profile::Profile,
+    key: &str,
+    flag: &str,
+    wanted: Value,
+    used: Value,
+) -> Option<Warning> {
+    let message = format!(
+        "--profile {} は {flag} {} を求めましたが、明示した {} が効きます",
+        profile.name,
+        spell(&wanted),
+        spell(&used)
+    );
+    let hint = format!(
+        "profile の値で書くなら {flag} を外してください（規格の条件と出典は kiri schema の profiles[] にあります）"
+    );
+    overridden_with(key, wanted, used, message, hint)
+}
+
+/// 出力先の拡張子が profile の求めた形式を押しのけたことを報せる。
+///
+/// **`--format` で押しのけたときと同じ `code` / 同じ `data` の形にする。**
+/// 呼び出し側が答えたいのは「profile を指定したのに効かなかった項目はどれか」
+/// であり、押しのけた主が指定だったか綴った名前だったかで分岐を増やす理由は
+/// 無い（その違いは `message` と `hint` が言う）。
+fn overridden_by_extension(
+    profile: &profile::Profile,
+    path: &Path,
+    wanted: OutputFormat,
+    used: OutputFormat,
+) -> Option<Warning> {
+    let message = format!(
+        "--profile {} は --format {} を求めましたが、出力先 {} の拡張子が示す {} で書きます",
+        profile.name,
+        wanted.as_str(),
+        path.display(),
+        used.as_str()
+    );
+    let hint = format!(
+        "profile の形式で書くなら出力先の拡張子を .{} にしてください\
+         （拡張子と中身が食い違うファイルを作らないため、拡張子は形式の明示指定として扱います）",
+        wanted.as_str()
+    );
+    overridden_with(
+        "format",
+        json!(wanted.as_str()),
+        json!(used.as_str()),
+        message,
+        hint,
+    )
+}
+
+/// 上書き 1 件を警告へ組む。**「同じ値なら黙る」規則はここ 1 箇所にしか無い。**
+///
+/// `data` の形（`key` / `profile` / `used`）もここが決める。押しのけた主ごとに
+/// 組み立てを分けると、片方にだけキーを足したときに受け手が両方を読める分岐を
+/// 書かされる。
+fn overridden_with(
+    key: &str,
+    wanted: Value,
+    used: Value,
+    message: String,
+    hint: String,
+) -> Option<Warning> {
+    if wanted == used {
+        return None;
+    }
+    Some(
+        Warning::new(WarningCode::ProfileOverridden, message)
+            .with_hint(hint)
+            .with_data("key", key)
+            .with_data("profile", wanted)
+            .with_data("used", used),
+    )
+}
+
+/// 値を人間向けの 1 行へ綴る。
+///
+/// **文字列の引用符を外すだけ。** `Value` の `Display` は `"jpeg"` と綴るので、
+/// そのまま文へ埋めると `--format "jpeg" を求めました` になり、利用者が
+/// **引用符ごと書き写せる指定だと読む**。`data` の側は JSON のまま返るので、
+/// 機械可読な値はそちらが持つ。
+fn spell(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
 }
 
 /// 探索の記録を結果 JSON へ落とす。

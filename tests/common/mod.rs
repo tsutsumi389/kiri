@@ -138,6 +138,37 @@ pub fn write_png(dir: &Path, name: &str, img: &RgbaImage) -> PathBuf {
     path
 }
 
+/// sRGB の ICC を埋めた PNG を書く。
+///
+/// **`write_png` と分けてあるのは、`kiri lint` の `color_space` が
+/// 「ファイルが色空間を名乗っているか」を見るためである。** `image` クレートが
+/// 素で書く PNG には iCCP も EXIF ColorSpace も無く、kiri から見れば
+/// **名乗りが 1 つも無いファイル**になる——その状態を `pass` とは言えない
+/// （`unmeasurable` になる）ので、`srgb_required` を持つ規格を素直に満たす
+/// 素材はこちらで書く。
+///
+/// 埋めるのは kiri 自身が出力へ付けるものと**同じ 1 つの ICC**（`srgb_icc`）で、
+/// テスト側に 2 つ目の sRGB プロファイルを持ち込まない。
+pub fn write_srgb_png(dir: &Path, name: &str, img: &RgbaImage) -> PathBuf {
+    use image::ImageEncoder;
+    let path = dir.join(name);
+    let mut bytes = Vec::new();
+    let mut encoder = image::codecs::png::PngEncoder::new(&mut bytes);
+    encoder
+        .set_icc_profile(kiri::color::srgb_profile::srgb_icc().to_vec())
+        .expect("PNG は ICC を受ける");
+    encoder
+        .write_image(
+            img.as_raw(),
+            img.width(),
+            img.height(),
+            image::ExtendedColorType::Rgba8,
+        )
+        .unwrap();
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
 pub fn write_jpeg(dir: &Path, name: &str, img: &RgbaImage) -> PathBuf {
     let path = dir.join(name);
     let rgb = image::DynamicImage::ImageRgba8(img.clone()).to_rgb8();

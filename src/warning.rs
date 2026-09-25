@@ -111,6 +111,10 @@ warning_catalog! {
         => "EXIF が uncalibrated で ICC も無い。sRGB と仮定した",
     DryRunOutputExists = "DRY_RUN_OUTPUT_EXISTS"
         => "--dry-run の出力先が既にある。本番実行には --force が要る",
+    ProfileOverridden = "PROFILE_OVERRIDDEN"
+        => "--profile が求めた値を明示指定が上書きした（明示 > profile > 既定）",
+    ProfileUncheckable = "PROFILE_UNCHECKABLE"
+        => "lint が検査できない項目を飛ばした（AVIF の画素など）。黙って合格にはしていない",
 }
 
 impl Serialize for WarningCode {

@@ -90,8 +90,15 @@ pub struct ItemSettings {
     pub shadow_opacity: Option<f64>,
     pub seal: Option<u32>,
     /// 切り抜いた後に時計回りへ回す角度(度)。**負値に意味がある**
-    /// （反時計回り）ので、他の数値と違って 0 以上の検査は掛けない
-    pub rotate: Option<f64>,
+    /// （反時計回り）ので、他の数値と違って 0 以上の検査は掛けない。
+    ///
+    /// **数値でも文字列でも書ける**（`90` と `"90"`、それに `"auto"`）。
+    /// 型を `f64` に決めないのは `max_bytes` とまったく同じ事情で、エージェントが
+    /// 書く JSON には両方が現れるうえ、`auto` は数値では表せない。`"90"` を
+    /// SPEC_INVALID で断ると、CLI では通る書き方が spec でだけ通らない。解くのは
+    /// `commands::batch`——CLI と同じ `cli::parse_rotate` を通し、読めない値は
+    /// INVALID_ROTATE にする
+    pub rotate: Option<serde_json::Value>,
     /// 規格の複合指定に名前を付けたもの（"amazon" など）。**未知の名前は
     /// `UNKNOWN_PROFILE` でその項目を落とす**——解くのは `commands::batch` で、
     /// CLI と同じ `profile::named` を通る。

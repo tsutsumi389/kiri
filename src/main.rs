@@ -13,6 +13,7 @@ use serde::Serialize;
 use kiri::cli::{Cli, Command};
 use kiri::commands;
 use kiri::compliance;
+use kiri::cutout::subject::TILT_SHAPE_MIN_FILL;
 use kiri::cutout::{Confidence, OptimizeFixed, bbox_argument};
 use kiri::error::{Error, ErrorCode, ErrorKind, Result};
 use kiri::report::{
@@ -760,7 +761,18 @@ fn print_subject(subject: Option<&SubjectReport>) {
     // **傾きは測れたときだけ 1 行増やす。** 測れなかった（丸いものなど）を
     // 「0 度」と書くと、傾いていないと測り切ったように読める
     if let Some(deg) = s.level_rotation {
-        println!("  傾き      --rotate {deg} で水平になる");
+        // **測れたことと信用できることは別である。** 最小外接矩形が向きを語るのは
+        // 形が矩形に近いときだけで、円に取っ手が 1 本生えた形では答えが輪郭の
+        // 量子化で決まる（水平に置いたフライパンに -21.7 度が high で出る）。
+        // `--rotate auto` が止める条件と同じものを、人が読む行でも断らないと、
+        // **この行だけが誤った角度を勧め続ける**ことになる
+        match s.level_fill_ratio {
+            Some(fill) if fill < TILT_SHAPE_MIN_FILL => println!(
+                "  傾き      --rotate {deg} と出たが、形が矩形から遠く当てにならない\
+                 （充填率 {fill:.3} < {TILT_SHAPE_MIN_FILL:.2}。--rotate auto も適用しない）"
+            ),
+            _ => println!("  傾き      --rotate {deg} で水平になる"),
+        }
     }
 }
 

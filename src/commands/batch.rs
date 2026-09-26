@@ -10,7 +10,8 @@ use rayon::prelude::*;
 
 use crate::batch::{self, BatchItem, ItemSettings};
 use crate::cli::{
-    BatchArgs, ColorOpts, CutoutArgs, OutputOpts, Polygon, SegmentOpts, parse_hex_color, parse_size,
+    BatchArgs, ColorOpts, CutoutArgs, OutputOpts, Polygon, RotateArg, SegmentOpts, parse_hex_color,
+    parse_size,
 };
 use crate::commands::{cutout, output};
 use crate::compliance::FailOn;
@@ -341,7 +342,7 @@ fn to_cutout_args(
         seal,
         // **角度だけは負値を通す。** 反時計回りの指定であり、他の設定の
         // ように「負値は機能が黙って消える」種類の誤りではない
-        rotate: angle(settings.rotate, 0.0, "rotate")?,
+        rotate: rotate(settings.rotate.as_ref())?,
         profile,
         // spec では `Some` がそのまま「明示した」である。CLI 側が clap の
         // `ValueSource` を見て解いているのと同じ問いに、JSON では素直に
@@ -606,17 +607,39 @@ fn ratio(value: Option<f64>, default: f64, key: &str) -> Result<f64> {
     Ok(value)
 }
 
-/// 角度に CLI と同じ関門を掛ける（`finite` の spec 版）。**負値は通す**
-/// （反時計回りの指定）。nan と無限大だけを断る。
-fn angle(value: Option<f64>, default: f64, key: &str) -> Result<f64> {
-    let value = value.unwrap_or(default);
-    if !value.is_finite() {
-        return Err(Error::new(
-            ErrorCode::InvalidSetting,
-            format!("{key} は有限な数値である必要があります（{value} が指定されました）"),
-        ));
-    }
-    Ok(value)
+/// spec の `rotate` を解く。**数値でも文字列でも受ける。**
+///
+/// `max_bytes` とまったく同じ事情である。エージェントが書く JSON には `90` と
+/// `"90"` の両方が現れ、そのうえ `auto` は数値では表せない。**CLI と同じ
+/// `cli::parse_rotate` へ流す**ので、`auto` の綴りも nan の扱いも片方でだけ
+/// 通る／通らないが起きない——数値は `to_string()` で綴り直してから渡す
+/// （`derive` が JSON の素の型を綴り直しているのと同じ作法）。
+///
+/// 断るときの code は `INVALID_ROTATE` で、`INVALID_SETTING` ではない。
+/// **角度の誤りは「どの値をどう直すか」が他の設定と違う**（綴りか、auto の
+/// 大文字小文字か、そもそも数値でないか）ので、受け手が同じ分岐でまとめて
+/// 扱える種類の失敗ではない。`INVALID_MAX_BYTES` を分けたのと同じ理由になる。
+///
+/// **負値は通す**（反時計回りの指定）。nan と無限大だけを `parse_rotate` が断る。
+fn rotate(value: Option<&serde_json::Value>) -> Result<RotateArg> {
+    let Some(value) = value else {
+        return Ok(RotateArg::Degrees(0.0));
+    };
+    let invalid = |message: String| {
+        Error::new(ErrorCode::InvalidRotate, message).with_hint(
+            "rotate は 90 / -3.5 のような度数か、\"auto\"（主体の傾きを測って適用）で指定してください",
+        )
+    };
+    let spelled = match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        other => {
+            return Err(invalid(format!(
+                "rotate を数値としても文字列としても読めません（{other} が指定されました）"
+            )));
+        }
+    };
+    crate::cli::parse_rotate(&spelled).map_err(|e| invalid(format!("rotate: {e}")))
 }
 
 /// ずらし量に CLI と同じ関門を掛ける。**負値は通す**（影を上や左へ出す指定）。

@@ -9,15 +9,17 @@ use std::time::Instant;
 
 use serde_json::{Value, json};
 
-use crate::cli::{CutoutArgs, Polygon};
+use crate::cli::{CutoutArgs, Polygon, RotateArg};
 use crate::commands::output::{self, round4};
 use crate::commands::segment;
 use crate::cutout::constraints::{
     ALPHA_BACKGROUND, ALPHA_FOREGROUND, MASK_THRESHOLD, TRIMAP_BACKGROUND, TRIMAP_FOREGROUND,
 };
 use crate::cutout::optimize;
+use crate::cutout::subject::TILT_SHAPE_MIN_FILL;
 use crate::cutout::{
-    Constraint, ConstraintSource, Constraints, CutoutOptions, FG_SEED_RADIUS, Matting, cutout_seen,
+    Constraint, ConstraintSource, Constraints, CutoutOptions, FG_SEED_RADIUS, LowReason, Matting,
+    SubjectHint, cutout_seen,
 };
 use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::{IccPolicy, LoadOptions, OutputFormat, SaveOptions, load, save};
@@ -139,6 +141,13 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     };
     let bbox = opts.bbox;
 
+    // **`--rotate auto` はここで畳む。** 新しい幾何は 1 行も書かない——
+    // `subject.level_rotation` は「`--rotate` にそのまま渡せる値」として
+    // 返っているので、測ったものをそのまま下の `apply_rotation` へ渡す。
+    // 解決を切り抜きの後に置くのは、`--optimize` が走った実行では
+    // **選ばれた候補の見立て**で決めたいからである（`result` は探索後のもの）
+    let (rotate_angle, rotate_auto_warning) = resolve_rotate(args.rotate, result.subject.as_ref());
+
     // **指定がどう解釈されたかを最初に言う。** 以降に並ぶ警告はすべて
     // 「その設定で切り抜いた結果」についてのもので、どの設定が効いたのかを
     // 知らずに読むと、数値の読み方そのものが変わる（指示についての警告を
@@ -158,6 +167,14 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     // 警告はすべて**選ばれた 1 つの候補**についてのもので、それが 20 通りの
     // 中で最良だったという事実を知らずに読むと、まだ手が残っていると読める
     warnings.extend(optimize_warning);
+    // **`--rotate auto` が効かなかったことも指示についての警告である。**
+    // 渡した指示がそのまま効いていない側の話なので、結果の警告より先に置く
+    // ——`rotate` ブロックが無い理由を、結果の数値を読む前に知れる位置である。
+    //
+    // 指示の警告の中では最後に置く。判断に使う `subject` は
+    // **`--optimize` が選んだ候補のもの**なので、探索の警告より後に並べると
+    // 「20 通りの中で選ばれた 1 つの見立てで測れなかった」という順に読める
+    warnings.extend(rotate_auto_warning);
     warnings.extend(result.warnings.clone());
 
     // **切り抜いてから回す。** 逆順にすると、回転が四隅に作った透過の余白が
@@ -169,7 +186,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     //
     // **`mask` / `background` / `subject` の座標は回す前のまま**である。
     // どれも「切り抜きがどう決まったか」を語る値で、回転はその後の配置にすぎない
-    let rotation = apply_rotation(&mut result.image, args.rotate)?;
+    let rotation = apply_rotation(&mut result.image, rotate_angle)?;
 
     // 長辺 1000px 換算を実寸へ掛け戻す。**基準は最終画像の長辺**なので、
     // キャンバスがあればそちらが基準になり、無ければ回した後の寸法になる。
@@ -346,7 +363,8 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             // 指定値。実際に効いたずらし量とぼかしは `shadow` ブロックのほう
             shadow: args.shadow.as_str(),
             // 同じく指定値。効いた角度は `rotate` ブロックのほう
-            rotate: round4(args.rotate),
+            // （`auto` を渡した実行では "auto" がそのまま出る）
+            rotate: args.rotate.rounded(),
             // 指定値。`auto` が走らせたかどうかは次の行が言う
             segment: decision.mode.as_str(),
             segment_ran: decision.ran(),
@@ -971,6 +989,131 @@ struct Placement {
     image: image::RgbaImage,
     report: CanvasReport,
     shadow: Option<ShadowReport>,
+}
+
+/// `--rotate` の指定を実際に回す角度へ畳む。`auto` のときだけ主体を見る。
+///
+/// **測った角度を渡すだけで、新しい幾何は 1 行も無い。** `level_rotation` は
+/// 「`--rotate` にそのまま渡せる値」として返る契約（符号を反転して渡す値では
+/// ない）なので、ここで符号を触ると往復が閉じなくなる。
+///
+/// # 適用しない 4 つの場合
+///
+/// どれも **0 度のまま**にして `ROTATE_AUTO_SKIPPED` で報せる。勝手に近い値を
+/// 当てにいかないのは、傾き直しが**構図の判断**だからである——測れていない
+/// ものを回すと、仕上がりを目で見るまで誰も気づけない形で絵が傾く。
+///
+/// `reason` を機械可読な 4 値にしてあるのは、**どの条件で落ちたかで次の一手が
+/// 変わる**ためである。`low_confidence` なら `--bbox` で主体を教えれば済むが、
+/// `not_measurable`（丸いもの）は何を渡しても測れないので角度を自分で決める
+/// しかない。`message` の日本語を正規表現で抜かせない、というこの repo の
+/// 約束もそのまま効く。
+///
+/// # 形の門（`not_rectangular`）
+///
+/// 4 つ目は**角度が出ているのに採らない**唯一の枝である。最小面積外接矩形が
+/// 「物の向き」を意味するのは、その物が実際に矩形に近いときだけで、円に取っ手が
+/// 1 本生えた形では最小の位置が輪郭の量子化で決まる（水平に置いたフライパンに
+/// `-21.7` 度を `high` で返していた）。`subject.level_fill_ratio` が
+/// `TILT_SHAPE_MIN_FILL` を下回ったらここで止める。
+///
+/// **`data` には測った値としきい値の両方を載せる。** 片方だけでは受け手が
+/// 「あと少しだったのか、全く違うのか」を分けられず、次の一手——`--bbox` で
+/// 主体を取り直すのか、角度を自分で決めるのか——を選べない。
+fn resolve_rotate(arg: RotateArg, subject: Option<&SubjectHint>) -> (f64, Option<Warning>) {
+    // 数値を渡した実行はここで抜ける。**主体を 1 度も見ない**——見てしまうと、
+    // auto を頼んでいない実行の挙動が主体の測り方に繋がってしまう
+    if let RotateArg::Degrees(d) = arg {
+        return (d, None);
+    }
+
+    let skipped = |reason: &str, message: String, hint: &str| {
+        (
+            0.0,
+            Some(
+                Warning::new(WarningCode::RotateAutoSkipped, message)
+                    .with_hint(hint)
+                    .with_data("reason", reason),
+            ),
+        )
+    };
+
+    let Some(subject) = subject else {
+        return skipped(
+            "no_subject",
+            "主体が見つからないので --rotate auto を適用していません（0 度のまま）".to_string(),
+            "背景しか写っていないか、前景が 1 画素も残っていません。\
+             --tolerance を上げるか --bbox で主体を教えてください",
+        );
+    };
+
+    if !subject.confidence.is_high() {
+        let low = match subject.low_reason() {
+            Some(LowReason::AreaTooSmall) => "area_too_small",
+            Some(LowReason::NotOneBlob) => "not_one_blob",
+            // `low_reason` は Low のときしか None を返さない。届く道は無いが、
+            // 将来 Confidence の段が増えたときに黙って別の理由へ化けないようにする
+            Some(LowReason::LeftoverOutside) | None => "leftover_outside",
+        };
+        return (
+            0.0,
+            Some(
+                Warning::new(
+                    WarningCode::RotateAutoSkipped,
+                    format!(
+                        "主体の信頼度が high でないので --rotate auto を適用していません\
+                         （0 度のまま、面積 {:.1}%, 捕捉率 {:.1}%）",
+                        subject.area_ratio * 100.0,
+                        subject.capture_ratio * 100.0
+                    ),
+                )
+                .with_hint(
+                    "--bbox で主体の範囲を教えると信頼度が上がります。\
+                     角度を自分で決めるなら --rotate <度> を渡してください",
+                )
+                .with_data("reason", "low_confidence")
+                .with_data("low_reason", low)
+                .with_data("area_ratio", round4(subject.area_ratio))
+                .with_data("capture_ratio", round4(subject.capture_ratio)),
+            ),
+        );
+    }
+
+    // 判定順は `level_rotation` が `Some` であることが前提なので、上の 3 つの後。
+    // 角度と充填率は同じ凸包から一度に出るので片方だけ欠けることは無いが、
+    // **対応が崩れた日に黙って回り始めないよう**、揃っていない場合は
+    // 「測れない」＝回さない側へ倒す
+    match (subject.level_rotation, subject.level_fill_ratio) {
+        (Some(_), Some(fill)) if fill < TILT_SHAPE_MIN_FILL => (
+            0.0,
+            Some(
+                Warning::new(
+                    WarningCode::RotateAutoSkipped,
+                    format!(
+                        "主体の形が矩形から遠く、測った傾きが向きを語らないので \
+                         --rotate auto を適用していません（0 度のまま、充填率 {:.3} < {:.2}）",
+                        fill, TILT_SHAPE_MIN_FILL
+                    ),
+                )
+                .with_hint(
+                    "最小外接矩形が向きを語るのは、形が矩形に近いときだけです。\
+                     円・取っ手つき・三角のような形では角度を自分で決めて \
+                     --rotate <度> を渡してください",
+                )
+                .with_data("reason", "not_rectangular")
+                .with_data("level_fill_ratio", round4(fill))
+                .with_data("min_fill_ratio", TILT_SHAPE_MIN_FILL)
+                .with_data("level_rotation", subject.level_rotation.map(round4)),
+            ),
+        ),
+        (Some(deg), Some(_)) => (deg, None),
+        _ => skipped(
+            "not_measurable",
+            "主体の傾きを測れないので --rotate auto を適用していません（0 度のまま）".to_string(),
+            "円や辺の多い形はどの角度でも外接矩形の面積が変わらず、\
+             最小の位置が雑音で決まります。角度を自分で決めて --rotate <度> を渡してください",
+        ),
+    }
 }
 
 /// `--rotate` を適用する。回らなければ画像に触れない。
@@ -1640,6 +1783,31 @@ fn resolve_point(point: [f64; 2], normalized: bool, width: u32, height: u32) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 受け入れ基準 (b) の 3 つ目。**主体そのものが無いときも 0 度のままにする。**
+    ///
+    /// 統合テスト（`cutout_rotate_auto_does_not_turn_what_it_cannot_trust`）は
+    /// `low_confidence` と `not_measurable` を実画像で踏むが、`no_subject` は
+    /// 「背景しか写っていない」という、切り抜きとしては別の失敗が先に立つ場面
+    /// でしか起きない。**3 つ目の枝を誰も通らないまま残さない**ためにここで踏む
+    #[test]
+    fn auto_without_a_subject_turns_nothing_and_says_why() {
+        let (angle, warning) = resolve_rotate(RotateArg::Auto, None);
+        assert_eq!(angle, 0.0);
+        let w = warning.expect("飛ばしたことを黙っている");
+        assert_eq!(w.code, WarningCode::RotateAutoSkipped);
+        assert_eq!(w.data["reason"], "no_subject");
+    }
+
+    /// 数値を渡した実行は主体を 1 度も見ない。**auto の門は素通りである。**
+    #[test]
+    fn a_numeric_rotation_passes_through_untouched() {
+        for deg in [0.0, -3.5, 90.0, 360.0] {
+            let (angle, warning) = resolve_rotate(RotateArg::Degrees(deg), None);
+            assert_eq!(angle, deg);
+            assert!(warning.is_none(), "{deg} で門の警告が出ている");
+        }
+    }
 
     #[test]
     fn pixel_coordinates_pass_through() {

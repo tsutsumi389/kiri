@@ -164,6 +164,10 @@ error_catalog! {
     InvalidDerivation = "INVALID_DERIVATION", Argument
         => "--derive の書式か値が不正（未知のキー、読めない値、sizes / formats との同時指定）。\
             spec 経由でのみこの code で、CLI では clap が code 無しの exit 2 で断る",
+    InvalidRotate = "INVALID_ROTATE", Argument
+        => "rotate が角度(度)の数値としても auto としても読めない。\
+            spec 経由でのみこの code で、CLI では clap が code 無しの exit 2 で断る。\
+            batch は 1 件の失敗で全体を止めないので、この code が出る実行の終了コードは 4 になる",
     InvalidFailOn = "INVALID_FAIL_ON", Argument
         => "--fail-on の書式か値が不正（未知の指標、演算子の綴り違い、値域外、同じ指標への二重指定）。\
             spec 経由でのみこの code で、CLI では clap が code 無しの exit 2 で断る",

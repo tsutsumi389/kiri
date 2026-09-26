@@ -115,6 +115,8 @@ warning_catalog! {
         => "--profile が求めた値を明示指定が上書きした（明示 > profile > 既定）",
     ProfileUncheckable = "PROFILE_UNCHECKABLE"
         => "lint が検査できない項目を飛ばした（AVIF の画素など）。黙って合格にはしていない",
+    RotateAutoSkipped = "ROTATE_AUTO_SKIPPED"
+        => "--rotate auto を適用しなかった（0 度のまま）。data.reason が no_subject / low_confidence / not_measurable / not_rectangular のどれかを言う",
 }
 
 impl Serialize for WarningCode {

@@ -1432,6 +1432,7 @@ mod tests {
             delta_e: 49.6,
             leftover_ratio: 0.0531,
             level_rotation: None,
+            level_fill_ratio: None,
             border: DEFAULT_BORDER,
             touches_edge: true,
             confidence,

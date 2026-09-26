@@ -475,6 +475,36 @@ fn fields() -> Vec<FieldEntry> {
             ),
         },
         FieldEntry {
+            path: "subject.level_fill_ratio",
+            appears_in: both(),
+            unit: "ratio",
+            nullable: true,
+            null_means: Some(
+                "level_rotation が null のときは同じく null。角度と同じ凸包から出る値なので、\
+                 片方だけが埋まることは無い",
+            ),
+            warns: vec![],
+            // **`gates` が語るのは `confidence` の条件だけ**（doc がそう定めて
+            // いる）なので、ここには載せない。0.85 が決めるのは
+            // 「`--rotate auto` が角度を採るか」であって信頼度ではなく、
+            // 混ぜると受け手は「これを満たせば high になる」と読む。
+            // しきい値は `notes` が綴り、機械可読な形では
+            // `ROTATE_AUTO_SKIPPED` の `data.min_fill_ratio` が配る
+            gates: None,
+            summary: "主体の凸包が最小外接矩形をどれだけ埋めているか（1.0 で矩形そのもの）",
+            notes: Some(
+                "**level_rotation をどれだけ信用してよいかを言う値である。** 1.0 に近いほど、\
+                 最小外接矩形がその形を実際に describe している。長方形は 1.0、角丸で 0.98、\
+                 取っ手つきで 0.88 あたり、**円は π/4≈0.785 が上限**。cutout --rotate auto は\
+                 これが 0.85 未満なら回さず、ROTATE_AUTO_SKIPPED の data.reason が \
+                 not_rectangular を言う（data.level_fill_ratio と data.min_fill_ratio に\
+                 測った値としきい値が入る）。**level_rotation を自分で読んで kiri rotate へ\
+                 渡す経路でも、同じ値で同じ判断をすること**——円に取っ手が 1 本生えた形では\
+                 最小外接矩形の位置が輪郭の量子化で決まり、水平に置いたフライパン（真値 0 度）に \
+                 -21.7 度が high で返る",
+            ),
+        },
+        FieldEntry {
             path: "subject.border",
             appears_in: both(),
             unit: "px",
@@ -822,6 +852,29 @@ fn fields() -> Vec<FieldEntry> {
                  成果物の画素は --shadow を足す前と 1 バイトも変わらず、shadow ブロックも現れない\
                  （schema_version は据え置き）。実際に効いたずらし量とぼかしは shadow.offset / \
                  shadow.blur のほう",
+            ),
+        },
+        FieldEntry {
+            path: "settings.rotate",
+            appears_in: vec!["cutout"],
+            // **数値か "auto" の union である。** 受け手が値を照合してよいかが
+            // ここで変わるので、deg のまま配ると「必ず数値」と読まれる
+            unit: "deg_or_auto",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "--rotate の指定値（度、または auto）",
+            notes: Some(
+                "**指定値である。** 実際に効いた角度は rotate.angle のほうで、回らなかった指定\
+                 （0 と 360、それに適用しなかった auto）では rotate ブロックごと現れない。\
+                 auto は subject.level_rotation をそのまま適用する指示で、subject.confidence が \
+                 high、level_rotation が測れ、かつ subject.level_fill_ratio が 0.85 以上の\
+                 ときだけ効く。効かなかったときは 0 度のまま \
+                 ROTATE_AUTO_SKIPPED が出て、data.reason が no_subject / low_confidence / \
+                 not_measurable / not_rectangular のどれかを言う。**分解能は 0.1〜0.5 度で、0.5 度を下回る差を\
+                 有意と読んではならない**（kiri rotate --angle に auto は無い——切り抜きを\
+                 通らないので subject を測っていない）",
             ),
         },
         FieldEntry {

@@ -9,15 +9,18 @@ use std::time::Instant;
 
 use serde_json::{Value, json};
 
-use crate::cli::{CutoutArgs, Polygon};
+use crate::batch::SetPlacement;
+use crate::cli::{CutoutArgs, Polygon, RotateArg};
 use crate::commands::output::{self, round4};
 use crate::commands::segment;
 use crate::cutout::constraints::{
     ALPHA_BACKGROUND, ALPHA_FOREGROUND, MASK_THRESHOLD, TRIMAP_BACKGROUND, TRIMAP_FOREGROUND,
 };
 use crate::cutout::optimize;
+use crate::cutout::subject::TILT_SHAPE_MIN_FILL;
 use crate::cutout::{
-    Constraint, ConstraintSource, Constraints, CutoutOptions, FG_SEED_RADIUS, Matting, cutout_seen,
+    Constraint, ConstraintSource, Constraints, CutoutOptions, FG_SEED_RADIUS, LowReason, Matting,
+    SubjectHint, cutout_seen,
 };
 use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::{IccPolicy, LoadOptions, OutputFormat, SaveOptions, load, save};
@@ -139,6 +142,13 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     };
     let bbox = opts.bbox;
 
+    // **`--rotate auto` はここで畳む。** 新しい幾何は 1 行も書かない——
+    // `subject.level_rotation` は「`--rotate` にそのまま渡せる値」として
+    // 返っているので、測ったものをそのまま下の `apply_rotation` へ渡す。
+    // 解決を切り抜きの後に置くのは、`--optimize` が走った実行では
+    // **選ばれた候補の見立て**で決めたいからである（`result` は探索後のもの）
+    let (rotate_angle, rotate_auto_warning) = resolve_rotate(args.rotate, result.subject.as_ref());
+
     // **指定がどう解釈されたかを最初に言う。** 以降に並ぶ警告はすべて
     // 「その設定で切り抜いた結果」についてのもので、どの設定が効いたのかを
     // 知らずに読むと、数値の読み方そのものが変わる（指示についての警告を
@@ -158,6 +168,14 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     // 警告はすべて**選ばれた 1 つの候補**についてのもので、それが 20 通りの
     // 中で最良だったという事実を知らずに読むと、まだ手が残っていると読める
     warnings.extend(optimize_warning);
+    // **`--rotate auto` が効かなかったことも指示についての警告である。**
+    // 渡した指示がそのまま効いていない側の話なので、結果の警告より先に置く
+    // ——`rotate` ブロックが無い理由を、結果の数値を読む前に知れる位置である。
+    //
+    // 指示の警告の中では最後に置く。判断に使う `subject` は
+    // **`--optimize` が選んだ候補のもの**なので、探索の警告より後に並べると
+    // 「20 通りの中で選ばれた 1 つの見立てで測れなかった」という順に読める
+    warnings.extend(rotate_auto_warning);
     warnings.extend(result.warnings.clone());
 
     // **切り抜いてから回す。** 逆順にすると、回転が四隅に作った透過の余白が
@@ -169,7 +187,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     //
     // **`mask` / `background` / `subject` の座標は回す前のまま**である。
     // どれも「切り抜きがどう決まったか」を語る値で、回転はその後の配置にすぎない
-    let rotation = apply_rotation(&mut result.image, args.rotate)?;
+    let rotation = apply_rotation(&mut result.image, rotate_angle)?;
 
     // 長辺 1000px 換算を実寸へ掛け戻す。**基準は最終画像の長辺**なので、
     // キャンバスがあればそちらが基準になり、無ければ回した後の寸法になる。
@@ -346,7 +364,8 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             // 指定値。実際に効いたずらし量とぼかしは `shadow` ブロックのほう
             shadow: args.shadow.as_str(),
             // 同じく指定値。効いた角度は `rotate` ブロックのほう
-            rotate: round4(args.rotate),
+            // （`auto` を渡した実行では "auto" がそのまま出る）
+            rotate: args.rotate.rounded(),
             // 指定値。`auto` が走らせたかどうかは次の行が言う
             segment: decision.mode.as_str(),
             segment_ran: decision.ran(),
@@ -408,17 +427,22 @@ fn apply_profile(args: &CutoutArgs, warnings: &mut Vec<Warning>) -> Option<Cutou
         }
     }
 
+    // **優先順位は 明示指定 > set > profile > 既定。** `set` は
+    // `--fill-ratio` と同じ席を争うので、どちらかがあれば profile の占有率は
+    // 効かない。明示のほうを先に見るのは、両方あるときに勝つのが明示だから
+    // である（spec では両方書けないよう `batch::validate_set` が断っている
+    // ので、ここへ届くのは CLI から `--fill-ratio` を明示した実行だけになる）
     if let Some(ratio) = want.fill_ratio {
-        if explicit.fill_ratio {
-            warnings.extend(overridden(
+        match args.set {
+            _ if explicit.fill_ratio => warnings.extend(overridden(
                 profile,
                 "fill_ratio",
                 "--fill-ratio",
                 json!(round4(ratio)),
                 json!(round4(args.fill_ratio)),
-            ));
-        } else {
-            out.fill_ratio = ratio;
+            )),
+            Some(set) => warnings.push(overridden_by_set(profile, set, ratio)),
+            None => out.fill_ratio = ratio,
         }
     }
 
@@ -848,6 +872,44 @@ fn overridden_by_extension(
     )
 }
 
+/// profile の占有率を batch の `set` が押しのけたことを報せる。
+///
+/// **`data` の形は他の `PROFILE_OVERRIDDEN` と同じ**（`key` / `profile` /
+/// `used`）で、押しのけた主が `set` であることは `by` が言う。code を分けない
+/// のは、受け手が答えたい問い——「profile を指定したのに効かなかった項目は
+/// どれか」——が 1 つも変わらないためである。
+///
+/// **`overridden_with` の「同じ値なら黙る」は通さない。** `set` が実際に
+/// 効かせるのは点ごとの `f_i` で、T が偶然 profile の値と一致しても、
+/// 効く値は点ごとに違う。黙ると「規格の占有率で揃えたはず」が成果物を並べて
+/// 見るまで分からない。`used` に入れるのは T（セット全体の目標）で、
+/// **その点で実際に効いた値は `canvas.fill_ratio` のほう**が返す。
+fn overridden_by_set(profile: &profile::Profile, set: SetPlacement, wanted: f64) -> Warning {
+    Warning::new(
+        WarningCode::ProfileOverridden,
+        format!(
+            "--profile {} は --fill-ratio {} を求めましたが、set の目標 {} が効きます\
+             （実際の占有率は点ごとに決まり、canvas.fill_ratio が返します）",
+            profile.name,
+            round4(wanted),
+            round4(set.target)
+        ),
+    )
+    .with_hint(format!(
+        "profile の占有率で書くなら spec の set を外してください\
+         （規格の条件と出典は kiri schema の profiles[] にあります）。\
+         set は全点を 1 つの目標へ揃えるものなので、規格の占有率とは両立しません。\
+         いま効いているのは align={} の目標 {}",
+        set.align.as_str(),
+        round4(set.target)
+    ))
+    .with_data("key", "fill_ratio")
+    .with_data("profile", round4(wanted))
+    .with_data("used", round4(set.target))
+    .with_data("by", "set")
+    .with_data("align", set.align.as_str())
+}
+
 /// 上書き 1 件を警告へ組む。**「同じ値なら黙る」規則はここ 1 箇所にしか無い。**
 ///
 /// `data` の形（`key` / `profile` / `used`）もここが決める。押しのけた主ごとに
@@ -973,6 +1035,131 @@ struct Placement {
     shadow: Option<ShadowReport>,
 }
 
+/// `--rotate` の指定を実際に回す角度へ畳む。`auto` のときだけ主体を見る。
+///
+/// **測った角度を渡すだけで、新しい幾何は 1 行も無い。** `level_rotation` は
+/// 「`--rotate` にそのまま渡せる値」として返る契約（符号を反転して渡す値では
+/// ない）なので、ここで符号を触ると往復が閉じなくなる。
+///
+/// # 適用しない 4 つの場合
+///
+/// どれも **0 度のまま**にして `ROTATE_AUTO_SKIPPED` で報せる。勝手に近い値を
+/// 当てにいかないのは、傾き直しが**構図の判断**だからである——測れていない
+/// ものを回すと、仕上がりを目で見るまで誰も気づけない形で絵が傾く。
+///
+/// `reason` を機械可読な 4 値にしてあるのは、**どの条件で落ちたかで次の一手が
+/// 変わる**ためである。`low_confidence` なら `--bbox` で主体を教えれば済むが、
+/// `not_measurable`（丸いもの）は何を渡しても測れないので角度を自分で決める
+/// しかない。`message` の日本語を正規表現で抜かせない、というこの repo の
+/// 約束もそのまま効く。
+///
+/// # 形の門（`not_rectangular`）
+///
+/// 4 つ目は**角度が出ているのに採らない**唯一の枝である。最小面積外接矩形が
+/// 「物の向き」を意味するのは、その物が実際に矩形に近いときだけで、円に取っ手が
+/// 1 本生えた形では最小の位置が輪郭の量子化で決まる（水平に置いたフライパンに
+/// `-21.7` 度を `high` で返していた）。`subject.level_fill_ratio` が
+/// `TILT_SHAPE_MIN_FILL` を下回ったらここで止める。
+///
+/// **`data` には測った値としきい値の両方を載せる。** 片方だけでは受け手が
+/// 「あと少しだったのか、全く違うのか」を分けられず、次の一手——`--bbox` で
+/// 主体を取り直すのか、角度を自分で決めるのか——を選べない。
+fn resolve_rotate(arg: RotateArg, subject: Option<&SubjectHint>) -> (f64, Option<Warning>) {
+    // 数値を渡した実行はここで抜ける。**主体を 1 度も見ない**——見てしまうと、
+    // auto を頼んでいない実行の挙動が主体の測り方に繋がってしまう
+    if let RotateArg::Degrees(d) = arg {
+        return (d, None);
+    }
+
+    let skipped = |reason: &str, message: String, hint: &str| {
+        (
+            0.0,
+            Some(
+                Warning::new(WarningCode::RotateAutoSkipped, message)
+                    .with_hint(hint)
+                    .with_data("reason", reason),
+            ),
+        )
+    };
+
+    let Some(subject) = subject else {
+        return skipped(
+            "no_subject",
+            "主体が見つからないので --rotate auto を適用していません（0 度のまま）".to_string(),
+            "背景しか写っていないか、前景が 1 画素も残っていません。\
+             --tolerance を上げるか --bbox で主体を教えてください",
+        );
+    };
+
+    if !subject.confidence.is_high() {
+        let low = match subject.low_reason() {
+            Some(LowReason::AreaTooSmall) => "area_too_small",
+            Some(LowReason::NotOneBlob) => "not_one_blob",
+            // `low_reason` は Low のときしか None を返さない。届く道は無いが、
+            // 将来 Confidence の段が増えたときに黙って別の理由へ化けないようにする
+            Some(LowReason::LeftoverOutside) | None => "leftover_outside",
+        };
+        return (
+            0.0,
+            Some(
+                Warning::new(
+                    WarningCode::RotateAutoSkipped,
+                    format!(
+                        "主体の信頼度が high でないので --rotate auto を適用していません\
+                         （0 度のまま、面積 {:.1}%, 捕捉率 {:.1}%）",
+                        subject.area_ratio * 100.0,
+                        subject.capture_ratio * 100.0
+                    ),
+                )
+                .with_hint(
+                    "--bbox で主体の範囲を教えると信頼度が上がります。\
+                     角度を自分で決めるなら --rotate <度> を渡してください",
+                )
+                .with_data("reason", "low_confidence")
+                .with_data("low_reason", low)
+                .with_data("area_ratio", round4(subject.area_ratio))
+                .with_data("capture_ratio", round4(subject.capture_ratio)),
+            ),
+        );
+    }
+
+    // 判定順は `level_rotation` が `Some` であることが前提なので、上の 3 つの後。
+    // 角度と充填率は同じ凸包から一度に出るので片方だけ欠けることは無いが、
+    // **対応が崩れた日に黙って回り始めないよう**、揃っていない場合は
+    // 「測れない」＝回さない側へ倒す
+    match (subject.level_rotation, subject.level_fill_ratio) {
+        (Some(_), Some(fill)) if fill < TILT_SHAPE_MIN_FILL => (
+            0.0,
+            Some(
+                Warning::new(
+                    WarningCode::RotateAutoSkipped,
+                    format!(
+                        "主体の形が矩形から遠く、測った傾きが向きを語らないので \
+                         --rotate auto を適用していません（0 度のまま、充填率 {:.3} < {:.2}）",
+                        fill, TILT_SHAPE_MIN_FILL
+                    ),
+                )
+                .with_hint(
+                    "最小外接矩形が向きを語るのは、形が矩形に近いときだけです。\
+                     円・取っ手つき・三角のような形では角度を自分で決めて \
+                     --rotate <度> を渡してください",
+                )
+                .with_data("reason", "not_rectangular")
+                .with_data("level_fill_ratio", round4(fill))
+                .with_data("min_fill_ratio", TILT_SHAPE_MIN_FILL)
+                .with_data("level_rotation", subject.level_rotation.map(round4)),
+            ),
+        ),
+        (Some(deg), Some(_)) => (deg, None),
+        _ => skipped(
+            "not_measurable",
+            "主体の傾きを測れないので --rotate auto を適用していません（0 度のまま）".to_string(),
+            "円や辺の多い形はどの角度でも外接矩形の面積が変わらず、\
+             最小の位置が雑音で決まります。角度を自分で決めて --rotate <度> を渡してください",
+        ),
+    }
+}
+
 /// `--rotate` を適用する。回らなければ画像に触れない。
 ///
 /// **`[0, 360)` へ正規化した後に 0 なら何もしない。** `--rotate 360` は
@@ -1051,15 +1238,39 @@ fn place_on_canvas(
     // 影が下地に隠れる。組み替えを `--shadow off` にも通すと、半透明の縁で
     // 1 ずつ丸めが変わる（下地の上へ合成するか、後から下地へ落とすかの違い）
     let flatten_here = args.out.flatten && shadow_spec.is_none();
+    // **セット統一はここで 1 つの数に畳む。** `canvas.rs` には 1 行も触れない
+    // ——狙った倍率は渡す `fill_ratio` のほうを組み替えれば出る
+    // （`SetPlacement::fill_ratio` の doc に式がある）。`set` を渡さない実行では
+    // `requested` が `None` で、以降は今までどおり `args.fill_ratio` を読む
+    let content = (trimmed.width(), trimmed.height());
+    let requested = args.set.map(|set| set.fill_ratio(content, (width, height)));
+    // `plan()` は `(0, 1]` の外を `INVALID_FILL_RATIO` で断る。**断らせずに
+    // 上限で止める**のは、1.0 を超えるのが誤りではなく物理だからである
+    // （正方キャンバスで横長の商品に高さを与えれば横がはみ出す）。止めたことは
+    // 下で `SET_SCALE_CLAMPED` が目標との差つきで言う
+    let fill_ratio = match requested {
+        Some(wanted) => wanted.min(1.0),
+        None => args.fill_ratio,
+    };
     let spec = CanvasSpec {
         width,
         height,
-        fill_ratio: args.fill_ratio,
+        fill_ratio,
         // --flatten が指定されていれば下地を塗る。既定は透明のまま
         background: flatten_here.then_some(args.out.background),
     };
-    let plan = canvas_plan((trimmed.width(), trimmed.height()), &spec)?;
+    let plan = canvas_plan(content, &spec)?;
     let mut placed = canvas_apply(&trimmed, &spec)?;
+
+    // **止めたことは配置が決まってから言う。** 目標との差を語るには実際に
+    // 得た高さが要り、それは `plan` が決めるまで綴れない。`CANVAS_UPSCALED`
+    // より先に置くのは、こちらが**指示がそのまま効かなかった**側の話だから
+    // である（結果についての警告より先、という `run()` の並べ方に揃える）
+    if let (Some(set), Some(wanted)) = (args.set, requested) {
+        if wanted > 1.0 {
+            warnings.push(set_clamped(set, wanted, height, plan.content.1));
+        }
+    }
 
     // 引数名を `spec` にすると上の `CanvasSpec` を隠す。どちらの仕様を
     // 読んでいるのかが目で追えなくなる
@@ -1096,13 +1307,53 @@ fn place_on_canvas(
         report: CanvasReport {
             width,
             height,
-            fill_ratio: args.fill_ratio,
+            // **効いた値を返す。** canvas ブロックは走った配置を語るもので、
+            // `set` を使った実行では要求した `--fill-ratio` は読まれていない。
+            // `set` を使わない実行では要求値と同じなので、出力は 1 バイトも
+            // 変わらない
+            fill_ratio,
             content: [plan.content.0, plan.content.1],
             offset: [plan.offset.0, plan.offset.1],
             scale: round4(plan.scale),
         },
         shadow,
     })
+}
+
+/// セット統一の占有率を上限で止めたことを報せる。
+///
+/// # これは「1 点だけ外れた異常」ではない
+///
+/// 計画書は「揃えた結果 1 点だけが極端に外れるとき」と書いているが、実際には
+/// **横長の商品では常態である。** 正方キャンバスで `align: "height"` なら
+/// `f_i = T * max(1, cw/ch)` なので、`T = 0.85` では縦横比 1.18:1 を超える
+/// 横長で必ず当たる。式の誤りではなく物理で、高さ `0.85*CH` を与えれば横幅は
+/// `0.85*CH*(cw/ch)` を要求し、それがキャンバスの幅を越える。
+///
+/// だからこそ**黙って「高さが揃った」ことにしない。** `data` には要求した
+/// `f_i` と使った 1.0 に加えて、**実際に得た高さと目標の差**を入れる。
+/// 受け手の次の一手はそこでしか決まらない——数 px なら見過ごせるが、
+/// 目標の半分しか無いならキャンバスを横長にするか `align` を変えるしかない。
+fn set_clamped(set: SetPlacement, wanted: f64, canvas_height: u32, got: u32) -> Warning {
+    let target = (set.target * f64::from(canvas_height)).round() as i64;
+    let shortfall = target - i64::from(got);
+    Warning::new(
+        WarningCode::SetScaleClamped,
+        format!(
+            "セット統一が求めた占有率 {wanted:.3} は 1.0 を超えるので 1.0 で止めました\
+             （高さは目標 {target}px に対して {got}px で、{shortfall}px 足りません）"
+        ),
+    )
+    .with_hint(
+        "正方のキャンバスに横長の商品を高さで揃えると、横がキャンバスからはみ出します。\
+         canvas を横長にするか、set.fill_ratio を下げるか、set.align を bbox にしてください",
+    )
+    .with_data("align", set.align.as_str())
+    .with_data("requested_fill_ratio", round4(wanted))
+    .with_data("used_fill_ratio", 1.0)
+    .with_data("target_height", target)
+    .with_data("height", got)
+    .with_data("height_shortfall", shortfall)
 }
 
 /// 重い処理に入る前に、付随出力（プレビュー・デバッグマスク）のパスを検証する。
@@ -1640,6 +1891,31 @@ fn resolve_point(point: [f64; 2], normalized: bool, width: u32, height: u32) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 受け入れ基準 (b) の 3 つ目。**主体そのものが無いときも 0 度のままにする。**
+    ///
+    /// 統合テスト（`cutout_rotate_auto_does_not_turn_what_it_cannot_trust`）は
+    /// `low_confidence` と `not_measurable` を実画像で踏むが、`no_subject` は
+    /// 「背景しか写っていない」という、切り抜きとしては別の失敗が先に立つ場面
+    /// でしか起きない。**3 つ目の枝を誰も通らないまま残さない**ためにここで踏む
+    #[test]
+    fn auto_without_a_subject_turns_nothing_and_says_why() {
+        let (angle, warning) = resolve_rotate(RotateArg::Auto, None);
+        assert_eq!(angle, 0.0);
+        let w = warning.expect("飛ばしたことを黙っている");
+        assert_eq!(w.code, WarningCode::RotateAutoSkipped);
+        assert_eq!(w.data["reason"], "no_subject");
+    }
+
+    /// 数値を渡した実行は主体を 1 度も見ない。**auto の門は素通りである。**
+    #[test]
+    fn a_numeric_rotation_passes_through_untouched() {
+        for deg in [0.0, -3.5, 90.0, 360.0] {
+            let (angle, warning) = resolve_rotate(RotateArg::Degrees(deg), None);
+            assert_eq!(angle, deg);
+            assert!(warning.is_none(), "{deg} で門の警告が出ている");
+        }
+    }
 
     #[test]
     fn pixel_coordinates_pass_through() {

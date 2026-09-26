@@ -8568,8 +8568,7 @@ fn a_parser_level_failure_returns_no_json() {
 /// **実装したら必ずここから消す**——実装済みのまま残っていると下の検査が落ちる。
 /// README / design.md には許さない（エージェントが写し取る場所だから）
 const PLANNED_CODES: &[&str] = &[
-    "ROTATE_AUTO_SKIPPED",
-    "SET_SCALE_CLAMPED",
+    // ROTATE_AUTO_SKIPPED と SET_SCALE_CLAMPED は Phase 23 で実装済み
     "WHITE_BALANCE_SKIPPED",
     "REFLECT_CLIPPED",
 ];
@@ -9147,6 +9146,9 @@ fn every_published_unit_is_in_the_known_vocabulary() {
         "px",
         "px_at_1000",
         "deg",
+        // 数値か "auto" の union（`settings.rotate`）。`deg` と分けるのは、
+        // 受け手が `as_f64()` で読んでよいかがここで変わるため
+        "deg_or_auto",
         "ms",
         "count",
         "quality",
@@ -9381,6 +9383,25 @@ fn every_published_field_exists_in_the_result() {
     // リポジトリにも CI にも置かないので、無ければその path だけを飛ばす。
     // 「配ったが確かめられなかった」と「配ったのに無い」は別で、後者だけを
     // 落とす
+    // **`set` は spec に書いた batch の実行にしか現れない。** `compliance` /
+    // `optimize` と同じ扱いで、専用の実行を 1 つ用意する。`--dry-run` で
+    // 回すのは、pass 1（代表寸法の測り）が 1 バイトも書かずに走る規約を
+    // ここでも使うためである
+    let batched = {
+        let spec = write_spec(
+            dir.path(),
+            r#"{"set":{"align":"height"},
+                 "defaults":{"canvas":"500x500","format":"png"},
+                 "items":[{"input":"product.jpg","output":"out/a.png"}]}"#,
+        );
+        let out = run_batch(&spec, &["--dry-run"]);
+        assert!(
+            out.status.success(),
+            "batch: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        json_stdout(&out)
+    };
     let segmented = segment_ready().then(|| {
         (
             run(&[
@@ -9430,6 +9451,7 @@ fn every_published_field_exists_in_the_result() {
                 "cutout" if path.starts_with("settings.") => &profiled,
                 "cutout" if path.starts_with("rotate.") => &rotated,
                 "lint" => &linted,
+                "batch" => &batched,
                 "rotate" => &turned,
                 "convert" => &converted,
                 "resize" => &resized,
@@ -10459,6 +10481,537 @@ fn cutout_places_the_rotated_subject_on_the_canvas() {
     assert_eq!(placed.get_pixel(399, 399)[3], 0);
 }
 
+// --- cutout --rotate auto（Phase 23）---
+
+/// `deg` だけ時計回りに倒した濃色の矩形を、白に近い背景へ 1 枚だけ置く。
+///
+/// **矩形にするのは `level_rotation` が測れる形だからである。** 丸いものでは
+/// どの角度でも外接矩形の面積が変わらず、測れないほうの枝へ落ちる
+/// （そちらは `disc_scene` が用意する）。
+/// `the_reported_level_rotation_actually_levels_the_subject` と同じ作りで、
+/// あちらは `info` → `rotate` の 2 本で閉じた往復を、ここでは `cutout` 1 本で閉じる
+fn tilted_scene(deg: f64) -> image::RgbaImage {
+    let (w, h) = (400u32, 400u32);
+    let mut scene = image::RgbaImage::from_pixel(w, h, image::Rgba([250, 250, 249, 255]));
+    let (sin, cos) = deg.to_radians().sin_cos();
+    for y in 0..h {
+        for x in 0..w {
+            let (dx, dy) = (f64::from(x) - 200.0, f64::from(y) - 200.0);
+            let (u, v) = (dx * cos + dy * sin, -dx * sin + dy * cos);
+            if u.abs() <= 130.0 && v.abs() <= 55.0 {
+                scene.put_pixel(x, y, image::Rgba([40, 40, 45, 255]));
+            }
+        }
+    }
+    scene
+}
+
+/// 円盤 1 枚。**`confidence` は high だが `level_rotation` は測れない。**
+///
+/// `subject.rs` の `a_disc_has_no_level_rotation` と同じ形を画像にしたもので、
+/// 「信用はできるが角度が無い」という 3 つ目の枝をここだけが踏む
+fn disc_scene() -> image::RgbaImage {
+    let (w, h) = (400u32, 400u32);
+    image::RgbaImage::from_fn(w, h, |x, y| {
+        let d = (f64::from(x) - 200.0).hypot(f64::from(y) - 200.0);
+        if d <= 130.0 {
+            image::Rgba([40, 40, 45, 255])
+        } else {
+            image::Rgba([250, 250, 249, 255])
+        }
+    })
+}
+
+/// 半径 70px の円盤。**`level_rotation` は `45.0` 度を `high` で返す。**
+///
+/// `disc_scene`（半径 130px）と同じただの円なのに、こちらは `None` へ落ちない。
+/// ラスタライズした輪郭には量子化の凹凸が残り、その凹凸が作る外接矩形面積の
+/// 振れ幅が `TILT_AMBIGUOUS`（2%）を抜けてしまう。半径を 60 から 170 まで 5px
+/// 刻みで振ると、`Some` を返したのは 60 / 65 / 70（いずれも **45.0 度**）と
+/// 85（0.0 度）の 4 つだった。
+///
+/// **「丸いものは必ず `None` になる」は成り立たない。** 円を止めているのは
+/// 面積の曖昧さではなく、量子化の運である。形の門がここを引き受ける
+/// （充填率は 0.798 で、円の上限 π/4≈0.785 のすぐ上）
+fn measurable_disc_scene() -> image::RgbaImage {
+    let (w, h) = (400u32, 400u32);
+    image::RgbaImage::from_fn(w, h, |x, y| {
+        let d = (f64::from(x) - 200.0).hypot(f64::from(y) - 200.0);
+        if d <= 70.0 {
+            image::Rgba([40, 40, 45, 255])
+        } else {
+            image::Rgba([250, 250, 249, 255])
+        }
+    })
+}
+
+/// `deg` だけ倒した「取っ手つきの円」（フライパン）。円 1 枚＋右へ伸びる細い帯。
+///
+/// **`level_rotation` が測れてしまうのに、その値が物の向きを語らない形である。**
+/// 円だけなら `TILT_AMBIGUOUS` が止めるが、取っ手が 1 本生えるだけで面積に
+/// 振れ幅が生まれて門を抜ける。それでいて最小外接矩形の位置は取っ手と円の
+/// 接し方——つまり輪郭の量子化——で決まるので、答えは形の向きと無関係に跳ぶ。
+/// 実測では真値 0 度に対して **-21.8 度**、10 度に対して **-31.8 度**を
+/// どちらも `confidence: high` で返す。
+///
+/// 帯の長さを円の半径より大きく取ってあるのは、取っ手を短くすると凸包が円に
+/// 呑まれて `TILT_AMBIGUOUS` 側へ落ち、**この欠陥を踏まなくなる**ためである
+fn handled_disc_scene(deg: f64) -> image::RgbaImage {
+    let (w, h) = (400u32, 400u32);
+    let (sin, cos) = deg.to_radians().sin_cos();
+    image::RgbaImage::from_fn(w, h, |x, y| {
+        let (dx, dy) = (f64::from(x) - 200.0, f64::from(y) - 200.0);
+        // 形の重心ではなく外接矩形の中心を画面中央へ置く（+64 がそのずらし）
+        let (u, v) = (dx * cos + dy * sin + 64.0, -dx * sin + dy * cos);
+        let disc = u.hypot(v) <= 90.0;
+        let handle = (86.0..=218.0).contains(&u) && v.abs() <= 11.0;
+        if disc || handle {
+            image::Rgba([40, 40, 45, 255])
+        } else {
+            image::Rgba([250, 250, 249, 255])
+        }
+    })
+}
+
+/// `deg` だけ倒した角丸長方形。`tilted_scene` と同じ寸法で四隅だけを落とす。
+///
+/// **角を丸めても矩形は矩形である**ことを言うためにある。形の門は「凸包が
+/// 最小外接矩形をどれだけ埋めるか」で測るので、四隅を半径 24px で落とすと
+/// 充填率はその面積ぶんだけ下がる（1.000 → 0.98 付近）。門がそこで止まると、
+/// 携帯・本・箱という EC でいちばんありふれた主体が回らなくなる
+fn rounded_tilted_scene(deg: f64) -> image::RgbaImage {
+    let (w, h) = (400u32, 400u32);
+    let (sin, cos) = deg.to_radians().sin_cos();
+    let (half_w, half_h, radius) = (130.0f64, 55.0f64, 24.0f64);
+    image::RgbaImage::from_fn(w, h, |x, y| {
+        let (dx, dy) = (f64::from(x) - 200.0, f64::from(y) - 200.0);
+        let (u, v) = (dx * cos + dy * sin, -dx * sin + dy * cos);
+        let qx = (u.abs() - (half_w - radius)).max(0.0);
+        let qy = (v.abs() - (half_h - radius)).max(0.0);
+        if u.abs() <= half_w && v.abs() <= half_h && qx.hypot(qy) <= radius {
+            image::Rgba([40, 40, 45, 255])
+        } else {
+            image::Rgba([250, 250, 249, 255])
+        }
+    })
+}
+
+/// まとまった塊 1 つと、その周りに散った雑音。**`confidence` が low になる。**
+///
+/// `subject.rs` の `scattered_noise_is_reported_with_low_confidence` と同じく
+/// **捕捉率で落とす**（`not_one_blob`）。点だけを撒くと最大の塊が 1 点まで
+/// 痩せて「塊がそもそも小さい」が先に立ち、切り抜きの結果も全面透過という
+/// 縮退した絵になる——それでは「回さなかったこと」をバイト列で確かめる意味が薄い。
+/// 塊を 1 つ置いてあるのは、**切り抜きに中身がある状態**で門を通すためである
+fn scattered_noise_scene() -> image::RgbaImage {
+    let mut img = image::RgbaImage::from_pixel(200, 200, image::Rgba([250, 250, 248, 255]));
+    for y in 20..84u32 {
+        for x in 20..84u32 {
+            img.put_pixel(x, y, image::Rgba([30, 30, 30, 255]));
+        }
+    }
+    // 塊から離して 8px 角を撒く。間隔 12px なので互いに繋がらない
+    for gy in 0..9u32 {
+        for gx in 0..5u32 {
+            let (bx, by) = (96 + gx * 20, 16 + gy * 20);
+            for y in by..by + 8 {
+                for x in bx..bx + 8 {
+                    img.put_pixel(x, y, image::Rgba([30, 30, 30, 255]));
+                }
+            }
+        }
+    }
+    img
+}
+
+/// `cutout` を 1 本走らせて結果 JSON を返す。失敗したら stderr ごと落とす。
+fn cutout_json(input: &Path, output: &Path, extra: &[&str]) -> Value {
+    let mut args = vec![
+        "cutout",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--json",
+    ];
+    args.extend_from_slice(extra);
+    let out = kiri().args(&args).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{extra:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    json_stdout(&out)
+}
+
+/// 結果 JSON から `ROTATE_AUTO_SKIPPED` だけを抜く。
+fn rotate_auto_skips(v: &Value) -> Vec<Value> {
+    v["warnings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|w| w["code"] == "ROTATE_AUTO_SKIPPED")
+        .collect()
+}
+
+/// 受け入れ基準 (a)。`--rotate auto` が実際に水平を出す。
+///
+/// **書いた画像へもう一度 `info` を掛けて測り直す。** 角度を返しただけでは
+/// 「符号が逆でも値はある」を捕まえられない——`--rotate` にそのまま渡せる値を
+/// そのまま渡す実装なので、符号を取り違えれば傾きは倍になって現れる。
+/// 許容は 0.5 度で、これは `level_rotation` の分解能そのものである
+/// （§7.5 の Phase 23 が定める基準）。
+///
+/// `--flatten` を付けるのは、測り直す側が**背景を持った画像**を要るためである。
+/// 透過のまま書くと外周は RGB が 0 の黒になり、濃色の主体との色差が消える
+#[test]
+fn cutout_rotate_auto_levels_the_subject() {
+    let dir = fixture_dir();
+    let input = write_png(dir.path(), "tilted.png", &tilted_scene(5.0));
+    let output = dir.path().join("level.png");
+
+    let v = cutout_json(&input, &output, &["--rotate", "auto", "--flatten"]);
+    assert!(
+        rotate_auto_skips(&v).is_empty(),
+        "測れているのに飛ばしている: {v}"
+    );
+    assert!(
+        v.get("rotate").is_some(),
+        "回した実行なのに rotate ブロックが無い: {v}"
+    );
+    // 受け入れ基準 (f)。指定値は `"auto"` を名乗る。効いた角度は rotate ブロック
+    assert_eq!(v["settings"]["rotate"], "auto", "{v}");
+
+    let after = json_stdout(
+        &kiri()
+            .args(["info", output.to_str().unwrap(), "--json"])
+            .output()
+            .unwrap(),
+    );
+    let left = after["subject"]["level_rotation"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("水平出しした画像の傾きが測れない: {after}"));
+    assert!(
+        left.abs() <= 0.5,
+        "--rotate auto の後もまだ {left} 度傾いていると言う（許容 0.5）"
+    );
+}
+
+/// 受け入れ基準 (b)。**信用できない見立てでは 1 画素も動かさない。**
+///
+/// `--rotate 0` の出力とバイト列が一致することまで見る。「角度 0 を適用した」と
+/// 「回していない」が同じ結果になるのは当然だが、auto の門が黙って別の角度を
+/// 選んでいれば 1 バイトも一致しない。`reason` を機械可読にしてあるのは、
+/// **どの条件で落ちたかで次の一手が変わる**ためである（low なら `--bbox`、
+/// 測れないなら角度を自分で決めるしかない）
+#[test]
+fn cutout_rotate_auto_does_not_turn_what_it_cannot_trust() {
+    let dir = fixture_dir();
+    for (name, scene, reason) in [
+        ("noise", scattered_noise_scene(), "low_confidence"),
+        ("disc", disc_scene(), "not_measurable"),
+    ] {
+        let input = write_png(dir.path(), &format!("{name}.png"), &scene);
+        let auto = dir.path().join(format!("{name}_auto.png"));
+        let zero = dir.path().join(format!("{name}_zero.png"));
+
+        let a = cutout_json(&input, &auto, &["--rotate", "auto"]);
+        let z = cutout_json(&input, &zero, &["--rotate", "0"]);
+        assert_eq!(
+            std::fs::read(&auto).unwrap(),
+            std::fs::read(&zero).unwrap(),
+            "{name}: 適用しないと言いながら画素が動いている"
+        );
+        assert!(
+            a.get("rotate").is_none(),
+            "{name}: 回していないのに rotate ブロックが出ている: {a}"
+        );
+
+        let skipped = rotate_auto_skips(&a);
+        assert_eq!(skipped.len(), 1, "{name}: 警告がちょうど 1 回でない: {a}");
+        assert_eq!(skipped[0]["data"]["reason"], reason, "{name}: {a}");
+        if reason == "low_confidence" {
+            // 低い理由も一緒に渡す。`info` の助言と同じ分岐を書けるようにする
+            assert_eq!(skipped[0]["data"]["low_reason"], "not_one_blob", "{a}");
+        }
+        assert!(
+            rotate_auto_skips(&z).is_empty(),
+            "{name}: auto を頼んでいない実行で門の警告が出ている: {z}"
+        );
+    }
+}
+
+/// 受け入れ基準 (b) の拡張。**取っ手が 1 本生えた円は回さない。**
+///
+/// **これが Phase 23 前半で見つかった欠陥の回帰テストである。** 水平に置いた
+/// フライパン（真値 0 度）に対して `level_rotation` は `-21.8` 度を
+/// `confidence: high` で返す。最小面積外接矩形が「物の向き」を意味するのは、
+/// **その物が実際に矩形に近いときだけ**だからで、円に取っ手が付いた形では
+/// 最小の位置が取っ手と円の接し方——輪郭の量子化——で決まる。形の門が無ければ
+/// auto はこれを適用し、正しく置かれた商品を 21.8 度回したうえで画素を
+/// 補間し直していた。
+///
+/// `--rotate 0` とのバイト一致まで見るのは `cutout_rotate_auto_does_not_turn_
+/// what_it_cannot_trust` と同じ理由で、**門が黙って別の角度を選んでいれば
+/// 1 バイトも一致しない**ためである
+#[test]
+fn cutout_rotate_auto_leaves_a_handled_shape_alone() {
+    let dir = fixture_dir();
+    let input = write_png(dir.path(), "pan.png", &handled_disc_scene(0.0));
+    let auto = dir.path().join("pan_auto.png");
+    let zero = dir.path().join("pan_zero.png");
+
+    let a = cutout_json(&input, &auto, &["--rotate", "auto"]);
+    let z = cutout_json(&input, &zero, &["--rotate", "0"]);
+    assert_eq!(
+        std::fs::read(&auto).unwrap(),
+        std::fs::read(&zero).unwrap(),
+        "取っ手つきの円を回している（真値は 0 度）"
+    );
+    assert!(
+        a.get("rotate").is_none(),
+        "回していないのに rotate ブロックが出ている: {a}"
+    );
+    assert!(
+        rotate_auto_skips(&z).is_empty(),
+        "auto を頼んでいない実行で門の警告が出ている: {z}"
+    );
+
+    let skipped = rotate_auto_skips(&a);
+    assert_eq!(skipped.len(), 1, "警告がちょうど 1 回でない: {a}");
+    let data = &skipped[0]["data"];
+    assert_eq!(data["reason"], "not_rectangular", "{a}");
+
+    // **測った値としきい値の両方を渡す。** 「あと少しだった」と「全く違う」を
+    // 受け手が分けられなければ、次の一手（--bbox で主体を教え直すのか、
+    // 角度を自分で決めるのか）を選べない
+    let fill = data["level_fill_ratio"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("充填率を渡していない: {a}"));
+    let min = data["min_fill_ratio"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("しきい値を渡していない: {a}"));
+    assert!(
+        fill < min,
+        "充填率 {fill} がしきい値 {min} を下回っていない"
+    );
+    assert!(
+        fill < 0.85,
+        "取っ手つきの円の充填率が {fill}（0.85 未満のはず）"
+    );
+}
+
+/// 受け入れ基準 (b) の拡張。**形の門が効きすぎていないこと。**
+///
+/// 長方形と角丸長方形を 7.5 度倒す。どちらも今までどおり門を通り、水平が出る
+/// ——`cutout_rotate_auto_levels_the_subject` と同じ往復（書いた画像へもう一度
+/// `info` を掛けて測り直す）で見る。**角丸を並べてあるのが要点で**、四隅を
+/// 落とすと充填率はその面積ぶん下がる（1.000 → 0.98 付近）。門をそこまで
+/// 上げると携帯・本・箱が回らなくなるので、0.85 がその上側にどれだけ
+/// 余裕を持っているかをここで固定する
+#[test]
+fn cutout_rotate_auto_still_levels_a_boxy_product() {
+    let dir = fixture_dir();
+    for (name, scene) in [
+        ("sharp", tilted_scene(7.5)),
+        ("rounded", rounded_tilted_scene(7.5)),
+    ] {
+        let input = write_png(dir.path(), &format!("{name}.png"), &scene);
+        let output = dir.path().join(format!("{name}_level.png"));
+
+        let v = cutout_json(&input, &output, &["--rotate", "auto", "--flatten"]);
+        assert!(
+            rotate_auto_skips(&v).is_empty(),
+            "{name}: 矩形に近い形なのに形の門で止めている: {v}"
+        );
+        assert!(
+            v.get("rotate").is_some(),
+            "{name}: 回した実行なのに rotate ブロックが無い: {v}"
+        );
+
+        let after = json_stdout(
+            &kiri()
+                .args(["info", output.to_str().unwrap(), "--json"])
+                .output()
+                .unwrap(),
+        );
+        let left = after["subject"]["level_rotation"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("{name}: 水平出しした画像の傾きが測れない: {after}"));
+        assert!(
+            left.abs() <= 0.5,
+            "{name}: --rotate auto の後もまだ {left} 度傾いていると言う（許容 0.5）"
+        );
+    }
+}
+
+/// 受け入れ基準 (b) の拡張。**門の値そのものを `kiri info` で見る。**
+///
+/// 警告の `data` 越しではなく `subject` の項目として読めることを固定する。
+/// `level_rotation` を採るかどうかの判断は `cutout` の外でも要る——`info` を
+/// 見て `kiri rotate --angle` を叩く経路には auto が無いので、**そちらの
+/// 受け手は自分でこの値を見るしかない。**
+///
+/// 並べる 3 枚は較正の谷の両側である。矩形は 0.9 以上、円と取っ手つきは
+/// 0.85 未満。円に `measurable_disc_scene`（半径 70px）を使うのは、
+/// `disc_scene`（半径 130px）だと `level_rotation` が `None` になって
+/// **充填率も `null` になる**ためで、それでは「丸いものを止めた」ことの証拠に
+/// ならない。ここで要るのは**角度を答えてしまう円**——半径 70px の円は
+/// `45.0` 度を `high` で名乗る——である
+#[test]
+fn the_shape_gate_separates_what_the_rectangle_describes() {
+    let dir = fixture_dir();
+    let fill_of = |name: &str, scene: &image::RgbaImage| -> f64 {
+        let input = write_png(dir.path(), &format!("{name}.png"), scene);
+        let v = json_stdout(
+            &kiri()
+                .args(["info", input.to_str().unwrap(), "--json"])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(v["subject"]["confidence"], "high", "{name}: {v}");
+        assert!(
+            !v["subject"]["level_rotation"].is_null(),
+            "{name}: 角度が測れていない標本では形の門を語れない: {v}"
+        );
+        v["subject"]["level_fill_ratio"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("{name}: level_fill_ratio が無い: {v}"))
+    };
+
+    let boxy = fill_of("gate_rect", &tilted_scene(7.5));
+    let round = fill_of("gate_disc", &measurable_disc_scene());
+    let handled = fill_of("gate_pan", &handled_disc_scene(0.0));
+
+    assert!(boxy >= 0.9, "矩形の充填率が {boxy}（0.9 以上のはず）");
+    // 円の上限は π/4≈0.785 である。量子化の凹凸で数 % 上下しうるので 0.85 と
+    // 比べる——**谷の中央であって、円の実測値への当てはめではない**
+    assert!(round < 0.85, "円の充填率が {round}（0.85 未満のはず）");
+    assert!(
+        handled < 0.85,
+        "取っ手つきの充填率が {handled}（0.85 未満のはず）"
+    );
+    assert!(
+        handled < round,
+        "取っ手つき {handled} は円 {round} より低いはず（四隅が空く）"
+    );
+}
+
+/// 受け入れ基準 (c)。**`--rotate` を渡さない実行は auto の門を 1 度も通らない。**
+///
+/// バイト列も結果 JSON も `--rotate 0` と同じところへ着く。既存の決定性 /
+/// md5 のテストを 1 本も書き換えずに通すことが第一の証拠で、この 1 本は
+/// 「`settings.rotate` が数値のままであること」——union にしたせいで
+/// 指定しなかった実行の JSON が動いていないこと——まで固定する
+#[test]
+fn a_run_without_a_rotation_never_mentions_the_auto_gate() {
+    let dir = fixture_dir();
+    let input = write_png(dir.path(), "tilted.png", &tilted_scene(5.0));
+    let silent = dir.path().join("silent.png");
+    let zero = dir.path().join("zero.png");
+
+    let a = cutout_json(&input, &silent, &[]);
+    let z = cutout_json(&input, &zero, &["--rotate", "0"]);
+
+    assert_eq!(
+        std::fs::read(&silent).unwrap(),
+        std::fs::read(&zero).unwrap(),
+        "--rotate を渡さない実行のバイト列が動いた"
+    );
+    assert_eq!(a["settings"]["rotate"], 0.0, "{a}");
+    assert_eq!(z["settings"]["rotate"], 0.0, "{z}");
+    assert!(a.get("rotate").is_none(), "{a}");
+    assert!(rotate_auto_skips(&a).is_empty(), "{a}");
+}
+
+/// 受け入れ基準 (d)。同じ入力からは毎回同じ角度が出る。
+///
+/// 測る側（`level_rotation`）は凸包の辺を舐めて最小を採る——**ほぼ同じ面積の
+/// 最小が 2 つある形では入力の微差で答えが跳ぶ**ことを `subject.rs` が明記して
+/// いるので、同じ入力に対して跳ばないことはここで固定しておく
+#[test]
+fn cutout_rotate_auto_is_deterministic() {
+    let dir = fixture_dir();
+    let input = write_png(dir.path(), "tilted.png", &tilted_scene(12.0));
+
+    let angles: Vec<Value> = (0..3)
+        .map(|i| {
+            let output = dir.path().join(format!("out{i}.png"));
+            cutout_json(&input, &output, &["--rotate", "auto"])["rotate"]["angle"].clone()
+        })
+        .collect();
+    assert_eq!(angles[0], angles[1], "{angles:?}");
+    assert_eq!(angles[1], angles[2], "{angles:?}");
+    assert!(!angles[0].is_null(), "12 度傾けた主体が回っていない");
+}
+
+/// 受け入れ基準 (f)。**`auto` の綴りは契約として配られる。**
+///
+/// `--rotate` は自由な数値も取るので `PossibleValuesParser` では作れないが、
+/// `accepts` が空のままだと**綴りを外したときに code 無しの exit 2 で落ちる
+/// 項目の候補を、呼ぶ前に知る手段が無くなる**（`profile_parser` のコメントが
+/// 明記している事情）。ヘルプと `kiri schema` の両方に載ることをここで固定する
+#[test]
+fn the_rotate_option_publishes_auto_as_a_choice() {
+    let v = schema_json();
+    let rotate = v["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "cutout")
+        .expect("cutout が schema に無い")["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["name"] == "--rotate")
+        .expect("--rotate が schema に無い")
+        .clone();
+
+    let accepts: Vec<&str> = rotate["accepts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("--rotate が accepts を持たない: {rotate}"))
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
+    assert!(accepts.contains(&"auto"), "{rotate}");
+
+    let detail = rotate["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("auto"),
+        "長いヘルプが auto を語らない: {detail}"
+    );
+    // 分解能と適用条件は**指定の前に知っていないと選びようがない**
+    assert!(detail.contains("0.5"), "分解能の注意が無い: {detail}");
+    assert!(detail.contains("high"), "適用条件が無い: {detail}");
+
+    let help =
+        String::from_utf8(kiri().args(["cutout", "--help"]).output().unwrap().stdout).unwrap();
+    assert!(help.contains("auto"), "--help が auto を配っていない");
+}
+
+/// 読めない `--rotate` は clap が断る。**code は伴わない**（`--max-bytes` と同じ）。
+#[test]
+fn a_malformed_rotation_on_the_command_line_is_refused_by_the_parser() {
+    let dir = fixture_dir();
+    let input = write_png(dir.path(), "a.png", &disc_scene());
+    for written in ["ななめ", "AUTO", "nan", "inf"] {
+        let out = kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                dir.path().join("x.png").to_str().unwrap(),
+                "--rotate",
+                written,
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "--rotate {written}");
+        assert!(out.stdout.is_empty(), "--rotate {written} で stdout が出た");
+    }
+}
+
 /// spec からも同じ角度を書ける。**CLI と同じ 1 本の経路を通る。**
 #[test]
 fn the_batch_spec_accepts_a_rotation() {
@@ -10514,13 +11067,18 @@ fn the_batch_spec_rejects_an_angle_that_is_not_finite() {
     assert_eq!(json_stdout(&out)["error"]["code"], "SPEC_INVALID_JSON");
 }
 
-/// 数値でない角度は仕様の構造の検査で落ちる。
+/// 文字列で書いた角度も CLI と同じに読む。
+///
+/// **`max_bytes` とまったく同じ事情である。** エージェントが書く JSON には
+/// `90` と `"90"` の両方が現れ、片方を断ると CLI では通る書き方が spec でだけ
+/// 通らない道具になる。`auto` を受けるために型を `Value` へ広げた以上、
+/// 数値の綴りも CLI と同じ `finite` が読む（Phase 23 で挙動を変えた点）
 #[test]
-fn the_batch_spec_rejects_an_angle_that_is_not_a_number() {
+fn the_batch_spec_reads_an_angle_written_as_a_string() {
     let dir = fixture_dir();
     let img = product_image(&ProductSpec {
-        width: 120,
-        height: 120,
+        width: 200,
+        height: 140,
         ..Default::default()
     });
     write_png(dir.path(), "a.png", &img);
@@ -10530,8 +11088,119 @@ fn the_batch_spec_rejects_an_angle_that_is_not_a_number() {
     );
 
     let out = run_batch(&spec, &[]);
-    assert!(!out.status.success());
-    assert_eq!(json_stdout(&out)["error"]["code"], "SPEC_INVALID");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        json_stdout(&out)["results"][0]["result"]["rotate"]["angle"],
+        90.0
+    );
+}
+
+/// 受け入れ基準 (e)。spec でも `"auto"` と数値の両方が通る。
+///
+/// **CLI と同じパーサ（`cli::parse_rotate`）を通す。** 別に書くと、`auto` の
+/// 綴りが片方でだけ通る／通らないが起きる
+#[test]
+fn the_batch_spec_accepts_auto_and_a_number_for_the_rotation() {
+    let dir = fixture_dir();
+    write_png(dir.path(), "tilted.png", &tilted_scene(5.0));
+    let spec = write_spec(
+        dir.path(),
+        r#"{"defaults":{"format":"png"},
+            "items":[{"input":"tilted.png","output":"out/a.png","rotate":"auto"},
+                     {"input":"tilted.png","output":"out/b.png","rotate":12.5}]}"#,
+    );
+
+    let out = run_batch(&spec, &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    assert_eq!(v["succeeded"], 2, "{v}");
+    assert_eq!(
+        v["results"][0]["result"]["settings"]["rotate"], "auto",
+        "{v}"
+    );
+    // 5 度傾けた主体なので、auto は 355 付近（時計回りへ -5）を選ぶ
+    let auto = v["results"][0]["result"]["rotate"]["angle"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("auto が何も回していない: {v}"));
+    assert!((auto - 355.0).abs() < 1.5, "auto が {auto} 度を選んだ: {v}");
+    assert_eq!(v["results"][1]["result"]["settings"]["rotate"], 12.5, "{v}");
+    assert_eq!(v["results"][1]["result"]["rotate"]["angle"], 12.5, "{v}");
+}
+
+/// 受け入れ基準 (e)。読めない角度は `INVALID_ROTATE` でその項目だけを落とす。
+///
+/// **黙って 0 度へ落とさない。** 水平出しを頼んだつもりの項目が回らないまま
+/// 数百点に混ざると、気づけるのは目で見たときになる。`INVALID_MAX_BYTES` /
+/// `INVALID_FAIL_ON` と同じ扱いで、batch は 1 件の失敗で全体を止めないので
+/// 終了コードは処理失敗の 4 になる
+#[test]
+fn a_malformed_rotation_in_a_spec_is_refused_with_a_code() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 140,
+        ..Default::default()
+    });
+    write_png(dir.path(), "a.png", &img);
+    let spec = write_spec(
+        dir.path(),
+        r#"{"defaults":{"format":"png"},
+            "items":[{"input":"a.png","output":"out/a.png","rotate":90},
+                     {"input":"a.png","output":"out/b.png","rotate":"ななめ"},
+                     {"input":"a.png","output":"out/c.png","rotate":"auto"}]}"#,
+    );
+
+    let out = run_batch(&spec, &[]);
+    assert_eq!(out.status.code(), Some(4));
+    let v = json_stdout(&out);
+    assert_eq!(v["failed"], 1, "{v}");
+    assert_eq!(v["succeeded"], 2, "落ちた項目が伝播している: {v}");
+    assert_eq!(v["results"][1]["error"]["code"], "INVALID_ROTATE", "{v}");
+    assert_eq!(v["results"][0]["result"]["rotate"]["angle"], 90.0, "{v}");
+}
+
+/// 読めない角度は他の綴りでも同じ code で落ちる。
+#[test]
+fn every_unreadable_rotation_in_a_spec_lands_on_the_same_code() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 60,
+        height: 60,
+        ..Default::default()
+    });
+    write_jpeg(dir.path(), "p.jpg", &img);
+
+    for written in [
+        "\"\"",
+        "\"AUTO\"",
+        "\"auto \"",
+        "\"nan\"",
+        "\"inf\"",
+        "true",
+        "[90]",
+    ] {
+        let spec = write_spec(
+            dir.path(),
+            &format!(
+                r#"{{"items":[{{"input":"p.jpg","output":"out/x.png","rotate":{written}}}]}}"#
+            ),
+        );
+        let out = run_batch(&spec, &[]);
+        assert_eq!(out.status.code(), Some(4), "rotate:{written}");
+        let v = json_stdout(&out);
+        assert_eq!(
+            v["results"][0]["error"]["code"], "INVALID_ROTATE",
+            "rotate:{written}"
+        );
+    }
 }
 
 /// 影の換算基準は**回した後の長辺**である。
@@ -13194,6 +13863,581 @@ fn a_file_over_the_byte_budget_fails_only_the_size_check() {
     assert_eq!(code, 0, "{v}");
     assert!(
         lint_check(&v, "file_size")["actual"].as_u64().unwrap() <= limit,
+        "{v}"
+    );
+}
+
+// --- セット内のスケール・余白の統一（batch の `set`） ---
+
+/// 「同じ商品を距離を変えて撮った」合成シーン。
+///
+/// `product_image` は商品を**画像に対する固定の割合**で描くので、寸法だけを
+/// 変えても占有率が 1 ビットも動かない。距離の違いを作るには、小さく描いた
+/// 1 枚を大きな背景の中央へ貼る——背景色は同じで雑音も切ってあるので、
+/// 貼り合わせた継ぎ目は 1 画素も見えない。
+fn distance_scene(canvas: u32, product: (u32, u32)) -> image::RgbaImage {
+    let background = ProductSpec::default().background;
+    let mut scene = image::RgbaImage::from_pixel(
+        canvas,
+        canvas,
+        image::Rgba([background[0], background[1], background[2], 255]),
+    );
+    let shot = product_image(&ProductSpec {
+        width: product.0,
+        height: product.1,
+        noise: false,
+        ..Default::default()
+    });
+    image::imageops::overlay(
+        &mut scene,
+        &shot,
+        i64::from((canvas - product.0) / 2),
+        i64::from((canvas - product.1) / 2),
+    );
+    scene
+}
+
+/// 書かれた画像の中で、不透明な画素が縦に占める高さ(px)。
+///
+/// **報告の数値ではなく成果物そのものを測る。** `canvas.fill_ratio` が
+/// 正しくても、`plan()` へ渡す経路がどこかで落ちていれば画像は揃わない。
+fn written_subject_height(path: &Path) -> u32 {
+    let img = image::open(path).unwrap().to_rgba8();
+    let rows: Vec<u32> = (0..img.height())
+        .filter(|&y| (0..img.width()).any(|x| img.get_pixel(x, y).0[3] > 0))
+        .collect();
+    assert!(!rows.is_empty(), "{} が全面透明", path.display());
+    rows[rows.len() - 1] - rows[0] + 1
+}
+
+/// 受け入れ基準 (a) — 同じ商品を 3 通りの距離で撮ったセットを
+/// `align: "height"` に掛けると、**出力上の商品高さが ±1px で揃う。**
+///
+/// 4 点目に**同じ商品を横に寝かせた 1 枚**を混ぜてある。縦横比が違う点が
+/// 無いと、`--fill-ratio` を 1 つ書くだけでも高さは揃ってしまう
+/// （正方キャンバスでは縦長の商品の高さは常に `round(CH*f)` になる）ので、
+/// **この検査は `set` が何もしなくても通る。** 寝かせた 1 枚は
+/// `align: "bbox"`（＝ただの `fill_ratio`）なら別の高さになるので、
+/// 4 点が揃ったことが「高さで揃えた」ことの証拠になる。
+#[test]
+fn a_set_aligns_the_subject_height_across_shooting_distances() {
+    let dir = fixture_dir();
+    for (name, product) in [
+        ("near.png", (280, 280)),
+        ("mid.png", (200, 200)),
+        ("far.png", (120, 120)),
+        ("lying.png", (400, 200)),
+    ] {
+        write_png(dir.path(), name, &distance_scene(400, product));
+    }
+
+    let items = r#"[{"input":"near.png","output":"out/near.png"},
+                    {"input":"mid.png","output":"out/mid.png"},
+                    {"input":"far.png","output":"out/far.png"},
+                    {"input":"lying.png","output":"out/lying.png"}]"#;
+    let spec = write_spec(
+        dir.path(),
+        &format!(
+            r#"{{"set":{{"align":"height"}},
+                 "defaults":{{"canvas":"500x500","format":"png"}},
+                 "items":{items}}}"#
+        ),
+    );
+    let out = run_batch(&spec, &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+
+    let heights: Vec<u32> = ["near", "mid", "far", "lying"]
+        .iter()
+        .map(|n| written_subject_height(&dir.path().join(format!("out/{n}.png"))))
+        .collect();
+    let (lo, hi) = (
+        *heights.iter().min().unwrap(),
+        *heights.iter().max().unwrap(),
+    );
+    assert!(hi - lo <= 1, "高さが揃っていない: {heights:?}（{v}）");
+
+    // 目標は T * CH。報告の T からそのまま綴れる
+    let target = v["set"]["fill_ratio"].as_f64().expect("set が無い") * 500.0;
+    assert!(
+        heights
+            .iter()
+            .all(|h| (f64::from(*h) - target).abs() <= 1.0),
+        "目標 {target} と食い違う: {heights:?}"
+    );
+
+    // **横に寝かせた 1 枚は `bbox` 揃えなら別の高さになる。** ここが同じなら
+    // 上の表明は `set` を通さなくても成り立ってしまう
+    let bbox_spec = write_spec(
+        dir.path(),
+        &format!(
+            r#"{{"set":{{"align":"bbox","fill_ratio":{}}},
+                 "defaults":{{"canvas":"500x500","format":"png"}},
+                 "items":[{{"input":"lying.png","output":"out/bbox.png"}}]}}"#,
+            v["set"]["fill_ratio"]
+        ),
+    );
+    let out = run_batch(&bbox_spec, &[]);
+    assert_eq!(out.status.code(), Some(0));
+    let by_bbox = written_subject_height(&dir.path().join("out/bbox.png"));
+    assert!(
+        by_bbox.abs_diff(heights[3]) > 1,
+        "bbox 揃えと同じ高さになった（検査に意味が無い）: {by_bbox} vs {}",
+        heights[3]
+    );
+}
+
+/// 受け入れ基準 (b) — `set` を書かない実行の結果 JSON に `set` のキーは無い。
+///
+/// `compliance` / `optimize` と同じ規約である。**渡さない実行の結果 JSON が
+/// 1 バイトも変わらない**ことが加算だけの変更の条件で、`null` を置くと
+/// 「揃えていない」と「揃えられない（古い版）」が同じ形になる。
+///
+/// 出力そのものが変わっていないことは**既存のテストを 1 本も書き換えずに
+/// 通すこと**が言う。ここはキーの有無だけを固定する。
+#[test]
+fn a_spec_without_set_carries_no_set_block() {
+    let dir = fixture_dir();
+    write_png(dir.path(), "p.png", &distance_scene(400, (200, 200)));
+    let spec = write_spec(
+        dir.path(),
+        r#"{"defaults":{"canvas":"500x500","format":"png"},
+             "items":[{"input":"p.png","output":"out/a.png"}]}"#,
+    );
+    let out = run_batch(&spec, &[]);
+    assert_eq!(out.status.code(), Some(0));
+    let v = json_stdout(&out);
+    assert!(v.get("set").is_none(), "set を書いていないのに現れた: {v}");
+}
+
+/// 受け入れ基準 (c) — `align: "bbox"` は全点で `f_i = T` になる。
+///
+/// **`set` 無しで同じ `fill_ratio` を全項目へ書いた実行とバイト一致する。**
+/// `f_i = T * min(CW/cw, CH/ch) / min(CW/cw, CH/ch) = T` なので、外接矩形を
+/// 揃えるとは「同じ占有率を配る」ことそのものである。ここが食い違うなら、
+/// `f_i` を綴る式か渡す経路のどちらかが壊れている。
+#[test]
+fn a_bbox_aligned_set_writes_the_same_bytes_as_one_fill_ratio() {
+    let dir = fixture_dir();
+    for (name, product) in [("a.png", (280, 280)), ("b.png", (140, 220))] {
+        write_png(dir.path(), name, &distance_scene(400, product));
+    }
+
+    let by_set = write_spec(
+        dir.path(),
+        r#"{"set":{"align":"bbox","fill_ratio":0.7},
+             "defaults":{"canvas":"500x500","format":"png"},
+             "items":[{"input":"a.png","output":"set/a.png"},
+                      {"input":"b.png","output":"set/b.png"}]}"#,
+    );
+    assert_eq!(run_batch(&by_set, &[]).status.code(), Some(0));
+
+    let plain = dir.path().join("plain.json");
+    std::fs::write(
+        &plain,
+        r#"{"defaults":{"canvas":"500x500","format":"png","fill_ratio":0.7},
+             "items":[{"input":"a.png","output":"plain/a.png"},
+                      {"input":"b.png","output":"plain/b.png"}]}"#,
+    )
+    .unwrap();
+    assert_eq!(run_batch(&plain, &[]).status.code(), Some(0));
+
+    for name in ["a.png", "b.png"] {
+        assert_eq!(
+            std::fs::read(dir.path().join("set").join(name)).unwrap(),
+            std::fs::read(dir.path().join("plain").join(name)).unwrap(),
+            "{name} のバイト列が食い違う"
+        );
+    }
+}
+
+/// 受け入れ基準 (d) — `fill_ratio` を省いた `set` の T は、全点の占有率の
+/// **中央値**である。偶数個は中央 2 つの平均を採る。
+///
+/// 占有率は結果 JSON の `subject.normalized_bbox` から綴り直せる。pass 1 は
+/// `see_background` だけを通し、pass 2 の切り抜きも同じ見立てを使うので、
+/// **測り方が 2 つある余地が無い**ことをここで確かめる。
+#[test]
+fn the_set_target_is_the_median_of_the_measured_occupancies() {
+    let dir = fixture_dir();
+    for (name, product) in [
+        ("a.png", (120, 120)),
+        ("b.png", (200, 200)),
+        ("c.png", (280, 280)),
+        ("d.png", (340, 340)),
+    ] {
+        write_png(dir.path(), name, &distance_scene(400, product));
+    }
+
+    // 測った高さの割合を結果から集める
+    let heights = |v: &Value| -> Vec<f64> {
+        v["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                let b = &r["result"]["subject"]["normalized_bbox"];
+                b[3].as_f64().unwrap() - b[1].as_f64().unwrap()
+            })
+            .collect()
+    };
+    let median = |mut xs: Vec<f64>| -> f64 {
+        xs.sort_by(f64::total_cmp);
+        let n = xs.len();
+        if n % 2 == 1 {
+            xs[n / 2]
+        } else {
+            (xs[n / 2 - 1] + xs[n / 2]) / 2.0
+        }
+    };
+
+    for (label, items) in [
+        (
+            "奇数個",
+            r#"[{"input":"a.png","output":"out/a.png"},
+                {"input":"b.png","output":"out/b.png"},
+                {"input":"c.png","output":"out/c.png"}]"#,
+        ),
+        (
+            "偶数個",
+            r#"[{"input":"a.png","output":"even/a.png"},
+                {"input":"b.png","output":"even/b.png"},
+                {"input":"c.png","output":"even/c.png"},
+                {"input":"d.png","output":"even/d.png"}]"#,
+        ),
+    ] {
+        let spec = write_spec(
+            dir.path(),
+            &format!(
+                r#"{{"set":{{"align":"height"}},
+                     "defaults":{{"canvas":"500x500","format":"png"}},
+                     "items":{items}}}"#
+            ),
+        );
+        let out = run_batch(&spec, &[]);
+        assert_eq!(out.status.code(), Some(0), "{label}");
+        let v = json_stdout(&out);
+        let want = median(heights(&v));
+        let got = v["set"]["fill_ratio"].as_f64().unwrap();
+        assert!(
+            (got - want).abs() < 1e-4,
+            "{label}: T {got} が中央値 {want} と違う: {v}"
+        );
+        assert_eq!(v["set"]["source"], "median", "{label}");
+        assert_eq!(v["set"]["align"], "height", "{label}");
+        assert_eq!(
+            v["set"]["measured"].as_u64().unwrap() as usize,
+            v["results"].as_array().unwrap().len(),
+            "{label}: 測れた件数が合わない"
+        );
+    }
+}
+
+/// 受け入れ基準 (e) — 極端に横長の 1 点は `f_i > 1.0` になり、1.0 で止めて
+/// `SET_SCALE_CLAMPED` を出す。**他の点は 1 バイトも影響を受けない。**
+///
+/// **これは「1 点だけ外れた異常」ではなく物理である。** 正方キャンバスで
+/// 高さを `T*CH` にすると、横幅は `T*CH*(cw/ch)` を要求する。縦横比が
+/// `1/T` を超える横長では、それがキャンバスの幅を越える。黙って
+/// 「高さが揃った」ことにせず、止めたことと目標との差を報せる。
+#[test]
+fn an_extremely_wide_item_is_clamped_without_touching_the_others() {
+    let dir = fixture_dir();
+    write_png(dir.path(), "a.png", &distance_scene(400, (200, 200)));
+    write_png(dir.path(), "b.png", &distance_scene(400, (280, 280)));
+    // 縦横比 1.12/0.68 ≈ 1.65。T=0.85 では f_i ≈ 1.40 になる
+    write_png(dir.path(), "wide.png", &distance_scene(400, (400, 160)));
+
+    // **T は書いて固定する。** 中央値のままだと「横長を外した spec」で
+    // T が動いてしまい、残りの点のバイト一致を比べる意味が無くなる
+    let with_wide = write_spec(
+        dir.path(),
+        r#"{"set":{"align":"height","fill_ratio":0.85},
+             "defaults":{"canvas":"500x500","format":"png"},
+             "items":[{"input":"a.png","output":"all/a.png"},
+                      {"input":"wide.png","output":"all/wide.png"},
+                      {"input":"b.png","output":"all/b.png"}]}"#,
+    );
+    let out = run_batch(&with_wide, &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+
+    let clamped = &v["results"][1]["result"]["warnings"];
+    let warning = clamped
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "SET_SCALE_CLAMPED")
+        .unwrap_or_else(|| panic!("横長で止まっていない: {clamped}"));
+    assert_eq!(warning["data"]["used_fill_ratio"], 1.0);
+    assert!(
+        warning["data"]["requested_fill_ratio"].as_f64().unwrap() > 1.0,
+        "{warning}"
+    );
+    assert!(
+        warning["data"]["height_shortfall"].as_i64().unwrap() > 0,
+        "目標との差が出ていない: {warning}"
+    );
+    assert_eq!(v["set"]["clamped"], 1, "{v}");
+
+    // 他の 2 点には 1 件も出ない
+    for i in [0, 2] {
+        assert!(
+            !has_warning(&v["results"][i]["result"], "SET_SCALE_CLAMPED"),
+            "{i} 件目に波及した: {v}"
+        );
+    }
+
+    // 横長を外した実行と、残りの点の出力がバイト一致する
+    let without = dir.path().join("without.json");
+    std::fs::write(
+        &without,
+        r#"{"set":{"align":"height","fill_ratio":0.85},
+             "defaults":{"canvas":"500x500","format":"png"},
+             "items":[{"input":"a.png","output":"rest/a.png"},
+                      {"input":"b.png","output":"rest/b.png"}]}"#,
+    )
+    .unwrap();
+    assert_eq!(run_batch(&without, &[]).status.code(), Some(0));
+    for name in ["a.png", "b.png"] {
+        assert_eq!(
+            std::fs::read(dir.path().join("all").join(name)).unwrap(),
+            std::fs::read(dir.path().join("rest").join(name)).unwrap(),
+            "{name} が横長の有無で変わった"
+        );
+    }
+}
+
+/// 受け入れ基準 (f) — 1 点も測れなければ `set` は効かず `SET_NOT_MEASURED` を
+/// 実行全体の警告として出す。
+///
+/// 各項目は自分で解決した `fill_ratio` をそのまま使う。**本当のエラーは
+/// pass 2 が報告する**——pass 1 は測れなかったことしか知らないので、
+/// 読めない理由をここで名乗ると同じ失敗が 2 通りの綴りで返る。
+#[test]
+fn a_set_that_measures_nothing_says_so_and_stands_aside() {
+    let dir = fixture_dir();
+    let spec = write_spec(
+        dir.path(),
+        r#"{"set":{"align":"height"},
+             "defaults":{"canvas":"500x500","format":"png"},
+             "items":[{"input":"missing.png","output":"out/a.png"}]}"#,
+    );
+    let out = run_batch(&spec, &[]);
+    assert_eq!(out.status.code(), Some(4), "pass 2 の失敗で 4 になるはず");
+    let v = json_stdout(&out);
+    assert!(
+        has_warning(&v, "SET_NOT_MEASURED"),
+        "実行全体の警告に出ていない: {v}"
+    );
+    assert!(
+        v.get("set").is_none(),
+        "効いていないのにブロックがある: {v}"
+    );
+    assert_eq!(v["results"][0]["status"], "error");
+}
+
+/// 受け入れ基準 (g) — 同じ spec を 3 回走らせて、T も全項目の出力バイト列も
+/// 同じである。
+#[test]
+fn the_same_set_spec_is_deterministic() {
+    let dir = fixture_dir();
+    for (name, product) in [
+        ("a.png", (140, 200)),
+        ("b.png", (220, 220)),
+        ("c.png", (300, 180)),
+    ] {
+        write_png(dir.path(), name, &distance_scene(400, product));
+    }
+    let mut seen: Option<(f64, Vec<Vec<u8>>)> = None;
+    for round in 0..3 {
+        let spec = write_spec(
+            dir.path(),
+            &format!(
+                r#"{{"set":{{"align":"height"}},
+                     "defaults":{{"canvas":"500x500","format":"png"}},
+                     "items":[{{"input":"a.png","output":"r{round}/a.png"}},
+                              {{"input":"b.png","output":"r{round}/b.png"}},
+                              {{"input":"c.png","output":"r{round}/c.png"}}]}}"#
+            ),
+        );
+        assert_eq!(run_batch(&spec, &[]).status.code(), Some(0));
+        let v = json_stdout(&run_batch(&spec, &["--force"]));
+        let target = v["set"]["fill_ratio"].as_f64().unwrap();
+        let bytes: Vec<Vec<u8>> = ["a.png", "b.png", "c.png"]
+            .iter()
+            .map(|n| std::fs::read(dir.path().join(format!("r{round}")).join(n)).unwrap())
+            .collect();
+        match &seen {
+            None => seen = Some((target, bytes)),
+            Some((first, first_bytes)) => {
+                assert_eq!(*first, target, "{round} 回目で T が動いた");
+                assert_eq!(*first_bytes, bytes, "{round} 回目で出力が動いた");
+            }
+        }
+    }
+}
+
+/// 受け入れ基準 (i) — `--jobs` を変えても T と全項目の出力は 1 ビットも
+/// 動かない。
+///
+/// pass 1 は並べて回してよいが、**集計は順序に依らない**（並べ替えてから
+/// 中央を採る）。ここが崩れると、同じ spec が機械の負荷で違う仕上がりを出す。
+#[test]
+fn the_number_of_jobs_does_not_move_the_set_target() {
+    let dir = fixture_dir();
+    for (name, product) in [
+        ("a.png", (120, 180)),
+        ("b.png", (200, 200)),
+        ("c.png", (260, 200)),
+        ("d.png", (320, 240)),
+    ] {
+        write_png(dir.path(), name, &distance_scene(400, product));
+    }
+    let mut seen: Option<(f64, Vec<Vec<u8>>)> = None;
+    for jobs in ["1", "4"] {
+        let spec = write_spec(
+            dir.path(),
+            &format!(
+                r#"{{"set":{{"align":"height"}},
+                     "defaults":{{"canvas":"500x500","format":"png"}},
+                     "items":[{{"input":"a.png","output":"j{jobs}/a.png"}},
+                              {{"input":"b.png","output":"j{jobs}/b.png"}},
+                              {{"input":"c.png","output":"j{jobs}/c.png"}},
+                              {{"input":"d.png","output":"j{jobs}/d.png"}}]}}"#
+            ),
+        );
+        let out = run_batch(&spec, &["--jobs", jobs]);
+        assert_eq!(out.status.code(), Some(0));
+        let v = json_stdout(&out);
+        let target = v["set"]["fill_ratio"].as_f64().unwrap();
+        let bytes: Vec<Vec<u8>> = ["a.png", "b.png", "c.png", "d.png"]
+            .iter()
+            .map(|n| std::fs::read(dir.path().join(format!("j{jobs}")).join(n)).unwrap())
+            .collect();
+        match &seen {
+            None => seen = Some((target, bytes)),
+            Some((first, first_bytes)) => {
+                assert_eq!(*first, target, "--jobs {jobs} で T が動いた");
+                assert_eq!(*first_bytes, bytes, "--jobs {jobs} で出力が動いた");
+            }
+        }
+    }
+}
+
+/// 受け入れ基準 (h) — `set` と噛み合わない spec は断る。
+///
+/// **「指定したのに効かない」を作らない**のが要点である。`fill_ratio` を
+/// 書いた人はその値を望んでいるので、`set` が上から別の値を配るなら
+/// spec を読んだ時点で断る。`canvas` の無い項目も同じで、`set` は
+/// キャンバス上の占有率の話なので canvas 無しでは意味を持たない。
+#[test]
+fn a_set_that_cannot_take_effect_is_refused() {
+    let dir = fixture_dir();
+    write_png(dir.path(), "p.png", &distance_scene(400, (200, 200)));
+
+    let refuse = |json: &str| -> (Option<i32>, Value) {
+        let spec = write_spec(dir.path(), json);
+        let out = run_batch(&spec, &[]);
+        (out.status.code(), json_stdout(&out))
+    };
+
+    // defaults に fill_ratio がある
+    let (code, v) = refuse(
+        r#"{"set":{"align":"height"},
+             "defaults":{"canvas":"500x500","fill_ratio":0.8},
+             "items":[{"input":"p.png","output":"out/a.png"}]}"#,
+    );
+    assert_eq!(code, Some(2), "{v}");
+    assert_eq!(v["error"]["code"], "INVALID_SET", "{v}");
+
+    // 項目に fill_ratio がある
+    let (code, v) = refuse(
+        r#"{"set":{"align":"height"},
+             "defaults":{"canvas":"500x500"},
+             "items":[{"input":"p.png","output":"out/a.png","fill_ratio":0.8}]}"#,
+    );
+    assert_eq!(code, Some(2), "{v}");
+    assert_eq!(v["error"]["code"], "INVALID_SET", "{v}");
+
+    // align の綴り違い
+    let (code, v) = refuse(
+        r#"{"set":{"align":"heigth"},
+             "defaults":{"canvas":"500x500"},
+             "items":[{"input":"p.png","output":"out/a.png"}]}"#,
+    );
+    assert_eq!(code, Some(2), "{v}");
+    assert_eq!(v["error"]["code"], "INVALID_SET", "{v}");
+
+    // set の中の未知のキーは既存の綴り検査が断る
+    let (code, v) = refuse(
+        r#"{"set":{"align":"height","fill_ration":0.8},
+             "defaults":{"canvas":"500x500"},
+             "items":[{"input":"p.png","output":"out/a.png"}]}"#,
+    );
+    // 綴り違いは仕様ファイルの異常なので exit 3（`SPEC_UNKNOWN_FIELD` は
+    // `ErrorKind::Input`）。`set` の中でも他の階層と同じ 1 本を通る
+    assert_eq!(code, Some(3), "{v}");
+    assert_eq!(v["error"]["code"], "SPEC_UNKNOWN_FIELD", "{v}");
+    assert!(
+        v["error"]["hint"].as_str().unwrap().contains("fill_ratio"),
+        "{v}"
+    );
+
+    // canvas がどこからも取れない項目。**その項目だけが落ちる**（batch は
+    // 1 件の失敗で全体を止めない規約なので、実行全体は 4 で返る）
+    let (code, v) = refuse(
+        r#"{"set":{"align":"height"},
+             "items":[{"input":"p.png","output":"out/a.png"}]}"#,
+    );
+    assert_eq!(code, Some(4), "{v}");
+    assert_eq!(v["results"][0]["error"]["code"], "INVALID_SET", "{v}");
+}
+
+/// profile の `fill_ratio` は `set` が上書きし、`PROFILE_OVERRIDDEN` で報せる。
+///
+/// 優先順位は **明示指定 > set > profile > 既定**。上書きを黙ると、
+/// 「規格の占有率で書いたはず」のセットが別の値で揃ったまま納品される。
+#[test]
+fn a_set_overrides_the_profile_fill_ratio_and_says_so() {
+    let dir = fixture_dir();
+    write_png(dir.path(), "p.png", &distance_scene(400, (200, 200)));
+    let spec = write_spec(
+        dir.path(),
+        r#"{"set":{"align":"bbox","fill_ratio":0.6},
+             "defaults":{"profile":"amazon"},
+             "items":[{"input":"p.png","output":"out/a.jpg"}]}"#,
+    );
+    let out = run_batch(&spec, &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    let warnings = &v["results"][0]["result"]["warnings"];
+    let w = warnings
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "PROFILE_OVERRIDDEN" && w["data"]["key"] == "fill_ratio")
+        .unwrap_or_else(|| panic!("上書きを報せていない: {warnings}"));
+    assert_eq!(w["data"]["by"], "set", "{w}");
+    assert_eq!(w["data"]["used"], 0.6, "{w}");
+    // **効いた占有率は canvas ブロックが言う。** `align: "bbox"` なので T そのもの
+    assert_eq!(
+        v["results"][0]["result"]["canvas"]["fill_ratio"], 0.6,
         "{v}"
     );
 }

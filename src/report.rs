@@ -6,6 +6,7 @@
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::cli::RotateArg;
 use crate::cutout::Confidence;
 use crate::error::{Error, ErrorCode};
 use crate::image_io::IccSignal;
@@ -181,6 +182,23 @@ pub struct SubjectReport {
     /// そのまま角度の誤差になる。小数第 4 位まで出るが、**0.5 度を下回る差を
     /// 有意と読んではならない**（「0 になるまで回し直す」ループを組まないこと）。
     pub level_rotation: Option<f64>,
+    /// 主体の凸包の面積 / 最小面積外接矩形の面積。**`level_rotation` を
+    /// どれだけ信用してよいかを言う値である。**
+    ///
+    /// 1.0 に近いほど、最小外接矩形がその形を実際に describe している。長方形は
+    /// 1.0、角丸で 0.98、取っ手つきの商品で 0.88 あたり、**円は π/4≈0.785 が
+    /// 上限**である。
+    ///
+    /// **`cutout --rotate auto` はこれが 0.85 未満なら回さない**
+    /// （`ROTATE_AUTO_SKIPPED` の `data.reason` が `not_rectangular`）。円に
+    /// 取っ手が 1 本生えた形では最小外接矩形の位置が輪郭の量子化で決まり、
+    /// 水平に置いたフライパン（真値 0 度）に `-21.7` 度が `"high"` で返る。
+    /// **`level_rotation` を自分で読んで回す経路でも、同じ値で同じ判断を
+    /// すること。**
+    ///
+    /// `level_rotation` が `null` なら、ここも `null`。同じ凸包から同時に出る
+    /// 値なので、片方だけが埋まることは無い。
+    pub level_fill_ratio: Option<f64>,
     /// 主体の統計を測った外周の帯の幅(px)。
     ///
     /// 既定では `settings.border` と同じ値になる。`--border` が短辺の 3% を
@@ -552,13 +570,18 @@ pub struct SettingsReport {
     /// 落ち影を合成したか（"off" / "synth"）。**常に出す。**
     /// 実際に効いたずらし量とぼかしは `shadow` ブロックのほう
     pub shadow: &'static str,
-    /// `--rotate` の**指定値**(度)。**常に出す。**
+    /// `--rotate` の**指定値**。**常に出す。数値か `"auto"` の union である。**
     ///
     /// `shadow` と同じ二段構えである。実際に効いた角度は `rotate.angle`
     /// （`[0, 360)` へ正規化したもの）で、回らなかった指定——`0` と `360`——
     /// では `rotate` ブロックごと現れない。**ここが無いと、`--rotate 360` を
     /// 渡した実行と渡さなかった実行の JSON が 1 バイトも違わない**
-    pub rotate: f64,
+    ///
+    /// **`auto` を 0 に潰さない**のも同じ理由である。潰すと「回さないと指定した」と
+    /// 「測って決めろと指定したが、測れなくて回らなかった」が同じ JSON になる。
+    /// 後者が起きたことは `ROTATE_AUTO_SKIPPED` が理由つきで言うので、ここは
+    /// 指定をそのままの形で返し切る（数値を指定した実行の形は 1 バイトも動かない）
+    pub rotate: RotateArg,
     /// `--segment` の**指定値**（"off" / "auto" / "isnet"）
     pub segment: &'static str,
     /// 実際にモデルが走ったか。**`auto` では指定値から読めない**——
@@ -788,6 +811,15 @@ pub struct BatchReport {
     pub with_warnings: usize,
     /// この実行が実際に書き出したか。項目ごとの結果にも同じものが入る
     pub dry_run: bool,
+    /// セット統一が効いたときだけ出る。**`set` を書かない実行ではキーごと
+    /// 現れない**——`compliance` / `optimize` と同じ規約で、渡さない実行の
+    /// 結果 JSON は 1 バイトも変わらない。
+    ///
+    /// **1 点も測れずに効かなかった実行でも現れない。** ここが語るのは
+    /// 「実際に何で揃えたか」であり、揃えていない実行に書く値が無い。
+    /// 効かなかったことは `warnings` の `SET_NOT_MEASURED` が理由つきで言う
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub set: Option<SetReport>,
     /// 実行**全体**に掛かる警告。項目ごとの警告は `results[].result.warnings`。
     ///
     /// **加算だけの変更である。** ここが空なのは今までどおりの実行で、いま入りうる
@@ -797,6 +829,29 @@ pub struct BatchReport {
     pub warnings: Vec<Warning>,
     pub elapsed_ms: u128,
     pub results: Vec<BatchItemReport>,
+}
+
+/// セット統一が実際に何で揃えたか。
+///
+/// **要求ではなく効いたものを返す。** 目標 T の出どころ（書かれた値か、
+/// 測った中央値か）まで返すのは、同じ `fill_ratio` という数でも、次の一手が
+/// そこで変わるためである——書いた値なら書き直せばよいが、中央値なら
+/// **セットの構成を変えない限り動かない。**
+#[derive(Debug, Serialize)]
+pub struct SetReport {
+    /// 何で揃えたか（"height" / "bbox"）
+    pub align: &'static str,
+    /// 効いた目標 T。**点ごとに実際に効いた占有率はこれではない**
+    /// （`results[].result.canvas.fill_ratio` のほうが返す）
+    pub fill_ratio: f64,
+    /// T の出どころ（"specified" / "median"）
+    pub source: &'static str,
+    /// 代表寸法を測れた項目の数。`source` が "specified" なら 0
+    /// （**測っていない**——書かれた T があるので pass 1 ごと省く）
+    pub measured: usize,
+    /// 占有率が 1.0 を超えて上限で止まった項目の数。
+    /// 0 でない項目は `SET_SCALE_CLAMPED` を持つ
+    pub clamped: usize,
 }
 
 /// `--fail-on` の判定。**`--fail-on` を指定したときだけ出る。**
@@ -1148,11 +1203,14 @@ pub struct FieldEntry {
     /// この項目が現れるコマンド。`info` で取れない値を待たせないため
     pub appears_in: Vec<&'static str>,
     /// 値の種類。**語彙はこの一覧がすべてである**——`ratio` / `delta_e` /
-    /// `gradient` / `px` / `px_at_1000` / `deg` / `ms` / `count` / `quality` /
-    /// `bool` / `enum` / `path` / `text` / `list` / `normalized_bbox`。
+    /// `gradient` / `px` / `px_at_1000` / `deg` / `deg_or_auto` / `ms` / `count` /
+    /// `quality` / `bool` / `enum` / `path` / `text` / `list` / `normalized_bbox`。
     ///
     /// `text` は**決まった選択肢を持たない文字列**である（`compliance.fail_on`）。
     /// `enum` と分けるのは、受け手が値を照合してよいかどうかがここで変わるため
+    ///
+    /// `deg_or_auto` は**数値か `"auto"` の union**である（`settings.rotate`）。
+    /// `deg` と分けるのは、受け手が `as_f64()` で読んでよいかがここで変わるため
     ///
     /// schema はこれをそのまま配るので、綴りも契約である。増やすときはここと
     /// `every_published_unit_is_in_the_known_vocabulary` の両方を直す。

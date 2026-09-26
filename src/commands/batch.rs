@@ -10,16 +10,22 @@ use rayon::prelude::*;
 
 use crate::batch::{self, BatchItem, ItemSettings};
 use crate::cli::{
-    BatchArgs, ColorOpts, CutoutArgs, OutputOpts, Polygon, SegmentOpts, parse_hex_color, parse_size,
+    BatchArgs, ColorOpts, CutoutArgs, OutputOpts, Polygon, RotateArg, SegmentOpts, parse_hex_color,
+    parse_size,
 };
 use crate::commands::{cutout, output};
 use crate::compliance::FailOn;
-use crate::cutout::{BackgroundModel, CutoutOptions, DEFAULT_BORDER, Matting, OptimizeFixed};
+use crate::cutout::{
+    BackgroundModel, CutoutOptions, DEFAULT_BORDER, Matting, OptimizeFixed, see_background,
+};
 use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::OutputFormat;
 use crate::image_io::derive::DeriveSpec;
+use crate::image_io::load;
 use crate::profile::{self, ExplicitOptions, PROFILE_NAMES};
-use crate::report::{BatchItemReport, BatchReport, ErrorBody, ManifestItem, SCHEMA_VERSION};
+use crate::report::{
+    BatchItemReport, BatchReport, ErrorBody, ManifestItem, SCHEMA_VERSION, SetReport,
+};
 use crate::segment::SegmentMode;
 use crate::transform::shadow::ShadowMode;
 use crate::warning::{Warning, WarningCode};
@@ -44,13 +50,36 @@ pub fn run(args: &BatchArgs) -> Result<BatchReport> {
             .into_iter()
             .collect();
 
+    // **プールは 1 本だけ建てて 2 つの pass で使い回す。** 2 本建てると
+    // `--jobs` の意味が「同時に走る件数」から「pass ごとの上限」へ静かに
+    // 変わる。`jobs == 1` では建てない——1 スレッドのプールで回すのと結果は
+    // 同じだが、費用を払う理由が無い
+    let pool = if args.jobs == 1 {
+        None
+    } else {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(args.jobs)
+                .build()
+                .map_err(|e| Error::new(ErrorCode::ThreadPoolFailed, e.to_string()))?,
+        )
+    };
+
+    // **pass 1。** `--dry-run` でも走る（Phase 19 の「--dry-run でも探索は
+    // 走る」と同じ規約で、1 バイトも書かずに「何が起きるか」を返すのが
+    // その旗の約束である）
+    let (set, set_warnings) = resolve_set(&spec, &base, pool.as_ref());
+
     let process = |item: &BatchItem| -> BatchItemReport {
         let input = batch::resolve(&base, &item.input);
         let output = batch::resolve(&base, &item.output);
         let settings = item.settings.merged_over(&spec.defaults);
 
         let outcome = to_cutout_args(&base, &input, &output, &settings, args.force, args.dry_run)
-            .and_then(|args| cutout::run(&args));
+            .and_then(|mut args| {
+                attach_set(&mut args, set.as_ref().map(|s| s.placement))?;
+                cutout::run(&args)
+            });
 
         match outcome {
             Ok(report) => BatchItemReport {
@@ -76,15 +105,7 @@ pub fn run(args: &BatchArgs) -> Result<BatchReport> {
     };
 
     // par_iter は入力順を保つので、結果の並びは仕様ファイルどおりになる
-    let results: Vec<BatchItemReport> = if args.jobs == 1 {
-        spec.items.iter().map(process).collect()
-    } else {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(args.jobs)
-            .build()
-            .map_err(|e| Error::new(ErrorCode::ThreadPoolFailed, e.to_string()))?
-            .install(|| spec.items.par_iter().map(process).collect())
-    };
+    let results: Vec<BatchItemReport> = map_items(pool.as_ref(), &spec.items, process);
 
     let failed = results.iter().filter(|r| r.status == "error").count();
     let rejected = results.iter().filter(|r| r.status == REJECTED).count();
@@ -93,8 +114,35 @@ pub fn run(args: &BatchArgs) -> Result<BatchReport> {
         .filter(|r| r.result.as_ref().is_some_and(|c| !c.warnings.is_empty()))
         .count();
 
-    let mut warnings = manifest_warnings;
+    // **セット統一の報告は指示についてのもの**なので、書き出しの結果より先に
+    // 並べる（`cutout::run` が指示の警告を結果の警告より先に置くのと同じ）
+    let mut warnings = set_warnings;
+    warnings.extend(manifest_warnings);
     warnings.extend(write_manifest(args, &results, failed)?);
+
+    let set = set.map(|set| SetReport {
+        align: set.placement.align.as_str(),
+        // **丸めない。** `align: "bbox"` では `f_i = T` なので、ここと
+        // `results[].result.canvas.fill_ratio` は同じ 1 つの数である。片方だけを
+        // 小数第 4 位で畳むと、受け手が等値で比べたときに食い違う。
+        // `canvas.fill_ratio` は要求値をそのまま返してきた側なので、丸めを
+        // 足すほうが規約を動かすことになる
+        fill_ratio: set.placement.target,
+        source: set.source,
+        measured: set.measured,
+        // **止まった件数は pass 2 を終えてからしか数えられない。** `f_i` は
+        // 切り抜いた後の寸法で決まるので、pass 1 には分からない
+        clamped: results
+            .iter()
+            .filter(|r| {
+                r.result.as_ref().is_some_and(|c| {
+                    c.warnings
+                        .iter()
+                        .any(|w| w.code == WarningCode::SetScaleClamped)
+                })
+            })
+            .count(),
+    });
 
     Ok(BatchReport {
         schema_version: SCHEMA_VERSION,
@@ -108,10 +156,213 @@ pub fn run(args: &BatchArgs) -> Result<BatchReport> {
         rejected,
         with_warnings,
         dry_run: args.dry_run,
+        set,
         warnings,
         elapsed_ms: started.elapsed().as_millis(),
         results,
     })
+}
+
+/// 全項目を（建ててあればプールの上で）回す。
+///
+/// **pass 1 と pass 2 で同じ 1 本を通す。** `par_iter` は入力順を保つので、
+/// どちらの結果も仕様ファイルの並びのままになる。
+fn map_items<T: Send>(
+    pool: Option<&rayon::ThreadPool>,
+    items: &[BatchItem],
+    f: impl Fn(&BatchItem) -> T + Sync + Send,
+) -> Vec<T> {
+    match pool {
+        None => items.iter().map(f).collect(),
+        Some(pool) => pool.install(|| items.par_iter().map(&f).collect()),
+    }
+}
+
+/// pass 1 を終えた `set`。
+struct ResolvedSet {
+    placement: batch::SetPlacement,
+    /// 目標 T の出どころ（"specified" / "median"）
+    source: &'static str,
+    /// 代表寸法を測れた項目の数
+    measured: usize,
+}
+
+/// pass 1 — 全点の代表寸法を測り、揃える目標 T を決める。
+///
+/// # 切り抜きは 1 度も回さない
+///
+/// 要るのは `subject.normalized_bbox` だけで、それは `see_background` が
+/// 背景の見立てと一緒に返す。切り抜きまで回すと 1 件あたりの費用が二桁変わる
+/// うえ、**pass 2 が同じことをもう一度やる。** 増えるのは decode 1 回ぶんで、
+/// 1000 点級でも「2 回デコードする」が素直である（キャッシュは要らない）。
+///
+/// # 測れなかった項目は材料から外す
+///
+/// 読めない画像も、主体が見つからない画像もある。ここで落とすと、1 点の
+/// 素材事故がセット全体を止める——**本当のエラーは pass 2 が項目ごとに
+/// 報告する**ので、ここは黙って外すのが正しい。1 点も測れなければ `set` は
+/// 効かず、`SET_NOT_MEASURED` が実行全体の警告としてそう言う。
+///
+/// # `set.fill_ratio` があるときは pass 1 ごと省く
+///
+/// 中央値を採る相手がいない。測っても 1 点も使わない decode を全点ぶん積む
+/// だけなので、**分岐で明示的に抜ける。**
+fn resolve_set(
+    spec: &batch::BatchSpec,
+    base: &Path,
+    pool: Option<&rayon::ThreadPool>,
+) -> (Option<ResolvedSet>, Vec<Warning>) {
+    let Some(set) = spec.set.as_ref() else {
+        return (None, Vec::new());
+    };
+    // 綴りと値域は `batch::load` が spec を読んだ時点で断っている。ここへ
+    // 届く時点でどちらも解ける（解けなければ `run()` はもう返っている）
+    let (Ok(align), Ok(target)) = (set.align(), set.target()) else {
+        return (None, Vec::new());
+    };
+
+    if let Some(target) = target {
+        return (
+            Some(ResolvedSet {
+                placement: batch::SetPlacement { align, target },
+                source: "specified",
+                measured: 0,
+            }),
+            Vec::new(),
+        );
+    }
+
+    let measured: Vec<f64> = map_items(pool, &spec.items, |item| {
+        occupancy(
+            &item.settings.merged_over(&spec.defaults),
+            base,
+            item,
+            align,
+        )
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+    let count = measured.len();
+
+    match median(measured) {
+        // 材料はどれも `(0, 1]` の正規化座標なので中央値もその中に入るが、
+        // **`plan()` が断る値を渡さない**ことは式ではなく型で守れないので、
+        // ここで 1 度だけ畳んでおく
+        Some(target) => (
+            Some(ResolvedSet {
+                placement: batch::SetPlacement {
+                    align,
+                    target: target.min(1.0),
+                },
+                source: "median",
+                measured: count,
+            }),
+            Vec::new(),
+        ),
+        None => (
+            None,
+            vec![
+                Warning::new(
+                    WarningCode::SetNotMeasured,
+                    format!(
+                        "{} 点のどれからも代表寸法を測れなかったので、セット統一を適用していません",
+                        spec.items.len()
+                    ),
+                )
+                .with_hint(
+                    "読めない画像か、主体を 1 つも検出できない画像だけのセットです。\
+                     個々の理由は results[] が言います。目標を自分で決めるなら \
+                     set.fill_ratio を書いてください（そのときは測りません）",
+                )
+                .with_data("align", align.as_str())
+                .with_data("items", spec.items.len()),
+            ],
+        ),
+    }
+}
+
+/// 1 点の占有率を測る。**測れなければ `None`。**
+///
+/// `align` で見る辺が変わる。どちらも `normalized_bbox`（自分の枠に対する
+/// 割合）から採るので**無次元**で、寸法の違う画像どうしを比べられる。
+fn occupancy(
+    settings: &ItemSettings,
+    base: &Path,
+    item: &BatchItem,
+    align: batch::SetAlign,
+) -> Option<f64> {
+    let input = batch::resolve(base, &item.input);
+    // **読み込みの設定は pass 2 と同じものを使う。** `color_convert` を
+    // 取り違えると、測った画素と切り抜く画素が違う色空間になる
+    let color = ColorOpts {
+        no_color_convert: !settings.color_convert.unwrap_or(true),
+    };
+    let loaded = load::load_with(&input, &color.to_load_options()).ok()?;
+    let border = settings.border.unwrap_or(DEFAULT_BORDER);
+    let bbox = see_background(&loaded.image, border)
+        .subject?
+        .normalized_bbox;
+    let value = match align {
+        batch::SetAlign::Height => bbox[3] - bbox[1],
+        batch::SetAlign::Bbox => (bbox[2] - bbox[0]).max(bbox[3] - bbox[1]),
+    };
+    (value.is_finite() && value > 0.0).then_some(value.min(1.0))
+}
+
+/// 中央値。偶数個は中央 2 つの平均を採る。
+///
+/// **並べ替えてから採るので、測った順序に依らない。** `--jobs` を変えても
+/// T が 1 ビットも動かないのはここが理由で、`par_iter` の並び保存に頼って
+/// いるわけではない。`total_cmp` を使うのは、比較が決定的であることを
+/// 型で言い切るためである（材料は有限値だけだが、そこに `unwrap` を
+/// 置きたくない）。
+fn median(mut values: Vec<f64>) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let n = values.len();
+    Some(if n % 2 == 1 {
+        values[n / 2]
+    } else {
+        (values[n / 2 - 1] + values[n / 2]) / 2.0
+    })
+}
+
+/// `set` をこの項目へ効かせる。**canvas が取れない項目は断る。**
+///
+/// `set` はキャンバス上の占有率の話なので、canvas の無い項目では意味を持たない。
+/// 黙って素通しにすると、その 1 点だけが揃わないまま数百点に混ざる——
+/// しかも結果 JSON は `set` が効いたと言うので、並べて見るまで気づけない。
+///
+/// **profile の canvas も数える。** `--profile amazon` は寸法を決めるので、
+/// spec に `canvas` が無くてもキャンバスはある。ここで profile を見ないと、
+/// 「profile で寸法を決めたセット」だけが `set` を使えない道具になる。
+///
+/// `to_cutout_args` の引数にしないのは、**この判断が canvas と profile の
+/// 両方が解けた後にしかできない**ためである。解けた姿（`CutoutArgs`）を
+/// 見れば 2 行で済む。
+fn attach_set(args: &mut CutoutArgs, set: Option<batch::SetPlacement>) -> Result<()> {
+    let Some(placement) = set else {
+        return Ok(());
+    };
+    let has_canvas = args.canvas.is_some()
+        || args
+            .profile
+            .is_some_and(|p| p.write_defaults().canvas.is_some());
+    if !has_canvas {
+        return Err(Error::new(
+            ErrorCode::InvalidSet,
+            "set を指定した項目には canvas が必要です",
+        )
+        .with_hint(
+            "set はキャンバス上の占有率を揃えるものなので、canvas が無いと意味を持ちません。\
+             defaults か項目に canvas を書くか、canvas を決める profile を指定してください",
+        ));
+    }
+    args.set = Some(placement);
+    Ok(())
 }
 
 /// 実行全体で 1 つのマニフェストを書く。
@@ -341,7 +592,7 @@ fn to_cutout_args(
         seal,
         // **角度だけは負値を通す。** 反時計回りの指定であり、他の設定の
         // ように「負値は機能が黙って消える」種類の誤りではない
-        rotate: angle(settings.rotate, 0.0, "rotate")?,
+        rotate: rotate(settings.rotate.as_ref())?,
         profile,
         // spec では `Some` がそのまま「明示した」である。CLI 側が clap の
         // `ValueSource` を見て解いているのと同じ問いに、JSON では素直に
@@ -359,6 +610,9 @@ fn to_cutout_args(
         },
         canvas,
         fill_ratio: settings.fill_ratio.unwrap_or(0.85),
+        // **セット統一は canvas と profile が解けた後で足す**（`attach_set`）。
+        // canvas が無い項目を断る判断が、ここではまだできない
+        set: None,
         fail_on,
         debug_mask: None,
         // バッチは JSON だけで回す。数百点でプレビューを吐くと無駄な I/O になる
@@ -606,17 +860,39 @@ fn ratio(value: Option<f64>, default: f64, key: &str) -> Result<f64> {
     Ok(value)
 }
 
-/// 角度に CLI と同じ関門を掛ける（`finite` の spec 版）。**負値は通す**
-/// （反時計回りの指定）。nan と無限大だけを断る。
-fn angle(value: Option<f64>, default: f64, key: &str) -> Result<f64> {
-    let value = value.unwrap_or(default);
-    if !value.is_finite() {
-        return Err(Error::new(
-            ErrorCode::InvalidSetting,
-            format!("{key} は有限な数値である必要があります（{value} が指定されました）"),
-        ));
-    }
-    Ok(value)
+/// spec の `rotate` を解く。**数値でも文字列でも受ける。**
+///
+/// `max_bytes` とまったく同じ事情である。エージェントが書く JSON には `90` と
+/// `"90"` の両方が現れ、そのうえ `auto` は数値では表せない。**CLI と同じ
+/// `cli::parse_rotate` へ流す**ので、`auto` の綴りも nan の扱いも片方でだけ
+/// 通る／通らないが起きない——数値は `to_string()` で綴り直してから渡す
+/// （`derive` が JSON の素の型を綴り直しているのと同じ作法）。
+///
+/// 断るときの code は `INVALID_ROTATE` で、`INVALID_SETTING` ではない。
+/// **角度の誤りは「どの値をどう直すか」が他の設定と違う**（綴りか、auto の
+/// 大文字小文字か、そもそも数値でないか）ので、受け手が同じ分岐でまとめて
+/// 扱える種類の失敗ではない。`INVALID_MAX_BYTES` を分けたのと同じ理由になる。
+///
+/// **負値は通す**（反時計回りの指定）。nan と無限大だけを `parse_rotate` が断る。
+fn rotate(value: Option<&serde_json::Value>) -> Result<RotateArg> {
+    let Some(value) = value else {
+        return Ok(RotateArg::Degrees(0.0));
+    };
+    let invalid = |message: String| {
+        Error::new(ErrorCode::InvalidRotate, message).with_hint(
+            "rotate は 90 / -3.5 のような度数か、\"auto\"（主体の傾きを測って適用）で指定してください",
+        )
+    };
+    let spelled = match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        other => {
+            return Err(invalid(format!(
+                "rotate を数値としても文字列としても読めません（{other} が指定されました）"
+            )));
+        }
+    };
+    crate::cli::parse_rotate(&spelled).map_err(|e| invalid(format!("rotate: {e}")))
 }
 
 /// ずらし量に CLI と同じ関門を掛ける。**負値は通す**（影を上や左へ出す指定）。

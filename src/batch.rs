@@ -17,10 +17,146 @@ use crate::error::{Error, ErrorCode, Result};
 
 #[derive(Debug, Deserialize, Default)]
 pub struct BatchSpec {
+    /// セット内でスケールと余白を揃える指定。書かなければ何も変わらない
+    pub set: Option<SetSpec>,
     /// 全項目に適用する既定値。項目側の指定が優先される
     #[serde(default)]
     pub defaults: ItemSettings,
     pub items: Vec<BatchItem>,
+}
+
+/// セット内でスケールと余白を揃える指定。
+///
+/// **`defaults` の隣ではなく最上位に置く。** これは項目ごとの設定ではない
+/// ——揃える相手は「このセットの全点」で、1 点だけを見ても決まらない。
+/// `defaults` に置けば項目側で上書きできる形になり、「自分だけ別の基準で
+/// 揃える」という意味を持たない指定が書けてしまう。
+#[derive(Debug, Deserialize, Clone)]
+pub struct SetSpec {
+    /// 何を揃えるか（`"height"` / `"bbox"`）。**必須**
+    pub align: String,
+    /// 目標の占有率 T。**省けるのが普通の使い方**で、省くと pass 1 で測った
+    /// 代表寸法（全点の占有率の中央値）が T になる
+    pub fill_ratio: Option<f64>,
+}
+
+/// 何を揃えるか。
+///
+/// **2 つは別の問いに答える。** `Height` は「出力上の商品の高さ」を共通の
+/// `T * CH` にする——撮影距離の違いを正規化する側である。`Bbox` は外接矩形を
+/// 共通の枠 `(T*CW, T*CH)` へ長辺基準で収める——縦長と横長が混ざったセットで
+/// 「はみ出さない」ことを優先する側になる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetAlign {
+    Height,
+    Bbox,
+}
+
+impl SetAlign {
+    /// 書ける綴り。断るときの hint がここから組まれる
+    pub const NAMES: &'static [&'static str] = &["height", "bbox"];
+
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "height" => Some(Self::Height),
+            "bbox" => Some(Self::Bbox),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Height => "height",
+            Self::Bbox => "bbox",
+        }
+    }
+}
+
+impl SetSpec {
+    /// `align` を解く。**綴りを外したら断る。**
+    ///
+    /// 未知の値を既定へ落とすと、頼んだのと別の基準でセット全体が揃う。
+    /// しかも結果 JSON は「揃えた」と言うので、仕上がりを並べて見るまで
+    /// 気づけない。
+    pub fn align(&self) -> Result<SetAlign> {
+        SetAlign::parse(&self.align).ok_or_else(|| {
+            Error::new(
+                ErrorCode::InvalidSet,
+                format!("'{}' は未対応の set.align です", self.align),
+            )
+            .with_hint(format!(
+                "{} のいずれかを指定してください",
+                SetAlign::NAMES.join(" / ")
+            ))
+        })
+    }
+
+    /// 書かれた目標 T を取る。**書かれていなければ `None`**（中央値で決める）。
+    ///
+    /// 値域は `canvas::plan()` が `fill_ratio` に課すものと同じ `(0, 1]` に
+    /// する。ここで断らないと、1.2 を書いた spec が全項目そろって
+    /// `INVALID_FILL_RATIO` で落ちる——同じ 1 つの誤りが項目数ぶんの
+    /// エラーになって返る。
+    pub fn target(&self) -> Result<Option<f64>> {
+        let Some(value) = self.fill_ratio else {
+            return Ok(None);
+        };
+        if !(value > 0.0 && value <= 1.0) {
+            return Err(Error::new(
+                ErrorCode::InvalidSet,
+                format!(
+                    "set.fill_ratio は 0.0 より大きく 1.0 以下である必要があります（{value} が指定されました）"
+                ),
+            )
+            .with_hint("省けば全点の占有率の中央値が目標になります"));
+        }
+        Ok(Some(value))
+    }
+}
+
+/// pass 1 を終えた `set`。**項目ごとの `CutoutArgs` はこの形で受け取る。**
+///
+/// spec の `SetSpec` と分けるのは、こちらが**測り終えた後の姿**だからである。
+/// `target` は「書かれた値」か「測った中央値」のどちらかで、使う側はその
+/// 違いを知る必要が無い——知る必要があるのは結果 JSON の読み手だけなので、
+/// 出どころは `BatchReport.set.source` が言う。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SetPlacement {
+    pub align: SetAlign,
+    /// 目標の占有率 T。`(0, 1]`
+    pub target: f64,
+}
+
+impl SetPlacement {
+    /// `canvas::plan()` へ渡す占有率 `f_i` を綴る。
+    ///
+    /// # なぜ `canvas.rs` に手を入れないのか
+    ///
+    /// `plan()` は `scale = min(CW*f/cw, CH*f/ch)` を返す。狙った倍率 `s_i` を
+    /// 出したいなら、**渡す `f` のほうを組み替えれば足りる**——
+    ///
+    /// ```text
+    /// f_i = s_i * max(cw_i/CW, ch_i/CH)
+    /// ```
+    ///
+    /// を代入すると `min` の中が両方 `s_i` になる。配置の算術は 1 つのままで、
+    /// セット統一は「何を渡すか」だけの話に畳める。
+    ///
+    /// - `bbox` は `s_i = T*min(CW/cw, CH/ch)` なので **`f_i = T`（全点同じ）**
+    /// - `height` は `s_i = T*CH/ch` なので **`f_i = T * max(1, (CH*cw)/(CW*ch))`**
+    ///
+    /// **`(0, 1]` を外れうるのは `height` だけである。** 正方キャンバスで
+    /// 横長の商品に高さ `T*CH` を与えると、横幅が `T*CH*(cw/ch)` を要求する
+    /// ——縦横比が `1/T` を超えればキャンバスの幅を越える。止めるかどうかは
+    /// 呼ぶ側（`place_on_canvas`）が決める。ここは**要求そのもの**を返す。
+    pub fn fill_ratio(self, content: (u32, u32), canvas: (u32, u32)) -> f64 {
+        let (cw, ch) = (f64::from(content.0), f64::from(content.1));
+        let (canvas_w, canvas_h) = (f64::from(canvas.0), f64::from(canvas.1));
+        match self.align {
+            SetAlign::Bbox => self.target,
+            SetAlign::Height => self.target * 1.0_f64.max((canvas_h * cw) / (canvas_w * ch)),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,8 +226,15 @@ pub struct ItemSettings {
     pub shadow_opacity: Option<f64>,
     pub seal: Option<u32>,
     /// 切り抜いた後に時計回りへ回す角度(度)。**負値に意味がある**
-    /// （反時計回り）ので、他の数値と違って 0 以上の検査は掛けない
-    pub rotate: Option<f64>,
+    /// （反時計回り）ので、他の数値と違って 0 以上の検査は掛けない。
+    ///
+    /// **数値でも文字列でも書ける**（`90` と `"90"`、それに `"auto"`）。
+    /// 型を `f64` に決めないのは `max_bytes` とまったく同じ事情で、エージェントが
+    /// 書く JSON には両方が現れるうえ、`auto` は数値では表せない。`"90"` を
+    /// SPEC_INVALID で断ると、CLI では通る書き方が spec でだけ通らない。解くのは
+    /// `commands::batch`——CLI と同じ `cli::parse_rotate` を通し、読めない値は
+    /// INVALID_ROTATE にする
+    pub rotate: Option<serde_json::Value>,
     /// 規格の複合指定に名前を付けたもの（"amazon" など）。**未知の名前は
     /// `UNKNOWN_PROFILE` でその項目を落とす**——解くのは `commands::batch` で、
     /// CLI と同じ `profile::named` を通る。
@@ -248,7 +391,11 @@ const SETTING_KEYS: &[&str] = &[
     "formats",
     "naming",
 ];
-const ROOT_KEYS: &[&str] = &["defaults", "items"];
+const ROOT_KEYS: &[&str] = &["set", "defaults", "items"];
+
+/// `set` の中に書けるキー。**`SETTING_KEYS` は増えない**——`set` は項目の
+/// 設定ではなく最上位の指定なので、`defaults` や項目に書かれたら未知のキーである。
+const SET_KEYS: &[&str] = &["align", "fill_ratio"];
 
 /// 仕様ファイルを読み込む。
 pub fn load(path: &Path) -> Result<BatchSpec> {
@@ -279,7 +426,48 @@ pub fn load(path: &Path) -> Result<BatchSpec> {
         return Err(Error::new(ErrorCode::SpecEmpty, "items が空です")
             .with_hint("処理する画像を items に列挙してください"));
     }
+    validate_set(&spec)?;
     Ok(spec)
+}
+
+/// `set` が噛み合わない spec を、**1 バイトも読む前に**断る。
+///
+/// 優先順位は **明示指定 > set > profile > 既定** の 1 本である。`fill_ratio` を
+/// 書いた人はその値を望んでいるので、`set` が上から別の値を配るなら
+/// 「指定したのに効かない」になる——数百点を書き切ってから仕上がりで気づく
+/// 種類の失敗で、`cli.rs` 全体が避けてきたものである。**どちらを消すかは
+/// 書いた人にしか決められない**ので、黙ってどちらかを勝たせずに断る。
+///
+/// 綴りと値域をここで見るのも同じ理由による。項目ごとに解くと、同じ 1 つの
+/// 誤りが項目数ぶんのエラーになって返る。
+fn validate_set(spec: &BatchSpec) -> Result<()> {
+    let Some(set) = spec.set.as_ref() else {
+        return Ok(());
+    };
+    set.align()?;
+    set.target()?;
+
+    let refuse = |location: &str| {
+        Err(Error::new(
+            ErrorCode::InvalidSet,
+            format!("set と {location} の fill_ratio は同時に指定できません"),
+        )
+        .with_hint(
+            "set は全点の占有率を 1 つの目標へ揃えるものなので、\
+             項目ごとの fill_ratio と両立しません。どちらか一方を消してください",
+        ))
+    };
+    if spec.defaults.fill_ratio.is_some() {
+        return refuse("defaults");
+    }
+    if let Some(i) = spec
+        .items
+        .iter()
+        .position(|item| item.settings.fill_ratio.is_some())
+    {
+        return refuse(&format!("items[{i}]"));
+    }
+    Ok(())
 }
 
 /// 未知のキーを拾ってエラーにする。serde の flatten では検出できないため自前で行う。
@@ -292,6 +480,18 @@ fn validate_keys(raw: &serde_json::Value) -> Result<()> {
     })?;
 
     check(object.keys(), ROOT_KEYS, "最上位")?;
+
+    // **`set` の中も同じ `check` を通す。** 綴り違いを黙って無視すると、
+    // `fill_ration` と書いた spec が「中央値で揃えた」結果を返してしまう
+    if let Some(set) = object.get("set") {
+        let s = set.as_object().ok_or_else(|| {
+            Error::new(
+                ErrorCode::SpecInvalid,
+                "set はオブジェクトである必要があります",
+            )
+        })?;
+        check(s.keys(), SET_KEYS, "set")?;
+    }
 
     if let Some(defaults) = object.get("defaults") {
         let d = defaults.as_object().ok_or_else(|| {
@@ -583,6 +783,121 @@ mod tests {
         let mut probe = Probe(None);
         let _ = T::deserialize(&mut probe);
         probe.0.expect("derive(Deserialize) の構造体であるべき")
+    }
+
+    /// `set` のキー表も serde が読むものと一致すること。
+    ///
+    /// `SETTING_KEYS` と同じ理由でずれを止める。ずれると「検査は通るのに値が
+    /// 入らない」か「正しいキーが未知と言われる」になる。
+    #[test]
+    fn set_keys_are_exactly_what_serde_reads() {
+        let mut serde_keys = serde_field_names::<SetSpec>().to_vec();
+        let mut ours = SET_KEYS.to_vec();
+        serde_keys.sort_unstable();
+        ours.sort_unstable();
+        assert_eq!(ours, serde_keys);
+    }
+
+    /// `align` の綴りは `NAMES` が配るものと過不足なく一致する。
+    ///
+    /// 断るときの hint はこの表から組まれるので、**表に無い綴りが通ると
+    /// 「指定できる値」の案内が嘘になる。**
+    #[test]
+    fn every_named_alignment_parses_and_spells_itself_back() {
+        for name in SetAlign::NAMES {
+            let parsed = SetAlign::parse(name).unwrap_or_else(|| panic!("{name} が解けない"));
+            assert_eq!(parsed.as_str(), *name);
+        }
+        assert!(SetAlign::parse("heigth").is_none(), "綴り違いが通った");
+        assert!(SetAlign::parse("HEIGHT").is_none(), "大文字が通った");
+    }
+
+    /// `f_i` の式が `canvas::plan()` の狙いどおりの倍率を返すこと。
+    ///
+    /// **ここが式そのものの検査である。** `plan()` は
+    /// `scale = min(CW*f/cw, CH*f/ch)` を返すので、`f_i` を入れた結果が
+    /// 狙った `s_i` に一致するかを両方の揃え方で確かめる——
+    ///
+    /// - `bbox` は `s_i = T*min(CW/cw, CH/ch)`（外接矩形が枠へ収まる）
+    /// - `height` は `s_i = T*CH/ch`（高さが `T*CH` になる）
+    ///
+    /// 出力を測る検査（tests/cli.rs）は丸めの後しか見られないので、
+    /// 式の誤りを 1px の差として受け取ることになる。こちらは実数のまま見る。
+    #[test]
+    fn the_fill_ratio_formula_produces_the_intended_scale() {
+        let plan_scale = |f: f64, content: (u32, u32), canvas: (u32, u32)| -> f64 {
+            let (cw, ch) = (f64::from(content.0), f64::from(content.1));
+            (f64::from(canvas.0) * f / cw).min(f64::from(canvas.1) * f / ch)
+        };
+        let canvas = (1000u32, 1000u32);
+        // 縦長・正方・横長・極端な横長
+        for content in [(300u32, 900u32), (500, 500), (800, 400), (900, 200)] {
+            let (cw, ch) = (f64::from(content.0), f64::from(content.1));
+            for target in [0.3, 0.5, 0.85, 1.0] {
+                let bbox = SetPlacement {
+                    align: SetAlign::Bbox,
+                    target,
+                };
+                assert!(
+                    (bbox.fill_ratio(content, canvas) - target).abs() < 1e-12,
+                    "bbox の f_i が T と違う: {content:?} T={target}"
+                );
+                let want = target * (f64::from(canvas.0) / cw).min(f64::from(canvas.1) / ch);
+                let got = plan_scale(bbox.fill_ratio(content, canvas), content, canvas);
+                assert!((got - want).abs() < 1e-9, "bbox: {got} != {want}");
+
+                let height = SetPlacement {
+                    align: SetAlign::Height,
+                    target,
+                };
+                let f = height.fill_ratio(content, canvas);
+                let want = target * f64::from(canvas.1) / ch;
+                let got = plan_scale(f, content, canvas);
+                assert!(
+                    (got - want).abs() < 1e-9,
+                    "height: {content:?} T={target} f={f} -> {got} != {want}"
+                );
+                // 高さは狙いどおり `T*CH` になる
+                assert!((got * ch - target * f64::from(canvas.1)).abs() < 1e-9);
+            }
+        }
+    }
+
+    /// `set` と `fill_ratio` の同時指定は spec を読んだ時点で断る。
+    #[test]
+    fn a_set_next_to_a_fill_ratio_is_refused() {
+        for json in [
+            r#"{"set":{"align":"height"},"defaults":{"fill_ratio":0.8},
+                 "items":[{"input":"a.jpg","output":"a.avif"}]}"#,
+            r#"{"set":{"align":"height"},
+                 "items":[{"input":"a.jpg","output":"a.avif","fill_ratio":0.8}]}"#,
+        ] {
+            let spec = spec_from(json).unwrap();
+            let err = validate_set(&spec).unwrap_err();
+            assert_eq!(err.code.as_str(), "INVALID_SET", "見逃した: {json}");
+            assert_eq!(err.exit_code(), 2);
+        }
+    }
+
+    /// `set.fill_ratio` の値域は `canvas::plan()` が課すものと同じ `(0, 1]`。
+    #[test]
+    fn a_set_target_outside_the_unit_interval_is_refused() {
+        for bad in [0.0, -0.5, 1.5] {
+            let set = SetSpec {
+                align: "height".to_string(),
+                fill_ratio: Some(bad),
+            };
+            assert_eq!(set.target().unwrap_err().code.as_str(), "INVALID_SET");
+        }
+        assert_eq!(
+            SetSpec {
+                align: "bbox".to_string(),
+                fill_ratio: Some(0.85)
+            }
+            .target()
+            .unwrap(),
+            Some(0.85)
+        );
     }
 
     /// 綴りの検査に使うキー表と、serde が実際に読むキーが一致すること。

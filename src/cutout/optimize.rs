@@ -841,6 +841,7 @@ mod tests {
             delta_e: 40.0,
             leftover_ratio: 0.0,
             level_rotation: None,
+            level_fill_ratio: None,
             border: crate::cutout::DEFAULT_BORDER,
             touches_edge: false,
             confidence,

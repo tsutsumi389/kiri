@@ -78,7 +78,7 @@ src/
 | 20 | 1 枚から複数サイズ・複数形式を書き、書いたものを列挙する | `--derive` / `--sizes` / `--formats` / `--manifest` | 2日 |
 | 21 | 品質指標を合否に畳み、exit code で仕分けられるようにする | `--fail-on` / exit 5 / `BatchReport.rejected` | 1日 |
 | 22 | モール規格をプリセットとして持ち、既存画像を検査する（**済**。§5 の Phase 22） | `--profile` / `kiri lint` / `schema.profiles[]` | 2日 |
-| 23 | 主体の傾きを畳み、セット内で大きさと余白を揃える | `--rotate auto` / batch の `set` | 1.5日 |
+| 23 | 主体の傾きを畳み、セット内で大きさと余白を揃える（**済**。§5 の Phase 23） | `--rotate auto` / batch の `set` | 1.5日 |
 | 24 | 背景が中性だという前提と照明場から白点と露出を直す | `--white-balance` / `--exposure` | 2日 |
 | 25 | 反射を合成する | `--reflect` | 1日 |
 
@@ -1542,6 +1542,188 @@ public リポジトリなので GitHub 製の標準ランナーは分数無制�
         `every_published_field_exists_in_the_result`（`--profile` を渡す実行と
         `kiri lint` の実行が既に足されていた）が追随している
 
+- [x] Phase 23: `--rotate auto` ＋ batch の `set`（`SCHEMA_VERSION` は 2 のまま据え置き）
+  - [x] `--rotate` を `f64 | "auto"` へ広げた。`subject.level_rotation` は**もともと
+        「`--rotate` にそのまま渡せる値」として返る契約**で、渡すところだけが利用者の
+        手作業だった。auto は**測りと回転を繋ぐだけ**で、新しい幾何は 1 行も書いていない
+  - [x] `cli::parse_rotate` と `RotateArg { Degrees(f64), Auto }`。spec の `rotate` も
+        `Option<f64>` → `Option<serde_json::Value>` へ広げ、**CLI とまったく同じパーサを
+        通す**（`--max-bytes` と同じ事情——エージェントが書く JSON には `90` と `"90"` の
+        両方が現れるうえ、`auto` は数値では表せない）。読めない値は `INVALID_ROTATE` で
+        その項目だけを落とす。黙って 0 度へ落とすと、**水平出しを頼んだつもりの項目が
+        回らないまま数百点に混ざる**
+  - [x] **既存の契約を 1 つ緩めた。** 以前は `{"rotate": "90"}` が `SPEC_INVALID` で
+        落ちていたが、`"auto"` を受ける以上、文字列の `"90"` を断る理由が無くなる
+        （断れば「CLI では通る書き方が spec でだけ通らない」道具になる）。テストは
+        `the_batch_spec_rejects_an_angle_that_is_not_a_number` を
+        `the_batch_spec_reads_an_angle_written_as_a_string` へ置き換えた。
+        **Phase 23 で挙動を変えた既存契約はこれ 1 つだけである**
+  - [x] `settings.rotate` が `f64 | "auto"` の union になった。auto を 0 に潰すと
+        「回さないと指定した」と「測って決めろと指定したが測れなかった」が**同じ JSON に
+        なる**。`kiri schema` の `unit` 語彙へ `deg_or_auto` を足したのは、受け手が
+        `as_f64()` で読んでよいかがそこで変わるためで、`deg` に相乗りさせない
+  - [x] 適用しない 4 つの場合はどれも 0 度のままにして `ROTATE_AUTO_SKIPPED` で報せる。
+        `data.reason` は機械可読な 4 値（`no_subject` / `low_confidence` /
+        `not_measurable` / `not_rectangular`）。**どの条件で落ちたかで次の一手が変わる**
+        ——`low_confidence` なら `--bbox` で主体を教えれば済むが、`not_measurable`
+        （丸いもの）は何を渡しても測れないので角度を自分で決めるしかない
+  - [x] `kiri rotate --angle` には auto を足していない。**切り抜きを通らないので subject を
+        1 度も測っていない。** 測る経路をそこへ足すのは「渡された角度を回す」という
+        このサブコマンドの仕事ではなく、`kiri cutout` と二重の測り方を持つことになる
+  - ※ **形の門（`not_rectangular`）は計画に無い。** `src/cutout/subject.rs` の
+        `level_rotation` の doc 自身が「**自動では適用しない。** 傾きを直すかどうかは
+        構図の判断」と書いており、**計画 Phase 23 はその注意書きに正面から反していた**
+        （§7.2 へ追記した）。同じ値を消費する計画が、書いた当人の但し書きを読んでいない
+  - ※ **実測が doc のほうを裏付けた。** 水平に置いたフライパン（円＋取っ手、真値 0 度）に
+        `-21.7 / +31.9 / -43.3 度`を `confidence: high` で返す。円も安定しない
+        （直径 240 → 45.0 度、320 → 0.0 度、420 → `None`）。**最小面積外接矩形が
+        「物の向き」を意味するのは、その物が実際に矩形に近いときだけ**で、円に取っ手が
+        1 本生えた形では最小の位置が取っ手と円の接し方——つまり輪郭の量子化——で決まる。
+        このまま配ると、**仕上がりを目で見るまで誰も気づけない形で絵が傾く**
+  - ※ **広がり（`TILT_AMBIGUOUS`）でも最小外接矩形の縦横比でも分離できない。**
+        広がりは「全向きで平ら」しか見ていないので、フライパン（17.1%）は傾いた長方形
+        （51.9%）と同じく門の 2% をはるかに上回って通る。縦横比に至っては順序が逆で、
+        **正しく置かれたフライパン（1.71）が、本当に傾いた長方形（1.63）より上に来る**
+        ——「1 に近いほど条件が悪い」という読み方ではフライパンのほうが条件の揃った形に
+        見えることになり、線を引く向きが決まらない
+  - ※ **分離できたのは凸包の面積 / 最小面積外接矩形の面積である。** 最小外接矩形が向きを
+        語るのはその形が矩形に近いときだけで、**この比はまさにそれを測っている**。
+        長方形は 1.0、角丸で 0.98、取っ手つきで 0.88、円は π/4≈0.785 が上限になる。
+        `level_rotation` と**同じ凸包から一度に**返し（`Tilt { rotation, fill }`）、
+        包を 2 度組んで値が食い違う余地を型の上で作らない。分母を最小の面積にしたのは、
+        最大で割ると**傾きの曖昧さと形の矩形らしさが 1 つの数に混ざる**ためで、ここで
+        言いたいのは「採ろうとしているその矩形が、形をどれだけ説明しているか」である
+  - ※ **`TILT_SHAPE_MIN_FILL` = 0.85 は谷の中央であって、当てはめた値ではない。**
+        合成 35 枚＋実写 4 枚で較正した結果、**誤る側の最大が 0.797（円 d=240）、
+        正しく回せる側の最小が 0.881（取っ手つきマグ t=10）**で、そのあいだ 0.084 に
+        他の標本は 1 つも無い。実写（不織布の上のリモコン）は 0.903〜0.968 で、いずれも
+        谷の上側にある。**角丸を較正に並べてあるのが要点で**、四隅を落とすと充填率は
+        その面積ぶん下がる（1.000 → 0.98 付近）——門をそこまで上げると携帯・本・箱が
+        回らなくなる
+  - ※ **成績: 合成 35 枚で誤って回す件数が 0 になった。** 正しく回す 21、止めて正解 8、
+        惜しくも止めた 4（楕円 t=0 / L 字 t=0 / L 字 t=12 / 三角 t=0）。残る 2 枚は門の
+        手前で決着する（円 d=160 は `confidence` が low、円 d=420 は `level_rotation` が
+        `None`）。門が無ければ誤って回すのは 8 件だった。**見送りは「回さずに
+        `ROTATE_AUTO_SKIPPED` で報せる」＝安全側の失敗**で、回してしまうほうは目で見る
+        まで気づけない
+  - ※ **`subject.level_fill_ratio` として結果 JSON にも出す。** `level_rotation` を自分で
+        読んで回す経路でも同じ値で同じ判断ができないと、**門は kiri の中だけのものになる**。
+        警告の `data` に測った値（`level_fill_ratio`）としきい値（`min_fill_ratio`）の
+        両方を載せるのも同じ理由で、片方だけでは受け手が「あと少しだったのか、全く違うのか」
+        を分けられない
+  - ※ **`level_rotation` の戻り値は 1 つも動かしていない。** `kiri info` の出力は不変で、
+        門が効くのは `--rotate auto` にだけである。角度だけを返して黙る案（門に掛かったら
+        `level_rotation` を `None` にする）は採らなかった——「measurable だが向きを
+        語らない」を `None` に畳むと、**既存の「測れない形では `None`」という意味が
+        2 通りになる**
+  - [x] `main.rs` の `print_subject` も同じ門で断るようにした。ここを直さないと
+        **人が読む行だけがフライパンに `--rotate -21.7` を勧め続ける**。結果 JSON が
+        止めているものを端末の行が勧めるのは、同じ実行が 2 つの答えを返すのと同じである
+  - [x] batch の spec の**最上位**へ `set: { align, fill_ratio }` を足した。1 枚ずつ
+        `fill_ratio` を決めても並べたときには揃わない——占有率は「外接矩形がキャンバスの
+        何割か」なので、縦長と横長が混ざると高さがばらつく。`defaults` の隣に置かなかった
+        のは、**揃える相手が「このセットの全点」で、1 点だけを見ても決まらない**ため
+        である。`defaults` に置けば項目側で上書きでき、「自分だけ別の基準で揃える」という
+        意味を持たない指定が書けてしまう
+  - [x] `align` は 2 値。`height` は**出力上の商品の高さを共通の `T*CH` にする**
+        （撮影距離の正規化）、`bbox` は外接矩形を共通の枠へ長辺基準で収める
+  - [x] **`canvas.rs` には 1 行も触れていない。** `plan()` が
+        `scale = min(CW*f/cw, CH*f/ch)` を返すので、狙った倍率 s_i を出したければ渡す
+        `f` のほうを組み替えればよい——`f_i = s_i * max(cw_i/CW, ch_i/CH)` を代入すると
+        `min()` の中が両方 s_i になる。`bbox` は `f_i = T`（全点同じ）、`height` は
+        `f_i = T * max(1, (CH*cw)/(CW*ch))` に畳める。**配置の算術は 1 つのままで、
+        セット統一は「何を渡すか」だけの話になる。** 式は 1350 通りの数値で検算して
+        単体テストにも残した——出力を測る検査は丸めの後しか見られないので、**式の誤りを
+        1px の差として受け取る**ことになる
+  - [x] `T` は `set.fill_ratio` があればそれ、無ければ pass 1 で測った占有率の**中央値**。
+        `BatchReport.set.source` が `specified` / `median` のどちらかを名乗るのは、
+        **同じ数でも次の一手が変わる**ためで、書いた値なら書き直せばよいが、中央値は
+        セットの構成を変えない限り動かない
+  - [x] **pass 1 では切り抜きを回さない。** 要るのは `subject.normalized_bbox` だけで、
+        それは `see_background` が背景の見立てと一緒に返す。増えるのは decode 1 回ぶんで、
+        1000 点級でも「2 回デコードする」が素直（キャッシュは要らない）。
+        **`set.fill_ratio` を書いた実行では pass 1 ごと省く**——中央値を採る相手がいない
+        ので、測っても 1 点も使わない decode を全点ぶん積むだけになる
+  - [x] 並べ替えてから中央を採るので順序に依らず、**`--jobs` を変えても 1 ビットも
+        動かない。** `--dry-run` でも測りは走る（Phase 19 の「`--dry-run` でも探索は
+        走る」と同じ規約）。読めない項目と主体が `None` の項目は材料から外す——1 点の
+        素材事故がセット全体を止めないためで、本当のエラーは pass 2 が項目ごとに報告する。
+        **1 点も測れなければ `set` は効かず `SET_NOT_MEASURED`** でそう言う
+  - [x] プールは 1 本だけ建てて 2 つの pass で使い回す。2 本建てると `--jobs` の意味が
+        「同時に走る件数」から「pass ごとの上限」へ**静かに変わる**
+  - [x] 優先順位は **明示指定 > set > profile > 既定**。`item` / `defaults` に
+        `fill_ratio` がある spec に `set` を足したら、**spec を読んだ時点で**
+        `INVALID_SET` で断る（成果物は 1 つも書かれない）——どちらを消すかは書いた人に
+        しか決められないので、黙ってどちらかを勝たせない。`set` があるのに canvas が
+        取れない項目も `INVALID_SET` で、こちらは他の失敗と同じくその項目だけが落ちる。
+        判定を `to_cutout_args` ではなく解けた `CutoutArgs` の側でするのは、
+        **profile が決めた canvas も数えたい**ため
+  - [x] profile の `fill_ratio` は `set` が上書きし、`PROFILE_OVERRIDDEN` の `data.by` が
+        `set` と名乗る。**Phase 22 の「同じ値なら黙る」はここでは通さない**——`set` が
+        効かせるのは点ごとの `f_i` で、`T` が profile の値と偶然一致しても実際に効く値は
+        点ごとに違う
+  - [x] `CanvasReport.fill_ratio` は**効いた `f_i`** を返す（canvas ブロックは効いた値を
+        語る規約）。`set` を使わない実行では要求値と同じなので出力は 1 バイトも変わらない。
+        `BatchReport.set` は `set` を書いた実行にしか現れず、**1 点も測れずに効かなかった
+        実行でも現れない**（揃えていない実行に書く値が無い。そのことは
+        `SET_NOT_MEASURED` が理由つきで言う）
+  - ※ **`kiri set` という新しいサブコマンドにはしなかった**（§7.6 の却下案のとおりに
+        決着した）。spec / `ItemSettings` / 警告の継承 / `--jobs` / `--dry-run` の規約を
+        もう 1 系統持つことになり、`kiri schema` が配る契約が二重化する
+  - ※ **`SET_SCALE_CLAMPED` は計画の見立てと違う。** §7.2 の箇条書きは「揃えた結果
+        1 点だけが極端に外れるとき」と書いていたが、**横長商品では常態である。** 正方のキャンバスで height 揃えなら
+        `f_i = T * max(1, cw/ch)` なので、`T=0.85` では**切り抜いた内容の**縦横比
+        1.18:1 を超える横長で必ず当たる。式の誤りではなく物理で、高さ `0.85*CH` を
+        与えれば横幅は `0.85*CH*(cw/ch)` を要求し、それがキャンバスの幅を越える。
+        1000x1000 / `T=0.85` では、内容の縦横比 1.23:1 で 37px、1.65:1 で 244px、
+        1.98:1 で 345px 足りない（**binding なのは素材の縦横比ではなく content bounds の
+        ほうである**）。黙って「高さが揃った」ことにせず、1.0 で止めて**要求した `f_i`・
+        使った 1.0・目標との差**を `data` に載せる——数 px の不足なのか半分しか無いのかで
+        次の一手が変わる
+  - ※ テスト名（`--rotate auto`）: `cutout_rotate_auto_levels_the_subject`
+        （受け入れ基準 (a)。書いた画像へもう一度 `info` を掛けて測り直す往復で見る）/
+        `cutout_rotate_auto_does_not_turn_what_it_cannot_trust`（(b)。信用できない
+        見立てでは 1 画素も動かさない）/ `cutout_rotate_auto_leaves_a_handled_shape_alone`
+        （(b) の拡張。取っ手が 1 本生えた円は回さない）/
+        `cutout_rotate_auto_still_levels_a_boxy_product`（(b) の拡張。**門が効きすぎて
+        いないこと**——門だけを見る検査は「何も回さない」実装を緑にするので、角丸が
+        今までどおり通ることを同じ往復で固定する）/
+        `the_shape_gate_separates_what_the_rectangle_describes`（(b) の拡張。門の値
+        そのものを `kiri info` で見る）/
+        `a_run_without_a_rotation_never_mentions_the_auto_gate`（(c)。`--rotate` を
+        渡さない実行は門を 1 度も通らない）/ `cutout_rotate_auto_is_deterministic`（(d)）/
+        `the_batch_spec_accepts_auto_and_a_number_for_the_rotation` /
+        `a_malformed_rotation_in_a_spec_is_refused_with_a_code` /
+        `every_unreadable_rotation_in_a_spec_lands_on_the_same_code`（(e)）/
+        `the_rotate_option_publishes_auto_as_a_choice`（(f)。`--rotate` は自由な数値も
+        取るので `PossibleValuesParser` では作れず、`accepts` が空のままだと**綴りを
+        外したときに code 無しの exit 2 で落ちる項目の候補を、呼ぶ前に知る手段が無くなる**）/
+        `a_malformed_rotation_on_the_command_line_is_refused_by_the_parser` /
+        `the_batch_spec_reads_an_angle_written_as_a_string`（(f)。**緩めた契約があったのは
+        この 1 本の場所である**）。
+        テスト名（`set`）: `a_set_aligns_the_subject_height_across_shooting_distances`
+        （(a)。同じ商品を 3 通りの距離で撮ったセットで、出力上の高さが ±1px に揃う）/
+        `a_spec_without_set_carries_no_set_block`（(b)）/
+        `a_bbox_aligned_set_writes_the_same_bytes_as_one_fill_ratio`（(c)。**全点が同じ
+        `f_i` になる**ことを、同じ `fill_ratio` を 1 つ書いた実行とのバイト一致で言う）/
+        `the_set_target_is_the_median_of_the_measured_occupancies`（(d)）/
+        `an_extremely_wide_item_is_clamped_without_touching_the_others`（(e)。**他の点が
+        1 バイトも影響を受けない**ことまで見る）/
+        `a_set_that_measures_nothing_says_so_and_stands_aside`（(f)）/
+        `the_same_set_spec_is_deterministic`（(g)。`T` も全項目の出力バイト列も 3 回とも
+        同じ）/ `a_set_that_cannot_take_effect_is_refused`（(h)）/
+        `the_number_of_jobs_does_not_move_the_set_target`（(i)）/
+        `a_set_overrides_the_profile_fill_ratio_and_says_so`（(j)）。
+        既存の契約テストは `every_published_unit_is_in_the_known_vocabulary`
+        （`deg_or_auto` を語彙へ足した）/ `every_published_field_exists_in_the_result`
+        （`set` を書いた `--dry-run` の batch 実行を 1 つ足した。**`set` ブロックは
+        `compliance` / `optimize` と同じく専用の実行でしか現れない**）/
+        `every_code_named_in_the_docs_exists`（**計画書だけが先に名指ししてよい
+        「予定の code」の表から** `ROTATE_AUTO_SKIPPED` と `SET_SCALE_CLAMPED` の
+        2 つを消した。実装済みのまま表に残すと、その表明のほうが落ちる）/
+        `the_readme_warning_table_lists_every_warning_in_the_contract`
+        （README の表へ 3 行足した）が追随している
+
 ## 6. 残件の優先順位
 
 §5 の `[ ]` は 1 件だけになった（`※` は決定とその理由の記録であって作業では
@@ -1783,6 +1965,8 @@ Phase 22 が同じ exit code の語彙を使うので、その前に置く。
 
 #### Phase 23: `--rotate auto` ＋ セット内のスケール・余白の統一
 
+**済（§5 の Phase 23）。**
+
 **なぜここか。** 両方とも `subject`（`level_rotation` / `normalized_bbox`）を消費する。
 前者は「測った角度を畳むだけ」の S で、後者の 2 パスは「pass 1 で subject を測って
 持ち回る」構造そのものなので、**同じ機構を 1 度作って 2 つに使う**。
@@ -1790,6 +1974,15 @@ Phase 22 が同じ exit code の語彙を使うので、その前に置く。
 - `--rotate` を `f64 | "auto"` に広げる。`confidence` が `high` のときだけ適用し、
   そうでなければ 0 度のまま `ROTATE_AUTO_SKIPPED` で報せる。分解能 0.5 度の注意を
   ヘルプへ引く
+- ※ **「`level_rotation` を適用する」という前提そのものが、同じ値の doc コメントに
+  反していた。** `src/cutout/subject.rs` の `level_rotation` は「**自動では適用しない。**
+  傾きを直すかどうかは構図の判断」と自分で書いており、**この計画はそれを読まずに
+  「測った角度を畳むだけの S」と見積もっていた。** 実測でも doc のほうが正しく、
+  水平に置いたフライパンへ `-21.7 / +31.9 / -43.3 度`が `confidence: high` で返る
+  ——`confidence` は「主体をどれだけ確かに切り出せたか」しか言っておらず、
+  **切り出せた形が向きを持つかどうかは 1 つも見ていない。** 実装では形の門
+  （`level_fill_ratio` < `TILT_SHAPE_MIN_FILL` なら `not_rectangular` で見送る）を
+  足して埋めた。**計画に無い条件を 1 つ増やしたのはここだけである**（§5 の Phase 23）
 - batch に `set: { align: "height" | "bbox", fill_ratio: ... }` を足す。**pass 1 では
   切り抜きを回さない**——`--optimize` の探索段が使う縮小で subject だけを測り、
   全点の代表寸法（中央値）を決める。pass 2 は今までどおり `par_iter` で回す
@@ -1863,8 +2056,9 @@ Phase 25 --reflect（依存なし。いつでも繰り上げ可）
 | 20 | `MANIFEST_PARTIAL` | 一部の派生が失敗したままマニフェストを書いた |
 | 22 | `PROFILE_OVERRIDDEN` | profile の値を明示指定が上書きした |
 | 22 | `PROFILE_UNCHECKABLE` | lint が検査できない項目を飛ばした（AVIF の画素など） |
-| 23 | `ROTATE_AUTO_SKIPPED` | `--rotate auto` だが `confidence` が high でない |
-| 23 | `SET_SCALE_CLAMPED` | セット統一で 1 点だけ極端に外れ、上限で止めた |
+| 23 | `ROTATE_AUTO_SKIPPED` | `--rotate auto` を適用しなかった（0 度のまま）。`data.reason` が `no_subject` / `low_confidence` / `not_measurable` / `not_rectangular` の 4 値でどの条件かを言う |
+| 23 | `SET_SCALE_CLAMPED` | `set` が求めた占有率が 1.0 を超えたので 1.0 で止めた（その点だけ目標の高さに届かない）。**横長商品では常態**で、不足分は `data.height_shortfall` |
+| 23 | `SET_NOT_MEASURED` | `set` の代表寸法を 1 点も測れず、揃えなかった（各項目は自分で解決した `fill_ratio` のまま） |
 | 24 | `WHITE_BALANCE_SKIPPED` | 背景が中性でないため正規化しなかった |
 | 25 | `REFLECT_CLIPPED` | 反射が画像の外へ出た |
 
@@ -1872,12 +2066,12 @@ Phase 25 --reflect（依存なし。いつでも繰り上げ可）
 
 - 引数（exit 2）: `INVALID_MAX_BYTES` / `INVALID_DERIVATION` /
   `INVALID_NAMING_TEMPLATE` / `OUTPUT_NAME_COLLISION` / `UNKNOWN_PROFILE` /
-  `INVALID_FAIL_ON`
+  `INVALID_FAIL_ON` / `INVALID_ROTATE` / `INVALID_SET`
 - 一般（exit 1）: `MANIFEST_WRITE_FAILED`
 - **新分類 `Compliance`（exit 5）**: `QUALITY_GATE_FAILED`（Phase 21）/
   `PROFILE_VIOLATION`（Phase 22）
 
-**既存の意味が変わるもの**は 4 件ある。ここを黙って変えると古い読み手が誤読する。
+**既存の意味が変わるもの**は 5 件ある。ここを黙って変えると古い読み手が誤読する。
 
 1. `outputs[]` — 型は `Vec<OutputReport>` のままだが、**常に 1 要素だった前提が
    崩れる**。`SCHEMA_VERSION` を 2 へ上げる唯一の根拠（Phase 20）
@@ -1887,10 +2081,20 @@ Phase 25 --reflect（依存なし。いつでも繰り上げ可）
    全警告の `data` に `output` キーを足す
 4. `exit_codes[]` — 表そのものが伸びる。5 は「成果物はあるが人が見るべき」である
    ことを `meaning` に書く
+5. spec の `rotate` — **文字列を受けるようになった**（Phase 23。緩める向きの変更で、
+   `{"rotate": "90"}` は `SPEC_INVALID` で落ちていた）。`"auto"` を受けるために型を
+   `Option<f64>` から `Option<serde_json::Value>` へ広げた以上、数値の綴りも CLI と
+   同じパーサが読む——断れば「CLI では通る書き方が spec でだけ通らない」道具になる。
+   **Phase 23 が挙動を変えた既存契約はこれ 1 つだけである**
 
 新しいブロック: `schema.profiles[]`（**実装の定数から組む**。`fields[]` と同じ）、
 `outputs[].quality_used` / `.role` / `.icc`、lint の `LintReport { checks: [{ name,
-status, expected, actual }] }`。
+status, expected, actual }] }`、`subject.level_fill_ratio`（Phase 23。`level_rotation`
+をどれだけ信用してよいかを言う値で、**門を kiri の外でも引けるようにするために配る**）、
+`BatchReport.set`（`{ align, fill_ratio, source, measured, clamped }`。`compliance` /
+`optimize` と同じく、`set` を書いた実行にしか現れない）。`settings.rotate` は
+`f64 | "auto"` の union になり、`unit` の語彙へ `deg_or_auto` が増える——**受け手が
+`as_f64()` で読んでよいかがそこで変わる**ので `deg` に相乗りさせない。
 
 batch spec には `profile` / `max_bytes` / `derive` / `naming` / `fail_on` /
 `white_balance` / `reflect*` と、最上位の `set` が増える。**そのたびに `batch.rs` の
@@ -1996,10 +2200,62 @@ batch spec には `profile` / `max_bytes` / `derive` / `naming` / `fail_on` /
   成立しない**——品質を定めているモール規格が無く、出典の無い数値を `Rules` に
   入れない方針を採ったので、`write_defaults` は quality を一度も求めない
   （求めていない値は押しのけようがない）
-- **Phase 23** — `auto` を適用した画像へもう一度 `info` を掛けると `level_rotation`
-  が 0 に近い（許容 0.5 度）。セット統一は「同じ商品を 3 通りの距離で撮った合成
-  セット → 出力上の商品高さが ±1px で揃う」「`set` 無しの結果が 1 バイトも
-  変わらない」
+- **Phase 23**（済。結果は §5 の Phase 23 に、テスト名はそちらへも並べた）。
+  **受け入れ基準の letter はこの一覧が定義である**——テストの doc コメントが
+  `受け入れ基準 (a)` のように引くので、参照先をここに置く。前半（`--rotate auto`）と
+  後半（batch の `set`）で letter は別に振っている。
+  - **前半 (a) 効くこと**（`cutout_rotate_auto_levels_the_subject`）。`auto` を適用した
+    画像へもう一度 `info` を掛けて `level_rotation` が 0 に近いことを見る
+    （許容 0.5 度。**分解能そのものが 0.5 度なので、それを下回る差は有意でない**）
+  - **前半 (b) 適用しないときは 1 画素も回さない**
+    （`cutout_rotate_auto_does_not_turn_what_it_cannot_trust` /
+    `cutout_rotate_auto_leaves_a_handled_shape_alone` /
+    `the_shape_gate_separates_what_the_rectangle_describes`）。4 つの `data.reason`
+    （`no_subject` / `low_confidence` / `not_measurable` / `not_rectangular`）を
+    実画像で踏む。**門が効きすぎていないことを同時に固定する**
+    （`cutout_rotate_auto_still_levels_a_boxy_product`）——門だけを見る検査は
+    「何も回さない」実装を緑にするので、角丸長方形（充填率 0.98 付近）が今までどおり
+    水平になることを同じ往復で見る
+  - **前半 (c) 無害性**（`a_run_without_a_rotation_never_mentions_the_auto_gate`）。
+    `--rotate` を渡さない実行は門を 1 度も通らず、警告も `level_fill_ratio` 由来の
+    分岐も出ない
+  - **前半 (d) 決定性**（`cutout_rotate_auto_is_deterministic`）
+  - **前半 (e) spec 経由**（`the_batch_spec_accepts_auto_and_a_number_for_the_rotation` /
+    `a_malformed_rotation_in_a_spec_is_refused_with_a_code` /
+    `every_unreadable_rotation_in_a_spec_lands_on_the_same_code`）。読めない角度は
+    `INVALID_ROTATE` で**その項目だけ**が落ちる
+  - **前半 (f) 契約**（`the_rotate_option_publishes_auto_as_a_choice` /
+    `a_malformed_rotation_on_the_command_line_is_refused_by_the_parser` /
+    `the_batch_spec_reads_an_angle_written_as_a_string`）。`--rotate` は自由な数値も
+    取るので `PossibleValuesParser` では作れず、`accepts` が空のままだと**綴りを外した
+    ときに code 無しの exit 2 で落ちる項目の候補を、呼ぶ前に知る手段が無くなる**。
+    最後の 1 本は `the_batch_spec_rejects_an_angle_that_is_not_a_number` を置き換えた
+    もので、**Phase 23 が緩めた唯一の既存契約がそこにある**
+  - **後半 (a) 3 通りの距離で高さが ±1px**
+    （`a_set_aligns_the_subject_height_across_shooting_distances`）。同じ商品を
+    3 通りの距離で撮った合成セットで、**書いた画像を測り直した高さ**が揃う
+  - **後半 (b) 無害性**（`a_spec_without_set_carries_no_set_block`）。`set` を書かない
+    実行の結果 JSON に `set` のキーは 1 つも現れない
+  - **後半 (c) `bbox` は全点同じ `f_i`**
+    （`a_bbox_aligned_set_writes_the_same_bytes_as_one_fill_ratio`）。同じ
+    `fill_ratio` を 1 つ書いた実行との**バイト一致**で言う
+  - **後半 (d) 中央値**（`the_set_target_is_the_median_of_the_measured_occupancies`）
+  - **後半 (e) 上限**（`an_extremely_wide_item_is_clamped_without_touching_the_others`）。
+    `f_i > 1.0` の点は 1.0 で止めて `SET_SCALE_CLAMPED` を出し、**他の点は 1 バイトも
+    影響を受けない**
+  - **後半 (f) 測れないセット**（`a_set_that_measures_nothing_says_so_and_stands_aside`）。
+    `set` は効かず `SET_NOT_MEASURED` が出て、各項目は自分で解決した `fill_ratio` で書く
+  - **後半 (g) 決定性**（`the_same_set_spec_is_deterministic`）。`T` も全項目の出力
+    バイト列も 3 回とも同じ
+  - **後半 (h) 排他**（`a_set_that_cannot_take_effect_is_refused`）。`item` / `defaults` の
+    `fill_ratio` との同時指定と、canvas の無い項目を `INVALID_SET` で断る
+  - **後半 (i) `--jobs`**（`the_number_of_jobs_does_not_move_the_set_target`）。
+    中央値は並べ替えてから採るので、並列度で 1 ビットも動かない
+  - **後半 (j) 契約**（`a_set_overrides_the_profile_fill_ratio_and_says_so`。profile の
+    `fill_ratio` を `set` が上書きし、`PROFILE_OVERRIDDEN` の `data.by` が `set` と
+    名乗る）と、既存の `every_published_unit_is_in_the_known_vocabulary` /
+    `every_published_field_exists_in_the_result` / `every_code_named_in_the_docs_exists` /
+    `the_readme_warning_table_lists_every_warning_in_the_contract`
 - **Phase 24** — `tests/real_backgrounds.rs` と `tests/edge_quality.rs` を**着手前後で
   必ず取る**（[3.2b](#32b-境界品質の回帰テストtestsedge_qualityrs) の作法）。既知の
   色温度ずれを与えた合成シーンで元へ戻せることと、`off` で 1 バイトも変わらないこと

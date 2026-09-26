@@ -186,6 +186,7 @@ pub fn subject_report(subject: &SubjectHint, source: &'static str) -> SubjectRep
         leftover_ratio: round4(subject.leftover_ratio),
         touches_edge: subject.touches_edge,
         level_rotation: subject.level_rotation.map(round4),
+        level_fill_ratio: subject.level_fill_ratio.map(round4),
         border: subject.border,
         confidence: subject.confidence,
     }

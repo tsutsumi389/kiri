@@ -164,6 +164,10 @@ error_catalog! {
     InvalidDerivation = "INVALID_DERIVATION", Argument
         => "--derive の書式か値が不正（未知のキー、読めない値、sizes / formats との同時指定）。\
             spec 経由でのみこの code で、CLI では clap が code 無しの exit 2 で断る",
+    InvalidRotate = "INVALID_ROTATE", Argument
+        => "rotate が角度(度)の数値としても auto としても読めない。\
+            spec 経由でのみこの code で、CLI では clap が code 無しの exit 2 で断る。\
+            batch は 1 件の失敗で全体を止めないので、この code が出る実行の終了コードは 4 になる",
     InvalidFailOn = "INVALID_FAIL_ON", Argument
         => "--fail-on の書式か値が不正（未知の指標、演算子の綴り違い、値域外、同じ指標への二重指定）。\
             spec 経由でのみこの code で、CLI では clap が code 無しの exit 2 で断る",
@@ -177,6 +181,11 @@ error_catalog! {
         => "2 つ以上の派生が同じ出力パスになる（書き始める前に断るので、成果物は 1 つも書かれない）",
     InvalidSetting = "INVALID_SETTING", Argument
         => "spec の設定値が不正（負値・nan・上限超過）",
+    InvalidSet = "INVALID_SET", Argument
+        => "batch の set が噛み合わない（align の綴り違い、fill_ratio の値域外、\
+            項目の fill_ratio との同時指定、canvas の無い項目）。\
+            綴りと値域と同時指定は spec を読んだ時点で断るので成果物は 1 つも書かれず、\
+            canvas が取れない項目だけは他の失敗と同じくその項目が落ちて実行全体は 4 になる",
     MissingDimension = "MISSING_DIMENSION", Argument
         => "--width も --height も指定されていない",
     UpscaleNotAllowed = "UPSCALE_NOT_ALLOWED", Argument

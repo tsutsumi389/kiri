@@ -6,7 +6,9 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
+use serde::Serialize;
 
+use crate::batch::SetPlacement;
 use crate::compliance::{DEFAULT_TOKEN, FAIL_ON_METRICS, FailOn};
 use crate::cutout::background::DEFAULT_BORDER;
 use crate::cutout::constraints::{
@@ -531,8 +533,115 @@ fn cutout_rotate_long_help() -> String {
      mask / background / subject の座標は**回す前**のものである（どれも\
      「切り抜きがどう決まったか」を語る値で、回転はその後の配置にすぎない）。\n\
      --canvas と併せると、回した後の外接矩形が中央へ載る。\n\
-     回転だけを行う kiri rotate では、同じ値を --angle で渡す。"
+     auto は subject.level_rotation（主体の最小外接矩形が軸に揃う角度）を\
+     そのまま適用する。**効くのは subject.confidence が high で、かつ \
+     level_rotation が測れたときだけ**で、そうでなければ 0 度のまま \
+     ROTATE_AUTO_SKIPPED で報せる（data.reason が no_subject / low_confidence / \
+     not_measurable / not_rectangular のどれかを言う）。丸いものや正多角形はどの角度でも外接矩形の\
+     面積が変わらないので測れない側に入る。\n\
+     **形が矩形から遠いものも回さない。** 最小外接矩形が向きを語るのは形が矩形に\
+     近いときだけで、円に取っ手が 1 本生えるだけで答えは輪郭の量子化で決まる\
+     （水平に置いたフライパンに -21.7 度を high で返す）。subject.level_fill_ratio\
+     （凸包が最小外接矩形をどれだけ埋めるか。円は π/4≈0.785 が上限）が 0.85 未満なら\
+     not_rectangular で見送る。\n\
+     **分解能は 0.1〜0.5 度で、0.5 度を下回る差を有意と読んではならない。** \
+     主体は長辺 250px へ縮めてから測るので、輪郭の量子化がそのまま角度の誤差になる。\n\
+     回転だけを行う kiri rotate では、同じ値を --angle で渡す（あちらに auto は\
+     無い。切り抜きを通らないので subject を測っていない）。"
         .to_string()
+}
+
+/// `cutout --rotate` が受け取る値。**角度そのものか、測って決める指示か。**
+///
+/// 数値と `auto` を 1 つの引数に畳むのは、両者が「切り抜いた後にどれだけ回すか」
+/// という同じ問いへの答えだからである。別の引数（`--rotate-auto`）にすると、
+/// 両方渡されたときの勝ち負けという**契約には要らない規則**が 1 つ増える。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RotateArg {
+    /// 指定された角度(度)。時計回りが正
+    Degrees(f64),
+    /// `subject.level_rotation` を測って適用する
+    Auto,
+}
+
+impl RotateArg {
+    /// 結果 JSON へ出す前の丸め。**`auto` は丸めるものを持たない。**
+    ///
+    /// 指定値をそのまま返す規約（`settings.rotate`）なので、ここで角度を
+    /// 解決してはいけない——効いた角度は `rotate` ブロックのほうが言う
+    pub fn rounded(self) -> Self {
+        match self {
+            RotateArg::Degrees(d) => RotateArg::Degrees(crate::commands::output::round4(d)),
+            RotateArg::Auto => RotateArg::Auto,
+        }
+    }
+}
+
+/// **`settings.rotate` は数値か `"auto"` の union である。**
+///
+/// `auto` を渡した実行で 0 を返すと、「回さないと指定した」と「測った結果
+/// 回らなかった」が区別できなくなる。効いた角度は `rotate` ブロックが言うので、
+/// ここは指定値をそのままの形で返し切る
+impl Serialize for RotateArg {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            RotateArg::Degrees(d) => s.serialize_f64(*d),
+            RotateArg::Auto => s.serialize_str(ROTATE_AUTO),
+        }
+    }
+}
+
+/// `auto` の綴り。**契約として 1 箇所から配る。**
+pub const ROTATE_AUTO: &str = "auto";
+
+/// `--rotate` の値を読む。`auto` か有限の数値。
+///
+/// **spec 経由も同じここを通る**（`commands::batch`）。別に書くと、`auto` の
+/// 綴りや nan の扱いが片方でだけ通る／通らないが起きる。数値の側は `finite` を
+/// そのまま使う——角度だけが負値に意味を持つ、という約束もそこにある
+pub fn parse_rotate(s: &str) -> Result<RotateArg, String> {
+    if s == ROTATE_AUTO {
+        return Ok(RotateArg::Auto);
+    }
+    finite(s)
+        .map(RotateArg::Degrees)
+        .map_err(|_| format!("'{s}' は角度(度)の数値でも {ROTATE_AUTO} でもありません"))
+}
+
+/// `--rotate` の value_parser。**候補に `auto` を名乗らせるためだけに自前で書く。**
+///
+/// `profile_parser` が `PossibleValuesParser` を通しているのと同じ事情で、
+/// `accepts` が空になると**綴りを外したときに code 無しの exit 2 で落ちる項目の
+/// 候補を、呼ぶ前に知る手段が無くなる**。とはいえ `--rotate` は自由な数値も
+/// 取るので候補の表では作れない——そこで解釈は `parse_rotate` に任せ、
+/// `possible_values` だけを自分で名乗る。clap は候補を**検証には使わない**
+/// （ヘルプと綴り違いの助言にしか読まない）ので、数値が弾かれることはない
+#[derive(Clone)]
+struct RotateParser;
+
+impl clap::builder::TypedValueParser for RotateParser {
+    type Value = RotateArg;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        // 失敗の綴り方は clap に任せる。自前で組むと、他の項目と文面が揃わない
+        clap::builder::StringValueParser::new()
+            .try_map(|s: String| parse_rotate(&s))
+            .parse_ref(cmd, arg, value)
+    }
+
+    fn possible_values(
+        &self,
+    ) -> Option<Box<dyn Iterator<Item = clap::builder::PossibleValue> + '_>> {
+        Some(Box::new(std::iter::once(
+            clap::builder::PossibleValue::new(ROTATE_AUTO)
+                .help("subject.level_rotation を適用する（high のときだけ）"),
+        )))
+    }
 }
 
 /// `--angle` の長いヘルプ。
@@ -1383,18 +1492,23 @@ pub struct CutoutArgs {
     #[arg(skip)]
     pub fixed: OptimizeFixed,
 
-    /// 切り抜いた後に時計回りへ回す角度(度)。負値は反時計回り。既定 0（回さない）
+    /// 切り抜いた後に時計回りへ回す角度(度)。負値は反時計回り。既定 0（回さない）。auto で subject.level_rotation を適用する
     ///
     /// ヘルプの本文は `cutout_rotate_long_help` に置く。順序（切り抜き →
-    /// 回転 → キャンバス → 影）は指定の前に知っていないと結果を読み違える
+    /// 回転 → キャンバス → 影）は指定の前に知っていないと結果を読み違える。
+    /// `auto` の適用条件と分解能も同じ理由でそちらにある
+    ///
+    /// **`allow_hyphen_values` は `auto` を足しても要る。** 負値に意味がある
+    /// （反時計回り）のは変わっていない
     #[arg(
         long,
-        default_value_t = 0.0,
+        value_name = "DEG|auto",
+        default_value = "0",
         allow_hyphen_values = true,
-        value_parser = finite,
+        value_parser = RotateParser,
         long_help = cutout_rotate_long_help()
     )]
-    pub rotate: f64,
+    pub rotate: RotateArg,
 
     /// 規格の複合指定に名前を付けたもの（既定 off）。--canvas / --fill-ratio / --format / --background / --flatten / --max-bytes をまとめて決める
     ///
@@ -1436,6 +1550,21 @@ pub struct CutoutArgs {
     /// 既定の 0.85 は kiri が選んだ値で、規格の主張ではない。規格が求める占有率は --profile の表が持ち、条件と出典は kiri schema の profiles[] が配る
     #[arg(long, default_value_t = 0.85)]
     pub fill_ratio: f64,
+
+    /// セット内でスケールと余白を揃える指定。**引数ではない**——`kiri batch` が
+    /// spec の `set` と pass 1 の測りから埋める。
+    ///
+    /// **CLI からの入口を作らない。** `kiri cutout` は 1 枚を処理する
+    /// コマンドで、揃える相手がその中に無い。「セットの代表寸法」を渡せる形に
+    /// すると、利用者が自分で全点を測って同じ数を全コマンドへ書き写す運用が
+    /// 生まれる——`--fill-ratio` を直接書くのと変わらないうえ、写し間違えても
+    /// 誰も気づけない。
+    ///
+    /// **`fill_ratio` と同じ席を争う。** ここが `Some` の実行では
+    /// `--fill-ratio` の値は読まれず、実際に効いた占有率は `canvas.fill_ratio`
+    /// が返す（canvas ブロックは効いた値を語る規約）
+    #[arg(skip)]
+    pub set: Option<SetPlacement>,
 
     /// 指標がこの条件に触れたら exit 5 で返す。カンマ区切り (例 default,halo_ratio>0.05)
     ///

@@ -475,6 +475,36 @@ fn fields() -> Vec<FieldEntry> {
             ),
         },
         FieldEntry {
+            path: "subject.level_fill_ratio",
+            appears_in: both(),
+            unit: "ratio",
+            nullable: true,
+            null_means: Some(
+                "level_rotation が null のときは同じく null。角度と同じ凸包から出る値なので、\
+                 片方だけが埋まることは無い",
+            ),
+            warns: vec![],
+            // **`gates` が語るのは `confidence` の条件だけ**（doc がそう定めて
+            // いる）なので、ここには載せない。0.85 が決めるのは
+            // 「`--rotate auto` が角度を採るか」であって信頼度ではなく、
+            // 混ぜると受け手は「これを満たせば high になる」と読む。
+            // しきい値は `notes` が綴り、機械可読な形では
+            // `ROTATE_AUTO_SKIPPED` の `data.min_fill_ratio` が配る
+            gates: None,
+            summary: "主体の凸包が最小外接矩形をどれだけ埋めているか（1.0 で矩形そのもの）",
+            notes: Some(
+                "**level_rotation をどれだけ信用してよいかを言う値である。** 1.0 に近いほど、\
+                 最小外接矩形がその形を実際に describe している。長方形は 1.0、角丸で 0.98、\
+                 取っ手つきで 0.88 あたり、**円は π/4≈0.785 が上限**。cutout --rotate auto は\
+                 これが 0.85 未満なら回さず、ROTATE_AUTO_SKIPPED の data.reason が \
+                 not_rectangular を言う（data.level_fill_ratio と data.min_fill_ratio に\
+                 測った値としきい値が入る）。**level_rotation を自分で読んで kiri rotate へ\
+                 渡す経路でも、同じ値で同じ判断をすること**——円に取っ手が 1 本生えた形では\
+                 最小外接矩形の位置が輪郭の量子化で決まり、水平に置いたフライパン（真値 0 度）に \
+                 -21.7 度が high で返る",
+            ),
+        },
+        FieldEntry {
             path: "subject.border",
             appears_in: both(),
             unit: "px",
@@ -822,6 +852,29 @@ fn fields() -> Vec<FieldEntry> {
                  成果物の画素は --shadow を足す前と 1 バイトも変わらず、shadow ブロックも現れない\
                  （schema_version は据え置き）。実際に効いたずらし量とぼかしは shadow.offset / \
                  shadow.blur のほう",
+            ),
+        },
+        FieldEntry {
+            path: "settings.rotate",
+            appears_in: vec!["cutout"],
+            // **数値か "auto" の union である。** 受け手が値を照合してよいかが
+            // ここで変わるので、deg のまま配ると「必ず数値」と読まれる
+            unit: "deg_or_auto",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "--rotate の指定値（度、または auto）",
+            notes: Some(
+                "**指定値である。** 実際に効いた角度は rotate.angle のほうで、回らなかった指定\
+                 （0 と 360、それに適用しなかった auto）では rotate ブロックごと現れない。\
+                 auto は subject.level_rotation をそのまま適用する指示で、subject.confidence が \
+                 high、level_rotation が測れ、かつ subject.level_fill_ratio が 0.85 以上の\
+                 ときだけ効く。効かなかったときは 0 度のまま \
+                 ROTATE_AUTO_SKIPPED が出て、data.reason が no_subject / low_confidence / \
+                 not_measurable / not_rectangular のどれかを言う。**分解能は 0.1〜0.5 度で、0.5 度を下回る差を\
+                 有意と読んではならない**（kiri rotate --angle に auto は無い——切り抜きを\
+                 通らないので subject を測っていない）",
             ),
         },
         FieldEntry {
@@ -1430,6 +1483,94 @@ fn fields() -> Vec<FieldEntry> {
                  **skipped が 1 つでもあれば \
                  PROFILE_UNCHECKABLE が出て、飛ばした項目を data.checks に配列で並べる**\
                  ——黙って合格にはしていない。skipped を消したければ JPEG か PNG を渡す",
+            ),
+        },
+        // セット内のスケール・余白の統一。**`BatchReport` の根に付くブロック**
+        // なので、path にコマンド名の接頭辞は付かない（`lint` の 3 つと同じ
+        // 事情で、どのコマンドの話かは `appears_in` が言う）
+        FieldEntry {
+            path: "set.align",
+            appears_in: vec!["batch"],
+            unit: "enum",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "何で揃えたか（height / bbox）",
+            notes: Some(
+                "**set ブロックごと、spec に set を書いた実行にしか現れない**\
+                 （compliance / optimize と同じ規約で、書かない実行の結果 JSON は \
+                 1 バイトも変わらない）。1 点も測れずに揃えられなかった実行でも現れない\
+                 ——そのことは警告の SET_NOT_MEASURED が理由つきで言う。\
+                 height は出力上の商品の高さを共通の T*CH にする（撮影距離の正規化）、\
+                 bbox は外接矩形を共通の枠 (T*CW, T*CH) へ長辺基準で収める",
+            ),
+        },
+        FieldEntry {
+            path: "set.fill_ratio",
+            appears_in: vec!["batch"],
+            unit: "ratio",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "効いた目標の占有率 T",
+            notes: Some(
+                "**点ごとに実際に効いた占有率はこれではない。** そちらは \
+                 results[].result.canvas.fill_ratio が返す——height 揃えでは \
+                 f_i = T * max(1, (CH*cw)/(CW*ch)) なので、横長の点ほど大きくなる。\
+                 1.0 を超えた点は 1.0 で止まり、SET_SCALE_CLAMPED がその点だけ\
+                 目標に届いていないことを差つきで言う",
+            ),
+        },
+        FieldEntry {
+            path: "set.source",
+            appears_in: vec!["batch"],
+            unit: "enum",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "T の出どころ（specified / median）",
+            notes: Some(
+                "**同じ数でも次の一手が変わる。** specified は spec の \
+                 set.fill_ratio をそのまま使った（書き直せばよい）、median は\
+                 全点の占有率の中央値を測って決めた（セットの構成を変えない限り動かない）。\
+                 specified のときは代表寸法を 1 点も測らない——中央値を採る相手がいないので、\
+                 pass 1 ごと省いて余分な decode を 1 回も増やさない",
+            ),
+        },
+        FieldEntry {
+            path: "set.measured",
+            appears_in: vec!["batch"],
+            unit: "count",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "代表寸法を測れた項目の数",
+            notes: Some(
+                "読めなかった項目と主体を検出できなかった項目は中央値の材料から外れるので、\
+                 total より小さくなりうる（**外した理由は results[] が項目ごとに言う**）。\
+                 source が specified なら常に 0 で、これは「測って 0 点だった」ではなく\
+                 「測っていない」である",
+            ),
+        },
+        FieldEntry {
+            path: "set.clamped",
+            appears_in: vec!["batch"],
+            unit: "count",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "占有率が 1.0 を超えて上限で止まった項目の数",
+            notes: Some(
+                "0 でなければ、その項目は SET_SCALE_CLAMPED を持ち、目標の高さに\
+                 届いていない（不足分は data.height_shortfall）。\
+                 **これは異常ではなく物理である**——正方のキャンバスで height 揃えなら、\
+                 縦横比が 1/T を超える横長の商品では必ず当たる。\
+                 canvas を横長にするか、set.fill_ratio を下げるか、align を bbox にする",
             ),
         },
         FieldEntry {

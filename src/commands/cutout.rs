@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use serde_json::{Value, json};
 
+use crate::batch::SetPlacement;
 use crate::cli::{CutoutArgs, Polygon, RotateArg};
 use crate::commands::output::{self, round4};
 use crate::commands::segment;
@@ -426,17 +427,22 @@ fn apply_profile(args: &CutoutArgs, warnings: &mut Vec<Warning>) -> Option<Cutou
         }
     }
 
+    // **優先順位は 明示指定 > set > profile > 既定。** `set` は
+    // `--fill-ratio` と同じ席を争うので、どちらかがあれば profile の占有率は
+    // 効かない。明示のほうを先に見るのは、両方あるときに勝つのが明示だから
+    // である（spec では両方書けないよう `batch::validate_set` が断っている
+    // ので、ここへ届くのは CLI から `--fill-ratio` を明示した実行だけになる）
     if let Some(ratio) = want.fill_ratio {
-        if explicit.fill_ratio {
-            warnings.extend(overridden(
+        match args.set {
+            _ if explicit.fill_ratio => warnings.extend(overridden(
                 profile,
                 "fill_ratio",
                 "--fill-ratio",
                 json!(round4(ratio)),
                 json!(round4(args.fill_ratio)),
-            ));
-        } else {
-            out.fill_ratio = ratio;
+            )),
+            Some(set) => warnings.push(overridden_by_set(profile, set, ratio)),
+            None => out.fill_ratio = ratio,
         }
     }
 
@@ -866,6 +872,44 @@ fn overridden_by_extension(
     )
 }
 
+/// profile の占有率を batch の `set` が押しのけたことを報せる。
+///
+/// **`data` の形は他の `PROFILE_OVERRIDDEN` と同じ**（`key` / `profile` /
+/// `used`）で、押しのけた主が `set` であることは `by` が言う。code を分けない
+/// のは、受け手が答えたい問い——「profile を指定したのに効かなかった項目は
+/// どれか」——が 1 つも変わらないためである。
+///
+/// **`overridden_with` の「同じ値なら黙る」は通さない。** `set` が実際に
+/// 効かせるのは点ごとの `f_i` で、T が偶然 profile の値と一致しても、
+/// 効く値は点ごとに違う。黙ると「規格の占有率で揃えたはず」が成果物を並べて
+/// 見るまで分からない。`used` に入れるのは T（セット全体の目標）で、
+/// **その点で実際に効いた値は `canvas.fill_ratio` のほう**が返す。
+fn overridden_by_set(profile: &profile::Profile, set: SetPlacement, wanted: f64) -> Warning {
+    Warning::new(
+        WarningCode::ProfileOverridden,
+        format!(
+            "--profile {} は --fill-ratio {} を求めましたが、set の目標 {} が効きます\
+             （実際の占有率は点ごとに決まり、canvas.fill_ratio が返します）",
+            profile.name,
+            round4(wanted),
+            round4(set.target)
+        ),
+    )
+    .with_hint(format!(
+        "profile の占有率で書くなら spec の set を外してください\
+         （規格の条件と出典は kiri schema の profiles[] にあります）。\
+         set は全点を 1 つの目標へ揃えるものなので、規格の占有率とは両立しません。\
+         いま効いているのは align={} の目標 {}",
+        set.align.as_str(),
+        round4(set.target)
+    ))
+    .with_data("key", "fill_ratio")
+    .with_data("profile", round4(wanted))
+    .with_data("used", round4(set.target))
+    .with_data("by", "set")
+    .with_data("align", set.align.as_str())
+}
+
 /// 上書き 1 件を警告へ組む。**「同じ値なら黙る」規則はここ 1 箇所にしか無い。**
 ///
 /// `data` の形（`key` / `profile` / `used`）もここが決める。押しのけた主ごとに
@@ -1194,15 +1238,39 @@ fn place_on_canvas(
     // 影が下地に隠れる。組み替えを `--shadow off` にも通すと、半透明の縁で
     // 1 ずつ丸めが変わる（下地の上へ合成するか、後から下地へ落とすかの違い）
     let flatten_here = args.out.flatten && shadow_spec.is_none();
+    // **セット統一はここで 1 つの数に畳む。** `canvas.rs` には 1 行も触れない
+    // ——狙った倍率は渡す `fill_ratio` のほうを組み替えれば出る
+    // （`SetPlacement::fill_ratio` の doc に式がある）。`set` を渡さない実行では
+    // `requested` が `None` で、以降は今までどおり `args.fill_ratio` を読む
+    let content = (trimmed.width(), trimmed.height());
+    let requested = args.set.map(|set| set.fill_ratio(content, (width, height)));
+    // `plan()` は `(0, 1]` の外を `INVALID_FILL_RATIO` で断る。**断らせずに
+    // 上限で止める**のは、1.0 を超えるのが誤りではなく物理だからである
+    // （正方キャンバスで横長の商品に高さを与えれば横がはみ出す）。止めたことは
+    // 下で `SET_SCALE_CLAMPED` が目標との差つきで言う
+    let fill_ratio = match requested {
+        Some(wanted) => wanted.min(1.0),
+        None => args.fill_ratio,
+    };
     let spec = CanvasSpec {
         width,
         height,
-        fill_ratio: args.fill_ratio,
+        fill_ratio,
         // --flatten が指定されていれば下地を塗る。既定は透明のまま
         background: flatten_here.then_some(args.out.background),
     };
-    let plan = canvas_plan((trimmed.width(), trimmed.height()), &spec)?;
+    let plan = canvas_plan(content, &spec)?;
     let mut placed = canvas_apply(&trimmed, &spec)?;
+
+    // **止めたことは配置が決まってから言う。** 目標との差を語るには実際に
+    // 得た高さが要り、それは `plan` が決めるまで綴れない。`CANVAS_UPSCALED`
+    // より先に置くのは、こちらが**指示がそのまま効かなかった**側の話だから
+    // である（結果についての警告より先、という `run()` の並べ方に揃える）
+    if let (Some(set), Some(wanted)) = (args.set, requested) {
+        if wanted > 1.0 {
+            warnings.push(set_clamped(set, wanted, height, plan.content.1));
+        }
+    }
 
     // 引数名を `spec` にすると上の `CanvasSpec` を隠す。どちらの仕様を
     // 読んでいるのかが目で追えなくなる
@@ -1239,13 +1307,53 @@ fn place_on_canvas(
         report: CanvasReport {
             width,
             height,
-            fill_ratio: args.fill_ratio,
+            // **効いた値を返す。** canvas ブロックは走った配置を語るもので、
+            // `set` を使った実行では要求した `--fill-ratio` は読まれていない。
+            // `set` を使わない実行では要求値と同じなので、出力は 1 バイトも
+            // 変わらない
+            fill_ratio,
             content: [plan.content.0, plan.content.1],
             offset: [plan.offset.0, plan.offset.1],
             scale: round4(plan.scale),
         },
         shadow,
     })
+}
+
+/// セット統一の占有率を上限で止めたことを報せる。
+///
+/// # これは「1 点だけ外れた異常」ではない
+///
+/// 計画書は「揃えた結果 1 点だけが極端に外れるとき」と書いているが、実際には
+/// **横長の商品では常態である。** 正方キャンバスで `align: "height"` なら
+/// `f_i = T * max(1, cw/ch)` なので、`T = 0.85` では縦横比 1.18:1 を超える
+/// 横長で必ず当たる。式の誤りではなく物理で、高さ `0.85*CH` を与えれば横幅は
+/// `0.85*CH*(cw/ch)` を要求し、それがキャンバスの幅を越える。
+///
+/// だからこそ**黙って「高さが揃った」ことにしない。** `data` には要求した
+/// `f_i` と使った 1.0 に加えて、**実際に得た高さと目標の差**を入れる。
+/// 受け手の次の一手はそこでしか決まらない——数 px なら見過ごせるが、
+/// 目標の半分しか無いならキャンバスを横長にするか `align` を変えるしかない。
+fn set_clamped(set: SetPlacement, wanted: f64, canvas_height: u32, got: u32) -> Warning {
+    let target = (set.target * f64::from(canvas_height)).round() as i64;
+    let shortfall = target - i64::from(got);
+    Warning::new(
+        WarningCode::SetScaleClamped,
+        format!(
+            "セット統一が求めた占有率 {wanted:.3} は 1.0 を超えるので 1.0 で止めました\
+             （高さは目標 {target}px に対して {got}px で、{shortfall}px 足りません）"
+        ),
+    )
+    .with_hint(
+        "正方のキャンバスに横長の商品を高さで揃えると、横がキャンバスからはみ出します。\
+         canvas を横長にするか、set.fill_ratio を下げるか、set.align を bbox にしてください",
+    )
+    .with_data("align", set.align.as_str())
+    .with_data("requested_fill_ratio", round4(wanted))
+    .with_data("used_fill_ratio", 1.0)
+    .with_data("target_height", target)
+    .with_data("height", got)
+    .with_data("height_shortfall", shortfall)
 }
 
 /// 重い処理に入る前に、付随出力（プレビュー・デバッグマスク）のパスを検証する。

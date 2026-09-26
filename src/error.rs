@@ -181,6 +181,11 @@ error_catalog! {
         => "2 つ以上の派生が同じ出力パスになる（書き始める前に断るので、成果物は 1 つも書かれない）",
     InvalidSetting = "INVALID_SETTING", Argument
         => "spec の設定値が不正（負値・nan・上限超過）",
+    InvalidSet = "INVALID_SET", Argument
+        => "batch の set が噛み合わない（align の綴り違い、fill_ratio の値域外、\
+            項目の fill_ratio との同時指定、canvas の無い項目）。\
+            綴りと値域と同時指定は spec を読んだ時点で断るので成果物は 1 つも書かれず、\
+            canvas が取れない項目だけは他の失敗と同じくその項目が落ちて実行全体は 4 になる",
     MissingDimension = "MISSING_DIMENSION", Argument
         => "--width も --height も指定されていない",
     UpscaleNotAllowed = "UPSCALE_NOT_ALLOWED", Argument

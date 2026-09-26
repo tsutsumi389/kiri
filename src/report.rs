@@ -811,6 +811,15 @@ pub struct BatchReport {
     pub with_warnings: usize,
     /// この実行が実際に書き出したか。項目ごとの結果にも同じものが入る
     pub dry_run: bool,
+    /// セット統一が効いたときだけ出る。**`set` を書かない実行ではキーごと
+    /// 現れない**——`compliance` / `optimize` と同じ規約で、渡さない実行の
+    /// 結果 JSON は 1 バイトも変わらない。
+    ///
+    /// **1 点も測れずに効かなかった実行でも現れない。** ここが語るのは
+    /// 「実際に何で揃えたか」であり、揃えていない実行に書く値が無い。
+    /// 効かなかったことは `warnings` の `SET_NOT_MEASURED` が理由つきで言う
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub set: Option<SetReport>,
     /// 実行**全体**に掛かる警告。項目ごとの警告は `results[].result.warnings`。
     ///
     /// **加算だけの変更である。** ここが空なのは今までどおりの実行で、いま入りうる
@@ -820,6 +829,29 @@ pub struct BatchReport {
     pub warnings: Vec<Warning>,
     pub elapsed_ms: u128,
     pub results: Vec<BatchItemReport>,
+}
+
+/// セット統一が実際に何で揃えたか。
+///
+/// **要求ではなく効いたものを返す。** 目標 T の出どころ（書かれた値か、
+/// 測った中央値か）まで返すのは、同じ `fill_ratio` という数でも、次の一手が
+/// そこで変わるためである——書いた値なら書き直せばよいが、中央値なら
+/// **セットの構成を変えない限り動かない。**
+#[derive(Debug, Serialize)]
+pub struct SetReport {
+    /// 何で揃えたか（"height" / "bbox"）
+    pub align: &'static str,
+    /// 効いた目標 T。**点ごとに実際に効いた占有率はこれではない**
+    /// （`results[].result.canvas.fill_ratio` のほうが返す）
+    pub fill_ratio: f64,
+    /// T の出どころ（"specified" / "median"）
+    pub source: &'static str,
+    /// 代表寸法を測れた項目の数。`source` が "specified" なら 0
+    /// （**測っていない**——書かれた T があるので pass 1 ごと省く）
+    pub measured: usize,
+    /// 占有率が 1.0 を超えて上限で止まった項目の数。
+    /// 0 でない項目は `SET_SCALE_CLAMPED` を持つ
+    pub clamped: usize,
 }
 
 /// `--fail-on` の判定。**`--fail-on` を指定したときだけ出る。**

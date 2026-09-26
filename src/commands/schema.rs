@@ -1485,6 +1485,94 @@ fn fields() -> Vec<FieldEntry> {
                  ——黙って合格にはしていない。skipped を消したければ JPEG か PNG を渡す",
             ),
         },
+        // セット内のスケール・余白の統一。**`BatchReport` の根に付くブロック**
+        // なので、path にコマンド名の接頭辞は付かない（`lint` の 3 つと同じ
+        // 事情で、どのコマンドの話かは `appears_in` が言う）
+        FieldEntry {
+            path: "set.align",
+            appears_in: vec!["batch"],
+            unit: "enum",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "何で揃えたか（height / bbox）",
+            notes: Some(
+                "**set ブロックごと、spec に set を書いた実行にしか現れない**\
+                 （compliance / optimize と同じ規約で、書かない実行の結果 JSON は \
+                 1 バイトも変わらない）。1 点も測れずに揃えられなかった実行でも現れない\
+                 ——そのことは警告の SET_NOT_MEASURED が理由つきで言う。\
+                 height は出力上の商品の高さを共通の T*CH にする（撮影距離の正規化）、\
+                 bbox は外接矩形を共通の枠 (T*CW, T*CH) へ長辺基準で収める",
+            ),
+        },
+        FieldEntry {
+            path: "set.fill_ratio",
+            appears_in: vec!["batch"],
+            unit: "ratio",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "効いた目標の占有率 T",
+            notes: Some(
+                "**点ごとに実際に効いた占有率はこれではない。** そちらは \
+                 results[].result.canvas.fill_ratio が返す——height 揃えでは \
+                 f_i = T * max(1, (CH*cw)/(CW*ch)) なので、横長の点ほど大きくなる。\
+                 1.0 を超えた点は 1.0 で止まり、SET_SCALE_CLAMPED がその点だけ\
+                 目標に届いていないことを差つきで言う",
+            ),
+        },
+        FieldEntry {
+            path: "set.source",
+            appears_in: vec!["batch"],
+            unit: "enum",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "T の出どころ（specified / median）",
+            notes: Some(
+                "**同じ数でも次の一手が変わる。** specified は spec の \
+                 set.fill_ratio をそのまま使った（書き直せばよい）、median は\
+                 全点の占有率の中央値を測って決めた（セットの構成を変えない限り動かない）。\
+                 specified のときは代表寸法を 1 点も測らない——中央値を採る相手がいないので、\
+                 pass 1 ごと省いて余分な decode を 1 回も増やさない",
+            ),
+        },
+        FieldEntry {
+            path: "set.measured",
+            appears_in: vec!["batch"],
+            unit: "count",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "代表寸法を測れた項目の数",
+            notes: Some(
+                "読めなかった項目と主体を検出できなかった項目は中央値の材料から外れるので、\
+                 total より小さくなりうる（**外した理由は results[] が項目ごとに言う**）。\
+                 source が specified なら常に 0 で、これは「測って 0 点だった」ではなく\
+                 「測っていない」である",
+            ),
+        },
+        FieldEntry {
+            path: "set.clamped",
+            appears_in: vec!["batch"],
+            unit: "count",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "占有率が 1.0 を超えて上限で止まった項目の数",
+            notes: Some(
+                "0 でなければ、その項目は SET_SCALE_CLAMPED を持ち、目標の高さに\
+                 届いていない（不足分は data.height_shortfall）。\
+                 **これは異常ではなく物理である**——正方のキャンバスで height 揃えなら、\
+                 縦横比が 1/T を超える横長の商品では必ず当たる。\
+                 canvas を横長にするか、set.fill_ratio を下げるか、align を bbox にする",
+            ),
+        },
         FieldEntry {
             path: "mask.touches_edge",
             appears_in: vec!["cutout"],

@@ -117,6 +117,10 @@ warning_catalog! {
         => "lint が検査できない項目を飛ばした（AVIF の画素など）。黙って合格にはしていない",
     RotateAutoSkipped = "ROTATE_AUTO_SKIPPED"
         => "--rotate auto を適用しなかった（0 度のまま）。data.reason が no_subject / low_confidence / not_measurable / not_rectangular のどれかを言う",
+    SetScaleClamped = "SET_SCALE_CLAMPED"
+        => "batch の set が求めた占有率が 1.0 を超えたので 1.0 で止めた（その点だけ目標の高さに届いていない）。data.height_shortfall が不足分を言う",
+    SetNotMeasured = "SET_NOT_MEASURED"
+        => "batch の set が 1 点も測れなかったので揃えていない（各項目は自分で解決した fill_ratio のまま）",
 }
 
 impl Serialize for WarningCode {

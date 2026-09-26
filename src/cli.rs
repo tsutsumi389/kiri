@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 
+use crate::batch::SetPlacement;
 use crate::compliance::{DEFAULT_TOKEN, FAIL_ON_METRICS, FailOn};
 use crate::cutout::background::DEFAULT_BORDER;
 use crate::cutout::constraints::{
@@ -1549,6 +1550,21 @@ pub struct CutoutArgs {
     /// 既定の 0.85 は kiri が選んだ値で、規格の主張ではない。規格が求める占有率は --profile の表が持ち、条件と出典は kiri schema の profiles[] が配る
     #[arg(long, default_value_t = 0.85)]
     pub fill_ratio: f64,
+
+    /// セット内でスケールと余白を揃える指定。**引数ではない**——`kiri batch` が
+    /// spec の `set` と pass 1 の測りから埋める。
+    ///
+    /// **CLI からの入口を作らない。** `kiri cutout` は 1 枚を処理する
+    /// コマンドで、揃える相手がその中に無い。「セットの代表寸法」を渡せる形に
+    /// すると、利用者が自分で全点を測って同じ数を全コマンドへ書き写す運用が
+    /// 生まれる——`--fill-ratio` を直接書くのと変わらないうえ、写し間違えても
+    /// 誰も気づけない。
+    ///
+    /// **`fill_ratio` と同じ席を争う。** ここが `Some` の実行では
+    /// `--fill-ratio` の値は読まれず、実際に効いた占有率は `canvas.fill_ratio`
+    /// が返す（canvas ブロックは効いた値を語る規約）
+    #[arg(skip)]
+    pub set: Option<SetPlacement>,
 
     /// 指標がこの条件に触れたら exit 5 で返す。カンマ区切り (例 default,halo_ratio>0.05)
     ///

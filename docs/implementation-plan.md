@@ -79,7 +79,7 @@ src/
 | 21 | 品質指標を合否に畳み、exit code で仕分けられるようにする | `--fail-on` / exit 5 / `BatchReport.rejected` | 1日 |
 | 22 | モール規格をプリセットとして持ち、既存画像を検査する（**済**。§5 の Phase 22） | `--profile` / `kiri lint` / `schema.profiles[]` | 2日 |
 | 23 | 主体の傾きを畳み、セット内で大きさと余白を揃える（**済**。§5 の Phase 23） | `--rotate auto` / batch の `set` | 1.5日 |
-| 24 | 背景が中性だという前提と照明場から白点と露出を直す | `--white-balance` / `--exposure` | 2日 |
+| 24 | 背景が中性だという前提と照明場から白点と露出を直す（**済**。§5 の Phase 24） | `--white-balance` / `--exposure` | 2日 |
 | 25 | 反射を合成する | `--reflect` | 1日 |
 
 **Phase 17 以降は EC 特化のロードマップ**で、狙いと順序の根拠は
@@ -1723,6 +1723,107 @@ public リポジトリなので GitHub 製の標準ランナーは分数無制�
         2 つを消した。実装済みのまま表に残すと、その表明のほうが落ちる）/
         `the_readme_warning_table_lists_every_warning_in_the_contract`
         （README の表へ 3 行足した）が追随している
+- [x] Phase 24: `--white-balance auto|off` ＋ `--exposure auto|off`（どちらも既定
+      off。`SCHEMA_VERSION` は 2 のまま据え置き）
+  - [x] **背景をグレーカードとして読む段である。** EC の素材は「白い紙・布の上に
+        商品を置いて撮る」形がほとんどで、画面の大半に**本当は無彩色で本当は明るい
+        はずの面**が写っている。そこから白点（照明場の格子セルの線形 RGB の
+        チャンネル中央値）と露出（背景の輝度を狙いの L\* へ運ぶスカラー）を推定し、
+        **線形 RGB の対角ゲイン 1 回**で正す。設計は docs/design.md 4.15
+  - [x] 置き場所は `load` 直後・`segment` 推論より前。**以降のすべて（モデルの推論・
+        背景の見立て・`subject`・`--optimize` の探索・切り抜き・診断）が正規化後の
+        画素で測り直される。** 色の上で測る判定（ΔE・外周のばらつき・
+        `separability`）は正す前と後で別物なので、後から画素だけ直してもマスクは
+        狂った色で引かれている。推定に使う見立てだけは**正規化前の画像から 1 度だけ**
+        測る（正規化後に測り直せば、当てたゲインぶんだけ白点が動いて意味を失う）
+  - [x] **off の実行では新しいコードを 1 行も通らない。** 見立ても測らない。
+        `color` ブロックは `auto` を渡した実行にしか現れず、`settings` には足さない
+        ——足せば既定の実行の JSON が変わり、「off なら 1 バイトも変わらない」が
+        破れる。裏取りは main から建てたバイナリとの md5 突き合わせで行った
+        （実写 2 枚 × フラグなし / `--bbox` / `--optimize` の 6 通りで出力 PNG も
+        結果 JSON も一致。テスト内の golden に頼らない独立の確認）
+  - [x] 白点のゲインは**輝度を変えない** von Kries（`g_c = Y / W_c`）。段を分けて
+        おかないと「色かぶりを直したら明るくなった」が起きる。輝度の係数は
+        `linear_to_lab` の y 行と**一字一句同じ**にする（0.2126 と丸めて書き写すと
+        「白点を当てても輝度は変わらない」が 1 ビット崩れる）
+  - [x] 門は 5 つ（`NEUTRAL_CHROMA_MAX` 20 / `EXPOSURE_TARGET_L` 96 /
+        `EXPOSURE_MIN_L` 60 / `MAX_GAIN` 4 / `CLIP_BUDGET` 0.03）。**すべて 32 点
+        （合成 10 + S 13 + R 7 + 実写 2）で掃引して窓の中に置いた**。表は
+        design.md 4.15 と各定数の doc にある。入口は
+        `tests/color_normalize.rs::print_the_calibration_table`（`--ignored`）
+  - [x] **門は段ごとに落ちる。** 白点だけ落ちる / 露出だけ落ちる / 両方落ちるの
+        3 通りがすべて起こり、落ちた段は `WHITE_BALANCE_SKIPPED` /
+        `EXPOSURE_SKIPPED` が `data.reason` と数つきで言う。`color.status` は
+        `applied` / `no_change` / `skipped` の 3 値で、**`no_change`（直すものが
+        無い）と `skipped`（門が閉じた）を混ぜない**
+  - [x] `unit` の語彙へ `gain` と `stops`。batch spec は `white_balance` /
+        `exposure` を `batch.rs` の 3 箇所（`ItemSettings` / `pick!` /
+        `SETTING_KEYS`）へ足し、読めない値は CLI と同じパーサで `SPEC_INVALID`
+  - [x] `linear_to_srgb_u8` を `color/lab.rs` へ 1 本化した。**同じ式の複製が
+        `cutout/background.rs` と `cutout/refine.rs` に 2 つあり、Phase 24 が
+        3 つ目を要求した。** 3 箇所が別々に持つと、片方だけ直した日に境界帯の
+        1 画素が静かにずれる。式は 1 ビットも変えていない（往復恒等の単体テストと
+        上の md5 一致がその裏取り）
+  - ※ **計画の「マスク品質の 7 指標すべてに影響する」は効果の所在を読み違えていた。**
+        一様な色かぶりは背景の中央値との ΔE をほとんど動かさないので、マスクへの
+        効果は原理的に小さい。実測（実写 2 枚、`--white-balance auto`）では
+        `halo_ratio` と `contour_roughness` が下がる一方で `separability` は悪化し、
+        `foreground_ratio` は 1 ポイント強増える。**良くなる指標と悪くなる指標が
+        混ざる**——これが既定 off の根拠であり、この段の価値は Phase 23 の隣
+        （セット内で色と明るさが揃うこと）にある。7 指標は「悪化させていないか」を
+        見る側の物差しとして使った（`edge_quality` / `real_backgrounds` の
+        `--ignored` 一覧は着手前後で**時間と RSS 以外 1 つも動いていない**。
+        edge_quality 139 行 / real_backgrounds 279 行を突き合わせて差分 0）
+  - ※ **費用の警戒（§7.2 の「着手前に必ずベンチで見積もる」）は空振りだった。**
+        24.5MP の実写に ICC 変換の全画素パスを掛けても `info` は 0.44 秒で変わらない。
+        実際の画素パスは 24.5MP で 51ms（256 エントリの表を引くだけ）、費用の大半は
+        見立て（281ms）のほうである。**rayon は入れていない**——縮まるのは 51ms の
+        側だけだからで、L と見積もった規模のうち計算は M でしかなかった
+  - ※ **指示書が決めた `CLIP_BUDGET` の初期値 0.001 は間違っていた。** 24.5MP の
+        実写では布のハイライト 1.5% が 255 に達するので、予算を 0.1% に置くと
+        **白点のわずかな補正（青を 12% 上げるだけ）まで断られ、この段が実写で
+        1 度も動かない。** 通したい最大 0.015 と断りたい最小 0.060 のあいだ、
+        0.03 へ上げた
+  - ※ **合成ゲインの門で「露出から先に諦める」と決めたのも間違いだった**
+        （レビューで発覚。`f994ccd` で修正）。根拠にした「白点は絵を明るくしない」が
+        誤りで、**輝度不変の von Kries は必ず弱いチャンネルを持ち上げる**（実写
+        remote で青を +12.0%、合成の検体で +32.5%）。白飛びの判定は各チャンネルの
+        ゲインについて単調非減少なので、**`k ≤ 1` の露出は新しい飽和を 1 画素も
+        作れない**。それを先に落とすと次の反復は「より飛ぶゲイン」を評価することに
+        なり、必ず断られて白点も落ちる——**両方 `auto` を渡すと片方だけ渡すより
+        悪い結果を返していた**（合成 1 枚で `status: skipped` / 警告 2 本。
+        `--exposure auto` 単独なら `gain 0.984` で無害に当たる）。いまは
+        `stage_to_drop` が**実際に門を押し出している段**を落とすので、両方 `auto` は
+        片方ずつの実行の和になる（`both_stages_are_never_worse_than_one` が
+        バイト一致で固定）。**警告の並びは契約にしない**——諦めた順で、どちらが先かは
+        素材が決める
+  - ※ **計画の表に無い code を 1 つ足した**: `EXPOSURE_SKIPPED`。1 つの
+        `WHITE_BALANCE_SKIPPED` に `data.what` を持たせて兼用させる案は採らなかった
+        ——段ごとに落ちる設計なので、**同じ実行で 2 本出る**ことがあり、code が
+        同じだと受け手はどちらの段の話かを `data` の中身で分岐することになる
+  - ※ **契約の文面が実装とずれていた 3 件をレビューで見つけて直した**（`0defe1d`）。
+        (1) `color.gain` の notes が「3 つの積がおおよそ 1 なら露出は効いていない」
+        という推論規則を配っていたが、輝度不変なのは積ではなく `Σ coeff_c·W_c·g_c`
+        で、**README の自分の例が反例**（積 1.0645 の白点だけの実行）。
+        (2) `color.source` の「`background.model` と一致する」は約束できない
+        ——前者は正規化前、後者は正規化後の画素から測った見立てで、`auto` の分岐は
+        `uniformity` の 0.90、対角ゲインは Lab 距離を変えるので境目では裏返りうる。
+        (3) `clipped_ratio` の「新たに 255 へ張り付いた画素」は実装の「線形で 1.0 を
+        超えた画素」とずれる（`linear_to_srgb_u8` は線形 0.9923 以上を 255 に丸める
+        ので、**張り付くのに数えない画素が存在する**）。守りたいのは「情報が失われた
+        量」なので実装を残し、4 箇所の文面を実装へ合わせた
+  - ※ **恒等判定の幅（1e-6 の定数）は捨てた。** 8bit の分解能（256 通りのどれかが動く最小の
+        相対変化は下げ側 0.4455% / 上げ側 0.4483%）より 3 桁細かく、
+        `gain = 1.0003` の実行が**画素を 1 つも動かさないまま `applied` を名乗り**、
+        `round4` の報告は `[1.0, 1.0, 1.0]` になっていた。いまは適用・白飛びの数え・
+        恒等判定の 3 つを**同じ表**で行う（別々に持つと「飛ぶと数えた画素が飛ばない」が
+        起こる）
+  - ※ **`data` の数が JSON の `null` になる経路が 1 つあった。** 白点の材料が
+        線形 0 のチャンネルを持つと商が `f64::INFINITY` になり、`gain_out_of_range`
+        の `data.gain` が `[null, null, null]` で出ていた（真っ黒な背景に
+        `--white-balance auto` で到達する）。上限で clamp して `[4.0, 4.0, 4.0]` と
+        書く案は**採らなかった**——試したのは無限のほうなので嘘になる。有限でない
+        ゲインは載せず、`reason` と `white_point`（`[0, 0, 0]`）で語る
 
 ## 6. 残件の優先順位
 
@@ -1995,6 +2096,8 @@ decode コストで、1000 点級でも「2 回デコードする」が素直。
 
 #### Phase 24: ホワイトバランス／露出の正規化
 
+**済（§5 の Phase 24）。**
+
 **なぜここか。** **画素を動かす唯一のフェーズ**で、マスク品質の 7 指標すべてに
 影響する。Phase 21 の合否と Phase 23 の一貫性が先に入っていれば「良くなったか」を
 数値で言える。逆順にすると悪化を目視でしか検出できない。
@@ -2011,6 +2114,22 @@ decode コストで、1000 点級でも「2 回デコードする」が素直。
 切り抜きの**前**に掛かるので、`tolerance` の意味（背景色との ΔE）が実質変わる。
 既定 off を崩さないことと、`--optimize` と併用したとき探索の前段に置くことを設計で
 固定する。§6 の P2 と同じ注意が効く——**着手前に必ずベンチで見積もる**。
+
+- ※ **「マスク品質の 7 指標すべてに影響する」は効果の所在を読み違えていた。**
+  一様な色かぶりは**背景の中央値との ΔE をほとんど動かさない**ので、マスクへの
+  効果は原理的に小さい。実測でも指標は良くも悪くもなる（`halo_ratio` と
+  `contour_roughness` は下がり、`separability` は悪化する）。この段の価値は
+  Phase 23 の隣——**セット内で色と明るさが揃うこと**にあり、7 指標は「悪化させて
+  いないか」を見る側の物差しである（§5 の Phase 24）
+- ※ **費用の警戒（「着手前に必ずベンチで見積もる」）は空振りだった。** 24.5MP の
+  実写に ICC 変換の全画素パス（行列 + TRC）を掛けても `info` の所要時間は 0.44 秒で
+  変わらない。実際の画素パスは 51ms、費用の大半は見立て（281ms）のほうである。
+  **rayon は要らない**
+- ※ **「`tolerance` の意味が実質変わる」という衝突リスクは、既定 off が丸ごと
+  引き受けた。** 渡さない実行では新しいコードを 1 行も通らないので、実写 2 枚 ×
+  3 通り（フラグなし / `--bbox` / `--optimize`）で出力バイト列と結果 JSON が
+  main と一致する。`--optimize` の前段に置く要件もそこで同時に満たされる
+  （正規化は `load` 直後で、探索はその後の画素を見る）
 
 #### Phase 25: `--reflect`
 
@@ -2059,7 +2178,8 @@ Phase 25 --reflect（依存なし。いつでも繰り上げ可）
 | 23 | `ROTATE_AUTO_SKIPPED` | `--rotate auto` を適用しなかった（0 度のまま）。`data.reason` が `no_subject` / `low_confidence` / `not_measurable` / `not_rectangular` の 4 値でどの条件かを言う |
 | 23 | `SET_SCALE_CLAMPED` | `set` が求めた占有率が 1.0 を超えたので 1.0 で止めた（その点だけ目標の高さに届かない）。**横長商品では常態**で、不足分は `data.height_shortfall` |
 | 23 | `SET_NOT_MEASURED` | `set` の代表寸法を 1 点も測れず、揃えなかった（各項目は自分で解決した `fill_ratio` のまま） |
-| 24 | `WHITE_BALANCE_SKIPPED` | 背景が中性でないため正規化しなかった |
+| 24 | `WHITE_BALANCE_SKIPPED` | 白点を当てなかった。`data.reason` は `not_neutral` / `not_light` を除く 4 値（`not_neutral` / `no_material` / `gain_out_of_range` / `would_clip`） |
+| 24 | `EXPOSURE_SKIPPED` | 露出を正さなかった（**計画の表に無い追加**）。`data.reason` は `not_light` / `no_material` / `gain_out_of_range` / `would_clip` |
 | 25 | `REFLECT_CLIPPED` | 反射が画像の外へ出た |
 
 新しいエラー code:
@@ -2092,13 +2212,20 @@ Phase 25 --reflect（依存なし。いつでも繰り上げ可）
 status, expected, actual }] }`、`subject.level_fill_ratio`（Phase 23。`level_rotation`
 をどれだけ信用してよいかを言う値で、**門を kiri の外でも引けるようにするために配る**）、
 `BatchReport.set`（`{ align, fill_ratio, source, measured, clamped }`。`compliance` /
-`optimize` と同じく、`set` を書いた実行にしか現れない）。`settings.rotate` は
-`f64 | "auto"` の union になり、`unit` の語彙へ `deg_or_auto` が増える——**受け手が
-`as_f64()` で読んでよいかがそこで変わる**ので `deg` に相乗りさせない。
+`optimize` と同じく、`set` を書いた実行にしか現れない）、`CutoutReport.color`
+（Phase 24。`{ white_balance, exposure, status, source, white_point,
+white_point_shift, gain, exposure_stops, clipped_ratio }`。**`--white-balance` /
+`--exposure` に `auto` を渡した実行にしか現れず、`settings` には足さない**——
+足せば既定の実行の JSON が変わり、「off なら 1 バイトも変わらない」が破れる）。
+`settings.rotate` は `f64 | "auto"` の union になり、`unit` の語彙へ
+`deg_or_auto` が増える——**受け手が `as_f64()` で読んでよいかがそこで変わる**ので
+`deg` に相乗りさせない。Phase 24 は `gain`（線形へ掛ける倍率。1 を超えるのが正常）と
+`stops`（2 の対数。0 が「動かさない」で負値も正常）の 2 つを足す——どちらも
+`ratio` に相乗りさせない。
 
 batch spec には `profile` / `max_bytes` / `derive` / `naming` / `fail_on` /
-`white_balance` / `reflect*` と、最上位の `set` が増える。**そのたびに `batch.rs` の
-3 箇所を同時に触る**（Phase 18 のテストがこれを守る）。
+`white_balance` / `exposure` / `reflect*` と、最上位の `set` が増える。**そのたびに
+`batch.rs` の 3 箇所を同時に触る**（Phase 18 のテストがこれを守る）。
 
 ### 7.5 テスト方針
 
@@ -2256,9 +2383,64 @@ batch spec には `profile` / `max_bytes` / `derive` / `naming` / `fail_on` /
     名乗る）と、既存の `every_published_unit_is_in_the_known_vocabulary` /
     `every_published_field_exists_in_the_result` / `every_code_named_in_the_docs_exists` /
     `the_readme_warning_table_lists_every_warning_in_the_contract`
-- **Phase 24** — `tests/real_backgrounds.rs` と `tests/edge_quality.rs` を**着手前後で
-  必ず取る**（[3.2b](#32b-境界品質の回帰テストtestsedge_qualityrs) の作法）。既知の
-  色温度ずれを与えた合成シーンで元へ戻せることと、`off` で 1 バイトも変わらないこと
+- **Phase 24**（済。結果は §5 の Phase 24 に、テスト名はここに並べた）。新規
+  `tests/color_normalize.rs` ＋ `src/color/normalize.rs` の単体テスト。**受け入れ
+  基準の letter はこの一覧が定義である。**
+  - **(a) off で無変化**（`off_does_not_change_a_single_byte`）。フラグ無しと
+    `off` 明示の出力がバイト一致。**着手前後で `tests/edge_quality.rs` と
+    `tests/real_backgrounds.rs` の `--ignored` 一覧を取る**
+    （[3.2b](#32b-境界品質の回帰テストtestsedge_qualityrs) の作法）のはこの裏取りで、
+    edge_quality 139 行 / real_backgrounds 279 行のうち**時間と RSS を含む行以外の
+    差分は 0**。さらに main から建てたバイナリとの md5 突き合わせを添える
+    （実写 2 枚 × フラグなし / `--bbox` / `--optimize`）
+  - **(b) 既知の色かぶりを戻せる**（`a_known_colour_cast_is_undone`）
+  - **(c) 既知の露出ずれを戻せる**（`a_known_exposure_offset_is_undone`）
+  - **(d) 色のある背景は中性化しない**（`a_coloured_background_is_not_neutralised` /
+    単体 `a_coloured_background_is_refused`）。出力は off とバイト一致
+  - **(e) 白飛びする量は当てない**（`a_gain_that_would_clip_is_refused`。単体にも
+    同名がある）。判定は**予算 0.03 を超えたこと**で言う——0.001 のような弱い
+    しきい値で見ると「断った理由」を固定できない
+  - **(f) 暗い背景に露出を当てない**（`a_dark_background_is_not_lifted_to_white` /
+    単体 `a_dark_background_refuses_only_the_exposure`）
+  - **(g) 決定性**（`the_same_normalisation_is_deterministic`）。3 回とも出力バイト列と
+    `color` ブロックが同じ
+  - **(h) 段ごとに落ちる**（`white_balance_applies_even_when_exposure_is_refused` /
+    単体 `a_darkening_exposure_survives_a_clipping_white_point`）と、**合成の門が
+    押し出している段を落とす**（`both_stages_are_never_worse_than_one`。両方 `auto` の
+    出力が `--exposure auto` 単独とバイト一致すること——**§5 の ※ で直した欠陥が
+    ここに固定されている**）と、**断り文句がどの段を落としたか名乗る**
+    （`the_refusals_name_the_stage_that_pushed_the_gate`）
+  - **(i) 探索の前段に掛かる**（`normalisation_runs_before_the_search`）。CLI を
+    2 段に分けた実行とは比べられない（1 段目の出力は切り抜き済みで、2 段目の探索が
+    見る材料が別物になる）ので、1 段目はライブラリの `normalise` 直呼びにしてある
+  - **(j) 白点は場のセルから測る**
+    （`the_white_point_comes_from_the_field_cells_when_a_field_is_built` /
+    単体 `the_cell_median_is_taken_per_channel_and_ignores_outliers` /
+    `an_even_number_of_cells_takes_the_upper_median`）。**`--background-model field`
+    を明示して `color.source` を固定する**——合成シーンは `auto` では `flat` に
+    落ちやすく、中央値の経路が「通るだけの検査すら無い」状態になりやすい
+  - **(k) 範囲の門**（`an_unbounded_gain_is_refused_and_reports_no_gain` /
+    単体 `an_unbounded_white_point_gain_is_refused_by_the_range_gate`）。
+    `data` に有限でない数を載せないことも同じテストが見る
+  - **(l) 8bit を 1 も動かさないゲインは当てない**
+    （`a_gain_too_small_to_move_any_8bit_value_is_not_applied`）
+  - **(m) spec**（`the_batch_spec_reads_white_balance` /
+    `the_batch_defaults_carry_the_white_balance` /
+    `an_unknown_white_balance_in_the_spec_is_refused`）
+  - **(n) CLI**（`an_unknown_white_balance_value_is_refused_by_the_parser`。exit 2）
+  - **(o) 契約** — `every_published_unit_is_in_the_known_vocabulary`（`gain` と
+    `stops` を語彙へ足した）/ `every_published_field_exists_in_the_result`
+    （**両方に `auto` を渡した `--dry-run` の実行を 1 つ足した**。片方だけでは、
+    もう片方のキーが「出るが 0 のまま」なのか「出ない」のかを確かめられない）/
+    `every_code_named_in_the_docs_exists`（「予定の code」の表から
+    `WHITE_BALANCE_SKIPPED` を消した）/
+    `the_readme_warning_table_lists_every_warning_in_the_contract`
+    （README の表へ 2 行足した）
+  - **較正とベンチの入口**は `print_the_calibration_table`（32 点の C\* / L\* /
+    要るゲイン / clip）と `print_the_cost_on_a_large_image`（見立てと画素パスの
+    所要時間）。どちらも `--ignored` で、実写は `KIRI_BENCH_DIR` から読む。
+    **表は `cutout` と同じ読み込み経路（ICC → sRGB）を通す**——`image::open` で
+    素通しすると白点が実行と食い違う（remote.jpg で C\* が 4.2 と 4.8 に分かれた）
 - **Phase 25** — `--shadow` と同型（`bounds` / `clipped` / 決定性 / `off` で無変化）
 
 ### 7.6 却下した代替案

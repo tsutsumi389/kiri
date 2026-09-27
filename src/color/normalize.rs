@@ -95,7 +95,7 @@ const NEUTRAL_CHROMA_MAX: f32 = 20.0;
 /// |---|---|---|---|---|
 /// | 92 | 232 | 238 | 0.00000 | 白背景が目に見えて暗くなる。織り目の S11 が 0.00082 で予算を通ってしまう |
 /// | **96** | **243** | **245** | **0.00000** | — |
-/// | 98 | 250 | 250 | 0.00001〜0.00146 | S9 が 0.00146 で予算を超え、**きれいな白背景が断られる** |
+/// | 98 | 250 | 250 | 0.00001〜0.00146 | 合成の暖色かぶりが clip 0.625 で断られる（狙いが高いぶん持ち上げ量が増える） |
 /// | 100 | 255 | 255 | 0.31〜0.62 | 全素材が白飛びで断られる（段が死ぬ） |
 ///
 /// 純白に置けないのは、背景のノイズ（±1.5 程度）と JPEG の振幅がそのまま
@@ -134,13 +134,20 @@ const EXPOSURE_MIN_L: f64 = 60.0;
 /// `EXPOSURE_MIN_L` (60) から `EXPOSURE_TARGET_L` (96) までの 3.18 倍で、
 /// 白点のゲインは C* が上限 (20) のときでも 1.3 倍前後にとどまる。掛け合わせて
 /// ようやく 4.1 に届くので、**この門が閉じるのは 2 つの段が同時に効いた
-/// 極端な組み合わせだけ**である。較正に使った 30 枚では 1 枚も届かなかった
+/// 極端な組み合わせだけ**である。較正に使った 32 点では 1 点も届かなかった
 /// （最大は実写 keyboard.jpg の 13.66 だが、そちらは `EXPOSURE_MIN_L` が
 /// 先に閉じる）。**それでも置く**——白点の材料が真っ黒（線形で 0）だと
 /// 商が無限になり、この門だけがそれを止める。
 const MAX_GAIN: f64 = 4.0;
 
-/// 正規化で新たに 255 へ張り付かせてよい画素の割合。**較正して決めた。**
+/// 正規化で新たに白へ飽和させてよい画素の割合。**較正して決めた。**
+///
+/// 数えるのは「ゲインを掛けた線形値が 1.0 を**超えた**画素」である。
+/// **8bit へ丸めた結果が 255 になる画素とは厳密には一致しない**——
+/// `linear_to_srgb_u8` は線形 0.9923 以上を 255 へ丸めるので、超えていないのに
+/// 255 になる画素が存在する。**予算が守りたいのは「情報が失われた量」**で、
+/// 上限を超えた分は二度と戻らない。丸めで 255 に乗った画素は元の値を
+/// まだ保っている（逆向きのゲインで戻せる）ので、数える理由が無い。
 ///
 /// **指示書の初期値 0.001 では段が実写で 1 度も動かなかった。** これは較正で
 /// 分かったことで、値を上げた理由がそこにある。実測（狙い L* 96）:
@@ -173,12 +180,100 @@ const MAX_GAIN: f64 = 4.0;
 /// 桁で大きいからである。実際に飛んだ量は `color.clipped_ratio` が返す。
 const CLIP_BUDGET: f64 = 0.03;
 
-/// ここに収まるゲインは「当てない」と同じである。
+/// ゲインの 256 通りの行き先。**`apply` / 白飛びの数え / 恒等かどうかの判定を
+/// 同じ 1 つの表で行う。**
 ///
-/// **`1.0` との厳密な比較にしない。** 白点も露出も浮動小数の商から出るので、
-/// 完全に中性・完全に狙いどおりの背景でも最下位ビットは揺れる。揺れたぶんを
-/// 掛けると 8bit では 1 も動かないのに `status` が `applied` を名乗ることになる。
-const GAIN_EPS: f64 = 1e-6;
+/// 入力が 8bit で、ゲインがチャンネルごとの定数なので、`powf` を画素ごとに
+/// 呼ぶ理由が無い（24.5MP では 7350 万回になる）。表を引く形にすると結果は
+/// 完全に同じで、決定性も自明になる。
+///
+/// **3 つを別々の表で持たない。** 別々にすると、片方だけ式を直した日に
+/// 「飛ぶと数えた画素が飛ばない」「恒等と判定した表で画素が動く」が起こりうる。
+struct GainTable {
+    /// sRGB 8bit の行き先
+    value: [[u8; 256]; 3],
+    /// **新たに**線形の上限を超えるか（元から 255 のチャンネルは数えない）
+    clips: [[bool; 256]; 3],
+}
+
+impl GainTable {
+    fn build(gain: [f64; 3], lut: &[f32; 256]) -> Self {
+        let mut table = Self {
+            value: [[0; 256]; 3],
+            clips: [[false; 256]; 3],
+        };
+        for (c, &g) in gain.iter().enumerate() {
+            let g = g as f32;
+            for (v, &base) in lut.iter().enumerate() {
+                let linear = base * g;
+                table.value[c][v] = linear_to_srgb_u8(linear);
+                table.clips[c][v] = v < 255 && linear > 1.0;
+            }
+        }
+        table
+    }
+
+    /// 256 通りすべてで入力と同じなら、この表は画素を 1 つも動かさない。
+    ///
+    /// **これが「当てない」の判定である。** 以前は `|g - 1| <= 1e-6` という
+    /// 幅で見ていたが、それは 8bit の分解能より 3 桁細かかった。実測すると
+    /// **相対 0.4455%（下げ側）/ 0.4483%（上げ側）より小さいゲインは 256 通り
+    /// すべてで恒等**で、最初に動くのは v=255 と v=254 である。1e-6 の幅では
+    /// `gain = 1.003` のような実行が `status: applied` を名乗りながら画素を
+    /// 1 つも動かさず、`round4` の報告は `[1.0, 1.0, 1.0]` になっていた
+    /// ——「applied なのに恒等ゲイン」である。**表を見れば幅を決める必要が無い**
+    /// （`no_change` は「直すものが無い」という意味なので、そちらが忠実）。
+    fn is_identity(&self) -> bool {
+        (0..3).all(|c| (0..256).all(|v| self.value[c][v] == v as u8))
+    }
+
+    /// 新たに白へ飽和する画素の割合。
+    ///
+    /// **もともと 255 だったチャンネルは数えない。** 張り付きは正規化の責任では
+    /// なく、元の露出の結果である。数えると、白飛びした素材では常に門が閉じて
+    /// 「色かぶりも直せない」になる。
+    ///
+    /// 判定は画素単位（1 チャンネルでも新たに飛べば 1 画素と数える）。
+    /// チャンネル単位で数えると分母が 3 倍になり、[`CLIP_BUDGET`] の意味が
+    /// 「飛んだ画素の割合」から「飛んだ成分の割合」へ静かに変わる。
+    fn clip_ratio(&self, image: &RgbaImage) -> f64 {
+        let mut count = 0u64;
+        for p in image.pixels() {
+            if self.clips[0][p[0] as usize]
+                || self.clips[1][p[1] as usize]
+                || self.clips[2][p[2] as usize]
+            {
+                count += 1;
+            }
+        }
+        let total = u64::from(image.width()) * u64::from(image.height());
+        if total == 0 {
+            0.0
+        } else {
+            count as f64 / total as f64
+        }
+    }
+
+    /// 表どおりに書き戻す。
+    ///
+    /// **アルファは触らない。** 完全透明な画素の RGB も一様に掛ける——入力はまだ
+    /// 切り抜かれていないので、「透明だから背景」という意味はここには無い。
+    /// 飛ばす枝を作ると、指示用のアルファ付き画像を渡した実行だけ画素が揃わない。
+    fn apply(&self, image: &mut RgbaImage) {
+        for p in image.pixels_mut() {
+            p[0] = self.value[0][p[0] as usize];
+            p[1] = self.value[1][p[1] as usize];
+            p[2] = self.value[2][p[2] as usize];
+        }
+    }
+}
+
+/// 2 つの段。合成の門が閉じたとき、**どちらを諦めるか**を名前で語るために持つ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    WhiteBalance,
+    Exposure,
+}
 
 /// 正規化で実際に起きたこと。**数はすべて公開する桁に丸めてある。**
 ///
@@ -202,7 +297,7 @@ pub struct Normalisation {
     pub gain: [f64; 3],
     /// log2(k)。露出を当てなかったなら 0
     pub exposure_stops: f64,
-    /// 正規化で新たに 255 へ張り付いた画素の割合
+    /// 正規化で新たに白へ飽和した（線形の 1.0 を超えた）画素の割合
     pub clipped_ratio: f64,
     /// 落ちた段の報告。**段ごとに 1 本**（両方落ちれば 2 本）
     pub warnings: Vec<Warning>,
@@ -218,6 +313,11 @@ fn round3(v: f64) -> f64 {
 
 fn round4(v: f64) -> f64 {
     (v * 10_000.0).round() / 10_000.0
+}
+
+/// `-0.0` を `0.0` へ揃える。丸めで符号だけが残った 0 を JSON へ出さない。
+fn zero_is_zero(v: f64) -> f64 {
+    if v == 0.0 { 0.0 } else { v }
 }
 
 /// 白点と露出を推定して画素へ当てる。
@@ -244,10 +344,16 @@ pub fn normalise(
 
     // ## 白点をどこから測るか
     //
-    // 場（格子）があるならセルの中央値を採る。セルは「ここは背景だ」と
-    // 言い切れる画素だけから作られているので、商品が外周の帯を大きく占める
-    // 画像でも商品の色を吸わない。中央値にするのは、照明の落ちた隅のセルや
-    // 取りこぼした商品のセルに引っ張られないためである（平均だと引っ張られる）。
+    // 場（格子）があるならセルの中央値を採る。中央値にするのは、照明の落ちた
+    // 隅のセルや取りこぼした商品のセルに引っ張られないためである（平均だと
+    // 引っ張られる）。
+    //
+    // **セルの中身は「測れた背景の中央値」だけではない。** `estimate_field` は
+    // 標本が足りなかったセルを近傍から埋め（`fill_unknown`、最後の逃げ道は
+    // 外周の中央値 1 色）、そのうえで格子全体を小さく均している。つまり
+    // 商品が大きく写った素材では、材料の多くが外挿値になる。**安全側ではある**
+    // ——逃げ道が外周の中央値なので、白点は 1 色モデルの答えへ寄っていく——が、
+    // 「セルは背景だけから作られている」と読むと実装より強い主張になる。
     let (white, source, material) = match field.cells_linear() {
         Some(cells) if !cells.is_empty() => (median_per_channel(cells), "field", true),
         // **格子が空という受け皿。** `estimate_field` は必ず cols*rows 個の
@@ -269,9 +375,16 @@ pub fn normalise(
     // ちょうど XN / YN / ZN なので、pivot の引数が 3 つとも同じ値になる）。
     // 1 つの数を門（`NEUTRAL_CHROMA_MAX`）と報告（`white_point_shift`）の
     // 両方に使うのは、**門が何を見たのかを利用者が読めるようにする**ためである
-    let shift = delta_e76_f32(lab, linear_to_lab([y, y, y]));
+    //
+    // **門は公開する桁（小数第 1 位）で判定する。** 生の値で切ると、C* 20.04 を
+    // 「彩度 ΔE 20.0 が上限 20.0 を超えるため」と報せる実行が作れる——message と
+    // `data` が矛盾し、受け手は自分で同じ判定を書けなくなる。公開した数が契約で
+    // あり、**その数で門が閉じたと言えるほうが正しい**（較正した 32 点では
+    // どの判定も裏返らない。境目から最も近い素材でも C* は 7.5 と 53.5、
+    // L* は 58.3 と 77.0 で、丸めの 0.05 では動かない）
+    let shift = round1(f64::from(delta_e76_f32(lab, linear_to_lab([y, y, y]))));
     let white_point = white.map(linear_to_srgb_u8);
-    let background_l = f64::from(lab[0]);
+    let background_l = round1(f64::from(lab[0]));
     // 断り文句に何度も渡すので束ねる。**3 つで 1 つの意味**（どの白点を
     // どの明るさで測って、無彩色からどれだけ離れていたか）を持つ
     let measured = Measured {
@@ -291,7 +404,7 @@ pub fn normalise(
     if white_balance.is_auto() {
         if !material {
             warnings.push(refused_white_balance("no_material", &measured, None, None));
-        } else if shift > NEUTRAL_CHROMA_MAX {
+        } else if shift > f64::from(NEUTRAL_CHROMA_MAX) {
             warnings.push(refused_white_balance("not_neutral", &measured, None, None));
         } else {
             // 0 で割らない。真っ黒なチャンネルは 1 のままにして、下の範囲の門へ渡す
@@ -321,56 +434,74 @@ pub fn normalise(
     //
     // **合成で初めて越えることがある。** 白点だけ・露出だけなら収まるのに、
     // 掛け合わせると上限を越える／白が飛ぶ、という組み合わせが実在する。
-    // そのとき**露出側から先に諦める**——白点は絵を明るくしない（輝度を変えない
-    // von Kries なので、上がるチャンネルと下がるチャンネルが釣り合う）ので、
-    // 白飛びの原因は露出であることがほとんどである。両方諦めるより情報が残るし、
-    // 「色かぶりは直ったが明るさは元のまま」は人が読める結果になる（逆は
-    // 「明るくなったが色かぶりは残った」で、直したい順が逆転する）。
+    // そのとき落とすのは**実際に門を押し出している段**である（`stage_to_drop`）。
     //
-    // **警告の並びはこの諦める順になる**（両方落ちた実行では EXPOSURE_SKIPPED が
-    // 先）。段ごとの門の並び（wb → exposure）と逆になるが、合成で落ちたときに
-    // 読むべき順はこちらである——「まず露出を諦め、それでも駄目だったので
-    // 白点も諦めた」という経過がそのまま並ぶ。
+    // **以前は「露出から先に諦める」と決め打ちしていた。それは間違いだった。**
+    // 根拠にしていたのは「白点は絵を明るくしないので白飛びの原因は露出のほう」
+    // という主張だが、輝度を変えない von Kries は**必ず弱いチャンネルを持ち上げる**
+    // （暖色の背景なら B を 1 割から 3 割）。そして露出が暗くする側（k < 1）の
+    // とき、決め打ちは証明可能に逆効果になる——白飛びの述語は各チャンネルの
+    // ゲインについて単調非減少なので、k < 1 の合成は白点単独より必ず飛ぶ量が
+    // 少ない。露出を先に落とせば次の周回はより飛ぶゲインを評価することになり、
+    // 必ず断られ、最後に白点も落ちて**何も当たらない**。
+    //
+    // 実機で再現した: 背景 255,245,215 に 252,252,252 の商品を 10% 置いた画像で、
+    // `--exposure auto` 単独なら gain 0.984（-0.023 段）が当たるのに、
+    // `--white-balance auto --exposure auto` にすると両方落ちて skipped になった。
+    // **渡した段が増えたせいで別の段が死ぬ**という、読みようのない振る舞いである。
+    //
+    // 落とした段の警告が並ぶ順は「諦めた順」で、**どちらが先かは素材が決める。**
+    // 受け手は並びではなく `code` で分岐する（順序を契約にしない）。
     let mut clipped = 0.0;
+    let mut accepted: Option<GainTable> = None;
     loop {
         let gain = compose(wb_gain, k);
-        if gain == [1.0, 1.0, 1.0] {
-            clipped = 0.0;
+        let table = GainTable::build(gain, lut);
+        // **恒等なら白飛びを数えない。** 24.5MP の 1 周（約 50 ms）を、
+        // 当てても当てなくても結果が同じゲインのために払う理由が無い
+        if table.is_identity() {
             break;
         }
+        // 範囲を先に見るのも同じ理由である（捨てるゲインのために全画素を舐めない）
         let refusal = if out_of_range(gain) {
             Some(("gain_out_of_range", None))
         } else {
-            let ratio = clip_ratio(image, gain, lut);
+            let ratio = table.clip_ratio(image);
             if ratio > CLIP_BUDGET {
                 Some(("would_clip", Some(ratio)))
             } else {
                 clipped = ratio;
+                accepted = Some(table);
                 None
             }
         };
         let Some((reason, ratio)) = refusal else {
             break;
         };
-        let refused = Some(gain);
-        if k != 1.0 {
-            warnings.push(refused_exposure(reason, &measured, refused, ratio));
-            k = 1.0;
-        } else {
-            warnings.push(refused_white_balance(reason, &measured, refused, ratio));
-            wb_gain = [1.0; 3];
+        match stage_to_drop(reason, gain, wb_gain, k) {
+            Stage::Exposure => {
+                warnings.push(refused_exposure(reason, &measured, Some(gain), ratio));
+                k = 1.0;
+            }
+            Stage::WhiteBalance => {
+                warnings.push(refused_white_balance(reason, &measured, Some(gain), ratio));
+                wb_gain = [1.0; 3];
+            }
         }
     }
 
-    // `GAIN_EPS` 以内なら画素を 1 つも触らない
+    // 表が恒等だった（または門で全部落ちた）なら画素を 1 つも触らない。
+    // **報告する数もそこで恒等へ揃える**——`gain = 1.0003` を報告しながら
+    // 画素が動いていない、という読めない組み合わせを作らない
     let mut gain = compose(wb_gain, k);
-    let moves_pixels = gain.iter().any(|g| (g - 1.0).abs() > GAIN_EPS);
-    if moves_pixels {
-        apply(image, gain, lut);
-    } else {
-        gain = [1.0, 1.0, 1.0];
-        k = 1.0;
-        clipped = 0.0;
+    let moves_pixels = accepted.is_some();
+    match &accepted {
+        Some(table) => table.apply(image),
+        None => {
+            gain = [1.0, 1.0, 1.0];
+            k = 1.0;
+            clipped = 0.0;
+        }
     }
 
     Normalisation {
@@ -379,19 +510,23 @@ pub fn normalise(
         status: status_of(moves_pixels, &warnings),
         source,
         white_point,
-        white_point_shift: round1(f64::from(shift)),
+        white_point_shift: shift,
         gain: gain.map(round4),
-        // 当てなかった段の stops は 0（log2(1) がちょうど 0 なので式のまま）
-        exposure_stops: round3(k.log2()),
+        // 当てなかった段の stops は 0（log2(1) がちょうど 0 なので式のまま）。
+        // **`-0.0` を潰す。** k が (0.99885, 1) に入ると `round3` は `-0.0` を
+        // 返し、JSON には `-0.0` が出る——「わずかに暗くした」と読めるが、
+        // 実際には 0.000 段である（`0.0 == -0.0` なので比較で潰せる）
+        exposure_stops: zero_is_zero(round3(k.log2())),
         clipped_ratio: round4(clipped),
         warnings,
     }
 }
 
-/// 断り文句が語る「何を測ったか」。
+/// 断り文句が語る「何を測ったか」。**すでに公開する桁へ丸めてある**
+/// （`normalise` の「門は公開する桁で判定する」を参照）。
 struct Measured {
     white_point: [u8; 3],
-    shift: f32,
+    shift: f64,
     background_l: f64,
 }
 
@@ -419,9 +554,9 @@ fn refused_white_balance(
         ),
     };
     let hint = match reason {
-        // **`--exposure off` を勧めてはならない。** ここへ来た時点で露出は
-        // すでに諦めてあり（合成の門は露出から先に落とす）、残った白点の
-        // ゲインだけで画面の明るい部分が飛んでいる。切るのは白点のほうである
+        // **`--exposure off` を勧めてはならない。** 白点が白飛びで落ちるのは
+        // 白点のゲインそのものが飽和を作っているとき（`stage_to_drop` が
+        // 単調性からそう選んでいる）なので、露出を切っても直らない
         "would_clip" => {
             "白点のゲインが画面の明るい部分を飛ばします。--white-balance off で\
              このまま出すか、ハイライトに余裕のある露出で撮り直してください"
@@ -440,7 +575,7 @@ fn refused_white_balance(
             .with_hint(hint)
             .with_data("reason", reason)
             .with_data("white_point", m.white_point.to_vec())
-            .with_data("white_point_shift", round1(f64::from(m.shift))),
+            .with_data("white_point_shift", m.shift),
         gain,
         clipped,
     )
@@ -472,9 +607,12 @@ fn refused_exposure(
             "背景が暗いので露出は正しません。白い面を測らせるなら --bbox で商品を囲うか、\
              明るい背景で撮り直してください"
         }
+        // ここへ来るのは**持ち上げる側（k > 1）だけ**である（`stage_to_drop`）。
+        // 下げる側は新しい飽和を 1 画素も作れないので、この文面が嘘になる枝は無い
         "would_clip" => {
-            "背景が明るすぎて持ち上げる余地がありません。--exposure off で色かぶりだけを\
-             直すか、露出を下げて撮り直してください"
+            "背景を狙いの明るさまで持ち上げると画面の明るい部分が飛びます。\
+             持ち上げたいならハイライトに余裕のある露出で撮り直すか、--exposure off で\
+             警告を止めてください"
         }
         _ => {
             "背景の見立てが外れている可能性があります。--bbox で商品を囲って測り直すか、\
@@ -486,7 +624,7 @@ fn refused_exposure(
             .with_hint(hint)
             .with_data("reason", reason)
             .with_data("target_l", round1(EXPOSURE_TARGET_L))
-            .with_data("background_l", round1(m.background_l)),
+            .with_data("background_l", m.background_l),
         gain,
         clipped,
     )
@@ -497,9 +635,18 @@ fn refused_exposure(
 /// **段の門（`not_neutral` / `not_light`）では付けない。** そこではゲインを
 /// まだ組んでおらず、載せる値が無い。無い情報を 0 で埋めると「ゲイン 0 倍で
 /// 落ちた」と読める。
+///
+/// **有限でないゲインも載せない。** 真っ黒な背景に白点を当てようとすると商が
+/// 無限になり、`serde_json` はそれを `null` にする——`color.gain` を
+/// `nullable: false` で配っている契約の中で、警告の `data.gain` だけが
+/// `[null, null, null]` を返すことになっていた（実機で再現した）。
+/// **上限で丸めて載せる案は採らない**——`[4.0, 4.0, 4.0]` と書けば
+/// 「その倍率を試して断った」と読めるが、試したのは無限のほうである。
+/// 断った理由は `reason` が、測ったものは `white_point`（真っ黒な背景では
+/// `[0, 0, 0]`）が語るので、数が 1 つ欠けても追える。
 fn with_gain(w: Warning, gain: Option<[f64; 3]>, clipped: Option<f64>) -> Warning {
     let mut w = w;
-    if let Some(gain) = gain {
+    if let Some(gain) = gain.filter(|g| g.iter().all(|c| c.is_finite())) {
         w = w.with_data("gain", gain.map(round4).to_vec());
     }
     if let Some(ratio) = clipped {
@@ -517,6 +664,61 @@ fn out_of_range(gain: [f64; 3]) -> bool {
     let lo = 1.0 / MAX_GAIN;
     gain.iter()
         .any(|g| !g.is_finite() || *g < lo || *g > MAX_GAIN)
+}
+
+/// 合成の門が閉じたときに諦める段を選ぶ。
+///
+/// **落とすのは「門を押し出している段」である。** 押していない段を落としても
+/// 次の周回はより悪いゲインを評価することになり、必ず両方落ちる（`normalise` の
+/// 合成の門のコメントに実機の再現例がある）。
+///
+/// 白飛びの根拠は**単調性**である。判定は各チャンネルについて
+/// `lut[v] * g > 1.0` なので、`g` について単調非減少——**1 以下のゲインは新しい
+/// 飽和を 1 画素も作れない。** したがって `k <= 1` のとき飛ばしているのは白点の
+/// 側（von Kries は必ず弱いチャンネルを持ち上げる）で、露出を落としても
+/// 飛ぶ量は減らない。
+///
+/// 範囲も同じ考え方で、**越えている向きへ押している段**を落とす。
+///
+/// 両方が同じ向きへ押しているときは露出を落とす。露出は 3 チャンネルすべてを
+/// 同じだけ動かすので寄与が大きく、また「色かぶりは直ったが明るさは元のまま」は
+/// 人が読める結果になる（逆は「明るくなったが色かぶりは残った」で、直したい順が
+/// 逆転する）。
+///
+/// **返すのは必ず「いま効いている」段である。** そうでなければ門が同じゲインを
+/// 二度評価して止まらない。
+fn stage_to_drop(reason: &str, gain: [f64; 3], wb_gain: [f64; 3], k: f64) -> Stage {
+    let wb_on = wb_gain != [1.0, 1.0, 1.0];
+    let exposure_on = k != 1.0;
+    debug_assert!(wb_on || exposure_on, "恒等のゲインが門に落ちた");
+    if !exposure_on {
+        return Stage::WhiteBalance;
+    }
+    if !wb_on {
+        return Stage::Exposure;
+    }
+    // **有限でないゲインの出どころは白点だけである。** `k` は有限な商から
+    // 出るのに対し、白点は線形で 0 のチャンネル（真っ黒な背景）を割るので
+    // 無限になりうる。露出を落としても無限は無限のままである
+    if gain.iter().any(|g| !g.is_finite()) {
+        return Stage::WhiteBalance;
+    }
+    if reason == "would_clip" {
+        // 上の単調性。k <= 1 は新しい飽和を作れないので、飛ばしているのは白点
+        return if k > 1.0 {
+            Stage::Exposure
+        } else {
+            Stage::WhiteBalance
+        };
+    }
+    // 範囲。越えている向きへ露出が押しているなら露出、そうでなければ白点
+    let too_high = gain.iter().any(|g| *g > MAX_GAIN);
+    let too_low = gain.iter().any(|g| *g < 1.0 / MAX_GAIN);
+    if (too_high && k > 1.0) || (too_low && k < 1.0) {
+        Stage::Exposure
+    } else {
+        Stage::WhiteBalance
+    }
 }
 
 /// `status` の 3 値。
@@ -566,6 +768,10 @@ fn target_luminance() -> f64 {
 /// **チャンネルを独立に取る。** 「中央のセル」を 1 つ選ぶ形にすると、
 /// どのチャンネルで順位を付けるかで答えが変わる。白点は色そのものではなく
 /// 3 つの比なので、成分ごとの代表値でよい。
+///
+/// **要素数が偶数のときは上側中央値を返す**（`len / 2` 番目）。2 つの平均を
+/// 採らないのは、平均が標本に無い値を作るからである——中央値を選ぶ理由が
+/// 「外れたセルに引かれない」ことなので、境目で外挿を始めたら筋が通らない。
 fn median_per_channel(cells: &[[f32; 3]]) -> [f32; 3] {
     let mut out = [0f32; 3];
     let mut buf: Vec<f32> = Vec::with_capacity(cells.len());
@@ -579,56 +785,6 @@ fn median_per_channel(cells: &[[f32; 3]]) -> [f32; 3] {
         *slot = buf[buf.len() / 2];
     }
     out
-}
-
-/// ゲインを当てたとき**新たに** 255 へ張り付く画素の割合。
-///
-/// **もともと 255 だったチャンネルは数えない。** 張り付きは正規化の責任では
-/// なく、元の露出の結果である。数えると、白飛びした素材では常に門が閉じて
-/// 「色かぶりも直せない」になる。
-///
-/// 判定は画素単位（1 チャンネルでも新たに飛べば 1 画素と数える）。
-/// チャンネル単位で数えると分母が 3 倍になり、`CLIP_BUDGET` の意味が
-/// 「飛んだ画素の割合」から「飛んだ成分の割合」へ静かに変わる。
-fn clip_ratio(image: &RgbaImage, gain: [f64; 3], lut: &[f32; 256]) -> f64 {
-    // 8bit しか入らないので、飛ぶかどうかも 256 通りの表で決まる
-    let clips: [[bool; 256]; 3] = std::array::from_fn(|c| {
-        let g = gain[c] as f32;
-        std::array::from_fn(|v| v < 255 && lut[v] * g > 1.0)
-    });
-    let mut count = 0u64;
-    for p in image.pixels() {
-        if clips[0][p[0] as usize] || clips[1][p[1] as usize] || clips[2][p[2] as usize] {
-            count += 1;
-        }
-    }
-    let total = u64::from(image.width()) * u64::from(image.height());
-    if total == 0 {
-        0.0
-    } else {
-        count as f64 / total as f64
-    }
-}
-
-/// ゲインを線形で掛けて書き戻す。
-///
-/// **256 エントリの表で済む。** 入力が 8bit で、ゲインがチャンネルごとの定数
-/// なので、`powf` を画素ごとに呼ぶ理由が無い（24.5MP では 7350 万回になる）。
-/// 表を引く形にすると結果は完全に同じで、決定性も自明になる。
-///
-/// **アルファは触らない。** 完全透明な画素の RGB も一様に掛ける——入力はまだ
-/// 切り抜かれていないので、「透明だから背景」という意味はここには無い。
-/// 飛ばす枝を作ると、指示用のアルファ付き画像を渡した実行だけ画素が揃わなくなる。
-fn apply(image: &mut RgbaImage, gain: [f64; 3], lut: &[f32; 256]) {
-    let table: [[u8; 256]; 3] = std::array::from_fn(|c| {
-        let g = gain[c] as f32;
-        std::array::from_fn(|v| linear_to_srgb_u8(lut[v] * g))
-    });
-    for p in image.pixels_mut() {
-        p[0] = table[0][p[0] as usize];
-        p[1] = table[1][p[1] as usize];
-        p[2] = table[2][p[2] as usize];
-    }
 }
 
 #[cfg(test)]
@@ -736,6 +892,135 @@ mod tests {
             (l - EXPOSURE_TARGET_L).abs() < 0.6,
             "背景が狙いに乗っていない: L* {l:.2}"
         );
+    }
+
+    /// セルの中央値はチャンネルごとに独立で、外れたセルに引かれない。
+    ///
+    /// **`field` 経路の唯一の直接の検査である。** `normalise` を通す検査は
+    /// どれも `BackgroundField::flat` を渡すので、ここが無いと中央値の取り方は
+    /// 1 度も表明されない（合成の CLI 検査は `color.source` が `field` になる
+    /// ことまでしか見られない）。
+    #[test]
+    fn the_cell_median_is_taken_per_channel_and_ignores_outliers() {
+        // R は昇順、G は降順、B は一定。チャンネルを混ぜていれば答えが崩れる
+        let cells = [
+            [0.1, 0.5, 0.3],
+            [0.2, 0.4, 0.3],
+            [0.3, 0.3, 0.3],
+            [0.4, 0.2, 0.3],
+            [0.5, 0.1, 0.3],
+        ];
+        assert_eq!(median_per_channel(&cells), [0.3, 0.3, 0.3]);
+
+        // 外れたセル（商品を吸ったセル）を 2 つ混ぜても中央値は動かない
+        let mut with_outliers = cells.to_vec();
+        with_outliers.push([0.99, 0.99, 0.99]);
+        with_outliers.push([0.0, 0.0, 0.0]);
+        let robust = median_per_channel(&with_outliers);
+        assert!(
+            robust.iter().all(|c| (0.25..=0.35).contains(c)),
+            "外れたセルに引かれている: {robust:?}"
+        );
+
+        // **並べ替えても同じ答えになる**（決定性）
+        let mut shuffled = with_outliers.clone();
+        shuffled.reverse();
+        assert_eq!(median_per_channel(&shuffled), robust);
+        shuffled.swap(0, 3);
+        assert_eq!(median_per_channel(&shuffled), robust);
+    }
+
+    /// 偶数個では上側中央値を返す（2 つの平均は採らない）。
+    #[test]
+    fn an_even_number_of_cells_takes_the_upper_median() {
+        let cells = [[0.2, 0.2, 0.2], [0.4, 0.4, 0.4]];
+        assert_eq!(median_per_channel(&cells), [0.4, 0.4, 0.4]);
+    }
+
+    /// 8bit で恒等なゲインは `applied` を名乗らない。
+    ///
+    /// **幅（かつての `GAIN_EPS` = 1e-6）を捨てた根拠の表明である。** 相対 0.4% 程度のゲインは
+    /// 256 通りすべてで恒等なので、幅で見ていた頃は「applied なのに画素が
+    /// 1 つも動かず、報告のゲインは丸めで [1,1,1]」という実行が作れた。
+    #[test]
+    fn a_gain_too_small_to_move_any_8bit_value_is_not_applied() {
+        let lut = srgb_linear_lut();
+        // 0.4% 未満は恒等、0.5% は恒等でない（実測の境目は 0.4455% / 0.4483%）
+        assert!(GainTable::build([1.004, 1.004, 1.004], lut).is_identity());
+        assert!(GainTable::build([0.9960, 0.9960, 0.9960], lut).is_identity());
+        assert!(!GainTable::build([1.005, 1.005, 1.005], lut).is_identity());
+        assert!(!GainTable::build([0.995, 0.995, 0.995], lut).is_identity());
+
+        // 恒等のゲインしか出ない背景では `no_change` になる
+        let rgb = [200u8, 200, 200];
+        let mut img = flat(rgb, 4, 4);
+        let before = img.clone();
+        let n = normalise(
+            &mut img,
+            &BackgroundField::flat(rgb),
+            NormalizeMode::Auto,
+            NormalizeMode::Off,
+        );
+        assert_eq!(n.status, "no_change", "{n:?}");
+        assert_eq!(img.as_raw(), before.as_raw());
+    }
+
+    /// **暗くする露出と白点が競合しても、暗くする側は残る。**
+    ///
+    /// HIGH-1 の回帰検査。白飛びの述語は各チャンネルのゲインについて単調
+    /// 非減少なので、`k <= 1` の合成は白点単独より必ず飛ぶ量が少ない。
+    /// 「露出から先に諦める」と決め打ちしていた頃は、露出を落として**より飛ぶ**
+    /// 白点単独を評価し、それも断って何も当たらなかった。
+    #[test]
+    fn a_darkening_exposure_survives_a_clipping_white_point() {
+        // 背景は暖色で狙いより明るい（k < 1）。画面の一部をほぼ白にして、
+        // 白点が B を持ち上げると飽和する形にする
+        let bg = [255u8, 245, 215];
+        let mut img = flat(bg, 40, 40);
+        for y in 0..40 {
+            for x in 0..20 {
+                img.put_pixel(x, y, Rgba([252, 252, 252, 255]));
+            }
+        }
+        let n = normalise(
+            &mut img,
+            &BackgroundField::flat(bg),
+            NormalizeMode::Auto,
+            NormalizeMode::Auto,
+        );
+        assert_eq!(n.status, "applied", "{n:?}");
+        assert!(n.exposure_stops < 0.0, "暗くする露出が残っていない: {n:?}");
+        assert_eq!(n.gain[0], n.gain[1], "白点が残っている: {:?}", n.gain);
+        assert_eq!(n.gain[1], n.gain[2], "白点が残っている: {:?}", n.gain);
+        assert_eq!(n.warnings.len(), 1, "{n:?}");
+        assert_eq!(n.warnings[0].code.as_str(), "WHITE_BALANCE_SKIPPED");
+        assert_eq!(n.warnings[0].data["reason"], "would_clip");
+    }
+
+    /// 真っ黒な背景では白点の商が無限になり、範囲の門が止める。
+    ///
+    /// **`data.gain` は載せない**（無限は JSON で `null` になり、
+    /// `color.gain` の `nullable: false` と食い違う）。
+    #[test]
+    fn an_unbounded_white_point_gain_is_refused_by_the_range_gate() {
+        let rgb = [0u8, 0, 0];
+        let mut img = flat(rgb, 8, 8);
+        let before = img.clone();
+        let n = normalise(
+            &mut img,
+            &BackgroundField::flat(rgb),
+            NormalizeMode::Auto,
+            NormalizeMode::Off,
+        );
+        assert_eq!(n.status, "skipped", "{n:?}");
+        assert_eq!(n.gain, [1.0, 1.0, 1.0]);
+        assert_eq!(n.warnings[0].data["reason"], "gain_out_of_range");
+        assert!(
+            n.warnings[0].data.get("gain").is_none(),
+            "有限でないゲインを載せている: {:?}",
+            n.warnings[0].data
+        );
+        assert_eq!(img.as_raw(), before.as_raw());
     }
 
     /// 白が飛ぶ量は当てない。**画素は 1 バイトも動かない。**

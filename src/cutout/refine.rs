@@ -226,14 +226,14 @@ fn srgb_lut() -> [f32; 256] {
     lut
 }
 
+/// 線形 RGB を sRGB 8bit へ戻す。**式は `color::lab::linear_to_srgb_u8`。**
+///
+/// 境界帯の復元色は 1 ビットずれれば `halo_ratio` と `rim_contamination` が
+/// 動く。`background.rs` と別々に式を持っていた頃は、どちらかを直した日に
+/// それが起きる形だった（`linear_to_srgb_u8` の doc を参照）。
+#[inline]
 fn linear_to_srgb(v: f32) -> u8 {
-    let c = v.clamp(0.0, 1.0);
-    let s = if c <= 0.003_130_8 {
-        c * 12.92
-    } else {
-        1.055 * c.powf(1.0 / 2.4) - 0.055
-    };
-    (s * 255.0).round() as u8
+    crate::color::lab::linear_to_srgb_u8(v)
 }
 
 /// 帯幅 r の帯に必要な窓の半径。

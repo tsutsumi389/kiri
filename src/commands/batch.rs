@@ -13,6 +13,7 @@ use crate::cli::{
     BatchArgs, ColorOpts, CutoutArgs, OutputOpts, Polygon, RotateArg, SegmentOpts, parse_hex_color,
     parse_size,
 };
+use crate::color::normalize::NormalizeMode;
 use crate::commands::{cutout, output};
 use crate::compliance::FailOn;
 use crate::cutout::{
@@ -546,6 +547,14 @@ fn to_cutout_args(
             BackgroundModel::Auto,
             "background_model",
         )?,
+        // **CLI と同じ 1 つの列挙を通す**（`value_enum` の doc）。既定は off で、
+        // 書かない項目では正規化のコードを 1 行も通らない
+        white_balance: value_enum(
+            settings.white_balance.as_deref(),
+            NormalizeMode::Off,
+            "white_balance",
+        )?,
+        exposure: value_enum(settings.exposure.as_deref(), NormalizeMode::Off, "exposure")?,
         optimize: settings.optimize.unwrap_or(false),
         // spec では `Some` がそのまま「明示した」である。CLI 側が clap の
         // `ValueSource` を見て解いているのと同じ問いに、JSON では素直に答えられる

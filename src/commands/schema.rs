@@ -1008,6 +1008,168 @@ fn fields() -> Vec<FieldEntry> {
                  エンコードするのは決まった 1 枚だけなので、この回数は探索の後ろに 1 度だけ積む",
             ),
         },
+        // `color` ブロックは `--white-balance` / `--exposure` のどちらかに
+        // `auto` を渡した実行にしか現れない（`optimize` / `shadow` と同じ規約）。
+        // **要求したモードもここが持つ**——`settings` へ足すと既定の実行の
+        // JSON が変わり、「既定 off なら 1 バイトも変わらない」が破れる
+        FieldEntry {
+            path: "color.white_balance",
+            appears_in: vec!["cutout"],
+            unit: "enum",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "要求した白点の正し方（auto / off）",
+            notes: Some(
+                "**要求値であって効いた値ではない。** 効いたかどうかは status と gain が言う\
+                 ——段ごとに落ちることがあるので（色かぶりは直ったが露出は断った、など）、\
+                 auto を渡したことから当たったことは導けない。off でもこのブロックが出るのは、\
+                 --exposure auto だけを渡した実行があるためである",
+            ),
+        },
+        FieldEntry {
+            path: "color.exposure",
+            appears_in: vec!["cutout"],
+            unit: "enum",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "要求した露出の正し方（auto / off）",
+            notes: Some("color.white_balance と同じ規約で、要求値である"),
+        },
+        FieldEntry {
+            path: "color.status",
+            appears_in: vec!["cutout"],
+            unit: "enum",
+            nullable: false,
+            null_means: None,
+            // **warns には載せない。** `skipped` は「しきい値をまたいだ」結果では
+            // なく 4 通りの理由（`data.reason`）の総称で、`threshold` に書く数が無い
+            warns: vec![],
+            gates: None,
+            summary: "applied（画素が動いた） / no_change（すでに正しかった） / skipped（当てられなかった）",
+            notes: Some(
+                "**no_change と skipped は別である。** no_change は背景がすでに中性で狙いの\
+                 明るさだったということで、直すものが無い（警告も出ない）。skipped は門が\
+                 閉じたということで、WHITE_BALANCE_SKIPPED / EXPOSURE_SKIPPED が理由を言う。\
+                 **片方の段だけが落ちた実行は applied である**——絵は変わっているので、\
+                 落ちた段は警告のほうで読む",
+            ),
+        },
+        FieldEntry {
+            path: "color.source",
+            appears_in: vec!["cutout"],
+            unit: "enum",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "白点をどこから測ったか（field / flat）",
+            notes: Some(
+                "field は照明場の格子セルの線形 RGB のチャンネル中央値、flat は外周の\
+                 中央値 1 色。**background.model と食い違うことがある**（異常ではない）\
+                 ——こちらは正規化**前**の画素から測った見立て、あちらは正規化**後**の\
+                 画素から測り直した見立てで、--background-model auto の分岐は\
+                 background.uniformity で決まる。対角ゲインは Lab 距離を変えるので、\
+                 分岐の境目にいる素材では前後で裏返りうる。どちらのモデルが切り抜きに\
+                 効いたかは background.model のほうが言う",
+            ),
+        },
+        FieldEntry {
+            path: "color.white_point",
+            // 3 要素の数の並びに対して既存の語彙が持っているのは `list` である。
+            // **`srgb` を新設しない**——この 1 項目のためだけに 3 つ目の新しい
+            // 綴りを契約へ足すことになり、値の読み方は notes で足りる
+            appears_in: vec!["cutout"],
+            unit: "list",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "推定した白点 [R, G, B]（sRGB 8bit。background.rgb と同じ形）",
+            notes: Some(
+                "**status が skipped でも入る。** 断った理由を数で言うためで、\
+                 どんな色を白として測ったのかが分からないと次の一手が決まらない。\
+                 当てた実行では、この色が (Y,Y,Y) の無彩色へ移る",
+            ),
+        },
+        FieldEntry {
+            path: "color.white_point_shift",
+            appears_in: vec!["cutout"],
+            unit: "delta_e",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "白点と同輝度の無彩色との ΔE76（当てる前）",
+            notes: Some(
+                "**中性度の門が見た数そのものである**（Lab の C* と同じ値になる——同輝度の\
+                 無彩色は a*=b*=0 で L* が白点と一致するため）。これが上限を超えると\
+                 WHITE_BALANCE_SKIPPED（reason=not_neutral）になる。小さいほど背景が\
+                 もともと無彩色だったということで、0 に近ければ白点を当てても絵は変わらない",
+            ),
+        },
+        FieldEntry {
+            path: "color.gain",
+            appears_in: vec!["cutout"],
+            // **新しい unit である。** 線形 RGB へ掛ける倍率で、ratio（0-1 の
+            // 割合）とも quality とも値域が違う。同じ綴りへ寄せると、受け手は
+            // 「1.02」を割合として読んで 102% と解釈する
+            unit: "gain",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "実際に掛けた合成ゲイン [R, G, B]（線形）",
+            notes: Some(
+                "白点のゲインと露出のスカラーを掛け合わせた 1 つの対角ゲインである。\
+                 当てなかったなら [1, 1, 1]。**3 つの積から露出が効いたかは読めない。**\
+                 白点が保つのは輝度（係数つきの重み付き和）であって積ではないので、\
+                 白点だけを当てた実行でも積は 1 から離れる。露出が効いたかは\
+                 color.exposure_stops が 0 かどうかで見ること",
+            ),
+        },
+        FieldEntry {
+            path: "color.exposure_stops",
+            appears_in: vec!["cutout"],
+            // **新しい unit である。** 2 の対数なので、px でも ratio でもない。
+            // 0 が「動かしていない」を意味する点も他の語彙と違う
+            unit: "stops",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "露出で動かした段数（log2(k)）",
+            notes: Some(
+                "正なら明るくした、負なら暗くした。0 は「当てなかった」か「すでに狙いに\
+                 乗っていた」のどちらかで、どちらかは EXPOSURE_SKIPPED が出ているかで分かる。\
+                 **背景の明度が狙いより高い素材では負になる**——正規化は持ち上げるだけの\
+                 段ではない",
+            ),
+        },
+        FieldEntry {
+            path: "color.clipped_ratio",
+            appears_in: vec!["cutout"],
+            unit: "ratio",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "正規化で新たに白へ飽和した（線形の 1.0 を超えた）画素の割合",
+            notes: Some(
+                "数えるのは**線形値が 1.0 を超えた**画素で、8bit へ丸めた結果が 255 になった\
+                 画素とは厳密には一致しない（線形 0.9923 以上は丸めで 255 になる）。\
+                 守りたいのは「情報が失われた量」で、超えた分は二度と戻らないのに対し、\
+                 丸めで 255 に乗った画素は元の値をまだ保っている。\
+                 **元から 255 だったチャンネルも数えない**——張り付きは元の露出の結果で、\
+                 正規化の責任ではない（数えると白飛びした素材では門が常に閉じて色かぶりも\
+                 直せなくなる）。これが予算を超えるゲインは当てずに WHITE_BALANCE_SKIPPED / \
+                 EXPOSURE_SKIPPED（reason=would_clip）を返すので、**ここに出るのは予算内に\
+                 収まった値だけ**である（断られた量は警告の data.clipped_ratio のほう）",
+            ),
+        },
         FieldEntry {
             path: "rotate.angle",
             // `kiri rotate` と `cutout --rotate` が同じブロックを返す。

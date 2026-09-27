@@ -9,6 +9,7 @@ use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 
 use crate::batch::SetPlacement;
+use crate::color::normalize::NormalizeMode;
 use crate::compliance::{DEFAULT_TOKEN, FAIL_ON_METRICS, FailOn};
 use crate::cutout::background::DEFAULT_BORDER;
 use crate::cutout::constraints::{
@@ -323,6 +324,53 @@ fn shadow_long_help() -> String {
      --flatten と併せると「下地 → 影 → 商品」の順に重なる。透過を保てる形式\
      （PNG / AVIF）では影も半透明のアルファとして残る。\n\
      mask ブロックの統計と診断値は影を足す前の商品だけで測る"
+        .to_string()
+}
+
+/// `--white-balance` の本文。**既定 off の理由を最初に言う。**
+fn white_balance_long_help() -> String {
+    "背景を無彩色とみなして白点を正す（既定 off）。\n\
+     off  … 当てない。出力画像も結果 JSON も 1 バイト変わらない\
+     （color ブロックごと現れない）。\n\
+     auto … 背景から白点 W を測り、輝度を変えない von Kries の対角ゲイン\
+     g_c = Y / W_c を線形 RGB へ掛ける。W は照明場の格子セルの中央値\
+     （1 色モデルでは外周の中央値そのもの）で、どちらから測ったかは\
+     color.source が言う。\n\
+     **既定 off の理由。** 1 枚の画像からは「色のある背景」と「色かぶりした\
+     中性背景」を区別できない。青い背景紙に白点を当てれば背景は灰色になり、\
+     商品の色は青の補色へ転ぶ。中性度の門はその事故を狭めるだけで、無くせない。\n\
+     **当てない条件が 3 つある。** 背景の彩度（Lab の C*）が上限を超える\
+     （reason=not_neutral）、合成ゲインが 2 段を越える（gain_out_of_range）、\
+     当てると白飛びする画素が増えすぎる（would_clip）。どれも\
+     WHITE_BALANCE_SKIPPED で理由と数を返す。\n\
+     **切り抜きより前に掛かる。** 以降のすべて（背景の見立て・subject・\
+     --optimize の探索・切り抜き・診断）は正された画素で測り直される。\n\
+     --exposure とは段が別で、片方だけ落ちることがある（色かぶりは直ったが\
+     露出はそのまま、など）。実際に掛かった合成ゲインは color.gain に出る。\n\
+     **--no-color-convert と併せると、門は入力の色空間のまま測る。** Display P3 の\
+     素材を素通しした実行では C* も L* も P3 の数になり、中性度と明度の判定が\
+     sRGB のときと変わる。これは既存の ΔE 経路（--tolerance など）と同じ前提だが、\
+     **この段は画素そのものを書き換える唯一の段**なので、併用するなら結果の\
+     color ブロックを確かめること"
+        .to_string()
+}
+
+/// `--exposure` の本文。
+fn exposure_long_help() -> String {
+    "背景をグレーカードとみなして露出を正す（既定 off）。\n\
+     off  … 当てない。出力画像も結果 JSON も 1 バイト変わらない。\n\
+     auto … 背景の輝度 Y を狙いの明度（L*）へ運ぶスカラー k を線形 RGB へ掛ける。\
+     狙いは固定の定数で、純白ではなく少し下に置いてある（背景のノイズで\
+     白飛びの門を踏まないため）。実際に掛けた段数は color.exposure_stops に出る。\n\
+     **白を狙った面だと言えるときだけ当てる。** 背景の L* が下限を下回れば\
+     EXPOSURE_SKIPPED（reason=not_light）で当てない——暗いグレーや色紙を白まで\
+     持ち上げるのは正規化ではなく別の絵にすることである。\n\
+     合成ゲインが 2 段を越える（gain_out_of_range）、当てると白飛びする画素が\
+     増えすぎる（would_clip）ときも当てない。\n\
+     **--white-balance と合わせて 1 回の対角ゲインになる。** 合成で初めて門を\
+     越えたときは、**実際に門を押し出している段**を諦める——白飛びなら持ち上げて\
+     いる側（露出が暗くする側なら白点のほう）、範囲なら越えている向きへ押している側。\
+     どちらが落ちたかは WHITE_BALANCE_SKIPPED / EXPOSURE_SKIPPED が言う"
         .to_string()
 }
 
@@ -1467,6 +1515,28 @@ pub struct CutoutArgs {
     /// field は常に照明場で測る。低周波の照明変動は場が吸うので、--tolerance は織り目や圧縮ノイズの振幅だけを受け持てばよくなる。実際に効いたモデルは settings.background_model に出る。
     #[arg(long, value_enum, default_value_t = BackgroundModel::Auto)]
     pub background_model: BackgroundModel,
+
+    /// 背景を無彩色とみなして白点を正す（既定 off）。auto で背景から推定した対角ゲインを掛ける
+    ///
+    /// ヘルプの本文は `white_balance_long_help` に置く。**既定 off の理由**と
+    /// 断る条件（中性でない背景・白飛び）は、指定の前に知っていないと
+    /// 「渡したのに効かない」を読み違える
+    #[arg(
+        long = "white-balance",
+        value_enum,
+        default_value_t = NormalizeMode::Off,
+        long_help = white_balance_long_help()
+    )]
+    pub white_balance: NormalizeMode,
+
+    /// 背景をグレーカードとみなして露出を正す（既定 off）。auto で背景を狙いの明度へ運ぶ
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = NormalizeMode::Off,
+        long_help = exposure_long_help()
+    )]
+    pub exposure: NormalizeMode,
 
     /// 境界帯のアルファを画像の色から推定し直さず、マスクの形から作る旧方式に戻す
     ///

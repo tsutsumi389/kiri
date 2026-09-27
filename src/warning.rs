@@ -119,6 +119,10 @@ warning_catalog! {
         => "--rotate auto を適用しなかった（0 度のまま）。data.reason が no_subject / low_confidence / not_measurable / not_rectangular のどれかを言う",
     SetScaleClamped = "SET_SCALE_CLAMPED"
         => "batch の set が求めた占有率が 1.0 を超えたので 1.0 で止めた（その点だけ目標の高さに届いていない）。data.height_shortfall が不足分を言う",
+    WhiteBalanceSkipped = "WHITE_BALANCE_SKIPPED"
+        => "背景が中性でないため白点を当てなかった。data.reason が not_neutral / no_material / gain_out_of_range / would_clip のどれかを言う",
+    ExposureSkipped = "EXPOSURE_SKIPPED"
+        => "背景の水準から露出を正せなかった。data.reason が not_light / no_material / gain_out_of_range / would_clip のどれかを言う",
     SetNotMeasured = "SET_NOT_MEASURED"
         => "batch の set が 1 点も測れなかったので揃えていない（各項目は自分で解決した fill_ratio のまま）",
 }

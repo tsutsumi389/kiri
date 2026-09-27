@@ -206,10 +206,14 @@ mod tests {
     fn linear_values_outside_the_unit_interval_are_clamped() {
         assert_eq!(linear_to_srgb_u8(-0.5), 0);
         assert_eq!(linear_to_srgb_u8(1.5), 255);
+        // **`clamp` が落としているのではない。** `f32::clamp` は NaN をそのまま
+        // 伝播させ、0 になるのは最後の `as u8` が飽和キャストで NaN を 0 へ
+        // 潰すからである。どちらの理由でも値は 0 でよいが、理由を取り違えたまま
+        // `clamp` を別の式へ置き換えると、この表明だけが静かに破れる
         assert_eq!(
             linear_to_srgb_u8(f32::NAN),
             0,
-            "NaN は clamp が 0 側へ落とす"
+            "NaN は飽和キャストが 0 にする"
         );
     }
 

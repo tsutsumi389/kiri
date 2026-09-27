@@ -8568,8 +8568,8 @@ fn a_parser_level_failure_returns_no_json() {
 /// **実装したら必ずここから消す**——実装済みのまま残っていると下の検査が落ちる。
 /// README / design.md には許さない（エージェントが写し取る場所だから）
 const PLANNED_CODES: &[&str] = &[
-    // ROTATE_AUTO_SKIPPED と SET_SCALE_CLAMPED は Phase 23 で実装済み
-    "WHITE_BALANCE_SKIPPED",
+    // ROTATE_AUTO_SKIPPED と SET_SCALE_CLAMPED は Phase 23、
+    // WHITE_BALANCE_SKIPPED は Phase 24 で実装済み
     "REFLECT_CLIPPED",
 ];
 
@@ -9152,6 +9152,13 @@ fn every_published_unit_is_in_the_known_vocabulary() {
         "ms",
         "count",
         "quality",
+        // 線形 RGB へ掛ける倍率（`color.gain`）。`ratio` と分けるのは値域が
+        // 違うためで、1 を超えるのが正常なものを 0-1 の割合と同じ綴りにすると、
+        // 受け手は 1.02 を 102% として読む
+        "gain",
+        // 2 の対数で数えた露出の段（`color.exposure_stops`）。`gain` と分けるのは
+        // 0 の意味が逆（`gain` の 1 が `stops` の 0）で、負値が正常だからである
+        "stops",
         "bool",
         "enum",
         "path",
@@ -9379,6 +9386,24 @@ fn every_published_field_exists_in_the_result() {
         "--shadow",
         "synth",
     ]);
+    // **`color` も --white-balance / --exposure に auto を渡したときだけ現れる。**
+    // 渡さない実行の結果 JSON は Phase 24 を足す前と 1 バイトも変わらない、
+    // というのがそのブロックの約束なので、`compliance` / `optimize` と同じく
+    // 専用の実行が要る。**両方 auto を渡す**——片方だけでは、もう片方の
+    // path（`color.exposure_stops` など）が「出るが 0 のまま」なのか
+    // 「出ない」のかを確かめられない
+    let normalised = run(&[
+        "cutout",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--dry-run",
+        "--json",
+        "--white-balance",
+        "auto",
+        "--exposure",
+        "auto",
+    ]);
     // **`segment` もモデルが走ったときだけ現れる。** モデルは 176MB あって
     // リポジトリにも CI にも置かないので、無ければその path だけを飛ばす。
     // 「配ったが確かめられなかった」と「配ったのに無い」は別で、後者だけを
@@ -9447,6 +9472,7 @@ fn every_published_field_exists_in_the_result() {
                 "cutout" if path.starts_with("constraints.") => &constrained,
                 "cutout" if path.starts_with("optimize.") => &optimized,
                 "cutout" if path.starts_with("shadow.") => &shadowed,
+                "cutout" if path.starts_with("color.") => &normalised,
                 "cutout" if path.starts_with("compliance.") => &gated,
                 "cutout" if path.starts_with("settings.") => &profiled,
                 "cutout" if path.starts_with("rotate.") => &rotated,

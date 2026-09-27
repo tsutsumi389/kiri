@@ -338,7 +338,146 @@ fn a_gain_that_would_clip_is_refused() {
     assert_eq!(json["color"]["clipped_ratio"], 0.0);
     let w = warning(&json, "EXPOSURE_SKIPPED");
     assert_eq!(w["data"]["reason"], "would_clip", "{w}");
-    assert!(w["data"]["clipped_ratio"].as_f64().unwrap() > 0.001, "{w}");
+    // **予算そのものを超えたことを見る。** 固定したいのは「0.03 を超えたから
+    // 断った」で、0.001 を超えたことでは門の位置を語れない（予算を上げた日に
+    // 何も気づかずに通る）
+    assert!(
+        w["data"]["clipped_ratio"].as_f64().unwrap() > 0.03,
+        "予算（0.03）を超えていない量で断っている: {w}"
+    );
+}
+
+/// **暗くする露出は、白点が飛ぶせいで死んではならない。**
+///
+/// HIGH-1 の回帰検査。白飛びの述語は各チャンネルのゲインについて単調非減少
+/// なので、`k <= 1` の合成は白点単独より必ず飛ぶ量が少ない。「合成の門では
+/// 露出から先に諦める」と決め打ちしていた頃は、露出を落として**より飛ぶ**
+/// 白点単独を評価し、それも断って何も当たらなかった——つまり
+/// **両方 auto を渡すと片方だけ渡すより悪い結果になっていた。**
+///
+/// 見るのは「両方 auto の出力が `--exposure auto` 単独とバイト一致すること」
+/// である。数値だけを見ると、片方が偶然同じ値になった実行を通してしまう。
+#[test]
+fn both_stages_are_never_worse_than_one() {
+    let dir = fixture_dir();
+    // 背景は暖色で狙いより明るい（k < 1）。画面の一部をほぼ白にして、
+    // 白点が B を持ち上げると飽和する形にする
+    let mut scene = product_image(&ProductSpec {
+        width: 400,
+        height: 400,
+        background: [255, 245, 215],
+        product: [252, 252, 252],
+        noise: false,
+        ..Default::default()
+    });
+    for y in 340..400 {
+        for x in 0..400 {
+            scene.put_pixel(x, y, image::Rgba([252, 252, 252, 255]));
+        }
+    }
+    let input = write_png(dir.path(), "high1.png", &scene);
+
+    let (only_exposure, ex_json) = cut(dir.path(), &input, "ex.png", &["--exposure", "auto"]);
+    let (both, both_json) = cut(
+        dir.path(),
+        &input,
+        "both.png",
+        &["--white-balance", "auto", "--exposure", "auto"],
+    );
+
+    assert_eq!(
+        ex_json["color"]["status"], "applied",
+        "{}",
+        ex_json["color"]
+    );
+    assert!(
+        ex_json["color"]["exposure_stops"].as_f64().unwrap() < 0.0,
+        "暗くする露出になっていない: {}",
+        ex_json["color"]
+    );
+    assert_eq!(
+        both, only_exposure,
+        "両方 auto の出力が --exposure auto 単独と違う（白点のせいで露出が死んでいる）"
+    );
+    assert_eq!(
+        both_json["color"]["gain"], ex_json["color"]["gain"],
+        "{}",
+        both_json["color"]
+    );
+    assert_eq!(
+        both_json["color"]["exposure_stops"],
+        ex_json["color"]["exposure_stops"]
+    );
+    // 落ちたのは白点のほうだと名指しする
+    let w = warning(&both_json, "WHITE_BALANCE_SKIPPED");
+    assert_eq!(w["data"]["reason"], "would_clip", "{w}");
+    assert!(
+        both_json["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|w| w["code"] != "EXPOSURE_SKIPPED"),
+        "露出まで落ちている: {}",
+        both_json["warnings"]
+    );
+}
+
+/// 両段が落ちる実行では、**落ちた順**に警告が並ぶ。
+///
+/// 持ち上げる側（`k > 1`）では露出も白点も飽和を作るので、寄与の大きい
+/// 露出から諦める。それでも白点単独が飛ぶなら白点も諦める。**並びは
+/// 「押し出している段から」という規則がそのまま出たもの**で、逆向き
+/// （暗くする側）では白点だけが落ちる（`both_stages_are_never_worse_than_one`）
+/// ——つまり**並びは契約ではない。** 受け手は `code` で分岐する。
+#[test]
+fn the_refusals_name_the_stage_that_pushed_the_gate() {
+    let dir = fixture_dir();
+    // 背景は狙いより暗く（k > 1）暖色。画面の一部をほぼ白にして、白点単独でも
+    // 飽和するようにする
+    let mut scene = product_image(&ProductSpec {
+        width: 400,
+        height: 400,
+        background: [200, 182, 150],
+        product: [30, 30, 32],
+        noise: false,
+        ..Default::default()
+    });
+    for y in 340..400 {
+        for x in 0..400 {
+            scene.put_pixel(x, y, image::Rgba([250, 250, 250, 255]));
+        }
+    }
+    let input = write_png(dir.path(), "bothfall.png", &scene);
+    let (got, json) = cut(
+        dir.path(),
+        &input,
+        "bothfall-out.png",
+        &["--white-balance", "auto", "--exposure", "auto"],
+    );
+    let (base, _) = cut(dir.path(), &input, "bothfall-base.png", &[]);
+
+    assert_eq!(json["color"]["status"], "skipped", "{}", json["color"]);
+    assert_eq!(got, base, "両方落ちたのに画素が動いた");
+    let codes: Vec<&str> = json["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w["code"].as_str())
+        .filter(|c| c.ends_with("_SKIPPED") && c.starts_with(['W', 'E']))
+        .collect();
+    assert_eq!(
+        codes,
+        vec!["EXPOSURE_SKIPPED", "WHITE_BALANCE_SKIPPED"],
+        "並びが諦めた順になっていない: {}",
+        json["warnings"]
+    );
+    for code in ["EXPOSURE_SKIPPED", "WHITE_BALANCE_SKIPPED"] {
+        assert_eq!(
+            warning(&json, code)["data"]["reason"],
+            "would_clip",
+            "{code}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -407,6 +546,76 @@ fn white_balance_applies_even_when_exposure_is_refused() {
     );
     // 露出が落ちているので、輝度を変えないゲインだけが残っている
     assert_eq!(json["color"]["exposure_stops"], 0.0);
+}
+
+/// 照明場が立った実行では白点を**格子セルから**測る。
+///
+/// **`color.source` を固定する唯一の検査である。** 単体テストはどれも
+/// `BackgroundField::flat` を渡すので `flat` 経路しか通らない。ここが無いと
+/// 「場があるならセルの中央値を採る」という設計は 1 度も表明されない
+/// （中央値の取り方そのものは `color::normalize` の単体テストが見ている）。
+#[test]
+fn the_white_point_comes_from_the_field_cells_when_a_field_is_built() {
+    let dir = fixture_dir();
+    let input = write_png(dir.path(), "field.png", &neutral_scene());
+    let (_, json) = cut(
+        dir.path(),
+        &input,
+        "field-out.png",
+        &[
+            "--white-balance",
+            "auto",
+            // **明示する。** `auto` は uniformity を見るので、合成の中性シーンでは
+            // 1 色に落ちる。場の経路を確かめたいなら場を要求するしかない
+            "--background-model",
+            "field",
+        ],
+    );
+    assert_eq!(json["color"]["source"], "field", "{}", json["color"]);
+    // 1 色モデルでは `flat` になる（同じ素材で経路だけが変わることを見る）
+    let (_, flat) = cut(
+        dir.path(),
+        &input,
+        "flat-out.png",
+        &["--white-balance", "auto", "--background-model", "flat"],
+    );
+    assert_eq!(flat["color"]["source"], "flat", "{}", flat["color"]);
+}
+
+/// 白点の商が有限にならない背景（真っ黒）は範囲の門が止める。
+///
+/// **警告の `data.gain` を載せてはならない。** 無限は `serde_json` で `null` に
+/// なり、`color.gain` を `nullable: false` で配っている契約と食い違う。
+#[test]
+fn an_unbounded_gain_is_refused_and_reports_no_gain() {
+    let dir = fixture_dir();
+    let mut scene = RgbaImage::from_pixel(200, 200, image::Rgba([0, 0, 0, 255]));
+    for y in 70..130 {
+        for x in 70..130 {
+            scene.put_pixel(x, y, image::Rgba([90, 90, 90, 255]));
+        }
+    }
+    let input = write_png(dir.path(), "black.png", &scene);
+    let (got, json) = cut(
+        dir.path(),
+        &input,
+        "black-out.png",
+        &["--white-balance", "auto", "--exposure", "auto"],
+    );
+    let (base, _) = cut(dir.path(), &input, "black-base.png", &[]);
+    assert_eq!(got, base, "有限でないゲインを当ててしまった");
+    assert_eq!(json["color"]["status"], "skipped", "{}", json["color"]);
+    let w = warning(&json, "WHITE_BALANCE_SKIPPED");
+    assert_eq!(w["data"]["reason"], "gain_out_of_range", "{w}");
+    assert!(
+        w["data"].get("gain").is_none(),
+        "有限でないゲインを data に載せている: {w}"
+    );
+    // 露出は明度の下限で落ちる（段ごとに落ちることの確認）
+    assert_eq!(
+        warning(&json, "EXPOSURE_SKIPPED")["data"]["reason"],
+        "not_light"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -803,7 +1012,7 @@ fn y_of(l: f64) -> f64 {
     target_y(l)
 }
 
-/// ゲインを当てたとき**新たに** 255 へ張り付く画素の割合。
+/// ゲインを当てたとき**新たに**白へ飽和する（線形の 1.0 を超える）画素の割合。
 fn clipped(img: &RgbaImage, gain: [f64; 3]) -> f64 {
     let lut = srgb_linear_lut();
     let mut count = 0u64;

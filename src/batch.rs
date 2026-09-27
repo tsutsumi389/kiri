@@ -197,6 +197,14 @@ pub struct ItemSettings {
     pub reclassify: Option<bool>,
     /// 背景のモデル（"auto" / "flat" / "field"）
     pub background_model: Option<String>,
+    /// 背景を無彩色とみなして白点を正すか（"off" / "auto"、既定 "off"）。
+    ///
+    /// **綴りと値は CLI と同じ**（`--white-balance`）。読めない値は
+    /// `SPEC_INVALID` でその項目を落とす——既定へ落とすと、その項目だけ
+    /// 正規化されないまま数百点に混ざる
+    pub white_balance: Option<String>,
+    /// 背景をグレーカードとみなして露出を正すか（"off" / "auto"、既定 "off"）
+    pub exposure: Option<String>,
     /// セグメンテーションモデルの使い方（"off" / "auto" / "isnet"）。
     ///
     /// **数百点に一律で付ける値ではない。** 1 件あたり推論だけで 1.3 秒
@@ -309,6 +317,8 @@ impl ItemSettings {
             smooth_contour,
             reclassify,
             background_model,
+            white_balance,
+            exposure,
             segment,
             model_path,
             optimize,
@@ -362,6 +372,8 @@ const SETTING_KEYS: &[&str] = &[
     "smooth_contour",
     "reclassify",
     "background_model",
+    "white_balance",
+    "exposure",
     "segment",
     "model_path",
     "optimize",

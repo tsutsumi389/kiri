@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 
 use crate::batch::SetPlacement;
 use crate::cli::{CutoutArgs, Polygon, RotateArg};
+use crate::color::normalize;
 use crate::commands::output::{self, round4};
 use crate::commands::segment;
 use crate::cutout::constraints::{
@@ -27,9 +28,9 @@ use crate::image_io::{IccPolicy, LoadOptions, OutputFormat, SaveOptions, load, s
 use crate::preview::{PreviewSpec, contact_sheet};
 use crate::profile;
 use crate::report::{
-    CanvasReport, ConstraintsReport, CutoutReport, Dimensions, MaskReport, OptimizeCandidate,
-    OptimizeReport, OptimizeScore, ProfileRef, RotateReport, SCHEMA_VERSION, SettingsReport,
-    ShadowReport,
+    CanvasReport, ColorReport, ConstraintsReport, CutoutReport, Dimensions, MaskReport,
+    OptimizeCandidate, OptimizeReport, OptimizeScore, ProfileRef, RotateReport, SCHEMA_VERSION,
+    SettingsReport, ShadowReport,
 };
 use crate::transform::canvas::{CanvasSpec, apply as canvas_apply, composite, plan as canvas_plan};
 use crate::transform::rotate::{self, RotateSpec};
@@ -65,7 +66,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         naming: output::plan_naming(&args.out)?,
     };
 
-    let loaded = load::load_with(&args.input, &args.color.to_load_options())?;
+    let mut loaded = load::load_with(&args.input, &args.color.to_load_options())?;
     let (w, h) = (loaded.width(), loaded.height());
 
     let bbox = args
@@ -78,6 +79,34 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         .map(|p| resolve_point(*p, args.normalized, w, h))
         .collect::<Result<Vec<_>>>()?;
     let (user_constraints, constraint_warnings) = resolve_constraints(args, &fg_seeds, w, h)?;
+
+    // **色の正規化は画素を動かす前段である。** ここより下のすべて
+    // （segment 推論・背景の見立て・subject・`--optimize` の探索・切り抜き・
+    // 診断）は**正された画素で測り直される**。持ち回す見立てを正規化前のもので
+    // 使い回してはならないので、`segment::decide` より前に置く——`decision.seen`
+    // も正規化後の画像から作られる。
+    //
+    // **推定に使う見立ては正規化前の画像から 1 度だけ測る。** bbox と空間的な
+    // 指示はもう解けているので、それを材料に入れた場を作れる（正規化した後の
+    // 画像で測り直すと、当てたゲインぶんだけ白点が動いて意味を失う）。
+    //
+    // **off の実行ではこの見立てを 1 度も測らない。** 測れば費用が増え、乱れれば
+    // 既存の数値が動く。既定（両方 off）では新しいコードを 1 行も通らない
+    let colour = (args.white_balance.is_auto() || args.exposure.is_auto()).then(|| {
+        let analysis = crate::cutout::analyse_background(
+            &loaded.image,
+            args.border,
+            args.background_model,
+            bbox,
+            user_constraints.as_ref(),
+        );
+        normalize::normalise(
+            &mut loaded.image,
+            &analysis.field,
+            args.white_balance,
+            args.exposure,
+        )
+    });
 
     // **モデルは提案、利用者は決定。** 先にモデルの提案を敷いてから、利用者の
     // 指示を上から重ねる（`Constraints::overlay`）。重なった画素は利用者の
@@ -156,6 +185,12 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     // ——指示の値そのものを決めた側である）
     let mut warnings = profile_warnings;
     warnings.extend(loaded.warnings());
+    // **色の正規化の警告は読み込みの警告の続きに置く。** どちらも「以降の
+    // 数値をどの色の上で測ったか」を語るもので、`color_converted` と同じ層に
+    // ある。結果の警告より前に置くのは、正規化が効いたかどうかを知らずに
+    // `background` や `mask` を読むと、数値の読み方そのものが変わるためである
+    // （profile の警告を最初に置いているのと同じ理由）
+    warnings.extend(colour.iter().flat_map(|c| c.warnings.clone()));
     warnings.extend(overwrite_warning);
     warnings.extend(manifest_warning);
     // 指示についての警告は結果の警告より先に出す。渡したものがそのまま
@@ -378,6 +413,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
                 revision: p.revision,
             }),
         },
+        color: colour.as_ref().map(color_report),
         applied_bbox: bbox.map(|(x1, y1, x2, y2)| [x1, y1, x2, y2]),
         constraints: opts.constraints.as_ref().map(constraints_report),
         segment: segment_report,
@@ -393,6 +429,25 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         elapsed_ms: started.elapsed().as_millis(),
         warnings,
     })
+}
+
+/// 正規化の結果を JSON のブロックへ落とす。
+///
+/// **丸めはここで行わない。** `Normalisation` が保持している数がすでに公開する
+/// 桁になっている——同じ数が警告の `data` にも出るので、丸めを 2 箇所に置くと
+/// 片方だけ桁を変えた日に 2 つの数が食い違う（`warning.rs` の `with_data` の doc）。
+fn color_report(n: &normalize::Normalisation) -> ColorReport {
+    ColorReport {
+        white_balance: n.white_balance.as_str(),
+        exposure: n.exposure.as_str(),
+        status: n.status,
+        source: n.source,
+        white_point: n.white_point,
+        white_point_shift: n.white_point_shift,
+        gain: n.gain,
+        exposure_stops: n.exposure_stops,
+        clipped_ratio: n.clipped_ratio,
+    }
 }
 
 /// profile の値を設定へ当てる。**優先順位は「明示指定 > profile > 既定」の 1 本。**

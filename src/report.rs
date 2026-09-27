@@ -381,6 +381,39 @@ pub struct RotateReport {
     pub resampled: bool,
 }
 
+/// 色の正規化で実際に起きたこと。
+///
+/// **要求と結果の両方を返す。** `white_balance` / `exposure` は要求したモードで、
+/// 実際に効いたかどうかは `status` と `gain` が言う——段ごとに落ちることがある
+/// ので（色かぶりは直ったが露出は断った、など）、「auto を渡した」から
+/// 「当たった」は導けない。落ちた理由は `warnings[]` の
+/// `WHITE_BALANCE_SKIPPED` / `EXPOSURE_SKIPPED` が数つきで言う。
+///
+/// `status = "skipped"` でも `white_point` / `white_point_shift` は入る
+/// （断った理由を数で言うため）。そのとき `gain` は (1,1,1) である。
+#[derive(Debug, Serialize)]
+pub struct ColorReport {
+    /// 要求したモード（`auto` / `off`）
+    pub white_balance: &'static str,
+    pub exposure: &'static str,
+    /// `applied`（画素が動いた） / `no_change`（すでに正しかった） /
+    /// `skipped`（両段とも当てられなかった）
+    pub status: &'static str,
+    /// 白点をどこから測ったか。`field`（照明場の格子セルの中央値） /
+    /// `flat`（外周の中央値 1 色）
+    pub source: &'static str,
+    /// 推定した白点（sRGB 8bit。`background.rgb` と同じ unit）
+    pub white_point: [u8; 3],
+    /// 白点と同輝度の無彩色との ΔE76。**当てる前**の値で、中性度の門が見た数そのもの
+    pub white_point_shift: f64,
+    /// 実際に掛けた合成ゲイン（線形、RGB の順）
+    pub gain: [f64; 3],
+    /// 露出で動かした段数（log2(k)）。当てなかったなら 0
+    pub exposure_stops: f64,
+    /// 正規化で**新たに** 255 へ張り付いた画素の割合。元から飛んでいた画素は数えない
+    pub clipped_ratio: f64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ProcessReport {
     /// 契約の版。`SCHEMA_VERSION` を参照
@@ -752,6 +785,17 @@ pub struct CutoutReport {
     /// 探索が走ったときだけ出る。`--optimize` 無しではキーごと無い
     #[serde(skip_serializing_if = "Option::is_none")]
     pub optimize: Option<OptimizeReport>,
+    /// `--white-balance` / `--exposure` のどちらかに `auto` を渡したときだけ出る。
+    /// 既定（どちらも off）ではキーごと無い——`optimize` / `shadow` /
+    /// `compliance` と同じ規約で、**渡さない実行の結果 JSON は 1 バイトも
+    /// 変わらない。**
+    ///
+    /// **`settings` には足していない。** 足せば既定の実行の JSON が変わり、
+    /// 「既定 off なら 1 バイトも変わらない」が破れる。要求したモードは
+    /// このブロックの `white_balance` / `exposure` が持つ——ブロックが現れる
+    /// のは要求した実行だけなので、置き場所としてそこで足りる
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<ColorReport>,
     /// `--rotate` で回したときだけ出る。既定（0 度）ではキーごと無い。
     /// **`mask` / `background` / `subject` の座標は回す前のもの**で、
     /// ここに出る角度はそれらを測った後に掛かった変換である
@@ -1204,7 +1248,16 @@ pub struct FieldEntry {
     pub appears_in: Vec<&'static str>,
     /// 値の種類。**語彙はこの一覧がすべてである**——`ratio` / `delta_e` /
     /// `gradient` / `px` / `px_at_1000` / `deg` / `deg_or_auto` / `ms` / `count` /
-    /// `quality` / `bool` / `enum` / `path` / `text` / `list` / `normalized_bbox`。
+    /// `quality` / `gain` / `stops` / `bool` / `enum` / `path` / `text` / `list` /
+    /// `normalized_bbox`。
+    ///
+    /// `gain` は**線形 RGB へ掛ける倍率**である（`color.gain`）。`ratio` と
+    /// 分けるのは値域が違うためで、1 を超える値が正常なものを 0-1 の割合と
+    /// 同じ綴りにすると、受け手は 1.02 を 102% として読む
+    ///
+    /// `stops` は**2 の対数で数えた露出の段**である（`color.exposure_stops`）。
+    /// `gain` と分けるのは、0 の意味が逆（`gain` の 1 が `stops` の 0）で、
+    /// 負値が正常だからである
     ///
     /// `text` は**決まった選択肢を持たない文字列**である（`compliance.fail_on`）。
     /// `enum` と分けるのは、受け手が値を照合してよいかどうかがここで変わるため

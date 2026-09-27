@@ -53,6 +53,30 @@ pub fn srgb_linear_lut() -> &'static [f32; 256] {
     &LINEAR_F32
 }
 
+/// 線形 RGB (0.0-1.0) を sRGB 8bit へ戻す。
+///
+/// **`srgb_linear_lut` の逆向きだが、表にはできない。** 入力が連続値なので
+/// 256 エントリで受けられるのは行きだけである。
+///
+/// ここへ 1 本化した理由: まったく同じ式と丸めの複製が
+/// `cutout/background.rs`（場の sRGB 報告）と `cutout/refine.rs`（境界帯の
+/// 復元色）に 2 つあり、Phase 24 でさらに 3 つ目（`color/normalize.rs` の
+/// ゲイン適用）が要ることになった。3 箇所が別々に持つと、片方だけを直した日に
+/// **出力バイト列が静かに食い違う**——`0.003_130_8` の境界と `round()` の
+/// どちらが動いても、境界帯の 1 画素が 1 ずつずれる。両者はこれへ委譲する。
+///
+/// **式は 1 ビットも変えていない。** 委譲に切り替えても実写の出力の md5 が
+/// 変わらないことを確かめてある（design.md 4.15）。
+pub fn linear_to_srgb_u8(v: f32) -> u8 {
+    let c = v.clamp(0.0, 1.0);
+    let s = if c <= 0.003_130_8 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    };
+    (s * 255.0).round() as u8
+}
+
 /// 線形 RGB (0.0-1.0) を CIE Lab に変換する。`srgb_linear_lut` と組で使う。
 pub fn linear_to_lab(rgb: [f32; 3]) -> [f32; 3] {
     let pivot32 = |t: f32| -> f32 {
@@ -158,6 +182,35 @@ mod tests {
     #[test]
     fn white_and_black_are_far_apart() {
         assert!(delta_e_rgb([255, 255, 255], [0, 0, 0]) > 99.0);
+    }
+
+    /// sRGB → 線形 → sRGB の往復は 256 通りすべてで恒等である。
+    ///
+    /// **`linear_to_srgb_u8` を 1 本化したときの回帰検査である。** 同じ式の複製が
+    /// `cutout/background.rs` と `cutout/refine.rs` に 2 つあり、そちらを委譲へ
+    /// 切り替えた。式が 1 ビットでも動けば、場の `rgb_at` が返す背景色と境界帯の
+    /// 復元色が同時にずれ、`halo_ratio` / `rim_contamination` と出力バイト列が
+    /// 静かに変わる。**往復が恒等であることは、境界の 0.003_130_8 と `round()` の
+    /// どちらが動いても破れる**ので、1 本の表明でどちらも押さえられる。
+    #[test]
+    fn the_round_trip_through_linear_is_the_identity() {
+        let lut = srgb_linear_lut();
+        for v in 0..=255u8 {
+            let back = linear_to_srgb_u8(lut[v as usize]);
+            assert_eq!(back, v, "{v} が往復で {back} になった");
+        }
+    }
+
+    /// 定義域の外は端で止める（クランプは [0, 1]）。
+    #[test]
+    fn linear_values_outside_the_unit_interval_are_clamped() {
+        assert_eq!(linear_to_srgb_u8(-0.5), 0);
+        assert_eq!(linear_to_srgb_u8(1.5), 255);
+        assert_eq!(
+            linear_to_srgb_u8(f32::NAN),
+            0,
+            "NaN は clamp が 0 側へ落とす"
+        );
     }
 
     /// f32 経路は f64 経路と実質同じ値を返さなければならない。

@@ -28,6 +28,7 @@ use crate::report::{
     BatchItemReport, BatchReport, ErrorBody, ManifestItem, SCHEMA_VERSION, SetReport,
 };
 use crate::segment::SegmentMode;
+use crate::transform::reflect::ReflectMode;
 use crate::transform::shadow::ShadowMode;
 use crate::warning::{Warning, WarningCode};
 
@@ -598,6 +599,23 @@ fn to_cutout_args(
             .transpose()?
             .unwrap_or([0, 0, 0]),
         shadow_opacity: ratio(settings.shadow_opacity, 0.25, "shadow_opacity")?,
+        // **spec は clap を通らないので、CLI と同じ関門をここでも掛ける。**
+        // 抜けていると `--reflect-height` では断る値が spec 経由でだけ通り、
+        // 数百点を回した後に仕上がりで気づくことになる
+        reflect: value_enum(settings.reflect.as_deref(), ReflectMode::Off, "reflect")?,
+        reflect_height: capped_f64(
+            settings.reflect_height,
+            150.0,
+            crate::cli::REFLECT_HEIGHT_MAX,
+            "reflect_height",
+        )?,
+        reflect_opacity: ratio(settings.reflect_opacity, 0.25, "reflect_opacity")?,
+        reflect_gap: capped_f64(
+            settings.reflect_gap,
+            0.0,
+            crate::cli::REFLECT_GAP_MAX,
+            "reflect_gap",
+        )?,
         seal,
         // **角度だけは負値を通す。** 反時計回りの指定であり、他の設定の
         // ように「負値は機能が黙って消える」種類の誤りではない

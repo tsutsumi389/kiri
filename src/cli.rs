@@ -23,6 +23,7 @@ use crate::preview::DEFAULT_PANEL;
 use crate::profile::{self, ExplicitOptions, PROFILE_NAMES, Profile};
 use crate::segment::SegmentMode;
 use crate::transform::FitMode;
+use crate::transform::reflect::ReflectMode;
 use crate::transform::shadow::ShadowMode;
 
 #[derive(Parser, Debug)]
@@ -312,8 +313,10 @@ fn shadow_long_help() -> String {
      背景として消す側で、こちらは消した後のアルファから影を作り直す側になる。\
      合成なら商品ごとに影の向きと濃さが揃うので、EC の「影つき」の納品に使える。\n\
      --shadow-offset と --shadow-blur は長辺 1000px 換算で指定する。基準は\
-     **最終画像の長辺**で、--canvas があればキャンバスの長辺、無ければ元画像の\
-     長辺になる。実際に効いた px は結果の shadow.offset / shadow.blur に出る。\n\
+     **最終画像の長辺**で、--canvas があればキャンバスの長辺、無ければ --rotate まで\
+     済ませた画像の長辺になる（--rotate を渡さなければ元画像の長辺と同じ。任意角で\
+     回すと外接矩形は必ず元より大きくなる）。\
+     実際に効いた px は結果の shadow.offset / shadow.blur に出る。\n\
      出力の寸法は変わらない。影が画像（またはキャンバス）の外へ出る分は切り、\
      切ったことを shadow.clipped が言う。--canvas の配置は影なしと同じで、\
      影のぶん商品を小さくはしない。\n\
@@ -321,9 +324,42 @@ fn shadow_long_help() -> String {
      σ が小さすぎて幅が 1 に落ちるときは 0.0 で、ぼかしていないのに σ を\
      名乗ることはない。--shadow-blur の上限は 1000（px@1000 で最終画像の\
      長辺いっぱい。これ以上広げると影は一様に 0 まで薄まる）。\n\
-     --flatten と併せると「下地 → 影 → 商品」の順に重なる。透過を保てる形式\
-     （PNG / AVIF）では影も半透明のアルファとして残る。\n\
+     --flatten と併せると「下地 → 影 → 商品」の順に重なる（--reflect on を\
+     併せるなら「下地 → 影 → 反射 → 商品」で、影は最下層のままである）。\
+     透過を保てる形式（PNG / AVIF）では影も半透明のアルファとして残る。\n\
      mask ブロックの統計と診断値は影を足す前の商品だけで測る"
+        .to_string()
+}
+
+/// `--reflect` の長いヘルプ。
+///
+/// **影と何が違うのかを最初に言う。** 名前は `--shadow` と並ぶが、影は
+/// アルファだけを使って色を塗る段で、こちらは画素を写す段である。そこを
+/// 知らずに `--reflect-color` を探す往復が起きるのがいちばん惜しい。
+/// px@1000 の基準と合成順を書くのは `shadow_long_help` と同じ理由で、
+/// どちらも指定の前に知っていないと出来上がりを予想できない。
+fn reflect_long_help() -> String {
+    "切り抜いた商品の鏡像を下に敷く（既定 off）。艶のある台に映った反射の見た目になる。\n\
+     off … 何も足さない。成果物の画素は --reflect を足す前と 1 バイトも変わらない\
+     （報告 JSON には settings.reflect が増える。schema_version は据え置き）。\n\
+     on  … 商品のアルファの下端を基準線にして、そこから上の画素を上下反転で \
+     --reflect-height ぶん写し、--reflect-opacity から足元の 0 へ線形に薄めて\
+     商品の下に敷く。--reflect-gap を渡すとそのぶん商品と反射のあいだを空ける。\n\
+     **影とは写すものが違う。** --shadow は最終アルファを --shadow-color で塗るが、\
+     こちらは商品の画素（RGB も）をそのまま写す——台に映るのは商品の色である。\
+     色を指定するノブは無い。ぼかしや遠近の変形も入れない（design.md 4.16）。\n\
+     --reflect-height と --reflect-gap は長辺 1000px 換算で指定する。基準は\
+     **最終画像の長辺**で、--canvas があればキャンバスの長辺、無ければ --rotate まで\
+     済ませた画像の長辺になる（--shadow-offset と同じ基準）。実際に効いた px は結果の \
+     reflect.height / reflect.gap に出る——ただし**敷いた行数ではない**ので、\
+     占めた範囲は reflect.bounds で読むこと。\n\
+     出力の寸法は変わらない。反射が画像（またはキャンバス）の外へ出る分は切り、\
+     切ったことを reflect.clipped が言う。--canvas の配置は反射なしと同じで、\
+     反射のぶん商品を小さくはしない。**写せる行は基準線より上にある分だけ**なので、\
+     商品より高い反射を頼んでも足りない行は空のままである。\n\
+     --shadow と併せると「下地 → 影 → 反射 → 商品」の順に重なる。\
+     反射の材料は商品だけで、影を写した反射にはならない。\n\
+     mask ブロックの統計と診断値は反射を敷く前の商品だけで測る"
         .to_string()
 }
 
@@ -575,7 +611,7 @@ fn cutout_rotate_long_help() -> String {
      360 を超える値や負値は [0, 360) へ正規化し、実際に効いた角度は \
      rotate.angle が返す。90 度単位だけは画素を補間し直さない\
      （rotate.resampled が false）。\n\
-     **順序は「切り抜き → 回転 → --canvas → --shadow」で固定である。** \
+     **順序は「切り抜き → 回転 → --canvas → --shadow / --reflect」で固定である。** \
      kiri rotate で先に回してから cutout へ流すと、回転が四隅に作った透過の\
      余白が画像の外周に乗り、背景推定がそれを背景色の標本として数える。\n\
      mask / background / subject の座標は**回す前**のものである（どれも\
@@ -1293,6 +1329,49 @@ pub fn shadow_blur_px(s: &str) -> Result<f64, String> {
     Ok(v)
 }
 
+/// `--reflect-height` の上限(px, 長辺 1000px 換算)。
+///
+/// **反射が最終画像の長辺に達した時点で、それ以上に意味のある結果は無い。**
+/// 写せる行は基準線（商品のアルファの下端）より上にある分しかなく、基準線は
+/// 画像の中にあるので、長辺ぶんを指定すれば必ず「素材のある行すべて」を
+/// 覆い切る。1000 は px@1000 換算でちょうど最終画像の長辺いっぱいにあたる。
+///
+/// `SHADOW_BLUR_MAX` と同じ根拠がもう半分ある——**上限が無いと算術に無理が
+/// 掛かる。** `transform/reflect.rs` は走る行数を `baseline + 1` で抑えて
+/// あるので桁溢れも長時間の走りも起きないが、それは二重の備えのほうで、
+/// こちらが第一の門である（`MAX_BOX_WIDTH` と `SHADOW_BLUR_MAX` の関係と同じ）。
+pub const REFLECT_HEIGHT_MAX: f64 = 1000.0;
+
+/// `--reflect-gap` の上限(px, 長辺 1000px 換算)。
+///
+/// 隙間が最終画像の長辺に達すれば反射は必ず画像の外へ落ちる（`clipped` が
+/// 真になって `bounds` は `null`）。それ以上の指定に意味のある結果は無い。
+/// 上限を `REFLECT_HEIGHT_MAX` と同じ値にしてあるのは、2 つを足しても
+/// 「長辺の 2 倍」までしか届かないことが読んで分かるほうがよいからである。
+pub const REFLECT_GAP_MAX: f64 = 1000.0;
+
+/// 0 以上 `REFLECT_HEIGHT_MAX` 以下の実数だけを受け付ける。
+pub fn reflect_height_px(s: &str) -> Result<f64, String> {
+    let v = non_negative(s)?;
+    if v > REFLECT_HEIGHT_MAX {
+        return Err(format!(
+            "'{s}' は 0 から {REFLECT_HEIGHT_MAX} の範囲で指定してください"
+        ));
+    }
+    Ok(v)
+}
+
+/// 0 以上 `REFLECT_GAP_MAX` 以下の実数だけを受け付ける。
+pub fn reflect_gap_px(s: &str) -> Result<f64, String> {
+    let v = non_negative(s)?;
+    if v > REFLECT_GAP_MAX {
+        return Err(format!(
+            "'{s}' は 0 から {REFLECT_GAP_MAX} の範囲で指定してください"
+        ));
+    }
+    Ok(v)
+}
+
 /// 0.0 以上 1.0 以下の有限な実数だけを受け付ける。
 ///
 /// 不透明度に 1.5 を渡せば飽和して 1.0 と同じ結果になり、-0.2 は影が消える。
@@ -1473,6 +1552,30 @@ pub struct CutoutArgs {
     /// 影の不透明度 (0.0-1.0)。--shadow synth のときだけ効く
     #[arg(long, default_value_t = 0.25, value_parser = unit_interval)]
     pub shadow_opacity: f64,
+
+    /// 切り抜いた商品の鏡像を下に敷く（既定 off）。影と違って画素をそのまま写す
+    ///
+    /// ヘルプの本文は `reflect_long_help` に置く。影との違いと合成順は、
+    /// 指定の前に知っていないと出来上がりを予想できない
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = ReflectMode::Off,
+        long_help = reflect_long_help()
+    )]
+    pub reflect: ReflectMode,
+
+    /// 反射の高さ(px、長辺 1000px 換算)。--reflect on のときだけ効く（上限 1000）
+    #[arg(long, default_value_t = 150.0, value_parser = reflect_height_px)]
+    pub reflect_height: f64,
+
+    /// 反射の不透明度 (0.0-1.0)。商品に接する側の濃さで、足元へ 0 まで薄まる。--reflect on のときだけ効く
+    #[arg(long, default_value_t = 0.25, value_parser = unit_interval)]
+    pub reflect_opacity: f64,
+
+    /// 商品と反射のあいだに空ける隙間(px、長辺 1000px 換算)。--reflect on のときだけ効く（上限 1000）
+    #[arg(long, default_value_t = 0.0, value_parser = reflect_gap_px)]
+    pub reflect_gap: f64,
 
     /// 幅 2N px 以下の隙間を通ってしか外周につながらない背景を前景へ戻す。0 で無効
     ///

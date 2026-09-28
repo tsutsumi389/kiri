@@ -855,6 +855,25 @@ fn fields() -> Vec<FieldEntry> {
             ),
         },
         FieldEntry {
+            path: "settings.reflect",
+            appears_in: vec!["cutout"],
+            unit: "enum",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "商品の鏡像を下に敷いたか（off / on）",
+            notes: Some(
+                "**--shadow とは写すものが違う。** 影は最終アルファを --shadow-color で塗る段だが、\
+                 反射は商品の画素（RGB も）をそのまま写す段で、色を指定するノブは無い。\
+                 off（既定）なら成果物の画素は --reflect を足す前と 1 バイトも変わらず、\
+                 reflect ブロックも現れない（schema_version は据え置き）。実際に効いた高さと\
+                 隙間は reflect.height / reflect.gap のほう。併用すると層は\
+                 「下地 → 影 → 反射 → 商品」の順で、反射の材料は商品だけである\
+                 （影を写した反射にはならない）",
+            ),
+        },
+        FieldEntry {
             path: "settings.rotate",
             appears_in: vec!["cutout"],
             // **数値か "auto" の union である。** 受け手が値を照合してよいかが
@@ -1251,6 +1270,96 @@ fn fields() -> Vec<FieldEntry> {
                  true のときに影を収めたければ --canvas を広げるか、--shadow-offset / \
                  --shadow-blur を小さくする——**商品は影のために動かさない**ので、kiri が\
                  勝手に縮めることはない",
+            ),
+        },
+        FieldEntry {
+            path: "reflect.height",
+            appears_in: vec!["cutout"],
+            unit: "px",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "要求した反射の高さを実寸へ掛け戻した px",
+            notes: Some(
+                "**指定値でも、実際に敷いた行数でもない。** --reflect-height は長辺 1000px 換算で、\
+                 基準は最終画像の長辺（--canvas があればキャンバスの長辺、無ければ --rotate まで\
+                 済ませた画像の長辺）。ここに出るのはその掛け戻しである。\
+                 **実際に占めた範囲は reflect.bounds で読むこと**——写せる行は商品のアルファの\
+                 下端より上にある分しかなく、足元の数行は減衰が 8bit の丸めで 0 になるので、\
+                 bounds の高さはこれより小さいのが普通である（収まりきらなければ \
+                 reflect.clipped も true になる）",
+            ),
+        },
+        FieldEntry {
+            path: "reflect.gap",
+            appears_in: vec!["cutout"],
+            unit: "px",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "要求した隙間を実寸へ掛け戻した px",
+            notes: Some(
+                "reflect.height と同じく長辺 1000px 換算からの掛け戻し。0 なら商品の真下から\
+                 続く。隙間が画像の外まで届けば反射は 1 画素も残らず、reflect.bounds が null で\
+                 reflect.clipped が true になる",
+            ),
+        },
+        FieldEntry {
+            path: "reflect.opacity",
+            appears_in: vec!["cutout"],
+            unit: "ratio",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "商品に接する側（反射の 1 行目）の不透明度",
+            notes: Some(
+                "**反射の中で一様ではない。** ここに出るのは商品に接する側の濃さで、足元へ\
+                 向かって 0 まで線形に薄まる（j 行目の係数は (height - j) / height）。0 は\
+                 「反射を敷かない」指定なので、reflect.bounds は null で reflect.clipped は\
+                 必ず false になる",
+            ),
+        },
+        FieldEntry {
+            path: "reflect.bounds",
+            appears_in: vec!["cutout"],
+            unit: "px",
+            nullable: true,
+            null_means: Some("反射が 1 画素も残らなかった。矩形が空（面積 0）ではない"),
+            warns: vec![],
+            gates: None,
+            summary: "反射のアルファが 0 より大きい画素の外接矩形 [x1, y1, x2, y2]",
+            notes: Some(
+                "商品ではなく反射の占める範囲である。--reflect-opacity 0 / --reflect-height 0 や、\
+                 隙間が画像より大きいときに null になる。どちらだったかは reflect.clipped が\
+                 分ける（前者は false、後者は true）",
+            ),
+        },
+        FieldEntry {
+            path: "reflect.clipped",
+            appears_in: vec!["cutout"],
+            unit: "bool",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "反射の一部が画像（またはキャンバス）の外にあるか",
+            notes: Some(
+                "**最終の反射のアルファで決める**（shadow.clipped と同じ規約）。真になるのは \
+                 (a) インクの出る行が画像の外へ落ちた、(b) 下端の行に反射が残っている\
+                 （= その先へ続いていた）、(c) 左右の 1 列に反射が残っている、の 3 つ。\
+                 **(c) は切られたことを意味しない。** 反射は横へ広がらないので、左右にインクが\
+                 残るのは商品が画像の左右の縁に触れているという意味であり、1 画素も切られて\
+                 いなくても true になる（--shadow の offset 0,0 とまったく同じ振る舞い）。\
+                 縦に収まっているかを知りたければ reflect.bounds の y2 を画像の高さと\
+                 突き合わせること。**reflect.bounds が null でも true になりうる**——隙間が\
+                 画像より大きければ反射は 1 画素も残らないが、それは「敷かなかった」のではなく\
+                 「全部はみ出した」である。--reflect-opacity 0 と --reflect-height 0 は敷かない\
+                 指定なので必ず false。true のときに収めたければ --canvas を広げるか、\
+                 --reflect-height / --reflect-gap を小さくする——**商品は反射のために動かさない**\
+                 ので、kiri が勝手に縮めることはない",
             ),
         },
         FieldEntry {

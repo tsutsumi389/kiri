@@ -232,6 +232,16 @@ pub struct ItemSettings {
     /// 影の色（"#RRGGBB"）
     pub shadow_color: Option<String>,
     pub shadow_opacity: Option<f64>,
+    /// 商品の鏡像を下に敷くか（"off" / "on"）。**影とは写すものが違う**
+    /// ——影は `shadow_color` で塗るが、反射は商品の画素をそのまま写すので
+    /// 色を指定するキーが無い
+    pub reflect: Option<String>,
+    /// 反射の高さ(px、長辺 1000px 換算)
+    pub reflect_height: Option<f64>,
+    /// 反射の不透明度。商品に接する側の濃さで、足元へ 0 まで薄まる
+    pub reflect_opacity: Option<f64>,
+    /// 商品と反射のあいだに空ける隙間(px、長辺 1000px 換算)
+    pub reflect_gap: Option<f64>,
     pub seal: Option<u32>,
     /// 切り抜いた後に時計回りへ回す角度(度)。**負値に意味がある**
     /// （反時計回り）ので、他の数値と違って 0 以上の検査は掛けない。
@@ -331,6 +341,10 @@ impl ItemSettings {
             shadow_blur,
             shadow_color,
             shadow_opacity,
+            reflect,
+            reflect_height,
+            reflect_opacity,
+            reflect_gap,
             seal,
             rotate,
             profile,
@@ -386,6 +400,10 @@ const SETTING_KEYS: &[&str] = &[
     "shadow_blur",
     "shadow_color",
     "shadow_opacity",
+    "reflect",
+    "reflect_height",
+    "reflect_opacity",
+    "reflect_gap",
     "seal",
     "rotate",
     "profile",

@@ -144,13 +144,27 @@ impl IccSignal {
     }
 }
 
+/// `--quality` の既定値。**この 1 箇所だけが持ち主である。**
+///
+/// 同じ数が clap の `default_value_t`、`SaveOptions::default()`、batch spec の
+/// `unwrap_or` の 3 箇所に手書きされていた。片方だけ動かしてもコンパイルは通り、
+/// テストも「その値でたまたま通る」ので気づけない
+/// （`the_cli_defaults_match_the_library_defaults` が押さえているのと同じ罠で、
+/// quality はそこを通らない）。3 箇所ともここを引く。
+pub const DEFAULT_QUALITY: f32 = 75.0;
+
+/// `--effort` の既定値。持ち主は `DEFAULT_QUALITY` と同じ理由でここ 1 箇所。
+///
+/// 実測で effort 1 は 7.7MP の AVIF で 40 秒に達する。6 はその妥協点で、
+/// **Phase 26 でも値は動かしていない**——動かしたのは quality だけである。
+pub const DEFAULT_EFFORT: u8 = 6;
+
 #[derive(Debug, Clone)]
 pub struct SaveOptions {
     pub format: OutputFormat,
-    /// AVIF / JPEG の品質 (0-100)
+    /// AVIF / JPEG の品質 (0-100)。既定は `DEFAULT_QUALITY`
     pub quality: f32,
-    /// AVIF のエンコード速度 (1-10)。小さいほど高品質・低速。
-    /// 実測では 1 は 7.7MP で 40 秒に達するため既定は 6。
+    /// AVIF のエンコード速度 (1-10)。小さいほど高品質・低速。既定は `DEFAULT_EFFORT`
     pub effort: u8,
     /// アルファを保持できない形式へ出力する際の合成色
     pub background: [u8; 3],
@@ -164,8 +178,8 @@ impl Default for SaveOptions {
     fn default() -> Self {
         Self {
             format: OutputFormat::Avif,
-            quality: 75.0,
-            effort: 6,
+            quality: DEFAULT_QUALITY,
+            effort: DEFAULT_EFFORT,
             background: [255, 255, 255],
             flatten: false,
             icc: IccPolicy::Embed,

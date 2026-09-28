@@ -16,9 +16,9 @@ use crate::cutout::constraints::{
     ALPHA_BACKGROUND, ALPHA_FOREGROUND, MASK_THRESHOLD, TRIMAP_BACKGROUND, TRIMAP_FOREGROUND,
 };
 use crate::cutout::{BackgroundModel, DEFAULT_EDGE_THRESHOLD, Matting, OptimizeFixed};
-use crate::image_io::OutputFormat;
 use crate::image_io::derive::{DERIVE_KEYS, DeriveSpec};
 use crate::image_io::naming::DEFAULT_TEMPLATE;
+use crate::image_io::{DEFAULT_EFFORT, DEFAULT_QUALITY, OutputFormat};
 use crate::preview::DEFAULT_PANEL;
 use crate::profile::{self, ExplicitOptions, PROFILE_NAMES, Profile};
 use crate::segment::SegmentMode;
@@ -422,11 +422,11 @@ pub struct OutputOpts {
     pub format: Option<OutputFormat>,
 
     /// 品質 (0-100)。AVIF は 75 を超えるとサイズが急増する
-    #[arg(long, default_value_t = 75.0)]
+    #[arg(long, default_value_t = DEFAULT_QUALITY)]
     pub quality: f32,
 
     /// AVIF のエンコード速度 (1-10)。小さいほど高品質・低速
-    #[arg(long, default_value_t = 6)]
+    #[arg(long, default_value_t = DEFAULT_EFFORT)]
     pub effort: u8,
 
     /// 出力の上限バイト数。品質を梯子状に落として収める (例 500k)

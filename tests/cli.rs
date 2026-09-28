@@ -8531,6 +8531,71 @@ fn the_cli_defaults_match_the_library_defaults() {
     );
 }
 
+/// `--quality` / `--effort` の既定値が、実装側の 3 箇所で 1 つの定数に揃っていること。
+///
+/// 上の `the_cli_defaults_match_the_library_defaults` は `CutoutOptions` を通る
+/// つまみしか見ていない。出力側の 2 つは `OutputOpts` にあって、同じ数が
+/// clap の `default_value_t` / `SaveOptions::default()` / batch spec の
+/// `unwrap_or` の 3 箇所に手書きされていた。**ここは前 2 者を突き合わせ、
+/// 3 つ目は `the_spec_defaults_for_the_quality_match_the_cli` が外から押さえる。**
+#[test]
+fn the_cli_defaults_for_the_output_match_the_library_defaults() {
+    use clap::Parser;
+    use kiri::cli::{Cli, Command as CliCommand};
+    use kiri::image_io::{DEFAULT_EFFORT, DEFAULT_QUALITY, SaveOptions};
+
+    let cli = Cli::parse_from(["kiri", "convert", "in.png", "-o", "out.avif"]);
+    let CliCommand::Convert(args) = cli.command else {
+        panic!("convert として解釈されていない");
+    };
+    let defaults = SaveOptions::default();
+
+    assert_eq!(args.out.quality, DEFAULT_QUALITY, "--quality の既定値");
+    assert_eq!(
+        defaults.quality, DEFAULT_QUALITY,
+        "SaveOptions が定数を引いていない"
+    );
+    assert_eq!(args.out.effort, DEFAULT_EFFORT, "--effort の既定値");
+    assert_eq!(
+        defaults.effort, DEFAULT_EFFORT,
+        "SaveOptions が定数を引いていない"
+    );
+}
+
+/// spec を通した品質の既定値が、CLI の既定値と食い違わないこと。
+///
+/// `the_spec_defaults_for_the_reflection_match_the_cli`（Phase 25）と同じ形の
+/// 突き合わせを quality にも置く。**spec は clap を通らない**ので、
+/// `commands/batch.rs` の `unwrap_or` だけが取り残されてもコンパイルは通る。
+/// JPEG を選ぶのは、PNG が品質を持たず `quality_used` が null になるため。
+#[test]
+fn the_spec_defaults_for_the_quality_match_the_cli() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "a.png", &img);
+
+    let cli = cutout_on_canvas(dir.path(), &input, "cli.jpg", &["--canvas", "1000"]);
+    let spec = write_spec(
+        dir.path(),
+        r#"{"items":[{"input":"a.png","output":"spec.jpg","canvas":"1000"}]}"#,
+    );
+    let out = run_batch(&spec, &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        json_stdout(&out)["results"][0]["result"]["outputs"][0]["quality_used"],
+        cli["outputs"][0]["quality_used"],
+        "spec の既定値が CLI と食い違っている"
+    );
+}
+
 /// `--help` が語る既定値が `DEFAULT_EDGE_THRESHOLD` と食い違っていないこと。
 ///
 /// `--edge-threshold` の既定値は clap の `default_value_t` に無く、ヘルプの

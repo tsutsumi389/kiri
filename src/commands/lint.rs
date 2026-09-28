@@ -1300,54 +1300,76 @@ mod tests {
     /// `the_write_defaults_never_contradict_the_rules` は表と設定の整合を
     /// 見るが、**lint の判定を通していない**——占有率の測り方や背景の許容が
     /// ずれていれば、そちらは通ったままここが落ちる。
+    ///
+    /// **canvas が入力依存になった後も、選びうる段を全部通す**（Phase 26）。
+    /// 1 つの寸法だけを見ると、`profile::CANVAS_LADDER` のどれかの段でだけ
+    /// 落ちる誤り——たとえば最小段で占有率の丸めが下限を割る——を見逃す。
     #[test]
     fn what_a_profile_writes_passes_the_same_profiles_lint() {
+        // 商品の長辺を全段ぶん振ると、選ばれる canvas も全段を舐める。
+        // 外側（どの段も拡大になる 1px）も 1 つ足す
+        let subjects = {
+            let mut v = vec![1u32];
+            v.extend(profile::CANVAS_LADDER);
+            v
+        };
         for p in profile::ALL {
             let w = p.write_defaults();
-            let (cw, ch) = w.canvas.unwrap();
+            assert_eq!(w.canvas, Some(profile::CanvasChoice::FromSubject));
             let ratio = w.fill_ratio.unwrap_or(0.9);
-            // 占有率どおりに置かれた外接矩形
-            let side = (f64::from(cw) * ratio).round() as u32;
-            let margin = (cw - side) / 2;
-            let f = Facts {
-                width: cw,
-                height: ch,
-                file_size: 1_000_000,
-                format: w.format.unwrap_or(OutputFormat::Png),
-                // 潰す規格では不透明になり、許す規格では検査されない
-                has_alpha: false,
-                naming: Naming {
-                    status: PASS,
-                    actual: None,
-                },
-                pixels: Some(Pixels {
-                    // 書いた背景色そのまま。色差 0 で通る
-                    background: w.background.unwrap_or([255, 255, 255]),
-                    border: crate::cutout::background::field_band(
-                        &image::RgbaImage::new(cw, ch),
-                        crate::cutout::background::DEFAULT_BORDER,
-                    ),
-                    uniformity: 1.0,
-                    background_from_opaque: true,
-                    background_uniform: true,
-                    fill: Some(Fill {
-                        ratio: fill_ratio(
-                            [margin, margin, margin + side - 1, margin + side - 1],
-                            cw,
-                            ch,
-                        ),
-                        source: FILL_FROM_ALPHA,
-                        bbox: [margin, margin, margin + side - 1, margin + side - 1],
-                    }),
-                }),
-            };
-            let checks = run_checks(&f, p.name);
-            let bad: Vec<(&str, &str)> = checks
-                .iter()
-                .filter(|c| c.status != PASS)
-                .map(|c| (c.name, c.status))
-                .collect();
-            assert!(bad.is_empty(), "{}: {bad:?}", p.name);
+            for subject in &subjects {
+                let (cw, ch) = p.canvas_for(*subject, ratio);
+                what_a_profile_writes_passes_its_lint(p, cw, ch, ratio);
+            }
         }
+    }
+
+    /// 1 つの寸法について、書いたものが lint を通ることを見る。
+    ///
+    /// 段ごとに回すために切り出しただけで、判定は Phase 22 のままである。
+    fn what_a_profile_writes_passes_its_lint(p: &profile::Profile, cw: u32, ch: u32, ratio: f64) {
+        let w = p.write_defaults();
+        // 占有率どおりに置かれた外接矩形
+        let side = (f64::from(cw) * ratio).round() as u32;
+        let margin = (cw - side) / 2;
+        let f = Facts {
+            width: cw,
+            height: ch,
+            file_size: 1_000_000,
+            format: w.format.unwrap_or(OutputFormat::Png),
+            // 潰す規格では不透明になり、許す規格では検査されない
+            has_alpha: false,
+            naming: Naming {
+                status: PASS,
+                actual: None,
+            },
+            pixels: Some(Pixels {
+                // 書いた背景色そのまま。色差 0 で通る
+                background: w.background.unwrap_or([255, 255, 255]),
+                border: crate::cutout::background::field_band(
+                    &image::RgbaImage::new(cw, ch),
+                    crate::cutout::background::DEFAULT_BORDER,
+                ),
+                uniformity: 1.0,
+                background_from_opaque: true,
+                background_uniform: true,
+                fill: Some(Fill {
+                    ratio: fill_ratio(
+                        [margin, margin, margin + side - 1, margin + side - 1],
+                        cw,
+                        ch,
+                    ),
+                    source: FILL_FROM_ALPHA,
+                    bbox: [margin, margin, margin + side - 1, margin + side - 1],
+                }),
+            }),
+        };
+        let checks = run_checks(&f, p.name);
+        let bad: Vec<(&str, &str)> = checks
+            .iter()
+            .filter(|c| c.status != PASS)
+            .map(|c| (c.name, c.status))
+            .collect();
+        assert!(bad.is_empty(), "{}: {bad:?}", p.name);
     }
 }

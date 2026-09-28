@@ -91,11 +91,34 @@ const MAX_BOX_WIDTH: i64 = (1 << 20) - 1;
 /// 影が画像の外へ出る部分は切る。**商品の配置は影のために動かさない**——
 /// 影の分だけ商品を小さくすると、`--canvas --fill-ratio` で揃えたはずの
 /// 占有率が影の有無で変わってしまう。
+///
+/// # `alpha` と `compose` に割ってある
+///
+/// 影だけを敷く実行はこの 1 本で閉じるが、`--reflect` と併せると**層の順**が
+/// 問題になる（design.md 4.16）。`over` は結合的でも、層が重なる順は呼んだ順で
+/// 決まるので、影を敷き終えた画像へ後から反射を敷くと反射が影の下に入る。
+/// しかも影を敷いた後の画像はアルファが混ざっているので、そこから鏡像を取ると
+/// **影を写した反射**になる。だから測る側（`alpha`）と敷く側（`compose`）を
+/// 分けて公開し、`commands/cutout.rs` が「商品だけから影のアルファを測る →
+/// 反射を敷く → その下へ影を敷く」の順に呼べるようにしてある。
 pub fn synth(mut product: RgbaImage, spec: &ShadowSpec) -> (RgbaImage, ShadowBounds) {
+    let (layer, bounds) = alpha(&product, spec);
+    compose(&mut product, &layer, spec.color);
+    (product, bounds)
+}
+
+/// 影の層のアルファだけを作る。長さは `product` の画素数（行優先）。
+///
+/// **商品を読むだけで書かない。** 呼び出し側は、この結果を持ったまま別の層
+/// （反射）を先に敷き、最後に `compose` で影をその下へ落とせる。
+///
+/// 寸法 0 の画像では空の層を返す。`compose` は `zip` で回るので、長さが
+/// 合っていれば空でも素通りする。
+pub fn alpha(product: &RgbaImage, spec: &ShadowSpec) -> (Vec<u8>, ShadowBounds) {
     let (w, h) = (product.width(), product.height());
     if w == 0 || h == 0 {
         return (
-            product,
+            Vec::new(),
             ShadowBounds {
                 rect: None,
                 clipped: false,
@@ -103,7 +126,7 @@ pub fn synth(mut product: RgbaImage, spec: &ShadowSpec) -> (RgbaImage, ShadowBou
         );
     }
 
-    let shifted = shift_alpha(&product, spec.offset);
+    let shifted = shift_alpha(product, spec.offset);
     let mut alpha = shifted.alpha;
 
     let widths = box_widths(spec.sigma, BOX_PASSES);
@@ -145,8 +168,7 @@ pub fn synth(mut product: RgbaImage, spec: &ShadowSpec) -> (RgbaImage, ShadowBou
     // `clipped: true` が出る偽陽性になっていた
     let clipped = spec.opacity > 0.0 && (shifted.dropped || touches_border);
 
-    compose(&mut product, &alpha, spec.color);
-    (product, ShadowBounds { rect, clipped })
+    (alpha, ShadowBounds { rect, clipped })
 }
 
 /// 箱型フィルタが実際に実現する σ。
@@ -199,7 +221,10 @@ fn shift_alpha(product: &RgbaImage, offset: (i32, i32)) -> Shifted {
 /// 約束はここで保たれる。
 ///
 /// `pixels_mut` は行優先で回るので、添字はそのまま影のアルファの添字になる。
-fn compose(image: &mut RgbaImage, alpha: &[u8], color: [u8; 3]) {
+///
+/// **`pub(crate)` にしてあるのは合成順のためである**（`synth` の doc）。
+/// 反射を併せる実行では、反射を敷いた後にこれを呼ぶことで影が最下層に来る。
+pub(crate) fn compose(image: &mut RgbaImage, alpha: &[u8], color: [u8; 3]) {
     for (p, sa) in image.pixels_mut().zip(alpha) {
         if *sa == 0 || p[3] == 255 {
             continue;
@@ -580,6 +605,94 @@ mod tests {
         );
         assert_eq!(bounds.rect, None);
         assert!(bounds.clipped, "全部はみ出したのに clipped が偽");
+    }
+
+    /// 半透明の縁を持つ商品。**`over` の混色の枝を通す素材である。**
+    ///
+    /// 不透明な矩形だけでは、影の合成は「アルファ 0 は素通り」と
+    /// 「アルファ 255 は触らない」の 2 つの早期 return しか通らない。縁の
+    /// 階調があって初めて `over` の割り算に入る。
+    fn soft_block(w: u32, h: u32, x1: u32, y1: u32, x2: u32, y2: u32) -> RgbaImage {
+        let mut img = RgbaImage::new(w, h);
+        for y in y1..=y2 {
+            for x in x1..=x2 {
+                // 中心から外へ向かってアルファが落ちる。縁の 1〜2px が半透明
+                let dx = (x as i64 - (x1 + x2) as i64 / 2).unsigned_abs() as u32;
+                let dy = (y as i64 - (y1 + y2) as i64 / 2).unsigned_abs() as u32;
+                let half = ((x2 - x1) / 2).max((y2 - y1) / 2).max(1);
+                let reach = dx.max(dy);
+                let a = 255u32.saturating_sub(255 * reach / (half + 1));
+                img.put_pixel(x, y, image::Rgba([180, 90, 70, a as u8]));
+            }
+        }
+        img
+    }
+
+    /// `synth` は `alpha` と `compose` を順に呼ぶのと**バイト一致**する。
+    ///
+    /// # これが Phase 25 の手術の担保である
+    ///
+    /// 合成順（下地 → 影 → 反射 → 商品）のために `synth` を 2 つに割った。
+    /// `commands/cutout.rs` の `compose_layers` は `synth` を呼ばずに
+    /// `alpha` → （反射）→ `compose` の順で呼ぶので、**影だけの実行が
+    /// 以前と同じ出力になる根拠は「2 つを順に呼ぶことが `synth` と同じ」
+    /// という等式そのもの**になる。`--reflect off` と `--reflect` 無しを
+    /// 比べても、その 2 つは clap の既定値で同一の引数値になるだけなので、
+    /// この等式の裏は取れない（同義反復になる）。
+    ///
+    /// **半透明の縁とぼかしのある素材で見る。** 不透明な矩形では `over` の
+    /// 混色の枝を 1 度も通らないので、割り方を間違えても気づけない。
+    #[test]
+    fn splitting_synth_into_alpha_and_compose_changes_nothing() {
+        let product = soft_block(96, 96, 24, 20, 71, 67);
+        for spec in [
+            ShadowSpec {
+                offset: (5, 9),
+                sigma: 4.0,
+                color: [10, 20, 30],
+                opacity: 0.25,
+            },
+            // ぼかし 0・不透明度 1 の極（早期 return の側）も通す
+            ShadowSpec {
+                offset: (0, 3),
+                sigma: 0.0,
+                color: [0, 0, 0],
+                opacity: 1.0,
+            },
+            // 全部はみ出す指定（`clipped` が真で層が空）
+            ShadowSpec {
+                offset: (0, 400),
+                sigma: 2.0,
+                color: [0, 0, 0],
+                opacity: 0.5,
+            },
+        ] {
+            let (whole, whole_bounds) = synth(product.clone(), &spec);
+
+            let (layer, split_bounds) = alpha(&product, &spec);
+            let mut piecewise = product.clone();
+            compose(&mut piecewise, &layer, spec.color);
+
+            assert_eq!(
+                whole.as_raw(),
+                piecewise.as_raw(),
+                "synth と alpha+compose で画素が違う（spec: {spec:?}）"
+            );
+            assert_eq!(
+                whole_bounds, split_bounds,
+                "synth と alpha+compose で bounds が違う（spec: {spec:?}）"
+            );
+            // 半透明の縁が実際に混色を通っていること（素材の前提の検査）
+            if spec.opacity > 0.0 && whole_bounds.rect.is_some() {
+                let mixed = product
+                    .enumerate_pixels()
+                    .any(|(x, y, p)| p[3] > 0 && p[3] < 255 && whole.get_pixel(x, y).0 != p.0);
+                assert!(
+                    mixed,
+                    "半透明の縁が 1 画素も混色を通っていない（spec: {spec:?}）"
+                );
+            }
+        }
     }
 
     /// 同じ入力からは同じバイト列が出る。

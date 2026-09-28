@@ -1,9 +1,11 @@
 pub mod canvas;
+pub mod reflect;
 pub mod resize;
 pub mod rotate;
 pub mod shadow;
 
 pub use canvas::{CanvasPlan, CanvasSpec};
+pub use reflect::{ReflectBounds, ReflectMode, ReflectSpec};
 pub use resize::{FitMode, ResizePlan, ResizeSpec, apply, plan};
 pub use rotate::{RotatePlan, RotateSpec};
 pub use shadow::{ShadowBounds, ShadowMode, ShadowSpec};

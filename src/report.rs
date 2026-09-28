@@ -538,6 +538,46 @@ pub struct ShadowReport {
     pub clipped: bool,
 }
 
+/// 合成した反射が実際にどう効いたか。
+///
+/// **`ShadowReport` と同型にしてある。** `--reflect on` のときだけ出て、
+/// `off` ではキーごと消える（`null` を出すと「敷いたが反射が残らなかった」と
+/// 読めてしまう）。頼んだかどうかは `settings.reflect` が常に言う。
+///
+/// `height` / `gap` は**長辺 1000px 換算の指定を実寸へ掛け戻した px**。
+/// 指定値をそのまま返すと、長辺が違う素材のあいだで同じ数字が違う見た目を
+/// 指すことになる（`ShadowReport` と `smooth_radius_px` と同じ理由）。
+///
+/// **`--reflect-color` に相当するキーは無い。** 反射は商品の画素をそのまま
+/// 写すので、色は商品が決める（design.md 4.16）。
+#[derive(Debug, Serialize)]
+pub struct ReflectReport {
+    /// 要求した高さを実寸へ掛け戻した px。
+    ///
+    /// **実際に敷いた行数ではない。** 写せる行は商品のアルファの下端より上に
+    /// ある分しかなく、足元の数行は減衰が 8bit の丸めで 0 になる。**占めた
+    /// 範囲は `bounds` で読む**（`bounds` が null なら 1 行も残っていない）
+    pub height: u32,
+    /// 要求した隙間を実寸へ掛け戻した px
+    pub gap: u32,
+    /// 商品に接する側の不透明度。足元へ 0 まで線形に薄まる
+    pub opacity: f64,
+    /// 反射のアルファが 0 より大きい画素の外接矩形 [x1, y1, x2, y2]。
+    /// 1 画素も無ければ null
+    pub bounds: Option<[u32; 4]>,
+    /// 反射の一部が画像（またはキャンバス）の外にあるか。
+    ///
+    /// **最終の反射のアルファで決める。** インクの出る行が画像の外へ落ちたか、
+    /// 外周の 1 列・1 行に反射が残っている（= その先へ続いていた）ときに真。
+    ///
+    /// **`bounds` が null でも真になりうる。** 隙間が画像より大きければ反射は
+    /// 1 画素も残らないが、それは「反射を敷かなかった」のではなく「全部
+    /// はみ出した」である。`ShadowReport::clipped` とまったく同じ規約で、
+    /// `--reflect-opacity 0` と `--reflect-height 0` は敷かない指定なので
+    /// 必ず偽になる
+    pub clipped: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CanvasReport {
     pub width: u32,
@@ -607,6 +647,14 @@ pub struct SettingsReport {
     /// 落ち影を合成したか（"off" / "synth"）。**常に出す。**
     /// 実際に効いたずらし量とぼかしは `shadow` ブロックのほう
     pub shadow: &'static str,
+    /// 反射を合成したか（"off" / "on"）。**常に出す。**
+    ///
+    /// `shadow` と同じ二段構えである。頼んだかどうかはここ、実際に効いた
+    /// 高さと隙間は `reflect` ブロックが言う。**単一のノブなので `settings` に
+    /// 置く**——Phase 24 の `color` だけは要求値をブロックの中に持たせたが、
+    /// あれは白点と露出の 2 段を 1 ブロックで語る必要があったためで、
+    /// `--shadow` / `--rotate` / `--segment` と同じこちらが既定の形である
+    pub reflect: &'static str,
     /// `--rotate` の**指定値**。**常に出す。数値か `"auto"` の union である。**
     ///
     /// `shadow` と同じ二段構えである。実際に効いた角度は `rotate.angle`
@@ -820,6 +868,11 @@ pub struct CutoutReport {
     /// 落ち影を合成したときだけ出る。`--shadow off`（既定）ではキーごと無い
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shadow: Option<ShadowReport>,
+    /// 反射を合成したときだけ出る。`--reflect off`（既定）ではキーごと無い。
+    /// **`shadow` の隣に置く**——層としては商品と影のあいだで、順序も
+    /// 「下地 → 影 → 反射 → 商品」である
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reflect: Option<ReflectReport>,
     /// --preview で書き出した検証用画像のパス
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,

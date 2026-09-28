@@ -29,10 +29,11 @@ use crate::preview::{PreviewSpec, contact_sheet};
 use crate::profile;
 use crate::report::{
     CanvasReport, ColorReport, ConstraintsReport, CutoutReport, Dimensions, MaskReport,
-    OptimizeCandidate, OptimizeReport, OptimizeScore, ProfileRef, RotateReport, SCHEMA_VERSION,
-    SettingsReport, ShadowReport,
+    OptimizeCandidate, OptimizeReport, OptimizeScore, ProfileRef, ReflectReport, RotateReport,
+    SCHEMA_VERSION, SettingsReport, ShadowReport,
 };
 use crate::transform::canvas::{CanvasSpec, apply as canvas_apply, composite, plan as canvas_plan};
+use crate::transform::reflect::{self, ReflectMode, ReflectSpec};
 use crate::transform::rotate::{self, RotateSpec};
 use crate::transform::shadow::{self, ShadowMode, ShadowSpec};
 use crate::warning::{Warning, WarningCode};
@@ -228,17 +229,22 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     // キャンバスがあればそちらが基準になり、無ければ回した後の寸法になる。
     // 元画像の長辺で換算すると、同じ指定が --canvas や --rotate の有無で
     // 違う見た目を指す
-    let shadow_spec = resolve_shadow(
-        args,
-        match args.canvas {
-            Some((cw, ch)) => cw.max(ch),
-            None => result.image.width().max(result.image.height()),
-        },
-    );
+    // **反射も同じ長辺を基準にする。** 影と別の基準を持たせると、同じ
+    // 「px@1000 で 150」が 2 つのノブで違う実寸を指すことになる
+    let long_side = match args.canvas {
+        Some((cw, ch)) => cw.max(ch),
+        None => result.image.width().max(result.image.height()),
+    };
+    let shadow_spec = resolve_shadow(args, long_side);
+    let reflect_spec = resolve_reflect(args, long_side);
+    let layers = Layers {
+        shadow: shadow_spec.as_ref(),
+        reflect: reflect_spec.as_ref(),
+    };
 
     // キャンバスを使わないときは切り抜き結果をそのまま書き出す。複製すると
     // 12MP で 48MB を余分に積み、batch の並列度ぶんだけ倍になる
-    let (placed, canvas, shadow) = match args.canvas {
+    let (placed, canvas, shadow, reflect) = match args.canvas {
         Some((cw, ch)) => {
             let placement = place_on_canvas(
                 &result.image,
@@ -246,26 +252,26 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
                 cw,
                 ch,
                 args,
-                shadow_spec.as_ref(),
+                layers,
                 &mut warnings,
             )?;
             (
                 Some(placement.image),
                 Some(placement.report),
                 placement.shadow,
+                placement.reflect,
             )
         }
-        // **切り抜き結果の画像そのものを影の合成へ渡す。** 24.5MP の RGBA は
-        // 98MB あり、複製する理由が無い——`synth` は画素ごとにその場で書く。
+        // **切り抜き結果の画像そのものを合成へ渡す。** 24.5MP の RGBA は
+        // 98MB あり、複製する理由が無い——影も反射も画素ごとにその場で書く。
         // 取り出した後の `result.image` は空になるが、この枝では下の
         // `unwrap_or` が必ず `placed` を採るので読まれない
-        None => match shadow_spec.as_ref() {
-            Some(spec) => {
-                let (image, bounds) = shadow::synth(std::mem::take(&mut result.image), spec);
-                (Some(image), None, Some(shadow_report(spec, &bounds)))
-            }
-            None => (None, None, None),
-        },
+        None if layers.any() => {
+            let mut image = std::mem::take(&mut result.image);
+            let (shadow, reflect) = compose_layers(&mut image, layers);
+            (Some(image), None, shadow, reflect)
+        }
+        None => (None, None, None, None),
     };
     let final_image = placed.as_ref().unwrap_or(&result.image);
 
@@ -398,6 +404,8 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             optimize: args.optimize,
             // 指定値。実際に効いたずらし量とぼかしは `shadow` ブロックのほう
             shadow: args.shadow.as_str(),
+            // 同じく指定値。実際に効いた高さと隙間は `reflect` ブロックのほう
+            reflect: args.reflect.as_str(),
             // 同じく指定値。効いた角度は `rotate` ブロックのほう
             // （`auto` を渡した実行では "auto" がそのまま出る）
             rotate: args.rotate.rounded(),
@@ -425,6 +433,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         compliance,
         canvas,
         shadow,
+        reflect,
         preview,
         elapsed_ms: started.elapsed().as_millis(),
         warnings,
@@ -1083,11 +1092,108 @@ fn shadow_report(spec: &ShadowSpec, bounds: &crate::transform::ShadowBounds) -> 
     }
 }
 
+/// 長辺 1000px 換算の指定を、最終画像の実寸へ掛け戻す（反射の版）。
+///
+/// `--reflect off` なら `None`。`resolve_shadow` とまったく同じ約束で、
+/// 合成しない実行で仕様を組み立てても使い道が無い。
+fn resolve_reflect(args: &CutoutArgs, long_side: u32) -> Option<ReflectSpec> {
+    if args.reflect != ReflectMode::On {
+        return None;
+    }
+    let scale = f64::from(long_side) / 1000.0;
+    Some(ReflectSpec {
+        // 行数なので整数へ丸める。`as u32` は負値と桁外れを飽和で受けるが、
+        // どちらも `cli::reflect_height_px` / `reflect_gap_px` が先に断る
+        height: (args.reflect_height * scale).round() as u32,
+        gap: (args.reflect_gap * scale).round() as u32,
+        opacity: args.reflect_opacity,
+    })
+}
+
+/// 効いた反射を結果 JSON へ落とす。
+///
+/// **`shadow_report` と違って要求値を組み替える必要が無い。** あちらは箱型の
+/// 幅が実現する σ を出し直すが、こちらの高さと隙間は行数そのもので、
+/// 指定した px がそのまま効く（写せる行が足りなかったことは `bounds` の
+/// 高さが言う）。
+fn reflect_report(spec: &ReflectSpec, bounds: &crate::transform::ReflectBounds) -> ReflectReport {
+    ReflectReport {
+        height: spec.height,
+        gap: spec.gap,
+        opacity: round4(spec.opacity),
+        bounds: bounds.rect,
+        clipped: bounds.clipped,
+    }
+}
+
+/// 商品の下に敷く層の仕様。
+///
+/// **2 つを 1 つにまとめてあるのは、必ず一緒に扱われるからである。** 合成順
+/// （`compose_layers`）も `--canvas --flatten` の塗り順の組み替えも、「どちらかが
+/// on か」でしか分岐しない。別々に持ち回ると `place_on_canvas` の引数が 8 つになり、
+/// 呼び出し側で 2 つの `Option` を取り違える余地も残る。
+#[derive(Clone, Copy)]
+struct Layers<'a> {
+    shadow: Option<&'a ShadowSpec>,
+    reflect: Option<&'a ReflectSpec>,
+}
+
+impl Layers<'_> {
+    /// 敷く層が 1 つでもあるか。
+    ///
+    /// `--flatten` の塗り順を組み替えるかどうかがこれで決まる（`place_on_canvas`）。
+    fn any(self) -> bool {
+        self.shadow.is_some() || self.reflect.is_some()
+    }
+}
+
+/// 商品の下へ反射と影を敷く。**層の順は「下地 → 影 → 反射 → 商品」。**
+///
+/// # 影を 2 つに割ってあるのはこの順序のためである
+///
+/// `over` は結合的だが、**層が重なる順は呼んだ順で決まる。** `shadow::synth`
+/// を先に呼ぶと画像はもう「商品 over 影」になっており、その上へ反射を敷けば
+/// 反射が影の下に入る。しかもアルファが混ざっているので、そこから鏡像を取ると
+/// **影を写した反射**になる（影は商品の下へずれているので、反射の中で影が
+/// 二重に伸びる）。
+///
+/// だから影は測る側（`shadow::alpha`）と敷く側（`shadow::compose`）に割り、
+///
+/// 1. 商品だけから影のアルファを測る（この時点の画像は商品のみ）
+/// 2. 商品だけから反射を作って下へ敷く
+/// 3. 測っておいた影をその下へ落とす
+///
+/// の順に呼ぶ。**影だけの実行は `shadow::synth` を呼ぶのとバイト一致する**
+/// ——同じ 2 つの関数を同じ順で通るだけである。
+fn compose_layers(
+    image: &mut image::RgbaImage,
+    layers: Layers<'_>,
+) -> (Option<ShadowReport>, Option<ReflectReport>) {
+    // **商品だけから測る。** 反射を敷いた後では材料が別物になる
+    let measured = layers.shadow.map(|spec| (spec, shadow::alpha(image, spec)));
+
+    let reflect = layers.reflect.map(|spec| {
+        // 値で受けてその場に書く形（`synth` の doc）を崩さないために入れ替える。
+        // 24.5MP の RGBA は 98MB あり、複製する理由が無い
+        let (with_reflection, bounds) = reflect::synth(std::mem::take(image), spec);
+        *image = with_reflection;
+        reflect_report(spec, &bounds)
+    });
+
+    let shadow = measured.map(|(spec, (alpha, bounds))| {
+        shadow::compose(image, &alpha, spec.color);
+        shadow_report(spec, &bounds)
+    });
+
+    (shadow, reflect)
+}
+
 /// キャンバス配置の成果。
 struct Placement {
     image: image::RgbaImage,
     report: CanvasReport,
     shadow: Option<ShadowReport>,
+    reflect: Option<ReflectReport>,
 }
 
 /// `--rotate` の指定を実際に回す角度へ畳む。`auto` のときだけ主体を見る。
@@ -1276,7 +1382,7 @@ fn place_on_canvas(
     width: u32,
     height: u32,
     args: &CutoutArgs,
-    shadow_spec: Option<&ShadowSpec>,
+    layers: Layers<'_>,
     warnings: &mut Vec<Warning>,
 ) -> Result<Placement> {
     let (x1, y1, x2, y2) = bounds.ok_or_else(|| {
@@ -1289,10 +1395,11 @@ fn place_on_canvas(
 
     let trimmed = image::imageops::crop_imm(image, x1, y1, x2 - x1 + 1, y2 - y1 + 1).to_image();
 
-    // **影があるときだけ塗る順序を組み替える。** 下地 → 影 → 商品でなければ
-    // 影が下地に隠れる。組み替えを `--shadow off` にも通すと、半透明の縁で
-    // 1 ずつ丸めが変わる（下地の上へ合成するか、後から下地へ落とすかの違い）
-    let flatten_here = args.out.flatten && shadow_spec.is_none();
+    // **影か反射があるときだけ塗る順序を組み替える。** 下地 → 影 → 反射 →
+    // 商品でなければ、下に敷いた層が下地に隠れる。組み替えを両方 off の実行にも
+    // 通すと、半透明の縁で 1 ずつ丸めが変わる（下地の上へ合成するか、後から
+    // 下地へ落とすかの違い）
+    let flatten_here = args.out.flatten && !layers.any();
     // **セット統一はここで 1 つの数に畳む。** `canvas.rs` には 1 行も触れない
     // ——狙った倍率は渡す `fill_ratio` のほうを組み替えれば出る
     // （`SetPlacement::fill_ratio` の doc に式がある）。`set` を渡さない実行では
@@ -1327,22 +1434,16 @@ fn place_on_canvas(
         }
     }
 
-    // 引数名を `spec` にすると上の `CanvasSpec` を隠す。どちらの仕様を
-    // 読んでいるのかが目で追えなくなる
-    let shadow = shadow_spec.map(|shadow| {
-        let (with_shadow, bounds) = shadow::synth(std::mem::take(&mut placed), shadow);
-        placed = with_shadow;
-        if args.out.flatten {
-            // 透明のまま置いた影と商品を、改めて下地の上へ載せる。
-            // 書き出し側の --flatten に任せると、影のアルファが 0 の画素まで
-            // 別の丸めを通り、影なしの出力とビット一致しなくなる
-            let [r, g, b] = args.out.background;
-            let mut base = image::RgbaImage::from_pixel(width, height, image::Rgba([r, g, b, 255]));
-            composite(&mut base, &placed, (0, 0));
-            placed = base;
-        }
-        shadow_report(shadow, &bounds)
-    });
+    let (shadow, reflect) = compose_layers(&mut placed, layers);
+    if layers.any() && args.out.flatten {
+        // 透明のまま置いた影・反射・商品を、改めて下地の上へ載せる。
+        // 書き出し側の --flatten に任せると、影や反射のアルファが 0 の画素まで
+        // 別の丸めを通り、合成なしの出力とビット一致しなくなる
+        let [r, g, b] = args.out.background;
+        let mut base = image::RgbaImage::from_pixel(width, height, image::Rgba([r, g, b, 255]));
+        composite(&mut base, &placed, (0, 0));
+        placed = base;
+    }
 
     if plan.scale > 1.0 {
         warnings.push(
@@ -1372,6 +1473,7 @@ fn place_on_canvas(
             scale: round4(plan.scale),
         },
         shadow,
+        reflect,
     })
 }
 

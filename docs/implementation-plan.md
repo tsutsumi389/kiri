@@ -80,7 +80,7 @@ src/
 | 22 | モール規格をプリセットとして持ち、既存画像を検査する（**済**。§5 の Phase 22） | `--profile` / `kiri lint` / `schema.profiles[]` | 2日 |
 | 23 | 主体の傾きを畳み、セット内で大きさと余白を揃える（**済**。§5 の Phase 23） | `--rotate auto` / batch の `set` | 1.5日 |
 | 24 | 背景が中性だという前提と照明場から白点と露出を直す（**済**。§5 の Phase 24） | `--white-balance` / `--exposure` | 2日 |
-| 25 | 反射を合成する | `--reflect` | 1日 |
+| 25 | 反射を合成する（**済**。§5 の Phase 25） | `--reflect` | 1日 |
 
 **Phase 17 以降は EC 特化のロードマップ**で、狙いと順序の根拠は
 [7. EC 特化のロードマップ](#7-ec-特化のロードマップphase-1725)に置く。
@@ -1824,6 +1824,84 @@ public リポジトリなので GitHub 製の標準ランナーは分数無制�
         `--white-balance auto` で到達する）。上限で clamp して `[4.0, 4.0, 4.0]` と
         書く案は**採らなかった**——試したのは無限のほうなので嘘になる。有限でない
         ゲインは載せず、`reason` と `white_point`（`[0, 0, 0]`）で語る
+- [x] Phase 25: `--reflect off|on` ＋ `--reflect-height` / `--reflect-opacity` /
+      `--reflect-gap`（既定 off。`SCHEMA_VERSION` は 2 のまま据え置き）
+  - [x] **切り抜いた商品の鏡像を下に敷く段である。** 商品のアルファの下端を基準線に
+        して、そこから上の画素を上下反転で写し、商品に接する側の `--reflect-opacity`
+        から足元の 0 へ線形に薄めて敷く。設計は docs/design.md 4.16
+  - [x] **影とは写すものが違う。** 影は最終アルファを `--shadow-color` で塗るが、
+        反射は**画素（RGB も）をそのまま写す**——台に映るのは商品の色である。
+        アルファだけを敷いて単色で塗る案は却下した（それは影の別名でしかなく、
+        `--reflect-color` を持たない計画の意図に反する）。ぼかしと遠近変形も
+        入れていない（計画のフラグに無く、箱型 3 回をもう 1 箇所で持つことになる）
+  - [x] **既定 off の実行では画素が 1 バイトも動かない。** 増えるのは
+        `settings.reflect` の 1 行だけで、`reflect` ブロックは `on` の実行にしか
+        現れない（`--shadow` / `--rotate` / `--segment` と同じ二段構え）
+  - [x] **合成順のために `shadow::synth` を `alpha` + `compose` に割った。**
+        `over` は結合的でも層の順は呼ぶ順で決まるので、影を敷き終えた画像へ反射を
+        足すと反射が影の下に入る。しかも `synth` の後の画像はアルファが混ざって
+        いるので、そこから鏡像を取ると**影を写した反射**になる（影は商品の下へ
+        ずれているぶん、反射の中で二重に伸びる）。いまは (1) 商品だけから影の
+        アルファを測り、(2) 商品だけから反射を作って敷き、(3) 影をその下へ落とす。
+        **振る舞いは変えていない**——既存の影のテスト（`tests/cli.rs` の落ち影の節 15 本と
+        `shadow.rs` の単体 20 本）は 1 行も直していない
+  - [x] **決定性は影と同じ形で立てた。** 減衰の割り算は行ごとに 1 度だけで、画素
+        あたりは乗算 1 回と丸め 1 回で閉じる。実数の総和を作らないので足す順序に
+        依存する余地が無い
+  - [x] **商品の層は 1 画素も変えない。** 合成の算術は `transform/canvas.rs` の
+        `over` を共有する（3 種類目の合成を作らない）。その場で書いても材料が
+        壊れないのは、読むのは基準線より上の行だけ、書くのは下の行だけで 2 つが
+        交わらないからである（24.5MP で 98MB の複製を避ける）
+  - [x] `bounds` と `clipped` は 1 つの `Option` に畳まない。`--reflect-opacity 0` と
+        `--reflect-height 0` は敷かない指定なので `clipped` は必ず偽（`--shadow` の
+        同じ規約）。上限は px@1000 で 1000（`REFLECT_HEIGHT_MAX` / `REFLECT_GAP_MAX`）
+  - [x] batch spec は `reflect` / `reflect_height` / `reflect_opacity` /
+        `reflect_gap` を `batch.rs` の 3 箇所（`ItemSettings` / `pick!` /
+        `SETTING_KEYS`）へ足し、**spec は clap を通らないので同じ関門を
+        `commands/batch.rs` でも掛ける**（`value_enum` / `capped_f64` / `ratio`）
+  - [x] **新しい warning code も error code も足していない。** はみ出しは
+        `clipped` が言う。`unit` の語彙も 1 つも増えていない（`px` / `ratio` /
+        `bool` / `enum` で足りる）
+  - ※ **計画の「`transform/shadow.rs` の構造をほぼそのまま流用できる」は半分
+        外れていた。** 流用できたのは `ShadowSpec` / `ShadowBounds` の形、`clipped` の
+        規約、px@1000 の掛け戻しの置き場所で、**算術は 1 行も共有できない**。結果
+        として `reflect.rs` の算術は 181 行で `shadow.rs` の 397 行の半分以下になり、
+        費用も 1 桁安い
+        （24.5MP で高さ 857px が 9.4ms、2856px でも 14.7ms。同じ機械で影のぼかしは
+        σ 57px で 148ms）。**rayon は要らない**
+  - ※ **「衝突リスク小」が外れたのは 1 箇所だけで、それが上の `synth` の分割である。**
+        指示書の段取り（分割を先に入れて既存の影のテストが 1 本も落ちないことを
+        確かめてから反射を書く）がそのまま効いた
+  - ※ **計画 §7.4 の表にあった Phase 25 の warning code は足さなかった**（表から
+        行を消し、`tests/cli.rs` の「予定の code」の表も空にした）。はみ出したことは
+        `reflect.clipped` が真偽で言うので足りる——`--shadow` は同じ事実を
+        `shadow.clipped` だけで語っており、反射にだけ警告を重ねると**同じ事実が
+        2 通りの形で配られる**。加えて既定 off の段なので、警告の出る条件が増える
+        こと自体が受け手にとっては新しい契約になる。**一度配った契約は引っ込め
+        られない**ので、要るとわかってから足す
+  - ※ **`clipped` は左右の縁で偽陽性になる。** `touches_border` に左右の 1 列が
+        入っているので、商品が画像の左右の縁に触れていれば 1 画素も切られていなくても
+        真になる。**振る舞いは `--shadow` の `offset (0, 0)` と同じなので変えず**、
+        README / `kiri schema` / design.md の 3 箇所でそう言い切る側へ倒した
+        （縦に収まっているかは `reflect.bounds` の y2 で読める）。単体の
+        `a_product_touching_the_side_edges_is_reported_as_clipped` が規約として固定する
+  - ※ **`settings` にキーを足すか、ブロックに持たせるかの規則を design.md 4.16 に
+        書き出した。** 4.15 の表が「`settings` に足さない＝既定の実行の JSON が変わる
+        から」と書いていたので、`settings.reflect` を常に出すことと**字面が矛盾して
+        いた**。整理は「キーの追加は `SCHEMA_VERSION` を上げない（`report.rs` の doc）
+        ／単一のノブは `settings`、段ごとに落ちうる複数段（`color`）だけがブロックに
+        要求値を持つ」で、4.15 の表の行も同じ根拠へ直した
+  - ※ **`reflect.height` を「実際に効いた px」と名乗っていたのは嘘だった**
+        （レビューで発覚）。あれは px@1000 の指定を実寸へ掛け戻した数で、敷いた行数
+        （`min(height, baseline + 1)`、足元は丸めで 0）ではない。`report.rs` /
+        `kiri schema` の summary と notes / README / design.md の 4 箇所を
+        「要求した高さの掛け戻し。占めた範囲は `reflect.bounds` で読む」へ揃えた
+  - ※ **既定の高さ 150 は「写せる行が足りない」ことが常態である。** px@1000 の 150 は
+        長辺 2000px のキャンバスで 300 行になるが、横長の商品（実写のリモコンは
+        `content` が 1700x523）なら足りる一方、`--fill-ratio` を下げれば足りなくなる。
+        足りない行を作れば反射ではなく捏造なので、**空のまま**にして
+        `reflect.bounds` の高さで語る。実写の実行では 300 行を頼んで 298 行残った
+        （足元の 2 行は減衰が 8bit の丸めで 0 になった）
 
 ## 6. 残件の優先順位
 
@@ -2133,6 +2211,8 @@ decode コストで、1000 点級でも「2 回デコードする」が素直。
 
 #### Phase 25: `--reflect`
 
+**済（§5 の Phase 25）。**
+
 **なぜここか。** 依存が無く、`transform/shadow.rs` の構造（アルファを複製 → 変形 →
 ぼかし → 色を塗る → 下に敷く）をほぼそのまま流用できる、最も安全で価値の小さい
 項目。**どこかで詰まったときに前へ繰り上げてよい唯一のフェーズ**でもある。
@@ -2140,6 +2220,18 @@ decode コストで、1000 点級でも「2 回デコードする」が素直。
 `--reflect on` / `--reflect-height`（px@1000）/ `--reflect-opacity` /
 `--reflect-gap`。合成順は「下地 → 影 → 反射 → 商品」。`reflect.bounds` /
 `reflect.clipped` を `ShadowReport` と同型で出す。規模 M、衝突リスク小。
+
+- ※ **「`transform/shadow.rs` の構造をほぼそのまま流用できる」は半分外れていた。**
+  流用できたのは `ShadowSpec` / `ShadowBounds` の形と `clipped` の規約、そして
+  px@1000 の掛け戻しの置き場所で、**算術は共有できない**——影はアルファだけを使って
+  色を塗るが、反射は画素（RGB も）を写す段で、ぼかしも変形も要らない。結果として
+  `transform/reflect.rs` の算術は 181 行で `shadow.rs` の 397 行の半分以下になり、
+  費用も 1 桁安い（24.5MP で 9.4ms 対 148ms）
+- ※ **「衝突リスク小」は 1 箇所だけ外れた。** `shadow::synth` が「アルファを作る」と
+  「下へ敷く」を 1 関数で閉じていたので、そのまま反射を後から敷くと (1) 反射が影の
+  下に入り、(2) `synth` の後の混ざったアルファから鏡像を取って**影を写した反射**に
+  なる、の 2 つが同時に起きた。`alpha` + `compose` へ割って解いた（**振る舞いは
+  変えていない**——既存の影のテストは 1 本も修正していない）。設計は design.md 4.16
 
 ### 7.3 依存関係
 
@@ -2180,7 +2272,12 @@ Phase 25 --reflect（依存なし。いつでも繰り上げ可）
 | 23 | `SET_NOT_MEASURED` | `set` の代表寸法を 1 点も測れず、揃えなかった（各項目は自分で解決した `fill_ratio` のまま） |
 | 24 | `WHITE_BALANCE_SKIPPED` | 白点を当てなかった。`data.reason` は `not_neutral` / `not_light` を除く 4 値（`not_neutral` / `no_material` / `gain_out_of_range` / `would_clip`） |
 | 24 | `EXPOSURE_SKIPPED` | 露出を正さなかった（**計画の表に無い追加**）。`data.reason` は `not_light` / `no_material` / `gain_out_of_range` / `would_clip` |
-| 25 | `REFLECT_CLIPPED` | 反射が画像の外へ出た |
+
+**Phase 25 は warning code を 1 つも足さなかった**（済。表から行を 1 つ消した）。
+反射がはみ出したことは `reflect.clipped` が真偽で言う——`--shadow` が同じ事実を
+`shadow.clipped` だけで語っているのに、反射だけ警告を重ねると**同じ事実が 2 通りの
+形で配られる**。既定 off の段で警告の出る条件が増えることの方が、受け手にとっては
+新しい契約である。
 
 新しいエラー code:
 
@@ -2441,7 +2538,76 @@ batch spec には `profile` / `max_bytes` / `derive` / `naming` / `fail_on` /
     所要時間）。どちらも `--ignored` で、実写は `KIRI_BENCH_DIR` から読む。
     **表は `cutout` と同じ読み込み経路（ICC → sRGB）を通す**——`image::open` で
     素通しすると白点が実行と食い違う（remote.jpg で C\* が 4.2 と 4.8 に分かれた）
-- **Phase 25** — `--shadow` と同型（`bounds` / `clipped` / 決定性 / `off` で無変化）
+- **Phase 25**（済。結果は §5 の Phase 25 に、テスト名はここに並べた）。`--shadow` と
+  同型（`bounds` / `clipped` / 決定性 / `off` で無変化）。
+  単体（`src/transform/reflect.rs`）:
+  `the_reflection_mirrors_the_product_row_by_row`（どの行がどこへ落ちたか。
+  **減衰で動かない量——インクの出る x の集合と RGB——で見る**ので、指示書の
+  `an_unfaded_reflection_...` から名を替えた。減衰は常に掛かるので「unfaded」は
+  嘘になる）/ `the_reflection_starts_one_gap_below_the_product`（隙間の行に 1 画素も
+  漏らさないことまで）/ `the_reflection_fades_monotonically_to_its_foot` /
+  `the_reflection_takes_the_product_colours` /
+  `opaque_product_pixels_and_reflection_free_pixels_are_untouched` /
+  `a_zero_opacity_leaves_the_image_untouched` /
+  `a_zero_opacity_is_never_reported_as_clipped` /
+  `a_zero_height_leaves_the_image_untouched` /
+  `a_reflection_running_off_the_image_is_clipped_and_reported` /
+  `a_reflection_pushed_entirely_off_the_image_still_reports_the_clipping` /
+  `an_empty_product_lays_no_reflection` /
+  `an_absurd_height_neither_panics_nor_overflows`（`u32::MAX` の高さ・隙間。走る行数を
+  `baseline + 1` で抑えていることの検査でもある）/ `a_zero_sized_image_is_left_alone` /
+  `a_product_touching_the_side_edges_is_reported_as_clipped`（**左右の縁の偽陽性は規約で
+  あって不具合ではない**ことを固定する。1px 内側へ寄せれば偽になる側も見る）/
+  `ink_above_a_transparent_band_still_counts_as_dropped`（外へ落ちた行で loop を
+  抜けてはいけない理由）/ `the_same_input_produces_the_same_bytes`。
+  影側に 1 本足した: `transform::shadow` の
+  `splitting_synth_into_alpha_and_compose_changes_nothing`（`synth` と
+  `alpha` + `compose` が**半透明の縁つきの素材で**バイト一致。**これが分割の担保で
+  ある**——`--reflect off` との比較は同義反復なので裏にならない）。
+  費用の入口は `print_the_reflection_cost_on_a_large_product`（`--ignored`）。
+  CLI / 契約（`tests/cli.rs`）:
+  `a_run_without_a_reflection_reports_no_reflect_block` /
+  `an_explicit_reflect_off_writes_the_same_bytes_as_no_reflect_at_all`（成果物と結果 JSON の
+  両方。**`outputs` は落とさず `path` だけ畳んで比べる**ので `bytes` / `width` /
+  `height` / `quality_used` も比較対象に入る。ただし clap の既定値で `--reflect` 無しと
+  `off` は同一の引数値になるので、**「Phase 25 の前と変わらない」の裏はここでは取れない**
+  ——そちらは main から建てたバイナリとの md5 突き合わせで取る。Phase 24 と同じ作法で、
+  テストに golden digest は埋めていない）/
+  `the_reflection_is_reported_with_its_bounds`（1 行目が商品の下端の真下に来ることと、
+  px@1000 の基準がキャンバスの長辺であること）/
+  `the_reflection_reports_the_clipping_when_it_runs_off_the_canvas`（切れた / 全部
+  はみ出した / 敷かなかった の 3 通り）/ `the_same_reflection_is_deterministic` /
+  `the_reflection_sits_above_the_shadow`（**層の順を画素で固定する**。影を不透明な緑で
+  真下へ出し、商品の真下が鏡像になっていることを見る）/
+  `the_reflection_is_made_of_the_product_alone`（**指示書に無かった 1 本**。影を商品より
+  上へ出し、鏡像が商品の上端を越える行を写しても影が降りてこないことを見る——
+  `shadow::alpha` と `compose` を割った理由そのものの検査）/
+  `an_explicit_reflect_off_does_not_disturb_a_shadow_only_run`（影だけの 3 通りの実行
+  ——`--canvas` あり / なし、`--flatten` あり / なし——が `--reflect off` とバイト一致。
+  **`place_on_canvas` から `compose_layers` へ差し替えた側**を通す経路の検査でもある）/
+  `a_flattened_canvas_burns_the_reflection_between_the_background_and_the_product`
+  （**今回いちばん壊れやすい 2 行**——`flatten_here` の条件と下地の載せ直しの条件を
+  `layers.any()` へ広げた箇所——を画素で固定する。全画素が不透明であること＋商品の
+  真下が白でなく鏡像であること＋足元が下地へ溶けること）/ パーサ
+  `an_unknown_reflect_value_is_refused_by_the_parser` /
+  `an_out_of_range_reflect_opacity_is_refused` / `too_large_a_reflect_height_is_refused`
+  （上限ちょうどが通ることまで）/ `too_large_a_reflect_gap_is_refused` / spec
+  `the_batch_spec_reads_reflect` / `the_batch_defaults_carry_the_reflect` /
+  `an_unknown_reflect_in_the_spec_is_refused` /
+  `an_out_of_range_reflect_height_is_refused_in_a_spec_too` /
+  `a_misspelled_reflect_height_key_suggests_the_right_one` /
+  `the_spec_defaults_for_the_reflection_match_the_cli`（**指示書に無かったもう 1 本**。
+  同じ既定値が clap と `commands/batch.rs` の 2 箇所に書かれていて、`reflect` は
+  `CutoutOptions` を通らないので既存の既定値の突き合わせでは押さえられない）。
+  schema: `schema_publishes_the_four_knobs_of_the_reflection`（影の 5 ノブの 1 本を写した。
+  `accepts` が `["off","on"]`、3 つの既定値、summary が「鏡像」と px@1000 を名乗ること、
+  long help が合成順を言うこと）。
+  既存の契約テストは `every_published_field_exists_in_the_result`
+  （`--reflect on` の `--dry-run` の実行を 1 本足した）/
+  `every_published_unit_is_in_the_known_vocabulary`（**語彙は 1 つも足していない**
+  ——`px` / `ratio` / `bool` / `enum` で足りる）/
+  `the_readme_warning_table_lists_every_warning_in_the_contract`（**新しい code は
+  無い**ので README の警告表は触っていない）が追随している
 
 ### 7.6 却下した代替案
 

@@ -16,7 +16,7 @@ AIエージェントから使われることを前提とした、EC商品画像�
 - **どこが商品かを面で教えられる** — `--trimap` / `--alpha-trimap` / `--fg-mask` / `--bg-mask` / `--fg-polygon` / `--bg-polygon`。**数値ノブにはもう余地が無い**——粗いトライマップを 1 枚渡すだけで輪郭の誤差が 5 分の 1 になる
 - **色で解けないものはモデルに聞ける** — 任意の `--segment` でセグメンテーションモデルを**粗マスクの供給源**として使う。既定では走らず、モデルは別ファイル。[意味の事前知識](#意味の事前知識モデルに何を聞くか)を参照
 - **設定の探索を kiri に任せられる** — `--optimize` は `info` → `cutout` → 調整という 3 手のループを 1 コマンドへ畳む。[探索を kiri に任せる](#探索を-kiri-に任せるoptimize)を参照
-- **仕上げまで 1 本で** — キャンバス配置、[落ち影の合成](#落ち影を合成する)（`--shadow synth`）、回転、Web配信形式への変換
+- **仕上げまで 1 本で** — キャンバス配置、[落ち影の合成](#落ち影を合成する)（`--shadow synth`）、[反射の合成](#反射を合成する)（`--reflect on`）、回転、Web配信形式への変換
 - **結果を自分で採点する** — `mask` が返す 7 項目（前景比率・ハロー・境界の色差・遷移幅・輪郭の粗さ・縁の汚染・外周接触）と、機械可読な 34 の警告
 - **AIエージェント向けの構造化I/O** — `--json` で結果を返し、stdout はJSONのみ、ログは stderr に分離
 - **契約を自分で配る** — `kiri schema` がオプションと警告・エラー code の一覧を返す。README を読ませなくてよい
@@ -994,6 +994,10 @@ product.png  1600x2000  png  841.4 KB  (338 ms)
 | `--shadow-blur` | 10 | 影のぼかしの σ(px)。**長辺 1000px 換算**。0 でぼかさない、上限 1000 |
 | `--shadow-color` | #000000 | 影の色 |
 | `--shadow-opacity` | 0.25 | 影の不透明度 (0.0-1.0) |
+| `--reflect` | off | 切り抜いた商品の鏡像を下に敷く。`off` / `on`（[反射を合成する](#反射を合成する)） |
+| `--reflect-height` | 150 | 反射の高さ(px)。**長辺 1000px 換算**（基準は最終画像の長辺）。上限 1000 |
+| `--reflect-opacity` | 0.25 | 反射の不透明度 (0.0-1.0)。商品に接する側の濃さで、足元へ 0 まで薄まる |
+| `--reflect-gap` | 0 | 商品と反射のあいだに空ける隙間(px)。**長辺 1000px 換算**。上限 1000 |
 | `--seal` | 1 | 幅 2N px 以下の隙間を通ってしか外周につながらない背景を前景へ戻す。0 で無効、上限 8 |
 | `--cleanup` | 2 | 孤立ノイズ除去の半径(px)。**長辺 1000px 換算**で指定し、面積 (2n+1)² × (長辺/1000)² 未満の連結成分を消す。0 で無効、上限 64 |
 | `--feather` | 1 | 境界の階調を色から決められなかった箇所で使うフェザリング半径(px) |
@@ -2131,7 +2135,7 @@ $ kiri cutout product.jpg -o product.png --rotate 90
 $ kiri cutout product.jpg -o product.png --rotate -3.5 --canvas 1000
 ```
 
-**順序は「切り抜き → 回転 → `--canvas` → `--shadow`」で固定である。** `kiri rotate`
+**順序は「切り抜き → 回転 → `--canvas` → `--shadow` / `--reflect`」で固定である。** `kiri rotate`
 で先に回してから `cutout` へ流すと、回転が四隅に作った透過の余白が画像の外周に
 乗り、背景推定がそれを背景色の標本として数える（[切り抜きと併せるときは、切り抜いてから回す](#切り抜きと併せるときは切り抜いてから回す)）。
 1 本に畳めば、**順序を知らなくても間違えようがない。**
@@ -2328,6 +2332,111 @@ JPEG 出力では下地の上に焼き込まれる。
 `batch` の spec では `shadow` / `shadow_offset`（`[dx, dy]`）/ `shadow_blur` /
 `shadow_color` / `shadow_opacity` が同じ意味で使える。
 
+#### 反射を合成する
+
+`--reflect on`。艶のある台に置いた見た目を作る段で、動機は落ち影とまったく同じ
+——**撮影で作ると台の反射率と光源の向きで濃さがばらつく。** 合成なら指定どおりに
+揃い、`batch` の spec に 1 行書けば数百点に同じ反射が付く。
+
+```
+$ kiri cutout product.jpg -o product.png --canvas 1000 --reflect on
+$ kiri cutout product.jpg -o product.png --canvas 1000 --reflect on --reflect-gap 8
+```
+
+**`--shadow` とは写すものが違う。** 影は最終アルファを `--shadow-color` で塗るが、
+反射は**商品の画素（RGB も）をそのまま写す**。台に映るのは商品の色なので、色を
+指定するノブは無い。ぼかしや台の傾きも入れない。
+
+##### 反射の姿を決める 3 つのノブ（と、それを使うかどうかの 1 つ）
+
+| オプション | 既定 | 意味 |
+|---|---|---|
+| `--reflect` | `off` | `on` で敷く。`off` なら成果物は 1 バイトも変わらない |
+| `--reflect-height` | `150` | 反射の高さ(px、長辺 1000px 換算)。上限 1000 |
+| `--reflect-opacity` | `0.25` | 商品に接する側の不透明度 (0.0-1.0)。足元へ 0 まで薄まる |
+| `--reflect-gap` | `0` | 商品と反射のあいだに空ける隙間(px、長辺 1000px 換算)。上限 1000 |
+
+`--reflect-height` と `--reflect-gap` は**長辺 1000px 換算**で指定する。基準は
+`--shadow-offset` と同じ**最終画像の長辺**で、`--canvas` があればキャンバスの長辺、
+無ければ `--rotate` まで済ませた画像の長辺になる。**実際に効いた px は結果に出る**
+ので、換算を自分で追う必要はない。
+
+濃さは一様ではない。商品に接する行が `--reflect-opacity` で、足元へ向かって 0 まで
+線形に薄まる（j 行目の係数は `(height - j) / height`）。
+
+**写せる行は商品のアルファの下端より上にある分しかない。** 商品より高い反射を頼んでも
+足りない行は空のままで、これは制限ではなく反射の定義そのものである。実際に占めた
+範囲は `reflect.bounds` が言う。
+
+##### 重なる順序
+
+下地 → 影 → **反射** → 商品。商品に接して見えるのは反射なので、`--shadow` と併せると
+反射が影の上に載る。**反射の材料は商品だけ**で、影を写した反射にはならない（影は台の
+上にあり、台には映らない）。
+
+`--canvas` の配置（`fill_ratio` / `content` / `offset` / `scale`）は**反射の有無で
+変わらない**——反射のぶん商品を小さくはしない。反射がキャンバスからはみ出すなら切り、
+切ったことを `reflect.clipped` が言う。
+
+透過を保てる形式（PNG / AVIF）では反射も半透明のアルファとして残る。`--flatten` や
+JPEG 出力では下地の上に焼き込まれる。
+
+**商品の層は 1 画素も変わらない。** 反射のアルファが 0 の画素と、商品のアルファが 255 の
+画素は、`--reflect off` の出力とビット一致する。`mask` ブロックの統計と診断値も反射を
+敷く**前**の商品だけで測る。
+
+##### 結果
+
+```json
+{
+  "settings": { "reflect": "on" },
+  "reflect": {
+    "height": 300,
+    "gap": 0,
+    "opacity": 0.25,
+    "bounds": [150, 1261, 1849, 1558],
+    "clipped": false
+  }
+}
+```
+
+`reflect` ブロックは **`on` のときだけ**現れる（`shadow` と同じ規約）。頼んだかどうかは
+`settings.reflect` が常に言う。
+
+`height` と `gap` は**要求した値を実寸へ掛け戻した px** である。上の例は 24.5MP の素材を
+`--canvas 2000` に載せた実行で、px@1000 の既定値 150 が 300 へ換算されている。商品は
+`offset` `[150, 738]` に `content` `[1700, 523]` で置かれているので下端は 1260 行目で、
+反射はその真下の 1261 行目から始まっている。
+
+**`height` は「敷いた行数」ではない。** 上の例の `bounds` の高さは 298 行で、頼んだ 300 に
+2 行足りない——足元の 2 行は減衰が 8bit の丸めで 0 になったためである。食い違う理由は
+3 つあり、どれも正常である: 写せる行が足りなかった（商品より高い反射を頼んだ）／足元が
+丸めで消えた／画像の外へ出て切られた（このときは `clipped` も真）。**実際に占めた範囲は
+必ず `bounds` で読むこと。**
+
+`bounds` は反射が占めた矩形、`clipped` は**反射の一部が画像の外にある**ことを表す。
+
+**左右の縁では、切られていなくても真になる。** 判定は「インクの出る行が画像の外へ落ちた」
+か「外周にインクが残っている」で、後者には左右の 1 列も入る。反射は横へ広がらないので、
+左右にインクが残るのは**商品が画像の左右の縁に触れている**という意味であって、反射が
+1 画素も切られていなくても真になる（`--shadow-offset 0,0` の `shadow.clipped` が
+まったく同じ振る舞いをする）。縦に収まっているかを知りたければ `bounds` の 4 つ目
+（y2）を画像の高さと突き合わせればよい——上の例は `1558` で、キャンバスの高さ 2000 に
+届いていないので縦には収まっている。
+
+**`bounds` が `null` でも `clipped` は真になりうる。** 隙間が画像より大きければ反射は
+1 画素も残らないが、それは「敷かなかった」のではなく「全部はみ出した」である。
+`--reflect-opacity 0` と `--reflect-height 0`（どちらも敷かない指定）なら必ず偽になるので、
+2 つは `clipped` で見分けられる。
+
+費用は影より 1 桁安い。24.5MP で合成そのものが高さ 857px（px@1000 の 150）で 9.4ms、
+2856px でも 14.7ms である（同じ機械で `--shadow` のぼかしは σ 57px で 148ms。
+design.md 4.16）。切り抜き全体は 5.0 秒なので、`--reflect off` との差は実行ごとの
+ばらつきに埋もれる。
+
+`batch` の spec では `reflect` / `reflect_height` / `reflect_opacity` / `reflect_gap` が
+同じ意味で使える。
+
 #### 結果の検証
 
 `--json` が返す `mask` を見れば、画像を開かずに失敗を検出できる。
@@ -2356,7 +2465,8 @@ JPEG 出力では下地の上に焼き込まれる。
     "cleanup": 2, "feather": 1, "despill": true, "refine": true,
     "matting": "guided", "smooth_contour": 2.0, "reclassify": true,
     "background_model": "flat",
-    "band_min_radius": 2, "smooth_radius_px": 2, "shadow": "off"
+    "band_min_radius": 2, "smooth_radius_px": 2,
+    "shadow": "off", "reflect": "off"
   },
   "color": {
     "white_balance": "auto", "exposure": "off",
@@ -3012,7 +3122,8 @@ x broken.jpg  失敗
 `reclassify` / `background_model` / `segment` / `model_path` / `optimize` /
 `color_convert` / `edge_threshold` /
 `step_tolerance` / `shadow_tolerance` / `shadow` / `shadow_offset` / `shadow_blur` /
-`shadow_color` / `shadow_opacity` / `seal` / `rotate` / `canvas` / `fill_ratio` /
+`shadow_color` / `shadow_opacity` / `reflect` / `reflect_height` / `reflect_opacity` /
+`reflect_gap` / `seal` / `rotate` / `canvas` / `fill_ratio` /
 `format` / `quality` / `effort` / `max_bytes` / `background` / `flatten` /
 `derive` / `sizes` / `formats` / `naming`）。
 

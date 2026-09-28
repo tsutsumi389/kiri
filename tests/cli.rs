@@ -6338,6 +6338,932 @@ fn a_default_shadow_that_fits_the_canvas_is_not_reported_as_clipped() {
     );
 }
 
+// --- 反射の合成 (Phase 25) ---
+
+/// 反射を頼まない実行では、結果に `reflect` ブロックが現れない。
+///
+/// `null` も出さない（`shadow` / `constraints` と同じ規約）。走らなかった
+/// 処理の痕跡が残ると、エージェントは「敷いたが反射が出なかった」と読む。
+#[test]
+fn a_run_without_a_reflection_reports_no_reflect_block() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 160,
+        height: 160,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let v = cutout_on_canvas(dir.path(), &input, "out.png", &[]);
+    assert!(
+        v.get("reflect").is_none(),
+        "反射を頼んでいないのに reflect が出た"
+    );
+    assert_eq!(
+        v["settings"]["reflect"], "off",
+        "settings.reflect は常に出すべき"
+    );
+}
+
+/// `--reflect off` は、`--reflect` を渡さない実行と 1 バイトも変わらない。
+///
+/// # これは「Phase 25 の前と変わらない」の裏ではない
+///
+/// `--reflect` 無しと `--reflect off` は clap の `default_value_t` で**同一の
+/// 引数値**になるので、ここが見ているのは「既定値が `off` であること」と
+/// 「`off` の経路が合成を 1 つも走らせないこと」までである。Phase 25 を
+/// 足す前とのバイト一致は、main から建てたバイナリとの突き合わせで取る
+/// （Phase 24 と同じ作法。golden digest をテストに埋めると、素材や
+/// エンコーダが動いた日に「何が壊れたか」を語らない失敗になる）。
+///
+/// **`outputs` を比較から落とさない。** 落とすと `bytes` / `width` /
+/// `height` / `quality_used` が比較対象から消え、書き出しの側が動いても
+/// 気づけない。パスだけは必ず違うので、そこを畳んで比べる。
+#[test]
+fn an_explicit_reflect_off_writes_the_same_bytes_as_no_reflect_at_all() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let plain = cutout_on_canvas(dir.path(), &input, "plain.png", &["--canvas", "400"]);
+    let off = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "off.png",
+        &["--canvas", "400", "--reflect", "off"],
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("plain.png")).unwrap(),
+        std::fs::read(dir.path().join("off.png")).unwrap(),
+        "--reflect off が成果物を変えている"
+    );
+
+    // パスだけを畳む。`bytes` / `width` / `height` / `quality_used` は残す
+    let strip = |v: &Value| {
+        let mut o = v.as_object().unwrap().clone();
+        o.remove("elapsed_ms");
+        let outputs: Vec<Value> = o["outputs"]
+            .as_array()
+            .expect("outputs が配列ではない")
+            .iter()
+            .map(|entry| {
+                let mut e = entry.as_object().unwrap().clone();
+                e.insert("path".into(), Value::String("<output>".into()));
+                Value::Object(e)
+            })
+            .collect();
+        o.insert("outputs".into(), Value::Array(outputs));
+        Value::Object(o)
+    };
+    assert_eq!(
+        strip(&plain),
+        strip(&off),
+        "--reflect off が結果 JSON を動かしている"
+    );
+    // 畳んだのがパスだけであること（バイト数まで消していないことの検査）
+    assert!(
+        strip(&plain)["outputs"][0]["bytes"].as_u64().unwrap() > 0,
+        "outputs[].bytes が比較対象から消えている"
+    );
+}
+
+/// 効いた値と占めた範囲が報告される。px@1000 の基準は最終画像の長辺である。
+///
+/// **`--reflect-opacity 1` で測る。** 既定の 0.25 では、商品の下端の行の
+/// アルファが小さいと `round(a × 0.25)` が 0 になり、「1 行目が基準線の
+/// 真下から始まる」という主張が**素材の縁の濃さに依存する**。不透明度 1 なら
+/// 1 行目のアルファは源の行そのままで、丸めを生き延びるかどうかの話が消える。
+#[test]
+fn the_reflection_is_reported_with_its_bounds() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 400,
+        height: 400,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let v = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "out.png",
+        &[
+            "--canvas",
+            "1000",
+            "--fill-ratio",
+            "0.6",
+            "--reflect",
+            "on",
+            "--reflect-opacity",
+            "1",
+        ],
+    );
+    assert_eq!(v["settings"]["reflect"], "on");
+
+    let reflect = &v["reflect"];
+    // 長辺 1000px のキャンバスなので、px@1000 の既定値がそのまま実寸になる
+    assert_eq!(reflect["height"], 150, "既定の高さが実寸へ換算されていない");
+    assert_eq!(reflect["gap"], 0);
+    assert_eq!(reflect["opacity"], 1.0);
+
+    let offset = v["canvas"]["offset"].as_array().unwrap();
+    let content = v["canvas"]["content"].as_array().unwrap();
+    let baseline = (offset[1].as_u64().unwrap() + content[1].as_u64().unwrap() - 1) as u32;
+    let bounds = reflect["bounds"].as_array().expect("反射があるはず");
+
+    // 1 行目は商品の下端のすぐ下に来る
+    assert_eq!(
+        bounds[1].as_u64().unwrap(),
+        u64::from(baseline) + 1,
+        "反射が商品の下端の真下から始まっていない: {reflect}"
+    );
+
+    // **収まっている反射は切れたと言わない。** 影側の
+    // `a_default_shadow_that_fits_the_canvas_is_not_reported_as_clipped` と
+    // 同じ 2 段で見る——旗が偽であること、そして矩形が本当に縁から離れて
+    // いること（離れていないなら偽の理由が「縁を見ていない」かもしれない）
+    assert_eq!(
+        reflect["clipped"], false,
+        "余白に収まっている反射が切れたと報告された: {reflect}"
+    );
+    let (x1, y2) = (bounds[0].as_u64().unwrap(), bounds[3].as_u64().unwrap());
+    assert!(
+        x1 > 0 && bounds[2].as_u64().unwrap() < 999 && y2 < 999,
+        "矩形が縁に接していないのに clipped の判定が縁を見ている: {reflect}"
+    );
+    // 150 行を頼んで、収まった範囲もその中にある
+    assert_eq!(
+        y2 - bounds[1].as_u64().unwrap() + 1,
+        150,
+        "収まりきる指定なのに敷いた行数が 150 でない: {reflect}"
+    );
+
+    let out = image::open(dir.path().join("out.png")).unwrap().to_rgba8();
+    let cx = (offset[0].as_u64().unwrap() + content[0].as_u64().unwrap() / 2) as u32;
+    // 1 行目は不透明度 1・減衰の係数 1 なので、商品の下端の写しそのもの
+    assert_eq!(
+        out.get_pixel(cx, baseline + 1).0,
+        out.get_pixel(cx, baseline).0,
+        "1 行目が商品の下端の写しになっていない"
+    );
+    // 足元へ向かって薄まる途中は半透明として残る（透過を保てる形式なので）
+    let middle = out.get_pixel(cx, baseline + 75).0[3];
+    assert!(
+        middle > 0 && middle < 255,
+        "反射の中ほどが半透明のアルファとして残っていない: alpha={middle}"
+    );
+    assert_eq!(out.get_pixel(3, 3).0[3], 0, "遠い角の余白が透明でない");
+
+    // キャンバスの長辺が基準なので、2000 では倍になる。ここは既定の
+    // 不透明度で走らせて、既定値が結果へ出ることも併せて固定する
+    let wide = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "wide.png",
+        &["--canvas", "2000", "--reflect", "on", "--reflect-gap", "20"],
+    );
+    assert_eq!(
+        wide["reflect"]["height"], 300,
+        "元画像 400px ではなくキャンバス 2000px を基準にすべき: {}",
+        wide["reflect"]
+    );
+    assert_eq!(wide["reflect"]["gap"], 40);
+    assert_eq!(
+        wide["reflect"]["opacity"], 0.25,
+        "既定の不透明度が出ていない"
+    );
+}
+
+/// 反射がキャンバスからはみ出しても寸法は変わらず、切れたことが報告される。
+#[test]
+fn the_reflection_reports_the_clipping_when_it_runs_off_the_canvas() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    // 高さいっぱいの反射は下の縁を越える
+    let tall = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "tall.png",
+        &[
+            "--canvas",
+            "500",
+            "--fill-ratio",
+            "0.9",
+            "--reflect",
+            "on",
+            "--reflect-height",
+            "1000",
+        ],
+    );
+    assert_eq!(tall["outputs"][0]["height"], 500, "寸法が変わっている");
+    assert_eq!(tall["reflect"]["clipped"], true);
+    assert_eq!(
+        tall["reflect"]["bounds"][3].as_u64().unwrap(),
+        499,
+        "矩形が画像の中に収まっていない: {}",
+        tall["reflect"]
+    );
+
+    // 隙間だけで画像の外まで押し出すと 1 画素も残らないが、
+    // 「敷かなかった」とは報告しない
+    let pushed = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "pushed.png",
+        &[
+            "--canvas",
+            "500",
+            "--reflect",
+            "on",
+            "--reflect-gap",
+            "1000",
+        ],
+    );
+    assert!(pushed["reflect"]["bounds"].is_null());
+    assert_eq!(
+        pushed["reflect"]["clipped"], true,
+        "全部はみ出したのに clipped が偽: {}",
+        pushed["reflect"]
+    );
+
+    // 不透明度 0 は「敷かない」指定なので、同じ隙間でも切れたとは言わない
+    let empty = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "empty.png",
+        &[
+            "--canvas",
+            "500",
+            "--reflect",
+            "on",
+            "--reflect-gap",
+            "1000",
+            "--reflect-opacity",
+            "0",
+        ],
+    );
+    assert!(empty["reflect"]["bounds"].is_null());
+    assert_eq!(
+        empty["reflect"]["clipped"], false,
+        "反射を敷いていないのに切れたと報告した: {}",
+        empty["reflect"]
+    );
+}
+
+/// 同じ指定からは同じバイト列と同じ `reflect` が出る。
+#[test]
+fn the_same_reflection_is_deterministic() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 300,
+        height: 300,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let mut bytes = Vec::new();
+    let mut blocks = Vec::new();
+    for i in 0..3 {
+        let v = cutout_on_canvas(
+            dir.path(),
+            &input,
+            &format!("out{i}.png"),
+            &[
+                "--canvas",
+                "800",
+                "--reflect",
+                "on",
+                "--reflect-height",
+                "220",
+                "--reflect-gap",
+                "7",
+                "--reflect-opacity",
+                "0.37",
+            ],
+        );
+        blocks.push(v["reflect"].clone());
+        bytes.push(std::fs::read(dir.path().join(format!("out{i}.png"))).unwrap());
+    }
+    assert_eq!(bytes[0], bytes[1], "1 回目と 2 回目で出力が違う");
+    assert_eq!(bytes[0], bytes[2], "1 回目と 3 回目で出力が違う");
+    assert_eq!(blocks[0], blocks[1]);
+    assert_eq!(blocks[0], blocks[2]);
+}
+
+/// 層の順は「下地 → 影 → 反射 → 商品」である。
+///
+/// **影を不透明な緑で真下へ出して測る。** 反射が影の下に入っていれば商品の
+/// 真下は緑になり、上に載っていれば商品の色の写しになる。`over` は結合的でも
+/// 層の順は呼ぶ順で決まるので、`shadow::synth` を先に通していた頃の形では
+/// ここが緑になる。
+#[test]
+fn the_reflection_sits_above_the_shadow() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 300,
+        height: 300,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let shadow_only = [
+        "--canvas",
+        "1000",
+        "--fill-ratio",
+        "0.6",
+        "--shadow",
+        "synth",
+        "--shadow-offset",
+        "0,80",
+        "--shadow-blur",
+        "0",
+        "--shadow-opacity",
+        "1",
+        "--shadow-color",
+        "#00FF00",
+    ];
+    let v = cutout_on_canvas(dir.path(), &input, "shadow.png", &shadow_only);
+    let offset = v["canvas"]["offset"].as_array().unwrap();
+    let content = v["canvas"]["content"].as_array().unwrap();
+    let cx = (offset[0].as_u64().unwrap() + content[0].as_u64().unwrap() / 2) as u32;
+    let baseline = (offset[1].as_u64().unwrap() + content[1].as_u64().unwrap() - 1) as u32;
+
+    let only = image::open(dir.path().join("shadow.png"))
+        .unwrap()
+        .to_rgba8();
+    assert_eq!(
+        only.get_pixel(cx, baseline + 1).0,
+        [0, 255, 0, 255],
+        "影だけの実行で商品の真下が影の色になっていない（前提が崩れている）"
+    );
+
+    let mut both = shadow_only.to_vec();
+    both.extend_from_slice(&["--reflect", "on", "--reflect-opacity", "1"]);
+    cutout_on_canvas(dir.path(), &input, "both.png", &both);
+    let out = image::open(dir.path().join("both.png")).unwrap().to_rgba8();
+
+    // 不透明度 1・1 行目の係数 1 なので、真下の画素は商品の下端の写しそのもの
+    assert_eq!(
+        out.get_pixel(cx, baseline + 1).0,
+        out.get_pixel(cx, baseline).0,
+        "商品の真下が鏡像になっていない（反射が影の下に入っている）"
+    );
+    assert_ne!(
+        out.get_pixel(cx, baseline + 1).0,
+        [0, 255, 0, 255],
+        "商品の真下が影の色のまま（反射が影の下に入っている）"
+    );
+}
+
+/// `--flatten` と併せると、下地 → 反射 → 商品の順に焼き込まれる。
+///
+/// # ここが Phase 25 でいちばん壊れやすい 2 行である
+///
+/// `place_on_canvas` の `flatten_here = args.out.flatten && !layers.any()` と
+/// `if layers.any() && args.out.flatten` の 2 行で、条件を「影が on」から
+/// 「影か反射が on」へ広げた。**片方だけ直すと静かに壊れる**:
+///
+/// - 前者を直し忘れると、キャンバス配置の時点で下地が塗られ、反射がその
+///   下に隠れる（商品の真下が純白のまま）
+/// - 後者を直し忘れると、下地が 1 度も塗られず、透過が残ったまま JPEG へ
+///   落ちる（または書き出し側の `--flatten` が別の丸めで焼く）
+///
+/// **不透明度 1 で測る。** 商品の真下の 1 行目は減衰の係数も 1 なので、
+/// 下端の画素の写しそのものになる——白との区別が丸めに依存しない。
+#[test]
+fn a_flattened_canvas_burns_the_reflection_between_the_background_and_the_product() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 300,
+        height: 300,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let v = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "out.png",
+        &[
+            "--canvas",
+            "1000",
+            "--fill-ratio",
+            "0.6",
+            "--flatten",
+            "--background",
+            "#FFFFFF",
+            "--reflect",
+            "on",
+            "--reflect-opacity",
+            "1",
+        ],
+    );
+    let out = image::open(dir.path().join("out.png")).unwrap().to_rgba8();
+
+    let offset = v["canvas"]["offset"].as_array().unwrap();
+    let content = v["canvas"]["content"].as_array().unwrap();
+    let cx = (offset[0].as_u64().unwrap() + content[0].as_u64().unwrap() / 2) as u32;
+    let baseline = (offset[1].as_u64().unwrap() + content[1].as_u64().unwrap() - 1) as u32;
+
+    // 下地が塗られている（後者の 1 行）。**画像の全画素が不透明**であること
+    for (x, y, p) in out.enumerate_pixels() {
+        assert_eq!(p.0[3], 255, "--flatten なのに透過が残っている ({x},{y})");
+    }
+    assert_eq!(
+        out.get_pixel(3, 3).0,
+        [255, 255, 255, 255],
+        "商品から遠い角が純白でない"
+    );
+
+    // 反射が下地の上に載っている（前者の 1 行）。真下は商品の下端の写しで、
+    // 白でもない
+    let under = out.get_pixel(cx, baseline + 1).0;
+    assert_eq!(
+        under,
+        out.get_pixel(cx, baseline).0,
+        "商品の真下が鏡像になっていない（反射が下地に隠れている）"
+    );
+    assert!(
+        under[0] < 250 || under[1] < 250 || under[2] < 250,
+        "商品の真下が純白のまま（反射が下地に隠れている）: {under:?}"
+    );
+
+    // 足元は白へ溶けていく（焼き込まれているので透過ではなく白へ寄る）
+    let foot = out.get_pixel(cx, baseline + 149).0;
+    assert!(
+        foot[0] > under[0] && foot[1] > under[1] && foot[2] > under[2],
+        "足元が下地へ溶けていない: 真下 {under:?} 足元 {foot:?}"
+    );
+}
+
+/// 反射の材料は商品だけで、影を写した反射にはならない。
+///
+/// **影を商品の上へ出して測る。** 鏡像が写す行が商品の上端を越えると、影を
+/// 敷いた後の画像から材料を取っていれば、その行の影が反射の中へ降りてくる。
+/// `shadow::alpha` と `shadow::compose` を割った理由そのものの検査である。
+#[test]
+fn the_reflection_is_made_of_the_product_alone() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 300,
+        height: 300,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let v = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "out.png",
+        &[
+            "--canvas",
+            "1000",
+            "--fill-ratio",
+            "0.25",
+            "--shadow",
+            "synth",
+            // 影は商品より 80px 上。商品の上端の外に不透明な緑の帯ができる
+            "--shadow-offset",
+            "0,-80",
+            "--shadow-blur",
+            "0",
+            "--shadow-opacity",
+            "1",
+            "--shadow-color",
+            "#00FF00",
+            "--reflect",
+            "on",
+            "--reflect-opacity",
+            "1",
+            // 商品の高さ（約 250px）より高くして、写す行を上端の外まで伸ばす
+            "--reflect-height",
+            "400",
+        ],
+    );
+    let offset = v["canvas"]["offset"].as_array().unwrap();
+    let content = v["canvas"]["content"].as_array().unwrap();
+    let top = offset[1].as_u64().unwrap() as u32;
+    let height = content[1].as_u64().unwrap() as u32;
+    let baseline = top + height - 1;
+
+    let out = image::open(dir.path().join("out.png")).unwrap().to_rgba8();
+    // 写す行が商品の上端を越える j（= height 以上）に対応する置き場所。
+    // 材料が商品だけなら、そこは透明のままである
+    let mut checked = 0;
+    for j in height..height + 80 {
+        let y = baseline + 1 + j;
+        if y >= 1000 {
+            break;
+        }
+        for x in 0..1000 {
+            assert_eq!(
+                out.get_pixel(x, y).0,
+                [0, 0, 0, 0],
+                "商品の外の行が反射へ写っている ({x},{y})——影を写した反射になっている"
+            );
+        }
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "検査すべき行が 1 つも無い（配置の前提が崩れた）"
+    );
+}
+
+/// `--reflect off` は影だけの経路に割り込まない。
+///
+/// # 見ているのは「割り込まない」ことだけである
+///
+/// `--reflect` 無しと `--reflect off` は clap の既定値で同一の引数値に
+/// なるので、**`shadow::synth` を `alpha` + `compose` へ割ったことが影の
+/// 出力を動かしていない**ことの裏はここでは取れない。それは単体の
+/// `transform::shadow::splitting_synth_into_alpha_and_compose_changes_nothing`
+/// が等式そのもので固定する。
+///
+/// ここが足しているのは経路の広さである——`--canvas` あり / なし、
+/// `--flatten` あり / なしの 3 通りで、`place_on_canvas` から
+/// `compose_layers` へ差し替えた側（塗り順の組み替えの条件を
+/// `layers.any()` へ広げた 2 行）が影だけの実行を動かしていないこと。
+#[test]
+fn an_explicit_reflect_off_does_not_disturb_a_shadow_only_run() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 250,
+        height: 250,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    for (i, extra) in [
+        vec!["--canvas", "600", "--shadow", "synth"],
+        vec![
+            "--canvas",
+            "600",
+            "--flatten",
+            "--background",
+            "#FFFFFF",
+            "--shadow",
+            "synth",
+        ],
+        vec!["--shadow", "synth"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut with_off = extra.clone();
+        with_off.extend_from_slice(&["--reflect", "off"]);
+        let (plain, off) = (format!("a{i}.png"), format!("b{i}.png"));
+        let a = cutout_on_canvas(dir.path(), &input, &plain, &extra);
+        let b = cutout_on_canvas(dir.path(), &input, &off, &with_off);
+        assert_eq!(
+            std::fs::read(dir.path().join(&plain)).unwrap(),
+            std::fs::read(dir.path().join(&off)).unwrap(),
+            "{extra:?} で --reflect off が影だけの出力を動かしている"
+        );
+        assert_eq!(a["shadow"], b["shadow"]);
+    }
+}
+
+/// 綴りを外した `--reflect` は code を伴わない exit 2 で断る（clap の関門）。
+#[test]
+fn an_unknown_reflect_value_is_refused_by_the_parser() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    for bad in ["mirror", "synth", "true"] {
+        let out = kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--json",
+                "--force",
+                "--reflect",
+                bad,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "--reflect {bad} が exit 2 で断られていない"
+        );
+    }
+}
+
+/// 範囲外の不透明度は exit 2 で断る。
+#[test]
+fn an_out_of_range_reflect_opacity_is_refused() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    for bad in ["1.5", "-0.2", "nan"] {
+        let out = kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--json",
+                "--force",
+                "--reflect-opacity",
+                bad,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "--reflect-opacity {bad} が exit 2 で断られていない"
+        );
+    }
+}
+
+/// 上限を超えた高さは exit 2 で断り、上限ちょうどは通す。
+#[test]
+fn too_large_a_reflect_height_is_refused() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    for bad in ["1001", "-1", "8e9", "1e30"] {
+        let out = kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--json",
+                "--force",
+                "--reflect-height",
+                bad,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "--reflect-height {bad} が exit 2 で断られていない"
+        );
+    }
+
+    // 上限ちょうどは通る。**落ちないこと**がここの主題だが、旗は真偽で
+    // 出るだけでなく**真**でなければならない——長辺 200px の素材で px@1000 の
+    // 1000 は実寸 200 行で、商品の下端から 200 行ぶんは必ず画像の外へ出る。
+    // `is_boolean()` で済ませると、直前の文が言っていることを検査が
+    // 確かめていない状態になる
+    let limit = kiri::cli::REFLECT_HEIGHT_MAX.to_string();
+    let v = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "limit.png",
+        &["--reflect", "on", "--reflect-height", &limit],
+    );
+    assert_eq!(v["settings"]["reflect"], "on");
+    assert_eq!(
+        v["reflect"]["height"], 200,
+        "上限が実寸へ換算されていない: {}",
+        v["reflect"]
+    );
+    assert_eq!(
+        v["reflect"]["clipped"], true,
+        "画像の外まで届く反射が切れていないと報告された: {}",
+        v["reflect"]
+    );
+}
+
+/// 上限を超えた隙間も exit 2 で断る。
+#[test]
+fn too_large_a_reflect_gap_is_refused() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let output = dir.path().join("out.png");
+
+    for bad in ["1001", "-1", "8e9"] {
+        let out = kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--json",
+                "--force",
+                "--reflect-gap",
+                bad,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "--reflect-gap {bad} が exit 2 で断られていない"
+        );
+    }
+}
+
+/// spec が反射の 4 つのキーを受けること。
+#[test]
+fn the_batch_spec_reads_reflect() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    write_png(dir.path(), "a.png", &img);
+    let spec = write_spec(
+        dir.path(),
+        r#"{"items":[{"input":"a.png","output":"out.png","canvas":"1000",
+                      "reflect":"on","reflect_height":200,
+                      "reflect_opacity":0.4,"reflect_gap":12}]}"#,
+    );
+
+    let out = run_batch(&spec, &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = json_stdout(&out);
+    assert_eq!(json["succeeded"], 1);
+    let result = &json["results"][0]["result"];
+    assert_eq!(result["settings"]["reflect"], "on");
+    assert_eq!(result["reflect"]["height"], 200);
+    assert_eq!(result["reflect"]["gap"], 12);
+    assert_eq!(result["reflect"]["opacity"], 0.4);
+}
+
+/// `defaults` に書いた反射は全項目に効く。
+#[test]
+fn the_batch_defaults_carry_the_reflect() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    write_png(dir.path(), "a.png", &img);
+    write_png(dir.path(), "b.png", &img);
+    let spec = write_spec(
+        dir.path(),
+        r#"{"defaults":{"canvas":"1000","format":"png","reflect":"on","reflect_gap":5},
+            "items":[{"input":"a.png","output":"out/a.png"},
+                     {"input":"b.png","output":"out/b.png","reflect":"off"}]}"#,
+    );
+
+    let out = run_batch(&spec, &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = json_stdout(&out);
+    let a = &json["results"][0]["result"];
+    assert_eq!(a["settings"]["reflect"], "on", "defaults が効いていない");
+    assert_eq!(a["reflect"]["gap"], 5);
+    // 項目側の指定が defaults に勝つ
+    let b = &json["results"][1]["result"];
+    assert_eq!(b["settings"]["reflect"], "off");
+    assert!(
+        b.get("reflect").is_none(),
+        "off の項目に reflect ブロックが出た: {b}"
+    );
+}
+
+/// spec を通した反射の既定値が、CLI の既定値と食い違わないこと。
+///
+/// **同じ数字が clap の `default_value_t` と `commands/batch.rs` の `unwrap_or` の
+/// 2 箇所に書かれている。** 片方だけ動かしてもコンパイルは通り、テストも
+/// 「その値でたまたま通る」ので誰も気づかない（`the_cli_defaults_match_the_library_defaults`
+/// と同じ危険で、`reflect` は `CutoutOptions` を通らないのでそちらでは押さえられない）。
+#[test]
+fn the_spec_defaults_for_the_reflection_match_the_cli() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "a.png", &img);
+
+    let cli = cutout_on_canvas(
+        dir.path(),
+        &input,
+        "cli.png",
+        &["--canvas", "1000", "--reflect", "on"],
+    );
+    let spec = write_spec(
+        dir.path(),
+        r#"{"items":[{"input":"a.png","output":"spec.png","canvas":"1000","reflect":"on"}]}"#,
+    );
+    let out = run_batch(&spec, &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        json_stdout(&out)["results"][0]["result"]["reflect"],
+        cli["reflect"],
+        "spec の既定値が CLI と食い違っている"
+    );
+}
+
+/// spec の綴り違いは既定へ落とさずに断る。
+#[test]
+fn an_unknown_reflect_in_the_spec_is_refused() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        ..Default::default()
+    });
+    write_png(dir.path(), "a.png", &img);
+    let spec = write_spec(
+        dir.path(),
+        r#"{"items":[{"input":"a.png","output":"out.png","reflect":"mirror"}]}"#,
+    );
+
+    let out = run_batch(&spec, &[]);
+    let json = json_stdout(&out);
+    assert_eq!(json["results"][0]["error"]["code"], "SPEC_INVALID");
+}
+
+/// 上限は spec 経由でも効く。**spec は clap を通らない。**
+#[test]
+fn an_out_of_range_reflect_height_is_refused_in_a_spec_too() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        ..Default::default()
+    });
+    write_png(dir.path(), "a.png", &img);
+    let spec = write_spec(
+        dir.path(),
+        r#"{"items":[{"input":"a.png","output":"out.png","reflect":"on","reflect_height":8e9}]}"#,
+    );
+
+    let out = run_batch(&spec, &[]);
+    let json = json_stdout(&out);
+    assert_eq!(json["results"][0]["error"]["code"], "INVALID_SETTING");
+}
+
+/// 反射の綴り違いのキーも候補を返す。
+#[test]
+fn a_misspelled_reflect_height_key_suggests_the_right_one() {
+    let dir = fixture_dir();
+    let spec = write_spec(
+        dir.path(),
+        r#"{"items":[{"input":"a.png","output":"b.png","reflect_hight":150}]}"#,
+    );
+
+    let out = run_batch(&spec, &[]);
+    let json = json_stdout(&out);
+    assert_eq!(json["error"]["code"], "SPEC_UNKNOWN_FIELD");
+    assert!(
+        json["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("reflect_height"),
+        "候補に reflect_height が出ていない: {}",
+        json["error"]["hint"]
+    );
+}
+
 // --- batch (Phase 5) ---
 
 /// 商品画像を n 枚と spec.json を用意する。
@@ -8440,6 +9366,69 @@ fn schema_publishes_the_five_knobs_of_the_synthetic_shadow() {
     assert!(removes.contains("消す"), "消す側だと分からない: {removes}");
 }
 
+/// 反射の 4 つのノブが契約に載ること。
+///
+/// **影の 5 つと同じ理由でここを固定する。** `--reflect` は `--shadow` と
+/// 名前が並ぶが**向きではなく写すものが違う**（影はアルファを塗り、反射は
+/// 画素を写す）ので、summary の 1 行目でそれが分からないとエージェントは
+/// 「色を指定するノブ」を探して 1 往復する。
+///
+/// `accepts` が埋まるのは `clap::ValueEnum` で書いたときだけなので、
+/// この 1 本は綴りの一覧が配られていることの検査でもある。
+#[test]
+fn schema_publishes_the_four_knobs_of_the_reflection() {
+    let v = schema_json();
+    let cutout = v["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "cutout")
+        .expect("cutout が無い");
+    let option = |name: &str| -> Value {
+        cutout["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["name"] == name)
+            .unwrap_or_else(|| panic!("{name} が無い"))
+            .clone()
+    };
+
+    let accepts: Vec<String> = option("--reflect")["accepts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("--reflect が accepts を返さない（ValueEnum で書くこと）"))
+        .iter()
+        .map(|x| x.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(accepts, vec!["off", "on"]);
+    assert_eq!(option("--reflect")["default"], "off");
+    assert_eq!(option("--reflect-height")["default"], "150");
+    assert_eq!(option("--reflect-opacity")["default"], "0.25");
+    assert_eq!(option("--reflect-gap")["default"], "0");
+
+    // 写す側だと 1 行目で分かること。影の「合成」とも取り違えないように、
+    // 鏡像であることを名乗る
+    let mirrors = option("--reflect")["summary"].as_str().unwrap().to_string();
+    assert!(mirrors.contains("鏡像"), "写す側だと分からない: {mirrors}");
+
+    // px@1000 のノブは単位を名乗る。実寸と取り違えると 5 倍外れる
+    for knob in ["--reflect-height", "--reflect-gap"] {
+        let summary = option(knob)["summary"].as_str().unwrap().to_string();
+        assert!(
+            summary.contains("長辺 1000px 換算"),
+            "{knob} が px@1000 だと言っていない: {summary}"
+        );
+    }
+
+    // 長いヘルプは合成順を言う。指定の前に知っていないと出来上がりを
+    // 予想できない（`--shadow` の long help と同じ役）
+    let detail = option("--reflect")["detail"].as_str().unwrap().to_string();
+    assert!(
+        detail.contains("下地 → 影 → 反射 → 商品"),
+        "--reflect の long help が合成順を言っていない"
+    );
+}
+
 /// 契約に載っている code はすべて、実際に返りうる。
 ///
 /// **返らない code を配るのは、誤った助言と同じ害を持つ。** エージェントはそれ用の
@@ -8569,8 +9558,11 @@ fn a_parser_level_failure_returns_no_json() {
 /// README / design.md には許さない（エージェントが写し取る場所だから）
 const PLANNED_CODES: &[&str] = &[
     // ROTATE_AUTO_SKIPPED と SET_SCALE_CLAMPED は Phase 23、
-    // WHITE_BALANCE_SKIPPED は Phase 24 で実装済み
-    "REFLECT_CLIPPED",
+    // WHITE_BALANCE_SKIPPED は Phase 24 で実装済み。
+    // REFLECT_CLIPPED は Phase 25 が**足さないと決めた**ので消した
+    // （はみ出しは reflect.clipped が真偽で言う。計画書 §7.4 と §5 の Phase 25）。
+    // **計画書から名前が消えたら、ここからも消す**——この表に残ると、
+    // 次に誰かが同じ名前を計画書へ書いたとき検討されないまま素通しになる
 ];
 
 /// ドキュメントが名指しする code は、実在する code か実在する定数のどちらかである。
@@ -9386,6 +10378,18 @@ fn every_published_field_exists_in_the_result() {
         "--shadow",
         "synth",
     ]);
+    // **`reflect` も敷いたときだけ現れる。** `shadow` とまったく同じ扱いで、
+    // 既定の実行で探すと「配った path が存在しない」になる
+    let reflected = run(&[
+        "cutout",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--dry-run",
+        "--json",
+        "--reflect",
+        "on",
+    ]);
     // **`color` も --white-balance / --exposure に auto を渡したときだけ現れる。**
     // 渡さない実行の結果 JSON は Phase 24 を足す前と 1 バイトも変わらない、
     // というのがそのブロックの約束なので、`compliance` / `optimize` と同じく
@@ -9472,6 +10476,7 @@ fn every_published_field_exists_in_the_result() {
                 "cutout" if path.starts_with("constraints.") => &constrained,
                 "cutout" if path.starts_with("optimize.") => &optimized,
                 "cutout" if path.starts_with("shadow.") => &shadowed,
+                "cutout" if path.starts_with("reflect.") => &reflected,
                 "cutout" if path.starts_with("color.") => &normalised,
                 "cutout" if path.starts_with("compliance.") => &gated,
                 "cutout" if path.starts_with("settings.") => &profiled,

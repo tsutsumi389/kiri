@@ -24,7 +24,7 @@ use crate::warning::{Warning, WarningCode};
 ///
 /// `Derivation` と分けているのは、省いたキーが `OutputOpts` の対応する値を継ぐ
 /// からである。継ぐ前の「書かなかった」を `None` として持てないと、
-/// 「`--quality 82` を書いた」と「既定の 75 が効いた」が同じ形になり、
+/// 「`--quality 82` を書いた」と「既定の `DEFAULT_QUALITY` が効いた」が同じ形になり、
 /// **`--derive` を 1 本だけ書いた実行が既定値を上書きしてしまう**。
 ///
 /// CLI（`k=v,k=v` の文字列）と spec（JSON のオブジェクト）は同じ `set` を通る。

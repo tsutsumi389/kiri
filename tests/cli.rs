@@ -1151,6 +1151,22 @@ fn ladder() -> &'static [f32] {
     kiri::image_io::derive::QUALITY_LADDER
 }
 
+/// `--quality` の既定。**梯子と同じ理由で実装の定数をそのまま引く。**
+/// ここを手書きしていたので、Phase 26 で 75 → 90 へ動かしたときに
+/// 「梯子を降りたか」を見ているだけのテストまで落ちた
+fn default_quality() -> f32 {
+    kiri::image_io::DEFAULT_QUALITY
+}
+
+/// 既定の `--quality` から降りる段（要求品質より小さい段）。
+fn rungs_below_default() -> Vec<f32> {
+    ladder()
+        .iter()
+        .copied()
+        .filter(|&q| q < default_quality())
+        .collect()
+}
+
 /// `convert` を 1 回回して結果 JSON を返す。
 fn convert_json(input: &Path, output: &Path, extra: &[&str]) -> Value {
     let mut args = vec![
@@ -1188,8 +1204,8 @@ fn reachable_budgets(input: &Path, output: &Path, format: &str) -> [u64; 2] {
             .as_u64()
             .unwrap()
     };
-    // 要求品質は CLI の既定（75）、下限は梯子のいちばん下の段
-    let baseline = at("75");
+    // 要求品質は CLI の既定、下限は梯子のいちばん下の段
+    let baseline = at(&default_quality().to_string());
     let floor = at(&ladder().last().unwrap().to_string());
     assert!(
         floor < baseline,
@@ -1237,7 +1253,7 @@ fn a_reachable_budget_always_lands_under_the_limit() {
 
             let quality = out["quality_used"].as_f64().unwrap() as f32;
             assert!(
-                ladder().contains(&quality) && quality < 75.0,
+                ladder().contains(&quality) && quality < default_quality(),
                 "{label}: {quality} は要求品質より下の梯子の段ではない"
             );
             assert!(out["attempts"].as_u64().unwrap() > 1, "{label}: {out}");
@@ -1271,12 +1287,56 @@ fn the_quality_reduced_warning_carries_every_number() {
     let data = &warning["data"];
     let out = &v["outputs"][0];
 
-    assert_eq!(data["requested"], 75.0);
+    assert_eq!(data["requested"], default_quality());
     assert_eq!(data["quality_used"], out["quality_used"]);
     assert_eq!(data["max_bytes"], max);
     assert_eq!(data["bytes"], out["bytes"]);
     assert_eq!(data["attempts"], out["attempts"]);
     assert_eq!(data["format"], "jpeg");
+}
+
+/// 既定の `--quality` から降りはじめる段が、梯子の**最上段**であること。
+///
+/// Phase 26 で既定が 75 → 90 へ上がり、**梯子（85 が最上段）の全体が要求品質より
+/// 下に来た。** 梯子そのものは 1 段も動かしていない——梯子は「降りる先」の集合で、
+/// 出発点が上がったことと段の位置は別の話である。変わったのは
+/// 「85 も降りる先になった」ことだけで、それをここで固定する。
+///
+/// 上限は最上段で実際に書けたバイト数をそのまま使う。割合で決め打ちにすると
+/// 素材が変わったときに降りる段数が変わって意味を失う
+#[test]
+fn the_search_starts_from_the_top_rung_of_the_ladder() {
+    let dir = fixture_dir();
+    let input = budget_input(dir.path());
+    let output = dir.path().join("top.jpg");
+
+    let top = ladder()[0];
+    assert!(
+        top < default_quality(),
+        "梯子の最上段 {top} が既定 {} より上にある",
+        default_quality()
+    );
+
+    let bytes = |extra: &[&str]| {
+        convert_json(&input, &output, extra)["outputs"][0]["bytes"]
+            .as_u64()
+            .unwrap()
+    };
+    let at_top = bytes(&["--quality", &top.to_string()]);
+    let at_default = bytes(&[]);
+    assert!(
+        at_top < at_default,
+        "既定と最上段で大きさが変わらない素材では梯子の 1 段目を試せない（{at_top} / {at_default}）"
+    );
+
+    let v = convert_json(&input, &output, &["--max-bytes", &at_top.to_string()]);
+    let out = &v["outputs"][0];
+    assert_eq!(
+        out["quality_used"], top,
+        "最初に降りる段が最上段ではない: {v}"
+    );
+    assert_eq!(out["attempts"], 2, "要求品質の 1 回 + 最上段の 1 回: {out}");
+    assert!(has_warning(&v, "QUALITY_REDUCED"), "{v}");
 }
 
 /// 受け入れ基準 (b)。**未達なら要求品質のものを書く。**
@@ -1302,9 +1362,9 @@ fn an_unreachable_budget_writes_the_requested_quality_file() {
 
     let out = &v["outputs"][0];
     assert_eq!(out["bytes"], plain["outputs"][0]["bytes"]);
-    assert_eq!(out["quality_used"], 75.0, "要求品質へ戻る");
-    // 要求品質の 1 回 + 75 より下の 5 段（65 / 55 / 45 / 35 / 25）
-    assert_eq!(out["attempts"], 6);
+    assert_eq!(out["quality_used"], default_quality(), "要求品質へ戻る");
+    // 要求品質の 1 回 + 既定より下の段（既定 90 なら 85 / 75 / 65 / 55 / 45 / 35 / 25 の 7 段）
+    assert_eq!(out["attempts"], 1 + rungs_below_default().len() as u64);
 
     let warning = v["warnings"]
         .as_array()

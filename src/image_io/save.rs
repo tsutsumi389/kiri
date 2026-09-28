@@ -151,7 +151,25 @@ impl IccSignal {
 /// テストも「その値でたまたま通る」ので気づけない
 /// （`the_cli_defaults_match_the_library_defaults` が押さえているのと同じ罠で、
 /// quality はそこを通らない）。3 箇所ともここを引く。
-pub const DEFAULT_QUALITY: f32 = 75.0;
+///
+/// **90 の根拠は「商品領域の PSNR が 40 dB に届く最小の q」である。** 40 dB は
+/// 視覚的無損失の目安で、実写 3 通りで測った到達点は 90 / 90 / 88 だった
+/// （リモコン 4284x5712 の商品領域 jpeg が q90 で 39.90 dB、キーボード
+/// 3024x4032 の全面 jpeg が 40.14 dB、リモコンの avif が 42.16 dB）。
+/// **形式では分けない**——同じ q でほぼ同じ PSNR が出るうえ、分けると
+/// `kiri schema` が配る `default` が単一の数で表せなくなる。
+///
+/// **払うのはバイトだけで、時間ではない。** リモコンの商品領域 jpeg は
+/// 150 KB → 219 KB、キーボード全面 jpeg は 555 KB → 940 KB、リモコンの
+/// avif は 52 KB → 129 KB。時間は 12.2MP の avif で 0.95 秒 → 1.06 秒、
+/// jpeg で 0.19 秒 → 0.20 秒。バイトを詰めたいときは `--max-bytes` を使う。
+///
+/// Phase 25 までの既定は 75 で、根拠は design.md 3.4 の「avif は 85 にすると
+/// サイズが約 4 倍」だった。**その 4 倍は合成画像でしか起きない**（同じ節が
+/// 「実画像での再計測を実装フェーズで行うこと」を宿題に残していた）。実写では
+/// avif 52 → 94 KB の 1.8 倍にとどまり、しかも上がった先の avif 129 KB は
+/// 同画質の jpeg 219 KB より小さい
+pub const DEFAULT_QUALITY: f32 = 90.0;
 
 /// `--effort` の既定値。持ち主は `DEFAULT_QUALITY` と同じ理由でここ 1 箇所。
 ///
@@ -819,12 +837,18 @@ mod tests {
         assert_eq!(encoded(&img, OutputFormat::Png, IccPolicy::None), phase17);
     }
 
+    /// **品質は `DEFAULT_QUALITY` から引く。** ここが見ているのは「ICC を抜けば
+    /// `image` の素のエンコーダと一致する」という性質であって、特定の品質値では
+    /// ない。数を手書きしていたので Phase 26 で既定を 90 へ動かしたときだけ落ちた
     #[test]
     fn icc_none_jpeg_is_the_phase17_encoder_output() {
         let img = gradient(true);
         let rgb = flatten_onto(&img, [255, 255, 255]);
         let mut phase17 = Vec::new();
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut phase17, 75)
+        let quality = OutputFormat::Jpeg
+            .effective_quality(DEFAULT_QUALITY)
+            .expect("JPEG は品質を持つ") as u8;
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut phase17, quality)
             .write_image(&rgb, img.width(), img.height(), ExtendedColorType::Rgb8)
             .unwrap();
         assert_eq!(encoded(&img, OutputFormat::Jpeg, IccPolicy::None), phase17);

@@ -14466,6 +14466,203 @@ fn a_derivation_that_leaves_the_profile_dimensions_says_so_one_by_one() {
     assert_eq!(lint_check(&big_result, "longest_side")["status"], "pass");
 }
 
+/// **profile のキャンバスは入力から決まる**（Phase 26）。
+///
+/// Phase 22〜25 は固定の 1600x1600 だった。固定値である限り、入力が大きければ
+/// 情報を捨て（実写 4284x5712 で倍率 0.3354）、小さければ捏造する
+/// （525x700 で倍率 2.6411）。**どちらかが必ず起きる。**
+///
+/// ここで見るのは 3 つ。**大きい素材では段が上がること**、**小さい素材では
+/// 最小段に落ちること**、そして**どの段も `kiri lint` を通ること**である。
+/// 段そのものの選び方（`canvas × fill_ratio ≤ 商品の長辺` を満たす最大の段）は
+/// `profile::canvas_for` の単体テストが持つので、ここは**実行を通したときに
+/// その判断が本当に成果物へ出る**ことだけを固定する。
+///
+/// 期待する段を数で書くのは、`profile::CANVAS_LADDER` を読んで計算し直すと
+/// **テストが実装と同じ式を 2 度書く**ことになるからである（それでは梯子ごと
+/// 差し替えた誤りを 1 つも捕まえられない）。
+#[test]
+fn the_profile_canvas_follows_the_subject_size() {
+    let dir = fixture_dir();
+    // `product_image` の商品は幅 0.56・高さ 0.68 の角丸で、外接矩形はその寸法に
+    // なる。縦長の素材を採るのは、**天井に当たる長辺（2580px 以上）を
+    // 3.2MP で作れる**ためである（正方形なら 14MP 要る）
+    let cases = [
+        // 入力寸法, 商品の長辺, 期待する段
+        ((800u32, 4000u32), 2720u32, 3000u32),
+        ((2000, 2000), 1360, 1500),
+        ((300, 300), 204, 1000),
+    ];
+
+    for ((w, h), subject, want_side) in cases {
+        let input = write_jpeg(
+            dir.path(),
+            &format!("p{w}x{h}.jpg"),
+            &product_image(&ProductSpec {
+                width: w,
+                height: h,
+                ..Default::default()
+            }),
+        );
+        let output = dir.path().join(format!("o{w}x{h}.jpg"));
+        let out = kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--json",
+                "--profile",
+                "amazon",
+            ])
+            .output()
+            .unwrap();
+        let v = json_stdout(&out);
+        assert_eq!(out.status.code(), Some(0), "{v}");
+        assert_eq!(
+            v["canvas"]["width"], want_side,
+            "{w}x{h}（商品の長辺 {subject}px）が選んだ段が違う: {}",
+            v["canvas"]
+        );
+        assert_eq!(v["canvas"]["height"], want_side, "{}", v["canvas"]);
+
+        let scale = v["canvas"]["scale"].as_f64().unwrap();
+        if want_side == 1000 {
+            // 最小段でも足りない素材では拡大が残る。**「拡大しなくなる」のでは
+            // なく、倍率が下がる**——キャンバス配置で拡大を禁止しないという
+            // 方針（docs/design.md 5.8）は変えていない
+            assert!(scale > 1.0, "{w}x{h}: 最小段なのに拡大していない: {scale}");
+            assert!(has_warning(&v, "CANVAS_UPSCALED"), "{v}");
+            // **拡大した実行は lint まで通さない。** 4 倍に伸ばした縁は
+            // 白へ溶け、lint が色で測る外接矩形が計画より痩せる（この素材で
+            // 占有率 0.86 → 0.828）。**段の選び方とは無関係で、`--canvas`
+            // 1000 / 1600 / 2000 のどれを明示しても同じ 0.828 になる**ので、
+            // ここで落とすと Phase 26 が壊したように読める
+            continue;
+        }
+        assert!(scale <= 1.0, "{w}x{h}: 段を上げたのに拡大した: {scale}");
+        assert!(!has_warning(&v, "CANVAS_UPSCALED"), "{v}");
+
+        // **選んだ段が規格の外へ出ない。** 押し込みが効いていることを、
+        // 組み立てた `Facts` ではなく書いたファイルで見る
+        let (code, linted) = lint(&output, "amazon");
+        assert_eq!(
+            code,
+            0,
+            "{w}x{h}: 段 {want_side} で書いたものが amazon の lint で落ちた: {:?}",
+            not_passing(&linted)
+        );
+    }
+}
+
+/// **小さい素材の拡大は、固定 1600 だった頃より必ず小さくなる**（Phase 26）。
+///
+/// 最小段でも拡大は消えない。消えないので「拡大しなくなった」とは言えず、
+/// 言えるのは**倍率が下がる**ことだけである。それを、当時の値を書き写さずに
+/// `--canvas 1600x1600` を明示した同じ実行との比較で言う——1600 を数で
+/// 埋め込むと、そこだけが**もう誰も参照していない過去の既定**の写しになる。
+#[test]
+fn the_smallest_rung_upscales_less_than_the_old_fixed_canvas() {
+    let dir = fixture_dir();
+    let input = write_jpeg(
+        dir.path(),
+        "tiny.jpg",
+        &product_image(&ProductSpec {
+            width: 300,
+            height: 300,
+            ..Default::default()
+        }),
+    );
+
+    let scale_of = |output: &Path, extra: &[&str]| -> f64 {
+        let mut args = vec![
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--json",
+            "--profile",
+            "amazon",
+        ];
+        args.extend_from_slice(extra);
+        let out = kiri().args(&args).output().unwrap();
+        let v = json_stdout(&out);
+        assert_eq!(out.status.code(), Some(0), "{v}");
+        assert!(has_warning(&v, "CANVAS_UPSCALED"), "{v}");
+        v["canvas"]["scale"].as_f64().unwrap()
+    };
+
+    let chosen = scale_of(&dir.path().join("chosen.jpg"), &[]);
+    let fixed = scale_of(&dir.path().join("fixed.jpg"), &["--canvas", "1600x1600"]);
+    assert!(
+        chosen < fixed,
+        "段を選んでも倍率が下がっていない: {chosen} >= {fixed}"
+    );
+}
+
+/// **`PROFILE_OVERRIDDEN` が名乗る canvas は入力ごとに違う**（Phase 26）。
+///
+/// `an_explicit_option_beats_the_profile_and_actually_takes_effect` は
+/// `data.used` が明示した値であることを見るが、`data.profile`——**profile が
+/// 求めた値**——のほうは 1 つの素材でしか見ていない。固定値のうちはそれで
+/// 足りたが、入力依存になった後は「求めた値が入力から決まっている」ことを
+/// 言わないと、`data.profile` に定数が残っていても赤にならない。
+///
+/// 同じ `--canvas` を 2 つの素材へ当て、**`used` は同じで `profile` が違う**
+/// ことを見る。どちらの値も書かずに関係だけで言えるので、段を組み替えても
+/// この表明は生き残る。
+#[test]
+fn the_overridden_canvas_the_profile_wanted_depends_on_the_input() {
+    let dir = fixture_dir();
+    let wanted = |w: u32, h: u32| -> Value {
+        let input = write_jpeg(
+            dir.path(),
+            &format!("ov{w}x{h}.jpg"),
+            &product_image(&ProductSpec {
+                width: w,
+                height: h,
+                ..Default::default()
+            }),
+        );
+        let output = dir.path().join(format!("ov{w}x{h}-out.jpg"));
+        let out = kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--json",
+                "--profile",
+                "amazon",
+                "--canvas",
+                "640x480",
+            ])
+            .output()
+            .unwrap();
+        let v = json_stdout(&out);
+        assert_eq!(out.status.code(), Some(0), "{v}");
+        // 明示した値が実際に効いている（`used` が言うだけでは足りない）
+        assert_eq!(v["outputs"][0]["width"], 640, "{v}");
+        assert_eq!(v["outputs"][0]["height"], 480, "{v}");
+        let warning = v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["code"] == "PROFILE_OVERRIDDEN" && w["data"]["key"] == "canvas")
+            .unwrap_or_else(|| panic!("canvas の PROFILE_OVERRIDDEN が無い: {v}"))
+            .clone();
+        assert_eq!(warning["data"]["used"], Value::from(vec![640, 480]));
+        warning["data"]["profile"].clone()
+    };
+
+    let small = wanted(300, 300);
+    let large = wanted(2000, 2000);
+    assert_ne!(
+        small, large,
+        "profile が求めた canvas が入力で変わっていない: {small} / {large}"
+    );
+}
+
 /// **`--profile` を渡さない実行は 1 バイトも変わらない。**
 ///
 /// Phase 21 の `no_fail_on_means_no_compliance_block_and_no_new_exit_code` と

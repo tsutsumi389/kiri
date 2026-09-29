@@ -16,9 +16,9 @@ use crate::cutout::constraints::{
     ALPHA_BACKGROUND, ALPHA_FOREGROUND, MASK_THRESHOLD, TRIMAP_BACKGROUND, TRIMAP_FOREGROUND,
 };
 use crate::cutout::{BackgroundModel, DEFAULT_EDGE_THRESHOLD, Matting, OptimizeFixed};
-use crate::image_io::OutputFormat;
 use crate::image_io::derive::{DERIVE_KEYS, DeriveSpec};
 use crate::image_io::naming::DEFAULT_TEMPLATE;
+use crate::image_io::{DEFAULT_EFFORT, DEFAULT_QUALITY, OutputFormat};
 use crate::preview::DEFAULT_PANEL;
 use crate::profile::{self, ExplicitOptions, PROFILE_NAMES, Profile};
 use crate::segment::SegmentMode;
@@ -421,12 +421,12 @@ pub struct OutputOpts {
     #[arg(long, value_enum)]
     pub format: Option<OutputFormat>,
 
-    /// 品質 (0-100)。AVIF は 75 を超えるとサイズが急増する
-    #[arg(long, default_value_t = 75.0)]
+    /// 品質 (0-100)。既定は実写で商品領域の PSNR が 40 dB（視覚的無損失の目安）に最も近づく値。バイトを詰めるなら --max-bytes
+    #[arg(long, default_value_t = DEFAULT_QUALITY)]
     pub quality: f32,
 
     /// AVIF のエンコード速度 (1-10)。小さいほど高品質・低速
-    #[arg(long, default_value_t = 6)]
+    #[arg(long, default_value_t = DEFAULT_EFFORT)]
     pub effort: u8,
 
     /// 出力の上限バイト数。品質を梯子状に落として収める (例 500k)
@@ -756,8 +756,8 @@ const MAX_BYTES_HELP: &str = "出力の上限バイト数。10 進の整数に�
      小数は受けない（1.5m ではなく 1500k）。\n\
      収まらなければ品質を**固定の梯子** 85 / 75 / 65 / 55 / 45 / 35 / 25 に沿って落とす。\
      降りるのは --quality より小さい段だけで、最初に収まった段で止め、\
-     QUALITY_REDUCED が落とした事実と着地点を言う（既定の --quality 75 なら降りる段は \
-     5 つで、要求品質そのものを入れて最大 6 回のエンコードになる）。\n\
+     QUALITY_REDUCED が落とした事実と着地点を言う（既定の --quality 90 なら降りる段は \
+     85 から下の 7 つで、要求品質そのものを入れて最大 8 回のエンコードになる）。\n\
      **段が時刻にもタイムアウトにも依存しない**ので、同じ入力からは毎回同じ \
      outputs[].quality_used と outputs[].attempts が出る。\n\
      下限まで降りても届かなければ、**要求品質のものをそのまま書いて** \
@@ -767,7 +767,7 @@ const MAX_BYTES_HELP: &str = "出力の上限バイト数。10 進の整数に�
      PNG は無損失で品質を持たないので効かない。1 回のエンコードで収まらなければ\
      段を降りずに MAX_BYTES_UNREACHABLE を出す（quality_used は null、attempts は 1）。\n\
      **--optimize と併せても時間は積にならない。** 探索はマスクの指標で候補を選び、\
-     エンコードするのは決まった 1 枚だけなので、掛かる時間は探索 + 最大 6 回の\
+     エンコードするのは決まった 1 枚だけなので、掛かる時間は探索 + 最大 8 回の\
      エンコードの**和**である。24.5MP の AVIF は 1 段あたり数秒かかるので、\
      その数秒 × 段数が探索の後ろに足されると見ればよい。\n\
      --dry-run でも実際にエンコードするので、bytes / quality_used / attempts は\

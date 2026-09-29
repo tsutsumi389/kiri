@@ -349,10 +349,8 @@ fn attach_set(args: &mut CutoutArgs, set: Option<batch::SetPlacement>) -> Result
     let Some(placement) = set else {
         return Ok(());
     };
-    let has_canvas = args.canvas.is_some()
-        || args
-            .profile
-            .is_some_and(|p| p.write_defaults().canvas.is_some());
+    let has_canvas =
+        args.canvas.is_some() || args.profile.is_some_and(profile::Profile::decides_canvas);
     if !has_canvas {
         return Err(Error::new(
             ErrorCode::InvalidSet,
@@ -649,8 +647,10 @@ fn to_cutout_args(
         out: OutputOpts {
             output: output.to_path_buf(),
             format,
-            quality: settings.quality.unwrap_or(75.0),
-            effort: settings.effort.unwrap_or(6),
+            // **spec の既定は CLI の既定と同じ定数を引く。** 手書きの数を並べると
+            // 片方だけ動いても気づけない（`the_spec_defaults_for_the_quality_match_the_cli`）
+            quality: settings.quality.unwrap_or(crate::image_io::DEFAULT_QUALITY),
+            effort: settings.effort.unwrap_or(crate::image_io::DEFAULT_EFFORT),
             max_bytes,
             background,
             flatten: settings.flatten.unwrap_or(false),

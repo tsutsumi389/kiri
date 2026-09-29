@@ -209,32 +209,96 @@ const fn spellings() -> [&'static str; ALL.len()] {
     out
 }
 
-/// `write_defaults` が目指す長辺(px)。
+/// `write_defaults` が canvas の長辺(px)を選ぶ段。**昇順であること。**
 ///
-/// **規格ではない。** `Rules` は amazon が 500〜10000、square-white が 1000 以上と
-/// しか言っておらず、その幅のどこを採るかは kiri が決めるしかない。1600 を採るのは
-/// 次の 3 つが同時に立つ値だからである。
+/// # なぜ固定値をやめたか
 ///
-/// - Amazon のズーム機能が効くのは長辺 1000px 以上だが、**これは推奨であって
-///   規格ではない**ので `Rules` には入れない。書く側の既定でだけ満たしておく
-/// - 1600x1600 は 2.56MP で、Shopify の 25MP 上限に対して 1 桁の余裕がある
+/// Phase 22 から Phase 25 までは固定の目標長辺 1600 という 1 つの数だった。
+/// その doc が挙げていた 3 つの根拠（1000px 以上でズームが効く／
+/// Shopify の 25MP に余裕がある／全プリセットの範囲に素で収まる）は、
+/// **1000〜5000 のどの値でも同じように立つ。** 1600 はその幅の中の任意の 1 点で、
+/// 上を選ばない理由がどこにも書かれていなかった。
+///
+/// 固定値である限り、入力が大きければ情報を捨て、小さければ捏造する
+/// （Phase 26 の実測）。
+///
+/// - 4284x5712 の実写に `--profile amazon` を当てると、商品は倍率 0.3354 まで
+///   潰れる。拡大が始まるのは canvas 約 4771 からで、そこまでは**まだ縮小である**
+/// - 700x525 の入力では倍率 2.6411 で拡大される（`--profile amazon --optimize
+///   --rotate auto`。フラグを揃えないと商品の長辺が 1〜2px 動き、倍率も動く）。
+///   Amazon の規格文
+///   （`ALL` の amazon が持つ `source`）は「小さい画像を人工的に拡大しないで
+///   ください」と書いており、既定で拡大するのは規格に反する側である
+///
+/// # 段に丸める理由
+///
+/// 入力ごとに連続の値を返すと、**同じ profile で処理したセットの寸法が 1 つも
+/// 揃わない。** これは固定値を選んでいた当時の doc が挙げていた懸念そのもので、
+/// 段に丸めるのがその答えである。
+///
+/// **ただし揃うのは同じ段に落ちる限りである。** 段の境界を跨ぐ素材が混ざれば
+/// 揃わない——選ぶ条件は `段 × 占有率 ≤ 商品の長辺` なので、占有率 0.86 では
+/// 寸法の動く境界が 1290 / 1720 / 2150 / 2580 px の 4 本あり、**商品の長辺が
+/// 1289px なら 1000、1290px なら 1500 になる。** 長辺は切り抜きの結果なので、
+/// `--tolerance` も `--feather` も `--rotate auto` の角度も 1 画素動かせば飛ぶ。
+/// 境界が段数より 1 つ少ないのは、**最小段が「どの段も拡大になる」ときの
+/// 落とし先でもある**ためで、その下側（860px）では canvas は 1000 のままで
+/// 倍率だけが動く。
+///
+/// **寸法を必ず揃えたい実行は `--canvas` を明示すること。** 段に丸めるのは
+/// 「連続の値よりは揃いやすい」までで、揃うことの保証ではない。
+///
+/// # 天井 3000 の根拠
+///
+/// 1600 の 3 つの根拠と同じ構造を保ち、1 つ目だけを「ズームが効く最低ライン」から
+/// 「ズームで等倍を割らない上限」へ置き換えた。
+///
+/// - 占有率 0.86（amazon の下限 0.85 + `FILL_RATIO_MARGIN`）を通すと商品の長辺は
+///   2580px になる。4K ディスプレイの短辺 2160px で全画面表示しても等倍を
+///   割らない——**これ以上大きくしても、見る側の画素数を超えるだけである**
+/// - 3000x3000 は 9MP で、Shopify の 25MP 上限に余裕がある
 /// - 現在のどのプリセットでも `longest_side_min..=longest_side_max` の中に素で
-///   収まる。丸ごと同じ値を採れるので、プリセットごとに数を覚える必要が無い
+///   収まる（amazon 500–10000、shopify –5000、square-white 1000–）
 ///
-/// 上下限のどちらかに触れる規格が将来入っても、`canvas()` が押し込むので
-/// **`Rules` に矛盾する canvas は出ない**（単体テストがそれを固定する）。
-pub const PREFERRED_LONG_SIDE: u32 = 1600;
+/// # 下限 1000 の根拠
+///
+/// Amazon の「最長辺が 1,000px 以上の画像ではズーム機能が有効になります」。
+/// 最小の段でも拡大になる素材は**拡大したうえで `CANVAS_UPSCALED` で報せる**
+/// ——キャンバス配置で拡大を禁止しないという設計（docs/design.md 5.8）は
+/// 変えない。ただし倍率は 1600 のときより必ず小さくなる。
+pub const CANVAS_LADDER: [u32; 5] = [1000, 1500, 2000, 2500, 3000];
+
+/// **この規格向けに canvas を決める**という事実。寸法そのものではない。
+///
+/// # なぜ値を持たないか
+///
+/// 段の選択には**切り抜き後の商品の長辺**が要る（`Profile::canvas_for`）ので、
+/// `write_defaults` が呼ばれる時点——画像を読む前——では寸法が決まらない。
+///
+/// `WriteDefaults::canvas` を `Option<(u32, u32)>` のままにして「決めるが値は
+/// まだ分からない」を `None` で表すと、**1 つの `Option` が 2 つの意味を運ぶ。**
+/// `commands::batch::attach_set` は `None` を「この規格は canvas を決めない」と
+/// 読んで `set` を断るので、profile だけで canvas を決めていた spec が
+/// `INVALID_SET` で落ちる。2 つを別の形で表すために、`Option` の中身のほうを
+/// 「決め方」に替えた——`is_some()` の意味は 1 つも変わらない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanvasChoice {
+    /// 切り抜き後の商品の長辺から `CANVAS_LADDER` の段を選ぶ。
+    /// 寸法は `Profile::canvas_for` が返す
+    FromSubject,
+}
 
 /// 占有率の下限ちょうどには置かない、その余裕。
 ///
 /// **下限ちょうどに置くと丸めで割り込む。** `canvas::plan` は倍率を掛けた寸法を
-/// `round()` で整数へ落とすので、1600px のキャンバスでは最大 0.5px（比率で
-/// 0.0003）が失われる。さらに `kiri lint` が測るのは書き出した画素の外接矩形で、
-/// JPEG の縁のにじみや `--feather` のぶんもそこに乗る。
+/// `round()` で整数へ落とすので最大 0.5px が失われる（比率では `CANVAS_LADDER` の
+/// 最小段 1000px で 0.0005、最大段 3000px で 0.00017）。さらに `kiri lint` が測る
+/// のは書き出した画素の外接矩形で、JPEG の縁のにじみや `--feather` のぶんも
+/// そこに乗る。
 ///
-/// 0.01 は 1600px で 16px にあたり、これらを飲み込む一方、構図が目に見えて
-/// 小さくなるほどではない。**profile で書いたものが profile の lint で落ちる**のが
-/// 最も高くつく失敗なので、余裕は書く側へ寄せる。
+/// 0.01 は 1000px で 10px、3000px で 30px にあたり、これらを飲み込む一方、構図が
+/// 目に見えて小さくなるほどではない。**profile で書いたものが profile の lint で
+/// 落ちる**のが最も高くつく失敗なので、余裕は書く側へ寄せる。
 ///
 /// # 拡大による不足はここでは飲まない
 ///
@@ -277,7 +341,10 @@ pub const BACKGROUND_DELTA_E_TOLERANCE: f64 = 2.0;
 /// kiri の既定のまま」を意味する。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WriteDefaults {
-    pub canvas: Option<(u32, u32)>,
+    /// canvas を決めるか。**寸法はここに無い**——段の選択に切り抜き後の商品の
+    /// 長辺が要るので、値は `Profile::canvas_for` が後から返す
+    /// （`CanvasChoice` の doc を参照）
+    pub canvas: Option<CanvasChoice>,
     pub fill_ratio: Option<f64>,
     pub format: Option<OutputFormat>,
     pub background: Option<[u8; 3]>,
@@ -290,12 +357,10 @@ impl Profile {
     pub fn write_defaults(&self) -> WriteDefaults {
         let r = &self.rules;
         WriteDefaults {
-            canvas: Some(self.canvas()),
-            // 下限をそのまま使うと丸めで割り込む。理由と採った値は
-            // `FILL_RATIO_MARGIN` に書いた
-            fill_ratio: r
-                .fill_ratio_min
-                .map(|min| (min + FILL_RATIO_MARGIN).min(1.0)),
+            // **現在のプリセットはすべて canvas を決める。** 寸法は商品を見て
+            // から決まるので、ここで言えるのは「決める」ことだけである
+            canvas: Some(CanvasChoice::FromSubject),
+            fill_ratio: self.fill_ratio(),
             // **先頭が第一候補である。** 並びは表を書くときに決めた優先順で、
             // 「どれでもよい」ではなく「迷ったらこれ」を先に置いてある。
             // 規定なし（空）なら kiri の既定（`--output` の拡張子）のまま
@@ -310,28 +375,89 @@ impl Profile {
         }
     }
 
-    /// キャンバスの寸法を長辺の規定から決める。
+    /// **この規格は canvas を決めるか。**
+    ///
+    /// 呼ぶ側が知りたいのはこの真偽 1 つで、`WriteDefaults::canvas` の
+    /// `Option` を開くのはその手段にすぎない。`is_some()` を呼ぶ側に綴らせると、
+    /// **「決めるか」の判定が呼ぶ側の数だけ散る**——`Option` の中身を
+    /// `CanvasChoice` に割ったときに `attach_set` を救った判断
+    /// （`CanvasChoice` の doc）と同じ向きで、決め方が増えた日に直す場所を
+    /// 1 つに保つ。
+    ///
+    /// 寸法はここでは分からない。要るなら `canvas_for` を切り抜きの後で呼ぶ。
+    pub fn decides_canvas(&self) -> bool {
+        self.write_defaults().canvas.is_some()
+    }
+
+    /// この規格が書く占有率。**規定が無ければ何も言わない。**
+    ///
+    /// 下限をそのまま使うと丸めで割り込む。理由と採った値は
+    /// `FILL_RATIO_MARGIN` に書いた。
+    fn fill_ratio(&self) -> Option<f64> {
+        self.rules
+            .fill_ratio_min
+            .map(|min| (min + FILL_RATIO_MARGIN).min(1.0))
+    }
+
+    /// キャンバスの寸法を、切り抜き後の商品の長辺から決める。
     ///
     /// **正方形を採る。** `square` が真なら規格の要求だからで、偽のときも
     /// 正方形にするのは、profile が複合指定の別名である以上どこかで縦横比を
-    /// 決めなければならず、入力ごとに変えると**同じ profile で処理したセットの
-    /// 寸法が揃わない**ためである（`--fill-ratio` が揃えようとしているものが
-    /// まさにそれである）。`square: false` は「規定なし」であって「正方形不可」
-    /// ではないので、規格に触れることはない。
+    /// 決めなければならず、縦横比まで入力ごとに変えると**同じ profile で処理した
+    /// セットの寸法が揃わない**ためである（`--fill-ratio` が揃えようとしている
+    /// ものがまさにそれである）。`square: false` は「規定なし」であって
+    /// 「正方形不可」ではないので、規格に触れることはない。
     ///
-    /// 目標は `PREFERRED_LONG_SIDE` で、下限があれば下回らないところまで上げ、
-    /// 上限があれば超えないところまで下げる。**総画素数の上限にも同じく
-    /// 押し込む**——正方形を採る以上 1 辺は √(上限) までで、それは長辺の
-    /// 上限とは別の頭打ちである。
+    /// # 段の選び方
     ///
-    /// いまの shopify では後者が先に効くことは無い（長辺 5000 から出る
-    /// 25,000,000 が `max_pixels` とちょうど同じで、判定は「以下」である。
-    /// `Rules::max_pixels` の doc を参照）。長辺の上限が緩い規格が入った日に
-    /// 効き始める押し込みで、**そのとき `canvas()` を書き足さずに済む**ように
-    /// 先に通してある。
-    fn canvas(&self) -> (u32, u32) {
+    /// **占有率を通したときに拡大にならない最大の段**を `CANVAS_LADDER` から
+    /// 選ぶ。`canvas::plan` が正方キャンバスで決める倍率は
+    /// `canvas × fill_ratio ÷ 商品の長辺` なので、拡大にならない条件は
+    /// `canvas × fill_ratio ≤ 商品の長辺` である。
+    ///
+    /// **`subject_long_side` は切り抜き後のアルファの外接矩形の長辺であって、
+    /// 画像の長辺ではない。** 商品が小さく写っている素材で拡大を見逃さないため
+    /// （4284x5712 の実写でも、切り抜いた商品の長辺は 4103px である）。
+    ///
+    /// **`fill_ratio` は実際に効く占有率を受け取る。** `write_defaults` が返す
+    /// 値ではないのは、`--fill-ratio` で押しのけられた実行と、占有率を規定
+    /// しない規格（shopify）の実行では、効く値がそちらではないからである。
+    /// 効かない値で段を選ぶと、選んだ段が「拡大にならない最大」でなくなる。
+    ///
+    /// どの段も拡大になるなら最小段を採る。**拡大は禁止しない**——キャンバスは
+    /// 枠の指定であり、要求を満たすために必要な拡大まで拒否するのは筋が悪い
+    /// （docs/design.md 5.8）。倍率は `CANVAS_UPSCALED` が報せる。
+    ///
+    /// # `Rules` への押し込み
+    ///
+    /// 選んだ段は最後に下限・上限・総画素数の 3 つへ押し込む。**`Rules` に
+    /// 矛盾する canvas は出ない**という不変条件はここが保っており、
+    /// `the_write_defaults_never_contradict_the_rules` がそれを固定する。
+    ///
+    /// 総画素数の押し込みは、いまの shopify では先に効くことが無い（長辺 5000
+    /// から出る 25,000,000 が `max_pixels` とちょうど同じで、判定は「以下」で
+    /// ある。`Rules::max_pixels` の doc を参照）。長辺の上限が緩い規格が入った
+    /// 日に効き始める押し込みで、**そのときここを書き足さずに済む**ように先に
+    /// 通してある。
+    pub fn canvas_for(&self, subject_long_side: u32, fill_ratio: f64) -> (u32, u32) {
         let r = &self.rules;
-        let mut side = PREFERRED_LONG_SIDE;
+        // 占有率が値域の外（`canvas::plan` が `INVALID_FILL_RATIO` で断る値）
+        // なら 1.0 として選ぶ。**ここで断らない**のは、断る場所を 2 つに
+        // 増やさないためである——同じ実行はこの後 `plan` で必ず落ちる
+        let fill = if fill_ratio > 0.0 && fill_ratio <= 1.0 {
+            fill_ratio
+        } else {
+            1.0
+        };
+        let subject = f64::from(subject_long_side);
+        // 梯子は昇順なので、条件を満たした最後の段が最大の段になる。
+        // どれも満たさなければ最小段のまま（＝拡大する）
+        let mut side = CANVAS_LADDER[0];
+        for rung in CANVAS_LADDER {
+            if f64::from(rung) * fill <= subject {
+                side = rung;
+            }
+        }
         if let Some(min) = r.longest_side_min {
             side = side.max(min);
         }
@@ -430,12 +556,27 @@ mod tests {
     /// 下限が上限を超えている表からは、どう導いても `Rules` を満たす canvas が
     /// 出ない。**導出のテストが落ちる前に、表の側の誤りとして落とす**——
     /// 同じ赤でも直す場所が違う。
+    ///
+    /// 押し込みの順序が `min → max → max_pixels` なので、**後ろの 2 つが前の
+    /// 下限を黙って割れる。** `longest_side_min > longest_side_max` な規格や、
+    /// `longest_side_min² > max_pixels` な規格（正方キャンバスでは下限の寸法が
+    /// そもそも総画素数に入らない）を足すと、下限を割った canvas が警告も
+    /// 無しに出る。現在の 3 プリセットでは起きないが、**足した日にここで
+    /// 落とす**ためにその 2 つを表の側で見る。
     #[test]
     fn the_table_itself_is_internally_consistent() {
         for p in ALL {
             let r = &p.rules;
             if let (Some(min), Some(max)) = (r.longest_side_min, r.longest_side_max) {
                 assert!(min <= max, "{}: 長辺の下限が上限を超えている", p.name);
+            }
+            if let (Some(min), Some(max_pixels)) = (r.longest_side_min, r.max_pixels) {
+                let at_min = u64::from(min) * u64::from(min);
+                assert!(
+                    at_min <= max_pixels,
+                    "{}: 長辺の下限 {min} の正方 {at_min}px が総画素数の上限 {max_pixels} を超える",
+                    p.name
+                );
             }
             if let Some(ratio) = r.fill_ratio_min {
                 assert!(
@@ -455,33 +596,60 @@ mod tests {
     /// 書き出したものが同じ規格の `kiri lint` で落ちてはならない。全プリセットを
     /// 回すのは、プリセットを足したときに**その 1 つだけが検査されない**状態を
     /// 作らないためである。
+    ///
+    /// **canvas は入力依存になったので、1 つの寸法では足りない**（Phase 26）。
+    /// 商品の長辺を極端な側まで振って、**どの段を選んでも** `Rules` に矛盾
+    /// しないことを見る——段の選び方を変えた日に、上限を超える段が 1 つだけ
+    /// 混ざる形の誤りを捕まえられるのはここである。
     #[test]
     fn the_write_defaults_never_contradict_the_rules() {
+        // 梯子の全段に加えて、その外側（どの段も拡大になる 1px、天井を
+        // 大きく超える 100000px）も通す
+        let subjects = {
+            let mut v = vec![1u32, 100_000];
+            v.extend(CANVAS_LADDER);
+            v
+        };
         for p in ALL {
             let r = &p.rules;
             let w = p.write_defaults();
-            let (cw, ch) = w
-                .canvas
-                .unwrap_or_else(|| panic!("{}: canvas が無い", p.name));
-            let long = cw.max(ch);
+            assert_eq!(
+                w.canvas,
+                Some(CanvasChoice::FromSubject),
+                "{}: canvas を決めないと言っている",
+                p.name
+            );
+            let ratio = w.fill_ratio.unwrap_or(1.0);
+            for subject in &subjects {
+                let (cw, ch) = p.canvas_for(*subject, ratio);
+                let long = cw.max(ch);
 
-            if let Some(min) = r.longest_side_min {
-                assert!(long >= min, "{}: 長辺 {long} が下限 {min} を下回る", p.name);
+                if let Some(min) = r.longest_side_min {
+                    assert!(
+                        long >= min,
+                        "{}: 商品 {subject}px で長辺 {long} が下限 {min} を下回る",
+                        p.name
+                    );
+                }
+                if let Some(max) = r.longest_side_max {
+                    assert!(
+                        long <= max,
+                        "{}: 商品 {subject}px で長辺 {long} が上限 {max} を超える",
+                        p.name
+                    );
+                }
+                if let Some(max_pixels) = r.max_pixels {
+                    let pixels = u64::from(cw) * u64::from(ch);
+                    assert!(
+                        pixels <= max_pixels,
+                        "{}: 商品 {subject}px で {pixels} 画素が上限 {max_pixels} を超える",
+                        p.name
+                    );
+                }
+                // `square: false` でも正方形を採る（`canvas_for` の doc）
+                assert_eq!(cw, ch, "{}: 商品 {subject}px で正方形でない", p.name);
             }
-            if let Some(max) = r.longest_side_max {
-                assert!(long <= max, "{}: 長辺 {long} が上限 {max} を超える", p.name);
-            }
-            if let Some(max_pixels) = r.max_pixels {
-                let pixels = u64::from(cw) * u64::from(ch);
-                assert!(
-                    pixels <= max_pixels,
-                    "{}: {pixels} 画素が上限 {max_pixels} を超える",
-                    p.name
-                );
-            }
-            if r.square {
-                assert_eq!(cw, ch, "{}: 正方形が要るのに正方形でない", p.name);
-            }
+
             if let Some(min) = r.fill_ratio_min {
                 let used = w
                     .fill_ratio
@@ -528,6 +696,144 @@ mod tests {
                 "{}: 上限バイト数が表と違う",
                 p.name
             );
+        }
+    }
+
+    /// 梯子は昇順で、重複が無いこと。
+    ///
+    /// `canvas_for` は「条件を満たした最後の段」を採るので、**並びが昇順で
+    /// ないと最大の段が出ない。** 並べ替えた日に静かに壊れる種類の前提なので、
+    /// 表の側の誤りとしてここで落とす（`the_table_itself_is_internally_consistent`
+    /// と同じ作法）。
+    #[test]
+    fn the_canvas_ladder_ascends_without_repeats() {
+        for pair in CANVAS_LADDER.windows(2) {
+            assert!(pair[0] < pair[1], "梯子が昇順でない: {CANVAS_LADDER:?}");
+        }
+    }
+
+    /// **選んだ段は拡大にならない。** 拡大になる段を選ぶのは最小段だけ。
+    ///
+    /// これが段の選び方そのものの表明である。`canvas × fill_ratio ≤ 商品の長辺`
+    /// を満たす最大の段を選ぶので、選んだ段が条件を破っていたら——最小段で
+    /// 拡大している場合を除いて——選び方が壊れている。
+    ///
+    /// **逃がすのは倍率で見て実際に拡大した実行だけである。** 「最小段を選んだ」
+    /// で逃がすと、最小段が正しく「拡大にならない最大の段」として選ばれた実行
+    /// （商品 1000px / 1400px）まで検査から外れてしまう。
+    #[test]
+    fn the_chosen_rung_never_upscales_unless_every_rung_would() {
+        let amazon = named("amazon").unwrap();
+        let ratio = amazon.write_defaults().fill_ratio.unwrap();
+        for subject in [1u32, 400, 521, 860, 1000, 1400, 2580, 4103, 10_000] {
+            let (side, _) = amazon.canvas_for(subject, ratio);
+            let scale = f64::from(side) * ratio / f64::from(subject);
+            if scale > 1.0 {
+                // 最小段では拡大が残りうる（`CANVAS_UPSCALED` が報せる）。
+                // **逃がすのは実際に拡大した実行だけにする**——「最小段を
+                // 選んだ」で逃がすと、最小段が正しく「拡大にならない最大の段」
+                // として選ばれた実行まで検査から外れる
+                assert_eq!(
+                    side, CANVAS_LADDER[0],
+                    "商品 {subject}px で最小段でない段 {side} を選んで拡大している"
+                );
+                continue;
+            }
+            // ここへ来たのは縮小に収まった実行である。**1 つ上の段は必ず拡大に
+            // なる**（＝拡大にならない最大の段を選んでいる）
+            if let Some(next) = CANVAS_LADDER.iter().find(|r| **r > side) {
+                assert!(
+                    f64::from(*next) * ratio > f64::from(subject),
+                    "商品 {subject}px で段 {side} を選んだが {next} でも拡大にならない"
+                );
+            }
+        }
+    }
+
+    /// **天井と床に当たる。** 実測の 2 枚がちょうど両端を踏む。
+    ///
+    /// **どちらも `--profile amazon --optimize --rotate auto` で測った値である。**
+    /// 商品の長辺は切り抜きの結果なので、フラグを揃えないと 1〜2px 動く
+    /// （700x525 の素材は `--rotate auto` の無い実行では 519px になる）。
+    ///
+    /// 4284x5712 の実写は切り抜いた商品の長辺が 4103px で、拡大しない上限は
+    /// 4771px——梯子に天井が無ければ 4500 まで行ける。**天井 3000 が効いている
+    /// ことをこの素材が示す。** 700x525 の入力は商品の長辺が 521px で、
+    /// どの段も拡大になるので最小段へ落ちる。
+    #[test]
+    fn a_big_subject_hits_the_ceiling_and_a_small_one_hits_the_floor() {
+        let amazon = named("amazon").unwrap();
+        let ratio = amazon.write_defaults().fill_ratio.unwrap();
+        assert_eq!(amazon.canvas_for(4103, ratio), (3000, 3000));
+        assert_eq!(amazon.canvas_for(521, ratio), (1000, 1000));
+        // 天井が無ければ 4500 まで行ける、を数で言う
+        assert!(f64::from(4500u32) * ratio <= 4103.0);
+    }
+
+    /// **段の境界は 1 画素で飛ぶ。** 丸めても揃うとは限らない。
+    ///
+    /// `CANVAS_LADDER` の doc が「同じ段に落ちる限り揃う。段の境界を跨ぐ素材が
+    /// 混ざると揃わない」と書き、境界を 1290 / 1720 / 2150 / 2580 px と
+    /// 名指ししている。**doc に書いた数をここで実行に照らす**——境界の数だけを
+    /// 直して梯子や占有率を直し忘れた日に、doc のほうが黙って嘘になる。
+    ///
+    /// **寸法が動く境界は 4 本で、`CANVAS_LADDER` の段数より 1 つ少ない。**
+    /// 最小段は「どの段も拡大になる」ときの落とし先でもあるので、その下側に
+    /// 境界が無い——商品の長辺が 859px でも 860px でも canvas は 1000 のままで、
+    /// 動くのは倍率のほう（1.0010 → 1.0000）である。
+    #[test]
+    fn a_single_pixel_at_the_boundary_moves_the_rung() {
+        let amazon = named("amazon").unwrap();
+        let ratio = amazon.write_defaults().fill_ratio.unwrap();
+        // 商品の長辺がこの値のとき、境界の下と上で段が 1 つ動く
+        let boundaries = [(1290u32, 1500u32), (1720, 2000), (2150, 2500), (2580, 3000)];
+        for (edge, upper) in boundaries {
+            let (below, _) = amazon.canvas_for(edge - 1, ratio);
+            let (at, _) = amazon.canvas_for(edge, ratio);
+            assert_eq!(at, upper, "商品 {edge}px で段 {upper} に上がっていない");
+            assert!(
+                below < upper,
+                "商品 {}px と {edge}px が同じ段 {at} に落ちている",
+                edge - 1
+            );
+        }
+        // 最小段の下側には境界が無い。**ここに 5 本目があると読まれないように
+        // 数で言う**——落とし先が同じで、変わるのは拡大するかどうかだけである
+        assert_eq!(amazon.canvas_for(859, ratio), (1000, 1000));
+        assert_eq!(amazon.canvas_for(860, ratio), (1000, 1000));
+        assert!(f64::from(1000u32) * ratio > 859.0);
+        assert!(f64::from(1000u32) * ratio <= 860.0);
+    }
+
+    /// **同じ寸法からは同じ段が出る。** 決定性。
+    ///
+    /// 段に丸めているのは「同じ撮影セットなら同じ段に落ちて寸法が揃う」ため
+    /// なので、同じ入力が違う段へ落ちたらその目的が立たない。**揃うのは同じ段に
+    /// 落ちる限りである**（`CANVAS_LADDER` の doc）が、決定性はその前提であって、
+    /// これが崩れると段の境界を跨がない素材どうしでも揃わなくなる。
+    #[test]
+    fn the_same_subject_always_picks_the_same_rung() {
+        for p in ALL {
+            let ratio = p.write_defaults().fill_ratio.unwrap_or(0.85);
+            for subject in [300u32, 1234, 4103] {
+                let first = p.canvas_for(subject, ratio);
+                for _ in 0..4 {
+                    assert_eq!(p.canvas_for(subject, ratio), first, "{}", p.name);
+                }
+            }
+        }
+    }
+
+    /// 占有率が値域の外でも段は出る。**断るのは `canvas::plan` の仕事。**
+    ///
+    /// 断る場所を 2 つに増やすと、同じ誤りが 2 通りの文面で返る。ここは
+    /// 1.0 として選び、その実行は少し先で `INVALID_FILL_RATIO` に当たる。
+    #[test]
+    fn an_out_of_range_fill_ratio_still_yields_a_rung() {
+        let amazon = named("amazon").unwrap();
+        for bad in [0.0, -1.0, 1.5, f64::NAN] {
+            let (side, _) = amazon.canvas_for(2000, bad);
+            assert_eq!(side, 2000, "占有率 {bad} で段が出なかった");
         }
     }
 

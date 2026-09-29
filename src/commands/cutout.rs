@@ -228,13 +228,26 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     // どれも「切り抜きがどう決まったか」を語る値で、回転はその後の配置にすぎない
     let rotation = apply_rotation(&mut result.image, rotate_angle)?;
 
+    // **キャンバスへ載せる中身の範囲は 1 度だけ測る。** profile の段を選ぶのに
+    // も配置にも同じ矩形が要り、24.5MP の全画素走査を 2 度払う理由が無い。
+    // キャンバスを使わない実行では 1 度も測らない——`content_bounds` が要る
+    // のは配置か段の選択のどちらかがあるときだけである
+    let wants_canvas =
+        args.canvas.is_some() || args.profile.is_some_and(profile::Profile::decides_canvas);
+    let content = wants_canvas
+        .then(|| content_bounds(&result.image))
+        .flatten();
+    // **profile の canvas が決まるのはここである。** 切り抜きと回転が済んで
+    // いないと商品の長辺が分からない（`resolve_canvas`）
+    let canvas_size = resolve_canvas(args, content, &mut warnings);
+
     // 長辺 1000px 換算を実寸へ掛け戻す。**基準は最終画像の長辺**なので、
     // キャンバスがあればそちらが基準になり、無ければ回した後の寸法になる。
     // 元画像の長辺で換算すると、同じ指定が --canvas や --rotate の有無で
     // 違う見た目を指す
     // **反射も同じ長辺を基準にする。** 影と別の基準を持たせると、同じ
     // 「px@1000 で 150」が 2 つのノブで違う実寸を指すことになる
-    let long_side = match args.canvas {
+    let long_side = match canvas_size {
         Some((cw, ch)) => cw.max(ch),
         None => result.image.width().max(result.image.height()),
     };
@@ -247,17 +260,10 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
 
     // キャンバスを使わないときは切り抜き結果をそのまま書き出す。複製すると
     // 12MP で 48MB を余分に積み、batch の並列度ぶんだけ倍になる
-    let (placed, canvas, shadow, reflect) = match args.canvas {
+    let (placed, canvas, shadow, reflect) = match canvas_size {
         Some((cw, ch)) => {
-            let placement = place_on_canvas(
-                &result.image,
-                content_bounds(&result.image),
-                cw,
-                ch,
-                args,
-                layers,
-                &mut warnings,
-            )?;
+            let placement =
+                place_on_canvas(&result.image, content, cw, ch, args, layers, &mut warnings)?;
             (
                 Some(placement.image),
                 Some(placement.report),
@@ -479,20 +485,10 @@ fn apply_profile(args: &CutoutArgs, warnings: &mut Vec<Warning>) -> Option<Cutou
     let explicit = args.explicit;
     let mut out = args.clone();
 
-    if let Some((cw, ch)) = want.canvas {
-        if explicit.canvas {
-            let used = args.canvas.map_or(Value::Null, |(w, h)| json!([w, h]));
-            warnings.extend(overridden(
-                profile,
-                "canvas",
-                "--canvas",
-                json!([cw, ch]),
-                used,
-            ));
-        } else {
-            out.canvas = Some((cw, ch));
-        }
-    }
+    // **canvas はここで当てない。** 段の選択に切り抜き後の商品の長辺が要る
+    // ので、画像を読む前のこの関数では寸法が決まらない（`resolve_canvas`）。
+    // `want.canvas` を読まないのはそのためで、`write_defaults` が返す
+    // `CanvasChoice` は「決めるか否か」しか言わない
 
     // **優先順位は 明示指定 > set > profile > 既定。** `set` は
     // `--fill-ratio` と同じ席を争うので、どちらかがあれば profile の占有率は
@@ -634,6 +630,78 @@ fn apply_profile(args: &CutoutArgs, warnings: &mut Vec<Warning>) -> Option<Cutou
     }
 
     Some(out)
+}
+
+/// キャンバスの寸法を確定させる。**profile が決める実行では、ここが初めて
+/// 寸法を知る場所である。**
+///
+/// # なぜ `apply_profile` ではないか
+///
+/// profile の canvas は「占有率を通したときに拡大にならない最大の段」で決まり
+/// （`profile::Profile::canvas_for`）、その判断には**切り抜いて回した後の商品の
+/// 外接矩形**が要る。`apply_profile` は画像を読む前に走るので、そこでは決めら
+/// れない。`args.canvas` が読まれるのはこの後の 2 箇所（長辺の換算と配置の分岐）
+/// だけなので、遅らせても読む側から見た順序は変わらない。
+///
+/// # `PROFILE_OVERRIDDEN`（canvas）がここに来る理由
+///
+/// `--canvas` を明示した実行では「profile が求めた値」と「実際に効いた値」を
+/// 並べるが、**前者が切り抜いた後にしか分からなくなった。** そのため canvas の
+/// 1 件だけが `run()` の先頭（`profile_warnings`）ではなくここで積まれ、
+/// 結果の警告の後・キャンバス配置の警告（`SET_SCALE_CLAMPED` /
+/// `CANVAS_UPSCALED`）の前に並ぶ。
+///
+/// **他の項目の並びは変えない。** 「指示についての警告を先に出す」という規約を
+/// canvas だけが外れるのは、それが指示ではなく**結果が出てから分かる事実**に
+/// なったからである。並びとしても canvas の話が 1 箇所にまとまる。
+///
+/// # 効かせる占有率
+///
+/// 段の選択には `args.fill_ratio`——`apply_profile` を通った後の、実際に効く
+/// 占有率——を渡す。profile の値ではないのは、`--fill-ratio` で押しのけられた
+/// 実行と、占有率を規定しない規格（shopify）では効く値がそちらではないから
+/// である。
+///
+/// **`set` がある実行だけは 1.0 を渡す。** `set` の占有率は点ごとに
+/// キャンバス寸法から逆算されるので（`SetPlacement::fill_ratio`）、段を選ぶ
+/// 時点では確定しない。ここで `args.fill_ratio`（`set` がある実行では CLI の
+/// 既定 0.85 のまま）を読むと、**実効占有率がそれを超えたときに選んだ段が
+/// 「拡大にならない最大の段」でなくなる**（`align: "height"` と横長の商品、
+/// `align: "bbox"` と高い目標占有率がこれに当たる）。1.0 は最も安全側で、
+/// `canvas ≤ 商品の長辺` を満たす段しか選ばないので拡大が増えることはない。
+/// `set` の目的（占有率はキャンバス寸法から逆算される）とも整合する
+fn resolve_canvas(
+    args: &CutoutArgs,
+    content: Option<(u32, u32, u32, u32)>,
+    warnings: &mut Vec<Warning>,
+) -> Option<(u32, u32)> {
+    let Some(profile) = args.profile else {
+        return args.canvas;
+    };
+    if !profile.decides_canvas() {
+        return args.canvas;
+    }
+    // 前景が 1 画素も無い実行では最小の段になるが、この後 `place_on_canvas` が
+    // `NO_FOREGROUND` で断るので、選んだ段が成果物に出ることはない
+    let subject_long_side = content.map_or(0, |(x1, y1, x2, y2)| (x2 - x1 + 1).max(y2 - y1 + 1));
+    let fill_for_rung = if args.set.is_some() {
+        1.0
+    } else {
+        args.fill_ratio
+    };
+    let (cw, ch) = profile.canvas_for(subject_long_side, fill_for_rung);
+    if args.explicit.canvas {
+        let used = args.canvas.map_or(Value::Null, |(w, h)| json!([w, h]));
+        warnings.extend(overridden(
+            profile,
+            "canvas",
+            "--canvas",
+            json!([cw, ch]),
+            used,
+        ));
+        return args.canvas;
+    }
+    Some((cw, ch))
 }
 
 /// 出力先が**拡張子を綴っているか**。

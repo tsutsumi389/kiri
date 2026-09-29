@@ -144,13 +144,48 @@ impl IccSignal {
     }
 }
 
+/// `--quality` の既定値。**この 1 箇所だけが持ち主である。**
+///
+/// 同じ数が clap の `default_value_t`、`SaveOptions::default()`、batch spec の
+/// `unwrap_or` の 3 箇所に手書きされていた。片方だけ動かしてもコンパイルは通り、
+/// テストも「その値でたまたま通る」ので気づけない
+/// （`the_cli_defaults_match_the_library_defaults` が押さえているのと同じ罠で、
+/// quality はそこを通らない）。3 箇所ともここを引く。
+///
+/// **90 の根拠は「商品領域の PSNR が 40 dB に最も近づく q」である。** 40 dB は
+/// 視覚的無損失の目安で、実写 3 通りで q90 のときに測れたのは 39.90 dB /
+/// 40.14 dB / 42.16 dB だった（リモコン 4284x5712 の商品領域 jpeg、キーボード
+/// 3024x4032 の全面 jpeg、リモコンの avif の順）。**40 dB に届く最小の q は
+/// この 3 通りで 92 / 90 / 88** で、90 では 2 通りが届き、残る 1 通りも
+/// 39.90 dB と 0.10 dB 差である。92 へ上げるとバイトが更に 8% 増える
+/// （リモコンの jpeg が 219 → 238 KB）ので、そこまでは払わない。
+/// **形式では分けない**——同じ q でほぼ同じ PSNR が出るうえ、分けると
+/// `kiri schema` が配る `default` が単一の数で表せなくなる。
+///
+/// **払うのはバイトだけで、時間ではない。** リモコンの商品領域 jpeg は
+/// 150 KB → 219 KB、キーボード全面 jpeg は 555 KB → 940 KB、リモコンの
+/// avif は 52 KB → 129 KB。時間は 12.2MP の avif で 0.95 秒 → 1.06 秒、
+/// jpeg で 0.19 秒 → 0.20 秒。バイトを詰めたいときは `--max-bytes` を使う。
+///
+/// Phase 25 までの既定は 75 で、根拠は design.md 3.4 の「avif は 85 にすると
+/// サイズが約 4 倍」だった。**その 4 倍は合成画像でしか起きない**（同じ節が
+/// 「実画像での再計測を実装フェーズで行うこと」を宿題に残していた）。実写では
+/// avif 52 → 94 KB の 1.8 倍にとどまり、しかも上がった先の avif 129 KB は
+/// 同画質の jpeg 219 KB より小さい
+pub const DEFAULT_QUALITY: f32 = 90.0;
+
+/// `--effort` の既定値。持ち主は `DEFAULT_QUALITY` と同じ理由でここ 1 箇所。
+///
+/// 実測で effort 1 は 7.7MP の AVIF で 40 秒に達する。6 はその妥協点で、
+/// **Phase 26 でも値は動かしていない**——動かしたのは quality だけである。
+pub const DEFAULT_EFFORT: u8 = 6;
+
 #[derive(Debug, Clone)]
 pub struct SaveOptions {
     pub format: OutputFormat,
-    /// AVIF / JPEG の品質 (0-100)
+    /// AVIF / JPEG の品質 (0-100)。既定は `DEFAULT_QUALITY`
     pub quality: f32,
-    /// AVIF のエンコード速度 (1-10)。小さいほど高品質・低速。
-    /// 実測では 1 は 7.7MP で 40 秒に達するため既定は 6。
+    /// AVIF のエンコード速度 (1-10)。小さいほど高品質・低速。既定は `DEFAULT_EFFORT`
     pub effort: u8,
     /// アルファを保持できない形式へ出力する際の合成色
     pub background: [u8; 3],
@@ -164,8 +199,8 @@ impl Default for SaveOptions {
     fn default() -> Self {
         Self {
             format: OutputFormat::Avif,
-            quality: 75.0,
-            effort: 6,
+            quality: DEFAULT_QUALITY,
+            effort: DEFAULT_EFFORT,
             background: [255, 255, 255],
             flatten: false,
             icc: IccPolicy::Embed,
@@ -805,12 +840,18 @@ mod tests {
         assert_eq!(encoded(&img, OutputFormat::Png, IccPolicy::None), phase17);
     }
 
+    /// **品質は `DEFAULT_QUALITY` から引く。** ここが見ているのは「ICC を抜けば
+    /// `image` の素のエンコーダと一致する」という性質であって、特定の品質値では
+    /// ない。数を手書きしていたので Phase 26 で既定を 90 へ動かしたときだけ落ちた
     #[test]
     fn icc_none_jpeg_is_the_phase17_encoder_output() {
         let img = gradient(true);
         let rgb = flatten_onto(&img, [255, 255, 255]);
         let mut phase17 = Vec::new();
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut phase17, 75)
+        let quality = OutputFormat::Jpeg
+            .effective_quality(DEFAULT_QUALITY)
+            .expect("JPEG は品質を持つ") as u8;
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut phase17, quality)
             .write_image(&rgb, img.width(), img.height(), ExtendedColorType::Rgb8)
             .unwrap();
         assert_eq!(encoded(&img, OutputFormat::Jpeg, IccPolicy::None), phase17);

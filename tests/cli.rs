@@ -1151,6 +1151,22 @@ fn ladder() -> &'static [f32] {
     kiri::image_io::derive::QUALITY_LADDER
 }
 
+/// `--quality` の既定。**梯子と同じ理由で実装の定数をそのまま引く。**
+/// ここを手書きしていたので、Phase 26 で 75 → 90 へ動かしたときに
+/// 「梯子を降りたか」を見ているだけのテストまで落ちた
+fn default_quality() -> f32 {
+    kiri::image_io::DEFAULT_QUALITY
+}
+
+/// 既定の `--quality` から降りる段（要求品質より小さい段）。
+fn rungs_below_default() -> Vec<f32> {
+    ladder()
+        .iter()
+        .copied()
+        .filter(|&q| q < default_quality())
+        .collect()
+}
+
 /// `convert` を 1 回回して結果 JSON を返す。
 fn convert_json(input: &Path, output: &Path, extra: &[&str]) -> Value {
     let mut args = vec![
@@ -1188,8 +1204,8 @@ fn reachable_budgets(input: &Path, output: &Path, format: &str) -> [u64; 2] {
             .as_u64()
             .unwrap()
     };
-    // 要求品質は CLI の既定（75）、下限は梯子のいちばん下の段
-    let baseline = at("75");
+    // 要求品質は CLI の既定、下限は梯子のいちばん下の段
+    let baseline = at(&default_quality().to_string());
     let floor = at(&ladder().last().unwrap().to_string());
     assert!(
         floor < baseline,
@@ -1237,7 +1253,7 @@ fn a_reachable_budget_always_lands_under_the_limit() {
 
             let quality = out["quality_used"].as_f64().unwrap() as f32;
             assert!(
-                ladder().contains(&quality) && quality < 75.0,
+                ladder().contains(&quality) && quality < default_quality(),
                 "{label}: {quality} は要求品質より下の梯子の段ではない"
             );
             assert!(out["attempts"].as_u64().unwrap() > 1, "{label}: {out}");
@@ -1271,12 +1287,56 @@ fn the_quality_reduced_warning_carries_every_number() {
     let data = &warning["data"];
     let out = &v["outputs"][0];
 
-    assert_eq!(data["requested"], 75.0);
+    assert_eq!(data["requested"], default_quality());
     assert_eq!(data["quality_used"], out["quality_used"]);
     assert_eq!(data["max_bytes"], max);
     assert_eq!(data["bytes"], out["bytes"]);
     assert_eq!(data["attempts"], out["attempts"]);
     assert_eq!(data["format"], "jpeg");
+}
+
+/// 既定の `--quality` から降りはじめる段が、梯子の**最上段**であること。
+///
+/// Phase 26 で既定が 75 → 90 へ上がり、**梯子（85 が最上段）の全体が要求品質より
+/// 下に来た。** 梯子そのものは 1 段も動かしていない——梯子は「降りる先」の集合で、
+/// 出発点が上がったことと段の位置は別の話である。変わったのは
+/// 「85 も降りる先になった」ことだけで、それをここで固定する。
+///
+/// 上限は最上段で実際に書けたバイト数をそのまま使う。割合で決め打ちにすると
+/// 素材が変わったときに降りる段数が変わって意味を失う
+#[test]
+fn the_search_starts_from_the_top_rung_of_the_ladder() {
+    let dir = fixture_dir();
+    let input = budget_input(dir.path());
+    let output = dir.path().join("top.jpg");
+
+    let top = ladder()[0];
+    assert!(
+        top < default_quality(),
+        "梯子の最上段 {top} が既定 {} より上にある",
+        default_quality()
+    );
+
+    let bytes = |extra: &[&str]| {
+        convert_json(&input, &output, extra)["outputs"][0]["bytes"]
+            .as_u64()
+            .unwrap()
+    };
+    let at_top = bytes(&["--quality", &top.to_string()]);
+    let at_default = bytes(&[]);
+    assert!(
+        at_top < at_default,
+        "既定と最上段で大きさが変わらない素材では梯子の 1 段目を試せない（{at_top} / {at_default}）"
+    );
+
+    let v = convert_json(&input, &output, &["--max-bytes", &at_top.to_string()]);
+    let out = &v["outputs"][0];
+    assert_eq!(
+        out["quality_used"], top,
+        "最初に降りる段が最上段ではない: {v}"
+    );
+    assert_eq!(out["attempts"], 2, "要求品質の 1 回 + 最上段の 1 回: {out}");
+    assert!(has_warning(&v, "QUALITY_REDUCED"), "{v}");
 }
 
 /// 受け入れ基準 (b)。**未達なら要求品質のものを書く。**
@@ -1302,9 +1362,9 @@ fn an_unreachable_budget_writes_the_requested_quality_file() {
 
     let out = &v["outputs"][0];
     assert_eq!(out["bytes"], plain["outputs"][0]["bytes"]);
-    assert_eq!(out["quality_used"], 75.0, "要求品質へ戻る");
-    // 要求品質の 1 回 + 75 より下の 5 段（65 / 55 / 45 / 35 / 25）
-    assert_eq!(out["attempts"], 6);
+    assert_eq!(out["quality_used"], default_quality(), "要求品質へ戻る");
+    // 要求品質の 1 回 + 既定より下の段（既定 90 なら 85 / 75 / 65 / 55 / 45 / 35 / 25 の 7 段）
+    assert_eq!(out["attempts"], 1 + rungs_below_default().len() as u64);
 
     let warning = v["warnings"]
         .as_array()
@@ -1322,7 +1382,13 @@ fn an_unreachable_budget_writes_the_requested_quality_file() {
         smallest > 64 && smallest <= out["bytes"].as_u64().unwrap(),
         "あとどれだけ足りないかを言えていない: {data}"
     );
-    assert!(data["smallest_quality"].as_f64().unwrap() <= 75.0);
+    // **未達なので梯子は最下段まで降りきっている。** `<= 75` だと旧既定の
+    // 名残りで、降りきったことを言えていない（実際に来るのは最下段の 25）
+    assert_eq!(
+        data["smallest_quality"].as_f64().unwrap() as f32,
+        *ladder().last().unwrap(),
+        "未達なのに梯子を降りきっていない: {data}"
+    );
     assert!(warning["hint"].is_string(), "次の一手が要る: {warning}");
 }
 
@@ -8531,6 +8597,71 @@ fn the_cli_defaults_match_the_library_defaults() {
     );
 }
 
+/// `--quality` / `--effort` の既定値が、実装側の 3 箇所で 1 つの定数に揃っていること。
+///
+/// 上の `the_cli_defaults_match_the_library_defaults` は `CutoutOptions` を通る
+/// つまみしか見ていない。出力側の 2 つは `OutputOpts` にあって、同じ数が
+/// clap の `default_value_t` / `SaveOptions::default()` / batch spec の
+/// `unwrap_or` の 3 箇所に手書きされていた。**ここは前 2 者を突き合わせ、
+/// 3 つ目は `the_spec_defaults_for_the_quality_match_the_cli` が外から押さえる。**
+#[test]
+fn the_cli_defaults_for_the_output_match_the_library_defaults() {
+    use clap::Parser;
+    use kiri::cli::{Cli, Command as CliCommand};
+    use kiri::image_io::{DEFAULT_EFFORT, DEFAULT_QUALITY, SaveOptions};
+
+    let cli = Cli::parse_from(["kiri", "convert", "in.png", "-o", "out.avif"]);
+    let CliCommand::Convert(args) = cli.command else {
+        panic!("convert として解釈されていない");
+    };
+    let defaults = SaveOptions::default();
+
+    assert_eq!(args.out.quality, DEFAULT_QUALITY, "--quality の既定値");
+    assert_eq!(
+        defaults.quality, DEFAULT_QUALITY,
+        "SaveOptions が定数を引いていない"
+    );
+    assert_eq!(args.out.effort, DEFAULT_EFFORT, "--effort の既定値");
+    assert_eq!(
+        defaults.effort, DEFAULT_EFFORT,
+        "SaveOptions が定数を引いていない"
+    );
+}
+
+/// spec を通した品質の既定値が、CLI の既定値と食い違わないこと。
+///
+/// `the_spec_defaults_for_the_reflection_match_the_cli`（Phase 25）と同じ形の
+/// 突き合わせを quality にも置く。**spec は clap を通らない**ので、
+/// `commands/batch.rs` の `unwrap_or` だけが取り残されてもコンパイルは通る。
+/// JPEG を選ぶのは、PNG が品質を持たず `quality_used` が null になるため。
+#[test]
+fn the_spec_defaults_for_the_quality_match_the_cli() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "a.png", &img);
+
+    let cli = cutout_on_canvas(dir.path(), &input, "cli.jpg", &["--canvas", "1000"]);
+    let spec = write_spec(
+        dir.path(),
+        r#"{"items":[{"input":"a.png","output":"spec.jpg","canvas":"1000"}]}"#,
+    );
+    let out = run_batch(&spec, &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        json_stdout(&out)["results"][0]["result"]["outputs"][0]["quality_used"],
+        cli["outputs"][0]["quality_used"],
+        "spec の既定値が CLI と食い違っている"
+    );
+}
+
 /// `--help` が語る既定値が `DEFAULT_EDGE_THRESHOLD` と食い違っていないこと。
 ///
 /// `--edge-threshold` の既定値は clap の `default_value_t` に無く、ヘルプの
@@ -14341,6 +14472,203 @@ fn a_derivation_that_leaves_the_profile_dimensions_says_so_one_by_one() {
     assert_eq!(lint_check(&big_result, "longest_side")["status"], "pass");
 }
 
+/// **profile のキャンバスは入力から決まる**（Phase 26）。
+///
+/// Phase 22〜25 は固定の 1600x1600 だった。固定値である限り、入力が大きければ
+/// 情報を捨て（実写 4284x5712 で倍率 0.3354）、小さければ捏造する
+/// （700x525 で倍率 2.6411）。**どちらかが必ず起きる。**
+///
+/// ここで見るのは 3 つ。**大きい素材では段が上がること**、**小さい素材では
+/// 最小段に落ちること**、そして**どの段も `kiri lint` を通ること**である。
+/// 段そのものの選び方（`canvas × fill_ratio ≤ 商品の長辺` を満たす最大の段）は
+/// `profile::canvas_for` の単体テストが持つので、ここは**実行を通したときに
+/// その判断が本当に成果物へ出る**ことだけを固定する。
+///
+/// 期待する段を数で書くのは、`profile::CANVAS_LADDER` を読んで計算し直すと
+/// **テストが実装と同じ式を 2 度書く**ことになるからである（それでは梯子ごと
+/// 差し替えた誤りを 1 つも捕まえられない）。
+#[test]
+fn the_profile_canvas_follows_the_subject_size() {
+    let dir = fixture_dir();
+    // `product_image` の商品は幅 0.56・高さ 0.68 の角丸で、外接矩形はその寸法に
+    // なる。縦長の素材を採るのは、**天井に当たる長辺（2580px 以上）を
+    // 3.2MP で作れる**ためである（正方形なら 14MP 要る）
+    let cases = [
+        // 入力寸法, 商品の長辺, 期待する段
+        ((800u32, 4000u32), 2720u32, 3000u32),
+        ((2000, 2000), 1360, 1500),
+        ((300, 300), 204, 1000),
+    ];
+
+    for ((w, h), subject, want_side) in cases {
+        let input = write_jpeg(
+            dir.path(),
+            &format!("p{w}x{h}.jpg"),
+            &product_image(&ProductSpec {
+                width: w,
+                height: h,
+                ..Default::default()
+            }),
+        );
+        let output = dir.path().join(format!("o{w}x{h}.jpg"));
+        let out = kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--json",
+                "--profile",
+                "amazon",
+            ])
+            .output()
+            .unwrap();
+        let v = json_stdout(&out);
+        assert_eq!(out.status.code(), Some(0), "{v}");
+        assert_eq!(
+            v["canvas"]["width"], want_side,
+            "{w}x{h}（商品の長辺 {subject}px）が選んだ段が違う: {}",
+            v["canvas"]
+        );
+        assert_eq!(v["canvas"]["height"], want_side, "{}", v["canvas"]);
+
+        let scale = v["canvas"]["scale"].as_f64().unwrap();
+        if want_side == 1000 {
+            // 最小段でも足りない素材では拡大が残る。**「拡大しなくなる」のでは
+            // なく、倍率が下がる**——キャンバス配置で拡大を禁止しないという
+            // 方針（docs/design.md 5.8）は変えていない
+            assert!(scale > 1.0, "{w}x{h}: 最小段なのに拡大していない: {scale}");
+            assert!(has_warning(&v, "CANVAS_UPSCALED"), "{v}");
+            // **拡大した実行は lint まで通さない。** 4 倍に伸ばした縁は
+            // 白へ溶け、lint が色で測る外接矩形が計画より痩せる（この素材で
+            // 占有率 0.86 → 0.828）。**段の選び方とは無関係で、`--canvas`
+            // 1000 / 1600 / 2000 のどれを明示しても同じ 0.828 になる**ので、
+            // ここで落とすと Phase 26 が壊したように読める
+            continue;
+        }
+        assert!(scale <= 1.0, "{w}x{h}: 段を上げたのに拡大した: {scale}");
+        assert!(!has_warning(&v, "CANVAS_UPSCALED"), "{v}");
+
+        // **選んだ段が規格の外へ出ない。** 押し込みが効いていることを、
+        // 組み立てた `Facts` ではなく書いたファイルで見る
+        let (code, linted) = lint(&output, "amazon");
+        assert_eq!(
+            code,
+            0,
+            "{w}x{h}: 段 {want_side} で書いたものが amazon の lint で落ちた: {:?}",
+            not_passing(&linted)
+        );
+    }
+}
+
+/// **小さい素材の拡大は、固定 1600 だった頃より必ず小さくなる**（Phase 26）。
+///
+/// 最小段でも拡大は消えない。消えないので「拡大しなくなった」とは言えず、
+/// 言えるのは**倍率が下がる**ことだけである。それを、当時の値を書き写さずに
+/// `--canvas 1600x1600` を明示した同じ実行との比較で言う——1600 を数で
+/// 埋め込むと、そこだけが**もう誰も参照していない過去の既定**の写しになる。
+#[test]
+fn the_smallest_rung_upscales_less_than_the_old_fixed_canvas() {
+    let dir = fixture_dir();
+    let input = write_jpeg(
+        dir.path(),
+        "tiny.jpg",
+        &product_image(&ProductSpec {
+            width: 300,
+            height: 300,
+            ..Default::default()
+        }),
+    );
+
+    let scale_of = |output: &Path, extra: &[&str]| -> f64 {
+        let mut args = vec![
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--json",
+            "--profile",
+            "amazon",
+        ];
+        args.extend_from_slice(extra);
+        let out = kiri().args(&args).output().unwrap();
+        let v = json_stdout(&out);
+        assert_eq!(out.status.code(), Some(0), "{v}");
+        assert!(has_warning(&v, "CANVAS_UPSCALED"), "{v}");
+        v["canvas"]["scale"].as_f64().unwrap()
+    };
+
+    let chosen = scale_of(&dir.path().join("chosen.jpg"), &[]);
+    let fixed = scale_of(&dir.path().join("fixed.jpg"), &["--canvas", "1600x1600"]);
+    assert!(
+        chosen < fixed,
+        "段を選んでも倍率が下がっていない: {chosen} >= {fixed}"
+    );
+}
+
+/// **`PROFILE_OVERRIDDEN` が名乗る canvas は入力ごとに違う**（Phase 26）。
+///
+/// `an_explicit_option_beats_the_profile_and_actually_takes_effect` は
+/// `data.used` が明示した値であることを見るが、`data.profile`——**profile が
+/// 求めた値**——のほうは 1 つの素材でしか見ていない。固定値のうちはそれで
+/// 足りたが、入力依存になった後は「求めた値が入力から決まっている」ことを
+/// 言わないと、`data.profile` に定数が残っていても赤にならない。
+///
+/// 同じ `--canvas` を 2 つの素材へ当て、**`used` は同じで `profile` が違う**
+/// ことを見る。どちらの値も書かずに関係だけで言えるので、段を組み替えても
+/// この表明は生き残る。
+#[test]
+fn the_overridden_canvas_the_profile_wanted_depends_on_the_input() {
+    let dir = fixture_dir();
+    let wanted = |w: u32, h: u32| -> Value {
+        let input = write_jpeg(
+            dir.path(),
+            &format!("ov{w}x{h}.jpg"),
+            &product_image(&ProductSpec {
+                width: w,
+                height: h,
+                ..Default::default()
+            }),
+        );
+        let output = dir.path().join(format!("ov{w}x{h}-out.jpg"));
+        let out = kiri()
+            .args([
+                "cutout",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+                "--json",
+                "--profile",
+                "amazon",
+                "--canvas",
+                "640x480",
+            ])
+            .output()
+            .unwrap();
+        let v = json_stdout(&out);
+        assert_eq!(out.status.code(), Some(0), "{v}");
+        // 明示した値が実際に効いている（`used` が言うだけでは足りない）
+        assert_eq!(v["outputs"][0]["width"], 640, "{v}");
+        assert_eq!(v["outputs"][0]["height"], 480, "{v}");
+        let warning = v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["code"] == "PROFILE_OVERRIDDEN" && w["data"]["key"] == "canvas")
+            .unwrap_or_else(|| panic!("canvas の PROFILE_OVERRIDDEN が無い: {v}"))
+            .clone();
+        assert_eq!(warning["data"]["used"], Value::from(vec![640, 480]));
+        warning["data"]["profile"].clone()
+    };
+
+    let small = wanted(300, 300);
+    let large = wanted(2000, 2000);
+    assert_ne!(
+        small, large,
+        "profile が求めた canvas が入力で変わっていない: {small} / {large}"
+    );
+}
+
 /// **`--profile` を渡さない実行は 1 バイトも変わらない。**
 ///
 /// Phase 21 の `no_fail_on_means_no_compliance_block_and_no_new_exit_code` と
@@ -14568,8 +14896,15 @@ fn what_a_profile_writes_passes_the_same_profiles_lint_even_when_it_upscales() {
         let ext = rules["formats"][0].as_str().unwrap();
 
         // 素材が小さいほど倍率が上がる。`product_image` の主体は常に高さの
-        // 0.68 を占めるので、1600px のキャンバスでは倍率がおよそ 1376/(0.68*S)
-        // になる——300px で 6 台、900px で 2 台である
+        // 0.68 を占めるので、キャンバスの 1 辺 C に対して倍率はおよそ
+        // C*0.86/(0.68*S) になる。
+        //
+        // **Phase 26 で C が 1600 固定でなくなったぶん、倍率は下がった。**
+        // ここで使う素材はどれも小さく、梯子のどの段も拡大になるので床の
+        // 1000 が選ばれる——実測で 300px が 4.1951、400px が 3.2084、
+        // 600px が 2.1078、900px が 1.4185 である（1600 固定の当時は
+        // 300px で 6 台、900px で 2 台だった）。**下がったのは改善である**
+        // ——拡大は情報の捏造で、Amazon の規格文も禁じている側である
         for side in [300u32, 400, 600, 900] {
             let input = write_jpeg(
                 dir.path(),
@@ -14608,7 +14943,7 @@ fn what_a_profile_writes_passes_the_same_profiles_lint_even_when_it_upscales() {
                 .as_f64()
                 .unwrap_or_else(|| panic!("{name} / {side}px: canvas が無い: {written}"));
             assert!(
-                scale > 1.5,
+                scale > 1.4,
                 "{name} / {side}px: 拡大していないので回帰を踏まない: 倍率 {scale}"
             );
             assert!(
@@ -15584,4 +15919,71 @@ fn a_set_overrides_the_profile_fill_ratio_and_says_so() {
         v["results"][0]["result"]["canvas"]["fill_ratio"], 0.6,
         "{v}"
     );
+}
+
+/// **`set` がある実行でも、profile が選ぶ段は拡大しない**（Phase 26）。
+///
+/// 段の選択は `canvas × fill_ratio ≤ 商品の長辺` を解くが、**`set` がある実行の
+/// `--fill-ratio` は CLI の既定 0.85 のままである**——実際に `canvas::plan` へ
+/// 行くのは `set.fill_ratio(content, canvas)` のほうで、`align: "height"` と
+/// 横長の商品ではそれが 0.85 を超える。超えた分だけ段が拡大側へ外れる
+/// （上限は 1/0.85 = 1.18 倍）。
+///
+/// そこで `set` があるときは段の選択に 1.0 を渡している。**最も安全側で、
+/// 拡大は絶対に増えない。** ここで固定するのはその帰結——「拡大しない段が
+/// 梯子にあるなら、`set` があっても拡大しない」——であって、1.0 という実装の
+/// 綴りそのものではない。
+#[test]
+fn a_set_does_not_push_the_chosen_rung_into_upscaling() {
+    let dir = fixture_dir();
+    // 横長の商品。`product_image` は幅 0.56・高さ 0.68 で描くので、
+    // 2320x1180 なら外接矩形はおよそ 1299x802 になる。**縦横比 1.6 が要る**
+    // ——`align: "height"` の実効占有率は `T × max(1, cw/ch)` なので、
+    // 横長でなければ 0.85 を超えない
+    write_png(
+        dir.path(),
+        "wide.png",
+        &product_image(&ProductSpec {
+            width: 2320,
+            height: 1180,
+            noise: false,
+            ..Default::default()
+        }),
+    );
+    let spec = write_spec(
+        dir.path(),
+        r#"{"set":{"align":"height","fill_ratio":0.6},
+             "defaults":{"profile":"amazon"},
+             "items":[{"input":"wide.png","output":"out/a.jpg"}]}"#,
+    );
+    let out = run_batch(&spec, &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    let result = &v["results"][0]["result"];
+    let canvas = &result["canvas"];
+
+    // 実効占有率は 0.85 を超えている。**超えていなければこのテストは
+    // 何も検査していない**ので、前提のほうを先に固定する
+    let effective = canvas["fill_ratio"].as_f64().unwrap();
+    assert!(
+        effective > 0.85,
+        "前提が崩れている（実効占有率が 0.85 を超えていない）: {canvas}"
+    );
+
+    let scale = canvas["scale"].as_f64().unwrap();
+    assert!(scale <= 1.0, "set のある実行で段が拡大側へ外れた: {canvas}");
+    assert!(
+        !has_warning(result, "CANVAS_UPSCALED"),
+        "拡大しない段が梯子にあるのに拡大した: {result}"
+    );
+    // 商品の長辺 1299px では、1.0 を通すと 1000 が最大の段になる
+    // （1500 は 1500 > 1299 で外れる）。0.85 を通していた頃は 1500 を選び、
+    // 倍率 1.125 で拡大していた
+    assert_eq!(canvas["width"], 1000, "{canvas}");
+    assert_eq!(canvas["height"], 1000, "{canvas}");
 }

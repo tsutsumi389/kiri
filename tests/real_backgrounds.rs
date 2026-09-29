@@ -1229,7 +1229,7 @@ fn print_the_stage_table() {
         let result = cutout(&truth.image, opts);
         let m = common::measure_edges_with(truth, &result.image, &result.mask, opts.bbox, None);
         println!(
-            "{label:<34} {stage:<12} {:>9.2} {:>8.3} {:>9.3} {:>8.4} {:>7} {:>8} {:>8} {:>9} r={:?}",
+            "{label:<34} {stage:<12} {:>9.2} {:>8.3} {:>9.4} {:>8.4} {:>7} {:>8} {:>8} {:>9} r={:?}",
             m.contour_error,
             m.rim_truth,
             m.alpha_mae,

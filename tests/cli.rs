@@ -14526,6 +14526,119 @@ fn what_a_profile_writes_passes_the_same_profiles_lint_end_to_end() {
     }
 }
 
+/// **拡大して配置したものも、同じ profile の lint を通る。**
+///
+/// 上の往復は 2000px の素材で走らせており、コメントがそう宣言しているとおり
+/// **拡大を 1 度も踏まない。** ところが不足は拡大したときにだけ現れた。
+///
+/// # 何が起きていたか
+///
+/// キャンバスへ載せる矩形（`content_bounds`、アルファが 0 でない画素）には、
+/// フェザーと境界帯が残す**見えない縁**が片側 5〜6px 含まれる。下地へ落とせば
+/// 下地の色そのものなので `kiri lint` には見えず、測る矩形は狙った占有率より
+/// 痩せる。痩せる幅は縁の厚み × 倍率 ÷ キャンバスの 1 辺なので、**倍率が
+/// そのまま不足の係数になる。** `--profile amazon`（1600px / 0.86）で
+/// 300px の素材を通すと倍率 6.4 で、lint は 0.837 を測って
+/// `PROFILE_VIOLATION` を返していた（0.85 が下限）。
+///
+/// 直したのは書く側で、占有率を**見える範囲**で数えるようにした
+/// （`cutout::visible_fill_correction`）。
+///
+/// # なぜ倍率を 4 通り踏むか
+///
+/// 不足は倍率に比例するので、1 通りだけでは「その倍率までは足りている」しか
+/// 言えない。**回帰した倍率（6 台）と、当時も通っていた倍率（2 台）の両方を
+/// 踏む**——直した結果として拡大しない側が壊れていないことも同じテストで見る。
+///
+/// # 占有率の下限を規定する規格だけを回す
+///
+/// 規定の無い規格（shopify）では `fill_ratio` の行がそもそも出ないので、
+/// この往復で守れるものが無い（`a_tightly_cropped_profile_output_...` と
+/// 同じ切り方である）。
+#[test]
+fn what_a_profile_writes_passes_the_same_profiles_lint_even_when_it_upscales() {
+    let dir = fixture_dir();
+
+    for name in ["amazon", "square-white"] {
+        let rules = profile_rules(name);
+        let min = match rules["fill_ratio_min"].as_f64() {
+            Some(min) => min,
+            None => continue,
+        };
+        let ext = rules["formats"][0].as_str().unwrap();
+
+        // 素材が小さいほど倍率が上がる。`product_image` の主体は常に高さの
+        // 0.68 を占めるので、1600px のキャンバスでは倍率がおよそ 1376/(0.68*S)
+        // になる——300px で 6 台、900px で 2 台である
+        for side in [300u32, 400, 600, 900] {
+            let input = write_jpeg(
+                dir.path(),
+                &format!("{name}_{side}.jpg"),
+                &product_image(&ProductSpec {
+                    width: side,
+                    height: side,
+                    ..Default::default()
+                }),
+            );
+            let output = dir.path().join(format!("{name}_{side}.{ext}"));
+            let out = kiri()
+                .args([
+                    "cutout",
+                    input.to_str().unwrap(),
+                    "-o",
+                    output.to_str().unwrap(),
+                    "--json",
+                    "--profile",
+                    name,
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "{name} / {side}px: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let written = json_stdout(&out);
+
+            // **拡大したことを確かめてから合否を見る。** 素材の大きさや
+            // `product_image` の構図が変われば倍率は動くので、ここが 1.0 の
+            // ままだとテストは緑のまま何も踏まなくなる
+            let scale = written["canvas"]["scale"]
+                .as_f64()
+                .unwrap_or_else(|| panic!("{name} / {side}px: canvas が無い: {written}"));
+            assert!(
+                scale > 1.5,
+                "{name} / {side}px: 拡大していないので回帰を踏まない: 倍率 {scale}"
+            );
+            assert!(
+                has_warning(&written, "CANVAS_UPSCALED"),
+                "{name} / {side}px: 拡大したのに報せていない: {written}"
+            );
+
+            let (code, v) = lint(&output, name);
+            assert_eq!(
+                code,
+                0,
+                "{name} / {side}px（倍率 {scale:.2}）: profile で書いたものが\
+                 同じ profile の lint で落ちた: {:?}",
+                not_passing(&v)
+            );
+            // **測った数まで見る。** exit 0 だけでは、`fill_ratio` の行が
+            // `unmeasurable` にならなかったことしか言えない
+            let check = lint_check(&v, "fill_ratio");
+            assert_eq!(check["status"], "pass", "{name} / {side}px: {check}");
+            let measured = check["actual"]["value"]
+                .as_f64()
+                .unwrap_or_else(|| panic!("{name} / {side}px: 占有率が無い: {check}"));
+            assert!(
+                measured >= min,
+                "{name} / {side}px（倍率 {scale:.2}）: 占有率 {measured} が下限 {min} を下回る"
+            );
+        }
+    }
+}
+
 /// **占有率を極端に寄せて書いたものも、同じ profile の lint を通る。**
 ///
 /// 上の往復は `--fill-ratio` を profile の既定（0.85）に任せているので、

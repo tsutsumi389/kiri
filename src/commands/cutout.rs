@@ -10,13 +10,16 @@ use std::time::Instant;
 use serde_json::{Value, json};
 
 use crate::batch::SetPlacement;
-use crate::cli::{CutoutArgs, Polygon, RotateArg};
+use crate::cli::{CutoutArgs, OutputOpts, Polygon, RotateArg};
+use crate::color::lab::{delta_e76_f32, linear_to_lab, srgb_linear_lut};
 use crate::color::normalize;
 use crate::commands::output::{self, round4};
 use crate::commands::segment;
+use crate::cutout::background::UNIFORM_DELTA_E;
 use crate::cutout::constraints::{
     ALPHA_BACKGROUND, ALPHA_FOREGROUND, MASK_THRESHOLD, TRIMAP_BACKGROUND, TRIMAP_FOREGROUND,
 };
+use crate::cutout::mask::FOREGROUND_THRESHOLD;
 use crate::cutout::optimize;
 use crate::cutout::subject::TILT_SHAPE_MIN_FILL;
 use crate::cutout::{
@@ -765,7 +768,7 @@ fn tag_derivation(warning: Warning, role: Option<&str>) -> Warning {
 /// ことになるが、照らす値そのものは `Rules` の 1 つの表から読む。
 fn derivation_size_warnings(
     profile: &profile::Profile,
-    opts: &crate::cli::OutputOpts,
+    opts: &OutputOpts,
     source: (u32, u32),
 ) -> Vec<Warning> {
     let rules = &profile.rules;
@@ -1371,6 +1374,185 @@ fn content_bounds(image: &image::RgbaImage) -> Option<(u32, u32, u32, u32)> {
     found.then_some((min.0, min.1, max.0, max.1))
 }
 
+/// 下地へ落としたときに**背景と見分けが付く**範囲。
+///
+/// `content_bounds` はアルファが 1 でも中身として数える（フェザーを切ると
+/// 輪郭がギザギザに戻る、という理由がそちらに書いてある）。ところが
+/// **アルファ 1 の画素を下地へ落とせば下地の色そのもの**で、書き出した
+/// ファイルからは背景と区別できない。占有率を数えるときはここで測った範囲を
+/// 使う——なぜそうしなければならないかは `visible_fill_correction` に書いた。
+///
+/// 判定は「落とした色と下地の ΔE76 が `UNIFORM_DELTA_E` を超えるか」。
+/// **新しいしきい値を置かない**——これは `kiri lint` が主体を見立てるのに
+/// 使っているしきい値の下限そのもので（`detect_subject` は
+/// `max(外周 ΔE p90, UNIFORM_DELTA_E)` を採る）、同じ問いに 2 つ目の数を
+/// 置けば書く側と見る側がまた離れる。下地を塗ったキャンバスでは外周が
+/// 1 色なので p90 はほぼ 0 で、両者は同じ数になる。
+///
+/// 色の判定だけで測ると、ここで出る矩形は**アルファ 13〜16 で切った矩形と
+/// 一致する**（合成シーン 5 枚で確認。`visible_fill_correction` の表を参照）。
+/// それでもアルファのしきい値で書かないのは、見えるかどうかが商品の色に
+/// 依るためである——白に近い商品はアルファ 60 でも見えない。
+///
+/// # 前景の芯は見えなくても数える
+///
+/// **床を張らないと、胴体が背景と同じ色の商品で矩形が点まで縮む。**
+/// 400x400 の白地に 250,250,250 の矩形（白から ΔE 1.7）を置き、中央に
+/// 20px の黒い点だけを入れた画像を `--profile amazon --tolerance 1` へ
+/// 通すと、見える画素はその点だけなので占有率が 1.0 で止まり、
+/// `content` が 1376x1376 ではなく **1600x1600**（余白ゼロ）になった。
+///
+/// そこで `FOREGROUND_THRESHOLD` 以上のアルファを持つ画素は、下地の上で
+/// 見えなくても数える。**補正が受け持つのは芯の外にあるフェザーだけ**で、
+/// 芯そのものを「見えない」と言い出す権限は無い——`Mask::stats` の `bbox` が
+/// 同じしきい値で「商品はここにある」と答えている。
+///
+/// # 合成は書き出しとまったく同じ整数式で行う
+///
+/// `save::flatten_onto` と同じ `(fg*a + bg*(255-a) + 127) / 255` を使う。
+/// 予測しているのは**書き出したファイルの画素**なので、そこと別の式で
+/// 丸めると縁 1 画素ぶん答えが動きうる。キャンバスへ下地を塗る経路
+/// （`canvas::over`）は切り捨てなので 1 だけ違うが、ΔE 5 の境目がそれで
+/// 動くことはない。
+///
+/// # 外側から内へ舐める
+///
+/// 見える範囲は切り詰めた矩形にほぼ等しい（縁は片側 5〜6px）ので、4 回の
+/// 走査はどれも数行・数列で止まる。実写 24.5MP（crop は 4025x1240 = 4.99MP）を
+/// `--profile amazon` へ通した実測で、**同じ矩形を返しながら 5.42s から
+/// 5.32s へ縮む**（全画素を舐める形 / 外側から舐める形。3 回の中央値）。
+/// ΔE も `srgb_linear_lut` から組んで `powf` を通さない。
+///
+/// この形にすると補正そのものの費用は書き出しの揺れに埋もれる。同じ素材を
+/// `--canvas 1600` で PNG へ書いた実測が 5.39s（補正なし）と 5.36s
+/// （`--flatten`、補正あり）で、**差は取れない**（不透明な PNG のほうが
+/// エンコードが軽いぶんも混ざる）。
+fn visible_bounds(image: &image::RgbaImage, background: [u8; 3]) -> Option<(u32, u32, u32, u32)> {
+    let lut = srgb_linear_lut();
+    let linear = |v: u8| lut[usize::from(v)];
+    let background_lab = linear_to_lab(background.map(linear));
+    let tolerance = UNIFORM_DELTA_E as f32;
+
+    let visible = |x: u32, y: u32| -> bool {
+        let p = image.get_pixel(x, y).0;
+        if p[3] >= FOREGROUND_THRESHOLD {
+            return true;
+        }
+        let a = u32::from(p[3]);
+        let mixed = [0usize, 1, 2].map(|c| {
+            let v = (u32::from(p[c]) * a + u32::from(background[c]) * (255 - a) + 127) / 255;
+            linear(v as u8)
+        });
+        delta_e76_f32(linear_to_lab(mixed), background_lab) > tolerance
+    };
+
+    let (w, h) = (image.width(), image.height());
+    // 上端と下端を決めてから、その行の範囲だけで左右を決める。見える画素は
+    // すべて `y1..=y2` の中にあるので、全画素を舐めた結果と同じ矩形になる
+    let y1 = (0..h).find(|&y| (0..w).any(|x| visible(x, y)))?;
+    let y2 = (y1..h).rev().find(|&y| (0..w).any(|x| visible(x, y)))?;
+    let x1 = (0..w).find(|&x| (y1..=y2).any(|y| visible(x, y)))?;
+    let x2 = (x1..w).rev().find(|&x| (y1..=y2).any(|y| visible(x, y)))?;
+    Some((x1, y1, x2, y2))
+}
+
+/// 書き出したファイルが不透明になるか。**`kiri lint` がどちらの物差しで
+/// 占有率を測るかがこれで決まる。**
+///
+/// lint はアルファが残っていればアルファの外接矩形で測り、残っていなければ
+/// 色で見立てた主体で測る（`lint::measure_pixels` がそう分岐している）。
+/// **書く側はその分岐に合わせる**——透過を残す実行では `content_bounds` が
+/// lint の測るものとぴたり同じなので、補正すると逆に外れる。
+///
+/// JPEG は `--flatten` を書かなくても `save` が潰す（透過を扱えない形式へ
+/// 出すときは否応なく塗る、という規約が `save::write` にある）。潰す色は
+/// どちらの道でも `--background` なので、ここは形式も一緒に見る。
+///
+/// **派生（`--derive`）が形式を変える実行は見ていない。** 配置は 1 つしか
+/// 無いのに派生ごとに透過の有無が変わりうるので、1 つの配置で両方へ
+/// 合わせることは原理的にできない。ここは本出力の形式で決める。
+fn writes_opaque(out: &OutputOpts) -> bool {
+    out.flatten
+        || out
+            .format
+            .or_else(|| OutputFormat::from_path(&out.output))
+            .is_some_and(|f| !f.supports_alpha())
+}
+
+/// 見えない縁のぶんだけ占有率を上へ寄せる係数。補正が要らないなら `None`。
+///
+/// # 直している失敗
+///
+/// **`--profile amazon` で書いたものが同じ amazon の `kiri lint` で
+/// `fill_ratio` に落ちていた。** `FILL_RATIO_MARGIN` の doc が「最も高くつく
+/// 失敗」と呼んでいるものそのもので、**商品を拡大して配置したときだけ**
+/// 起きていた。
+///
+/// 原因は物差しの食い違いである。`content_bounds` が数える矩形には、
+/// フェザーと境界帯のアルファが 1 から立ち上がる**見えない縁**が
+/// 片側 5〜6px 含まれる。lint はそれを見られない（落とせば下地の色である）
+/// ので、書いた側が狙った占有率より痩せた矩形を測る。痩せる幅は
+/// **切り抜きの縁の厚み × 倍率 ÷ キャンバスの 1 辺**なので、拡大するほど
+/// 効く。合成シーン（`tests/common` の `edge_scene`、濃色商品・くっきりした
+/// 輪郭）を `--profile amazon`（1600px / 占有率 0.86）へ通した実測:
+///
+/// | 素材の 1 辺 | 倍率 | 見えない縁(幅/高さの合計 px) | 書いたものの占有率 | kiri lint |
+/// |---|---|---|---|---|
+/// | 2023 | 0.99 | 11 / 10 | 0.860 | 0.876 pass |
+/// | 1349 | 1.49 | 7 / 7 | 0.859 | 0.876 pass |
+/// | 1011 | 1.97 | 11 / 11 | 0.849 | 0.873 pass |
+/// | 506 | 3.90 | 15 / 7 | 0.842 | 0.864 pass |
+/// | 300 | 6.37 | 11 / 12 | 0.820 | **0.837 fail** |
+///
+/// 「見えない縁」は `content_bounds` の矩形と `visible_bounds` の矩形の差で、
+/// **素材の大きさに依らず 10px 前後である**（フェザー半径も境界帯も px で
+/// 決まる）。だから小さい素材ほど相対的に太く、拡大率もそこで上がる。
+/// `kiri lint` の列が書いたものより大きいのは、`detect_subject` が求めた
+/// 矩形を 1% 外へ広げるぶん（`BBOX_MARGIN`）が乗るからで、その +0.02 と
+/// `FILL_RATIO_MARGIN` の 0.01 が倍率 4 までは不足を飲んでいた。
+///
+/// # なぜ余裕を広げるのでも lint を直すのでもないか
+///
+/// - **`FILL_RATIO_MARGIN` を広げる**: 不足は倍率に比例して増える（上の表で
+///   倍率 6.4 で 0.040、倍率 10 なら 0.06 を超える）ので、**どんな定数でも
+///   足りない倍率が必ずある**。しかも倍率 6 を飲む定数は、拡大しない実行の
+///   商品まで一律に大きくする。
+/// - **lint の閾値を下げる**: `UNIFORM_DELTA_E` は `cutout` が「背景と同じ色」
+///   と言うのに使っている数そのもので、下げれば切り抜き自体が変わる。lint
+///   だけに 2 つ目の数を置くのは `lint.rs` の冒頭が禁じている。そもそも
+///   **アルファ 3 の画素を白へ落としたものは白であり、lint の測りは正しい。**
+///
+/// 誤っているのは書く側である。`--fill-ratio` のヘルプは「商品がキャンバスの
+/// 何割を占めるか」と言っており、見えない縁は商品ではない。
+///
+/// # 採った形
+///
+/// **切り詰めはそのまま**（`content_bounds` のまま）で、`canvas::plan` へ渡す
+/// 占有率だけを `content / visible` 倍する。`canvas.rs` には 1 行も触れない
+/// ——セット統一を 1 つの数へ畳んだのと同じ作法である。倍率を決めるのは
+/// content の狭いほうの軸なので、**悪いほうの軸の比を採る**（緩いほうを
+/// 採ると、倍率を決める軸で足りない）。
+///
+/// # 残る限界
+///
+/// 補正後の占有率が 1.0 を超えると `min(1.0)` で止まるので、そこでは
+/// 見える範囲が要求に届かない。占有率 0.98 を 300px の素材へ要求すると
+/// 0.98 × 1.04 = 1.016 で止まり、見える占有率は 0.964 になる。**それでも
+/// 補正前（0.945）より要求に近い**ので、この枝は黙って通す——縁はどこかに
+/// 置かれなければならず、キャンバスの外へは置けない。
+fn visible_fill_correction(trimmed: &image::RgbaImage, out: &OutputOpts) -> Option<f64> {
+    if !writes_opaque(out) {
+        return None;
+    }
+    let (x1, y1, x2, y2) = visible_bounds(trimmed, out.background)?;
+    let widest = (
+        f64::from(trimmed.width()) / f64::from(x2 - x1 + 1),
+        f64::from(trimmed.height()) / f64::from(y2 - y1 + 1),
+    );
+    let factor = widest.0.max(widest.1);
+    (factor > 1.0).then_some(factor)
+}
+
 /// 切り抜いた商品を余白ごと切り詰め、指定サイズのキャンバス中央へ配置する。
 ///
 /// `bounds` は切り詰める範囲（`content_bounds` が決める）。**画像とマスクを
@@ -1414,10 +1596,18 @@ fn place_on_canvas(
         Some(wanted) => wanted.min(1.0),
         None => args.fill_ratio,
     };
+    // **見えない縁は占有率に数えない。** 要求された占有率は「見える商品が
+    // キャンバスの何割を占めるか」なので、`content_bounds` が拾った縁のぶんを
+    // ここで上へ寄せる（理由と実測は `visible_fill_correction`）。透過を残す
+    // 実行では `None` が返り、渡す数は 1 ビットも変わらない
+    let planned_ratio = match visible_fill_correction(&trimmed, &args.out) {
+        Some(factor) => (fill_ratio * factor).min(1.0),
+        None => fill_ratio,
+    };
     let spec = CanvasSpec {
         width,
         height,
-        fill_ratio,
+        fill_ratio: planned_ratio,
         // --flatten が指定されていれば下地を塗る。既定は透明のまま
         background: flatten_here.then_some(args.out.background),
     };
@@ -1466,7 +1656,16 @@ fn place_on_canvas(
             // **効いた値を返す。** canvas ブロックは走った配置を語るもので、
             // `set` を使った実行では要求した `--fill-ratio` は読まれていない。
             // `set` を使わない実行では要求値と同じなので、出力は 1 バイトも
-            // 変わらない
+            // 変わらない。
+            //
+            // **`visible_fill_correction` を掛ける前の数である。** ここが返す
+            // のは「**見える商品**がキャンバスの何割を占めるか」で、補正後の
+            // `planned_ratio` は見えない縁まで含めた矩形の割り当てにすぎない。
+            // 補正後を返すと、`align: "bbox"` の `set` で `f_i = T` が
+            // 成り立たなくなり、`set.fill_ratio` とこの数が食い違う
+            // （`commands::batch` がその一致を規約として書いている）。
+            // そのため `content` を `width` で割った数はこれより大きくなりうる
+            // ——`content` は**置いた矩形**で、縁まで含んでいる
             fill_ratio,
             content: [plan.content.0, plan.content.1],
             offset: [plan.offset.0, plan.offset.1],
@@ -2048,6 +2247,166 @@ fn resolve_point(point: [f64; 2], normalized: bool, width: u32, height: u32) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 中央に不透明な正方形、その外側に薄いアルファの縁を持つ画像。
+    ///
+    /// 縁のアルファは `alpha` で与える。既定の切り抜きが残す縁と同じ形
+    /// （1 から立ち上がる階調）を、厚みだけ決めて再現する。
+    fn rimmed(side: u32, core: u32, alpha: u8) -> image::RgbaImage {
+        let lo = (side - core) / 2;
+        image::RgbaImage::from_fn(side, side, |x, y| {
+            let inside = (lo..lo + core).contains(&x) && (lo..lo + core).contains(&y);
+            image::Rgba([0, 0, 0, if inside { 255 } else { alpha }])
+        })
+    }
+
+    fn opts(output: &str, flatten: bool) -> OutputOpts {
+        OutputOpts {
+            output: PathBuf::from(output),
+            format: None,
+            quality: 75.0,
+            effort: 6,
+            max_bytes: None,
+            background: [255, 255, 255],
+            flatten,
+            derive: Vec::new(),
+            sizes: Vec::new(),
+            formats: Vec::new(),
+            naming: None,
+            manifest: None,
+            force: false,
+            dry_run: true,
+        }
+    }
+
+    /// **下地へ落とせば下地の色になる縁は、見える範囲に数えない。**
+    ///
+    /// `content_bounds` はフェザーを切らないためにアルファ 1 まで数えるので、
+    /// 同じ画像で 2 つの矩形が出る。その差が `visible_fill_correction` が
+    /// 直している不足そのものである。
+    #[test]
+    fn a_rim_that_vanishes_into_the_background_is_not_visible() {
+        let img = rimmed(20, 10, 3);
+        assert_eq!(content_bounds(&img), Some((0, 0, 19, 19)), "縁ごと数える");
+        assert_eq!(
+            visible_bounds(&img, [255, 255, 255]),
+            Some((5, 5, 14, 14)),
+            "白へ落とした縁が見えることになっている"
+        );
+    }
+
+    /// 縁が濃ければ見える。**アルファのしきい値を固定してはいない。**
+    ///
+    /// 黒をアルファ 60 で白へ落とせば ΔE76 は 5 を超えるので、同じ 1 画素でも
+    /// 縁の濃さで答えが変わる。ここが固定値なら、淡い商品の縁を「見える」と
+    /// 数えて占有率を過大に補正する。
+    #[test]
+    fn a_rim_dark_enough_to_show_is_counted() {
+        let img = rimmed(20, 10, 60);
+        assert_eq!(visible_bounds(&img, [255, 255, 255]), Some((0, 0, 19, 19)));
+    }
+
+    /// **同じ画像でも、落とす下地が変われば答えが変わる。**
+    ///
+    /// 黒い縁をアルファ 45 で白へ落とすと 210 になって見えるが、暗い灰色
+    /// (40,40,40) へ落とすと 33 で、ΔE76 は 3.4 しかない。芯（アルファ 255 の
+    /// 黒）は同じ下地に対して ΔE 16 なので見える側に残る。**見えるかどうかは
+    /// アルファではなく下地との色差で決まる**ことがここに出る。
+    #[test]
+    fn what_counts_as_visible_depends_on_the_background_it_falls_onto() {
+        let img = rimmed(20, 10, 45);
+        assert_eq!(
+            visible_bounds(&img, [255, 255, 255]),
+            Some((0, 0, 19, 19)),
+            "白の上では縁も見える"
+        );
+        assert_eq!(
+            visible_bounds(&img, [40, 40, 40]),
+            Some((5, 5, 14, 14)),
+            "暗い下地の上の黒い縁が見えることになっている"
+        );
+    }
+
+    /// 見える画素が 1 つも無ければ `None`。**`content_bounds` と同じ規約**で、
+    /// 呼び出し側は補正を諦める（占有率は今までどおりの数で決まる）。
+    #[test]
+    fn an_image_with_nothing_visible_has_no_visible_bounds() {
+        let faint = image::RgbaImage::from_pixel(4, 4, image::Rgba([0, 0, 0, 2]));
+        assert!(visible_bounds(&faint, [255, 255, 255]).is_none());
+        assert!(visible_fill_correction(&faint, &opts("a.jpg", false)).is_none());
+    }
+
+    /// **透過を残す実行では補正しない。** lint はそこでアルファの外接矩形で
+    /// 測る（`lint::measure_pixels` の分岐）ので、`content_bounds` が測った
+    /// ものとぴたり同じである。補正すると逆に外れる。
+    #[test]
+    fn a_transparent_output_is_not_corrected() {
+        let img = rimmed(20, 10, 3);
+        assert!(
+            visible_fill_correction(&img, &opts("out.png", false)).is_none(),
+            "PNG に補正を掛けている"
+        );
+        assert!(
+            visible_fill_correction(&img, &opts("out.avif", false)).is_none(),
+            "AVIF に補正を掛けている"
+        );
+    }
+
+    /// **JPEG は `--flatten` を書かなくても補正する。** 透過を扱えない形式へ
+    /// 出すときは `save` が否応なく潰すので、書き出したファイルは不透明に
+    /// なり、lint は色で測る。
+    #[test]
+    fn an_opaque_format_is_corrected_without_an_explicit_flatten() {
+        let img = rimmed(20, 10, 3);
+        assert!(writes_opaque(&opts("out.jpg", false)));
+        assert!(!writes_opaque(&opts("out.png", false)));
+        assert!(
+            writes_opaque(&opts("out.png", true)),
+            "--flatten を見ていない"
+        );
+
+        let factor = visible_fill_correction(&img, &opts("out.jpg", false)).expect("補正が無い");
+        // 20px の矩形のうち見えるのは 10px。両軸とも 2.0 倍
+        assert!((factor - 2.0).abs() < 1e-9, "係数が合わない: {factor}");
+    }
+
+    /// **前景の芯は、下地の上で見えなくても数える。**
+    ///
+    /// 芯が背景と同じ色（白い商品を白へ落とす）だと、床が無ければ矩形が
+    /// 見える画素だけまで縮み、補正が 1.0 で止まるほど大きくなる。実測では
+    /// 400x400 の白地に ΔE 1.7 の矩形と 20px の黒い点を置いた画像で、
+    /// `content` が 1376x1376 ではなく 1600x1600（余白ゼロ）になった。
+    #[test]
+    fn the_foreground_core_is_counted_even_when_it_cannot_be_seen() {
+        // 芯は白（下地と同じ色）でアルファ 255、縁はアルファ 3
+        let img = image::RgbaImage::from_fn(20, 20, |x, y| {
+            let core = (5..15).contains(&x) && (5..15).contains(&y);
+            image::Rgba([255, 255, 255, if core { 255 } else { 3 }])
+        });
+        assert_eq!(
+            visible_bounds(&img, [255, 255, 255]),
+            Some((5, 5, 14, 14)),
+            "色で見えない芯が数から落ちている"
+        );
+        let factor = visible_fill_correction(&img, &opts("out.jpg", false)).expect("補正が無い");
+        assert!((factor - 2.0).abs() < 1e-9, "係数が合わない: {factor}");
+    }
+
+    /// **悪いほうの軸を採る。** `canvas::plan` の倍率は content の狭いほうの
+    /// 軸で決まるので、緩いほうの比を採ると倍率を決める軸で足りない。
+    #[test]
+    fn the_correction_takes_the_worse_of_the_two_axes() {
+        // 幅は 20 のうち 10 が見え（2.0 倍）、高さは 20 のうち 16 が見える（1.25 倍）
+        let img = image::RgbaImage::from_fn(20, 20, |x, y| {
+            let visible = (5..15).contains(&x) && (2..18).contains(&y);
+            image::Rgba([0, 0, 0, if visible { 255 } else { 3 }])
+        });
+        let factor = visible_fill_correction(&img, &opts("out.jpg", false)).expect("補正が無い");
+        assert!(
+            (factor - 2.0).abs() < 1e-9,
+            "緩いほうを採っている: {factor}"
+        );
+    }
 
     /// 受け入れ基準 (b) の 3 つ目。**主体そのものが無いときも 0 度のままにする。**
     ///

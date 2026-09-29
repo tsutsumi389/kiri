@@ -543,12 +543,27 @@ mod tests {
     /// 下限が上限を超えている表からは、どう導いても `Rules` を満たす canvas が
     /// 出ない。**導出のテストが落ちる前に、表の側の誤りとして落とす**——
     /// 同じ赤でも直す場所が違う。
+    ///
+    /// 押し込みの順序が `min → max → max_pixels` なので、**後ろの 2 つが前の
+    /// 下限を黙って割れる。** `longest_side_min > longest_side_max` な規格や、
+    /// `longest_side_min² > max_pixels` な規格（正方キャンバスでは下限の寸法が
+    /// そもそも総画素数に入らない）を足すと、下限を割った canvas が警告も
+    /// 無しに出る。現在の 3 プリセットでは起きないが、**足した日にここで
+    /// 落とす**ためにその 2 つを表の側で見る。
     #[test]
     fn the_table_itself_is_internally_consistent() {
         for p in ALL {
             let r = &p.rules;
             if let (Some(min), Some(max)) = (r.longest_side_min, r.longest_side_max) {
                 assert!(min <= max, "{}: 長辺の下限が上限を超えている", p.name);
+            }
+            if let (Some(min), Some(max_pixels)) = (r.longest_side_min, r.max_pixels) {
+                let at_min = u64::from(min) * u64::from(min);
+                assert!(
+                    at_min <= max_pixels,
+                    "{}: 長辺の下限 {min} の正方 {at_min}px が総画素数の上限 {max_pixels} を超える",
+                    p.name
+                );
             }
             if let Some(ratio) = r.fill_ratio_min {
                 assert!(
@@ -689,6 +704,10 @@ mod tests {
     /// これが段の選び方そのものの表明である。`canvas × fill_ratio ≤ 商品の長辺`
     /// を満たす最大の段を選ぶので、選んだ段が条件を破っていたら——最小段で
     /// 拡大している場合を除いて——選び方が壊れている。
+    ///
+    /// **逃がすのは倍率で見て実際に拡大した実行だけである。** 「最小段を選んだ」
+    /// で逃がすと、最小段が正しく「拡大にならない最大の段」として選ばれた実行
+    /// （商品 1000px / 1400px）まで検査から外れてしまう。
     #[test]
     fn the_chosen_rung_never_upscales_unless_every_rung_would() {
         let amazon = named("amazon").unwrap();
@@ -696,15 +715,19 @@ mod tests {
         for subject in [1u32, 400, 521, 860, 1000, 1400, 2580, 4103, 10_000] {
             let (side, _) = amazon.canvas_for(subject, ratio);
             let scale = f64::from(side) * ratio / f64::from(subject);
-            if side == CANVAS_LADDER[0] {
-                // 最小段では拡大が残りうる（`CANVAS_UPSCALED` が報せる）
+            if scale > 1.0 {
+                // 最小段では拡大が残りうる（`CANVAS_UPSCALED` が報せる）。
+                // **逃がすのは実際に拡大した実行だけにする**——「最小段を
+                // 選んだ」で逃がすと、最小段が正しく「拡大にならない最大の段」
+                // として選ばれた実行まで検査から外れる
+                assert_eq!(
+                    side, CANVAS_LADDER[0],
+                    "商品 {subject}px で最小段でない段 {side} を選んで拡大している"
+                );
                 continue;
             }
-            assert!(
-                scale <= 1.0,
-                "商品 {subject}px で段 {side} を選んで倍率 {scale} になった"
-            );
-            // かつ、1 つ上の段は必ず拡大になる（＝最大の段を選んでいる）
+            // ここへ来たのは縮小に収まった実行である。**1 つ上の段は必ず拡大に
+            // なる**（＝拡大にならない最大の段を選んでいる）
             if let Some(next) = CANVAS_LADDER.iter().find(|r| **r > side) {
                 assert!(
                     f64::from(*next) * ratio > f64::from(subject),

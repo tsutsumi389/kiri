@@ -531,13 +531,16 @@ fn bottom_rung() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::image_io::save::encode;
+    use crate::image_io::save::{DEFAULT_QUALITY, encode};
 
+    /// **要求品質は `DEFAULT_QUALITY` を引く。** ここに数を手書きしていたので、
+    /// Phase 26 で既定が 75 → 90 へ動いた後も派生の検査だけが旧既定で回り続け、
+    /// **実際に効く既定値で梯子を降りる経路が 1 度も通らなくなっていた。**
     fn derivation(path: PathBuf, format: OutputFormat, icc: IccPolicy) -> Derivation {
         Derivation {
             path,
             format,
-            quality: 75.0,
+            quality: DEFAULT_QUALITY,
             effort: 6,
             background: [255, 255, 255],
             flatten: false,
@@ -682,7 +685,9 @@ mod tests {
                 assert_eq!(report.attempts, 1, "{name}");
                 assert_eq!(
                     report.quality_used,
-                    format.effective_quality(75.0).map(quality_number),
+                    format
+                        .effective_quality(DEFAULT_QUALITY)
+                        .map(quality_number),
                     "{name}"
                 );
             }
@@ -731,7 +736,10 @@ mod tests {
             "上限ちょうどは収まり"
         );
         assert_eq!(rendered[0].report.attempts, 1);
-        assert_eq!(rendered[0].report.quality_used, Some(75.0));
+        assert_eq!(
+            rendered[0].report.quality_used,
+            Some(DEFAULT_QUALITY.into())
+        );
         assert!(
             rendered[0].warnings.is_empty(),
             "{:?}",
@@ -769,14 +777,14 @@ mod tests {
 
         let quality = report.quality_used.expect("JPEG は品質を持つ") as f32;
         assert!(
-            QUALITY_LADDER.contains(&quality) && quality < 75.0,
+            QUALITY_LADDER.contains(&quality) && quality < DEFAULT_QUALITY,
             "{quality} は要求品質より下の梯子の段ではない"
         );
         assert_eq!(
             report.attempts,
             1 + QUALITY_LADDER
                 .iter()
-                .filter(|&&q| q < 75.0)
+                .filter(|&&q| q < DEFAULT_QUALITY)
                 .position(|&q| q == quality)
                 .unwrap() as u32
                 + 1,
@@ -788,7 +796,7 @@ mod tests {
             vec![WarningCode::QualityReduced]
         );
         let data = &rendered[0].warnings[0].data;
-        assert_eq!(data["requested"], 75.0);
+        assert_eq!(data["requested"], f64::from(DEFAULT_QUALITY));
         // 報告と警告で同じ数が同じ字面で出る（`quality_number`）
         assert_eq!(data["quality_used"], report.quality_used.unwrap());
         assert_eq!(data["max_bytes"], max);
@@ -817,11 +825,18 @@ mod tests {
         assert_eq!(std::fs::read(&d.path).unwrap(), plain);
         let report = &rendered[0].report;
         assert_eq!(report.bytes, plain.len() as u64);
-        assert_eq!(report.quality_used, Some(75.0), "要求品質へ戻る");
-        // 要求品質の 1 回 + 75 より下の段の数
+        assert_eq!(
+            report.quality_used,
+            Some(DEFAULT_QUALITY.into()),
+            "要求品質へ戻る"
+        );
+        // 要求品質の 1 回 + 要求品質より下の段の数
         assert_eq!(
             report.attempts,
-            1 + QUALITY_LADDER.iter().filter(|&&q| q < 75.0).count() as u32
+            1 + QUALITY_LADDER
+                .iter()
+                .filter(|&&q| q < DEFAULT_QUALITY)
+                .count() as u32
         );
 
         assert_eq!(
@@ -848,7 +863,7 @@ mod tests {
         let smallest_quality = w.data["smallest_quality"].as_f64().unwrap() as f32;
         assert!(smallest_bytes > 64, "収まっているのに未達と言っている");
         assert!(
-            QUALITY_LADDER.contains(&smallest_quality) && smallest_quality < 75.0,
+            QUALITY_LADDER.contains(&smallest_quality) && smallest_quality < DEFAULT_QUALITY,
             "{smallest_quality} は降りた段ではない"
         );
         assert_eq!(

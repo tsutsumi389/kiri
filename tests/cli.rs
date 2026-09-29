@@ -1382,7 +1382,13 @@ fn an_unreachable_budget_writes_the_requested_quality_file() {
         smallest > 64 && smallest <= out["bytes"].as_u64().unwrap(),
         "あとどれだけ足りないかを言えていない: {data}"
     );
-    assert!(data["smallest_quality"].as_f64().unwrap() <= 75.0);
+    // **未達なので梯子は最下段まで降りきっている。** `<= 75` だと旧既定の
+    // 名残りで、降りきったことを言えていない（実際に来るのは最下段の 25）
+    assert_eq!(
+        data["smallest_quality"].as_f64().unwrap() as f32,
+        *ladder().last().unwrap(),
+        "未達なのに梯子を降りきっていない: {data}"
+    );
     assert!(warning["hint"].is_string(), "次の一手が要る: {warning}");
 }
 

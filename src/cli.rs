@@ -421,7 +421,7 @@ pub struct OutputOpts {
     #[arg(long, value_enum)]
     pub format: Option<OutputFormat>,
 
-    /// 品質 (0-100)。既定は実写で商品領域の PSNR が 40 dB に届く最小の値。バイトを詰めるなら --max-bytes
+    /// 品質 (0-100)。既定は実写で商品領域の PSNR が 40 dB（視覚的無損失の目安）に最も近づく値。バイトを詰めるなら --max-bytes
     #[arg(long, default_value_t = DEFAULT_QUALITY)]
     pub quality: f32,
 

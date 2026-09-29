@@ -349,10 +349,8 @@ fn attach_set(args: &mut CutoutArgs, set: Option<batch::SetPlacement>) -> Result
     let Some(placement) = set else {
         return Ok(());
     };
-    let has_canvas = args.canvas.is_some()
-        || args
-            .profile
-            .is_some_and(|p| p.write_defaults().canvas.is_some());
+    let has_canvas =
+        args.canvas.is_some() || args.profile.is_some_and(profile::Profile::decides_canvas);
     if !has_canvas {
         return Err(Error::new(
             ErrorCode::InvalidSet,

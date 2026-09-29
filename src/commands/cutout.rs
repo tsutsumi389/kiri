@@ -229,10 +229,8 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     // も配置にも同じ矩形が要り、24.5MP の全画素走査を 2 度払う理由が無い。
     // キャンバスを使わない実行では 1 度も測らない——`content_bounds` が要る
     // のは配置か段の選択のどちらかがあるときだけである
-    let wants_canvas = args.canvas.is_some()
-        || args
-            .profile
-            .is_some_and(|p| p.write_defaults().canvas.is_some());
+    let wants_canvas =
+        args.canvas.is_some() || args.profile.is_some_and(profile::Profile::decides_canvas);
     let content = wants_canvas
         .then(|| content_bounds(&result.image))
         .flatten();
@@ -677,7 +675,7 @@ fn resolve_canvas(
     let Some(profile) = args.profile else {
         return args.canvas;
     };
-    if profile.write_defaults().canvas.is_none() {
+    if !profile.decides_canvas() {
         return args.canvas;
     }
     // 前景が 1 画素も無い実行では最小の段になるが、この後 `place_on_canvas` が

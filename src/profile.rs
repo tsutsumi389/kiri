@@ -362,6 +362,20 @@ impl Profile {
         }
     }
 
+    /// **この規格は canvas を決めるか。**
+    ///
+    /// 呼ぶ側が知りたいのはこの真偽 1 つで、`WriteDefaults::canvas` の
+    /// `Option` を開くのはその手段にすぎない。`is_some()` を呼ぶ側に綴らせると、
+    /// **「決めるか」の判定が呼ぶ側の数だけ散る**——`Option` の中身を
+    /// `CanvasChoice` に割ったときに `attach_set` を救った判断
+    /// （`CanvasChoice` の doc）と同じ向きで、決め方が増えた日に直す場所を
+    /// 1 つに保つ。
+    ///
+    /// 寸法はここでは分からない。要るなら `canvas_for` を切り抜きの後で呼ぶ。
+    pub fn decides_canvas(&self) -> bool {
+        self.write_defaults().canvas.is_some()
+    }
+
     /// この規格が書く占有率。**規定が無ければ何も言わない。**
     ///
     /// 下限をそのまま使うと丸めで割り込む。理由と採った値は

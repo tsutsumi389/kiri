@@ -123,6 +123,22 @@ pub enum Matting {
     Projection,
     /// 射影のアルファを、線形 RGB の元画像を案内にした guided filter で均す
     Guided,
+    /// 帯だけを未知にした closed-form matting（Levin）で解き直す
+    ClosedForm,
+}
+
+impl Matting {
+    /// 射影のあとにアルファを均す（解き直す）段を持つか。
+    ///
+    /// **`== Guided` で書くと 3 つ目の値が黙って素通りする。** 色の復元を最終
+    /// アルファまで待つかどうかも、`Solved` の印を取るかどうかも、この 1 つの
+    /// 問いで決まっているので、問いそのものに名前を付ける。
+    fn smooths_alpha(self) -> bool {
+        match self {
+            Matting::Projection => false,
+            Matting::Guided | Matting::ClosedForm => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -322,7 +338,7 @@ pub fn refine(
     }
 
     let lut = srgb_lut();
-    let guided_matting = opts.matting == Matting::Guided;
+    let smooths_alpha = opts.matting.smooths_alpha();
     let background = field.rgb();
     let ctx = Context {
         image,
@@ -339,7 +355,7 @@ pub fn refine(
         separation_sq: opts.min_separation * opts.min_separation,
         // guided では色の復元を最終アルファまで待つ。射影のアルファで復元すると、
         // 均した後のアルファと復元色が食い違って縁が色づく
-        despill: opts.despill && !guided_matting,
+        despill: opts.despill && !smooths_alpha,
         feather_radius: opts.feather,
         core_window: window_for(band_max),
     };
@@ -348,7 +364,7 @@ pub fn refine(
     let fallback: OnceCell<Mask> = OnceCell::new();
     let mut ws = Workspace::default();
     // 色から決まった画素の印。guided のときだけ持つ
-    let mut solved = if guided_matting {
+    let mut solved = if smooths_alpha {
         guided::Solved::new((w as usize) * (h as usize))
     } else {
         guided::Solved::default()
@@ -369,7 +385,7 @@ pub fn refine(
         );
     });
 
-    if guided_matting {
+    if smooths_alpha {
         // (e) 射影アルファを入力、線形 RGB の元画像を案内画像として均す
         mask = guided::feather(
             image,

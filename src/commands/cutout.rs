@@ -659,9 +659,16 @@ fn apply_profile(args: &CutoutArgs, warnings: &mut Vec<Warning>) -> Option<Cutou
 /// 段の選択には `args.fill_ratio`——`apply_profile` を通った後の、実際に効く
 /// 占有率——を渡す。profile の値ではないのは、`--fill-ratio` で押しのけられた
 /// 実行と、占有率を規定しない規格（shopify）では効く値がそちらではないから
-/// である。**`set` を使った実行だけは近似になる**——`set` の占有率は点ごとに
+/// である。
+///
+/// **`set` がある実行だけは 1.0 を渡す。** `set` の占有率は点ごとに
 /// キャンバス寸法から逆算されるので（`SetPlacement::fill_ratio`）、段を選ぶ
-/// 時点では確定しない。そこで既定の `--fill-ratio` を代わりに読む
+/// 時点では確定しない。ここで `args.fill_ratio`（`set` がある実行では CLI の
+/// 既定 0.85 のまま）を読むと、**実効占有率がそれを超えたときに選んだ段が
+/// 「拡大にならない最大の段」でなくなる**（`align: "height"` と横長の商品、
+/// `align: "bbox"` と高い目標占有率がこれに当たる）。1.0 は最も安全側で、
+/// `canvas ≤ 商品の長辺` を満たす段しか選ばないので拡大が増えることはない。
+/// `set` の目的（占有率はキャンバス寸法から逆算される）とも整合する
 fn resolve_canvas(
     args: &CutoutArgs,
     content: Option<(u32, u32, u32, u32)>,
@@ -676,7 +683,12 @@ fn resolve_canvas(
     // 前景が 1 画素も無い実行では最小の段になるが、この後 `place_on_canvas` が
     // `NO_FOREGROUND` で断るので、選んだ段が成果物に出ることはない
     let subject_long_side = content.map_or(0, |(x1, y1, x2, y2)| (x2 - x1 + 1).max(y2 - y1 + 1));
-    let (cw, ch) = profile.canvas_for(subject_long_side, args.fill_ratio);
+    let fill_for_rung = if args.set.is_some() {
+        1.0
+    } else {
+        args.fill_ratio
+    };
+    let (cw, ch) = profile.canvas_for(subject_long_side, fill_for_rung);
     if args.explicit.canvas {
         let used = args.canvas.map_or(Value::Null, |(w, h)| json!([w, h]));
         warnings.extend(overridden(

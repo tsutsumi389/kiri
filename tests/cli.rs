@@ -15794,3 +15794,70 @@ fn a_set_overrides_the_profile_fill_ratio_and_says_so() {
         "{v}"
     );
 }
+
+/// **`set` がある実行でも、profile が選ぶ段は拡大しない**（Phase 26）。
+///
+/// 段の選択は `canvas × fill_ratio ≤ 商品の長辺` を解くが、**`set` がある実行の
+/// `--fill-ratio` は CLI の既定 0.85 のままである**——実際に `canvas::plan` へ
+/// 行くのは `set.fill_ratio(content, canvas)` のほうで、`align: "height"` と
+/// 横長の商品ではそれが 0.85 を超える。超えた分だけ段が拡大側へ外れる
+/// （上限は 1/0.85 = 1.18 倍）。
+///
+/// そこで `set` があるときは段の選択に 1.0 を渡している。**最も安全側で、
+/// 拡大は絶対に増えない。** ここで固定するのはその帰結——「拡大しない段が
+/// 梯子にあるなら、`set` があっても拡大しない」——であって、1.0 という実装の
+/// 綴りそのものではない。
+#[test]
+fn a_set_does_not_push_the_chosen_rung_into_upscaling() {
+    let dir = fixture_dir();
+    // 横長の商品。`product_image` は幅 0.56・高さ 0.68 で描くので、
+    // 2320x1180 なら外接矩形はおよそ 1299x802 になる。**縦横比 1.6 が要る**
+    // ——`align: "height"` の実効占有率は `T × max(1, cw/ch)` なので、
+    // 横長でなければ 0.85 を超えない
+    write_png(
+        dir.path(),
+        "wide.png",
+        &product_image(&ProductSpec {
+            width: 2320,
+            height: 1180,
+            noise: false,
+            ..Default::default()
+        }),
+    );
+    let spec = write_spec(
+        dir.path(),
+        r#"{"set":{"align":"height","fill_ratio":0.6},
+             "defaults":{"profile":"amazon"},
+             "items":[{"input":"wide.png","output":"out/a.jpg"}]}"#,
+    );
+    let out = run_batch(&spec, &[]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    let result = &v["results"][0]["result"];
+    let canvas = &result["canvas"];
+
+    // 実効占有率は 0.85 を超えている。**超えていなければこのテストは
+    // 何も検査していない**ので、前提のほうを先に固定する
+    let effective = canvas["fill_ratio"].as_f64().unwrap();
+    assert!(
+        effective > 0.85,
+        "前提が崩れている（実効占有率が 0.85 を超えていない）: {canvas}"
+    );
+
+    let scale = canvas["scale"].as_f64().unwrap();
+    assert!(scale <= 1.0, "set のある実行で段が拡大側へ外れた: {canvas}");
+    assert!(
+        !has_warning(result, "CANVAS_UPSCALED"),
+        "拡大しない段が梯子にあるのに拡大した: {result}"
+    );
+    // 商品の長辺 1299px では、1.0 を通すと 1000 が最大の段になる
+    // （1500 は 1500 > 1299 で外れる）。0.85 を通していた頃は 1500 を選び、
+    // 倍率 1.125 で拡大していた
+    assert_eq!(canvas["width"], 1000, "{canvas}");
+    assert_eq!(canvas["height"], 1000, "{canvas}");
+}

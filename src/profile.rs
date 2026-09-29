@@ -224,16 +224,29 @@ const fn spellings() -> [&'static str; ALL.len()] {
 ///
 /// - 4284x5712 の実写に `--profile amazon` を当てると、商品は倍率 0.3354 まで
 ///   潰れる。拡大が始まるのは canvas 約 4771 からで、そこまでは**まだ縮小である**
-/// - 525x700 の入力では倍率 2.6513 で拡大される。Amazon の規格文
+/// - 700x525 の入力では倍率 2.6411 で拡大される（`--profile amazon --optimize
+///   --rotate auto`。フラグを揃えないと商品の長辺が 1〜2px 動き、倍率も動く）。
+///   Amazon の規格文
 ///   （`ALL` の amazon が持つ `source`）は「小さい画像を人工的に拡大しないで
 ///   ください」と書いており、既定で拡大するのは規格に反する側である
 ///
 /// # 段に丸める理由
 ///
-/// 入力ごとに連続の値を返すと、**同じ profile で処理したセットの寸法が揃わない。**
-/// これは固定値を選んでいた当時の doc が挙げていた懸念そのもので、段に丸めるのが
-/// その答えである——同じ撮影セット（同じカメラ・同じ距離）なら商品の長辺も
-/// 近いので、同じ段に落ちて寸法が揃う。
+/// 入力ごとに連続の値を返すと、**同じ profile で処理したセットの寸法が 1 つも
+/// 揃わない。** これは固定値を選んでいた当時の doc が挙げていた懸念そのもので、
+/// 段に丸めるのがその答えである。
+///
+/// **ただし揃うのは同じ段に落ちる限りである。** 段の境界を跨ぐ素材が混ざれば
+/// 揃わない——選ぶ条件は `段 × 占有率 ≤ 商品の長辺` なので、占有率 0.86 では
+/// 寸法の動く境界が 1290 / 1720 / 2150 / 2580 px の 4 本あり、**商品の長辺が
+/// 1289px なら 1000、1290px なら 1500 になる。** 長辺は切り抜きの結果なので、
+/// `--tolerance` も `--feather` も `--rotate auto` の角度も 1 画素動かせば飛ぶ。
+/// 境界が段数より 1 つ少ないのは、**最小段が「どの段も拡大になる」ときの
+/// 落とし先でもある**ためで、その下側（860px）では canvas は 1000 のままで
+/// 倍率だけが動く。
+///
+/// **寸法を必ず揃えたい実行は `--canvas` を明示すること。** 段に丸めるのは
+/// 「連続の値よりは揃いやすい」までで、揃うことの保証ではない。
 ///
 /// # 天井 3000 の根拠
 ///
@@ -666,7 +679,7 @@ mod tests {
     fn the_chosen_rung_never_upscales_unless_every_rung_would() {
         let amazon = named("amazon").unwrap();
         let ratio = amazon.write_defaults().fill_ratio.unwrap();
-        for subject in [1u32, 400, 519, 860, 1000, 1400, 2580, 4103, 10_000] {
+        for subject in [1u32, 400, 521, 860, 1000, 1400, 2580, 4103, 10_000] {
             let (side, _) = amazon.canvas_for(subject, ratio);
             let scale = f64::from(side) * ratio / f64::from(subject);
             if side == CANVAS_LADDER[0] {
@@ -689,24 +702,65 @@ mod tests {
 
     /// **天井と床に当たる。** 実測の 2 枚がちょうど両端を踏む。
     ///
+    /// **どちらも `--profile amazon --optimize --rotate auto` で測った値である。**
+    /// 商品の長辺は切り抜きの結果なので、フラグを揃えないと 1〜2px 動く
+    /// （700x525 の素材は `--rotate auto` の無い実行では 519px になる）。
+    ///
     /// 4284x5712 の実写は切り抜いた商品の長辺が 4103px で、拡大しない上限は
     /// 4771px——梯子に天井が無ければ 4500 まで行ける。**天井 3000 が効いている
-    /// ことをこの素材が示す。** 525x700 の入力は商品の長辺が 519px で、
+    /// ことをこの素材が示す。** 700x525 の入力は商品の長辺が 521px で、
     /// どの段も拡大になるので最小段へ落ちる。
     #[test]
     fn a_big_subject_hits_the_ceiling_and_a_small_one_hits_the_floor() {
         let amazon = named("amazon").unwrap();
         let ratio = amazon.write_defaults().fill_ratio.unwrap();
         assert_eq!(amazon.canvas_for(4103, ratio), (3000, 3000));
-        assert_eq!(amazon.canvas_for(519, ratio), (1000, 1000));
+        assert_eq!(amazon.canvas_for(521, ratio), (1000, 1000));
         // 天井が無ければ 4500 まで行ける、を数で言う
         assert!(f64::from(4500u32) * ratio <= 4103.0);
     }
 
+    /// **段の境界は 1 画素で飛ぶ。** 丸めても揃うとは限らない。
+    ///
+    /// `CANVAS_LADDER` の doc が「同じ段に落ちる限り揃う。段の境界を跨ぐ素材が
+    /// 混ざると揃わない」と書き、境界を 1290 / 1720 / 2150 / 2580 px と
+    /// 名指ししている。**doc に書いた数をここで実行に照らす**——境界の数だけを
+    /// 直して梯子や占有率を直し忘れた日に、doc のほうが黙って嘘になる。
+    ///
+    /// **寸法が動く境界は 4 本で、`CANVAS_LADDER` の段数より 1 つ少ない。**
+    /// 最小段は「どの段も拡大になる」ときの落とし先でもあるので、その下側に
+    /// 境界が無い——商品の長辺が 859px でも 860px でも canvas は 1000 のままで、
+    /// 動くのは倍率のほう（1.0010 → 1.0000）である。
+    #[test]
+    fn a_single_pixel_at_the_boundary_moves_the_rung() {
+        let amazon = named("amazon").unwrap();
+        let ratio = amazon.write_defaults().fill_ratio.unwrap();
+        // 商品の長辺がこの値のとき、境界の下と上で段が 1 つ動く
+        let boundaries = [(1290u32, 1500u32), (1720, 2000), (2150, 2500), (2580, 3000)];
+        for (edge, upper) in boundaries {
+            let (below, _) = amazon.canvas_for(edge - 1, ratio);
+            let (at, _) = amazon.canvas_for(edge, ratio);
+            assert_eq!(at, upper, "商品 {edge}px で段 {upper} に上がっていない");
+            assert!(
+                below < upper,
+                "商品 {}px と {edge}px が同じ段 {at} に落ちている",
+                edge - 1
+            );
+        }
+        // 最小段の下側には境界が無い。**ここに 5 本目があると読まれないように
+        // 数で言う**——落とし先が同じで、変わるのは拡大するかどうかだけである
+        assert_eq!(amazon.canvas_for(859, ratio), (1000, 1000));
+        assert_eq!(amazon.canvas_for(860, ratio), (1000, 1000));
+        assert!(f64::from(1000u32) * ratio > 859.0);
+        assert!(f64::from(1000u32) * ratio <= 860.0);
+    }
+
     /// **同じ寸法からは同じ段が出る。** 決定性。
     ///
-    /// 段に丸めているのは「同じ撮影セットなら寸法が揃う」ためなので、同じ入力が
-    /// 違う段へ落ちたらその目的が立たない。
+    /// 段に丸めているのは「同じ撮影セットなら同じ段に落ちて寸法が揃う」ため
+    /// なので、同じ入力が違う段へ落ちたらその目的が立たない。**揃うのは同じ段に
+    /// 落ちる限りである**（`CANVAS_LADDER` の doc）が、決定性はその前提であって、
+    /// これが崩れると段の境界を跨がない素材どうしでも揃わなくなる。
     #[test]
     fn the_same_subject_always_picks_the_same_rung() {
         for p in ALL {

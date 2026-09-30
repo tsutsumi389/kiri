@@ -1421,3 +1421,38 @@ fn a_uniform_background_gives_the_very_same_pixels_whichever_model_is_asked_for(
         "均一なシーンが {checked} 枚しか無い。一覧が入れ替わっている"
     );
 }
+
+/// 大きい合成シーンを書き出す。`--ignored` を付けたときだけ走る。
+///
+/// **実写の 24.5MP が手元に無いときの代役である。** `--matting closed-form` の
+/// 時間とピーク RSS は帯の画素数で決まるので、測るには実寸のシーンが要る。
+/// 書き出す先は `KIRI_SCENE_OUT`。
+///
+/// ```text
+/// KIRI_SCENE_OUT=/tmp/big.png cargo test --release --test edge_quality -- --ignored --nocapture write_a_large_scene
+/// ```
+#[test]
+#[ignore = "計測用。シーンを書き出すだけ"]
+fn write_a_large_scene() {
+    let Ok(path) = std::env::var("KIRI_SCENE_OUT") else {
+        println!("KIRI_SCENE_OUT が無いので何も書かない");
+        return;
+    };
+    // 実写リモコンと同じ 4284x5712。柔らかい輪郭と落ち影を持たせる
+    let scene = common::EdgeScene {
+        name: "L1 24.5MP/柔輪郭/影",
+        width: 4284,
+        height: 5712,
+        product: [35, 35, 38],
+        softness: 4.0,
+        shadow: true,
+        ..Default::default()
+    };
+    let truth = common::edge_scene(&scene);
+    truth.image.save(&path).unwrap();
+    println!(
+        "{path} へ {}x{} を書いた",
+        truth.image.width(),
+        truth.image.height()
+    );
+}

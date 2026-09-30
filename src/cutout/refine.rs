@@ -226,6 +226,19 @@ pub struct Refined {
     /// `--smooth-contour` は長辺 1000px 換算なので解像度で掛け戻され、
     /// `RADIUS_CEILING` で頭打ちになる
     pub smooth_radius_px: u32,
+    /// 輪郭画素が要求した帯の半径の分布。**添字が半径(px)、値が輪郭画素の数**で、
+    /// 長さは `RADIUS_CEILING + 1`。帯を 1 度も引いていないときだけ空になる。
+    /// **計測のための通り道で、CLI にも JSON にも出さない。**
+    ///
+    /// `band` の値は「その画素を覆った最大の円の半径」なので、輪郭画素の位置で
+    /// 読むと近傍の広い帯に覆われて過大に出る。要求した半径をそのまま数えるのは
+    /// ここだけである。塗り直しが走る経路では**最後のパスの分布**であって、
+    /// 途中のパスのものではない。
+    ///
+    /// **数えるのは「要求」であって「残った帯」ではない。** `--seal` が塞いだ隙間
+    /// （`reshape` の最後で帯から外す）と、利用者が確定させた画素（`constraints`
+    /// で帯から外す）は、どちらも帯からは消えるがここには残る
+    pub band_width_histogram: Vec<u32>,
     /// `--matting closed-form` が解いた結果。他の解き方では `None`
     pub matting: Option<closed_form::Report>,
 }
@@ -288,6 +301,8 @@ pub fn refine(
             mask: binary.clone(),
             band_min_radius: 0,
             smooth_radius_px: 0,
+            // 帯を 1 度も引いていない
+            band_width_histogram: Vec::new(),
             matting: None,
         };
     }
@@ -302,7 +317,7 @@ pub fn refine(
     // 元のマスクをそのまま読むので、24.5MP で 24MB を確保する理由が無い
     let mut reshaped = opts.staged().then(|| binary.clone());
     let mut band = vec![0u8; (w as usize) * (h as usize)];
-    band_map_into(
+    let mut histogram = band_map_into(
         image,
         binary,
         field,
@@ -314,7 +329,8 @@ pub fn refine(
     // `--seal` が塞いだ隙間。帯からも参照色からも外す（`close_new_gaps`）
     let mut sealed = BitPlane::default();
     if let Some(shape) = reshaped.as_mut() {
-        reshape::Reshape {
+        // 塗り直しは帯を引き直すので、分布も最後のパスのものへ差し替える
+        if let Some(widths) = (reshape::Reshape {
             image,
             original: binary,
             field,
@@ -322,8 +338,11 @@ pub fn refine(
             scale,
             min_radius,
             max_radius,
+        })
+        .run(shape, &mut band, &mut sealed)
+        {
+            histogram = widths;
         }
-        .run(shape, &mut band, &mut sealed);
     }
     let (band, sealed) = (band, sealed);
     let shape = reshaped.as_ref().unwrap_or(binary);
@@ -337,6 +356,7 @@ pub fn refine(
             mask,
             band_min_radius: min_radius,
             smooth_radius_px: smooth_radius,
+            band_width_histogram: histogram,
             // 帯が 1 画素も無いので解くものが無い
             matting: None,
         };
@@ -435,6 +455,7 @@ pub fn refine(
         mask,
         band_min_radius: min_radius,
         smooth_radius_px: smooth_radius,
+        band_width_histogram: histogram,
         matting: matting_report,
     }
 }
@@ -1133,7 +1154,7 @@ pub(crate) fn band_map(
     max_radius: u32,
 ) -> Vec<u8> {
     let mut band = vec![0u8; (binary.width() as usize) * (binary.height() as usize)];
-    band_map_into(
+    let _ = band_map_into(
         image,
         binary,
         &BackgroundField::flat(background),
@@ -1145,12 +1166,19 @@ pub(crate) fn band_map(
     band
 }
 
-/// `band_map` を既にある領域へ書き直す。
+/// `band_map` を既にある領域へ書き直し、**輪郭画素が要求した半径の分布**を返す。
+///
+/// 分布は計測のための戻り値である。帯そのもの（`band`）には「覆った最大の円の
+/// 半径」しか残らないので、要求した半径を数えられるのはここだけである。
+/// **`#[must_use]` なのは、取り落とすと「引き直す前の分布」が最後の分布として
+/// 読まれるからである**——§8 が下限を帯幅として読んだのと同じ失敗形になる。
+/// 捨てるなら `let _ =` で明示する。
 ///
 /// 塗り直しはパスごとに帯を引き直すので、素直に作り直すと旧と新が同時に
 /// 生きて 24.5MP で 49MB を余分に抱える。中身を 0 に戻してから塗れば、
 /// 同じ結果を確保なしで得られる。
 #[allow(clippy::too_many_arguments)]
+#[must_use]
 pub(crate) fn band_map_into(
     image: &RgbaImage,
     binary: &Mask,
@@ -1159,11 +1187,13 @@ pub(crate) fn band_map_into(
     max_radius: u32,
     constraints: Option<&Constraints>,
     band: &mut [u8],
-) {
+) -> Vec<u32> {
     let (w, h) = (binary.width(), binary.height());
     band.fill(0);
     let min_r = min_radius.clamp(1, RADIUS_CEILING);
     let max_r = max_radius.clamp(min_r, RADIUS_CEILING);
+    // 添字が帯幅(px)。帯幅は `RADIUS_CEILING` で抑えてあるので固定長で足りる
+    let mut widths = vec![0u32; (RADIUS_CEILING + 1) as usize];
 
     for y in 0..h {
         for x in 0..w {
@@ -1177,6 +1207,10 @@ pub(crate) fn band_map_into(
                 // 取り残され、色が背景寄りでも不透明で残ってしまう
                 None => min_r,
             };
+            // 値域は上の 2 本の clamp で [1, RADIUS_CEILING] に閉じているので
+            // ここは届かない防御である。上限を後から動かしたときに添字で落ちる
+            // より、最終ビンへ飽和させて表が濁るほうがまだ直しやすい
+            widths[width.min(RADIUS_CEILING) as usize] += 1;
             paint_disc(band, w, h, x, y, width);
         }
     }
@@ -1196,6 +1230,7 @@ pub(crate) fn band_map_into(
             }
         }
     }
+    widths
 }
 
 /// (cx, cy) を中心に半径 `width` の円を、既にある値との大きいほうで塗る。
@@ -1703,6 +1738,134 @@ mod tests {
         assert!(
             band[6 * (w as usize) + 20] > 0,
             "幅 1px の構造に帯が張られていない"
+        );
+    }
+
+    /// 半径の分布は、輪郭画素を 1 つずつ数え、添字 0 と最終ビンを使わないこと。
+    ///
+    /// **壊れてもパニックしない。** 半径は `[1, RADIUS_CEILING]` に clamp されて
+    /// いるので添字 0 は空で、`.min(RADIUS_CEILING)` の飽和も起きない。どちらかが
+    /// 崩れると分布の意味が静かに変わり、**それを表として読んだ側が誤診する**
+    /// （計画 §8 が帯幅の下限を帯幅として読んだのがその形である）。機械に数えさせる
+    #[test]
+    fn the_band_width_histogram_counts_every_contour_pixel_once() {
+        let (w, h) = (40u32, 20u32);
+        let bg = [250u8, 250, 249];
+        let mut img = RgbaImage::from_pixel(w, h, Rgba([bg[0], bg[1], bg[2], 255]));
+        let mut mask = Mask::new(w, h, 0);
+        for y in 0..h {
+            for x in 0..w / 2 {
+                img.put_pixel(x, y, Rgba([40, 40, 45, 255]));
+                mask.set(x, y, 255);
+            }
+        }
+        let mut band = vec![0u8; (w as usize) * (h as usize)];
+        let hist = band_map_into(
+            &img,
+            &mask,
+            &BackgroundField::flat(bg),
+            DEFAULT_MIN_RADIUS,
+            DEFAULT_MAX_RADIUS,
+            None,
+            &mut band,
+        );
+
+        let contour = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .filter(|&(x, y)| mask.is_foreground(x, y) && mask.touches_background(x, y))
+            .count();
+        assert_eq!(
+            hist.len(),
+            RADIUS_CEILING as usize + 1,
+            "長さが上限 + 1 でない"
+        );
+        assert_eq!(
+            hist.iter().sum::<u32>() as usize,
+            contour,
+            "輪郭画素を 1 つずつ数えていない"
+        );
+        assert_eq!(hist[0], 0, "半径 0 の要求が数えられている（下限は 1）");
+        assert_eq!(
+            hist[RADIUS_CEILING as usize], 0,
+            "最終ビンへ飽和している。値域の clamp が緩んだ"
+        );
+    }
+
+    /// 柔らかい輪郭は、くっきりした輪郭より広い帯を要求すること。
+    ///
+    /// **遷移への追従は効いている。** 計画 §9.9 が測って分かったのはそれで、
+    /// 合成の柔輪郭 8px では下限 2px に対して半径の中央値が 6px 出る。
+    /// §8 はこの追従を見落として「帯の半径は 2px しかない」と書き、
+    /// **その誤診の上に 1 フェーズ分の説明を積んだ。**
+    ///
+    /// 追従が消えても既定の出力は動かない（帯が狭まれば狭まったなりに解ける）
+    /// ので、機械が見ていないと同じ誤診が戻る。
+    #[test]
+    fn a_soft_contour_asks_for_a_wider_band_than_a_hard_one() {
+        let widths_for = |ramp: u32| -> Vec<u32> {
+            let (w, h) = (60u32, 20u32);
+            let bg = [250u8, 250, 249];
+            let fg = [40u8, 40, 45];
+            let edge = 30i64;
+            let mut img = RgbaImage::new(w, h);
+            let mut mask = Mask::new(w, h, 0);
+            for y in 0..h {
+                for x in 0..w {
+                    // 境界をまたいで `ramp` px かけて線形に溶ける。0 なら階段
+                    let cover = if ramp == 0 {
+                        f32::from(i64::from(x) < edge)
+                    } else {
+                        let d = (i64::from(x) - edge) as f32 / ramp as f32;
+                        (0.5 - d).clamp(0.0, 1.0)
+                    };
+                    let mut rgb = [0u8; 3];
+                    for (k, slot) in rgb.iter_mut().enumerate() {
+                        *slot = (f32::from(fg[k]) * cover + f32::from(bg[k]) * (1.0 - cover))
+                            .round() as u8;
+                    }
+                    img.put_pixel(x, y, Rgba([rgb[0], rgb[1], rgb[2], 255]));
+                    if cover >= 0.5 {
+                        mask.set(x, y, 255);
+                    }
+                }
+            }
+            let mut band = vec![0u8; (w as usize) * (h as usize)];
+            band_map_into(
+                &img,
+                &mask,
+                &BackgroundField::flat(bg),
+                DEFAULT_MIN_RADIUS,
+                DEFAULT_MAX_RADIUS,
+                None,
+                &mut band,
+            )
+        };
+        let median = |hist: &[u32]| -> usize {
+            let total: u32 = hist.iter().sum();
+            assert!(total > 0, "輪郭画素が 1 つも無い");
+            let mut seen = 0u32;
+            for (px, &c) in hist.iter().enumerate() {
+                seen += c;
+                if u64::from(seen) * 2 >= u64::from(total) {
+                    return px;
+                }
+            }
+            unreachable!()
+        };
+
+        let hard = median(&widths_for(0));
+        let soft = median(&widths_for(8));
+        assert_eq!(
+            hard, DEFAULT_MIN_RADIUS as usize,
+            "くっきりした輪郭が下限より広い帯を要求している: {hard}px"
+        );
+        // **半径は遷移の片側ぶんである。** 境界をまたいで 8px かけて溶けるなら、
+        // 輪郭画素から純色までは外へ 4px・内へ 4px なので、4px に届けば追従して
+        // いる。§9.9 の合成 S4 が 6px 出るのは、あちらの遷移がノイズと sRGB
+        // 合成を含んで収束の宣言が遅れるからで、ここはノイズの無い直線境界である
+        assert!(
+            soft >= 4,
+            "8px かけて溶ける輪郭に帯が追従していない: {soft}px（くっきりは {hard}px）"
         );
     }
 

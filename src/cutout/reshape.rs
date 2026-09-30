@@ -143,10 +143,22 @@ impl Reshape<'_> {
     ///
     /// `sealed` には `--seal` が塞いだ隙間が溜まる。呼び出し側はこれを
     /// 「帯からも参照色からも外す画素」として使う。
-    pub fn run(&self, shape: &mut Mask, band: &mut [u8], sealed: &mut BitPlane) {
+    /// 帯を引き直したら、**最後のパスの半径の分布**を返す。1 パスも走らなかった
+    /// ときは `None` で、呼び出し側は引き直す前の分布を持ち続ける。
+    ///
+    /// **`#[must_use]` なのは、取り落とすと引き直す前の分布が最後の分布として
+    /// 読まれるからである。** 数の意味が違うものを同じ名前で読むのは、§8 が
+    /// 帯幅の下限を帯幅として読んだのと同じ失敗形である。
+    #[must_use]
+    pub fn run(
+        &self,
+        shape: &mut Mask,
+        band: &mut [u8],
+        sealed: &mut BitPlane,
+    ) -> Option<Vec<u32>> {
         let smooth_radius = smooth_radius_px(self.opts.smooth_contour, self.scale);
         if !self.opts.reclassify && smooth_radius == 0 {
-            return;
+            return None;
         }
         let (w, h) = (shape.width(), shape.height());
         let window = (local_colour::RIM_WINDOW * self.scale).ceil() as u32;
@@ -161,6 +173,7 @@ impl Reshape<'_> {
             &diagnostics::contour_pixels(self.original, None),
             reach,
         );
+        let mut widths = None;
         for _ in 0..RESHAPE_PASSES {
             let Some(bounds) = band_bounds(band, w, h) else {
                 break;
@@ -205,7 +218,7 @@ impl Reshape<'_> {
             // 戻り値（塞いだ画素数）は捨てる。ここで数えたいのは「色が動かした
             // 画素」であって、連結性が戻した画素ではない
             let _ = close_new_gaps(shape, self.original, band, sealed, bounds, self.opts.seal);
-            band_map_into(
+            widths = Some(band_map_into(
                 self.image,
                 shape,
                 self.field,
@@ -213,7 +226,7 @@ impl Reshape<'_> {
                 self.max_radius,
                 self.opts.constraints,
                 band,
-            );
+            ));
         }
         // 塞いだ隙間を帯から外す。**パスの途中では外さない**——途中で外すと
         // その画素が次のパスの局所色から消え、塗り直しの答えが連鎖して変わる
@@ -221,6 +234,7 @@ impl Reshape<'_> {
         // やりたいのは「決まった答えを色に覆させない」ことだけで、途中の判断を
         // 変えることではない
         sealed.for_each_set(|i| band[i] = 0);
+        widths
     }
 }
 

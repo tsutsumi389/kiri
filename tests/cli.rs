@@ -8266,6 +8266,12 @@ fn an_out_of_range_smooth_contour_is_refused_everywhere() {
 /// 綴りを外した `matting` を黙って既定へ落とさないこと。
 ///
 /// 数百点を回した後に仕上がりを見るまで気づけない種類の失敗になる。
+///
+/// **例は `closed_form` である。** `closed-form` が実在する値になったので、
+/// 落とすべきものは「実在しない語」から「実在する値のありそうな綴り違い」へ
+/// 変わった。区切りが `-` か `_` かはエージェントが最も取り違えるところで、
+/// ここを既定へ落とすと **guided で切ったものを closed-form の結果として
+/// 読む**ことになる。
 #[test]
 fn an_unknown_matting_is_refused_everywhere() {
     // CLI は clap が弾く（code の無い exit 2）
@@ -8279,7 +8285,7 @@ fn an_unknown_matting_is_refused_everywhere() {
             "-o",
             dir.path().join("o.png").to_str().unwrap(),
             "--matting",
-            "closed-form",
+            "closed_form",
         ])
         .output()
         .unwrap();
@@ -8289,7 +8295,7 @@ fn an_unknown_matting_is_refused_everywhere() {
     let spec = dir.path().join("spec.json");
     std::fs::write(
         &spec,
-        r#"{"items":[{"input":"a.png","output":"b.png","matting":"closed-form"}]}"#,
+        r#"{"items":[{"input":"a.png","output":"b.png","matting":"closed_form"}]}"#,
     )
     .unwrap();
     let out = kiri()
@@ -8298,6 +8304,64 @@ fn an_unknown_matting_is_refused_everywhere() {
         .unwrap();
     let json = json_stdout(&out);
     assert_eq!(json["results"][0]["error"]["code"], "SPEC_INVALID");
+}
+
+/// `closed-form` が CLI と spec の両方から届き、`settings` がそれを名乗ること。
+///
+/// **名乗りを固定するのが目的である。** 帯をどう解いたかは JSON からしか
+/// 分からないので、ここが `guided` を返していると「指定したのに効いていない」
+/// と「指定が効いて結果が同じ」が区別できなくなる。
+#[test]
+fn closed_form_matting_arrives_from_both_entrances() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "a.png", &img);
+
+    let out = kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            dir.path().join("o.png").to_str().unwrap(),
+            "--matting",
+            "closed-form",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(json_stdout(&out)["settings"]["matting"], "closed-form");
+
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        r#"{"defaults":{"matting":"closed-form"},
+             "items":[{"input":"a.png","output":"out.png"}]}"#,
+    )
+    .unwrap();
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = json_stdout(&out);
+    assert_eq!(json["succeeded"], 1);
+    assert_eq!(
+        json["results"][0]["result"]["settings"]["matting"],
+        "closed-form"
+    );
 }
 
 /// spec が matting の 3 つを受けること。

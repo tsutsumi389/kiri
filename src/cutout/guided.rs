@@ -123,7 +123,7 @@ impl Solved {
 
 /// 行列が退化したとみなす行列式。ε ≥ `EPS_FLOOR` なので正定値のはずだが、
 /// 公開 API に何が渡っても除算を破綻させない。
-const MIN_DET: f64 = 1e-18;
+pub(crate) const MIN_DET: f64 = 1e-18;
 
 /// タイル1枚分の作業領域。タイルをまたいで使い回し、確保を繰り返さない。
 #[derive(Default)]
@@ -390,7 +390,11 @@ fn solve(ws: &mut Workspace, tile: &Tile, radius: u32) {
 }
 
 /// 窓の中の確定背景の分散から ε を決める。確定背景が 1 画素も無ければ下限。
-fn epsilon(background: &Integral<5>, window: (usize, usize, usize, usize)) -> f64 {
+///
+/// **`closed_form` も同じ規則で ε を決める。** あちらは Σ を 3×3 で採るが、
+/// ε は素材の雑音の床であって 3×3 の性質ではないので、窓は帯幅のままここを
+/// 呼ぶ。式を 2 つ持つと必ず離れる。
+pub(crate) fn epsilon(background: &Integral<5>, window: (usize, usize, usize, usize)) -> f64 {
     let (x0, y0, x1, y1) = window;
     let s = background.sum(x0, y0, x1, y1);
     if s[4] < 1.0 {

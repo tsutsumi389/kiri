@@ -48,7 +48,7 @@ use crate::cutout::constraints::Constraints;
 use crate::cutout::integral::Integral;
 use crate::cutout::mask::Mask;
 use crate::cutout::morphology::BitPlane;
-use crate::cutout::{diagnostics, feather, guided, reshape};
+use crate::cutout::{closed_form, diagnostics, feather, guided, reshape};
 
 /// 帯幅の下限(px)。くっきりした輪郭でも、堤防が残す 1px の縁と JPEG の滲みを
 /// 跨げるだけの幅が要る。
@@ -123,6 +123,22 @@ pub enum Matting {
     Projection,
     /// 射影のアルファを、線形 RGB の元画像を案内にした guided filter で均す
     Guided,
+    /// 帯だけを未知にした closed-form matting（Levin）で解き直す
+    ClosedForm,
+}
+
+impl Matting {
+    /// 射影のあとにアルファを均す（解き直す）段を持つか。
+    ///
+    /// **`== Guided` で書くと 3 つ目の値が黙って素通りする。** 色の復元を最終
+    /// アルファまで待つかどうかも、`Solved` の印を取るかどうかも、この 1 つの
+    /// 問いで決まっているので、問いそのものに名前を付ける。
+    fn smooths_alpha(self) -> bool {
+        match self {
+            Matting::Projection => false,
+            Matting::Guided | Matting::ClosedForm => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -210,6 +226,8 @@ pub struct Refined {
     /// `--smooth-contour` は長辺 1000px 換算なので解像度で掛け戻され、
     /// `RADIUS_CEILING` で頭打ちになる
     pub smooth_radius_px: u32,
+    /// `--matting closed-form` が解いた結果。他の解き方では `None`
+    pub matting: Option<closed_form::Report>,
 }
 
 /// sRGB 8bit → 線形 RGB の変換表。境界帯では同じ変換を何十回も引くため。
@@ -270,6 +288,7 @@ pub fn refine(
             mask: binary.clone(),
             band_min_radius: 0,
             smooth_radius_px: 0,
+            matting: None,
         };
     }
 
@@ -318,11 +337,13 @@ pub fn refine(
             mask,
             band_min_radius: min_radius,
             smooth_radius_px: smooth_radius,
+            // 帯が 1 画素も無いので解くものが無い
+            matting: None,
         };
     }
 
     let lut = srgb_lut();
-    let guided_matting = opts.matting == Matting::Guided;
+    let smooths_alpha = opts.matting.smooths_alpha();
     let background = field.rgb();
     let ctx = Context {
         image,
@@ -339,7 +360,7 @@ pub fn refine(
         separation_sq: opts.min_separation * opts.min_separation,
         // guided では色の復元を最終アルファまで待つ。射影のアルファで復元すると、
         // 均した後のアルファと復元色が食い違って縁が色づく
-        despill: opts.despill && !guided_matting,
+        despill: opts.despill && !smooths_alpha,
         feather_radius: opts.feather,
         core_window: window_for(band_max),
     };
@@ -348,7 +369,7 @@ pub fn refine(
     let fallback: OnceCell<Mask> = OnceCell::new();
     let mut ws = Workspace::default();
     // 色から決まった画素の印。guided のときだけ持つ
-    let mut solved = if guided_matting {
+    let mut solved = if smooths_alpha {
         guided::Solved::new((w as usize) * (h as usize))
     } else {
         guided::Solved::default()
@@ -369,17 +390,23 @@ pub fn refine(
         );
     });
 
-    if guided_matting {
-        // (e) 射影アルファを入力、線形 RGB の元画像を案内画像として均す
-        mask = guided::feather(
-            image,
-            &ctx.lut,
-            shape,
-            &band,
-            &mask,
-            &solved,
-            (min_radius + GUIDED_MARGIN).min(u32::from(band_max)),
-        );
+    let mut matting_report = None;
+    if smooths_alpha {
+        // (e) アルファを解き直す。窓の半径はどちらの解き方でも帯幅である
+        let radius = (min_radius + GUIDED_MARGIN).min(u32::from(band_max));
+        match opts.matting {
+            // 射影アルファを入力、線形 RGB の元画像を案内画像として均す
+            Matting::Guided | Matting::Projection => {
+                mask = guided::feather(image, &ctx.lut, shape, &band, &mask, &solved, radius);
+            }
+            // 帯だけを未知にした連立方程式として解き直す
+            Matting::ClosedForm => {
+                let (solved_mask, report) =
+                    closed_form::solve(image, &ctx.lut, shape, &band, &mask, &solved, radius);
+                mask = solved_mask;
+                matting_report = Some(report);
+            }
+        }
         // (f) 最終アルファで色を復元する
         if opts.despill {
             let ctx = Context {
@@ -408,6 +435,7 @@ pub fn refine(
         mask,
         band_min_radius: min_radius,
         smooth_radius_px: smooth_radius,
+        matting: matting_report,
     }
 }
 

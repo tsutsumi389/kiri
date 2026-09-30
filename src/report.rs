@@ -619,7 +619,7 @@ pub struct SettingsReport {
     pub despill: bool,
     /// 境界帯のアルファを色から推定し直したか
     pub refine: bool,
-    /// 境界のアルファの解き方（"projection" / "guided"）
+    /// 境界のアルファの解き方（"projection" / "guided" / "closed-form"）
     pub matting: &'static str,
     /// 帯の中の二値輪郭に掛けたメディアンの半径(px, 長辺 1000px 換算)。0 で無効。
     /// **要求値である**（上限 16）。実際に効いた実寸の半径は `smooth_radius_px`

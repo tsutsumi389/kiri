@@ -1196,6 +1196,13 @@ fn print_the_stage_table() {
                 ..base.clone()
             },
         ),
+        (
+            "closed-form",
+            CutoutOptions {
+                matting: Matting::ClosedForm,
+                ..base.clone()
+            },
+        ),
     ];
 
     println!(
@@ -1229,7 +1236,7 @@ fn print_the_stage_table() {
         let result = cutout(&truth.image, opts);
         let m = common::measure_edges_with(truth, &result.image, &result.mask, opts.bbox, None);
         println!(
-            "{label:<34} {stage:<12} {:>9.2} {:>8.3} {:>9.3} {:>8.4} {:>7} {:>8} {:>8} {:>9} r={:?}",
+            "{label:<34} {stage:<12} {:>9.2} {:>8.3} {:>9.4} {:>8.4} {:>7} {:>8} {:>8} {:>9} r={:?}",
             m.contour_error,
             m.rim_truth,
             m.alpha_mae,
@@ -2109,4 +2116,201 @@ fn print_the_optimize_comparison() {
             found.warnings.join(" ")
         );
     }
+}
+
+/// どのシーンで closed-form が収束しないかを並べる。`--ignored` のときだけ走る。
+#[test]
+#[ignore = "計測用。判定はせず並べるだけ"]
+fn print_the_closed_form_convergence() {
+    use kiri::cutout::Matting;
+    let base = CutoutOptions {
+        matting: Matting::ClosedForm,
+        ..Default::default()
+    };
+    for scene in edge_scenes() {
+        let truth = edge_scene(&scene);
+        let result = cutout(&truth.image, &base);
+        let codes: Vec<&str> = result
+            .warnings
+            .iter()
+            .map(|w| w.code.as_str())
+            .filter(|c| c.starts_with("MATTING"))
+            .collect();
+        println!("{:<38} {codes:?}", scene.name);
+    }
+    for scene in real_scenes() {
+        let truth = common::real_scene(&scene);
+        let bbox = common::assisted_bbox(&truth);
+        let opts = CutoutOptions {
+            bbox: Some(bbox),
+            tolerance: scene.assisted_tolerance,
+            ..base.clone()
+        };
+        let result = cutout(&truth.image, &opts);
+        let codes: Vec<&str> = result
+            .warnings
+            .iter()
+            .map(|w| w.code.as_str())
+            .filter(|c| c.starts_with("MATTING"))
+            .collect();
+        println!("{:<38} {codes:?}", scene.name);
+    }
+}
+
+/// **closed-form が実際に効く側を固定する。** 織り目のある実写背景では、
+/// 正解由来の指標が guided より大きく下がる。
+///
+/// 比で書くのは `the_matting_stages_halve_the_truth_side_error_on_a_real_background`
+/// と同じ理由で、シーンの生成や較正が動いても意味が変わらないようにするため。
+#[test]
+fn closed_form_halves_the_truth_side_error_on_a_woven_background() {
+    use kiri::cutout::Matting;
+    let scene = real_scenes()
+        .into_iter()
+        .find(|s| s.name.starts_with("R1"))
+        .unwrap();
+    let truth = common::real_scene(&scene);
+    let bbox = common::assisted_bbox(&truth);
+    let measure = |matting: Matting| {
+        let opts = CutoutOptions {
+            bbox: Some(bbox),
+            tolerance: scene.assisted_tolerance,
+            matting,
+            ..Default::default()
+        };
+        let result = cutout(&truth.image, &opts);
+        let metrics =
+            common::measure_edges_with(&truth, &result.image, &result.mask, opts.bbox, None);
+        (metrics, result.diagnostics.clone())
+    };
+    let (guided, guided_diagnostics) = measure(Matting::Guided);
+    let (closed, closed_diagnostics) = measure(Matting::ClosedForm);
+
+    assert!(
+        closed.contour_error <= guided.contour_error * 0.5,
+        "輪郭誤差が半分になっていない: {:.2} → {:.2}",
+        guided.contour_error,
+        closed.contour_error
+    );
+    assert!(
+        closed.rim_truth <= guided.rim_truth * 0.5,
+        "帯の正解側の汚染が半分になっていない: {:.3} → {:.3}",
+        guided.rim_truth,
+        closed.rim_truth
+    );
+    assert!(
+        closed.alpha_mae < guided.alpha_mae,
+        "アルファ誤差が下がっていない: {:.4} → {:.4}",
+        guided.alpha_mae,
+        closed.alpha_mae
+    );
+    // **診断値も合否をまたぐ。** guided では 2 本とも警告の側にいる
+    let rough = |d: &kiri::cutout::diagnostics::Diagnostics| d.contour_roughness.unwrap();
+    let rim = |d: &kiri::cutout::diagnostics::Diagnostics| d.rim_contamination.unwrap();
+    assert!(
+        rough(&guided_diagnostics) > CONTOUR_ROUGH_WARN
+            && rough(&closed_diagnostics) < CONTOUR_ROUGH_WARN,
+        "粗さが警告をまたいでいない: {:.3} → {:.3}（警告 {CONTOUR_ROUGH_WARN}）",
+        rough(&guided_diagnostics),
+        rough(&closed_diagnostics)
+    );
+    assert!(
+        rim(&guided_diagnostics) > RIM_CONTAMINATION_WARN
+            && rim(&closed_diagnostics) < RIM_CONTAMINATION_WARN,
+        "縁の汚染が警告をまたいでいない: {:.3} → {:.3}（警告 {RIM_CONTAMINATION_WARN}）",
+        rim(&guided_diagnostics),
+        rim(&closed_diagnostics)
+    );
+}
+
+/// **closed-form が悪くする側も固定する。**
+///
+/// 「新しいほうが良い」と思って既定を差し替えられないように、**負ける事実を
+/// テストに書いておく。** 負けるのは 2 つの形である。
+///
+/// 1. **柔らかい輪郭**（R6、ぼけ 8px）。帯の半径は 3px しかないので、帯の外は
+///    0/1 に固定される。closed-form は帯の中で遷移を完結させるしかなく、真の
+///    傾斜より急になる。**これは解き方ではなく帯幅の限界である**
+/// 2. **細いストラップ**（S5、幅 3px）。帯が芯まで埋めてしまうので Dirichlet の
+///    支えがほとんど無く、輪郭が蛇行する。粗さが警告のしきい値を越える
+#[test]
+fn closed_form_loses_on_soft_edges_and_thin_straps() {
+    use kiri::cutout::Matting;
+    let scene = real_scenes()
+        .into_iter()
+        .find(|s| s.name.starts_with("R6"))
+        .unwrap();
+    let truth = common::real_scene(&scene);
+    let bbox = common::assisted_bbox(&truth);
+    let alpha_mae = |matting: Matting| {
+        let opts = CutoutOptions {
+            bbox: Some(bbox),
+            tolerance: scene.assisted_tolerance,
+            matting,
+            ..Default::default()
+        };
+        let result = cutout(&truth.image, &opts);
+        common::measure_edges_with(&truth, &result.image, &result.mask, opts.bbox, None).alpha_mae
+    };
+    let (guided, closed) = (alpha_mae(Matting::Guided), alpha_mae(Matting::ClosedForm));
+    assert!(
+        closed > guided,
+        "R6 で closed-form が guided を上回った。§8 の受け入れ条件が満たされたので\
+         計画書を読み直すこと: {guided:.4} → {closed:.4}"
+    );
+
+    let strap = edge_scenes()
+        .into_iter()
+        .find(|s| s.name.starts_with("S5 "))
+        .unwrap();
+    let truth = edge_scene(&strap);
+    let rough = |matting: Matting| {
+        let result = cutout(
+            &truth.image,
+            &CutoutOptions {
+                matting,
+                ..Default::default()
+            },
+        );
+        result.diagnostics.contour_roughness.unwrap()
+    };
+    assert!(
+        rough(Matting::Guided) < CONTOUR_ROUGH_WARN
+            && rough(Matting::ClosedForm) > CONTOUR_ROUGH_WARN,
+        "3px のストラップで粗さが警告をまたいでいない: {:.3} → {:.3}（警告 {CONTOUR_ROUGH_WARN}）",
+        rough(Matting::Guided),
+        rough(Matting::ClosedForm)
+    );
+}
+
+/// 同じ入力を 2 度解いて 1 ビットも違わないこと。
+///
+/// **共役勾配は加算順序で結果が動く。** 窓はタイル順に 1 度ずつ、内積は帯の
+/// 添字順に畳む、という約束が崩れていないかをここで見る。
+#[test]
+fn closed_form_is_deterministic() {
+    use kiri::cutout::Matting;
+    let scene = real_scenes()
+        .into_iter()
+        .find(|s| s.name.starts_with("R1"))
+        .unwrap();
+    let truth = common::real_scene(&scene);
+    let opts = CutoutOptions {
+        bbox: Some(common::assisted_bbox(&truth)),
+        tolerance: scene.assisted_tolerance,
+        matting: Matting::ClosedForm,
+        ..Default::default()
+    };
+    let first = cutout(&truth.image, &opts);
+    let second = cutout(&truth.image, &opts);
+    assert_eq!(
+        first.mask.as_slice(),
+        second.mask.as_slice(),
+        "同じ入力で解いたマスクが違う"
+    );
+    assert_eq!(
+        first.image.as_raw(),
+        second.image.as_raw(),
+        "同じ入力で復元した画素が違う"
+    );
 }

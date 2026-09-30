@@ -397,6 +397,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             matting: match opts.matting {
                 Matting::Projection => "projection",
                 Matting::Guided => "guided",
+                Matting::ClosedForm => "closed-form",
             },
             smooth_contour: opts.smooth_contour,
             // 実際に効いた値。指定値は長辺 1000px 換算なので、そのままでは

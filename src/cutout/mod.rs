@@ -14,6 +14,7 @@
 //! あるため、コードとしても残っている。
 
 pub mod background;
+pub mod closed_form;
 pub mod constraints;
 pub mod despill;
 pub mod diagnostics;
@@ -604,6 +605,7 @@ pub fn cutout_seen(
 
     let mut band_min_radius = None;
     let mut smooth_radius_px = None;
+    let mut matting_report = None;
     let mut out = if opts.refine {
         let refined = refine::refine(
             image,
@@ -626,6 +628,7 @@ pub fn cutout_seen(
         mask = refined.mask;
         band_min_radius = Some(refined.band_min_radius);
         smooth_radius_px = Some(refined.smooth_radius_px);
+        matting_report = refined.matting;
         refined.image
     } else {
         mask = feather::feather(&mask, opts.feather);
@@ -673,6 +676,7 @@ pub fn cutout_seen(
     // 設定の調整はいちばん先に伝える。結果への警告は、その設定で走った結果に
     // ついてのものなので、順序が逆だと読み手が原因を後から知ることになる
     let mut warnings = Vec::from_iter(texture_warning);
+    warnings.extend(matting_report.and_then(not_converged));
     warnings.extend(field_warning);
     warnings.extend(field_skipped);
     warnings.extend(collect_warnings(
@@ -968,6 +972,34 @@ pub fn bbox_argument(bbox: [f64; 4]) -> String {
 /// どの警告も機械可読な `code` を持ち、判断に使った数値を `data` に載せる。
 /// 文言は推敲で変わるが、code と data のキーは契約として動かさない。
 #[allow(clippy::too_many_arguments)]
+/// closed-form が解き切れなかったことを報せる。
+///
+/// **「帯が広いから遅い」と「解けていない」は別の事実である。** 遅いことは
+/// 時間で分かるが、上限で打ち切ったことは出力の画素からは読めない。読めない
+/// 事実だけを警告にする——収束したときは何も出さない。
+fn not_converged(report: closed_form::Report) -> Option<Warning> {
+    if report.converged || report.unknowns == 0 {
+        return None;
+    }
+    Some(
+        Warning::new(
+            WarningCode::MattingNotConverged,
+            format!(
+                "closed-form matting が {} 反復で止まりました（最後の変化 {:.5}、\
+                 止める基準 {:.5}、未知 {} 画素）。帯のアルファは解き切れていません",
+                report.iterations,
+                report.max_delta,
+                1.0 / 510.0,
+                report.unknowns,
+            ),
+        )
+        .with_hint("--matting guided なら 1 パスで終わります。帯が広い素材では closed-form の反復が足りません")
+        .with_data("iterations", report.iterations)
+        .with_data("max_delta", report.max_delta)
+        .with_data("unknowns", report.unknowns),
+    )
+}
+
 fn collect_warnings(
     background: &BackgroundEstimate,
     residual: &DeltaEQuantiles,
@@ -1187,6 +1219,47 @@ fn collect_warnings(
 mod tests {
     use super::*;
     use image::Rgba;
+
+    /// 解き切れなかったときだけ警告が出る。
+    ///
+    /// **収束した実行で出してはいけない。** 21 点の較正シーンはすべて 5〜97 反復で
+    /// 収束するので、この警告が出る素材はベンチに 1 つも無い。出る条件を
+    /// テストで持たないと、上限の側を動かしたときに気づけなくなる。
+    #[test]
+    fn only_an_unfinished_matting_warns() {
+        let converged = closed_form::Report {
+            unknowns: 1000,
+            iterations: 31,
+            converged: true,
+            max_delta: 0.001,
+        };
+        assert!(
+            not_converged(converged).is_none(),
+            "収束したのに警告が出ている"
+        );
+        assert!(
+            not_converged(closed_form::Report {
+                unknowns: 0,
+                ..converged
+            })
+            .is_none(),
+            "解くものが無いのに警告が出ている"
+        );
+
+        let warning = not_converged(closed_form::Report {
+            converged: false,
+            max_delta: 0.07,
+            iterations: 200,
+            ..converged
+        })
+        .expect("解き切れていないので警告が出る");
+        assert_eq!(warning.code, WarningCode::MattingNotConverged);
+        // 反復数と最後の変化は、エージェントが「もう少しで済むのか
+        // まるで足りないのか」を自分で判断する材料である
+        assert_eq!(warning.data["iterations"], 200);
+        assert_eq!(warning.data["unknowns"], 1000);
+        assert!(warning.hint.is_some(), "逃げ道を示していない");
+    }
 
     /// 背景色の上に矩形の商品を置いた画像と、その矩形どおりのマスクを作る。
     fn scene(bg: [u8; 3], product: [u8; 3]) -> (RgbaImage, Mask) {

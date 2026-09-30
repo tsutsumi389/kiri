@@ -67,6 +67,8 @@ warning_catalog! {
         => "輪郭がギザギザに蛇行している。背景のテクスチャが輪郭に乗っている",
     RimContaminated = "RIM_CONTAMINATED"
         => "縁の色が商品より背景に近い（HALO_REMAINS も出ていれば --tolerance で減る）",
+    MattingNotConverged = "MATTING_NOT_CONVERGED"
+        => "closed-form matting が反復の上限で止まった。帯のアルファは解き切れていない",
     EdgeThresholdRaised = "EDGE_THRESHOLD_RAISED"
         => "背景のテクスチャに合わせて輪郭の堤防を引き上げた",
     BackgroundFieldUsed = "BACKGROUND_FIELD_USED"

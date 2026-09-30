@@ -431,6 +431,15 @@ pub struct CutoutResult {
     /// 実際に効いた帯幅の下限(px)。輪郭の粗さで持ち上がることがあるので、
     /// 指定値からは読めない。`--no-refine` では帯そのものが無いので None
     pub band_min_radius: Option<u32>,
+    /// 輪郭画素が要求した帯の半径の分布（添字が半径 px、値が輪郭画素の数、
+    /// 長さは `refine` の帯幅の絶対上限 + 1）。**計測のための通り道で、
+    /// `report.rs` は読まない**——JSON にも `kiri schema` にも出さない。
+    ///
+    /// 3 つの状態がある。`--no-refine` では帯そのものが無いので `None`、
+    /// 寸法が合わない退避路では帯を 1 度も引いていないので**空**、それ以外は
+    /// 長さが上限 + 1 で埋まる。**数えるのは「要求」であって「残った帯」では
+    /// ない**（`refine::Refined` の同名フィールドを参照）
+    pub band_width_histogram: Option<Vec<u32>>,
     /// 実際に効いた輪郭の平滑化半径(px)。`--smooth-contour` は長辺 1000px 換算
     /// なので、指定値からは読めない。`--no-refine` では None
     pub smooth_radius_px: Option<u32>,
@@ -604,6 +613,7 @@ pub fn cutout_seen(
     restore_forced_foreground(&mut mask, opts);
 
     let mut band_min_radius = None;
+    let mut band_width_histogram = None;
     let mut smooth_radius_px = None;
     let mut matting_report = None;
     let mut out = if opts.refine {
@@ -627,6 +637,7 @@ pub fn cutout_seen(
         );
         mask = refined.mask;
         band_min_radius = Some(refined.band_min_radius);
+        band_width_histogram = Some(refined.band_width_histogram);
         smooth_radius_px = Some(refined.smooth_radius_px);
         matting_report = refined.matting;
         refined.image
@@ -698,6 +709,7 @@ pub fn cutout_seen(
         residual,
         edge_threshold,
         band_min_radius,
+        band_width_histogram,
         smooth_radius_px,
         stats,
         separability,

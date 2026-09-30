@@ -1271,6 +1271,116 @@ fn print_the_stage_table() {
     }
 }
 
+/// 輪郭画素が要求した帯幅の分布。**計画 §9.2 の第一歩で、判定はせず表を出す。**
+///
+/// §8.6 / §8.10 と `closed_form_loses_on_soft_edges_and_thin_straps` の doc は
+/// 「帯の半径は S4 で 2px / R6 で 3px しかない」を柔らかい輪郭で負けた原因に
+/// 挙げているが、その根拠は `settings.band_min_radius`——帯幅の**下限**である。
+/// 画素ごとの帯幅は `transition_width` が 1〜`DEFAULT_MAX_RADIUS`(10) の範囲で
+/// 決めるので、**下限が 2〜3px であることは帯が 2〜3px であることを意味しない。**
+///
+/// S4 と R6 の真の遷移は 8px にわたっている。**中央値が 8px 以上なら帯は既に
+/// 真の遷移を覆っていて、§8 の診断は誤りである**（§9.2 の表と中止条件 1）。
+///
+/// 段を 2 つ出すのは、帯が**塗り直しで引き直される**からである（`reshape` の
+/// パスごとに `band_map_into` が走る）。2 つの差がそのまま「引き直しが帯を
+/// 動かした量」になる。
+///
+/// **matting は既定（`Guided`）のまま置く。** `RefineOptions::staged()` が
+/// `band_radii` の「下限を解像度で掛け戻し、輪郭の粗さで持ち上げる」を門にして
+/// いるので、ここで `Projection` へ落とすと**「(b)(c) の効果」と「下限が生の
+/// 2px へ戻ったこと」が混ざる**。だから `print_the_stage_table` の `phase2` とは
+/// 別の設定で、ラベルも分けてある。帯は解く前に決まるので、matting の値そのもの
+/// は分布を動かさない。
+#[test]
+#[ignore = "計測用。判定はせず表を出すだけ"]
+fn print_the_band_width_distribution() {
+    let base = CutoutOptions::default();
+    let stages: Vec<(&str, CutoutOptions)> = vec![
+        (
+            "(b)(c) 無し",
+            CutoutOptions {
+                smooth_contour: 0.0,
+                reclassify: false,
+                ..base.clone()
+            },
+        ),
+        ("既定(b+c+e)", base.clone()),
+    ];
+
+    // 添字が帯幅(px)、値が輪郭画素の数。累積で分位点を引く
+    let quantile = |h: &[u32], q: f64| -> f64 {
+        let total: u64 = h.iter().map(|&c| u64::from(c)).sum();
+        if total == 0 {
+            return f64::NAN;
+        }
+        let target = ((total as f64) * q).ceil().max(1.0) as u64;
+        let mut seen = 0u64;
+        for (px, &c) in h.iter().enumerate() {
+            seen += u64::from(c);
+            if seen >= target {
+                return px as f64;
+            }
+        }
+        f64::NAN
+    };
+    let largest = |h: &[u32]| -> usize { h.iter().rposition(|&c| c != 0).unwrap_or(0) };
+    // **非ゼロのビンを全部、半径の昇順で出す。** 多い順に 4 つだけ出していたら
+    // 計画 §9.9 の表が「基準線として残る」と書いた役目を果たせない——将来
+    // 一致を見るには、記録から分布が復元できなければならない
+    let bins = |hist: &[u32]| -> String {
+        hist.iter()
+            .copied()
+            .enumerate()
+            .filter(|&(_, c)| c != 0)
+            .map(|(px, c)| format!("{px}px:{c}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+
+    println!(
+        "\n{:<34} {:<12} {:>5} {:>5} {:>5} {:>5} {:>9}  分布(半径:件数)",
+        "シーン", "段", "下限", "p50", "p90", "最大", "輪郭画素"
+    );
+
+    let row = |label: &str, truth: &common::EdgeTruth, opts: &CutoutOptions, stage: &str| {
+        let result = cutout(&truth.image, opts);
+        let lower = result
+            .band_min_radius
+            .map_or("-".to_string(), |r| r.to_string());
+        let hist = result.band_width_histogram.unwrap_or_default();
+        let total: u64 = hist.iter().map(|&c| u64::from(c)).sum();
+        println!(
+            "{label:<34} {stage:<12} {lower:>5} {:>5.0} {:>5.0} {:>5} {total:>9}  {}",
+            quantile(&hist, 0.5),
+            quantile(&hist, 0.9),
+            largest(&hist),
+            bins(&hist),
+        );
+    };
+
+    for scene in edge_scenes() {
+        let truth = edge_scene(&scene);
+        for (stage, opts) in &stages {
+            row(scene.name, &truth, opts, stage);
+        }
+        println!();
+    }
+    for scene in real_scenes() {
+        let truth = common::real_scene(&scene);
+        let bbox = common::assisted_bbox(&truth);
+        for (stage, opts) in &stages {
+            let opts = CutoutOptions {
+                bbox: Some(bbox),
+                tolerance: scene.assisted_tolerance,
+                ..opts.clone()
+            };
+            row(scene.name, &truth, &opts, stage);
+        }
+        println!();
+    }
+}
+
 /// 手持ちの正解つき実写を回す入口。`KIRI_BENCH_DIR` が指す場所を読む。
 ///
 /// **合成の正解はどこまで行っても合成である。** 実写に正解アルファを付ける
@@ -2228,11 +2338,17 @@ fn closed_form_halves_the_truth_side_error_on_a_woven_background() {
 /// 「新しいほうが良い」と思って既定を差し替えられないように、**負ける事実を
 /// テストに書いておく。** 負けるのは 2 つの形である。
 ///
-/// 1. **柔らかい輪郭**（R6、ぼけ 8px）。帯の半径は 3px しかないので、帯の外は
-///    0/1 に固定される。closed-form は帯の中で遷移を完結させるしかなく、真の
-///    傾斜より急になる。**これは解き方ではなく帯幅の限界である**
-/// 2. **細いストラップ**（S5、幅 3px）。帯が芯まで埋めてしまうので Dirichlet の
-///    支えがほとんど無く、輪郭が蛇行する。粗さが警告のしきい値を越える
+/// 1. **柔らかい輪郭**（R6、ぼけ 8px）
+/// 2. **細いストラップ**（S5、幅 3px）
+///
+/// **どちらの原因も帯幅ではない。** 計画 §9.9 で帯幅の分布を測ったところ、R6 の
+/// 半径は p50 8px / p90 10px（総幅で 17px / 21px）あり、真の遷移 8px を既に
+/// 覆っていた。3px しかないのは `settings.band_min_radius`——帯幅の**下限**である。
+/// S5 で 4px 以上を要求する輪郭画素も 1460 中 150 件しかなく、「帯が芯まで埋めて
+/// Dirichlet の支えを消す」も少数の画素でしか起きていない。
+///
+/// **負ける事実は動かない**（下の表明がそれを固定している）。動いたのは原因の
+/// 説明で、いまは分かっていない。次の疑いは §9.9 の末尾にある。
 #[test]
 fn closed_form_loses_on_soft_edges_and_thin_straps() {
     use kiri::cutout::Matting;

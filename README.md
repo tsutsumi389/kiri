@@ -3773,8 +3773,15 @@ error: invalid value 'sideways' for '--angle <ANGLE>': 'sideways' は有限な�
 
 ## ドキュメント
 
-- [設計ドキュメント](docs/design.md) — 技術選定と決定の根拠
-- [実装計画](docs/implementation-plan.md) — フェーズ分割と進捗
+- [設計ドキュメント](docs/design.md) — 技術選定と決定の根拠。切り抜きアルゴリズム
+  （§4）は主題ごとに [docs/design/](docs/design/) へ分かれていて、design.md の
+  §4 に番号から引く索引がある
+- [実装計画](docs/implementation-plan.md) — フェーズ分割・テスト方針・残件の順序。
+  フェーズごとの記録（§5 / §7〜§9）は [docs/phases/](docs/phases/) にある
+
+**節番号は分割しても変えていない。** README やソースのコメントが
+`design.md 4.13` や `計画 §8.6` のように番号で参照しているので、番号は識別子
+として固定し、どのファイルにあるかは各文書の索引で引く。
 
 ## ライセンス
 

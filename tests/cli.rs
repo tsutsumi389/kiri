@@ -9691,6 +9691,31 @@ fn collect_source(dir: &Path, out: &mut String) {
     }
 }
 
+/// `docs` 配下の Markdown を再帰で集める。返すのはリポジトリ相対のパスと本文。
+///
+/// **ファイル名を直書きしない。** 直書きだと、長くなった文書を分割した日に
+/// 新しいファイルだけが検査の外へ出る——分割はいつか必ず起きるのに、
+/// 漏れたことは誰にも分からない。歩いて集めれば足した文書は黙って入る
+fn collect_markdown(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    entries.sort(); // 落ちたときのメッセージを再現可能にする
+    for path in entries {
+        if path.is_dir() {
+            collect_markdown(&path, root, out);
+        } else if path.extension().is_some_and(|e| e == "md") {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push((rel, std::fs::read_to_string(&path).unwrap()));
+        }
+    }
+}
+
 fn pascal_case(screaming_snake: &str) -> String {
     screaming_snake
         .split('_')
@@ -9791,10 +9816,34 @@ fn every_code_named_in_the_docs_exists() {
     collect_source(&root.join("src"), &mut source);
     collect_public_string_constants(&root.join("tests"), &mut source);
 
+    // 見るのは README と `docs` 配下の Markdown すべてである。**3 つを直書きしていた
+    // ものを歩く側へ直した**——`docs/design.md` と `docs/implementation-plan.md` を
+    // 主題ごとに分割したとき、直書きのままなら新しい文書だけが検査の外へ出る。
+    // エージェントが写し取る場所が増えるほど、幽霊の入り口も増える
+    let mut docs: Vec<(String, String)> = vec![(
+        "README.md".to_string(),
+        std::fs::read_to_string(root.join("README.md")).unwrap(),
+    )];
+    collect_markdown(&root.join("docs"), root, &mut docs);
+    assert!(
+        docs.len() > 3,
+        "docs を歩けていない（{} 件しか集まっていない）",
+        docs.len()
+    );
+
+    // 計画書だけが未実装の code を名指ししてよい。分割後の計画書は
+    // `docs/implementation-plan.md` と `docs/phases/` に分かれているので、
+    // **両方を計画書として扱う**
+    let is_plan =
+        |doc: &str| doc == "docs/implementation-plan.md" || doc.starts_with("docs/phases/");
+
     // 逆向きも見る。計画書が名指しをやめた code が表に残ると、次に誰かが同じ名前を
     // 計画書へ書いたとき、検討されないまま素通しになる
-    let plan =
-        all_caps_words(&std::fs::read_to_string(root.join("docs/implementation-plan.md")).unwrap());
+    let plan: Vec<String> = docs
+        .iter()
+        .filter(|(doc, _)| is_plan(doc))
+        .flat_map(|(_, text)| all_caps_words(text))
+        .collect();
     for p in PLANNED_CODES {
         assert!(
             !known.iter().any(|k| k == p),
@@ -9806,13 +9855,11 @@ fn every_code_named_in_the_docs_exists() {
         );
     }
 
-    for doc in ["README.md", "docs/design.md", "docs/implementation-plan.md"] {
-        let text = std::fs::read_to_string(root.join(doc)).unwrap();
-        for name in all_caps_words(&text) {
+    for (doc, text) in &docs {
+        for name in all_caps_words(text) {
             let is_code = known.contains(&name);
             let is_constant = source.contains(&format!("const {name}"));
-            let is_planned =
-                doc == "docs/implementation-plan.md" && PLANNED_CODES.contains(&name.as_str());
+            let is_planned = is_plan(doc) && PLANNED_CODES.contains(&name.as_str());
             assert!(
                 is_code || is_constant || is_planned,
                 "{doc} が実在しない code を名指ししている: {name}"

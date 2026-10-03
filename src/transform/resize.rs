@@ -10,7 +10,15 @@ use image::RgbaImage;
 use crate::error::{Error, ErrorCode, Result};
 
 /// 指定した枠に対する当てはめ方。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+///
+/// `Deserialize` は `compose` の spec が `fit` を書くために要る。**綴りは CLI の
+/// `--fit` と同じ**（`clap::ValueEnum` が小文字へ畳むのに合わせて `snake_case` に
+/// してある）——同じ概念に 2 つの綴りを与えると、spec と CLI を行き来する人が
+/// どちらで書いたかを覚えることになる。
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Deserialize, serde::Serialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum FitMode {
     /// 枠に収まるよう縮小する。アスペクト比を保つ。結果は枠以下になる
     Contain,

@@ -220,6 +220,10 @@ error_catalog! {
         => "セグメンテーションモデルのファイルが置き場所に無い（kiri model list が取得手順を返す）",
     ModelUnreadable = "MODEL_UNREADABLE", Input
         => "モデルのファイルが壊れている（大きさが違う、ONNX として解析できない）",
+    FontNotFound = "FONT_NOT_FOUND", Input
+        => "compose が要求したフォントが無い（代替へは落ちない。同じ spec が機械ごとに違う絵になるため）",
+    FontUnreadable = "FONT_UNREADABLE", Input
+        => "フォントのファイルを読めない、または字体として解析できない",
 
     // 処理 (exit 4)
     EmptyImage = "EMPTY_IMAGE", Processing

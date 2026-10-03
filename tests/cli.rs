@@ -9784,12 +9784,7 @@ const PLANNED_CODES: &[&str] = &[
     // **計画書から名前が消えたら、ここからも消す**——この表に残ると、
     // 次に誰かが同じ名前を計画書へ書いたとき検討されないまま素通しになる
     //
-    // 以下は Phase 29（§10）。素材と文字を組む段が名指しする code で、まだ無い
-    "FONT_NOT_FOUND",
-    "TEXT_OVERFLOW",
-    "TEXT_CONTRAST_LOW",
-    "LAYERS_OVERLAP",
-    "OUTSIDE_SAFE_AREA",
+    // Phase 29（§10）の 5 つは実装済みなのでここから消した
 ];
 
 /// ドキュメントが名指しする code は、実在する code か実在する定数のどちらかである。
@@ -10680,6 +10675,30 @@ fn every_published_field_exists_in_the_result() {
         );
         json_stdout(&out)
     };
+    // **compose は spec を受けるので、専用の実行が要る。**
+    //
+    // **文字のレイヤを入れない。** 字体はシステムに依るので、ここへ混ぜると
+    // CI と手元で別の結果になる検査になる（文字を伴う測りは、字体を
+    // リポジトリの 1 本へ固定した専用の表明が確かめる）。文字にしか出ない
+    // path はどれも nullable なので、**画像 1 枚でもキーは全部出る**——
+    // この検査が見たいのは「配った path が結果に在るか」である
+    let composed = {
+        let spec = write_spec(
+            dir.path(),
+            r##"{"canvas":{"width":200,"height":200,"background":"#ffffff"},
+                 "safe_area":[10,10,180,180],
+                 "layers":[{"id":"subject","type":"image","role":"subject",
+                            "source":"product.jpg","rect":[20,20,160,160]}]}"##,
+        );
+        run(&[
+            "compose",
+            spec.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--dry-run",
+            "--json",
+        ])
+    };
     let segmented = segment_ready().then(|| {
         (
             run(&[
@@ -10731,6 +10750,7 @@ fn every_published_field_exists_in_the_result() {
                 "cutout" if path.starts_with("settings.") => &profiled,
                 "cutout" if path.starts_with("rotate.") => &rotated,
                 "lint" => &linted,
+                "compose" => &composed,
                 "batch" => &batched,
                 "rotate" => &turned,
                 "convert" => &converted,

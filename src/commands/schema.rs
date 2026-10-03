@@ -20,8 +20,9 @@ use crate::cutout::{MAX_FOREGROUND_RATIO, MIN_FOREGROUND_RATIO, background, diag
 use crate::error::{ErrorCode, ErrorKind};
 use crate::profile;
 use crate::report::{
-    ArgEntry, CommandEntry, ErrorCodeEntry, ExitCodeEntry, FieldEntry, FieldGate, FieldThreshold,
-    LintCheckEntry, ProfileEntry, ProfileRules, SCHEMA_VERSION, SchemaReport, WarningCodeEntry,
+    ArgEntry, CommandEntry, ComposeSpecEntry, ErrorCodeEntry, ExitCodeEntry, FieldEntry, FieldGate,
+    FieldThreshold, LintCheckEntry, ProfileEntry, ProfileRules, SCHEMA_VERSION, SchemaReport,
+    WarningCodeEntry,
 };
 use crate::warning::WarningCode;
 
@@ -54,7 +55,43 @@ pub fn run() -> SchemaReport {
         profiles: profiles(),
         global_options: global_options(),
         commands: commands(),
+        compose_spec: compose_spec(),
     }
+}
+
+/// compose の spec の形を配る。**`compose` が持つ表をそのまま引く。**
+///
+/// 書き写すと、キーを 1 つ足した日に schema だけが古い形を配る
+/// （`profiles` / `exit_codes` と同じ作法）。
+fn compose_spec() -> Vec<ComposeSpecEntry> {
+    use crate::compose::keys;
+    vec![
+        ComposeSpecEntry {
+            at: "spec",
+            keys: keys::SPEC.to_vec(),
+            summary: "最上位。layers は重ねる順に並べる",
+        },
+        ComposeSpecEntry {
+            at: "canvas",
+            keys: keys::CANVAS.to_vec(),
+            summary: "組む 1 枚の寸法と下地。background を省くと透明のまま組む",
+        },
+        ComposeSpecEntry {
+            at: "font",
+            keys: keys::FONT.to_vec(),
+            summary: "字体。文字のレイヤが 1 つでもあれば要る。                      見つからなければ FONT_NOT_FOUND で断る（代替へ落ちない）",
+        },
+        ComposeSpecEntry {
+            at: "layers[type=image]",
+            keys: keys::IMAGE_LAYER.to_vec(),
+            summary: "画像のレイヤ。rect は枠で、実際に置かれた矩形は結果の placed が返す",
+        },
+        ComposeSpecEntry {
+            at: "layers[type=text]",
+            keys: keys::TEXT_LAYER.to_vec(),
+            summary: "文字のレイヤ。lines は行の配列で、kiri は折り返さない                      （行ごとの実測幅は結果の line_widths が返す）",
+        },
+    ]
 }
 
 /// トップレベルの引数。`--json` がここにいる。
@@ -283,7 +320,8 @@ fn arg_entry(arg: &clap::Arg) -> ArgEntry {
 /// 嘘になる。
 fn fields() -> Vec<FieldEntry> {
     let both = || vec!["info", "cutout"];
-    vec![
+    let compose = || vec!["compose"];
+    let mut out = vec![
         FieldEntry {
             path: "background.uniformity",
             appears_in: both(),
@@ -1861,5 +1899,96 @@ fn fields() -> Vec<FieldEntry> {
                  （撮り直すしかない）に分かれる",
             ),
         },
-    ]
+    ];
+
+    // compose の測り。**`--fail-on` の指標の綴りはこの `path` の末尾である**
+    // （cutout の指標が `mask.*` の末尾であるのと同じ規約）。しきい値は
+    // `measure` の定数をそのまま引く——書き写すと、線を動かしたときに
+    // schema だけが古い値を配る
+    out.extend([
+        FieldEntry {
+            path: "layers[].placed",
+            appears_in: compose(),
+            unit: "list",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "実際に置かれた矩形 [x, y, 幅, 高さ]",
+            notes: Some(
+                "spec が書いた rect とは違う値になる。画像は枠へ内接して縮み、文字は\
+                 組んだ結果の外接矩形になる。**余白を計算できるのはこちらである**",
+            ),
+        },
+        FieldEntry {
+            path: "layers[].text_overflow",
+            appears_in: compose(),
+            unit: "px",
+            nullable: true,
+            null_means: Some("画像のレイヤ（はみ出しは文字にだけ測る）"),
+            warns: vec![FieldThreshold {
+                code: WarningCode::TextOverflow,
+                operator: "gt",
+                threshold: 0.0,
+            }],
+            gates: None,
+            summary: "文字が rect からはみ出した量（右と下の大きいほう）",
+            notes: Some(
+                "**どの向きであれ最も大きい 1 つ**で、向きまで要るなら rect と placed の\
+                 差で出る。kiri は縮めも折り返しもしないので、直すのは spec の側である",
+            ),
+        },
+        FieldEntry {
+            path: "layers[].text_contrast",
+            appears_in: compose(),
+            unit: "ratio",
+            nullable: true,
+            null_means: Some("role が decoration、画像のレイヤ、または 1 画素も描かれなかった"),
+            warns: vec![FieldThreshold {
+                code: WarningCode::TextContrastLow,
+                operator: "lt",
+                threshold: crate::compose::measure::MIN_CONTRAST,
+            }],
+            gates: None,
+            summary: "文字と、その文字が実際に載っている背後とのコントラスト比",
+            notes: Some(
+                "**背景色の指定からではなく実測である**\
+                 ——下に画像が敷いてあればそこが背後で、ちょうどそこが読めなくなる。\
+                 しきい値 4.5 は WCAG 2.1 の AA（kiri が決めた数ではない）",
+            ),
+        },
+        FieldEntry {
+            path: "layers[].layer_overlap",
+            appears_in: compose(),
+            unit: "ratio",
+            nullable: true,
+            null_means: Some("role が subject のレイヤが 1 つも無い"),
+            warns: vec![FieldThreshold {
+                code: WarningCode::LayersOverlap,
+                operator: "gt",
+                threshold: crate::compose::measure::MAX_SUBJECT_OVERLAP,
+            }],
+            gates: None,
+            summary: "文字が覆う画素のうち、subject の不透明部分と重なった比",
+            notes: Some(
+                "**外接矩形ではなく字が実際に覆う画素で数える**ので、行間の空白は\
+                 重なりに入らない",
+            ),
+        },
+        FieldEntry {
+            path: "layers[].outside_safe_area",
+            appears_in: compose(),
+            unit: "bool",
+            nullable: true,
+            null_means: Some("spec に safe_area が無い"),
+            warns: vec![],
+            gates: None,
+            summary: "そのレイヤが safe_area の外へ出たか",
+            notes: Some(
+                "**範囲は spec が書く**——どこまでが切られずに残るかは媒体ごとに違い、\
+                 出典も媒体の側にある",
+            ),
+        },
+    ]);
+    out
 }

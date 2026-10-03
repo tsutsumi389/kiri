@@ -84,7 +84,7 @@ src/
 | 26 | 出力の既定を実写の実測から引き直す：`--quality` を 40 dB に届く 90 へ、profile の canvas を固定値から入力依存の段へ（**済**。§5 の Phase 26） | `--quality` の既定 90 / `profile::CANVAS_LADDER` / `Profile::canvas_for` | 1日 |
 | 27 | 境界のアルファを帯だけの closed-form matting で解く（**済**。§8。**狙った的には当たらず、織り目のある実写背景に当たった**——受け入れ条件は §8.6 で差し替えた） | `--matting closed-form` / `MATTING_NOT_CONVERGED` | 1〜2日 |
 | 28 | 帯を遷移と厚みから引き直し、柔らかい輪郭と細い構造を取り戻す（**中止**。§9.9。**第一歩の計測で §8 の診断が誤りだと分かった**——帯は真の遷移を既に覆っていて、的は帯幅ではなかった。実装はしていない） | 計測の通り道（`CutoutResult.band_width_histogram`。JSON には出さない） | 0.5日（計測で中止） |
-| 29 | 切り抜いた素材と文字を spec から 1 枚へ組む（**計画**。§10。**組版は `resvg` へ出し、契約と測りは kiri が持つ**——幾何がレイヤ単位で取れることは着手前に実測した。§10.2） | `kiri compose` / spec の `layers[].role` / `TEXT_OVERFLOW` ほか指標 4 つ | L |
+| 29 | 切り抜いた素材と文字を spec から 1 枚へ組む（**済**。§10.10。**組版だけを `resvg` へ出し、契約と測りは kiri が持つ**。計画と違えた 6 点と費用の実測は §10.10） | `kiri compose` / spec の `layers[].role` / `TEXT_OVERFLOW` ほか指標 4 つ | L |
 
 **Phase 17〜26 は EC 特化のロードマップ**で、狙いと順序の根拠は
 [7. EC 特化のロードマップ](phases/07-roadmap-ec.md)に置く。

@@ -1,4 +1,5 @@
 pub mod batch;
+pub mod compose;
 pub mod convert;
 pub mod cutout;
 pub mod info;

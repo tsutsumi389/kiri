@@ -127,6 +127,14 @@ warning_catalog! {
         => "背景の水準から露出を正せなかった。data.reason が not_light / no_material / gain_out_of_range / would_clip のどれかを言う",
     SetNotMeasured = "SET_NOT_MEASURED"
         => "batch の set が 1 点も測れなかったので揃えていない（各項目は自分で解決した fill_ratio のまま）",
+    TextOverflow = "TEXT_OVERFLOW"
+        => "compose の文字が rect に収まらなかった。縮めても折り返してもいない（data.overflow が px で不足を言う）",
+    TextContrastLow = "TEXT_CONTRAST_LOW"
+        => "compose の文字と、その文字が実際に載っている背後とのコントラスト比が低い（data.contrast が実測値）",
+    LayersOverlap = "LAYERS_OVERLAP"
+        => "compose の文字が subject の不透明部分と重なっている（data.ratio が文字の面積に対する重なりの比）",
+    OutsideSafeArea = "OUTSIDE_SAFE_AREA"
+        => "compose の要素が safe_area の外へ出た（表示側で切られる範囲にある）",
 }
 
 impl Serialize for WarningCode {

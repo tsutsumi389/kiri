@@ -136,6 +136,19 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                 return Ok(ErrorKind::Compliance.exit_code());
             }
         }
+        Command::Compose(args) => {
+            let report = commands::compose::run(args)?;
+            if cli.json {
+                print_json(&report)?;
+            } else {
+                print_compose(&report);
+            }
+            // **`Err` 経路を通さない。** 組むのは成功していて、成果物もある。
+            // `lint` とまったく同じ扱いで、名乗りは `compliance.code` が行う
+            if report.compliance.as_ref().is_some_and(|c| !c.passed) {
+                return Ok(ErrorKind::Compliance.exit_code());
+            }
+        }
         Command::Lint(args) => {
             let report = commands::lint::run(args)?;
             if cli.json {
@@ -634,6 +647,81 @@ fn print_compliance(compliance: Option<&ComplianceReport>) {
 /// 切り抜きの要約を押し流すからである。lint は検査そのものが用件で、
 /// 行数も規格の条件の数（多くても 9）で決まるので、押し流すものが無い。
 /// **何を見て何を見ていないかが一目で分かること**のほうがここでは重い。
+/// compose の人間向けの行。
+///
+/// **実測を先に出す。** 書いた値は spec を見れば分かるが、置かれた矩形は
+/// 走らせないと分からない。はみ出しとコントラストはその場で読めるように
+/// 同じ行へ添える。
+fn print_compose(report: &kiri::report::ComposeReport) {
+    println!("{}", report.spec);
+    println!(
+        "  canvas    {} x {}{}",
+        report.canvas.width,
+        report.canvas.height,
+        match &report.canvas.background {
+            Some(color) => format!("  {color}"),
+            None => "  (透明)".to_string(),
+        }
+    );
+    if let Some(font) = &report.font {
+        println!(
+            "  font      {}{}",
+            font.family,
+            match &font.path {
+                Some(path) => format!("  {path}"),
+                None => String::new(),
+            }
+        );
+    }
+    for layer in &report.layers {
+        let [x, y, w, h] = layer.placed;
+        println!(
+            "    {:<10} {:<5} {:>7.1},{:>7.1} {:>7.1}x{:<7.1}",
+            layer.id, layer.kind, x, y, w, h
+        );
+        if let Some(over) = layer.text_overflow {
+            if over > 0.0 {
+                println!("               はみ出し {over:.1}px");
+            }
+        }
+        if let Some(contrast) = layer.text_contrast {
+            println!("               コントラスト {contrast:.2}");
+        }
+    }
+    println!(
+        "  出力      {} {} x {}  {} バイト{}",
+        report.output.format,
+        report.output.width,
+        report.output.height,
+        report.output.bytes,
+        if report.dry_run { "  (dry-run)" } else { "" }
+    );
+    if let Some(compliance) = &report.compliance {
+        println!(
+            "  fail-on   {}  {}",
+            compliance.fail_on,
+            if compliance.passed {
+                "合格"
+            } else {
+                "不合格"
+            }
+        );
+        for check in &compliance.checks {
+            let mark = match check.status {
+                kiri::compliance::PASS => "o",
+                kiri::compliance::FAIL => "x",
+                _ => "-",
+            };
+            let actual = check
+                .actual
+                .as_ref()
+                .map_or_else(|| check.status.to_string(), |v| v.to_string());
+            println!("    {mark} {:<15} {actual}", check.metric);
+        }
+    }
+    print_warnings(&report.warnings);
+}
+
 fn print_lint(report: &LintReport) {
     println!("{}", report.input);
     println!(

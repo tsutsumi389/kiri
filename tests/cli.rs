@@ -9783,6 +9783,13 @@ const PLANNED_CODES: &[&str] = &[
     // （はみ出しは reflect.clipped が真偽で言う。計画書 §7.4 と §5 の Phase 25）。
     // **計画書から名前が消えたら、ここからも消す**——この表に残ると、
     // 次に誰かが同じ名前を計画書へ書いたとき検討されないまま素通しになる
+    //
+    // 以下は Phase 29（§10）。素材と文字を組む段が名指しする code で、まだ無い
+    "FONT_NOT_FOUND",
+    "TEXT_OVERFLOW",
+    "TEXT_CONTRAST_LOW",
+    "LAYERS_OVERLAP",
+    "OUTSIDE_SAFE_AREA",
 ];
 
 /// ドキュメントが名指しする code は、実在する code か実在する定数のどちらかである。

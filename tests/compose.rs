@@ -35,17 +35,35 @@ fn json_stdout(output: &std::process::Output) -> Value {
         .unwrap_or_else(|e| panic!("stdout が JSON として解釈できません: {e}\n---\n{stdout}"))
 }
 
-/// 文字を組める字体が 1 つでもあるか。**綴りは問わない。**
+/// このファイルの表明が使う文字を**実際に描ける**字体を 1 つ借りる。
 ///
 /// 返すのは「この機械に在る family」で、どれが在るかは機械ごとに違う。
 /// 在るものを 1 つ借りて**関係だけ**を確かめる、というのがこのファイルの作法で
 /// ある（モジュールの doc を参照）。
+///
+/// **グリフの有無まで見る。** 1 面目をそのまま採ると記号だけの字体を掴むことが
+/// あり、そのとき `A` は豆腐にも成らずに消える——`FONT_GLYPHS_MISSING` と
+/// `TEXT_NOT_RENDERED` が出て、字体とは関係のない表明まで落ちる。
 fn any_font() -> Option<String> {
     let mut db = resvg::usvg::fontdb::Database::new();
     db.load_system_fonts();
-    db.faces()
-        .find_map(|face| face.families.first().map(|(name, _)| name.clone()))
+    let ids: Vec<_> = db
+        .faces()
+        .map(|f| (f.id, f.families.first().map(|(n, _)| n.clone())))
+        .collect();
+    ids.into_iter().find_map(|(id, family)| {
+        let family = family?;
+        let draws = db.with_face_data(id, |data, index| {
+            ttf_parser::Face::parse(data, index)
+                .map(|f| TEST_CHARS.iter().all(|&c| f.glyph_index(c).is_some()))
+                .unwrap_or(false)
+        })?;
+        draws.then_some(family)
+    })
 }
+
+/// このファイルが組ませる文字。`any_font` が覆いを確かめる相手である。
+const TEST_CHARS: [char; 2] = ['A', 'B'];
 
 /// 縦長の素材を 1 枚置く。**縦横比が枠と違うことが要点である**——
 /// 枠にそのまま収まる素材では「内接して縮んだ」ことを確かめられない。
@@ -756,4 +774,436 @@ fn a_spec_without_text_reports_a_null_font() {
     let report = json_stdout(&compose(&spec, &out, &["--dry-run"]));
     assert!(report.get("font").is_some());
     assert_eq!(report["font"], Value::Null);
+}
+
+// 以下は計画 §10.11 のレビューが見つけた欠陥の回帰。**どれも実装で踏んだ**
+// ので、形を変えて戻ってこないように 1 件ずつ固定する。
+
+/// 非 ASCII の色で panic しない（§10.11 の C1）。
+///
+/// `"#日本"` は `#` + 6 バイトなので長さの検査を通る。16 進かどうかを先に
+/// 見ないと、文字の途中でバイト列を切って panic する——**利用者の spec から
+/// 届く値なので、code も exit code も名乗らずに落ちる**ことになる。
+#[test]
+fn a_non_ascii_colour_is_refused_not_a_panic() {
+    let dir = TempDir::new().unwrap();
+    portrait(dir.path());
+    for colour in ["#日本語", "#あ", "#zzzzzz"] {
+        let spec = write_spec(
+            dir.path(),
+            &format!(
+                r##"{{"canvas":{{"width":50,"height":50,"background":"{colour}"}},
+                     "layers":[{{"id":"a","type":"image","role":"subject",
+                                "source":"product.png","rect":[0,0,50,50]}}]}}"##
+            ),
+        );
+        let out = dir.path().join("out.png");
+        let result = compose(&spec, &out, &["--force"]);
+        assert_eq!(
+            result.status.code(),
+            Some(2),
+            "{colour} が exit 2 以外で終わった（panic は 101）"
+        );
+        assert_eq!(json_stdout(&result)["error"]["code"], "INVALID_COLOR");
+    }
+}
+
+/// `--background` も同じ関門を通る。**CLI 側にも同じ切り方があった。**
+#[test]
+fn a_non_ascii_background_flag_is_refused_not_a_panic() {
+    let dir = TempDir::new().unwrap();
+    portrait(dir.path());
+    let spec = write_spec(
+        dir.path(),
+        r##"{"canvas":{"width":50,"height":50},
+             "layers":[{"id":"a","type":"image","role":"subject",
+                        "source":"product.png","rect":[0,0,50,50]}]}"##,
+    );
+    let out = dir.path().join("out.jpg");
+    let result = compose(&spec, &out, &["--background", "#日本"]);
+    // clap の value_parser が断るので code 無しの exit 2（kiri 全体の規約）
+    assert_eq!(result.status.code(), Some(2));
+}
+
+/// 枠が桁違いなら断る。**飽和させて走り出さない**（§10.11 の C3）。
+///
+/// `1e12` を `u32` へ飽和させると `u32::MAX` になり、約 73TB の確保を要求して
+/// 応答が返らなくなる。キャンバスが 400x400 でも、である。
+#[test]
+fn an_oversized_layer_rect_is_refused_before_any_allocation() {
+    let dir = TempDir::new().unwrap();
+    portrait(dir.path());
+    for rect in ["[0,0,100000,200000]", "[1e12,0,200,400]"] {
+        let spec = write_spec(
+            dir.path(),
+            &format!(
+                r##"{{"canvas":{{"width":400,"height":400,"background":"#ffffff"}},
+                     "layers":[{{"id":"p","type":"image","role":"subject",
+                                "source":"product.png","rect":{rect},"fit":"exact"}}]}}"##
+            ),
+        );
+        let out = dir.path().join("out.png");
+        let result = compose(&spec, &out, &["--force"]);
+        assert_eq!(result.status.code(), Some(3), "{rect} が断られていない");
+        assert_eq!(json_stdout(&result)["error"]["code"], "SPEC_INVALID");
+    }
+}
+
+/// 枠の外へ置いた層は、**切り落として、置いた位置を正直に返す**（§10.11 の H1）。
+///
+/// 原点を 0 で止めると、`placed` が spec と違う位置を名乗り、
+/// `outside_safe_area` もその嘘の位置から計算される。
+#[test]
+fn a_layer_placed_off_canvas_reports_where_it_actually_went() {
+    let dir = TempDir::new().unwrap();
+    portrait(dir.path());
+    let spec = write_spec(
+        dir.path(),
+        r##"{"canvas":{"width":400,"height":400,"background":"#ffffff"},
+             "safe_area":[0,0,400,400],
+             "layers":[{"id":"p","type":"image","role":"subject",
+                        "source":"product.png","rect":[-150,-200,200,400]}]}"##,
+    );
+    let out = dir.path().join("out.png");
+    let report = json_stdout(&compose(&spec, &out, &["--dry-run"]));
+    let p = layer(&report, "p");
+
+    assert_eq!(
+        rect_of(&p["placed"]),
+        [-150.0, -200.0, 200.0, 400.0],
+        "0 で止めると、置いた場所と違う位置を名乗ることになる"
+    );
+    assert_eq!(p["outside_safe_area"], Value::Bool(true));
+    assert!(codes(&report).contains(&"OUTSIDE_SAFE_AREA".to_string()));
+}
+
+/// キャンバスの外にある `subject` では、重なりを**測れたことにしない**
+/// （§10.11 の M1）。
+#[test]
+fn a_subject_entirely_off_canvas_leaves_the_overlap_unmeasured() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    portrait(dir.path());
+    let spec = write_spec(
+        dir.path(),
+        &format!(
+            r##"{{"canvas":{{"width":200,"height":200,"background":"#ffffff"}},
+                 "font":{{"family":"{family}"}},
+                 "layers":[
+                   {{"id":"subject","type":"image","role":"subject",
+                     "source":"product.png","rect":[-16000,-16000,100,200]}},
+                   {{"id":"t","type":"text","role":"body",
+                     "lines":["AB"],"rect":[20,40,160,60],
+                     "size":40,"color":"#000000"}}]}}"##
+        ),
+    );
+    let out = dir.path().join("out.png");
+    let report = json_stdout(&compose(&spec, &out, &["--dry-run"]));
+    assert_eq!(
+        layer(&report, "t")["layer_overlap"],
+        Value::Null,
+        "商品が 1 画素も載っていないのに「重なり 0.0」という測れた合格を返した"
+    );
+}
+
+/// 後の層に覆われた文字を見逃さない（§10.11 の H2）。
+///
+/// 背後だけを見ると「白地に黒、コントラスト 21」と報告した絵の中で、文字が
+/// 1 画素も見えていないことが起こりうる。
+#[test]
+fn text_hidden_under_a_later_layer_is_named() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let plate = image::RgbaImage::from_pixel(200, 200, image::Rgba([10, 10, 10, 255]));
+    write_png(dir.path(), "plate.png", &plate);
+
+    let spec = write_spec(
+        dir.path(),
+        &format!(
+            r##"{{"canvas":{{"width":200,"height":200,"background":"#ffffff"}},
+                 "font":{{"family":"{family}"}},
+                 "layers":[
+                   {{"id":"t","type":"text","role":"heading",
+                     "lines":["AB"],"rect":[20,40,160,60],
+                     "size":40,"color":"#000000"}},
+                   {{"id":"cover","type":"image","role":"decoration",
+                     "source":"plate.png","rect":[0,0,200,200],"fit":"exact"}}]}}"##
+        ),
+    );
+    let out = dir.path().join("out.png");
+    let result = compose(&spec, &out, &["--fail-on", "default"]);
+    let report = json_stdout(&result);
+
+    let t = layer(&report, "t");
+    assert!(
+        t["text_contrast"].as_f64().unwrap() > 20.0,
+        "背後は白のままなので、コントラストそのものは高く出る"
+    );
+    assert!(
+        t["text_obscured"].as_f64().unwrap() > 0.99,
+        "全面を塗り潰されているのに覆いが数えられていない"
+    );
+    assert!(codes(&report).contains(&"TEXT_OBSCURED".to_string()));
+    assert_eq!(
+        result.status.code(),
+        Some(5),
+        "見えない文字が --fail-on default を素通りした"
+    );
+}
+
+/// 字体にその文字が無ければ、**描く前に**名指しする（§10.11 の H3）。
+///
+/// 無い文字は豆腐（.notdef）として描けてしまうので、「1 画素も描かれなかった」
+/// という網には引っかからない。
+#[test]
+fn glyphs_missing_from_the_font_are_named_before_drawing() {
+    let mut db = resvg::usvg::fontdb::Database::new();
+    db.load_system_fonts();
+    // 日本語を**持たない**字体を 1 つ探す。見つからない機械では飛ばす
+    let latin_only = db.faces().find_map(|face| {
+        let family = face.families.first()?.0.clone();
+        let id = face.id;
+        let has_kana = db
+            .with_face_data(id, |data, index| {
+                ttf_parser::Face::parse(data, index)
+                    .map(|f| f.glyph_index('あ').is_some())
+                    .unwrap_or(true)
+            })
+            .unwrap_or(true);
+        (!has_kana).then_some(family)
+    });
+    let Some(family) = latin_only else {
+        return;
+    };
+
+    let dir = TempDir::new().unwrap();
+    let spec = write_spec(
+        dir.path(),
+        &format!(
+            r##"{{"canvas":{{"width":400,"height":120,"background":"#ffffff"}},
+                 "font":{{"family":"{family}"}},
+                 "layers":[{{"id":"t","type":"text","role":"body",
+                            "lines":["あいうえお"],"rect":[20,20,360,60],
+                            "size":28,"color":"#000000"}}]}}"##
+        ),
+    );
+    let out = dir.path().join("out.png");
+    let report = json_stdout(&compose(&spec, &out, &["--dry-run"]));
+    assert!(
+        codes(&report).contains(&"FONT_GLYPHS_MISSING".to_string()),
+        "'{family}' に仮名が無いのに黙って組んだ: {:?}",
+        codes(&report)
+    );
+    let warning = report["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "FONT_GLYPHS_MISSING")
+        .unwrap();
+    assert!(
+        warning["data"]["missing"].as_str().unwrap().contains('あ'),
+        "欠けている文字が名指しされていない"
+    );
+}
+
+/// 透過のまま書く実行では、**透明な下地の上のコントラストを測らない**
+/// （§10.11 の H5）。
+///
+/// RGB だけを見ると透明が黒として測られ、白い文字が「読めない」、黒い文字が
+/// 「読める」と、どちらも実物とは逆の答えになる。
+#[test]
+fn contrast_over_a_transparent_backdrop_is_not_guessed() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let body = format!(
+        r##"{{"canvas":{{"width":200,"height":120}},
+             "font":{{"family":"{family}"}},
+             "layers":[{{"id":"t","type":"text","role":"body",
+                        "lines":["AAA"],"rect":[10,20,180,60],
+                        "size":40,"color":"#000000"}}]}}"##
+    );
+    let spec = write_spec(dir.path(), &body);
+
+    // PNG は透過を保持する。最後に何色になるかを kiri は知らない
+    let png = dir.path().join("out.png");
+    let report = json_stdout(&compose(&spec, &png, &["--dry-run"]));
+    assert_eq!(
+        layer(&report, "t")["text_contrast"],
+        Value::Null,
+        "見る人の背景を知らないのに数を作っている"
+    );
+
+    // JPEG は潰す色が決まっている。そこへ重ねてから測れる
+    let jpg = dir.path().join("out.jpg");
+    let report = json_stdout(&compose(&spec, &jpg, &["--dry-run"]));
+    let measured = layer(&report, "t")["text_contrast"]
+        .as_f64()
+        .expect("潰す色が決まっていれば測れる");
+    assert!(
+        measured > 20.0,
+        "白へ潰す実行の黒文字が {measured:.2}（21 に近いはず）"
+    );
+    assert!(!codes(&report).contains(&"TEXT_CONTRAST_LOW".to_string()));
+}
+
+/// `default` と明示の条件を併記できる（§10.11 の H6）。
+///
+/// **`--help` が例として挙げている綴りそのものである。** `default` を 4 つの
+/// 条件へ展開してから重複を見ると、ここが「2 つの条件」として断られる。
+#[test]
+fn the_default_token_combines_with_an_explicit_rule() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let spec = write_spec(
+        dir.path(),
+        &format!(
+            r##"{{"canvas":{{"width":300,"height":120,"background":"#ffffff"}},
+                 "font":{{"family":"{family}"}},
+                 "layers":[{{"id":"t","type":"text","role":"body",
+                            "lines":["AA"],"rect":[10,20,280,60],
+                            "size":30,"color":"#000000"}}]}}"##
+        ),
+    );
+    let out = dir.path().join("out.png");
+    let result = compose(&spec, &out, &["--fail-on", "default,text_contrast<4.5"]);
+    assert_ne!(
+        result.status.code(),
+        Some(2),
+        "--help が挙げている綴りが書式として断られた: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        result.status.success(),
+        "収まっている組版が落ちた: exit={:?} {}",
+        result.status.code(),
+        String::from_utf8_lossy(&result.stdout)
+    );
+
+    // **明示が default を上書きする。** 同じ指標に両方が当たるなら、
+    // 書いたほうが勝つ（compliance の --fail-on と同じ規約）
+    let strict = compose(
+        &spec,
+        &out,
+        &["--force", "--fail-on", "default,text_contrast<99"],
+    );
+    assert_eq!(
+        strict.status.code(),
+        Some(5),
+        "明示した 99 が default の 4.5 に負けている"
+    );
+}
+
+/// 真偽の指標は `checks[].actual` でも真偽で返る（§10.11 の M2）。
+#[test]
+fn a_flag_metric_reports_a_boolean_not_a_number() {
+    let dir = TempDir::new().unwrap();
+    portrait(dir.path());
+    let spec = write_spec(
+        dir.path(),
+        r##"{"canvas":{"width":300,"height":300,"background":"#ffffff"},
+             "safe_area":[100,100,100,100],
+             "layers":[{"id":"a","type":"image","role":"subject",
+                        "source":"product.png","rect":[0,0,300,300]}]}"##,
+    );
+    let out = dir.path().join("out.png");
+    let result = compose(&spec, &out, &["--fail-on", "outside_safe_area"]);
+    assert_eq!(result.status.code(), Some(5));
+    let report = json_stdout(&result);
+    let check = report["compliance"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["metric"] == "outside_safe_area")
+        .unwrap();
+    assert_eq!(
+        check["actual"],
+        Value::Bool(true),
+        "同じ事実が layers[] では真偽、checks[] では数で配られている"
+    );
+}
+
+/// 描かれなかった文字は、はみ出しとは別の code で言う（§10.11 の H8）。
+#[test]
+fn text_that_never_rendered_gets_its_own_code() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let spec = write_spec(
+        dir.path(),
+        &format!(
+            r##"{{"canvas":{{"width":200,"height":120,"background":"#ffffff"}},
+                 "font":{{"family":"{family}"}},
+                 "layers":[{{"id":"t","type":"text","role":"body",
+                            "lines":["AAA"],"rect":[-16000,-16000,180,60],
+                            "size":40,"color":"#000000"}}]}}"##
+        ),
+    );
+    let out = dir.path().join("out.png");
+    let report = json_stdout(&compose(&spec, &out, &["--dry-run"]));
+    assert!(
+        codes(&report).contains(&"TEXT_NOT_RENDERED".to_string()),
+        "はみ出しと同じ code で言うと、overflow を読む側が null を受け取る: {:?}",
+        codes(&report)
+    );
+}
+
+/// 配ったしきい値のキーは、実際に出る `data` のキーと一致する（§10.11 の H7）。
+///
+/// エージェントが読むのは `kiri schema` のほうなので、**ここがずれると
+/// 書いた分岐が動かない。**
+#[test]
+fn the_published_warning_summaries_name_the_keys_that_are_emitted() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let spec = write_spec(
+        dir.path(),
+        &format!(
+            r##"{{"canvas":{{"width":200,"height":120,"background":"#ffffff"}},
+                 "font":{{"family":"{family}"}},
+                 "layers":[{{"id":"t","type":"text","role":"body",
+                            "lines":["AAAAAAAAAAAAAAAAAAAA"],"rect":[10,20,30,60],
+                            "size":40,"color":"#fbfbfb"}}]}}"##
+        ),
+    );
+    let out = dir.path().join("out.png");
+    let report = json_stdout(&compose(&spec, &out, &["--dry-run"]));
+
+    let schema = json_stdout(&kiri().args(["schema", "--json"]).output().unwrap());
+    let summary = |code: &str| -> String {
+        schema["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["code"] == code)
+            .unwrap()["summary"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+
+    for warning in report["warnings"].as_array().unwrap() {
+        let code = warning["code"].as_str().unwrap();
+        let text = summary(code);
+        for key in warning["data"].as_object().unwrap().keys() {
+            // 文脈のために添えている rect / placed は契約の対象ではない
+            if matches!(key.as_str(), "rect" | "placed" | "maximum" | "minimum") {
+                continue;
+            }
+            assert!(
+                text.contains(key.as_str()),
+                "{code} が data.{key} を出すのに、配っている説明は '{text}'"
+            );
+        }
+    }
 }

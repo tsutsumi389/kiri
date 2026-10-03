@@ -469,6 +469,33 @@ fn check_rect(rect: [f64; 4], location: &str) -> Result<()> {
             ),
         ));
     }
+    // **枠にもキャンバスと同じ上限を置く。** 枠はリサイズの要求そのもので、
+    // `100000x200000` と書かれると `fast_image_resize` がその大きさの画像を
+    // 確保しようとする——キャンバスが 400x400 でも、である。`f64` から `u32` への
+    // キャストは飽和するので、`1e12` は黙って `u32::MAX` になり、約 73TB を
+    // 要求したうえで応答が返らなくなる。**上限で黙って切るのではなく断る**のは、
+    // 切ると「書いた枠と違う寸法で組まれた」ことが結果からしか分からないため
+    let limit = f64::from(MAX_CANVAS_SIDE);
+    if rect[2] > limit || rect[3] > limit {
+        return Err(Error::new(
+            ErrorCode::SpecInvalid,
+            format!(
+                "{location} の幅と高さは {MAX_CANVAS_SIDE}px までです（指定: {}x{}）",
+                rect[2], rect[3]
+            ),
+        ));
+    }
+    // 原点も同じ幅で縛る。**キャンバスの外は見えないので、離れた位置を
+    // 許しても意味が無い**——許すと配置の算術が `i64` の端へ寄るだけである
+    if rect[0].abs() > limit || rect[1].abs() > limit {
+        return Err(Error::new(
+            ErrorCode::SpecInvalid,
+            format!(
+                "{location} の原点は ±{MAX_CANVAS_SIDE}px までです（指定: {},{}）",
+                rect[0], rect[1]
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -478,7 +505,13 @@ fn check_rect(rect: [f64; 4], location: &str) -> Result<()> {
 /// 「どちらで書いたか」を覚えることになる。`--background` が `r,g,b` の 1 通りしか
 /// 受けないのと同じ判断で、綴りは 1 つに保つ。
 pub fn parse_color(text: &str) -> Result<[u8; 3]> {
-    let body = text.strip_prefix('#').filter(|b| b.len() == 6);
+    // **`len()` はバイト数で、`&b[0..2]` もバイトで切る。** 16 進かどうかを先に
+    // 見ないと、`#日本`（`#` + 6 バイト）が長さの検査を通り、文字の途中で
+    // 切って panic する。**利用者の spec から届く値なので、panic は契約の外へ
+    // 出る失敗**になる——code も exit code も名乗らずに 101 で落ちる
+    let body = text
+        .strip_prefix('#')
+        .filter(|b| b.len() == 6 && b.bytes().all(|c| c.is_ascii_hexdigit()));
     let parsed = body.and_then(|b| {
         let r = u8::from_str_radix(&b[0..2], 16).ok()?;
         let g = u8::from_str_radix(&b[2..4], 16).ok()?;

@@ -2008,6 +2008,16 @@ fn parse_numbers(s: &str, expected: usize) -> Result<Vec<f64>, String> {
 /// `#RRGGBB` / `RRGGBB` / `#RGB` を受け付ける。
 pub fn parse_hex_color(s: &str) -> Result<[u8; 3], String> {
     let hex = s.strip_prefix('#').unwrap_or(s);
+    // **16 進かどうかを長さより先に見る。** `len()` も `hex[i * 2..]` も
+    // バイトで数えるので、`#日本`（6 バイト）は 6 桁として通り、文字の途中で
+    // 切って panic する。3 桁側も同じで、`#あ`（3 バイト）は `chars()` が
+    // 1 つしか返さないのに `d[1]` を読む。**どちらも利用者が書いた文字列から
+    // 届く**ので、code も exit code も名乗らずに落ちることになる
+    if !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "'{s}' は色として解釈できません（#RRGGBB 形式で指定してください）"
+        ));
+    }
     let expand = |c: u8| -> u8 { c * 17 };
     let digit = |c: char| -> Result<u8, String> {
         c.to_digit(16)

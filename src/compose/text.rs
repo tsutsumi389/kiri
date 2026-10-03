@@ -44,7 +44,8 @@ pub fn layout(
     family: &str,
     db: &Arc<usvg::fontdb::Database>,
 ) -> Result<Layout> {
-    let svg = to_svg(layer, canvas, family);
+    let ascent = crate::compose::font::ascent_ratio(db, family);
+    let svg = to_svg(layer, canvas, family, ascent);
     let options = usvg::Options {
         fontdb: Arc::clone(db),
         ..Default::default()
@@ -137,12 +138,15 @@ fn line_index(rest: &str) -> Option<usize> {
 
 /// spec の 1 レイヤを SVG にする。
 ///
-/// **1 行 1 `<text>`。** 最初の行のベースラインは `rect` の上端から `size` だけ
-/// 下がった位置に置き、以降は `size × line_height` ずつ送る。字体の ascent を
-/// 使わないのは、**同じ spec が字体を替えただけで縦に動くのを避ける**ためである。
-/// ベースラインの規則が単純であることのほうが、1 行目の上端が em box に
-/// ぴたり合うことより呼ぶ側に効く——実際にどこへ置かれたかは `bbox` が返す。
-fn to_svg(layer: &TextLayer, canvas: &Canvas, family: &str) -> String {
+/// **1 行 1 `<text>`。** 最初のベースラインは `rect` の上端から `size × ascent`
+/// だけ下がった位置に置き、以降は `size × line_height` ずつ送る。
+///
+/// **ascent を使う。** 「上端 + size」という字体に依らない規則のほうが単純だが、
+/// ascent が em を超える字体では字の天が枠の上へ出て、`text_overflow` が 4 辺を
+/// 見る以上**枠の上端に置いただけの文字が毎回はみ出しを報告する**。縦位置が
+/// 字体に依ることは受け入れる——字体は spec が 1 つに固定しており、実際に
+/// どこへ置かれたかは `bbox` が返す。
+fn to_svg(layer: &TextLayer, canvas: &Canvas, family: &str, ascent: f64) -> String {
     let [x, y, width, _] = layer.rect;
     let anchor_x = match layer.align {
         crate::compose::Align::Start => x,
@@ -152,7 +156,7 @@ fn to_svg(layer: &TextLayer, canvas: &Canvas, family: &str) -> String {
 
     let mut body = String::new();
     for (i, line) in layer.lines.iter().enumerate() {
-        let baseline = y + layer.size + (i as f64) * layer.size * layer.line_height;
+        let baseline = y + layer.size * ascent + (i as f64) * layer.size * layer.line_height;
         body.push_str(&format!(
             "<text id=\"{id}#line-{i}\" x=\"{anchor_x}\" y=\"{baseline}\" \
              font-family=\"{family}\" font-size=\"{size}\" font-weight=\"{weight}\" \

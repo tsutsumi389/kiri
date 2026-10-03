@@ -1932,7 +1932,7 @@ fn fields() -> Vec<FieldEntry> {
                 threshold: 0.0,
             }],
             gates: None,
-            summary: "文字が rect からはみ出した量（右と下の大きいほう）",
+            summary: "文字が rect からはみ出した量（4 辺のうち最も大きい 1 つ）",
             notes: Some(
                 "**どの向きであれ最も大きい 1 つ**で、向きまで要るなら rect と placed の\
                  差で出る。kiri は縮めも折り返しもしないので、直すのは spec の側である",
@@ -1955,6 +1955,24 @@ fn fields() -> Vec<FieldEntry> {
                 "**背景色の指定からではなく実測である**\
                  ——下に画像が敷いてあればそこが背後で、ちょうどそこが読めなくなる。\
                  しきい値 4.5 は WCAG 2.1 の AA（kiri が決めた数ではない）",
+            ),
+        },
+        FieldEntry {
+            path: "layers[].text_obscured",
+            appears_in: compose(),
+            unit: "ratio",
+            nullable: true,
+            null_means: Some("画像のレイヤ、または 1 画素も描かれなかった"),
+            warns: vec![FieldThreshold {
+                code: WarningCode::TextObscured,
+                operator: "gt",
+                threshold: crate::compose::measure::MAX_OBSCURED,
+            }],
+            gates: None,
+            summary: "文字が覆う画素のうち、自分より後の層に塗られた割合",
+            notes: Some(
+                "**text_contrast と対で読む。** あちらは背後しか見ないので、\
+上から塗り潰された文字でも高い値を返す",
             ),
         },
         FieldEntry {

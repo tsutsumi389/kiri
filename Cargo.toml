@@ -66,6 +66,14 @@ resvg = { version = "0.48.1", default-features = false, features = [
     "text",
     "system-fonts",
 ] }
+# 字体に、その文字のグリフが在るかを見るためだけに引く。
+#
+# **`compose` が「黙って代替へ落ちない」と言うための足である。** 字体を 1 つに
+# 絞っても、無い文字は豆腐（.notdef）として**描けてしまう**ので、描く前に
+# 自分で見るしかない（計画 §10.11 の H3）。
+#
+# MSRV 1.63、依存ゼロ、`-sys` も無い。resvg と同じ作者の pure Rust 実装である
+ttf-parser = { version = "0.25.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 assert_cmd = "2"

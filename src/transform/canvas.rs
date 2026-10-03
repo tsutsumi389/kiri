@@ -99,6 +99,35 @@ pub fn apply(content: &RgbaImage, spec: &CanvasSpec) -> Result<RgbaImage> {
     Ok(canvas)
 }
 
+/// **キャンバスの外へはみ出す位置でも載せる。** 負の原点を受け、収まらない分は
+/// 切り落とす。
+///
+/// `composite` と分けてあるのは、あちらが `plan` の返す「必ず収まる位置」専用
+/// だからである。そこへ `i64` を持ち込むと、収まることが分かっている呼び出しにも
+/// 範囲検査が付く。
+///
+/// **`u32` で足さない。** `compose` の層は spec が座標を書くので、キャンバスの外や
+/// 負の位置が普通に来る。`u32` へ飽和させてから足すと、release ビルドでは
+/// 検査が無いまま巻き戻り、**画像が反対側の端に描かれる**（計画 §10.11 の C2）。
+pub(crate) fn composite_clipped(canvas: &mut RgbaImage, src: &RgbaImage, offset: (i64, i64)) {
+    let (cw, ch) = (i64::from(canvas.width()), i64::from(canvas.height()));
+    for y in 0..i64::from(src.height()) {
+        let cy = offset.1 + y;
+        if cy < 0 || cy >= ch {
+            continue;
+        }
+        for x in 0..i64::from(src.width()) {
+            let cx = offset.0 + x;
+            if cx < 0 || cx >= cw {
+                continue;
+            }
+            let s = *src.get_pixel(x as u32, y as u32);
+            let d = canvas.get_pixel_mut(cx as u32, cy as u32);
+            d.0 = over(s.0, d.0);
+        }
+    }
+}
+
 /// アルファ合成でキャンバスへ載せる。
 pub(crate) fn composite(canvas: &mut RgbaImage, src: &RgbaImage, offset: (u32, u32)) {
     for y in 0..src.height() {

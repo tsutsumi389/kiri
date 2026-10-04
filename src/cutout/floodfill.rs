@@ -152,19 +152,9 @@ pub struct Terrain {
 /// その項目をここから `fill` の引数へ移すこと。
 pub fn prepare(image: &RgbaImage, opts: &FloodOptions<'_>) -> Terrain {
     let (w, h) = (image.width(), image.height());
-    // 堤防は Lab の表より**先**に作って先に捨てる。素の `Vec<bool>` は 24.5MP で
-    // 24.5MB あり、Sobel の作業域と合わせると 3 桁 MB になる。ビット面へ畳んで
-    // から Lab の表を作れば、生存期間が重なるのは 3MB だけで済む
-    let dam = (opts.edge_threshold > 0.0).then(|| {
-        let ridges = edge_ridges(image, opts.edge_threshold as f32);
-        let mut plane = BitPlane::new(ridges.len());
-        for (i, &on) in ridges.iter().enumerate() {
-            if on {
-                plane.insert(i);
-            }
-        }
-        plane
-    });
+    // 堤防は Lab の表より**先**に作る。`edge_ridges` はビット面を返すので、
+    // 2 回のフィルをまたいで生かしても 24.5MP で 3MB しか常駐しない
+    let dam = (opts.edge_threshold > 0.0).then(|| edge_ridges(image, opts.edge_threshold as f32));
     Terrain {
         lab: lab_map(image, srgb_linear_lut()),
         dam,
@@ -797,19 +787,24 @@ fn seal_narrow_gaps(
     let stride = w as usize;
     let idx = |x: u32, y: u32| (y as usize) * stride + (x as usize);
 
-    let mut permeable = vec![false; background.len()];
+    // 収縮の入力はビット面で作る。`Vec<bool>` なら 24.5MP で 24.5MB、ここは
+    // 元の背景マスクと同時に生きるので、そのぶんがそのままピークに乗る
+    let mut permeable = BitPlane::new(background.len());
     for y in 0..h {
         for x in 0..w {
             let i = idx(x, y);
-            permeable[i] = background[i]
+            let open = background[i]
                 || (candidates.has(i, NEAR_BG)
                     && ((x > 0 && background[idx(x - 1, y)])
                         || (y > 0 && background[idx(x, y - 1)])
                         || (x + 1 < w && background[idx(x + 1, y)])
                         || (y + 1 < h && background[idx(x, y + 1)])));
+            if open {
+                permeable.insert(i);
+            }
         }
     }
-    let eroded = morphology::separable(stride, h as usize, &permeable[..], radius, false);
+    let eroded = morphology::separable(stride, h as usize, &permeable, radius, false);
     drop(permeable);
 
     // 外周に接する背景も起点として信用する（上のコメントを参照）

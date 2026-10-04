@@ -127,6 +127,20 @@ warning_catalog! {
         => "背景の水準から露出を正せなかった。data.reason が not_light / no_material / gain_out_of_range / would_clip のどれかを言う",
     SetNotMeasured = "SET_NOT_MEASURED"
         => "batch の set が 1 点も測れなかったので揃えていない（各項目は自分で解決した fill_ratio のまま）",
+    TextOverflow = "TEXT_OVERFLOW"
+        => "compose の文字が rect に収まらなかった。縮めても折り返してもいない（data.text_overflow が px で不足を言う）",
+    TextContrastLow = "TEXT_CONTRAST_LOW"
+        => "compose の文字と、その文字が実際に載っている背後とのコントラスト比が低い（data.text_contrast が実測値）",
+    LayersOverlap = "LAYERS_OVERLAP"
+        => "compose の文字が subject の不透明部分と重なっている（data.layer_overlap が文字の面積に対する重なりの比）",
+    TextObscured = "TEXT_OBSCURED"
+        => "compose の文字が後の層に覆われている。text_contrast は背後を測った値なので、覆われた文字でも高い値を返す（data.text_obscured が覆われた比）",
+    TextNotRendered = "TEXT_NOT_RENDERED"
+        => "compose の文字が 1 画素も描かれなかった。rect がキャンバスの外にあるか、字体にその文字のグリフが無い",
+    FontGlyphsMissing = "FONT_GLYPHS_MISSING"
+        => "compose が要求した字体に、spec の文字のグリフが無い。描けば豆腐が並ぶ（data.missing が欠けている文字を言う）",
+    OutsideSafeArea = "OUTSIDE_SAFE_AREA"
+        => "compose の要素が safe_area の外へ出た（表示側で切られる範囲にある）",
 }
 
 impl Serialize for WarningCode {

@@ -65,6 +65,15 @@ pub enum Command {
     /// 仕様ファイルに従って複数の画像を一括処理する
     Batch(BatchArgs),
 
+    /// 切り抜いた素材と文字を spec から 1 枚へ組む
+    ///
+    /// **組版器ではなく合成器である。** どこに何を置くかは spec が決め、kiri は
+    /// 置いて測って言う。収まらない文字を縮めることも、長い行を折り返すことも
+    /// しない——どちらも spec に書いた指定が黙って消える向きの親切である。
+    /// 組んだ結果の実測は layers[] に出る（置かれた矩形・行ごとの幅・はみ出し・
+    /// コントラスト比・subject との重なり）
+    Compose(ComposeArgs),
+
     /// 既にある画像が --profile の規格を満たすか検査する
     ///
     /// **何も書かない。** 満たしていなければ終了コード 5 で、内訳は checks[] に
@@ -86,6 +95,107 @@ pub enum Command {
     /// **エージェントはまずこれを読む。** README を読み込まずに、呼び方と
     /// 返ってきた code の意味を引ける
     Schema,
+}
+
+/// `kiri compose` の引数。
+///
+/// **`OutputOpts` を使わない。** あちらは `--derive` / `--manifest` /
+/// `--max-bytes` / 命名テンプレートまで含む「1 枚から N 本の派生を書く」ための
+/// 束で、compose は 1 枚を組んで 1 枚を書く。使えない項目をヘルプに並べると、
+/// **`kiri schema` が「指定できる」と言った先に出口が無い**ことになる
+/// （profile の `formats` に書けない形式を並べないのと同じ理由）。派生が要るなら
+/// 組んだ結果を `kiri convert` / `kiri resize` へ渡せばよい。
+#[derive(Args, Debug)]
+pub struct ComposeArgs {
+    /// 組み立て方を書いた spec (JSON)
+    ///
+    /// 素材とフォントのパスは **spec からの相対**で解く
+    ///
+    /// 実行時の作業ディレクトリに依らせると、同じ spec が置き場所によって別のものを読む
+    pub spec: PathBuf,
+
+    /// 出力先。拡張子から形式を推論する
+    #[arg(short, long)]
+    pub output: PathBuf,
+
+    /// 品質 (0-100)
+    #[arg(long, default_value_t = DEFAULT_QUALITY)]
+    pub quality: f32,
+
+    /// AVIF のエンコード速度 (1-10)。小さいほど高品質・低速
+    #[arg(long, default_value_t = DEFAULT_EFFORT)]
+    pub effort: u8,
+
+    /// 透過を保持できない形式へ出力する際の合成色 (例 #FFFFFF)
+    #[arg(long, value_parser = parse_hex_color, default_value = "#FFFFFF")]
+    pub background: [u8; 3],
+
+    /// 透過を残さず --background の色で塗り潰す
+    #[arg(long)]
+    pub flatten: bool,
+
+    /// 既存のファイルを上書きする
+    #[arg(long)]
+    pub force: bool,
+
+    /// 画素を書かずに、組んだ結果の幾何だけを返す
+    ///
+    /// **エンコードまでは通す**
+    ///
+    /// バイト数を返さずに「書ける」と言うと、本番で初めて形式の制約に当たることになる
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// 測りがこの条件に触れたら exit 5 で返す。カンマ区切り (例 default,text_contrast<4.5)
+    ///
+    /// **cutout の --fail-on とは指標が別である**
+    ///
+    /// あちらは mask.* を見る
+    ///
+    /// 同じ表に混ぜると cutout --fail-on text_overflow が書式として通り、文字が 1 つも無いので永久に発火しない門になる
+    #[arg(long, value_parser = parse_compose_fail_on, long_help = compose_fail_on_long_help())]
+    pub fail_on: Option<crate::compose::gate::FailOn>,
+}
+
+fn parse_compose_fail_on(spec: &str) -> std::result::Result<crate::compose::gate::FailOn, String> {
+    crate::compose::gate::FailOn::parse(spec)
+}
+
+/// `--fail-on` の書き方を、**書ける指標の表そのものから**組む。
+///
+/// 手で書き写した一覧を増やさない（`profile::PROFILE_NAMES` と同じ作法）。
+fn compose_fail_on_long_help() -> String {
+    use crate::compose::gate::Metric;
+    let mut lines = vec![
+        "測りがこの条件に触れたら exit 5 で返す。".to_string(),
+        String::new(),
+        format!(
+            "'{}' は較正済みのしきい値をまとめて当てる。個別に書くなら <指標><演算子><値> をカンマで並べる。",
+            crate::compose::gate::DEFAULT_TOKEN
+        ),
+        String::new(),
+        "指標:".to_string(),
+    ];
+    for metric in Metric::ALL {
+        match metric.flag_meaning() {
+            Some(meaning) => lines.push(format!("  {} — {meaning}", metric.as_str())),
+            None => lines.push(format!(
+                "  {} — 演算子としきい値が要る (例 {}>0)",
+                metric.as_str(),
+                metric.as_str()
+            )),
+        }
+    }
+    lines.push(String::new());
+    lines.push(format!(
+        "演算子: {}",
+        crate::compliance::Operator::SPELLINGS
+            .iter()
+            .map(|(spelling, _)| *spelling)
+            .collect::<Vec<_>>()
+            .join(" ")
+    ));
+    lines.join("\n")
 }
 
 #[derive(Args, Debug)]
@@ -1898,6 +2008,16 @@ fn parse_numbers(s: &str, expected: usize) -> Result<Vec<f64>, String> {
 /// `#RRGGBB` / `RRGGBB` / `#RGB` を受け付ける。
 pub fn parse_hex_color(s: &str) -> Result<[u8; 3], String> {
     let hex = s.strip_prefix('#').unwrap_or(s);
+    // **16 進かどうかを長さより先に見る。** `len()` も `hex[i * 2..]` も
+    // バイトで数えるので、`#日本`（6 バイト）は 6 桁として通り、文字の途中で
+    // 切って panic する。3 桁側も同じで、`#あ`（3 バイト）は `chars()` が
+    // 1 つしか返さないのに `d[1]` を読む。**どちらも利用者が書いた文字列から
+    // 届く**ので、code も exit code も名乗らずに落ちることになる
+    if !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "'{s}' は色として解釈できません（#RRGGBB 形式で指定してください）"
+        ));
+    }
     let expand = |c: u8| -> u8 { c * 17 };
     let digit = |c: char| -> Result<u8, String> {
         c.to_digit(16)

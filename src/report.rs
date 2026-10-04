@@ -362,6 +362,60 @@ pub struct OutputReport {
     pub role: Option<String>,
 }
 
+/// `kiri compose` の結果。
+///
+/// **`ProcessReport` ではない。** あちらは「1 枚を読んで 1 枚を書く」形で
+/// `input` と `source` を名乗るが、compose の入力は spec と N 個の素材である。
+/// 無理に同じ型へ入れると `input` に何を入れるか（spec か、最初の素材か）が
+/// 決まらず、どちらにしても嘘になる。`LintReport` が別の型である理由と同じ。
+#[derive(Debug, Serialize)]
+pub struct ComposeReport {
+    /// 契約の版。`SCHEMA_VERSION` を参照
+    pub schema_version: u32,
+    /// 読んだ spec のパス
+    pub spec: String,
+    pub canvas: ComposeCanvasReport,
+    /// 実際に組むのに使った字体。文字のレイヤが無ければ null。
+    ///
+    /// **キーは常に出す。** 省くと「字体を使わなかった」と「古い版で走った」が
+    /// 同じ形になる
+    pub font: Option<crate::compose::font::ResolvedFont>,
+    pub output: ComposeOutputReport,
+    /// この実行が実際に書き出したか。`--dry-run` なら true で、
+    /// `output.path` にファイルは無い（`ProcessReport::dry_run` と同じ約束）
+    pub dry_run: bool,
+    /// 層ごとの測り。**並びは spec の `layers` の並びそのもの**——重ねた順である
+    pub layers: Vec<crate::compose::measure::LayerReport>,
+    /// `--fail-on` の合否。指定が無ければ null
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compliance: Option<crate::compose::gate::GateReport>,
+    pub elapsed_ms: u128,
+    pub warnings: Vec<Warning>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ComposeCanvasReport {
+    pub width: u32,
+    pub height: u32,
+    /// spec が書いた下地。無指定なら null（透明のまま組んだ）
+    pub background: Option<String>,
+}
+
+/// compose が書いた 1 枚。
+///
+/// **`OutputReport` を使わない。** あちらは `attempts` / `role` / `quality_used`
+/// を持つが、どれも `--derive` と `--max-bytes` の概念である。compose には
+/// どちらも無いので、載せれば必ず定数（1 / null）になる——**知らないことを
+/// 知っているかのように出す**のが、この repo が最も避けている形である。
+#[derive(Debug, Serialize)]
+pub struct ComposeOutputReport {
+    pub path: String,
+    pub format: String,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: u64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Dimensions {
     pub width: u32,
@@ -1157,6 +1211,23 @@ pub struct SchemaReport {
     /// 素直に組むと schema から丸ごと落ちる
     pub global_options: Vec<ArgEntry>,
     pub commands: Vec<CommandEntry>,
+    /// `kiri compose` の spec に書けるキー。**実装の表から組む。**
+    ///
+    /// `commands[]` は `--output` のような CLI の引数しか配れない。compose の
+    /// 本体は spec のほうにあり、ここが無いと**エージェントは spec の形を
+    /// 推測で書く**ことになる——未知のキーは `SPEC_UNKNOWN_FIELD` で断られるので、
+    /// 推測が外れたことは分かるが、何が正しいかは分からない
+    pub compose_spec: Vec<ComposeSpecEntry>,
+}
+
+/// compose の spec の 1 階層。
+#[derive(Debug, Serialize)]
+pub struct ComposeSpecEntry {
+    /// 階層の名前。`spec` が最上位、`layers[type=text]` のように条件を含む
+    pub at: &'static str,
+    /// そこに書けるキー。**並びは実装の表の順で決定的**
+    pub keys: Vec<&'static str>,
+    pub summary: &'static str,
 }
 
 /// `kiri lint` が見る条件 1 つ。

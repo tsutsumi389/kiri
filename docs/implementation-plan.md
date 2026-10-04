@@ -84,6 +84,7 @@ src/
 | 26 | 出力の既定を実写の実測から引き直す：`--quality` を 40 dB に届く 90 へ、profile の canvas を固定値から入力依存の段へ（**済**。§5 の Phase 26） | `--quality` の既定 90 / `profile::CANVAS_LADDER` / `Profile::canvas_for` | 1日 |
 | 27 | 境界のアルファを帯だけの closed-form matting で解く（**済**。§8。**狙った的には当たらず、織り目のある実写背景に当たった**——受け入れ条件は §8.6 で差し替えた） | `--matting closed-form` / `MATTING_NOT_CONVERGED` | 1〜2日 |
 | 28 | 帯を遷移と厚みから引き直し、柔らかい輪郭と細い構造を取り戻す（**中止**。§9.9。**第一歩の計測で §8 の診断が誤りだと分かった**——帯は真の遷移を既に覆っていて、的は帯幅ではなかった。実装はしていない） | 計測の通り道（`CutoutResult.band_width_histogram`。JSON には出さない） | 0.5日（計測で中止） |
+| 29 | 切り抜いた素材と文字を spec から 1 枚へ組む（**済**。§10.10。**組版だけを `resvg` へ出し、契約と測りは kiri が持つ**。計画と違えた 6 点と費用の実測は §10.10） | `kiri compose` / spec の `layers[].role` / `TEXT_OVERFLOW` ほか指標 4 つ | L |
 
 **Phase 17〜26 は EC 特化のロードマップ**で、狙いと順序の根拠は
 [7. EC 特化のロードマップ](phases/07-roadmap-ec.md)に置く。
@@ -234,7 +235,7 @@ public リポジトリなので GitHub 製の標準ランナーは分数無制�
 | Phase 24〜26 | [phases/05-progress-24-26.md](phases/05-progress-24-26.md) |
 
 **着手の順は [6. 残件の優先順位](#6-残件の優先順位)。** 計画中・中止した段は
-§7〜§9 にある（下の索引）。
+§7〜§10 にある（下の索引）。
 
 ## 6. 残件の優先順位
 
@@ -278,7 +279,7 @@ test / MSRV を GitHub Actions へ移した。**新規のコードは無い**—
   場所（織り目のある実写背景）で品質ゲートの警告 6 本が消えた。結果は
   [8.10](phases/08-phase-27.md#810-結果2026-09-30) にある
 
-## 7〜9. 段ごとの計画
+## 7〜10. 段ごとの計画
 
 狙い・順序の根拠・受け入れ条件は段ごとに `phases/` へ分けた。節番号は
 分割前のまま変えていない。
@@ -288,3 +289,4 @@ test / MSRV を GitHub Actions へ移した。**新規のコードは無い**—
 | 7 | EC 特化のロードマップ（Phase 17〜26） | [07-roadmap-ec.md](phases/07-roadmap-ec.md) |
 | 8 | Phase 27: 帯だけの closed-form matting | [08-phase-27.md](phases/08-phase-27.md) |
 | 9 | Phase 28: 帯を遷移と厚みから引き直す | [09-phase-28.md](phases/09-phase-28.md) |
+| 10 | Phase 29: 素材と文字を spec から組む | [10-phase-29.md](phases/10-phase-29.md) |

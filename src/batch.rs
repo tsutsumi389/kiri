@@ -548,7 +548,12 @@ fn validate_keys(raw: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-fn check<'a>(
+/// 未知のキーを、綴り違いの候補を添えて断る。
+///
+/// **`compose` の spec も同じ関門を通る。** 検査を 2 つ持つと、片方にだけ
+/// 候補の提案が付く・片方だけが `SPEC_UNKNOWN_FIELD` を名乗る、という形で
+/// 必ず離れる。spec の形は違っても「未知のキーを断る」の作法は 1 つでよい
+pub(crate) fn check<'a>(
     keys: impl Iterator<Item = &'a String>,
     allowed: &[&str],
     location: &str,
@@ -582,7 +587,7 @@ fn check<'a>(
 }
 
 /// 綴り違いの候補を探す。編集距離 2 以内で最も近いものを返す。
-fn closest(key: &str, allowed: &[&str]) -> Option<String> {
+pub(crate) fn closest(key: &str, allowed: &[&str]) -> Option<String> {
     allowed
         .iter()
         .map(|c| (edit_distance(key, c), *c))

@@ -8,6 +8,7 @@ pub mod cli;
 pub mod color;
 pub mod commands;
 pub mod compliance;
+pub mod compose;
 pub mod cutout;
 pub mod error;
 pub mod image_io;

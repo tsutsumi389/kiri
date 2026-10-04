@@ -244,7 +244,7 @@ pub enum Operator {
 impl Operator {
     /// 書式の綴りと演算子。**長いほうから試す**——`>=` を `>` として読むと、
     /// 右辺が `=0.10` になって「数値として読めません」と的外れに断る。
-    const SPELLINGS: [(&'static str, Operator); 4] = [
+    pub(crate) const SPELLINGS: [(&'static str, Operator); 4] = [
         (">=", Operator::Gte),
         ("<=", Operator::Lte),
         (">", Operator::Gt),
@@ -267,7 +267,7 @@ impl Operator {
 
     /// **この関係を満たしたら不合格**である（`halo_ratio>0.10` は
     /// 「0.10 を超えたら落とす」）。
-    fn touched(self, actual: f64, threshold: f64) -> bool {
+    pub(crate) fn touched(self, actual: f64, threshold: f64) -> bool {
         match self {
             Operator::Gt => actual > threshold,
             Operator::Lt => actual < threshold,

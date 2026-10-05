@@ -75,7 +75,7 @@ pub struct ReflectBounds {
     /// 左右にインクが残るのは**商品が画像の左右の縁に触れている**という
     /// 意味であって、反射が切られたわけではない。`--shadow` の
     /// `offset (0, 0)` がまったく同じ振る舞いをするので、規約をそちらへ
-    /// 揃えてある（README の反射の節と `kiri schema` の
+    /// 揃えてある（`docs/commands/05-5-finishing.md` の反射の節と `kiri schema` の
     /// `reflect.clipped` が同じことを言う）。
     ///
     /// 縦方向——下端の行にインクが残っている、または行が画像の外へ落ちた

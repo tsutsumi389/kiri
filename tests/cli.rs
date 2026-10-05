@@ -2484,7 +2484,8 @@ fn the_batch_manifest_overwrite_check_runs_before_any_item_is_written() {
 
 /// `--debug-mask` は命名の検査より後に書かれる。
 ///
-/// README の「どれで落ちてもファイルは 1 つも書かれない」は cutout でも成り立つ。
+/// 「どれで落ちてもファイルは 1 つも書かれない」（`docs/commands/03-output.md`）は
+/// cutout でも成り立つ。
 /// **綴り違いは切り抜き本体より前に捕まえる**——テンプレートの解析も `{role}` の
 /// 検査も寸法に一切依存しないのに、書き出しの直前でやると `--optimize` 込みで
 /// 数秒〜十数秒を捨てることになる
@@ -3704,8 +3705,9 @@ fn the_edge_dam_alone_stops_a_one_pixel_slit() {
     // 既定では帯の中のアルファを色から解き直すので、背景色そのもので彫られた
     // スリットには (b) が「背景」と答える。それを連結性で前景へ戻すのが
     // `close_new_gaps` で、戻した画素は帯から外すため二値のまま不透明で残る
-    // （`refine::close_new_gaps`）。ここが崩れると、README の「幅 2N px 以下の
-    // 隙間を前景へ戻す」が境界処理の中で黙って取り消される
+    // （`refine::close_new_gaps`）。ここが崩れると、`--seal` の「幅 2N px 以下の
+    // 隙間を前景へ戻す」（`docs/commands/05-cutout.md` のオプションの表）が
+    // 境界処理の中で黙って取り消される
     assert!(
         !slit_is_background(&[]),
         "既定の経路で 1px のスリットが透明になっている（--seal の約束が破れている）"
@@ -9372,7 +9374,8 @@ fn codes_of(v: &Value, section: &str) -> Vec<String> {
 
 /// `kiri schema --json` は契約そのものを返す。
 ///
-/// README は 1000 行ある。**エージェントに読ませられる長さではない**ので、
+/// 使い方の文書は README と `docs/commands/` に 4,000 行近くある。
+/// **エージェントに読ませられる長さではない**ので、
 /// 契約（code / exit code / オプション）だけを機械可読で配る。
 #[test]
 fn schema_returns_the_whole_contract() {
@@ -9716,6 +9719,32 @@ fn collect_markdown(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
     }
 }
 
+/// 読み手に配る文書すべて——README と `docs` 配下の Markdown——をまとめて返す。
+///
+/// **README を直書きで読む検査は、文書を動かすたびに人質になる。** 落ちては
+/// くれる（表が消えれば「載っていない code がある」で赤くなる）ので黙って無力化は
+/// しないが、落ちる理由が「契約が破れた」ではなく「場所が変わった」になる。
+/// 実際、README を `docs/commands/` へ分割したときに 3 つが同時に赤くなった。
+/// **どのファイルに書いてあるかは契約ではない**——契約は「配る文書のどこかに
+/// その表がある」ことだけである。
+///
+/// `collect_markdown` が「ファイル名を直書きしない」ために入れたのと同じ理屈を、
+/// README 自身にも広げる。次に分割が起きても、足された文書は黙って入る
+fn published_docs() -> Vec<(String, String)> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut docs = vec![(
+        "README.md".to_string(),
+        std::fs::read_to_string(root.join("README.md")).unwrap(),
+    )];
+    collect_markdown(&root.join("docs"), root, &mut docs);
+    assert!(
+        docs.len() > 3,
+        "docs を歩けていない（{} 件しか集まっていない）",
+        docs.len()
+    );
+    docs
+}
+
 fn pascal_case(screaming_snake: &str) -> String {
     screaming_snake
         .split('_')
@@ -9810,7 +9839,7 @@ fn every_code_named_in_the_docs_exists() {
     //
     // `tests` も見るのは、**ベンチの入口が環境変数だから**である
     // （`KIRI_BENCH_DIR`）。本体の挙動ではないので `src` には置き場所が無いが、
-    // README が名指しする以上、実在することは確かめたい。**ただし拾うのは
+    // 文書が名指しする以上、実在することは確かめたい。**ただし拾うのは
     // `pub const X: &str` の宣言だけにする。** テストのソース全文を許すと、
     // 表明の文字列やコメントに大文字の語が 1 度でも出てきた時点で「実在する」
     // ことになってしまい、この検査は何も守らなくなる
@@ -9821,17 +9850,9 @@ fn every_code_named_in_the_docs_exists() {
     // 見るのは README と `docs` 配下の Markdown すべてである。**3 つを直書きしていた
     // ものを歩く側へ直した**——`docs/design.md` と `docs/implementation-plan.md` を
     // 主題ごとに分割したとき、直書きのままなら新しい文書だけが検査の外へ出る。
-    // エージェントが写し取る場所が増えるほど、幽霊の入り口も増える
-    let mut docs: Vec<(String, String)> = vec![(
-        "README.md".to_string(),
-        std::fs::read_to_string(root.join("README.md")).unwrap(),
-    )];
-    collect_markdown(&root.join("docs"), root, &mut docs);
-    assert!(
-        docs.len() > 3,
-        "docs を歩けていない（{} 件しか集まっていない）",
-        docs.len()
-    );
+    // エージェントが写し取る場所が増えるほど、幽霊の入り口も増える。
+    // README を分割したときに同じ歩き方が 3 つへ増えたので `published_docs` へ寄せた
+    let docs = published_docs();
 
     // 計画書だけが未実装の code を名指ししてよい。分割後の計画書は
     // `docs/implementation-plan.md` と `docs/phases/` に分かれているので、
@@ -10256,23 +10277,27 @@ fn the_published_prose_has_no_stray_spaces() {
     );
 }
 
-/// README の警告の表は、契約の `warnings[]` を 1 つも落としていない。
+/// 配る文書の警告の表は、契約の `warnings[]` を 1 つも落としていない。
 ///
 /// 表の直後に「この表は `kiri schema --json` の `warnings[]` が同じものを返す」と
 /// 書いてある。ところが `every_code_named_in_the_docs_exists` は**文書 → カタログ**の
 /// 向きしか見ないので、**カタログへ足して表へ足し忘れる**と素通りする。実際
 /// Phase 19 の 2 つがそうやって抜けた。逆向きをここで塞ぐ。
 ///
-/// 見るのは警告だけである。README は error の全一覧を持たない（持つと名乗っても
+/// 見るのは警告だけである。文書は error の全一覧を持たない（持つと名乗っても
 /// いない）ので、同じ表明を errors[] へ広げると「文書に無いから落ちる」だけの
 /// 検査になる。**同期を守るのは、同期すると書いてある表に対してだけ意味がある。**
+///
+/// **名前に README を残しているのは識別子だからである。** 表は README の分割で
+/// `docs/commands/` へ移ったが、`docs/phases/` の記録がこの綴りで名指ししている
+/// ので、節番号と同じ扱いで固定する。読む先は `published_docs` が歩く
 #[test]
 fn the_readme_warning_table_lists_every_warning_in_the_contract() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
     // 表の行は `| `CODE` | 意味 |`。code を名乗る行だけを拾う
-    let listed: Vec<&str> = readme
-        .lines()
+    let docs = published_docs();
+    let listed: Vec<&str> = docs
+        .iter()
+        .flat_map(|(_, text)| text.lines())
         .filter_map(|line| line.strip_prefix("| `"))
         .filter_map(|rest| rest.split('`').next())
         .filter(|word| {
@@ -10289,10 +10314,82 @@ fn the_readme_warning_table_lists_every_warning_in_the_contract() {
         .collect();
     assert!(
         missing.is_empty(),
-        "README の警告の表に載っていない code がある（{} 件）: {}",
+        "配る文書の警告の表に載っていない code がある（{} 件）: {}",
         missing.len(),
         missing.join(" / ")
     );
+}
+
+/// 配る文書どうしのリンクは、実在するファイルを指している。
+///
+/// README を `docs/commands/` へ分割したことで、**文書のあいだのリンクが 190 本
+/// 近くになった。** 1 ファイルに閉じていたときは参照先が消えようがなかったが、分かれた
+/// 以上はファイル名の付け替えや次の分割で黙って切れる。読み手は 404 を見るまで
+/// 気づけないし、エージェントなら存在しないパスを読もうとして止まる。
+///
+/// **見るのはパスだけで、`#` のアンカーは見ない。** アンカーの綴りは GitHub の
+/// スラグ生成に依存し、それを手で書き写すとこの検査自身が実装と離れる側になる
+/// （実際、分割前の README はアンカー参照 46 本のうち 19 本が GitHub 上で解決して
+/// いなかった。`（--flag）` のような見出しの綴りを人が推測していたためである）。
+/// パスが合っていればファイルは開ける。そこから先は人の目のほうが確かである
+#[test]
+fn every_link_between_the_docs_points_at_a_real_file() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut broken = Vec::new();
+    let mut checked = 0usize;
+    for (doc, text) in published_docs() {
+        // 囲みの中の例はリンクではない
+        let prose: String = text.split("```").step_by(2).collect::<Vec<_>>().join("\n");
+        let dir = Path::new(&doc).parent().unwrap().to_path_buf();
+        for target in markdown_link_targets(&prose) {
+            if target.starts_with("http://")
+                || target.starts_with("https://")
+                || target.starts_with("mailto:")
+                || target.starts_with('#')
+            {
+                continue;
+            }
+            let path = target.split('#').next().unwrap();
+            if path.is_empty() {
+                continue;
+            }
+            checked += 1;
+            if !root.join(&dir).join(path).exists() {
+                broken.push(format!("{doc} -> {target}"));
+            }
+        }
+    }
+    assert!(checked > 100, "リンクを拾えていない（{checked} 本）");
+    assert!(
+        broken.is_empty(),
+        "指す先が無いリンクがある（{} 件）:\n  {}",
+        broken.len(),
+        broken.join("\n  ")
+    );
+}
+
+/// Markdown のリンクから行き先だけを拾う。表示文字に `[...]` が入る場合も通す
+fn markdown_link_targets(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != ']' || i + 1 >= chars.len() || chars[i + 1] != '(' {
+            i += 1;
+            continue;
+        }
+        let start = i + 2;
+        let Some(len) = chars[start..].iter().position(|&c| c == ')') else {
+            break;
+        };
+        let target: String = chars[start..start + len].iter().collect();
+        // 丸括弧の中に空白があるものはリンクではない（本文の括弧書き）
+        if !target.is_empty() && !target.contains(char::is_whitespace) {
+            out.push(target);
+        }
+        i = start + len + 1;
+    }
+    out
 }
 
 /// README の exit code の表は、`ErrorKind::meaning()` の文言をそのまま並べる。
@@ -10911,8 +11008,8 @@ fn the_published_thresholds_agree_with_the_warnings_that_fire() {
 
 /// **`subject` の較正表。`--ignored` を付けたときだけ走る。**
 ///
-/// README と `subject.rs` の表はここから取り直す。表の数値がどの画像から
-/// 出たのかを、コミットの外に置かないためである。
+/// `docs/commands/02-info.md` と `subject.rs` の表はここから取り直す。表の数値が
+/// どの画像から出たのかを、コミットの外に置かないためである。
 ///
 /// 1 色と場の 2 列を並べる。**主体は 1 色の背景に対して測る**ので 2 列は
 /// 一致するはずで、一致しなくなったら背景のモデルが主体検出へ漏れている。
@@ -13276,22 +13373,29 @@ fn a_spec_inherits_fail_on_from_the_defaults() {
     assert_eq!(v["rejected"], 1);
 }
 
-/// README が並べる `--fail-on default` の code は、実装の集合と一致する。
+/// 配る文書が並べる `--fail-on default` の code は、実装の集合と一致する。
 ///
 /// `the_readme_warning_table_lists_every_warning_in_the_contract` は
 /// **表**しか見ない。`default` の内訳は表とは別の場所にあるので、`FATAL_CODES` /
-/// `QUALITY_CODES` へ code を足して README を直し忘れると素通りする——そして
+/// `QUALITY_CODES` へ code を足して文書を直し忘れると素通りする——そして
 /// その表は「この条件で落ちる」と名乗っているので、外れたまま読まれると
 /// **落ちない条件を落ちると信じて運用される。**
+///
+/// **名前に README を残しているのは識別子だからである**（`docs/phases/` が
+/// この綴りで名指ししている）。囲みは README の分割で `docs/commands/` へ移った
+/// ので、読む先は `published_docs` が歩く
 #[test]
 fn the_readme_spells_the_real_default_gate() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
-    // `default` の説明の直後にある囲みだけを見る
-    let after = readme
-        .split_once("いずれかが出たら不合格**とする。")
-        .expect("README が default の集合を説明していない")
-        .1;
+    let docs = published_docs();
+    // `default` の説明の直後にある囲みだけを見る。**どの文書にあるかは問わない**
+    let after = docs
+        .iter()
+        .find_map(|(_, text)| {
+            text.split_once("いずれかが出たら不合格**とする。")
+                .map(|(_, rest)| rest.to_string())
+        })
+        .expect("配る文書のどれも default の集合を説明していない");
+    let after = after.as_str();
     let block = after
         .split_once("```")
         .expect("囲みが無い")

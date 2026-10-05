@@ -40,6 +40,7 @@ use crate::cutout::constraints::{Constraints, disc_pixels};
 use crate::cutout::edges::edge_ridges;
 use crate::cutout::mask::Mask;
 use crate::cutout::morphology;
+use crate::cutout::morphology::BitPlane;
 
 /// `--fg-seed` が保護する円の半径(px)。
 pub const FG_SEED_RADIUS: u32 = 5;
@@ -126,13 +127,74 @@ fn shadow_reach(width: u32, height: u32) -> u32 {
     (width.min(height) / 24).clamp(16, 64)
 }
 
+/// 場に依らない下ごしらえ。**画像と `opts` だけで決まる。**
+///
+/// 切り抜きは同じ画像を 2 度フィルする（`cutout_seen` の `second_pass`）。
+/// 2 回で変わるのは場と `core_tolerance` の 2 つだけで、Lab の表・堤防・種の
+/// 保護円は 1 ビットも違わない。それでも `foreground_mask` が 1 関数の中で
+/// 作って捨てていたため、24.5MP では Lab の表（147MB）と Sobel（作業域
+/// 220MB）を 2 度建てていた。**場に依らないものはここに集め、1 度だけ作る。**
+pub struct Terrain {
+    /// 画素ごとの Lab（固定小数）
+    lab: Vec<LabQ>,
+    /// 勾配の堤防。`Vec<bool>` ではなくビット面で持つ——2 回のフィルをまたいで
+    /// 生かすので、24.5MP で 24.5MB と 3MB の差がそのままピーク RSS に出る
+    dam: Option<BitPlane>,
+    /// `--fg-seed` の保護円。種が無ければ持たない
+    seeds: Option<BitPlane>,
+}
+
+/// 場に依らない下ごしらえを 1 度だけ作る。
+///
+/// **`fill` には同じ `opts` を渡すこと。** 変えてよいのは `core_tolerance` と
+/// 場だけである。`edge_threshold` と `fg_seeds` はここで焼き込まれるので、
+/// `fill` 側で違う値を渡しても効かない。2 回のフィルで違えたいものが増えたら、
+/// その項目をここから `fill` の引数へ移すこと。
+pub fn prepare(image: &RgbaImage, opts: &FloodOptions<'_>) -> Terrain {
+    let (w, h) = (image.width(), image.height());
+    // 堤防は Lab の表より**先**に作って先に捨てる。素の `Vec<bool>` は 24.5MP で
+    // 24.5MB あり、Sobel の作業域と合わせると 3 桁 MB になる。ビット面へ畳んで
+    // から Lab の表を作れば、生存期間が重なるのは 3MB だけで済む
+    let dam = (opts.edge_threshold > 0.0).then(|| {
+        let ridges = edge_ridges(image, opts.edge_threshold as f32);
+        let mut plane = BitPlane::new(ridges.len());
+        for (i, &on) in ridges.iter().enumerate() {
+            if on {
+                plane.insert(i);
+            }
+        }
+        plane
+    });
+    Terrain {
+        lab: lab_map(image, srgb_linear_lut()),
+        dam,
+        seeds: protected_pixels(w, h, &opts.fg_seeds),
+    }
+}
+
 /// 前景マスクを生成する。255 = 前景、0 = 背景。
 ///
 /// 背景は 1 色ではなく場（[`BackgroundField`]）で受ける。1 色モデルは
 /// 「全画素で同じ値を返す場」として**同じ経路を通る**——分岐を 2 本持てば、
 /// 片方だけ直した日に結果が静かに食い違う。
+///
+/// 1 度しか切らない呼び出しのための口である。同じ画像を 2 度切るなら
+/// [`prepare`] と [`fill`] に分けて下ごしらえを使い回す。
 pub fn foreground_mask(
     image: &RgbaImage,
+    field: &BackgroundField,
+    opts: &FloodOptions<'_>,
+) -> Mask {
+    if image.width() == 0 || image.height() == 0 {
+        return Mask::new(image.width(), image.height(), 0);
+    }
+    fill(image, &prepare(image, opts), field, opts)
+}
+
+/// 下ごしらえを受け取って 1 回ぶんのフィルを走らせる。
+pub fn fill(
+    image: &RgbaImage,
+    terrain: &Terrain,
     field: &BackgroundField,
     opts: &FloodOptions<'_>,
 ) -> Mask {
@@ -149,26 +211,21 @@ pub fn foreground_mask(
         .constraints
         .filter(|c| c.width() == w && c.height() == h);
     let protected = Protected {
-        seeds: protected_pixels(w, h, &opts.fg_seeds),
+        seeds: terrain.seeds.as_ref(),
         forced,
     };
-    // 堤防は Lab の表より**先**に作って先に捨てる。どちらも 12MP では 3 桁 MB を
-    // 占めるので、生存期間が重なるかどうかだけでピーク RSS が 100MB 単位で変わる
-    let dam = (opts.edge_threshold > 0.0).then(|| edge_ridges(image, opts.edge_threshold as f32));
-    let lut = srgb_linear_lut();
-    let bg = FieldLab::of(field, lut);
-    let lab = lab_map(image, lut);
+    let lab = terrain.lab.as_slice();
+    let bg = FieldLab::of(field, srgb_linear_lut());
     let candidates = classify(
         image,
-        &lab,
+        lab,
         &bg,
         w,
         opts,
         &protected,
         two_stage,
-        dam.as_deref(),
+        terrain.dam.as_ref(),
     );
-    drop(dam);
     let step = opts.step_tolerance as f32;
 
     let mut is_background = if two_stage {
@@ -189,14 +246,14 @@ pub fn foreground_mask(
         if colour_core {
             let stage = Expansion {
                 candidates: &candidates,
-                lab: &lab,
+                lab,
                 step_tolerance: step,
                 with_shadow: false,
                 reach: None,
             };
             // 第2段。商品を守るフィルはここまでで完結している
             let plain = expand(w, h, core, &stage);
-            if candidates.any(SHADOW) {
+            if candidates.shadow {
                 // 第3段。影候補へさらに広げる。ここだけは堤防を無視するので、
                 // 第2段の背景から `shadow_reach` px 以内に閉じ込める
                 expand(
@@ -220,53 +277,59 @@ pub fn foreground_mask(
     } else {
         fill_from_border(w, h, |i| candidates.has(i, LOOSE), opts.bbox, forced)
     };
-    // ここから先で Lab は使わない。12MP では 72MB あるので、
-    // 測地的オープニングの作業領域と重ねない
-    drop(lab);
 
     // bbox の外側は、色に関わらず背景として扱う。
     // AI が「商品はここにある」と判断した結果をここで効かせる。
     //
     // 測地的オープニングより先に効かせる。bbox の外側は「外周につながった
     // 確実な背景」なので、隙間の判定でも背景として数えるのが正しい。
+    //
+    // **矩形の外側だけを舐める。** 全画素を回して内側を捨てていたが、内側は
+    // 必ず何もしない。24.5MP では 1 回のフィルにつき 2450 万回の比較になる
     if let Some((x1, y1, x2, y2)) = opts.bbox {
+        let stride = w as usize;
         for y in 0..h {
-            for x in 0..w {
-                if x < x1 || x > x2 || y < y1 || y > y2 {
-                    is_background[(y as usize) * (w as usize) + (x as usize)] = true;
-                }
+            let row = (y as usize) * stride;
+            if y < y1 || y > y2 {
+                is_background[row..row + stride].fill(true);
+                continue;
             }
+            is_background[row..row + (x1 as usize).min(stride)].fill(true);
+            let right = (x2 as usize).saturating_add(1).min(stride);
+            is_background[row + right..row + stride].fill(true);
         }
     }
 
-    // 確定背景も bbox の外側と同じ扱いにする。
-    //
-    // 測地的オープニングより先に効かせるのも同じ理由で、確定背景は「利用者が
-    // 背景だと言い切った領域」なので、隙間の判定でも背景として数えるのが正しい
-    if let Some(c) = forced {
-        for (i, slot) in is_background.iter_mut().enumerate() {
-            if c.has_bg(i) {
-                *slot = true;
-            }
-        }
-    }
+    // **確定背景をここで塗り直してはいない。** `fill_from_border` が種を作る
+    // 前に `has_bg` の画素を立てており、`expand` も `seal_narrow_gaps` も真を
+    // 偽へ戻さない。ここに「念のため」の全画素走査を置いていたが、1 画素も
+    // 変えずに 24.5MP を 2 度（2 回のフィルで）舐めるだけだった
 
     if opts.seal > 0 {
         is_background = seal_narrow_gaps(w, h, &is_background, opts.seal, &candidates, forced);
     }
 
-    // 保護された画素は最後に前景へ戻す（bbox 指定・確定背景より優先する）
-    let foreground: Vec<bool> = if protected.any() {
-        is_background
-            .iter()
-            .enumerate()
-            .map(|(i, &bg)| protected.has(i) || !bg)
-            .collect()
+    // 保護された画素は最後に前景へ戻す（bbox 指定・確定背景より優先する）。
+    //
+    // **中間の `Vec<bool>` を挟まない。** 「真偽へ畳む」「0/255 へ畳む」の
+    // 2 段を踏むと、24.5MP では 24.5MB の表をもう 1 本作って全画素を 2 度
+    // 書くことになる。畳む先は最初から Mask のバイト列でよい
+    let mut mask = Mask::new(w, h, 0);
+    let out = mask.as_mut_slice();
+    if protected.any() {
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = if protected.has(i) || !is_background[i] {
+                255
+            } else {
+                0
+            };
+        }
     } else {
-        is_background.iter().map(|&bg| !bg).collect()
-    };
-
-    Mask::from_bools(w, h, &foreground)
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = if is_background[i] { 0 } else { 255 };
+        }
+    }
+    mask
 }
 
 /// Lab を固定小数で持つときの倍率。1 目盛りが ΔE 1/256。
@@ -331,15 +394,18 @@ const NEAR_BG: u8 = 1 << 3;
 ///
 /// 素性ごとに `Vec<bool>` を持つと、12MP では 4 本で 48MB になる。判定はどれも
 /// 1bit で足りるので 1 画素 1 バイトのフラグにまとめ、12MB に収める。
-struct Candidates(Vec<u8>);
+struct Candidates {
+    flags: Vec<u8>,
+    /// 影候補が 1 画素でもあったか。
+    ///
+    /// **`classify` が全画素を回るついでに畳む。** 後から `flags` を舐め直すと、
+    /// 影の無い素材でも 24.5MP の走査を 1 本よけいに払うことになる
+    shadow: bool,
+}
 
 impl Candidates {
     fn has(&self, i: usize, flag: u8) -> bool {
-        self.0[i] & flag != 0
-    }
-
-    fn any(&self, flag: u8) -> bool {
-        self.0.iter().any(|&f| f & flag != 0)
+        self.flags[i] & flag != 0
     }
 }
 
@@ -353,16 +419,15 @@ impl Candidates {
 /// 確定前景の側は表を作り直さない。`Constraints` が既に 1 画素 1 バイトで
 /// 持っており、12MP でもう 1 本 `Vec<bool>` を積む理由が無い。
 struct Protected<'a> {
-    /// `--fg-seed` の円。種が無ければ表そのものを作らない
-    seeds: Option<Vec<bool>>,
+    /// `--fg-seed` の円。種が無ければ面そのものを作らない
+    seeds: Option<&'a BitPlane>,
     forced: Option<&'a Constraints>,
 }
 
 impl Protected<'_> {
     #[inline]
     fn has(&self, index: usize) -> bool {
-        self.seeds.as_ref().is_some_and(|p| p[index])
-            || self.forced.is_some_and(|c| c.has_fg(index))
+        self.seeds.is_some_and(|p| p.get(index)) || self.forced.is_some_and(|c| c.has_fg(index))
     }
 
     /// 守る画素が 1 つでもあるか。無ければ最後の走査そのものを省ける
@@ -438,7 +503,7 @@ fn classify(
     opts: &FloodOptions<'_>,
     protected: &Protected<'_>,
     two_stage: bool,
-    dam: Option<&[bool]>,
+    dam: Option<&BitPlane>,
 ) -> Candidates {
     let tolerance = opts.tolerance as f32;
     let core = opts.core_tolerance as f32;
@@ -452,6 +517,7 @@ fn classify(
     };
 
     let mut flags = vec![0u8; lab.len()];
+    let mut any_shadow = false;
 
     // 座標は数えながら進める。添字から割り算で戻すと、場を持たない実行でも
     // 20MP ぶんの除算を払うことになる
@@ -484,15 +550,19 @@ fn classify(
         let bg_lab = bg.at(px, py);
         if is_shadow(lab[i], bg_lab, shadow) {
             f |= SHADOW;
+            any_shadow = true;
         }
         let d = delta_e_q(lab[i], bg_lab);
-        if d <= tolerance {
+        // しきい値との比較は 1 度だけにする。NEAR_BG と LOOSE は同じ問いで、
+        // 間に堤防の分岐が挟まっているだけである
+        let near = d <= tolerance;
+        if near {
             // 堤防に関わらず立てる。堤防が食べた背景を後から見分けるため
             f |= NEAR_BG;
         }
         // let-chain は Rust 1.88 以降。MSRV 1.85 を保つためネストで書く
         if let Some(g) = dam {
-            if g[i] {
+            if g.get(i) {
                 flags[i] = f;
                 continue;
             }
@@ -500,13 +570,16 @@ fn classify(
         if d <= core {
             f |= STRICT;
         }
-        if d <= tolerance {
+        if near {
             f |= LOOSE;
         }
         flags[i] = f;
     }
 
-    Candidates(flags)
+    Candidates {
+        flags,
+        shadow: any_shadow,
+    }
 }
 
 /// 落ち影らしさ。彩度はほぼ動かさず明度だけを下げる画素を影候補とする。
@@ -889,18 +962,18 @@ fn fill_from_border(
 /// 挙動が予測できることを優先している。
 ///
 /// 種の指定は例外的な救済手段で、ほとんどの呼び出しでは空である。
-/// 12MP では表 1 本で 12MB あるので、空のときは `None` を返す。
+/// 24.5MP では面 1 本で 3MB あるので、空のときは `None` を返す。
 ///
 /// 円そのものは `constraints::disc_pixels` が描く。**同じ種が保護円としても
 /// 制約（`fg_seed`）としても効く**ので、2 つの実装が 1px でも食い違えば、
 /// 報告される `fg_ratio` と実際に守られた画素が別のものになる。
-fn protected_pixels(w: u32, h: u32, seeds: &[(u32, u32)]) -> Option<Vec<bool>> {
+fn protected_pixels(w: u32, h: u32, seeds: &[(u32, u32)]) -> Option<BitPlane> {
     if seeds.is_empty() {
         return None;
     }
-    let mut protected = vec![false; (w as usize) * (h as usize)];
+    let mut protected = BitPlane::new((w as usize) * (h as usize));
     for &(sx, sy) in seeds {
-        disc_pixels(w, h, sx, sy, FG_SEED_RADIUS, |i| protected[i] = true);
+        disc_pixels(w, h, sx, sy, FG_SEED_RADIUS, |i| protected.insert(i));
     }
     Some(protected)
 }

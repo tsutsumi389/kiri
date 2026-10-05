@@ -590,7 +590,12 @@ pub fn cutout_seen(
         shadow_tolerance: opts.shadow_tolerance,
         seal: opts.seal,
     };
-    let mut mask = foreground_mask(image, &field, &flood);
+    // **下ごしらえは 1 度だけ。** Lab の表・堤防・種の保護円は画像と `flood`
+    // だけで決まり、場にも許容量にも依らない。2 回目のフィルで作り直すと、
+    // 24.5MP では Lab の表 147MB と Sobel の作業域 220MB をもう一度払う
+    let terrain = floodfill::prepare(image, &flood);
+    stages.mark("フィルの下ごしらえ");
+    let mut mask = floodfill::fill(image, &terrain, &field, &flood);
     stages.mark("フィル 1 回目");
 
     // **2 回目のパス。** 1 回目のフィルが背景と判定した画素をすべて「既知の
@@ -601,7 +606,7 @@ pub fn cutout_seen(
     // 1 色モデルでは走らせない。場が無いのだから作り直すものも無い
     if model == ResolvedModel::Field {
         if let Some((again, next_field, next_residual)) =
-            second_pass(image, &background, &mask, opts, &flood)
+            second_pass(image, &terrain, &background, &mask, opts, &flood)
         {
             mask = again;
             field = next_field;
@@ -609,6 +614,10 @@ pub fn cutout_seen(
         }
     }
 
+    // **下ごしらえはここで手放す。** Lab の表は 24.5MP で 147MB あり、この先の
+    // 境界の帯と診断はどちらも自前で 3 桁 MB を確保する。2 回のフィルを終えた
+    // 時点で用済みなので、生存期間を重ねない
+    drop(terrain);
     stages.mark("フィル 2 回目");
 
     // 孤立ノイズは面積で落とす。オープニングは幅で落とすため、ストラップや
@@ -745,14 +754,22 @@ pub fn cutout_seen(
 /// セルの中央値までは動かせない。
 fn second_pass(
     image: &RgbaImage,
+    terrain: &floodfill::Terrain,
     background: &BackgroundEstimate,
     mask: &Mask,
     opts: &CutoutOptions,
     flood: &FloodOptions<'_>,
 ) -> Option<(Mask, BackgroundField, DeltaEQuantiles)> {
     let field = {
-        // 1 画素 1 バイトの表は 20MP で 20MB ある。場を作り終えたら手放す
-        let filled: Vec<bool> = mask.as_slice().iter().map(|&v| v < 128).collect();
+        // 1 画素 1 バイトの表は 20MP で 20MB ある。場を作り終えたら手放す。
+        //
+        // しきい値は書き写さない。`FOREGROUND_THRESHOLD` の doc が
+        // 「定義はここ 1 箇所にしかない」と名乗っている
+        let filled: Vec<bool> = mask
+            .as_slice()
+            .iter()
+            .map(|&v| v < mask::FOREGROUND_THRESHOLD)
+            .collect();
         let known = background::KnownBackground {
             band: background::field_band(image, opts.border),
             outside_bbox: opts.bbox,
@@ -773,7 +790,7 @@ fn second_pass(
     let residual = background::perimeter_residual(image, opts.border, background, &field);
     let mut flood = flood.clone();
     flood.core_tolerance = floodfill::core_tolerance(opts.tolerance, residual.p90);
-    let mask = foreground_mask(image, &field, &flood);
+    let mask = floodfill::fill(image, terrain, &field, &flood);
     Some((mask, field, residual))
 }
 

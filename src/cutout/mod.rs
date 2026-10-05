@@ -689,23 +689,31 @@ pub fn cutout_seen(
     // 高解像度ほど縁を跨げなくなっていた。面積の下限から実効半径を逆算する
     let inset =
         morphology::speck_radius(opts.cleanup, image.width(), image.height()) + opts.feather + 4;
-    let separability = boundary_separability(
-        image,
-        &mask,
-        &field,
-        inset,
-        opts.bbox,
-        opts.constraints.as_ref(),
+    // **分離度と診断も互いに独立である。** どちらも画像・マスク・場を読む
+    // だけで、相手の結果を見ない。段の表では 1 つにまとめる——同時に走って
+    // いるものを 2 行に分けて出すと、足した数がどこにも存在しない時間になる
+    let (separability, diagnostics) = rayon::join(
+        || {
+            boundary_separability(
+                image,
+                &mask,
+                &field,
+                inset,
+                opts.bbox,
+                opts.constraints.as_ref(),
+            )
+        },
+        || {
+            diagnostics::diagnose(
+                image,
+                &mask,
+                &field,
+                diagnostics::halo_reference_gate(residual.p90),
+                opts.bbox,
+            )
+        },
     );
-    stages.mark("分離度");
-    let diagnostics = diagnostics::diagnose(
-        image,
-        &mask,
-        &field,
-        diagnostics::halo_reference_gate(residual.p90),
-        opts.bbox,
-    );
-    stages.mark("診断");
+    stages.mark("分離度と診断");
     stages.report();
 
     // 設定の調整はいちばん先に伝える。結果への警告は、その設定で走った結果に

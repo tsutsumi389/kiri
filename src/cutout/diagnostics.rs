@@ -216,11 +216,31 @@ pub fn diagnose(
 ) -> Diagnostics {
     // 輪郭画素の抽出は全画素の走査なので、2 つの指標で使い回す
     let contour = contour_pixels(mask, bbox);
+    // **4 つは互いに独立である。** どれも画像・マスク・場を読むだけで、
+    // 互いの結果を見ない。入れ子の `join` で 4 本同時に回すと、合計ではなく
+    // いちばん長い 1 本の時間になる。
+    //
+    // 浮動小数を畳むのは各指標の中だけで、指標をまたいで足す箇所は無い
+    // ——だから分け方で答えが動かない（計画 §11.5）
+    let ((halo_ratio_v, edge_width_v), (roughness, rim)) = rayon::join(
+        || {
+            rayon::join(
+                || halo_ratio(image, mask, field, reference_gate),
+                || edge_width(mask),
+            )
+        },
+        || {
+            rayon::join(
+                || roughness_of(mask, &contour, bbox),
+                || contamination_of(image, mask, &contour),
+            )
+        },
+    );
     Diagnostics {
-        halo_ratio: halo_ratio(image, mask, field, reference_gate),
-        edge_width: edge_width(mask),
-        contour_roughness: roughness_of(mask, &contour, bbox),
-        rim_contamination: contamination_of(image, mask, &contour),
+        halo_ratio: halo_ratio_v,
+        edge_width: edge_width_v,
+        contour_roughness: roughness,
+        rim_contamination: rim,
     }
 }
 

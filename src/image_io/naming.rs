@@ -175,8 +175,8 @@ pub fn stem_of(output: &Path) -> &str {
 /// `output` は `batch::resolve` で `--base-dir` の下へ寄せる規約になっているが、
 /// spec の `naming` / `derive[].role` はこの関門を通らない。spec はエージェントや
 /// 他人が生成しうる**データファイル**なので、1 行で `--base-dir` の境界を越えられる
-/// 形にはできない。README の「書き出し先のディレクトリも `--output` の親になる」も
-/// ここで初めて保証される
+/// 形にはできない。`docs/commands/03-output.md` の「書き出し先のディレクトリも
+/// `--output` の親になる」も、ここで初めて保証される
 pub fn beside(output: &Path, name: &str) -> Result<PathBuf> {
     let single = !name.is_empty()
         && !name.contains('/')

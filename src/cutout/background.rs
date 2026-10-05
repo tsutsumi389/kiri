@@ -347,7 +347,7 @@ const MIN_CELL_SAMPLE_DIVISOR: usize = 4;
 /// 「同じ色と言える」上限を 5 に置いている）。門をそこまで下げると背景自身が
 /// 材料から外れ、場が痩せる。15 はその 3 倍にあたる。
 ///
-/// 掃引の実測は README の「場の材料に掛ける色の門」を参照。
+/// 掃引の実測は `docs/commands/05-2-background.md` の「場の材料に掛ける色の門」を参照。
 pub const FIELD_GATE_FLOOR: f64 = 15.0;
 
 /// 門を外周 ΔE p50 の何倍のところへ置くか。[`FIELD_GATE_FLOOR`] の対。

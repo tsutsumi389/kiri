@@ -175,7 +175,7 @@ mod tests {
     }
 
     /// 変わったら全 PNG / JPEG 出力が動いたということ。意図した変更なら値を
-    /// 取り直し、README の「516 バイト」も合わせる
+    /// 取り直し、`docs/commands/03-output.md` の「516 バイト」も合わせる
     #[test]
     fn the_profile_bytes_are_pinned() {
         assert_eq!(srgb_icc().len(), 516);

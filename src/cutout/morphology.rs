@@ -272,6 +272,35 @@ impl BitPlane {
         }
     }
 
+    /// 1 ビットでも立っているか。**語ごとに見る**ので、空の面では
+    /// 画素数の 1/64 の読みで答えが出る。
+    pub fn any(&self) -> bool {
+        self.words.iter().any(|&word| word != 0)
+    }
+
+    /// 連続する範囲を一度に立てる。
+    ///
+    /// **語ごとに埋める。** bbox の外側のように広い範囲を 1 画素ずつ立てると、
+    /// 24.5MP では 2000 万回の読み・変更・書きになる。両端の語だけを画素で
+    /// 扱い、間は 1 語 64 画素でまとめて埋める。
+    pub fn insert_range(&mut self, start: usize, end: usize) {
+        let end = end.min(self.len);
+        if start >= end {
+            return;
+        }
+        let (first, last) = (start / 64, (end - 1) / 64);
+        if first == last {
+            let mask = (!0u64 << (start % 64)) & (!0u64 >> (63 - (end - 1) % 64));
+            self.words[first] |= mask;
+            return;
+        }
+        self.words[first] |= !0u64 << (start % 64);
+        for word in &mut self.words[first + 1..last] {
+            *word = !0u64;
+        }
+        self.words[last] |= !0u64 >> (63 - (end - 1) % 64);
+    }
+
     #[inline]
     pub fn set(&mut self, index: usize, value: bool) {
         let bit = 1u64 << (index % 64);

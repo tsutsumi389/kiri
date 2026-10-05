@@ -230,10 +230,18 @@ pub fn fill(
         // **指示を足したせいで結果が悪くなる**、いちばん筋の悪い壊れ方である。
         //
         // 落ちた先の 1 段フィルでも確定背景は効く（種になり、最後に強制される）
-        let colour_core = core
-            .iter()
-            .enumerate()
-            .any(|(i, &b)| b && !forced.is_some_and(|c| c.has_bg(i)));
+        //
+        // **確定背景が無ければ「芯に 1 ビットでも立っているか」で済む。**
+        // `BitPlane::any` は語ごとに見るので、画素数の 1/64 の読みで答えが
+        // 出る。指示がある経路だけ、立っている添字を辿って確定背景を除く
+        let colour_core = match forced.filter(|c| c.any_bg()) {
+            None => core.any(),
+            Some(c) => {
+                let mut found = false;
+                core.for_each_set(|i| found |= !c.has_bg(i));
+                found
+            }
+        };
         if colour_core {
             let stage = Expansion {
                 candidates: &candidates,
@@ -282,12 +290,12 @@ pub fn fill(
         for y in 0..h {
             let row = (y as usize) * stride;
             if y < y1 || y > y2 {
-                is_background[row..row + stride].fill(true);
+                is_background.insert_range(row, row + stride);
                 continue;
             }
-            is_background[row..row + (x1 as usize).min(stride)].fill(true);
+            is_background.insert_range(row, row + (x1 as usize).min(stride));
             let right = (x2 as usize).saturating_add(1).min(stride);
-            is_background[row + right..row + stride].fill(true);
+            is_background.insert_range(row + right, row + stride);
         }
     }
 
@@ -309,7 +317,7 @@ pub fn fill(
     let out = mask.as_mut_slice();
     if protected.any() {
         out.par_iter_mut().enumerate().for_each(|(i, slot)| {
-            *slot = if protected.has(i) || !is_background[i] {
+            *slot = if protected.has(i) || !is_background.get(i) {
                 255
             } else {
                 0
@@ -317,7 +325,7 @@ pub fn fill(
         });
     } else {
         out.par_iter_mut().enumerate().for_each(|(i, slot)| {
-            *slot = if is_background[i] { 0 } else { 255 };
+            *slot = if is_background.get(i) { 0 } else { 255 };
         });
     }
     mask
@@ -654,7 +662,7 @@ struct Expansion<'a> {
 /// `with_shadow` を立てると影候補も吸収する。そのときは `reach` を必ず与えて、
 /// 起点からの測地距離で進める範囲を切る。影の判定は堤防を無視するぶん危うく、
 /// 輪郭に 1 箇所でも通り道ができると商品の内部へ届いてしまうためである。
-fn expand(w: u32, h: u32, seed: Vec<bool>, stage: &Expansion) -> Vec<bool> {
+fn expand(w: u32, h: u32, seed: BitPlane, stage: &Expansion) -> BitPlane {
     let Expansion {
         candidates,
         lab,
@@ -684,13 +692,13 @@ fn expand(w: u32, h: u32, seed: Vec<bool>, stage: &Expansion) -> Vec<bool> {
     let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
     for y in 0..h {
         for x in 0..w {
-            if !filled[idx(x, y)] {
+            if !filled.get(idx(x, y)) {
                 continue;
             }
-            let open = (x > 0 && !filled[idx(x - 1, y)])
-                || (y > 0 && !filled[idx(x, y - 1)])
-                || (x + 1 < w && !filled[idx(x + 1, y)])
-                || (y + 1 < h && !filled[idx(x, y + 1)]);
+            let open = (x > 0 && !filled.get(idx(x - 1, y)))
+                || (y > 0 && !filled.get(idx(x, y - 1)))
+                || (x + 1 < w && !filled.get(idx(x + 1, y)))
+                || (y + 1 < h && !filled.get(idx(x, y + 1)));
             if open {
                 queue.push_back((x, y));
             }
@@ -726,7 +734,7 @@ fn expand(w: u32, h: u32, seed: Vec<bool>, stage: &Expansion) -> Vec<bool> {
         }
         let mut visit = |nx: u32, ny: u32, dx: i64, dy: i64, q: &mut VecDeque<(u32, u32)>| {
             let i = idx(nx, ny);
-            if filled[i] {
+            if filled.get(i) {
                 return;
             }
             if !candidates.has(i, LOOSE) && !(with_shadow && candidates.has(i, SHADOW)) {
@@ -742,7 +750,7 @@ fn expand(w: u32, h: u32, seed: Vec<bool>, stage: &Expansion) -> Vec<bool> {
                     return;
                 }
             }
-            filled[i] = true;
+            filled.insert(i);
             if let Some(d) = distance.as_mut() {
                 d[i] = u8::try_from(travelled + 1).unwrap_or(u8::MAX);
             }
@@ -798,11 +806,11 @@ fn expand(w: u32, h: u32, seed: Vec<bool>, stage: &Expansion) -> Vec<bool> {
 fn seal_narrow_gaps(
     w: u32,
     h: u32,
-    background: &[bool],
+    background: &BitPlane,
     radius: u32,
     candidates: &Candidates,
     forced: Option<&Constraints>,
-) -> Vec<bool> {
+) -> BitPlane {
     let stride = w as usize;
     let idx = |x: u32, y: u32| (y as usize) * stride + (x as usize);
 
@@ -812,12 +820,12 @@ fn seal_narrow_gaps(
     for y in 0..h {
         for x in 0..w {
             let i = idx(x, y);
-            let open = background[i]
+            let open = background.get(i)
                 || (candidates.has(i, NEAR_BG)
-                    && ((x > 0 && background[idx(x - 1, y)])
-                        || (y > 0 && background[idx(x, y - 1)])
-                        || (x + 1 < w && background[idx(x + 1, y)])
-                        || (y + 1 < h && background[idx(x, y + 1)])));
+                    && ((x > 0 && background.get(idx(x - 1, y)))
+                        || (y > 0 && background.get(idx(x, y - 1)))
+                        || (x + 1 < w && background.get(idx(x + 1, y)))
+                        || (y + 1 < h && background.get(idx(x, y + 1)))));
             if open {
                 permeable.insert(i);
             }
@@ -831,7 +839,7 @@ fn seal_narrow_gaps(
     for x in 0..w {
         for y in [0, h - 1] {
             let i = idx(x, y);
-            if background[i] {
+            if background.get(i) {
                 trusted.insert(i);
             }
         }
@@ -839,7 +847,7 @@ fn seal_narrow_gaps(
     for y in 0..h {
         for x in [0, w - 1] {
             let i = idx(x, y);
-            if background[i] {
+            if background.get(i) {
                 trusted.insert(i);
             }
         }
@@ -853,11 +861,15 @@ fn seal_narrow_gaps(
     // 「指定したのに効かない」がいちばん分かりにくい形で起きる
     let reachable = fill_from_border(w, h, |i| trusted.get(i), None, forced);
     drop(trusted);
-    let grown = morphology::separable(stride, h as usize, &reachable[..], radius, true);
+    let grown = morphology::separable(stride, h as usize, &reachable, radius, true);
 
-    (0..background.len())
-        .map(|i| grown.get(i) && background[i])
-        .collect()
+    let mut out = BitPlane::new(background.len());
+    for i in 0..background.len() {
+        if grown.get(i) && background.get(i) {
+            out.insert(i);
+        }
+    }
+    out
 }
 
 /// 外周を起点に 4 近傍で塗り広げる。
@@ -878,8 +890,8 @@ fn fill_from_border(
     candidate: impl Fn(usize) -> bool,
     bbox: Option<(u32, u32, u32, u32)>,
     forced: Option<&Constraints>,
-) -> Vec<bool> {
-    let mut filled = vec![false; (w as usize) * (h as usize)];
+) -> BitPlane {
+    let mut filled = BitPlane::new((w as usize) * (h as usize));
     let mut queue = VecDeque::new();
     let idx = |x: u32, y: u32| (y as usize) * (w as usize) + (x as usize);
 
@@ -893,18 +905,20 @@ fn fill_from_border(
     // 確定背景が 1 画素も無ければ走査そのものを省く。`--fg-polygon` だけを
     // 渡した実行や、渡したのに空だった指示で、12MP の表を 2 度舐める理由が無い
     if let Some(c) = forced.filter(|c| c.any_bg()) {
-        for (i, slot) in filled.iter_mut().enumerate() {
-            *slot = c.has_bg(i);
+        for i in 0..filled.len() {
+            if c.has_bg(i) {
+                filled.insert(i);
+            }
         }
         for y in 0..h {
             for x in 0..w {
-                if !filled[idx(x, y)] {
+                if !filled.get(idx(x, y)) {
                     continue;
                 }
-                let open = (x > 0 && !filled[idx(x - 1, y)])
-                    || (y > 0 && !filled[idx(x, y - 1)])
-                    || (x + 1 < w && !filled[idx(x + 1, y)])
-                    || (y + 1 < h && !filled[idx(x, y + 1)]);
+                let open = (x > 0 && !filled.get(idx(x - 1, y)))
+                    || (y > 0 && !filled.get(idx(x, y - 1)))
+                    || (x + 1 < w && !filled.get(idx(x + 1, y)))
+                    || (y + 1 < h && !filled.get(idx(x, y + 1)));
                 if open {
                     queue.push_back((x, y));
                 }
@@ -912,10 +926,10 @@ fn fill_from_border(
         }
     }
 
-    let seed = |x: u32, y: u32, filled: &mut Vec<bool>, queue: &mut VecDeque<(u32, u32)>| {
+    let seed = |x: u32, y: u32, filled: &mut BitPlane, queue: &mut VecDeque<(u32, u32)>| {
         let i = idx(x, y);
-        if candidate(i) && !filled[i] {
-            filled[i] = true;
+        if candidate(i) && !filled.get(i) {
+            filled.insert(i);
             queue.push_back((x, y));
         }
     };
@@ -945,10 +959,10 @@ fn fill_from_border(
     }
 
     while let Some((x, y)) = queue.pop_front() {
-        let visit = |nx: u32, ny: u32, filled: &mut Vec<bool>, q: &mut VecDeque<(u32, u32)>| {
+        let visit = |nx: u32, ny: u32, filled: &mut BitPlane, q: &mut VecDeque<(u32, u32)>| {
             let i = idx(nx, ny);
-            if candidate(i) && !filled[i] {
-                filled[i] = true;
+            if candidate(i) && !filled.get(i) {
+                filled.insert(i);
                 q.push_back((nx, ny));
             }
         };

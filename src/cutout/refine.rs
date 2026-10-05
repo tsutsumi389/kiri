@@ -37,10 +37,11 @@
 //! 「帯の外接矩形 + 窓の余白」を覆う局所の積分画像を作り直す。確保は数 MB に収まり、
 //! 窓の大きさが画素ごとに違っても成立する。
 
-use std::cell::OnceCell;
 use std::collections::VecDeque;
+use std::sync::{Mutex, OnceLock};
 
 use image::RgbaImage;
+use rayon::prelude::*;
 
 use crate::color::lab::{delta_e76, srgb_to_lab};
 use crate::cutout::background::BackgroundField;
@@ -386,8 +387,7 @@ pub fn refine(
     };
     // 色で決められなかった画素の受け皿。12MP では単独で 50ms かかるうえ、
     // 1 画素も落ちない素材のほうが多いので、実際に必要になるまで作らない
-    let fallback: OnceCell<Mask> = OnceCell::new();
-    let mut ws = Workspace::default();
+    let fallback: OnceLock<Mask> = OnceLock::new();
     // 色から決まった画素の印。guided のときだけ持つ
     let mut solved = if smooths_alpha {
         guided::Solved::new((w as usize) * (h as usize))
@@ -395,20 +395,15 @@ pub fn refine(
         guided::Solved::default()
     };
 
-    for_each_tile(w, h, |tile| {
-        refine_tile(
-            &ctx,
-            &mut ws,
-            &fallback,
-            tile,
-            Pass::Project,
-            &mut Output {
-                solved: &mut solved,
-                image: &mut out,
-                mask: &mut mask,
-            },
-        );
-    });
+    sweep_bands(
+        w,
+        &ctx,
+        &fallback,
+        Pass::Project,
+        &mut out,
+        &mut mask,
+        &mut solved,
+    );
 
     let mut matting_report = None;
     if smooths_alpha {
@@ -433,20 +428,15 @@ pub fn refine(
                 despill: true,
                 ..ctx
             };
-            for_each_tile(w, h, |tile| {
-                refine_tile(
-                    &ctx,
-                    &mut ws,
-                    &fallback,
-                    tile,
-                    Pass::Recover,
-                    &mut Output {
-                        solved: &mut solved,
-                        image: &mut out,
-                        mask: &mut mask,
-                    },
-                );
-            });
+            sweep_bands(
+                w,
+                &ctx,
+                &fallback,
+                Pass::Recover,
+                &mut out,
+                &mut mask,
+                &mut solved,
+            );
         }
     }
 
@@ -474,18 +464,55 @@ pub(crate) fn smooth_radius_px(smooth_contour: f64, scale: f64) -> u32 {
     }
 }
 
-/// タイルの左上を順に渡す。走査順は結果に影響しないが、**順序が決まって
-/// いること**は決定性の前提である。
-fn for_each_tile(w: u32, h: u32, mut body: impl FnMut((u32, u32))) {
-    let mut ty = 0;
-    while ty < h {
-        let mut tx = 0;
-        while tx < w {
-            body((tx, ty));
-            tx += TILE;
-        }
-        ty += TILE;
-    }
+/// タイルを `TILE` 行ずつの帯に割り、帯を並列に回す。
+///
+/// **タイルは自分のタイルの画素しか書かない。** 読みは積分画像の余白ぶん
+/// 外へ伸びるが、そちらは共有の不変参照で足りる。だから行で割れば書き先が
+/// 重ならず、`out` と `mask` を帯ごとの可変スライスに分けられる。
+///
+/// 結果がタイルの位置に依存しないことは
+/// `the_result_does_not_depend_on_where_the_tiles_fall` が見ている。走査順が
+/// 結果に影響しないので、帯の順序が崩れても答えは同じである。
+///
+/// 作業領域は帯ごとに持つ。1 本で持ち回していたものを割るので確保は増えるが、
+/// 帯の中ではこれまでどおり使い回すので、タイルごとに作り直すわけではない。
+fn sweep_bands(
+    w: u32,
+    ctx: &Context<'_>,
+    fallback: &OnceLock<Mask>,
+    pass: Pass,
+    image: &mut RgbaImage,
+    mask: &mut Mask,
+    solved: &mut guided::Solved,
+) {
+    let stride = w as usize;
+    let rows = TILE as usize;
+    let marks = Mutex::new(solved);
+    image
+        .par_chunks_mut(rows * stride * 4)
+        .zip(mask.as_mut_slice().par_chunks_mut(rows * stride))
+        .enumerate()
+        .for_each(|(band, (image, mask))| {
+            let y0 = (band * rows) as u32;
+            let mut ws = Workspace::default();
+            let mut out = Output {
+                solved: Vec::new(),
+                image,
+                mask,
+                y0,
+                stride,
+            };
+            let mut tx = 0;
+            while tx < w {
+                refine_tile(ctx, &mut ws, fallback, (tx, y0), pass, &mut out);
+                tx += TILE;
+            }
+            // 立てる順序は結果に影響しない（同じ添字に同じ 1 を置くだけ）
+            let mut solved = marks.lock().expect("印の錠が壊れている");
+            for index in out.solved {
+                solved.set(index as usize);
+            }
+        });
 }
 
 /// タイルをまたいで変わらない入力。
@@ -618,20 +645,67 @@ enum Pass {
 /// 3 つは常に一緒に動く——アルファを書けば印が立ち、色を復元すれば画像が
 /// 変わる。引数として並べると、呼ぶ側が順序を間違えても型が違うぶんしか
 /// 守られない。
+/// 1 本の帯（`TILE` 行ぶん）の書き先。
+///
+/// **帯ごとに別のスレッドが持つ。** タイルは自分のタイルの画素しか書かない
+/// （読みだけが余白へ伸びる）ので、行で割れば書き先が重ならない。座標は
+/// 画像全体のままにして、ここで先頭行を引く——呼ぶ側に帯の相対座標を
+/// 持たせると、読み（`ctx.band` など）と書きで座標系が 2 つになる。
 struct Output<'a> {
-    /// 色から決まった画素の印。guided のときだけ中身を持つ
-    solved: &'a mut guided::Solved,
-    /// 色を復元する先
-    image: &'a mut RgbaImage,
-    /// アルファを書く先
-    mask: &'a mut Mask,
+    /// 色から決まった画素の印。**添字を溜めて、帯の終わりに立てる。**
+    ///
+    /// `guided::Solved` は 64 画素を 1 語に詰めるので、語が行をまたぐ。
+    /// 帯ごとに並列で立てると境目の語を取り合う。そこで添字の列で溜め、
+    /// 帯 1 本を終えたところで錠を取ってまとめて立てる。
+    ///
+    /// **全帯ぶんを集めてから立てるのではない。** 最初はそうしていて、
+    /// 24.5MP でピーク RSS が 64MB 増えた（印は帯の画素ぶんあり、`Solved`
+    /// 本体と二重に抱えることになる）。錠を取るのは帯 1 本につき 1 回なので、
+    /// 待ちは測れるほど出ない
+    solved: Vec<u32>,
+    /// 色を復元する先。この帯の行だけ
+    image: &'a mut [u8],
+    /// アルファを書く先。この帯の行だけ
+    mask: &'a mut [u8],
+    /// この帯の先頭行
+    y0: u32,
+    stride: usize,
+}
+
+impl Output<'_> {
+    #[inline]
+    fn at(&self, x: u32, y: u32) -> usize {
+        ((y - self.y0) as usize) * self.stride + (x as usize)
+    }
+
+    #[inline]
+    fn set_alpha(&mut self, x: u32, y: u32, value: u8) {
+        let i = self.at(x, y);
+        self.mask[i] = value;
+    }
+
+    #[inline]
+    fn alpha(&self, x: u32, y: u32) -> u8 {
+        self.mask[self.at(x, y)]
+    }
+
+    #[inline]
+    fn mark_solved(&mut self, index: usize) {
+        self.solved.push(index as u32);
+    }
+
+    #[inline]
+    fn rgb_mut(&mut self, x: u32, y: u32) -> &mut [u8] {
+        let i = self.at(x, y) * 4;
+        &mut self.image[i..i + 3]
+    }
 }
 
 /// タイル1枚を処理する。
 fn refine_tile(
     ctx: &Context<'_>,
     ws: &mut Workspace,
-    fallback: &OnceCell<Mask>,
+    fallback: &OnceLock<Mask>,
     tile: (u32, u32),
     pass: Pass,
     out: &mut Output<'_>,
@@ -749,14 +823,10 @@ fn prepare_tile(ctx: &Context<'_>, ws: &mut Workspace, tile: &Tile) {
 fn estimate_alpha(
     ctx: &Context<'_>,
     ws: &mut Workspace,
-    fallback: &OnceCell<Mask>,
+    fallback: &OnceLock<Mask>,
     tile: &Tile,
     pass: Pass,
-    Output {
-        solved,
-        image: out,
-        mask,
-    }: &mut Output<'_>,
+    out: &mut Output<'_>,
 ) {
     let stride = ctx.image.width() as usize;
     let &Tile {
@@ -844,7 +914,8 @@ fn estimate_alpha(
 
             let Some(f) = f else {
                 if pass == Pass::Project {
-                    mask.set(x, y, feather_at(fallback, ctx, x, y));
+                    let v = feather_at(fallback, ctx, x, y);
+                    out.set_alpha(x, y, v);
                 }
                 continue;
             };
@@ -854,34 +925,35 @@ fn estimate_alpha(
             if dd < ctx.separation_sq {
                 // 色では決められない。幾何的フェザーへ落とす
                 if pass == Pass::Project {
-                    mask.set(x, y, feather_at(fallback, ctx, x, y));
+                    let v = feather_at(fallback, ctx, x, y);
+                    out.set_alpha(x, y, v);
                 }
                 continue;
             }
 
             let alpha = match pass {
                 Pass::Project => {
-                    solved.set((y as usize) * stride + (x as usize));
+                    out.mark_solved((y as usize) * stride + (x as usize));
                     let projected = ((observed[0] - b[0]) * d[0]
                         + (observed[1] - b[1]) * d[1]
                         + (observed[2] - b[2]) * d[2])
                         / dd;
                     let alpha = projected.clamp(0.0, 1.0);
-                    mask.set(x, y, (alpha * 255.0).round() as u8);
+                    out.set_alpha(x, y, (alpha * 255.0).round() as u8);
                     alpha
                 }
                 // 均した後のアルファをそのまま使う。射影の値で復元すると、
                 // 出力のアルファと復元色が食い違って縁が色づく
-                Pass::Recover => f32::from(mask.get(x, y)) / 255.0,
+                Pass::Recover => f32::from(out.alpha(x, y)) / 255.0,
             };
 
             if !ctx.despill || (alpha * 255.0).round() as u8 == 0 {
                 continue;
             }
             let recovered = recover_foreground(observed, b, f, alpha);
-            let pixel = out.get_pixel_mut(x, y);
-            for k in 0..3 {
-                pixel[k] = linear_to_srgb(recovered[k]);
+            let pixel = out.rgb_mut(x, y);
+            for (k, slot) in pixel.iter_mut().enumerate() {
+                *slot = linear_to_srgb(recovered[k]);
             }
         }
     }
@@ -965,7 +1037,7 @@ fn smoothstep(t: f32) -> f32 {
 }
 
 /// 幾何的フェザーの値。初めて必要になったときだけマスク全体を作る。
-fn feather_at(fallback: &OnceCell<Mask>, ctx: &Context<'_>, x: u32, y: u32) -> u8 {
+fn feather_at(fallback: &OnceLock<Mask>, ctx: &Context<'_>, x: u32, y: u32) -> u8 {
     fallback
         .get_or_init(|| feather::feather(ctx.binary, ctx.feather_radius))
         .get(x, y)

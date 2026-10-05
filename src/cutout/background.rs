@@ -17,6 +17,7 @@
 
 use clap::ValueEnum;
 use image::RgbaImage;
+use rayon::prelude::*;
 
 use crate::color::lab::{delta_e_rgb, delta_e76, linear_to_lab, srgb_linear_lut, srgb_to_lab};
 use crate::cutout::constraints::Constraints;
@@ -387,7 +388,12 @@ pub fn field_gate(background: &BackgroundEstimate) -> f64 {
 /// 色だけは正確に測り直すので、**素直に全画素を測ったのと同じ答え**になる
 /// （`the_quantised_gate_answers_exactly_like_the_naive_one` が固定している）。
 struct ColourGate {
-    base: [u8; 3],
+    /// 基準色の Lab。**1 度だけ測る。**
+    ///
+    /// `delta_e_rgb(rgb, base)` は両辺を変換するので、基準色のほうを毎回
+    /// 測り直していた。`srgb_to_lab` は 1 回で `cbrt` を 3 度呼ぶので、
+    /// 境目の区画に落ちた画素のたびに半分が無駄になる
+    base_lab: [f64; 3],
     limit: f64,
     /// 6bit x 3 の区画ごとの判定。0=未測定 / 1=通す / 2=弾く / 3=境目（毎回測る）
     table: Vec<u8>,
@@ -404,7 +410,7 @@ const GATE_MARGIN: f64 = 8.0;
 impl ColourGate {
     fn new(base: [u8; 3], limit: f64) -> Self {
         Self {
-            base,
+            base_lab: srgb_to_lab(base),
             limit,
             // 6bit x 3 = 262144 区画。1 区画 1 バイトで 256KB
             table: vec![0u8; 1 << 18],
@@ -420,7 +426,7 @@ impl ColourGate {
             0 => {
                 // 区画の代表色（各チャンネルの中央）で 1 度だけ測る
                 let rep = rgb.map(|c| (c & !3) | 2);
-                let d = delta_e_rgb(rep, self.base);
+                let d = delta_e76(srgb_to_lab(rep), self.base_lab);
                 let v = if d + GATE_MARGIN < self.limit {
                     1
                 } else if d - GATE_MARGIN > self.limit {
@@ -436,7 +442,7 @@ impl ColourGate {
         match verdict {
             1 => true,
             2 => false,
-            _ => delta_e_rgb(rgb, self.base) <= self.limit,
+            _ => delta_e76(srgb_to_lab(rgb), self.base_lab) <= self.limit,
         }
     }
 }
@@ -792,7 +798,6 @@ pub fn estimate_field(
     if w == 0 || h == 0 {
         return flat(0.0);
     }
-    let mut gate = ColourGate::new(rgb, field_gate(background));
     let (mut band_seen, mut band_kept) = (0u64, 0u64);
     let side = FIELD_LONG_SIDE;
     let long = w.max(h);
@@ -814,63 +819,88 @@ pub fn estimate_field(
     let mut value = vec![[0f32; 3]; cells];
     let mut weight = vec![0f32; cells];
     let lut = srgb_linear_lut();
+    let limit = field_gate(background);
+
+    // **セルの行ごとに並列に測る。** セルは互いに独立で、書き先は自分の添字
+    // しかない。帯の計数は u64 の和なので足す順序で答えが動かない（計画 §11.5）。
+    //
+    // 色の門は**スレッドごとに持つ**。中身は 6bit x 3 の区画ごとの判定を
+    // 覚えるだけの純粋な表なので、何本持っても同じ答えが出る。`map_init` が
+    // 働くスレッドの数だけ作る（セルの行ごとではない——256KB の表を 256 回
+    // 確保する理由が無い）
+    //
     // セル 1 つぶんの標本だけを持ち、セルごとに使い回す。**全画素ぶんの表は
     // 作らない**——20MP の線形 RGB を溜めると 240MB になり、場そのものより
     // 桁違いに重い。1 セルは 20MP / 49152 セルで 400 画素ほどにしかならない。
     //
     // 中央値は単調変換と交換できるので、8bit のまま採ってから線形へ移してよい
-    let mut samples: Vec<[u8; 3]> = Vec::new();
-    let mut channel: Vec<u8> = Vec::new();
-
-    for cy in 0..rows {
-        let y0 = (cy as u64 * u64::from(h) / rows as u64) as u32;
-        let y1 = (((cy + 1) as u64 * u64::from(h) / rows as u64) as u32).max(y0 + 1);
-        for cx in 0..cols {
-            let x0 = (cx as u64 * u64::from(w) / cols as u64) as u32;
-            let x1 = (((cx + 1) as u64 * u64::from(w) / cols as u64) as u32).max(x0 + 1);
-            // 既知の画素が 1 つも無いと言い切れるセルは、画素を舐めずに飛ばす
-            if known.certainly_empty(x0, y0, x1.min(w) - 1, y1.min(h) - 1, w, h) {
-                continue;
-            }
-            samples.clear();
-            for y in y0..y1.min(h) {
-                let row = (y as usize) * (w as usize);
-                for x in x0..x1.min(w) {
-                    let i = row + (x as usize);
-                    let p = image.get_pixel(x, y).0;
-                    // 透明な画素は色を持たない。切り抜き済みの再処理で混ぜると、
-                    // 透明部の黒が場を暗い側へ引く
-                    if p[3] < 250 || !known.holds(x, y, i, w, h) {
+    let (band_seen_total, band_kept_total) = value
+        .par_chunks_mut(cols)
+        .zip(weight.par_chunks_mut(cols))
+        .enumerate()
+        .map_init(
+            || {
+                (
+                    ColourGate::new(rgb, limit),
+                    Vec::<[u8; 3]>::new(),
+                    Vec::<u8>::new(),
+                )
+            },
+            |(gate, samples, channel), (cy, (value, weight))| {
+                let (mut band_seen, mut band_kept) = (0u64, 0u64);
+                let y0 = (cy as u64 * u64::from(h) / rows as u64) as u32;
+                let y1 = (((cy + 1) as u64 * u64::from(h) / rows as u64) as u32).max(y0 + 1);
+                for cx in 0..cols {
+                    let x0 = (cx as u64 * u64::from(w) / cols as u64) as u32;
+                    let x1 = (((cx + 1) as u64 * u64::from(w) / cols as u64) as u32).max(x0 + 1);
+                    // 既知の画素が 1 つも無いと言い切れるセルは、画素を舐めずに飛ばす
+                    if known.certainly_empty(x0, y0, x1.min(w) - 1, y1.min(h) - 1, w, h) {
                         continue;
                     }
-                    // 帯の画素がどれだけ門を通ったかを数える。**帯の大半が商品なら
-                    // 場そのものを諦める**ための材料で、門より先に数える
-                    let on_band = known.on_band(x, y, w, h);
-                    band_seen += u64::from(on_band);
-                    if !gate.passes([p[0], p[1], p[2]]) {
+                    samples.clear();
+                    for y in y0..y1.min(h) {
+                        let row = (y as usize) * (w as usize);
+                        for x in x0..x1.min(w) {
+                            let i = row + (x as usize);
+                            let p = image.get_pixel(x, y).0;
+                            // 透明な画素は色を持たない。切り抜き済みの再処理で
+                            // 混ぜると、透明部の黒が場を暗い側へ引く
+                            if p[3] < 250 || !known.holds(x, y, i, w, h) {
+                                continue;
+                            }
+                            // 帯の画素がどれだけ門を通ったかを数える。**帯の
+                            // 大半が商品なら場そのものを諦める**ための材料で、
+                            // 門より先に数える
+                            let on_band = known.on_band(x, y, w, h);
+                            band_seen += u64::from(on_band);
+                            if !gate.passes([p[0], p[1], p[2]]) {
+                                continue;
+                            }
+                            band_kept += u64::from(on_band);
+                            samples.push([p[0], p[1], p[2]]);
+                        }
+                    }
+                    let area = ((x1.min(w) - x0) as usize) * ((y1.min(h) - y0) as usize);
+                    let needed = (area / MIN_CELL_SAMPLE_DIVISOR).max(1);
+                    if samples.len() < needed {
                         continue;
                     }
-                    band_kept += u64::from(on_band);
-                    samples.push([p[0], p[1], p[2]]);
+                    let middle = samples.len() / 2;
+                    for k in 0..3 {
+                        channel.clear();
+                        channel.extend(samples.iter().map(|s| s[k]));
+                        // 全部を並べ替える必要は無い。要るのは真ん中の 1 つだけ
+                        let (_, median, _) = channel.select_nth_unstable(middle);
+                        value[cx][k] = lut[*median as usize];
+                    }
+                    weight[cx] = 1.0;
                 }
-            }
-            let area = ((x1.min(w) - x0) as usize) * ((y1.min(h) - y0) as usize);
-            let needed = (area / MIN_CELL_SAMPLE_DIVISOR).max(1);
-            if samples.len() < needed {
-                continue;
-            }
-            let cell = cy * cols + cx;
-            let middle = samples.len() / 2;
-            for k in 0..3 {
-                channel.clear();
-                channel.extend(samples.iter().map(|s| s[k]));
-                // 全部を並べ替える必要は無い。要るのは真ん中の 1 つだけ
-                let (_, median, _) = channel.select_nth_unstable(middle);
-                value[cell][k] = lut[*median as usize];
-            }
-            weight[cell] = 1.0;
-        }
-    }
+                (band_seen, band_kept)
+            },
+        )
+        .reduce(|| (0u64, 0u64), |a, b| (a.0 + b.0, a.1 + b.1));
+    band_seen += band_seen_total;
+    band_kept += band_kept_total;
 
     let band_material = if band_seen == 0 {
         0.0

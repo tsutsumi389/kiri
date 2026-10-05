@@ -9,6 +9,8 @@
 
 use image::RgbaImage;
 
+use crate::cutout::morphology::BitPlane;
+
 /// 非極大抑制で稜線を細線化し、`threshold` を超えた画素だけを立てた表。
 /// 堤防にはこれを使う。
 ///
@@ -31,14 +33,18 @@ use image::RgbaImage;
 /// 強度ではなく真偽値を返すのは、呼び出し側がしきい値との比較しかしないため。
 /// 12MP では f32 の表というだけで 48MB を積むので、返した先で捨てられる
 /// 精度に払う値段としては高すぎる。
-pub fn edge_ridges(image: &RgbaImage, threshold: f32) -> Vec<bool> {
+///
+/// **ビット面で返す。** `Vec<bool>` は 1 画素 1 バイトで、24.5MP では 24.5MB
+/// ある。呼び出し側（フィルの下ごしらえ）は 2 回のフィルをまたいでこれを
+/// 生かすので、常駐が 1/8 になる差がそのままピーク RSS に出る。
+pub fn edge_ridges(image: &RgbaImage, threshold: f32) -> BitPlane {
     let (w, h) = (image.width() as usize, image.height() as usize);
-    let mut out = vec![false; w * h];
-    if w < 3 || h < 3 {
-        return out;
-    }
-    let (magnitude, direction) = sobel(image, w, h);
-    suppress(w, h, &magnitude, &direction, |i, m| out[i] = m > threshold);
+    let mut out = BitPlane::new(w * h);
+    walk_ridges(image, w, h, |i, m| {
+        if m > threshold {
+            out.insert(i);
+        }
+    });
     out
 }
 
@@ -167,65 +173,153 @@ fn quantiles(samples: &mut [f32]) -> GradientQuantiles {
     GradientQuantiles { p50, p90 }
 }
 
-/// Sobel の勾配強度と向き。
+/// 1 行ぶんの輝度を書く。
+fn luma_row(image: &RgbaImage, y: usize, w: usize, out: &mut [f32]) {
+    for (x, slot) in out.iter_mut().enumerate().take(w) {
+        let p = image.get_pixel(x as u32, y as u32).0;
+        *slot = 0.2126 * f32::from(p[0]) + 0.7152 * f32::from(p[1]) + 0.0722 * f32::from(p[2]);
+    }
+}
+
+/// 3 行の輝度から 1 行ぶんの Sobel の強度と向きを書く。
 ///
 /// 値は「1px あたりの輝度変化量」に正規化してある。輝度 34 の段差なら
 /// おおよそ 34 が返るため、しきい値を輝度の差として直感的に指定できる。
 ///
-/// 輝度の表はこの関数の中で捨てる。12MP では輝度・強度・向き・出力の 4 本が
-/// 同時に生きると 156MB になり、フラッドフィルの Lab 表と重なった瞬間に
-/// ピーク RSS を押し上げていた。
-fn sobel(image: &RgbaImage, w: usize, h: usize) -> (Vec<f32>, Vec<u8>) {
-    let luma: Vec<f32> = image
-        .pixels()
-        .map(|p| 0.2126 * f32::from(p[0]) + 0.7152 * f32::from(p[1]) + 0.0722 * f32::from(p[2]))
-        .collect();
-
-    let mut magnitude = vec![0.0f32; w * h];
-    let mut direction = vec![0u8; w * h];
-    for y in 1..h - 1 {
-        for x in 1..w - 1 {
-            let at = |dx: usize, dy: usize| luma[(y + dy - 1) * w + (x + dx - 1)];
-            let gx = -at(0, 0) + at(2, 0) - 2.0 * at(0, 1) + 2.0 * at(2, 1) - at(0, 2) + at(2, 2);
-            let gy = -at(0, 0) - 2.0 * at(1, 0) - at(2, 0) + at(0, 2) + 2.0 * at(1, 2) + at(2, 2);
-            // Sobel は理想的な段差に対して 4 倍の値を返すため、4 で割って戻す
-            magnitude[y * w + x] = (gx * gx + gy * gy).sqrt() / 4.0;
-            direction[y * w + x] = octant(gx, gy);
-        }
+/// **両端の 1px は 0 で潰す。** 3x3 を読めないので値が無いのは元からだが、
+/// 行を使い回す器では「書かない」が「3 行前の値が残る」になる。
+fn sobel_row(above: &[f32], mid: &[f32], below: &[f32], w: usize, mag: &mut [f32], dir: &mut [u8]) {
+    mag[0] = 0.0;
+    dir[0] = 0;
+    mag[w - 1] = 0.0;
+    dir[w - 1] = 0;
+    for x in 1..w - 1 {
+        let gx = -above[x - 1] + above[x + 1] - 2.0 * mid[x - 1] + 2.0 * mid[x + 1] - below[x - 1]
+            + below[x + 1];
+        let gy = -above[x - 1] - 2.0 * above[x] - above[x + 1]
+            + below[x - 1]
+            + 2.0 * below[x]
+            + below[x + 1];
+        // Sobel は理想的な段差に対して 4 倍の値を返すため、4 で割って戻す
+        mag[x] = (gx * gx + gy * gy).sqrt() / 4.0;
+        dir[x] = octant(gx, gy);
     }
-    (magnitude, direction)
 }
 
-/// 勾配の向きに沿った両隣と比べ、極大でなければ落とす。
+/// 勾配の向きに沿った両隣と比べ、極大でなければ落とす（1 行ぶん）。
 ///
 /// 手前側は「以上」、奥側は「より大きい」で比べる。段差の応答は 2px の
 /// 平坦な山になるので、両側とも「以上」にすると 2px のまま残り、両側とも
 /// 「より大きい」にすると山がまるごと消えてしまう。
+fn suppress_row(
+    y: usize,
+    w: usize,
+    above: &[f32],
+    mid: &[f32],
+    below: &[f32],
+    dir: &[u8],
+    keep: &mut impl FnMut(usize, f32),
+) {
+    for x in 1..w - 1 {
+        let m = mid[x];
+        if m <= 0.0 {
+            continue;
+        }
+        let (dx, dy) = OFFSETS[dir[x] as usize];
+        let row = |d: isize| match d {
+            -1 => above,
+            1 => below,
+            _ => mid,
+        };
+        let back = row(-dy)[(x as isize - dx) as usize];
+        let ahead = row(dy)[(x as isize + dx) as usize];
+        if m >= back && m > ahead {
+            keep(y * w + x, m);
+        }
+    }
+}
+
+/// 輝度 → Sobel → 非極大抑制を、行を流しながら 1 回の走査で済ませる。
+///
+/// **全画面の表を 1 本も持たない。** 以前は輝度 f32・強度 f32・向き u8 の
+/// 3 本を同時に生かしていて、24.5MP では 220MB の一時確保になっていた。
+/// ピーク RSS 872MB の最大の山がここで、しかも**ピークは最大値であって総量
+/// ではない**ので、呼ぶ回数を減らしても下がらない。確保そのものを小さくする
+/// ほかにない。
+///
+/// 持つのは輝度・強度・向きを 3 行ずつだけで、5712px 幅でも合わせて 200KB を
+/// 切る。強度の行 `yy` を書いたら、その 1 つ上の行 `yy-1` は上下が揃うので
+/// その場で抑制できる、という依存の形をそのまま畳んである。
 ///
 /// 結果を溜める器は呼び出し側に決めさせる。本番は真偽値だけ、テストは強度を
 /// そのまま見たい、という違いのために f32 の表を作らずに済む。
-fn suppress(
-    w: usize,
-    h: usize,
-    magnitude: &[f32],
-    direction: &[u8],
-    mut keep: impl FnMut(usize, f32),
-) {
-    for y in 1..h - 1 {
-        for x in 1..w - 1 {
-            let i = y * w + x;
-            let m = magnitude[i];
-            if m <= 0.0 {
-                continue;
-            }
-            let (dx, dy) = OFFSETS[direction[i] as usize];
-            let back = magnitude[(y as isize - dy) as usize * w + (x as isize - dx) as usize];
-            let ahead = magnitude[(y as isize + dy) as usize * w + (x as isize + dx) as usize];
-            if m >= back && m > ahead {
-                keep(i, m);
-            }
+fn walk_ridges(image: &RgbaImage, w: usize, h: usize, mut keep: impl FnMut(usize, f32)) {
+    if w < 3 || h < 3 {
+        return;
+    }
+    // 行の環。添字は `行番号 % 3` で、1 周前の行を上書きする
+    let mut luma = vec![0.0f32; 3 * w];
+    let mut mag = vec![0.0f32; 3 * w];
+    let mut dir = vec![0u8; 3 * w];
+    // 画像の外に当たる強度の行。最後の抑制で 1 度だけ使う
+    let zeros = vec![0.0f32; w];
+    let row = |y: usize| (y % 3) * w;
+
+    luma_row(image, 0, w, &mut luma[row(0)..row(0) + w]);
+    luma_row(image, 1, w, &mut luma[row(1)..row(1) + w]);
+
+    for yy in 1..h - 1 {
+        luma_row(image, yy + 1, w, &mut luma[row(yy + 1)..row(yy + 1) + w]);
+        // 3 行の読みと 1 行の書きを同時に借りられないので、書く行を外へ出す
+        let mut mag_row = std::mem::take(&mut mag);
+        let mut dir_row = std::mem::take(&mut dir);
+        {
+            let (a, m, b) = (row(yy - 1), row(yy), row(yy + 1));
+            let (mag_at, dir_at) = (row(yy), row(yy));
+            let (mag_slice, dir_slice) = (
+                &mut mag_row[mag_at..mag_at + w],
+                &mut dir_row[dir_at..dir_at + w],
+            );
+            sobel_row(
+                &luma[a..a + w],
+                &luma[m..m + w],
+                &luma[b..b + w],
+                w,
+                mag_slice,
+                dir_slice,
+            );
+        }
+        mag = mag_row;
+        dir = dir_row;
+
+        if yy >= 2 {
+            let y = yy - 1;
+            let (a, m, b) = (row(y - 1), row(y), row(y + 1));
+            suppress_row(
+                y,
+                w,
+                &mag[a..a + w],
+                &mag[m..m + w],
+                &mag[b..b + w],
+                &dir[m..m + w],
+                &mut keep,
+            );
         }
     }
+
+    // 最後の行。下の行は画像の外なので強度 0 として扱う（以前も `magnitude` の
+    // 最終行は 1 度も書かれないまま読まれていた）
+    let y = h - 2;
+    let (a, m) = (row(y - 1), row(y));
+    suppress_row(
+        y,
+        w,
+        &mag[a..a + w],
+        &mag[m..m + w],
+        &zeros,
+        &dir[m..m + w],
+        &mut keep,
+    );
 }
 
 /// 勾配の向きを 4 方向へ量子化した際の隣接オフセット。
@@ -256,10 +350,34 @@ fn octant(gx: f32, gy: f32) -> u8 {
 #[cfg(test)]
 fn gradient_magnitude(image: &RgbaImage) -> Vec<f32> {
     let (w, h) = (image.width() as usize, image.height() as usize);
+    let mut out = vec![0.0f32; w * h];
     if w < 3 || h < 3 {
-        return vec![0.0; w * h];
+        return out;
     }
-    sobel(image, w, h).0
+    // 抑制を掛けない生の強度。**式は 1 本しかない**ので `sobel_row` を引く
+    let mut luma = vec![0.0f32; 3 * w];
+    let mut dir = vec![0u8; w];
+    let row = |y: usize| (y % 3) * w;
+    luma_row(image, 0, w, &mut luma[row(0)..row(0) + w]);
+    luma_row(image, 1, w, &mut luma[row(1)..row(1) + w]);
+    for y in 1..h - 1 {
+        luma_row(image, y + 1, w, &mut luma[row(y + 1)..row(y + 1) + w]);
+        let (a, m, b) = (row(y - 1), row(y), row(y + 1));
+        let (above, mid, below) = (
+            luma[a..a + w].to_vec(),
+            luma[m..m + w].to_vec(),
+            luma[b..b + w].to_vec(),
+        );
+        sobel_row(
+            &above,
+            &mid,
+            &below,
+            w,
+            &mut out[y * w..(y + 1) * w],
+            &mut dir,
+        );
+    }
+    out
 }
 
 /// 細線化した後の勾配強度。`edge_ridges` がしきい値を掛ける前の値。
@@ -267,11 +385,7 @@ fn gradient_magnitude(image: &RgbaImage) -> Vec<f32> {
 fn ridge_magnitude(image: &RgbaImage) -> Vec<f32> {
     let (w, h) = (image.width() as usize, image.height() as usize);
     let mut out = vec![0.0f32; w * h];
-    if w < 3 || h < 3 {
-        return out;
-    }
-    let (magnitude, direction) = sobel(image, w, h);
-    suppress(w, h, &magnitude, &direction, |i, m| out[i] = m);
+    walk_ridges(image, w, h, |i, m| out[i] = m);
     out
 }
 
@@ -364,7 +478,7 @@ mod tests {
             "前提が崩れている: 素の Sobel は 2px に立つ"
         );
         assert_eq!(
-            (0..9).filter(|&x| thin[4 * 9 + x]).count(),
+            (0..9).filter(|&x| thin.get(4 * 9 + x)).count(),
             1,
             "細線化できていない"
         );
@@ -558,7 +672,7 @@ mod tests {
         }
         let thin = edge_ridges(&img, 8.0);
         for y in 2..18u32 {
-            let on_row = (1..19u32).any(|x| thin[(y * 20 + x) as usize]);
+            let on_row = (1..19u32).any(|x| thin.get((y * 20 + x) as usize));
             assert!(on_row, "y={y} の行に稜線が無い");
         }
     }

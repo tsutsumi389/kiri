@@ -1909,7 +1909,9 @@ pub struct BatchArgs {
     #[arg(long, value_name = "DIR")]
     pub base_dir: Option<PathBuf>,
 
-    /// 並列実行数。0 で CPU 数に合わせる
+    /// 同時に処理する画像の枚数。0 で CPU 数に合わせる
+    ///
+    /// スレッド数ではなく枚数である。1 枚の切り抜きの中でも、画素ごとに独立な段は並列に走るので、--jobs 1 は「1 枚ずつ・全コアで」という意味になる。メモリは 1 枚ぶん × この枚数で決まるので、足りない環境ではこれを下げること
     #[arg(long, default_value_t = 0)]
     pub jobs: usize,
 

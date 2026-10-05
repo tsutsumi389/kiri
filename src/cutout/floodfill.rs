@@ -33,6 +33,7 @@
 use std::collections::VecDeque;
 
 use image::RgbaImage;
+use rayon::prelude::*;
 
 use crate::color::lab::{linear_to_lab, srgb_linear_lut};
 use crate::cutout::background::BackgroundField;
@@ -307,17 +308,17 @@ pub fn fill(
     let mut mask = Mask::new(w, h, 0);
     let out = mask.as_mut_slice();
     if protected.any() {
-        for (i, slot) in out.iter_mut().enumerate() {
+        out.par_iter_mut().enumerate().for_each(|(i, slot)| {
             *slot = if protected.has(i) || !is_background[i] {
                 255
             } else {
                 0
             };
-        }
+        });
     } else {
-        for (i, slot) in out.iter_mut().enumerate() {
+        out.par_iter_mut().enumerate().for_each(|(i, slot)| {
             *slot = if is_background[i] { 0 } else { 255 };
-        }
+        });
     }
     mask
 }
@@ -340,9 +341,15 @@ type LabQ = [i16; 3];
 ///
 /// 段差の判定には隣接画素同士の色差が要るので、フィルの最中に都度変換すると
 /// 同じ画素を何度も変換することになる。一度だけ作って引く。
+///
+/// **画素ごとに独立なので塊に割って並列に作る。** 24.5MP では `cbrt` を
+/// 7350 万回呼ぶ段で、ここが 1 スレッドで回っていた。rayon の `collect` は
+/// 入力順を保つので、割り方を変えても並びは同じである——**浮動小数を畳む
+/// 箇所が 1 つも無い**ことがこの段を安全にしている（計画 §11.5）。
 fn lab_map(image: &RgbaImage, lut: &[f32; 256]) -> Vec<LabQ> {
     image
-        .pixels()
+        .as_raw()
+        .par_chunks_exact(4)
         .map(|p| {
             quantize(linear_to_lab([
                 lut[p[0] as usize],
@@ -507,64 +514,76 @@ fn classify(
     };
 
     let mut flags = vec![0u8; lab.len()];
-    let mut any_shadow = false;
 
-    // 座標は数えながら進める。添字から割り算で戻すと、場を持たない実行でも
-    // 20MP ぶんの除算を払うことになる
-    let (mut x, mut y) = (0u32, 0u32);
-    for (i, p) in image.pixels().enumerate() {
-        let (px, py) = (x, y);
-        x += 1;
-        if x == width {
-            x = 0;
-            y += 1;
-        }
-        if protected.has(i) {
-            continue;
-        }
-        if p[3] == 0 {
-            flags[i] = STRICT | LOOSE | NEAR_BG;
-            continue;
-        }
-        // 影候補には堤防を適用しない。
-        //
-        // 堤防は輝度の勾配で測るが、Sobel は一定の傾斜に対して 1px あたりの
-        // 変化量の **2 倍** を返す（中央差分を 2px の間隔で取るため）。落ち影の
-        // 裾は 8bit へ量子化されると 1px あたり 5-6 の階段になり、勾配としては
-        // 10 前後と報告されてしまう。既定のしきい値 8 では商品の輪郭と区別が
-        // つかず、実測で影の 29% が商品直下に取り残された。
-        //
-        // 代わりに、影の吸収は第2段の背景から `shadow_reach` px 以内に
-        // 閉じ込める。堤防を外した分の危険は距離で抑える
-        let mut f = 0u8;
-        let bg_lab = bg.at(px, py);
-        if is_shadow(lab[i], bg_lab, shadow) {
-            f |= SHADOW;
-            any_shadow = true;
-        }
-        let d = delta_e_q(lab[i], bg_lab);
-        // しきい値との比較は 1 度だけにする。NEAR_BG と LOOSE は同じ問いで、
-        // 間に堤防の分岐が挟まっているだけである
-        let near = d <= tolerance;
-        if near {
-            // 堤防に関わらず立てる。堤防が食べた背景を後から見分けるため
-            f |= NEAR_BG;
-        }
-        // let-chain は Rust 1.88 以降。MSRV 1.85 を保つためネストで書く
-        if let Some(g) = dam {
-            if g.get(i) {
-                flags[i] = f;
-                continue;
+    // **行ごとに割って並列に判定する。** 画素の判定は `protected` / `dam` /
+    // `lab` / `bg` を読むだけで、書き先は自分の添字しかない。影が 1 つでも
+    // あったかは行ごとの真偽を OR で畳む——真偽の畳み込みなので、分割の
+    // 仕方で答えが動かない（計画 §11.5）。
+    //
+    // 座標は行の中で数えながら進める。添字から割り算で戻すと、場を持たない
+    // 実行でも 20MP ぶんの除算を払うことになる
+    let stride = width as usize;
+    let raw = image.as_raw();
+    let any_shadow = flags
+        .par_chunks_mut(stride)
+        .enumerate()
+        .map(|(row, line)| {
+            let py = row as u32;
+            let base = row * stride;
+            let mut any_shadow = false;
+            for (col, slot) in line.iter_mut().enumerate() {
+                let i = base + col;
+                let px = col as u32;
+                if protected.has(i) {
+                    continue;
+                }
+                if raw[i * 4 + 3] == 0 {
+                    *slot = STRICT | LOOSE | NEAR_BG;
+                    continue;
+                }
+                // 影候補には堤防を適用しない。
+                //
+                // 堤防は輝度の勾配で測るが、Sobel は一定の傾斜に対して 1px
+                // あたりの変化量の **2 倍** を返す（中央差分を 2px の間隔で
+                // 取るため）。落ち影の裾は 8bit へ量子化されると 1px あたり
+                // 5-6 の階段になり、勾配としては 10 前後と報告されてしまう。
+                // 既定のしきい値 8 では商品の輪郭と区別がつかず、実測で影の
+                // 29% が商品直下に取り残された。
+                //
+                // 代わりに、影の吸収は第2段の背景から `shadow_reach` px 以内に
+                // 閉じ込める。堤防を外した分の危険は距離で抑える
+                let mut f = 0u8;
+                let bg_lab = bg.at(px, py);
+                if is_shadow(lab[i], bg_lab, shadow) {
+                    f |= SHADOW;
+                    any_shadow = true;
+                }
+                let d = delta_e_q(lab[i], bg_lab);
+                // しきい値との比較は 1 度だけにする。NEAR_BG と LOOSE は同じ
+                // 問いで、間に堤防の分岐が挟まっているだけである
+                let near = d <= tolerance;
+                if near {
+                    // 堤防に関わらず立てる。堤防が食べた背景を後から見分けるため
+                    f |= NEAR_BG;
+                }
+                // let-chain は Rust 1.88 以降。MSRV 1.85 を保つためネストで書く
+                if let Some(g) = dam {
+                    if g.get(i) {
+                        *slot = f;
+                        continue;
+                    }
+                }
+                if d <= core {
+                    f |= STRICT;
+                }
+                if near {
+                    f |= LOOSE;
+                }
+                *slot = f;
             }
-        }
-        if d <= core {
-            f |= STRICT;
-        }
-        if near {
-            f |= LOOSE;
-        }
-        flags[i] = f;
-    }
+            any_shadow
+        })
+        .reduce(|| false, |a, b| a || b);
 
     Candidates {
         flags,

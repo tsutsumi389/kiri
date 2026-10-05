@@ -29,6 +29,7 @@ pub mod morphology;
 pub mod optimize;
 pub mod refine;
 pub mod reshape;
+pub mod stage;
 pub mod subject;
 
 use image::RgbaImage;
@@ -550,6 +551,8 @@ pub fn cutout_seen(
     opts: &CutoutOptions,
     seen: Option<&BackgroundSeen>,
 ) -> CutoutResult {
+    // 段ごとの時間は `KIRI_STAGE_MS=1` のときだけ採る。既定では何も持たない
+    let mut stages = stage::Stages::new();
     // 元画像から測る。アルファを適用した後の画像を渡すと、透明になった背景が
     // 「背景色から遠い」に化けて主体が画像全体へ広がる
     let analysis = analyse_background_seen(
@@ -569,6 +572,7 @@ pub fn cutout_seen(
         field_warning,
         field_skipped,
     } = analysis;
+    stages.mark("背景の推定");
     let (edge_threshold, texture_warning) =
         resolve_edge_threshold(opts.edge_threshold, &background.texture);
 
@@ -587,6 +591,7 @@ pub fn cutout_seen(
         seal: opts.seal,
     };
     let mut mask = foreground_mask(image, &field, &flood);
+    stages.mark("フィル 1 回目");
 
     // **2 回目のパス。** 1 回目のフィルが背景と判定した画素をすべて「既知の
     // 背景」に加えて場を作り直し、もう一度フィルする。外周の帯と矩形の外側
@@ -604,6 +609,8 @@ pub fn cutout_seen(
         }
     }
 
+    stages.mark("フィル 2 回目");
+
     // 孤立ノイズは面積で落とす。オープニングは幅で落とすため、ストラップや
     // ケーブルのような細い商品の一部まで巻き添えにしていた。
     // クロージングは掛けない（morphology::close のコメントを参照）。
@@ -611,6 +618,7 @@ pub fn cutout_seen(
     // ここで一度掛けるのは、境界帯の推定をノイズの一つ一つに走らせないため
     mask = morphology::remove_specks(&mask, opts.cleanup);
     restore_forced_foreground(&mut mask, opts);
+    stages.mark("面積フィルタ 1 回目");
 
     let mut band_min_radius = None;
     let mut band_width_histogram = None;
@@ -650,6 +658,8 @@ pub fn cutout_seen(
         out
     };
 
+    stages.mark("境界の帯");
+
     // もう一度掛ける。エッジ堤防は勾配が立つ画素を軒並み前景側へ残すので、
     // ゴミは実寸より 1px ほど太って見える。3x3 のゴミが 5x5 に見えると、
     // 面積の下限をちょうど超えて生き残ってしまう。帯の推定で縁が透明へ
@@ -657,6 +667,7 @@ pub fn cutout_seen(
     mask = morphology::remove_specks(&mask, opts.cleanup);
     restore_forced_foreground(&mut mask, opts);
     apply_alpha(&mut out, &mask);
+    stages.mark("面積フィルタ 2 回目とアルファ適用");
 
     let stats = mask.stats();
     // despill 前の元画像で測る。境界の色を書き換えた後では、
@@ -677,6 +688,7 @@ pub fn cutout_seen(
         opts.bbox,
         opts.constraints.as_ref(),
     );
+    stages.mark("分離度");
     let diagnostics = diagnostics::diagnose(
         image,
         &mask,
@@ -684,6 +696,9 @@ pub fn cutout_seen(
         diagnostics::halo_reference_gate(residual.p90),
         opts.bbox,
     );
+    stages.mark("診断");
+    stages.report();
+
     // 設定の調整はいちばん先に伝える。結果への警告は、その設定で走った結果に
     // ついてのものなので、順序が逆だと読み手が原因を後から知ることになる
     let mut warnings = Vec::from_iter(texture_warning);

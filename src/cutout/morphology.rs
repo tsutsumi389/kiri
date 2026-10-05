@@ -272,6 +272,59 @@ impl BitPlane {
         }
     }
 
+    /// 連続する `w` ビットを、語の列へ先頭詰めで写す。
+    ///
+    /// 行の morphology はビット列を語ごとにずらして畳むので、入口で
+    /// 「行 1 本を語に揃えて取り出す」ことが要る。1 画素ずつ問うと
+    /// 24.5MP で 2450 万回になるが、**どちらもビットの列なので、
+    /// ずらして繋ぐだけで済む。**
+    pub fn read_bits(&self, start: usize, w: usize, out: &mut [u64]) {
+        let (sw, so) = (start / 64, start % 64);
+        for (k, slot) in out.iter_mut().enumerate() {
+            let lo = self.words.get(sw + k).copied().unwrap_or(0);
+            *slot = if so == 0 {
+                lo
+            } else {
+                let hi = self.words.get(sw + k + 1).copied().unwrap_or(0);
+                (lo >> so) | (hi << (64 - so))
+            };
+        }
+        // 行からはみ出したビットは残さない。呼ぶ側が窓の外の扱いを決める
+        let used = w % 64;
+        if used != 0 {
+            let last = w.div_ceil(64) - 1;
+            out[last] &= (1u64 << used) - 1;
+        }
+    }
+
+    /// 語の列の先頭 `w` ビットを、`start` の位置へ重ねる。
+    ///
+    /// 面は画素の添字をそのまま詰める（行で揃えない）ので、行ごとに作った
+    /// 結果を書き戻すにはこのずらしが要る。立っていないビットは触らない
+    /// ——`new` 直後の面に順に重ねる使い方だけを想定している。
+    pub fn insert_bits(&mut self, start: usize, w: usize, src: &[u64]) {
+        let mut i = 0;
+        while i < w {
+            let n = (w - i).min(64);
+            let (sw, so) = (i / 64, i % 64);
+            let mut v = src[sw] >> so;
+            if so > 0 {
+                if let Some(&hi) = src.get(sw + 1) {
+                    v |= hi << (64 - so);
+                }
+            }
+            if n < 64 {
+                v &= (1u64 << n) - 1;
+            }
+            let (dw, dof) = ((start + i) / 64, (start + i) % 64);
+            self.words[dw] |= v << dof;
+            if dof + n > 64 {
+                self.words[dw + 1] |= v >> (64 - dof);
+            }
+            i += n;
+        }
+    }
+
     /// 1 ビットでも立っているか。**語ごとに見る**ので、空の面では
     /// 画素数の 1/64 の読みで答えが出る。
     pub fn any(&self) -> bool {
@@ -319,6 +372,21 @@ impl BitPlane {
 /// 2 つの表現に 2 つの収縮／膨張を持つと、片方だけ直したときに黙って食い違う。
 pub trait Plane {
     fn at(&self, index: usize) -> bool;
+
+    /// 連続する `w` ビットを語の列へ先頭詰めで写す。`out` は全体を書き換える。
+    ///
+    /// 既定は 1 画素ずつ。ビットで持っている面はずらして繋ぐだけで済むので、
+    /// そちらで上書きする。
+    fn read_bits(&self, start: usize, w: usize, out: &mut [u64]) {
+        for word in out.iter_mut() {
+            *word = 0;
+        }
+        for x in 0..w {
+            if self.at(start + x) {
+                out[x / 64] |= 1u64 << (x % 64);
+            }
+        }
+    }
 }
 
 impl Plane for [bool] {
@@ -332,6 +400,10 @@ impl Plane for BitPlane {
     #[inline]
     fn at(&self, index: usize) -> bool {
         self.get(index)
+    }
+
+    fn read_bits(&self, start: usize, w: usize, out: &mut [u64]) {
+        BitPlane::read_bits(self, start, w, out);
     }
 }
 
@@ -350,6 +422,9 @@ pub fn separable<P: Plane + ?Sized>(
     take_max: bool,
 ) -> BitPlane {
     let mut out = BitPlane::new(w * h);
+    if w == 0 || h == 0 {
+        return out;
+    }
     if radius == 0 {
         for i in 0..w * h {
             out.set(i, src.at(i));
@@ -357,30 +432,96 @@ pub fn separable<P: Plane + ?Sized>(
         return out;
     }
     let r = radius as usize;
-    let combine = |acc: bool, v: bool| if take_max { acc || v } else { acc && v };
+    // **窓の外は単位元で埋める。** 収縮（AND）なら真、膨張（OR）なら偽を
+    // 置けば、畳んだ答えが「窓に含めない」と同じになる。枠の外の扱いを
+    // 分岐で書き分けずに済む
+    let identity = !take_max;
+    let filler: u64 = if identity { !0 } else { 0 };
+    let wpr = w.div_ceil(64);
+    let used = w % 64;
 
-    let mut horizontal = BitPlane::new(w * h);
+    // 行の端のビットを単位元へ揃える。`read_bits` は行の外を 0 にするので、
+    // 収縮のときだけ立て直す必要がある
+    let seal_tail = |row: &mut [u64]| {
+        if used != 0 && identity {
+            row[wpr - 1] |= !0u64 << used;
+        }
+    };
+
+    // 横方向。**1 語 64 画素を一度に畳む。** 1 画素ずつ窓を舐めていた頃は
+    // 24.5MP・半径 1 で 7350 万回の読みになっていた
+    let mut rows = vec![0u64; h * wpr];
+    let mut line = vec![0u64; wpr];
     for y in 0..h {
-        for x in 0..w {
-            let (from, to) = (x.saturating_sub(r), (x + r).min(w - 1));
-            let mut acc = !take_max;
-            for k in from..=to {
-                acc = combine(acc, src.at(y * w + k));
+        src.read_bits(y * w, w, &mut line);
+        seal_tail(&mut line);
+        let acc = &mut rows[y * wpr..(y + 1) * wpr];
+        acc.copy_from_slice(&line);
+        for d in 1..=r as isize {
+            for (i, slot) in acc.iter_mut().enumerate() {
+                let a = shifted(&line, i, d, filler);
+                let b = shifted(&line, i, -d, filler);
+                *slot = if take_max {
+                    *slot | a | b
+                } else {
+                    *slot & a & b
+                };
             }
-            horizontal.set(y * w + x, acc);
         }
     }
+
+    // 縦方向。行どうしをそのまま語で畳む（ずらしが要らない）
+    let mut acc = vec![0u64; wpr];
     for y in 0..h {
-        for x in 0..w {
-            let (from, to) = (y.saturating_sub(r), (y + r).min(h - 1));
-            let mut acc = !take_max;
-            for k in from..=to {
-                acc = combine(acc, horizontal.get(k * w + x));
+        acc.copy_from_slice(&rows[y * wpr..(y + 1) * wpr]);
+        let from = y.saturating_sub(r);
+        let to = (y + r).min(h - 1);
+        for k in from..=to {
+            if k == y {
+                continue;
             }
-            out.set(y * w + x, acc);
+            let other = &rows[k * wpr..(k + 1) * wpr];
+            for (slot, &v) in acc.iter_mut().zip(other) {
+                *slot = if take_max { *slot | v } else { *slot & v };
+            }
         }
+        out.insert_bits(y * w, w, &acc);
     }
     out
+}
+
+/// 語の列を `d` 画素ずらして読んだときの `i` 番目の語。
+///
+/// `d > 0` は「右の画素を見る」（結果の x が元の x+d）。列の外は `filler`
+/// ——収縮なら全ビット 1、膨張なら 0 で、畳んでも答えを動かさない値である。
+#[inline]
+fn shifted(src: &[u64], i: usize, d: isize, filler: u64) -> u64 {
+    let at = |j: isize| -> u64 {
+        if j < 0 {
+            filler
+        } else {
+            src.get(j as usize).copied().unwrap_or(filler)
+        }
+    };
+    let i = i as isize;
+    if d >= 0 {
+        let (s, o) = (d / 64, (d % 64) as u32);
+        let lo = at(i + s);
+        if o == 0 {
+            lo
+        } else {
+            (lo >> o) | (at(i + s + 1) << (64 - o))
+        }
+    } else {
+        let e = -d;
+        let (s, o) = (e / 64, (e % 64) as u32);
+        let hi = at(i - s);
+        if o == 0 {
+            hi
+        } else {
+            (hi << o) | (at(i - s - 1) >> (64 - o))
+        }
+    }
 }
 
 #[cfg(test)]

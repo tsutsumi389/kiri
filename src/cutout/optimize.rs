@@ -26,6 +26,7 @@ use std::time::Instant;
 use image::RgbaImage;
 
 use crate::cutout::diagnostics::{CONTOUR_ROUGH_WARN, HALO_WARN, RIM_CONTAMINATION_WARN};
+use crate::cutout::stage;
 use crate::cutout::{
     BackgroundModel, BackgroundSeen, CutoutOptions, CutoutResult, Diagnostics, ResolvedModel,
     SubjectHint, analyse_background_seen, bbox_to_pixels, cutout_seen, see_background,
@@ -594,11 +595,16 @@ pub fn optimize(
     seen: Option<&BackgroundSeen>,
 ) -> Result<Optimized> {
     let started = Instant::now();
+    // 探索そのものの段。**`cutout_seen` の表とは別に 1 枚出す。**
+    // 候補ごとの表を足しても探索の時間にならない（縮小・見立て・採点が
+    // どの候補の表にも入っていない）ので、外側を測る口がこれまで無かった
+    let mut stages = stage::Stages::new();
     let source = (image.width(), image.height());
     // **原寸の指示を先に抜く。** この後で土台を組むのに `base` を複製するが、
     // 抜いてあれば複製されるのは数十バイトの数値だけになる
     let full_constraints = base.constraints.take();
     let small = reduced(image)?;
+    stages.mark("探索用の縮小");
     let target = (small.width(), small.height());
 
     // 探索段の土台。**利用者の数値ノブはそのまま渡す。** 変えるのは寸法で
@@ -641,6 +647,7 @@ pub fn optimize(
         search.bbox,
         search.constraints.as_ref(),
     );
+    stages.mark("縮小版の見立て");
     let set = candidates(&base, fixed, analysis.subject.as_ref(), analysis.model);
     drop(analysis);
 
@@ -655,6 +662,7 @@ pub fn optimize(
         .collect();
     drop(search);
     drop(small);
+    stages.mark("探索段（縮小版）");
     penalise_collapse(&mut trials);
     // 安定ソート。`better_search` が全順序を返すので、同じ入力からは必ず
     // 同じ並びが出る
@@ -681,6 +689,8 @@ pub fn optimize(
         )
         .with_hint("--tolerance や --background-model の明示を外して試してください")
     })?;
+    stages.mark("最終段（原寸）");
+    stages.report();
     let trial = trials[chosen].clone();
     // **勝った候補をもう 1 度当ててから返す。** `base` には最後に回した候補が
     // 残っており、早期打ち切りが無い限りそれは勝った候補ではない。当て直しは

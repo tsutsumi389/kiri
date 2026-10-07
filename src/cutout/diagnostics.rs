@@ -3,12 +3,12 @@
 //! `separability` は「輪郭が色の違いによって引かれたか」を境界の**内側**で測る。
 //! そのため、前景の外側に背景色のままの縁が残っていても検出できない。実際、
 //! エッジ堤防が残す 1px の縁は separability を何ら悪化させないまま、黒い下地に
-//! 載せたときの白い光輪として現れていた。
+//! 載せたときの白い光輪として現れる。
 //!
 //! ここでは縁そのものを測る `halo_ratio` と、境界の階調の広がりを測る
 //! `edge_width` を用意する。どちらも画像を開かずに失敗を検出するための値である。
 //!
-//! # 実写の不織布は、この 2 つをすり抜けた
+//! # 実写の不織布は、この 2 つをすり抜ける
 //!
 //! 白い不織布の上の黒いリモコン（20MP）を最良設定で切り抜くと `halo_ratio` 0.001 /
 //! `separability` 54.7 と両方が合格を返すのに、拡大すると上辺・下辺がギザギザで、
@@ -19,8 +19,8 @@
 //! - `edge_width` はアルファの**遷移の幅**しか見ないので、輪郭が輪郭に沿って
 //!   ギザギザに蛇行していても値は動かない
 //!
-//! そこで `contour_roughness`（輪郭の蛇行）と `rim_contamination`（縁の 2 択分類）を
-//! 足す。どちらも**長辺 1000px 換算**で報告する。EC の納品先は長辺 1000px 前後へ
+//! そこで `contour_roughness`（輪郭の蛇行）と `rim_contamination`（縁の 2 択分類）も
+//! 測る。どちらも**長辺 1000px 換算**で報告する。EC の納品先は長辺 1000px 前後へ
 //! 縮めるので、20MP で 3px のギザギザは納品時 0.5px となって見えないが、1000px の
 //! 素材で 3px なら見える。**縮めたときに見える大きさ**が知りたい量である。
 
@@ -86,7 +86,7 @@ const RIM_BAND: f64 = 3.0;
 ///
 /// # 較正の母集団
 ///
-/// **どのシーンがクリーンかは、指標ではなく正解が決める。** 受け入れ基準が
+/// **どのシーンがクリーンかは、指標ではなく正解が決める。** テストが
 /// 名指しするシーンをクリーン側に置くと、較正がテストを見て、テストが較正を
 /// 見ることになる。`tests/real_backgrounds.rs` の 27 点を、正解由来の
 /// `contour_error`（真の輪郭からの距離の平均、長辺 1000px 換算の px）だけで
@@ -221,7 +221,7 @@ pub fn diagnose(
     // いちばん長い 1 本の時間になる。
     //
     // 浮動小数を畳むのは各指標の中だけで、指標をまたいで足す箇所は無い
-    // ——だから分け方で答えが動かない（計画 §11.5）
+    // ——だから分け方で答えが動かない
     let ((halo_ratio_v, edge_width_v), (roughness, rim)) = rayon::join(
         || {
             rayon::join(
@@ -410,17 +410,17 @@ fn roughness_of(
     let distance = chamfer_distance(&smooth_contour, roi);
     // **中央値ではなく平均を採る。** チャンファー距離は 1px 刻みでしか
     // 測れないので、中央値は「0 か 1px か」の 2 値にしかならず、しきい値が
-    // その段の上に乗ってしまっていた（長辺 6600px を超える素材では中央値
-    // 2px 以上でないと発火しない、という解像度依存がそこから出ていた）。
-    // 平均なら「輪郭画素の何割が参照から離れているか」が連続量として出る。
+    // その段の上に乗る（長辺 6600px を超える素材では中央値 2px 以上でないと
+    // 発火しない、という解像度依存が出る）。平均なら「輪郭画素の何割が
+    // 参照から離れているか」が連続量として出る。
     //
     // **ただし平均には罠がある。** 平滑化で参照輪郭がまるごと消えた場所
     // （細いストラップ、背景を飲み込んで崩れたマスク）では、距離は近傍に
     // 参照が無いまま伸び続け、チャンファーの飽和値（85px）まで行って
-    // そのまま平均に入る。S9（明度が背景を横切る淡色商品）が 35.026 と
-    // 出ていたのがこれで、**輪郭の粗さではなく u8 の上限を報告していた**。
-    // 平滑化が届く距離は箱ぼかし 3 回ぶんの `3r` しかないのだから、
-    // それより遠い距離に情報は無い。**画素ごとに 3r で clamp してから平均する**
+    // そのまま平均に入る。S9（明度が背景を横切る淡色商品）ではそれで 35.026 と
+    // 出て、**輪郭の粗さではなく u8 の上限を報告する**。平滑化が届く距離は
+    // 箱ぼかし 3 回ぶんの `3r` しかないのだから、それより遠い距離に情報は無い。
+    // **画素ごとに 3r で clamp してから平均する**
     let cap = (3 * radius * u32::from(CHAMFER_STEP)).min(u32::from(u8::MAX));
     let total: u64 = contour
         .iter()
@@ -439,26 +439,19 @@ fn roughness_of(
 ///
 /// # 平均色への近さではなく、散らばりで正規化した近さで問う
 ///
-/// 平均色までの距離をそのまま比べていた頃、この指標は**定義上ほとんど 0 に
-/// なっていた**。`refine` は色から解いたアルファで縁を半透明にするので、
+/// 平均色までの距離をそのまま比べると、この指標は**定義上ほとんど 0 に
+/// なる**。`refine` は色から解いたアルファで縁を半透明にするので、
 /// 最終マスクで 128 以上の帯画素は「refine 自身が F/B から読んだアルファが
 /// 0.5 以上」の画素に限られる。そこへ同じ発想（局所平均 F/B への近さ）の
 /// 物差しを当てても、**refine が既に一貫させたものを同じ物差しで測り直す**
 /// ことにしかならない。正解が「帯の半分は純粋な背景」と言う R1 assisted で、
-/// 値は 0.028 しか出なかった。
+/// 値は 0.028 しか出ない。
 ///
-/// 見落としていたのは、不織布の**暗い孔・繊維の影**である。黒い商品との混色
-/// （アルファ 0.3〜0.6）と平均色からの距離では区別がつかない。区別できるのは
-/// 「その色は背景テクスチャの**散らばりの範囲内**か」だけである。そこで
-/// 格子セルごとに平均 μ だけでなく標準偏差 σ も持ち、
-///
-/// ```text
-/// d_B = |C − μ_B| / (σ_B + σ0)      d_F = |C − μ_F| / (σ_F + σ0)
-/// 汚染 ⇔ d_B × RIM_NEARER < d_F
-/// ```
-///
-/// で分類する。繊維の影は σ_B の中に収まるので d_B が小さくなり、正しい混色は
-/// どちらの分布からも離れているので比が 1 の近くで割れる。
+/// 平均色からの距離で見落とすのは、不織布の**暗い孔・繊維の影**である。黒い
+/// 商品との混色（アルファ 0.3〜0.6）と区別がつかない。区別できるのは「その色は
+/// 背景テクスチャの**散らばりの範囲内**か」だけなので、σ で正規化した 2 択
+/// （`d_B × RIM_NEARER < d_F` なら汚染）で分類する。式と定数は
+/// `local_colour` にあり、`refine` の縁の再分類と同じ定義を使う。
 ///
 /// # 判定できなかった画素を、黙って分母から外さない
 ///
@@ -466,9 +459,10 @@ fn roughness_of(
 /// どちらに近いかは答えようがない——が、**判定不能が帯の大半を占めたまま
 /// 割合を返すと、残りについて「汚染されていない」と言ったことになる。**
 /// R4（暗い机 + 白商品）の既定値がそれで、帯 14,160 画素のうち真に背景の
-/// 3,172 画素が**全部**判定不能に落ち、残りから 0.000（＝合格）を返していた。
+/// 3,172 画素が**全部**判定不能に落ち、素直に割れば残りから 0.000（＝合格）が
+/// 出る。
 ///
-/// 2 つで直す。
+/// そこで 2 つの手を打つ。
 ///
 /// 1. 窓に確定前景が無ければ、`RIM_BORROW_WINDOWS` の範囲でいちばん近い
 ///    「前景を持つセル」から借りる。借りた F でも `MIN_RIM_SEPARATION_SIGMA`
@@ -490,35 +484,31 @@ fn contamination_of(image: &RgbaImage, mask: &Mask, contour: &[(u32, u32)]) -> O
         return None;
     }
     let scale = scale_at_1000(w, h);
+    let rim = rim_band(scale);
     // 帯の判定はチャンファーの単位(1px = 3)のまま行う。px へ戻すと
     // 画素ごとに割り算が入るだけで、境目は何も変わらない
-    let band = rim_band(scale).min(CHAMFER_MAX_PX) * u32::from(CHAMFER_STEP);
+    let band = rim.min(CHAMFER_MAX_PX) * u32::from(CHAMFER_STEP);
     // 帯の判定にしか使わないので、輪郭から帯幅ぶん離れた外までで足りる
-    let distance = chamfer_distance(contour, around(contour, w, h, rim_band(scale) + 1));
+    let distance = chamfer_distance(contour, around(contour, w, h, rim + 1));
     let alpha = mask.as_slice();
     // 参照色を集める範囲は「帯 + 窓」までで足りる。輪郭から遠い画素は
     // どの帯画素の窓にも入らないので、全面を舐める理由が無い
     let window = (local_colour::RIM_WINDOW * scale).ceil() as u32;
-    let grid = local_colour::build(
-        image,
-        around(contour, w, h, rim_band(scale) + window),
-        scale,
-        |x, y| {
-            // 完全に透明／完全に不透明な画素だけを参照色に使う。中間の画素は
-            // 混色そのものなので、平均に混ぜると F と B が互いに寄ってしまう
-            let a = alpha[(y as usize) * (w as usize) + (x as usize)];
-            if a == 0 {
-                Role::Background
-            } else if a == u8::MAX && u32::from(distance.at(x, y)) > band {
-                Role::Foreground
-            } else {
-                Role::Skip
-            }
-        },
-    );
+    let grid = local_colour::build(image, around(contour, w, h, rim + window), scale, |x, y| {
+        // 完全に透明／完全に不透明な画素だけを参照色に使う。中間の画素は
+        // 混色そのものなので、平均に混ぜると F と B が互いに寄ってしまう
+        let a = alpha[(y as usize) * (w as usize) + (x as usize)];
+        if a == 0 {
+            Role::Background
+        } else if a == u8::MAX && u32::from(distance.at(x, y)) > band {
+            Role::Foreground
+        } else {
+            Role::Skip
+        }
+    });
 
     let pixels = image.as_raw();
-    let (x0, y0, x1, y1) = around(contour, w, h, rim_band(scale));
+    let (x0, y0, x1, y1) = around(contour, w, h, rim);
     let (mut contaminated, mut decided, mut in_band) = (0u64, 0u64, 0u64);
     for y in y0..=y1 {
         let row = (y as usize) * (w as usize);
@@ -562,6 +552,7 @@ fn around(contour: &[(u32, u32)], w: u32, h: u32, margin: u32) -> (u32, u32, u32
         (y1 + margin).min(h - 1),
     )
 }
+
 /// σ に相当する箱ぼかしの半径。箱ぼかし 3 回の分散は r² + r になる。
 fn smoothing_radius(scale: f64) -> u32 {
     let sigma = SMOOTHING_SIGMA * scale;
@@ -574,8 +565,8 @@ fn smoothing_radius(scale: f64) -> u32 {
 /// しきい値になるためである。
 ///
 /// **画素ごとの割り算をしない。** 窓の画素数は端の付近でしか変わらないので、
-/// 逆数を小さな表に持って掛け算で済ませる。12MP では 6 パス × 12M 回の割り算に
-/// なり、それだけで 90ms を食っていた。
+/// 逆数を小さな表に持って掛け算で済ませる。割り算にすると 12MP では 6 パス ×
+/// 12M 回になり、それだけで 90ms 掛かる。
 fn smoothed(mask: &Mask, radius: u32, roi: (u32, u32, u32, u32)) -> Mask {
     let (w, h) = (mask.width() as usize, mask.height() as usize);
     let r = radius as usize;
@@ -749,42 +740,39 @@ fn chamfer_distance(seeds: &[(u32, u32)], roi: (u32, u32, u32, u32)) -> Field {
         }
     }
     // 枠の中を 0 起点の座標で舐める。値は全面版と 1 ビットも変わらない
-    let (x1, y1) = (w - 1, h - 1);
-    let (x0, y0) = (0usize, 0usize);
-
-    for y in y0..=y1 {
-        for x in x0..=x1 {
+    for y in 0..h {
+        for x in 0..w {
             let i = y * w + x;
             let mut best = d[i];
-            if y > y0 {
+            if y > 0 {
                 best = best.min(d[i - w].saturating_add(CHAMFER_STEP));
-                if x > x0 {
+                if x > 0 {
                     best = best.min(d[i - w - 1].saturating_add(CHAMFER_DIAGONAL));
                 }
-                if x < x1 {
+                if x + 1 < w {
                     best = best.min(d[i - w + 1].saturating_add(CHAMFER_DIAGONAL));
                 }
             }
-            if x > x0 {
+            if x > 0 {
                 best = best.min(d[i - 1].saturating_add(CHAMFER_STEP));
             }
             d[i] = best;
         }
     }
-    for y in (y0..=y1).rev() {
-        for x in (x0..=x1).rev() {
+    for y in (0..h).rev() {
+        for x in (0..w).rev() {
             let i = y * w + x;
             let mut best = d[i];
-            if y < y1 {
+            if y + 1 < h {
                 best = best.min(d[i + w].saturating_add(CHAMFER_STEP));
-                if x > x0 {
+                if x > 0 {
                     best = best.min(d[i + w - 1].saturating_add(CHAMFER_DIAGONAL));
                 }
-                if x < x1 {
+                if x + 1 < w {
                     best = best.min(d[i + w + 1].saturating_add(CHAMFER_DIAGONAL));
                 }
             }
-            if x < x1 {
+            if x + 1 < w {
                 best = best.min(d[i + 1].saturating_add(CHAMFER_STEP));
             }
             d[i] = best;
@@ -792,10 +780,10 @@ fn chamfer_distance(seeds: &[(u32, u32)], roi: (u32, u32, u32, u32)) -> Field {
     }
     Field {
         data: d,
-        x0: roi.0 as usize,
-        y0: roi.1 as usize,
-        x1: roi.2 as usize,
-        y1: roi.3 as usize,
+        x0,
+        y0,
+        x1,
+        y1,
         w,
     }
 }
@@ -824,15 +812,14 @@ pub fn halo_ratio(
         return None;
     }
     let (mut halo, mut total) = (0u64, 0u64);
-    // 「境界近傍か」は 1 画素ごとに 7x7 を数えていた。前景の内側ほど全部を
-    // 舐めることになり、2.5MP で 29ms、12MP で 125ms をここだけで食っていた。
-    // 前景でない画素からのチェビシェフ距離を 1 度作れば同じ答えが O(N) で出る
-    // ——**値は 1 ビットも変わらない**（`near_boundary` の窓は 3px の
-    // チェビシェフ近傍そのもので、画像の外は数えない）
+    // 「境界近傍か」は前景でない画素からのチェビシェフ距離で引く。画素ごとに
+    // 7x7 を数えると前景の内側ほど全部を舐めることになり、12MP で 125ms を
+    // ここだけで食う。距離を 1 度作れば同じ答えが O(N) で出る（7x7 の窓は
+    // 3px のチェビシェフ近傍そのもので、画像の外は数えない）
     let near = background_distance(mask);
     // **参照に採れる画素は 1 度だけ決める。** 窓は重なり合うので、画素ごとに
     // 門を掛け直すと同じ画素の色差を何十回も測ることになる（17x17 の窓で
-    // 24.5MP の実写では `--optimize` が 12.9 → 16.0 秒へ伸びた）
+    // 24.5MP の実写の `--optimize` が 12.9 → 16.0 秒へ伸びる）
     let usable = usable_references(image, mask, field, reference_gate);
 
     for y in 0..h {
@@ -859,8 +846,7 @@ pub fn halo_ratio(
 /// 前景でない画素からのチェビシェフ距離(px)。255 で飽和する。
 ///
 /// 8 近傍の重み 1 で 2 パス回すと、チェビシェフ距離はそのまま厳密に求まる。
-/// 画像の外は種にしない——`near_boundary` が窓を画像の中へ切り詰めていたのと
-/// 同じで、見切れた商品の縁を境界と見なさないためである。
+/// 画像の外は種にしない。見切れた商品の縁を境界と見なさないためである。
 fn background_distance(mask: &Mask) -> Vec<u8> {
     chebyshev_distance(mask, false)
 }
@@ -941,7 +927,7 @@ fn chebyshev_distance(mask: &Mask, seed_foreground: bool) -> Vec<u8> {
 /// 大域の背景色ではなく局所の色を使うのは、照明ムラや落ち影のある場所で
 /// 「大域の背景色とは違うが、その場所の背景ではある」画素を見逃さないため。
 ///
-/// **門を掛けるのは、この参照が循環していたからである。** 輪郭の色差が
+/// **門を掛けるのは、門が無いとこの参照が循環するからである。** 輪郭の色差が
 /// 許容量を下回る素材（合成 S3、輪郭 ΔE 9.5 対 tolerance 12）ではフィルが
 /// 商品の外縁を食う。食われた画素は透明なので参照の材料になり、参照色が
 /// 商品色そのもの（sRGB 218.5、大域の背景は 248）へ寄る。すると**残った
@@ -1300,7 +1286,6 @@ mod tests {
     ///
     /// `scene` の `rim` は「背景色のままなのに不透明」な縁の厚さ(px)なので、
     /// `halo_ratio` と同じ素材で両者を比べられる。
-    /// 縁に背景色が残れば `rim_contamination` が跳ねる。
     ///
     /// 帯は境界から 3px なので、縁が 3px なら帯の半分しか埋まらない（実測 0.50）。
     /// 縁を 5px にして帯を埋め切ったところで見る。**縁の厚みに比例して上がる**
@@ -1470,8 +1455,8 @@ mod tests {
     /// 窓に確定前景が無くても、近くから借りて判定すること。
     ///
     /// 局所前景は「窓の中の、帯より深い完全不透明画素」なので、**帯より薄い
-    /// 舌のような領域には定義上 1 つも無い**。そこを judge できないままにすると、
-    /// 背景をどれだけ飲み込んでも値が 0 のままになる（R4 既定がそれだった）。
+    /// 舌のような領域には定義上 1 つも無い**。そこを判定できないままにすると、
+    /// 背景をどれだけ飲み込んでも値が 0 のままになる（R4 既定がそれに当たる）。
     #[test]
     fn a_thin_tongue_of_background_is_judged_by_borrowing_a_foreground() {
         let (w, h) = (120u32, 60u32);

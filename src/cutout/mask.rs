@@ -285,7 +285,7 @@ mod tests {
     fn bbox_above_includes_faint_edges() {
         let mut mask = Mask::new(10, 10, 0);
         mask.set(5, 5, 255);
-        // 薄い縁。前景judgeでは拾われないが、キャンバス配置では含めたい
+        // 薄い縁。前景判定では拾われないが、キャンバス配置では含めたい
         mask.set(3, 3, 20);
         assert_eq!(mask.stats().bbox, Some((5, 5, 5, 5)));
         assert_eq!(mask.bbox_above(0), Some((3, 3, 5, 5)));

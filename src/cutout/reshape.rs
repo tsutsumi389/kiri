@@ -19,6 +19,7 @@ use image::RgbaImage;
 
 use crate::cutout::background::BackgroundField;
 use crate::cutout::diagnostics;
+use crate::cutout::guided;
 use crate::cutout::local_colour::{self, Lean, LocalColours, Role};
 use crate::cutout::mask::Mask;
 use crate::cutout::morphology::{self, BitPlane};
@@ -40,17 +41,14 @@ const BAND_ROUGHNESS_GAIN: f64 = 2.0;
 /// 1 パス剥がすと F が商品に近づき、次のパスで判定できる画素が増える——
 /// **欠陥が大きいほど効きが悪い**という逆立ちが、繰り返しでほどける。
 ///
-/// **止めるのは収束であって、回数ではない。** 以前はここを 4 に固定し、その
-/// 理由を「5 パス目で R2 assisted が較正の母集団でクリーン側へ移り、粗さの
-/// 警告の余裕が落ちるから」と書いていた。それは**出力の質ではなく自分の較正の
-/// 都合で処理を止めている**。いまは `changed == 0` まで回し、8 はその上限——
-/// 収束しない入力で時間が青天井にならないための歯止め——にしてある。
-/// 累積の移動量には別に上限があるので（`reach_limit`）、回数を増やしても
-/// 背景色のチャネルを任意に深く進むことはない。
+/// **止めるのは収束（`changed == 0`）で、この値はその上限である。** 収束しない
+/// 入力で時間が青天井にならないための歯止めでもある。累積の移動量には別に
+/// 上限があるので（`REACH_PASSES`）、回数を増やしても背景色のチャネルを任意に
+/// 深く進むことはない。
 ///
-/// **上限は出力の質で決めた。** 以前は「5 パス目で較正の余裕が落ちるから」と
-/// 書いていたが、それは自分の較正の都合で処理を止めている。パス数ごとの実測
-/// （docs/design.md 4.10 の表）から読めるのは次の 2 つである。
+/// **上限は出力の質で決める。** 較正の母集団の都合（何パス目で較正の余裕が
+/// 落ちるか）で決めると、出力の質ではなく自分の較正の都合で処理を止めることに
+/// なる。パス数ごとの実測（docs/design.md 4.10 の表）から読めるのは次の 2 つである。
 ///
 /// - **7 パス以上で細部が消える。** 長辺 1000px に置いた 7x7 の突起が、6 パス
 ///   までは 49px² のまま残り、7 パスで丸ごと落ちる（`a_speck_scales_with_the_
@@ -61,7 +59,7 @@ const BAND_ROUGHNESS_GAIN: f64 = 2.0;
 ///   正解の輪郭誤差が 0.96px——良品——になるが、その粗さは 0.137 で
 ///   `CONTOUR_ROUGH_WARN`（0.16）まで 16% しかない。JPEG の量子化で警告が
 ///   出たり出なかったりする距離であり、**出た側に回った利用者には回せるノブが
-///   無い**（`CONTOUR_ROUGH` は hint を持たない）。H2 と同じ「解けないループ」を
+///   無い**（`CONTOUR_ROUGH` は hint を持たない）。利用者に解けないループを
 ///   自分から作ることになる
 ///
 /// 4 は、正解由来の合格条件（R1/R5/R6 の rim 正解と輪郭誤差）をすべて満たす
@@ -80,7 +78,8 @@ const RESHAPE_PASSES: u32 = 4;
 /// 別の領域への進入である。**保証はパス単位ではなく累積で立つ。**
 const REACH_PASSES: u32 = 2;
 
-/// (a) 帯幅を決める。新しい 3 段が効く経路だけ、解像度と輪郭の粗さで持ち上げる。
+/// (a) 帯幅を決める。(b)(c) と guided の 3 段が効く経路だけ、解像度と輪郭の
+/// 粗さで持ち上げる。
 ///
 /// **既定の 2〜10px は長辺 1000px の素材で決めた絶対値である。** 24.5MP の実写
 /// （長辺 5712px）では換算 0.35〜1.8px にしかならず、繊維の粒（実寸で 10px 級）を
@@ -92,9 +91,9 @@ const REACH_PASSES: u32 = 2;
 /// 粗さは refine の**前**に二値マスクで測り、`scale_at_1000` を掛け戻して原寸 px
 /// にする。
 ///
-/// **旧経路（`projection_only`）は絶対 px のまま。** 持ち上げた帯は新しい 3 段に
-/// 働く場所を与えるためのもので、射影アルファだけを回す経路には何の用も無い。
-/// ここを共有すると Phase 2 のバイト列が黙って変わる。
+/// **射影アルファだけを回す経路（`staged()` が偽）は絶対 px のまま。** 持ち上げた
+/// 帯は 3 段に働く場所を与えるためのもので、その経路には何の用も無い。ここを
+/// 共有すると、その経路の出力が黙って変わる。
 pub(crate) fn band_radii(binary: &Mask, scale: f64, opts: &RefineOptions<'_>) -> (u32, u32) {
     if !opts.staged() {
         return (opts.min_radius, opts.max_radius);
@@ -111,7 +110,7 @@ pub(crate) fn band_radii(binary: &Mask, scale: f64, opts: &RefineOptions<'_>) ->
     // 追従するか」を決める値で、広げると遷移そのものより広い帯が張られて
     // 確定 F/B が窓から消える。実測でも、解像度で掛け戻すと実写リモコンの
     // `rim_contamination` が 0.061 → 0.133、R1 assisted の輪郭誤差が
-    // 6.03 → 8.75 と、高解像度でも合成でも悪くなった（10 / 14 / 20 / 30 px と
+    // 6.03 → 8.75 と、高解像度でも合成でも悪くなる（10 / 14 / 20 / 30 px と
     // 振っても単調に悪い）。下限だけを掛け戻す
     let max_r = opts.max_radius.clamp(1, RADIUS_CEILING);
     let roughness = diagnostics::contour_roughness(binary, opts.bbox).unwrap_or(0.0) * scale;
@@ -147,8 +146,7 @@ impl Reshape<'_> {
     /// ときは `None` で、呼び出し側は引き直す前の分布を持ち続ける。
     ///
     /// **`#[must_use]` なのは、取り落とすと引き直す前の分布が最後の分布として
-    /// 読まれるからである。** 数の意味が違うものを同じ名前で読むのは、§8 が
-    /// 帯幅の下限を帯幅として読んだのと同じ失敗形である。
+    /// 読まれるからである。** 意味の違う数を同じ名前で読ませない。
     #[must_use]
     pub fn run(
         &self,
@@ -186,16 +184,7 @@ impl Reshape<'_> {
                     self.image,
                     grow(bounds, window, w, h),
                     self.scale,
-                    |x, y| {
-                        let at = (y as usize) * stride + (x as usize);
-                        if band[at] != 0 || sealed.get(at) {
-                            Role::Skip
-                        } else if shape.is_foreground(x, y) {
-                            Role::Foreground
-                        } else {
-                            Role::Background
-                        }
-                    },
+                    |x, y| role(band, shape, sealed, x, y),
                 );
                 let repaint = Repaint {
                     image: self.image,
@@ -249,6 +238,19 @@ pub(crate) struct Repaint<'a> {
     pub bounds: (u32, u32, u32, u32),
 }
 
+/// 局所色の材料としての役割。帯の画素は混色そのもの、`sealed` の画素は
+/// `--seal` が決めた答えなので、どちらの材料にもしない。
+fn role(band: &[u8], shape: &Mask, sealed: &BitPlane, x: u32, y: u32) -> Role {
+    let at = (y as usize) * (shape.width() as usize) + (x as usize);
+    if band[at] != 0 || sealed.contains(at) {
+        Role::Skip
+    } else if shape.is_foreground(x, y) {
+        Role::Foreground
+    } else {
+        Role::Background
+    }
+}
+
 /// 帯画素の外接矩形。帯が 1 画素も無ければ None。
 pub(crate) fn band_bounds(band: &[u8], w: u32, h: u32) -> Option<(u32, u32, u32, u32)> {
     let stride = w as usize;
@@ -296,11 +298,16 @@ pub(crate) fn grow(
 /// 結果を境界処理が黙って作り直すことになる。
 impl Repaint<'_> {
     pub fn reclassify_rim(&self, shape: &mut Mask) -> usize {
-        let (image, band, out_of_reach, grid) =
-            (self.image, self.band, self.out_of_reach, self.grid);
+        let &Repaint {
+            image,
+            band,
+            out_of_reach,
+            grid,
+            bounds: (x0, y0, x1, y1),
+            ..
+        } = self;
         let w = image.width() as usize;
         let pixels = image.as_raw();
-        let (x0, y0, x1, y1) = self.bounds;
         let mut changed = 0usize;
         for y in y0..=y1 {
             let row = (y as usize) * w;
@@ -331,7 +338,7 @@ impl Repaint<'_> {
     /// (c) 帯の中の二値マスクにメディアン（多数決）を掛け、**色が変化に矛盾する
     /// 画素だけ元へ戻す**。
     ///
-    /// 形だけを見た平滑化は `morphology::open` の失敗を繰り返す——幅 3px の
+    /// 形だけを見た平滑化は `morphology::open` と同じく細部を消す——幅 3px の
     /// ストラップはメディアンで消える。そこで色の門を通す。
     ///
     /// - 前景 → 背景に変わった画素: 色が F 寄りなら戻す
@@ -342,14 +349,14 @@ impl Repaint<'_> {
     /// これは狙いどおりで、色で決まるものは色が決め、決まらないものだけを形が
     /// 決める、という順序になっている。
     pub fn smooth_in_band(&self, shape: &mut Mask, radius: u32) -> usize {
-        let (image, original, band, out_of_reach, grid) = (
-            self.image,
-            self.original,
-            self.band,
-            self.out_of_reach,
-            self.grid,
-        );
-        let bounds = self.bounds;
+        let &Repaint {
+            image,
+            original,
+            band,
+            out_of_reach,
+            grid,
+            bounds,
+        } = self;
         let (w, h) = (shape.width(), shape.height());
         let stride = w as usize;
         let pixels = image.as_raw();
@@ -375,25 +382,16 @@ impl Repaint<'_> {
         let (x0, y0, x1, y1) = bounds;
         let mut integral: Vec<u32> = Vec::new();
         let mut changed = 0usize;
-        let mut tile_y = y0;
-        while tile_y <= y1 {
+        for tile_y in (y0..=y1).step_by(TILE as usize) {
             let ty1 = (tile_y + TILE - 1).min(y1);
-            let mut tile_x = x0;
-            while tile_x <= x1 {
+            for tile_x in (x0..=x1).step_by(TILE as usize) {
                 let tx1 = (tile_x + TILE - 1).min(x1);
                 // 帯の無いタイルには積分画像も要らない
-                let mut has_band = false;
-                'scan: for y in tile_y..=ty1 {
+                let has_band = (tile_y..=ty1).any(|y| {
                     let row = (y as usize) * stride;
-                    for x in tile_x..=tx1 {
-                        if band[row + (x as usize)] != 0 {
-                            has_band = true;
-                            break 'scan;
-                        }
-                    }
-                }
+                    (tile_x..=tx1).any(|x| band[row + (x as usize)] != 0)
+                });
                 if !has_band {
-                    tile_x += TILE;
                     continue;
                 }
                 let (px0, py0, px1, py1) = grow((tile_x, tile_y, tx1, ty1), radius, w, h);
@@ -423,10 +421,8 @@ impl Repaint<'_> {
                         if band[i] == 0 || out_of_reach.contains(i) {
                             continue;
                         }
-                        let qx0 = (x.saturating_sub(radius).max(px0) - px0) as usize;
-                        let qy0 = (y.saturating_sub(radius).max(py0) - py0) as usize;
-                        let qx1 = ((x + radius).min(px1) - px0) as usize;
-                        let qy1 = ((y + radius).min(py1) - py0) as usize;
+                        let (qx0, qy0, qx1, qy1) =
+                            guided::window((px0, py0, px1, py1), x, y, radius);
                         let inside = count(qx0, qy0, qx1, qy1);
                         let total = ((qx1 - qx0 + 1) * (qy1 - qy0 + 1)) as u32;
                         // 同数なら動かさない。どちらへ倒しても根拠が無い
@@ -462,9 +458,7 @@ impl Repaint<'_> {
                         changed += 1;
                     }
                 }
-                tile_x += TILE;
             }
-            tile_y += TILE;
         }
         changed
     }
@@ -536,8 +530,8 @@ fn close_new_gaps(
     // つながってしまい、収縮した意味が消える。
     //
     // 起点（帯の外の背景と外周の背景）は**キューへ積まない**。24.5MP の実写
-    // では帯の外の背景が 2000 万画素あり、`VecDeque` の倍々確保だけでピークが
-    // 400MB 級に跳ねていた。起点は定義上すべて到達済みなので印だけ付け、
+    // では帯の外の背景が 2000 万画素あり、積めば `VecDeque` の倍々確保だけで
+    // ピークが 400MB 級に跳ねる。起点は定義上すべて到達済みなので印だけ付け、
     // 積むのは「そこから帯の中の芯へ入る一歩」だけでよい
     let mut seen = BitPlane::new(pw * ph);
     for y in ry0..=ry1 {
@@ -617,8 +611,7 @@ mod tests {
     use crate::cutout::refine::{DEFAULT_MAX_RADIUS, DEFAULT_MIN_RADIUS, band_map};
     use image::Rgba;
 
-    /// 1 パスぶんの入力を組む。テストは (b) と (c) を単体で呼ぶので、
-    /// 上限（M1）は掛けない面（空の `BitPlane`）を渡す。
+    /// 1 パスぶんの入力を組む。累積の上限を掛けないときは空の `BitPlane` を渡す。
     fn repaint<'a>(
         image: &'a RgbaImage,
         original: &'a Mask,
@@ -635,6 +628,19 @@ mod tests {
             grid,
             bounds,
         }
+    }
+
+    /// 帯の外の確定前景・確定背景から局所色の格子を組む（`run` と同じ役割分け）。
+    fn grid_around(
+        img: &RgbaImage,
+        band: &[u8],
+        shape: &Mask,
+        bounds: (u32, u32, u32, u32),
+    ) -> LocalColours {
+        let (w, h) = (img.width(), img.height());
+        local_colour::build(img, grow(bounds, 8, w, h), 1.0, |x, y| {
+            role(band, shape, &BitPlane::default(), x, y)
+        })
     }
 
     /// 帯の中で「マスクは前景だが色は背景」の画素が背景へ落ちること。(b)
@@ -662,15 +668,7 @@ mod tests {
         let original = shape.clone();
         let band = band_map(&img, &shape, bg, DEFAULT_MIN_RADIUS, DEFAULT_MAX_RADIUS);
         let bounds = band_bounds(&band, w, h).expect("帯がある");
-        let grid = local_colour::build(&img, grow(bounds, 8, w, h), 1.0, |x, y| {
-            if band[(y as usize) * (w as usize) + (x as usize)] != 0 {
-                Role::Skip
-            } else if shape.is_foreground(x, y) {
-                Role::Foreground
-            } else {
-                Role::Background
-            }
-        });
+        let grid = grid_around(&img, &band, &shape, bounds);
         let changed = repaint(&img, &original, &band, &BitPlane::default(), &grid, bounds)
             .reclassify_rim(&mut shape);
         assert!(changed > 0, "縁が 1 画素も塗り直されていない");
@@ -713,15 +711,7 @@ mod tests {
         }
         let band = band_map(&img, &shape, bg, DEFAULT_MIN_RADIUS, DEFAULT_MAX_RADIUS);
         let bounds = band_bounds(&band, w, h).expect("帯がある");
-        let grid = local_colour::build(&img, grow(bounds, 8, w, h), 1.0, |x, y| {
-            if band[(y as usize) * (w as usize) + (x as usize)] != 0 {
-                Role::Skip
-            } else if shape.is_foreground(x, y) {
-                Role::Foreground
-            } else {
-                Role::Background
-            }
-        });
+        let grid = grid_around(&img, &band, &shape, bounds);
         let original = shape.clone();
         assert_eq!(
             repaint(&img, &original, &band, &BitPlane::default(), &grid, bounds)
@@ -733,8 +723,7 @@ mod tests {
 
     /// 色の門つきメディアンが、幅 3px のストラップを消さないこと。(c)
     ///
-    /// `morphology::open` が細部を巻き添えにした失敗を繰り返さないための
-    /// 歯止めである。形だけの多数決なら 5x5 の窓で 3px の棒は消える。
+    /// `morphology::open` のように細部を巻き添えにしないための歯止めである。形だけの多数決なら 5x5 の窓で 3px の棒は消える。
     #[test]
     fn the_colour_gate_keeps_a_three_pixel_strap_through_the_median() {
         let (w, h) = (60u32, 40u32);
@@ -751,15 +740,7 @@ mod tests {
         let original = shape.clone();
         let band = band_map(&img, &shape, bg, DEFAULT_MIN_RADIUS, DEFAULT_MAX_RADIUS);
         let bounds = band_bounds(&band, w, h).expect("帯がある");
-        let grid = local_colour::build(&img, grow(bounds, 8, w, h), 1.0, |x, y| {
-            if band[(y as usize) * (w as usize) + (x as usize)] != 0 {
-                Role::Skip
-            } else if shape.is_foreground(x, y) {
-                Role::Foreground
-            } else {
-                Role::Background
-            }
-        });
+        let grid = grid_around(&img, &band, &shape, bounds);
         repaint(&img, &original, &band, &BitPlane::default(), &grid, bounds)
             .smooth_in_band(&mut shape, 2);
         assert!(
@@ -813,7 +794,7 @@ mod tests {
         assert!(opened(5), "幅 5px の隙間まで塞いでいる");
     }
 
-    /// 塗り直しの累積の移動量に上限が掛かっていること。(M1)
+    /// 塗り直しの累積の移動量に上限が掛かっていること。
     ///
     /// **「帯の外を触らない」は 1 パスの性質でしかない。** パスごとに帯を
     /// 引き直すので、累積では `RESHAPE_PASSES × max_radius` 動きうる。上限は
@@ -843,15 +824,7 @@ mod tests {
         }
         let band = band_map(&img, &shape, bg, DEFAULT_MIN_RADIUS, DEFAULT_MAX_RADIUS);
         let bounds = band_bounds(&band, w, h).expect("帯がある");
-        let grid = local_colour::build(&img, grow(bounds, 8, w, h), 1.0, |x, y| {
-            if band[(y as usize) * (w as usize) + (x as usize)] != 0 {
-                Role::Skip
-            } else if shape.is_foreground(x, y) {
-                Role::Foreground
-            } else {
-                Role::Background
-            }
-        });
+        let grid = grid_around(&img, &band, &shape, bounds);
         // 上限 0px なら、動けるのは元の輪郭そのものの列だけ
         let contour = diagnostics::contour_pixels(&shape, None);
         assert!(!contour.is_empty(), "前提: 元の輪郭がある");

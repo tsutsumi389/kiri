@@ -22,7 +22,7 @@ use crate::cutout::morphology::BitPlane;
 ///   「色は完全に背景なのに不透明」という縁として残る）
 /// - 商品の直下に落ちた影のうち、輪郭に近い数 px が背景として消せずに残る
 ///
-/// という 2 つの副作用が出ていた。勾配の向きに沿って隣と比べ、極大でない画素を
+/// という 2 つの副作用が出る。勾配の向きに沿って隣と比べ、極大でない画素を
 /// 落とすことで、堤防を輪郭上の 1px の線に絞る。線が 1px でも 4 近傍のフィルは
 /// 越えられない（斜めにつながっていれば 4 近傍の経路は必ず遮られる）ので、
 /// 堤防としての働きは失われない。
@@ -90,7 +90,7 @@ pub struct GradientQuantiles {
 ///
 /// 透明な画素は標本に入れない。α=0 の画素の RGB は書き出し側の都合で決まり
 /// （0 や切り抜き前の残骸）、混ぜると存在しない段差が立つ。切り抜き済みの PNG を
-/// もう一度通した実測では、それだけで p90 が 14 まで出ていた。
+/// もう一度通した実測では、それだけで p90 が 14 まで出る。
 pub fn border_gradient_quantiles(image: &RgbaImage, band: u32) -> GradientQuantiles {
     quantiles(&mut border_gradient_samples(image, band))
 }
@@ -125,8 +125,7 @@ fn border_gradient_samples(image: &RgbaImage, band: u32) -> Vec<f32> {
                 if p[3] == 0 {
                     return;
                 }
-                luma[dy * 3 + dx] =
-                    0.2126 * f32::from(p[0]) + 0.7152 * f32::from(p[1]) + 0.0722 * f32::from(p[2]);
+                luma[dy * 3 + dx] = luma_of(p);
             }
         }
         let at = |dx: usize, dy: usize| -> f32 { luma[dy * 3 + dx] };
@@ -173,11 +172,18 @@ fn quantiles(samples: &mut [f32]) -> GradientQuantiles {
     GradientQuantiles { p50, p90 }
 }
 
+/// Rec.709 の輝度（0〜255 の実数）。堤防の強度はこの輝度の差で測る。
+///
+/// `constraints` がマスク画像を 1 チャンネルとして読むときも同じ係数を使う。
+#[inline]
+pub(crate) fn luma_of(p: [u8; 4]) -> f32 {
+    0.2126 * f32::from(p[0]) + 0.7152 * f32::from(p[1]) + 0.0722 * f32::from(p[2])
+}
+
 /// 1 行ぶんの輝度を書く。
 fn luma_row(image: &RgbaImage, y: usize, w: usize, out: &mut [f32]) {
     for (x, slot) in out.iter_mut().enumerate().take(w) {
-        let p = image.get_pixel(x as u32, y as u32).0;
-        *slot = 0.2126 * f32::from(p[0]) + 0.7152 * f32::from(p[1]) + 0.0722 * f32::from(p[2]);
+        *slot = luma_of(image.get_pixel(x as u32, y as u32).0);
     }
 }
 
@@ -241,11 +247,10 @@ fn suppress_row(
 
 /// 輝度 → Sobel → 非極大抑制を、行を流しながら 1 回の走査で済ませる。
 ///
-/// **全画面の表を 1 本も持たない。** 以前は輝度 f32・強度 f32・向き u8 の
-/// 3 本を同時に生かしていて、24.5MP では 220MB の一時確保になっていた。
-/// ピーク RSS 872MB の最大の山がここで、しかも**ピークは最大値であって総量
-/// ではない**ので、呼ぶ回数を減らしても下がらない。確保そのものを小さくする
-/// ほかにない。
+/// **全画面の表を 1 本も持たない。** 輝度 f32・強度 f32・向き u8 の 3 本を
+/// 全画面で同時に生かすと、24.5MP では 220MB の一時確保になり、ピーク RSS の
+/// 最大の山になる。しかも**ピークは最大値であって総量ではない**ので、呼ぶ回数を
+/// 減らしても下がらない。確保そのものを小さくするほかにない。
 ///
 /// 持つのは輝度・強度・向きを 3 行ずつだけで、5712px 幅でも合わせて 200KB を
 /// 切る。強度の行 `yy` を書いたら、その 1 つ上の行 `yy-1` は上下が揃うので
@@ -270,27 +275,15 @@ fn walk_ridges(image: &RgbaImage, w: usize, h: usize, mut keep: impl FnMut(usize
 
     for yy in 1..h - 1 {
         luma_row(image, yy + 1, w, &mut luma[row(yy + 1)..row(yy + 1) + w]);
-        // 3 行の読みと 1 行の書きを同時に借りられないので、書く行を外へ出す
-        let mut mag_row = std::mem::take(&mut mag);
-        let mut dir_row = std::mem::take(&mut dir);
-        {
-            let (a, m, b) = (row(yy - 1), row(yy), row(yy + 1));
-            let (mag_at, dir_at) = (row(yy), row(yy));
-            let (mag_slice, dir_slice) = (
-                &mut mag_row[mag_at..mag_at + w],
-                &mut dir_row[dir_at..dir_at + w],
-            );
-            sobel_row(
-                &luma[a..a + w],
-                &luma[m..m + w],
-                &luma[b..b + w],
-                w,
-                mag_slice,
-                dir_slice,
-            );
-        }
-        mag = mag_row;
-        dir = dir_row;
+        let (a, m, b) = (row(yy - 1), row(yy), row(yy + 1));
+        sobel_row(
+            &luma[a..a + w],
+            &luma[m..m + w],
+            &luma[b..b + w],
+            w,
+            &mut mag[m..m + w],
+            &mut dir[m..m + w],
+        );
 
         if yy >= 2 {
             let y = yy - 1;
@@ -307,8 +300,7 @@ fn walk_ridges(image: &RgbaImage, w: usize, h: usize, mut keep: impl FnMut(usize
         }
     }
 
-    // 最後の行。下の行は画像の外なので強度 0 として扱う（以前も `magnitude` の
-    // 最終行は 1 度も書かれないまま読まれていた）
+    // 最後の行。下の行は画像の外なので強度 0 として扱う
     let y = h - 2;
     let (a, m) = (row(y - 1), row(y));
     suppress_row(
@@ -363,15 +355,10 @@ fn gradient_magnitude(image: &RgbaImage) -> Vec<f32> {
     for y in 1..h - 1 {
         luma_row(image, y + 1, w, &mut luma[row(y + 1)..row(y + 1) + w]);
         let (a, m, b) = (row(y - 1), row(y), row(y + 1));
-        let (above, mid, below) = (
-            luma[a..a + w].to_vec(),
-            luma[m..m + w].to_vec(),
-            luma[b..b + w].to_vec(),
-        );
         sobel_row(
-            &above,
-            &mid,
-            &below,
+            &luma[a..a + w],
+            &luma[m..m + w],
+            &luma[b..b + w],
             w,
             &mut out[y * w..(y + 1) * w],
             &mut dir,
@@ -405,6 +392,18 @@ mod tests {
         img
     }
 
+    /// 輝度 34 の変化を 34px かけて起こす、幅 40px のなだらかな傾斜。
+    fn gentle_ramp() -> RgbaImage {
+        let mut img = RgbaImage::new(40, 9);
+        for y in 0..9 {
+            for x in 0..40 {
+                let v = (250 - x.min(34)) as u8;
+                img.put_pixel(x, y, Rgba([v, v, v, 255]));
+            }
+        }
+        img
+    }
+
     #[test]
     fn a_flat_image_has_no_gradient() {
         let img = RgbaImage::from_pixel(9, 9, Rgba([200, 200, 200, 255]));
@@ -427,13 +426,7 @@ mod tests {
     #[test]
     fn a_gentle_ramp_reports_a_small_gradient() {
         // 同じ 34 の変化を 34px かけて起こすと、1px あたりは 1 程度になる
-        let mut img = RgbaImage::new(40, 9);
-        for y in 0..9 {
-            for x in 0..40 {
-                let v = (250 - x.min(34)) as u8;
-                img.put_pixel(x, y, Rgba([v, v, v, 255]));
-            }
-        }
+        let img = gentle_ramp();
         let g = gradient_magnitude(&img);
         let peak = g.iter().cloned().fold(0.0f32, f32::max);
         assert!(peak < 3.0, "なだらかな傾斜で {peak} と大きく出ている");
@@ -443,14 +436,7 @@ mod tests {
     fn a_sharp_edge_and_a_soft_shadow_are_separable() {
         // 商品の輪郭(急峻)と落ち影(なだらか)を1枚に置き、しきい値で分けられること
         let sharp = gradient_magnitude(&gray_step(9, 250, 216));
-        let mut ramp = RgbaImage::new(40, 9);
-        for y in 0..9 {
-            for x in 0..40 {
-                let v = (250 - x.min(34)) as u8;
-                ramp.put_pixel(x, y, Rgba([v, v, v, 255]));
-            }
-        }
-        let soft = gradient_magnitude(&ramp);
+        let soft = gradient_magnitude(&gentle_ramp());
         let threshold = 8.0;
         assert!(sharp.iter().cloned().fold(0.0f32, f32::max) > threshold);
         assert!(soft.iter().cloned().fold(0.0f32, f32::max) < threshold);
@@ -502,13 +488,7 @@ mod tests {
     /// 連なった壁にはならないので、4 近傍のフィルは迂回できる。
     #[test]
     fn a_constant_ramp_is_mostly_suppressed() {
-        let mut img = RgbaImage::new(40, 9);
-        for y in 0..9 {
-            for x in 0..40 {
-                let v = (250 - x.min(34)) as u8;
-                img.put_pixel(x, y, Rgba([v, v, v, 255]));
-            }
-        }
+        let img = gentle_ramp();
         let raw = gradient_magnitude(&img);
         let thin = ridge_magnitude(&img);
         let count = |g: &[f32]| {
@@ -629,7 +609,7 @@ mod tests {
     /// 標本の器は伸ばさない。走査範囲から数が厳密に決まるため。
     ///
     /// 12MP・帯 90px では 121 万標本（4.9MB）。伸ばすに任せると 2 の冪へ
-    /// 丸められて 210 万ぶん（8.4MB）を抱えていた。
+    /// 丸められて 210 万ぶん（8.4MB）を抱える。
     #[test]
     fn the_sample_buffer_is_sized_exactly() {
         for (w, h, band) in [(60u32, 60u32, 8usize), (120, 80, 12), (40, 200, 5)] {

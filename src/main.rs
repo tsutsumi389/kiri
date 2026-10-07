@@ -129,7 +129,7 @@ fn dispatch(cli: &Cli) -> Result<i32> {
             &commands::model::run(&args.command)?,
             print_models,
         )?,
-        Command::Schema => emit(cli.json, &commands::schema::run(), print_schema)?,
+        Command::Schema(args) => emit(cli.json, &commands::schema::run(args), print_schema)?,
         Command::Batch(args) => {
             let report = commands::batch::run(args)?;
             emit(cli.json, &report, print_batch)?;
@@ -159,28 +159,42 @@ fn print_schema(report: &SchemaReport) {
         "kiri {}  (schema {})",
         report.kiri_version, report.schema_version
     );
+    // 絞った返答であることを名乗る。名乗らないと、1 行だけの「コマンド」欄を
+    // 全コマンドと読まれる（JSON の `scope` と同じ理由）
+    if let Some(command) = &report.scope.command {
+        println!("{command} の分だけ（全体は kiri schema）");
+    }
 
     println!("\nexit code");
     for e in &report.exit_codes {
         println!("  {}  {}", e.code, e.meaning);
     }
 
-    println!("\n警告 ({})", report.warnings.len());
-    let w = column_width(report.warnings.iter().map(|e| e.code.as_str()));
-    for e in &report.warnings {
-        println!("  {:<w$}  {}", e.code.as_str(), e.summary, w = w);
+    if let Some(warnings) = &report.warnings {
+        println!("\n警告 ({})", warnings.len());
+        let w = column_width(warnings.iter().map(|e| e.code.as_str()));
+        for e in warnings {
+            println!("  {:<w$}  {}", e.code.as_str(), e.summary, w = w);
+        }
     }
 
-    println!("\nエラー ({})", report.errors.len());
-    let w = column_width(report.errors.iter().map(|e| e.code.as_str()));
-    for e in &report.errors {
-        println!(
-            "  {:<w$}  [{}]  {}",
-            e.code.as_str(),
-            e.exit_code,
-            e.summary,
-            w = w
-        );
+    if report.warnings.is_none() {
+        // `--summary` は code の表を落とす。黙って消すと「code が無い」と読める
+        println!("\n警告・エラーの一覧は kiri schema が返す");
+    }
+
+    if let Some(errors) = &report.errors {
+        println!("\nエラー ({})", errors.len());
+        let w = column_width(errors.iter().map(|e| e.code.as_str()));
+        for e in errors {
+            println!(
+                "  {:<w$}  [{}]  {}",
+                e.code.as_str(),
+                e.exit_code,
+                e.summary,
+                w = w
+            );
+        }
     }
 
     // **オプション一覧を出さない方針に反しない。** ここに並ぶのは指定の綴りでは
@@ -210,7 +224,7 @@ fn print_schema(report: &SchemaReport) {
         println!("  {:<9}{}", c.name, c.about.as_deref().unwrap_or(""));
     }
 
-    println!("\nオプションの既定値と綴りは --json が返す（kiri schema --json）");
+    println!("\nオプションの既定値と綴りは --json が返す（kiri schema <command> --brief --json）");
 }
 
 /// 表の 1 列目を揃える幅（文字数）。

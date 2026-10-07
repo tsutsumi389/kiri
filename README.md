@@ -46,8 +46,10 @@ $ kiri cutout product.jpg -o out.jpg --profile amazon --fail-on default
 
 書き出さずに結果だけ見たいときは `--dry-run` を足す。成果物は 1 バイトも変わらない。
 
-**エージェントから使うなら、まず `kiri schema --json` を読ませる。** オプションと
-警告・エラー code の一覧をそれが返すので、この README を文脈へ載せる必要はない。
+**エージェントから使うなら、まず `kiri schema --summary --json` を読ませる。**
+使うコマンドが決まったら `kiri schema cutout --brief --json` のようにその分だけ引く。
+オプションと警告・エラー code の一覧はそれが返すので、この README を文脈へ載せる
+必要はない（全体は 220KB あり、[絞り方](docs/commands/01-schema.md#必要な分だけ引く)を参照）。
 
 ## コマンド
 

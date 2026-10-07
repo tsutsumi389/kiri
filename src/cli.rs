@@ -281,10 +281,6 @@ pub struct LintArgs {
 /// 指定の前に知っておくべきことが違う——特に **AVIF では画素の検査が飛ぶ**こと
 /// は、lint を呼ぶ前に知らないと結果を読み違える。
 fn lint_profile_long_help() -> String {
-    let names: Vec<String> = profile::ALL
-        .iter()
-        .map(|p| format!("{}（{}、{}）", p.name, p.revision, p.summary))
-        .collect();
     format!(
         "照らす規格（必須）。指定できるのは {}。\n\
          検査するのは規格が**規定している項目だけ**である。規定の無い項目は \
@@ -319,7 +315,7 @@ fn lint_profile_long_help() -> String {
          **規格は変わる。** 版は kiri がその規格を写し取った時点であり、\
          古い kiri が古い規格で合格を出すことは避けられない。\
          profile.revision で鮮度を判断すること。",
-        names.join(" / "),
+        profile_list(),
         crate::commands::lint::CHECK_STATUSES.join(" / "),
         crate::error::ErrorKind::Compliance.exit_code(),
         crate::error::ErrorCode::ProfileViolation.as_str(),
@@ -1137,10 +1133,6 @@ fn fail_on_long_help() -> String {
 /// 一覧を直書きしないのは `derive_long_help` と同じ理由である——表へ 1 つ
 /// 足したときにヘルプだけが古い一覧を語ると、それがそのまま誤った指定になる。
 fn profile_long_help() -> String {
-    let names: Vec<String> = profile::ALL
-        .iter()
-        .map(|p| format!("{}（{}、{}）", p.name, p.revision, p.summary))
-        .collect();
     format!(
         "規格の複合指定に名前を付けたもの（既定 off）。指定できるのは {}。\n\
          profile が決めるのは --canvas / --fill-ratio / --format / --background / \
@@ -1166,12 +1158,21 @@ fn profile_long_help() -> String {
          **規格は変わる。** 版は kiri がその規格を写し取った時点であり、\
          古い kiri が古い規格で合格を出すことは避けられない。\
          settings.profile.revision で鮮度を判断すること。",
-        names.join(" / "),
+        profile_list(),
         crate::warning::WarningCode::ProfileOverridden.as_str(),
         PROFILE_NAMES[0],
         PROFILE_NAMES[0],
         crate::warning::WarningCode::ProfileOverridden.as_str(),
     )
+}
+
+/// ヘルプに並べるプリセットの一覧（名前・版・要約）。
+fn profile_list() -> String {
+    profile::ALL
+        .iter()
+        .map(|p| format!("{}（{}、{}）", p.name, p.revision, p.summary))
+        .collect::<Vec<_>>()
+        .join(" / ")
 }
 
 /// 利用者が明示した項目を clap の `ValueSource` から読む。
@@ -1233,10 +1234,9 @@ fn trimap_help() -> String {
 
 fn trimap_long_help() -> String {
     format!(
-        "{}\n{}",
-        trimap_help(),
-        "不明の帯（その間の輝度）には何の指示も無いものとして、いつもどおり色と\
+        "{}\n不明の帯（その間の輝度）には何の指示も無いものとして、いつもどおり色と\
          連結性で決める。",
+        trimap_help(),
     ) + &image_constraint_notes()
 }
 
@@ -1250,14 +1250,13 @@ fn alpha_trimap_help() -> String {
 
 fn alpha_trimap_long_help() -> String {
     format!(
-        "{}\n{}",
-        alpha_trimap_help(),
-        "--trimap が輝度で読むのに対し、こちらはアルファだけを読む。切り抜き済みの PNG を\
+        "{}\n--trimap が輝度で読むのに対し、こちらはアルファだけを読む。切り抜き済みの PNG を\
          そのまま渡せる入口で、半透明の境界がそのまま matting の作業領域になる。\
          同じファイルを --trimap に渡すと輝度で読まれ、黒い商品が確定背景になって指示が\
          裏返るので、入口を取り違えないこと。\n\
          アルファを持たない画像（JPEG など）を渡すと全画素が確定前景になる。\
          それを防ぐため、半透明も透明も 1 画素も無いファイルは CONSTRAINT_ALL_OPAQUE で断る。",
+        alpha_trimap_help(),
     ) + &image_constraint_notes()
 }
 
@@ -1367,13 +1366,15 @@ impl Polygon {
 pub fn parse_polygon(s: &str) -> Result<Polygon, String> {
     let values = s
         .split(',')
-        .map(str::trim)
-        .map(|p| {
-            p.parse::<f64>()
-                .map_err(|_| format!("'{p}' を数値として解釈できません"))
-        })
+        .map(|p| parse_number(p.trim()))
         .collect::<Result<Vec<f64>, String>>()?;
     Polygon::from_values(&values)
+}
+
+/// カンマ区切りの 1 項目を数値として読む。
+fn parse_number(p: &str) -> Result<f64, String> {
+    p.parse::<f64>()
+        .map_err(|_| format!("'{p}' を数値として解釈できません"))
 }
 
 /// 0 以上の有限な実数だけを受け付ける。
@@ -1393,10 +1394,10 @@ pub fn non_negative(s: &str) -> Result<f64, String> {
 
 /// `--smooth-contour` の上限(px, 長辺 1000px 換算)。
 ///
-/// **要求値をそのまま返していた。** 実効の半径は `RADIUS_CEILING` で頭打ちに
-/// なるので、`--smooth-contour 100` と指定しても効くのは 48px までで、結果の
-/// `settings.smooth_contour` には 100 が出ていた。「指定したのに効かない」が
-/// 数値の上では見分けられない状態である。
+/// **上限が無いと、要求値と効く値が食い違う。** 実効の半径は `RADIUS_CEILING`
+/// で頭打ちになるので、`--smooth-contour 100` と指定しても効くのは 48px までで、
+/// 結果の `settings.smooth_contour` には 100 が出る。「指定したのに効かない」が
+/// 数値の上では見分けられない。
 ///
 /// 16 は、長辺 1000px の素材で「商品の角（曲率半径 20px 級）が丸まり始める」
 /// 手前の値で、`RADIUS_CEILING`（48）に当たるのは長辺 3000px を超えてからに
@@ -1405,13 +1406,7 @@ pub const MAX_SMOOTH_CONTOUR: f64 = 16.0;
 
 /// 0 以上 `MAX_SMOOTH_CONTOUR` 以下の実数だけを受け付ける。
 pub fn smooth_contour_px(s: &str) -> Result<f64, String> {
-    let v = non_negative(s)?;
-    if v > MAX_SMOOTH_CONTOUR {
-        return Err(format!(
-            "'{s}' は 0 から {MAX_SMOOTH_CONTOUR} の範囲で指定してください"
-        ));
-    }
-    Ok(v)
+    at_most(s, MAX_SMOOTH_CONTOUR)
 }
 
 /// `--shadow-blur` の上限(px, 長辺 1000px 換算)。
@@ -1424,19 +1419,13 @@ pub fn smooth_contour_px(s: &str) -> Result<f64, String> {
 /// **上限が無いと算術が壊れる**のがもう半分の理由である。`--shadow-blur 8e9`
 /// は箱型の幅を 32 億まで押し上げ、3 回ぶんの半径を足す計算が `u32` を溢れて
 /// debug では panic し、release では幅が化けて「ぼかしていないのに
-/// `blur: 2e29` と報告する」嘘の結果になっていた。`transform/shadow.rs` 側の
+/// `blur: 2e29` と報告する」嘘の結果になる。`transform/shadow.rs` 側の
 /// `MAX_BOX_WIDTH` は同じ事故への二重の備えで、こちらが第一の門である。
 pub const SHADOW_BLUR_MAX: f64 = 1000.0;
 
 /// 0 以上 `SHADOW_BLUR_MAX` 以下の実数だけを受け付ける。
 pub fn shadow_blur_px(s: &str) -> Result<f64, String> {
-    let v = non_negative(s)?;
-    if v > SHADOW_BLUR_MAX {
-        return Err(format!(
-            "'{s}' は 0 から {SHADOW_BLUR_MAX} の範囲で指定してください"
-        ));
-    }
-    Ok(v)
+    at_most(s, SHADOW_BLUR_MAX)
 }
 
 /// `--reflect-height` の上限(px, 長辺 1000px 換算)。
@@ -1462,22 +1451,19 @@ pub const REFLECT_GAP_MAX: f64 = 1000.0;
 
 /// 0 以上 `REFLECT_HEIGHT_MAX` 以下の実数だけを受け付ける。
 pub fn reflect_height_px(s: &str) -> Result<f64, String> {
-    let v = non_negative(s)?;
-    if v > REFLECT_HEIGHT_MAX {
-        return Err(format!(
-            "'{s}' は 0 から {REFLECT_HEIGHT_MAX} の範囲で指定してください"
-        ));
-    }
-    Ok(v)
+    at_most(s, REFLECT_HEIGHT_MAX)
 }
 
 /// 0 以上 `REFLECT_GAP_MAX` 以下の実数だけを受け付ける。
 pub fn reflect_gap_px(s: &str) -> Result<f64, String> {
+    at_most(s, REFLECT_GAP_MAX)
+}
+
+/// 0 以上 `max` 以下の有限な実数だけを受け付ける。
+fn at_most(s: &str, max: f64) -> Result<f64, String> {
     let v = non_negative(s)?;
-    if v > REFLECT_GAP_MAX {
-        return Err(format!(
-            "'{s}' は 0 から {REFLECT_GAP_MAX} の範囲で指定してください"
-        ));
+    if v > max {
+        return Err(format!("'{s}' は 0 から {max} の範囲で指定してください"));
     }
     Ok(v)
 }
@@ -1975,36 +1961,30 @@ pub fn parse_point(s: &str) -> Result<[f64; 2], String> {
 /// 座標は画像の中を指すので負値は取り違えでしかないが、ずらし量は影を上や
 /// 左へ出す正当な指定になる。同じ関数で両方を受けると、どちらかの関門が緩む。
 pub fn parse_offset(s: &str) -> Result<[f64; 2], String> {
-    let parts: Vec<&str> = s.split(',').map(str::trim).collect();
-    if parts.len() != 2 {
-        return Err(format!(
-            "'{s}' はカンマ区切りの数値 2 個である必要があります"
-        ));
-    }
+    let parts = split_fields(s, 2)?;
     Ok([finite(parts[0])?, finite(parts[1])?])
 }
 
-fn parse_numbers(s: &str, expected: usize) -> Result<Vec<f64>, String> {
+/// カンマで区切り、ちょうど `expected` 個であることを確かめる。
+fn split_fields(s: &str, expected: usize) -> Result<Vec<&str>, String> {
     let parts: Vec<&str> = s.split(',').map(str::trim).collect();
     if parts.len() != expected {
         return Err(format!(
             "'{s}' はカンマ区切りの数値 {expected} 個である必要があります"
         ));
     }
-    parts
-        .iter()
-        .map(|p| {
-            p.parse::<f64>()
-                .map_err(|_| format!("'{p}' を数値として解釈できません"))
-        })
-        .collect::<Result<Vec<f64>, String>>()
-        .and_then(|v| {
-            if v.iter().any(|x| !x.is_finite() || *x < 0.0) {
-                Err(format!("'{s}' に負数または不正な値が含まれています"))
-            } else {
-                Ok(v)
-            }
-        })
+    Ok(parts)
+}
+
+fn parse_numbers(s: &str, expected: usize) -> Result<Vec<f64>, String> {
+    let v = split_fields(s, expected)?
+        .into_iter()
+        .map(parse_number)
+        .collect::<Result<Vec<f64>, String>>()?;
+    if v.iter().any(|x| !x.is_finite() || *x < 0.0) {
+        return Err(format!("'{s}' に負数または不正な値が含まれています"));
+    }
+    Ok(v)
 }
 
 /// `#RRGGBB` / `RRGGBB` / `#RGB` を受け付ける。
@@ -2020,34 +2000,23 @@ pub fn parse_hex_color(s: &str) -> Result<[u8; 3], String> {
             "'{s}' は色として解釈できません（#RRGGBB 形式で指定してください）"
         ));
     }
-    let expand = |c: u8| -> u8 { c * 17 };
-    let digit = |c: char| -> Result<u8, String> {
-        c.to_digit(16)
-            .map(|d| d as u8)
-            .ok_or_else(|| format!("'{c}' は16進数ではありません"))
+    // 1 チャンネルあたりの桁数。`#RGB` の 1 桁は 17 倍して 8bit へ広げる
+    let width = match hex.len() {
+        3 => 1,
+        6 => 2,
+        _ => {
+            return Err(format!(
+                "'{s}' は色として解釈できません（#RRGGBB 形式で指定してください）"
+            ));
+        }
     };
-
-    match hex.len() {
-        3 => {
-            let d: Vec<char> = hex.chars().collect();
-            Ok([
-                expand(digit(d[0])?),
-                expand(digit(d[1])?),
-                expand(digit(d[2])?),
-            ])
-        }
-        6 => {
-            let mut out = [0u8; 3];
-            for (i, slot) in out.iter_mut().enumerate() {
-                *slot = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-                    .map_err(|_| format!("'{s}' は色として解釈できません"))?;
-            }
-            Ok(out)
-        }
-        _ => Err(format!(
-            "'{s}' は色として解釈できません（#RRGGBB 形式で指定してください）"
-        )),
+    let mut out = [0u8; 3];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let v = u8::from_str_radix(&hex[i * width..(i + 1) * width], 16)
+            .map_err(|_| format!("'{s}' は色として解釈できません"))?;
+        *slot = if width == 1 { v * 17 } else { v };
     }
+    Ok(out)
 }
 
 /// `--max-bytes` の値を読む。10 進の整数に単位を付けられる（大文字も可）。

@@ -21,19 +21,19 @@ use crate::warning::{Warning, WarningCode};
 /// 版を名乗らないと、契約が動いたときに古い読み手が黙って誤読する。
 /// **黙って間違えるのが最も高くつく**ので、成功にも失敗にも必ず添える。
 ///
-/// # 2 へ上げた理由（Phase 20）
+/// # 2 である理由
 ///
-/// **`outputs[]` が常に 1 要素だという前提が崩れた。** 型は `Vec<OutputReport>`
-/// のままなので、`outputs[0]` を読むコードはコンパイルも実行も通る——通ったうえで
-/// 2 本目以降を黙って捨てる。キーが増えただけなら上げないのは、古い読み手が
-/// 知らないキーを無視しても誤読にならないからである。ここは無視した結果が
-/// 「成果物が 1 つしか無い」という誤った事実になるので、版で断る。
+/// **`outputs[]` は 1 要素とは限らない**（派生ごとに 1 要素）。型は
+/// `Vec<OutputReport>` なので、`outputs[0]` だけを読むコードはコンパイルも実行も
+/// 通る——通ったうえで 2 本目以降を黙って捨てる。キーが増えただけなら上げないのは、
+/// 古い読み手が知らないキーを無視しても誤読にならないからである。ここは無視した
+/// 結果が「成果物が 1 つしか無い」という誤った事実になるので、版で断る。
 ///
-/// 同じ版で入った変更が 2 つある。どちらも単独では上げる理由にならないが、
-/// **上げる回は 1 回だけにする**という決め（計画 7.2）に従ってここへ寄せた。
+/// 版 2 には、単独では上げる理由にならない次の 2 つも含まれる（版を上げる回は
+/// 1 回にまとめる）。
 /// - `outputs[].role`（キーの追加）
-/// - 派生に紐づく警告の `data.output`。`DRY_RUN_OUTPUT_EXISTS` の `data.path` は
-///   この `output` へ**改名した**（同じ意味のキーが 2 つ並ぶのを避けた）
+/// - 派生に紐づく警告の `data.output`。`DRY_RUN_OUTPUT_EXISTS` もパスを
+///   `data.path` ではなくこの `output` で言う（同じ意味のキーを 2 つ並べない）
 pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Serialize)]
@@ -65,11 +65,7 @@ impl From<&Error> for ErrorReport {
     fn from(e: &Error) -> Self {
         ErrorReport {
             schema_version: SCHEMA_VERSION,
-            error: ErrorBody {
-                code: e.code,
-                message: e.message.clone(),
-                hint: e.hint.clone(),
-            },
+            error: ErrorBody::from(e),
         }
     }
 }
@@ -211,8 +207,7 @@ pub struct SubjectReport {
     pub confidence: Confidence,
     /// この矩形が何から出たか（"colour" / "segment"）。
     ///
-    /// **キーを足すだけで、既存の値の意味は変えない。** `--segment` を
-    /// 渡さなければ今までどおり `"colour"`（背景色から遠い画素の最大の塊）で、
+    /// `--segment` を渡さなければ `"colour"`（背景色から遠い画素の最大の塊）で、
     /// 渡してモデルが走ったときだけ `"segment"` になる。`area_ratio` や
     /// `confidence` の判定は**どちらでも同じもの**を通るので、2 つの
     /// `high` は同じ意味を持つ
@@ -538,8 +533,8 @@ pub struct MaskReport {
     /// （px、**長辺 1000px 換算**）。輪郭が輪郭に沿って蛇行していれば大きくなる。
     ///
     /// `edge_width` はアルファ遷移の**幅**しか見ないので、ギザギザには反応
-    /// しない。実写（不織布の上のリモコン）は `halo_ratio` 0.001 /
-    /// `separability` 54.7 と合格を返しながら上辺・下辺がギザギザだった。
+    /// しない。実写（不織布の上のリモコン）では `halo_ratio` 0.001 /
+    /// `separability` 54.7 と合格を返しながら上辺・下辺がギザギザになる。
     ///
     /// 測れる輪郭が無ければ null
     pub contour_roughness: Option<f64>,
@@ -705,8 +700,8 @@ pub struct SettingsReport {
     ///
     /// `shadow` と同じ二段構えである。頼んだかどうかはここ、実際に効いた
     /// 高さと隙間は `reflect` ブロックが言う。**単一のノブなので `settings` に
-    /// 置く**——Phase 24 の `color` だけは要求値をブロックの中に持たせたが、
-    /// あれは白点と露出の 2 段を 1 ブロックで語る必要があったためで、
+    /// 置く**——`color` だけは要求値をブロックの中に持つが、
+    /// あれは白点と露出の 2 段を 1 ブロックで語る必要があるためで、
     /// `--shadow` / `--rotate` / `--segment` と同じこちらが既定の形である
     pub reflect: &'static str,
     /// `--rotate` の**指定値**。**常に出す。数値か `"auto"` の union である。**
@@ -728,7 +723,7 @@ pub struct SettingsReport {
     pub segment_ran: bool,
     /// `--profile` を渡したときだけ出る。渡さない実行の結果 JSON は
     /// **1 バイトも変わらない**ので `SCHEMA_VERSION` は据え置きである
-    /// （Phase 21 の `compliance` ブロックとまったく同じ論法。キーが増えるのは
+    /// （`compliance` ブロックとまったく同じ論法。キーが増えるのは
     /// 新しい指定を書いた実行だけで、既存の読み手が見ている形は動かない）。
     ///
     /// **ここは指定値である。** profile が実際に何を決めたかは、同じ
@@ -896,7 +891,7 @@ pub struct CutoutReport {
     /// `compliance` と同じ規約で、**渡さない実行の結果 JSON は 1 バイトも
     /// 変わらない。**
     ///
-    /// **`settings` には足していない。** 足せば既定の実行の JSON が変わり、
+    /// **`settings` には置かない。** 置けば既定の実行の JSON が変わり、
     /// 「既定 off なら 1 バイトも変わらない」が破れる。要求したモードは
     /// このブロックの `white_balance` / `exposure` が持つ——ブロックが現れる
     /// のは要求した実行だけなので、置き場所としてそこで足りる
@@ -957,10 +952,9 @@ pub struct BatchReport {
     pub failed: usize,
     /// `--fail-on` の条件に触れた項目の数。
     ///
-    /// **`succeeded` の定義は変えていない。** 不合格でも処理は成功しており、
-    /// 成果物は書かれている——`succeeded` を「書けた件数」として読んでいる
-    /// 既存の読み手にとって、それは今も正しい。ここは「書けたが人が見るべき
-    /// 件数」を別に数える
+    /// **不合格の項目も `succeeded` に数える。** 不合格でも処理は成功しており、
+    /// 成果物は書かれている——`succeeded` は「書けた件数」である。ここは
+    /// 「書けたが人が見るべき件数」を別に数える
     pub rejected: usize,
     /// 成功したが警告が付いた項目の数。目視確認の対象になる
     pub with_warnings: usize,
@@ -977,8 +971,7 @@ pub struct BatchReport {
     pub set: Option<SetReport>,
     /// 実行**全体**に掛かる警告。項目ごとの警告は `results[].result.warnings`。
     ///
-    /// **加算だけの変更である。** ここが空なのは今までどおりの実行で、いま入りうる
-    /// のは `MANIFEST_PARTIAL` の 1 つだけ——batch は 1 件の失敗で全体を止めない
+    /// いま入りうるのは `MANIFEST_PARTIAL` の 1 つだけ——batch は 1 件の失敗で全体を止めない
     /// 規約なので、失敗した項目があるのにマニフェストを書いたら、成功分だけを
     /// 載せたことをここで言う。**項目の警告に混ぜない**——どの項目の話でもない
     pub warnings: Vec<Warning>,
@@ -1011,7 +1004,7 @@ pub struct SetReport {
 
 /// `--fail-on` の判定。**`--fail-on` を指定したときだけ出る。**
 ///
-/// **このブロックの形は Phase 22 の `LintReport` が再利用する。** そのために
+/// **このブロックの形は `LintReport` が再利用する。** そのために
 /// `expected` / `actual` を文字列へ畳まない——数値は数値のまま返す。
 /// エージェントに正規表現を書かせないための決めである。
 #[derive(Debug, Serialize)]
@@ -1062,7 +1055,7 @@ pub struct ComplianceCheck {
 /// `kiri lint` の結果。**既にあるファイルを規格に照らしただけで、何も書かない。**
 ///
 /// 形は `ComplianceReport` を写し取っている（`ComplianceReport` の doc が
-/// 「このブロックの形は Phase 22 の `LintReport` が再利用する」と宣言している）。
+/// 「このブロックの形は `LintReport` が再利用する」と宣言している）。
 /// **同じ問い（この成果物は納品してよいか）に 2 つの形を持たせない**ためで、
 /// `--fail-on` の結果を読める受け手は lint の結果もそのまま読める。
 /// `expected` / `actual` を文字列へ畳まないのも同じ約束である。

@@ -85,18 +85,26 @@ pub fn contact_sheet(
     Ok(compose(&[source, mask_panel, result_panel]))
 }
 
+/// 長辺が `panel` に収まる縮小後の寸法。縮小が要らなければ `None`。
+fn shrunk_size(w: u32, h: u32, panel: u32) -> Option<(u32, u32)> {
+    let long = w.max(h);
+    if long <= panel {
+        return None;
+    }
+    let scale = f64::from(panel) / f64::from(long);
+    Some((
+        ((f64::from(w) * scale).round() as u32).max(1),
+        ((f64::from(h) * scale).round() as u32).max(1),
+    ))
+}
+
 /// 長辺が `panel` に収まるよう縮小する。元が小さければ拡大せずそのまま使う。
 fn fit(image: &RgbaImage, panel: u32) -> Result<RgbaImage> {
     let (w, h) = (image.width(), image.height());
-    let long = w.max(h);
-    if w == 0 || h == 0 || long <= panel {
-        return Ok(image.clone());
-    }
-    let scale = f64::from(panel) / f64::from(long);
-    let to = (
-        ((f64::from(w) * scale).round() as u32).max(1),
-        ((f64::from(h) * scale).round() as u32).max(1),
-    );
+    let to = match shrunk_size(w, h, panel) {
+        Some(to) if w != 0 && h != 0 => to,
+        _ => return Ok(image.clone()),
+    };
     // resize::apply を通すことで事前乗算つきの補間が効く。素朴に縮小すると
     // 切り抜き済み画像の境界に背景色がにじみ、プレビューが実物と食い違う
     resize_apply(
@@ -122,16 +130,7 @@ fn fit_mask(mask: &Mask, panel: u32) -> RgbaImage {
     if w == 0 || h == 0 {
         return RgbaImage::new(w, h);
     }
-    let long = w.max(h);
-    let (tw, th) = if long <= panel {
-        (w, h)
-    } else {
-        let scale = f64::from(panel) / f64::from(long);
-        (
-            ((f64::from(w) * scale).round() as u32).max(1),
-            ((f64::from(h) * scale).round() as u32).max(1),
-        )
-    };
+    let (tw, th) = shrunk_size(w, h, panel).unwrap_or((w, h));
 
     let mut out = RgbaImage::new(tw, th);
     for oy in 0..th {

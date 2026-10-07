@@ -11,12 +11,16 @@
 //! code は `warning.rs` / `error.rs` のカタログから取る。手で書いた一覧は必ず
 //! 実装から離れ、離れた一覧は「指定したのに効かない」という最も追いにくい
 //! 失敗をそのまま招く。ここに書き写す余地を残さないことが要点である。
+//!
+//! **全体は大きい**（220KB ある）。呼ぶ前に要るのは使うコマンドの分だけ
+//! なので、`<command>` で絞り、`--brief` で長い説明を落とし、`--summary` で
+//! 入口だけを返せるようにする。絞っても組み立て方は同じで、全体から削るだけである。
 
 use std::sync::LazyLock;
 
 use clap::{ArgAction, CommandFactory};
 
-use crate::cli::Cli;
+use crate::cli::{Cli, SchemaArgs};
 use crate::commands::lint::{CHECK_STATUSES, Check};
 use crate::cutout::{MAX_FOREGROUND_RATIO, MIN_FOREGROUND_RATIO, background, diagnostics, subject};
 use crate::error::{ErrorCode, ErrorKind};
@@ -24,11 +28,56 @@ use crate::profile;
 use crate::report::{
     ArgEntry, CommandEntry, ComposeSpecEntry, ErrorCodeEntry, ExitCodeEntry, FieldEntry, FieldGate,
     FieldThreshold, LintCheckEntry, ProfileEntry, ProfileRules, SCHEMA_VERSION, SchemaReport,
-    WarningCodeEntry,
+    SchemaScope, WarningCodeEntry,
 };
 use crate::warning::WarningCode;
 
-pub fn run() -> SchemaReport {
+pub fn run(args: &SchemaArgs) -> SchemaReport {
+    let command = args.command.as_deref();
+    let brief = args.brief || args.summary;
+
+    let mut commands = commands();
+    let mut fields = fields();
+    let mut global_options = global_options();
+    if let Some(name) = command {
+        // `model` は葉の `model list` として並ぶので、語の区切りで前方一致を取る
+        let leaf_prefix = format!("{name} ");
+        commands.retain(|c| c.name == name || c.name.starts_with(&leaf_prefix));
+        // **batch の結果の本体は項目ごとの cutout の結果である**（`results[].result`）。
+        // `appears_in` に batch を持つのは `set.*` だけなので、batch だけで絞ると
+        // 項目の値の読み方がすべて落ちる
+        let reads: &[&str] = if name == "batch" {
+            &["batch", "cutout"]
+        } else {
+            &[name]
+        };
+        fields.retain(|f| f.appears_in.iter().any(|a| reads.contains(a)));
+    }
+    if brief {
+        let options = commands
+            .iter_mut()
+            .flat_map(|c| c.arguments.iter_mut().chain(c.options.iter_mut()).flatten())
+            .chain(global_options.iter_mut());
+        for option in options {
+            option.detail = None;
+        }
+        for field in &mut fields {
+            field.notes = None;
+        }
+    }
+    if args.summary {
+        for c in &mut commands {
+            c.arguments = None;
+            c.options = None;
+        }
+    }
+    // 全体を返すとき、またはそのコマンドを引いたときだけ載せる。spec を書くのは
+    // compose だけで、`lint_checks[]` の綴りが出るのは `kiri lint` の `checks[]` だけである
+    // （cutout の `--profile` が返す `checks[]` は規格の表 `profiles[]` から読む）
+    let wants_compose_spec = command.is_none_or(|name| name == "compose");
+    let wants_lint_checks = command.is_none_or(|name| name == "lint");
+    let full = !args.summary;
+
     SchemaReport {
         schema_version: SCHEMA_VERSION,
         kiri_version: env!("CARGO_PKG_VERSION"),
@@ -36,28 +85,37 @@ pub fn run() -> SchemaReport {
         // `cfg!` を書くと、片方だけが feature の綴りを取りこぼしても
         // コンパイルは通る
         segment_available: crate::commands::model::AVAILABLE,
+        scope: SchemaScope {
+            command: args.command.clone(),
+            brief,
+            summary: args.summary,
+        },
         exit_codes: exit_codes(),
-        errors: ErrorCode::ALL
-            .iter()
-            .map(|&code| ErrorCodeEntry {
-                code,
-                exit_code: code.kind().exit_code(),
-                summary: code.summary(),
-            })
-            .collect(),
-        warnings: WarningCode::ALL
-            .iter()
-            .map(|&code| WarningCodeEntry {
-                code,
-                summary: code.summary(),
-            })
-            .collect(),
-        fields: fields(),
-        lint_checks: lint_checks(),
+        errors: full.then(|| {
+            ErrorCode::ALL
+                .iter()
+                .map(|&code| ErrorCodeEntry {
+                    code,
+                    exit_code: code.kind().exit_code(),
+                    summary: code.summary(),
+                })
+                .collect()
+        }),
+        warnings: full.then(|| {
+            WarningCode::ALL
+                .iter()
+                .map(|&code| WarningCodeEntry {
+                    code,
+                    summary: code.summary(),
+                })
+                .collect()
+        }),
+        fields: full.then_some(fields),
+        lint_checks: (full && wants_lint_checks).then(lint_checks),
         profiles: profiles(),
-        global_options: global_options(),
-        commands: commands(),
-        compose_spec: compose_spec(),
+        global_options,
+        commands,
+        compose_spec: (full && wants_compose_spec).then(compose_spec_entries),
     }
 }
 
@@ -65,7 +123,7 @@ pub fn run() -> SchemaReport {
 ///
 /// 書き写すと、キーを 1 つ足した日に schema だけが古い形を配る
 /// （`profiles` / `exit_codes` と同じ作法）。
-fn compose_spec() -> Vec<ComposeSpecEntry> {
+fn compose_spec_entries() -> Vec<ComposeSpecEntry> {
     use crate::compose::keys;
     vec![
         ComposeSpecEntry {
@@ -257,8 +315,8 @@ fn collect_command(command: &clap::Command, prefix: &str, out: &mut Vec<CommandE
     out.push(CommandEntry {
         name,
         about: command.get_about().map(|a| a.to_string()),
-        arguments,
-        options,
+        arguments: Some(arguments),
+        options: Some(options),
     });
 }
 

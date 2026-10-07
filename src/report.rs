@@ -1179,11 +1179,19 @@ pub struct SchemaReport {
     /// `--segment` の綴りが feature の有無によらず並ぶので、**綴りが載って
     /// いることは走らせられることを意味しない**
     pub segment_available: bool,
+    /// この返答がどこまでを含むか。**一部だけを返したことを本文で名乗る。**
+    /// 名乗らないと、絞った返答の `commands[]` を「kiri のコマンドはこれで全部」と読まれる
+    pub scope: SchemaScope,
     pub exit_codes: Vec<ExitCodeEntry>,
-    pub errors: Vec<ErrorCodeEntry>,
-    pub warnings: Vec<WarningCodeEntry>,
+    /// `--summary` では載せない（以下 `None` の項目も同じ）。**空の配列にしない**——
+    /// 空だと「この code は 1 つも無い」と読める
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub errors: Option<Vec<ErrorCodeEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warnings: Option<Vec<WarningCodeEntry>>,
     /// 結果の値をどう読むか。しきい値と `null` の意味を配る
-    pub fields: Vec<FieldEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Vec<FieldEntry>>,
     /// `kiri lint` が見る条件の一覧。**`lint::Check::ALL` から組む。**
     ///
     /// `checks[].name` の綴りをエージェントが日本語の散文から抜き直さずに
@@ -1193,7 +1201,8 @@ pub struct SchemaReport {
     /// **条件そのものは `profiles[]` が配る。** ここにあるのは「kiri が見る
     /// 項目の一覧」で、どの規格がどれを規定するかとは別である——規定の無い
     /// 条件は `checks[]` に 1 行も出ない
-    pub lint_checks: Vec<LintCheckEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lint_checks: Option<Vec<LintCheckEntry>>,
     /// `--profile` / `kiri lint` が見る規格の表。**実装の定数から組む。**
     ///
     /// 並びは `profile::ALL` の順で決定的。ここが無いと、不合格の根拠
@@ -1211,7 +1220,19 @@ pub struct SchemaReport {
     /// 本体は spec のほうにあり、ここが無いと**エージェントは spec の形を
     /// 推測で書く**ことになる——未知のキーは `SPEC_UNKNOWN_FIELD` で断られるので、
     /// 推測が外れたことは分かるが、何が正しいかは分からない
-    pub compose_spec: Vec<ComposeSpecEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compose_spec: Option<Vec<ComposeSpecEntry>>,
+}
+
+/// `kiri schema` の返答が含む範囲。何も指定しなければ全体である
+#[derive(Debug, Serialize)]
+pub struct SchemaScope {
+    /// 絞り込んだコマンド。`null` なら全コマンド
+    pub command: Option<String>,
+    /// 長い説明（`options[].detail` / `fields[].notes`）を落としたか
+    pub brief: bool,
+    /// 入口だけを返したか
+    pub summary: bool,
 }
 
 /// compose の spec の 1 階層。
@@ -1316,9 +1337,11 @@ pub struct CommandEntry {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub about: Option<String>,
-    /// 位置引数。並び順は指定する順序と同じ
-    pub arguments: Vec<ArgEntry>,
-    pub options: Vec<ArgEntry>,
+    /// 位置引数。並び順は指定する順序と同じ。`--summary` では載せない
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<Vec<ArgEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub options: Option<Vec<ArgEntry>>,
 }
 
 #[derive(Debug, Serialize)]

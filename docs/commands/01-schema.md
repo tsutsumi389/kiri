@@ -9,6 +9,7 @@ $ kiri schema --json
 {
   "schema_version": 2,
   "kiri_version": "0.1.0",
+  "scope": { "command": null, "brief": false, "summary": false },
   "exit_codes": [{ "code": 0, "meaning": "成功" }, ...],
   "errors":   [{ "code": "OUTPUT_EXISTS",  "exit_code": 2, "summary": "出力先が既に存在する。--force が要る" }, ...],
   "warnings": [{ "code": "LOW_UNIFORMITY", "summary": "背景の均一度が低い（単色背景ではない）" }, ...],
@@ -55,12 +56,44 @@ $ kiri schema --json
 - `detail` は `--help` の長い説明。**指定の前に知っていないと選びようがないこと**が
   書いてある（90 度単位だけが無劣化、など）。無ければキーごと消える
 
-全体で 44KB ある。必要な節だけ引くとよい。
+## 必要な分だけ引く
+
+**全体は 220KB ある。** エージェントの文脈に載せると数万トークンを占め、そのうち
+`cutout` の 61 オプションの長い説明と、`fields[]` の注記が大半である。呼ぶ前に
+要るのは使うコマンドの分だけなので、3 段階で引けるようにしてある。
 
 ```
-$ kiri schema --json | jq '.warnings'
-$ kiri schema --json | jq '.fields[] | select(.path | startswith("mask."))'
-$ kiri schema --json | jq '.commands[] | select(.name == "cutout") | .options'
+$ kiri schema --summary --json        # 入口（約 4KB）。コマンド名と説明・exit code・規格
+$ kiri schema cutout --brief --json   # 1 コマンド分の綴り・既定値・候補・しきい値（約 66KB）
+$ kiri schema cutout --json           # 同じく長い説明つき（約 144KB）
+```
+
+| 指定 | `commands[]` | `fields[]` | `errors[]` / `warnings[]` | `lint_checks[]` / `compose_spec` |
+|---|---|---|---|---|
+| なし | 全コマンド | 全部 | 載る | 載る |
+| `<command>` | そのコマンドだけ | そのコマンドに出る値だけ（batch は cutout の値も） | 載る（結果を読むのに要る） | lint / compose のときだけ |
+| `--brief` | `detail` を落とす | `notes` を落とす | 載る | 載る |
+| `--summary` | 名前と説明だけ | 載せない | 載せない | 載せない |
+
+- **`<command>` は最上位の名前で引く。** `model` は葉の `model list` を返す。
+  候補は `commands[]` の `schema` の `accepts` に並び、外すと code 無しの exit 2
+- **`--brief` が落とすのは散文だけである。** 綴り・既定値・`accepts`・しきい値
+  （`fields[].warns`）は残る
+- **batch は cutout の値も返す。** batch の結果の本体は `results[].result` に入った
+  cutout の結果で、`appears_in` に batch を持つ値（`set.*`）だけでは項目が読めない
+- `<command>` と `--summary` は同時に指定できない（exit 2）。`--summary` は
+  `--brief` を兼ね、`scope.brief` も `true` になる
+- `schema` / `model` は結果の値を持たないので `fields` は `[]` になる。これは
+  「載せなかった」ではなく「無い」である
+- **返答は自分がどこまでを含むかを `scope` で名乗る**（`{"command": "cutout",
+  "brief": true, "summary": false}`）。載せない節は**空の配列にせずキーごと消す**——
+  空だと「その code は 1 つも無い」と読める
+
+絞った返答をさらに `jq` で削ってもよい。
+
+```
+$ kiri schema cutout --brief --json | jq '.commands[0].options[] | {name, default, accepts}'
+$ kiri schema info --json | jq '.fields[] | select(.path | startswith("background."))'
 ```
 
 `--json` を付けなければ人間向けの要約を返す（他のコマンドと同じ規約）。そちらには

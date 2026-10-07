@@ -10061,6 +10061,278 @@ fn schema_without_json_is_a_human_summary() {
     assert!(text.contains("OUTPUT_EXISTS"), "{text}");
 }
 
+/// `kiri schema` に引数を渡して JSON を得る。
+fn schema_json_with(args: &[&str]) -> Value {
+    let out = kiri()
+        .arg("schema")
+        .args(args)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    json_stdout(&out)
+}
+
+fn command_names(v: &Value) -> Vec<String> {
+    v["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// 何も付けなければ全体を返し、全体であることを名乗る。
+#[test]
+fn the_whole_schema_says_it_is_whole() {
+    let v = schema_json();
+    assert_eq!(v["scope"]["command"], Value::Null);
+    assert_eq!(v["scope"]["brief"], false);
+    assert_eq!(v["scope"]["summary"], false);
+    for section in [
+        "errors",
+        "warnings",
+        "fields",
+        "lint_checks",
+        "compose_spec",
+    ] {
+        assert!(v[section].is_array(), "全体から {section} が落ちている");
+    }
+}
+
+/// `kiri schema <command>` はそのコマンドの分だけを返す。
+///
+/// **全体は 200KB を超える。** エージェントが呼ぶ前に要るのは使うコマンドの
+/// 呼び方と、その結果の読み方だけである。code の表は結果を読むのに要るので絞らない。
+#[test]
+fn schema_can_be_narrowed_to_one_command() {
+    let whole = schema_json();
+    let v = schema_json_with(&["cutout"]);
+
+    assert_eq!(v["scope"]["command"], "cutout");
+    assert_eq!(command_names(&v), vec!["cutout"]);
+    // 中身は全体の cutout と同じ。絞り込みは削るだけで、組み立て直さない
+    let whole_cutout = whole["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "cutout")
+        .unwrap();
+    assert_eq!(&v["commands"][0], whole_cutout);
+
+    // 全体のうち cutout に出る値が、過不足なく残る
+    assert_eq!(
+        v["fields"],
+        Value::Array(fields_appearing_in(&whole, &["cutout"]))
+    );
+    assert!(!v["fields"].as_array().unwrap().is_empty());
+
+    // 結果の code を読むための表は残す
+    assert_eq!(v["errors"], whole["errors"]);
+    assert_eq!(v["warnings"], whole["warnings"]);
+    assert_eq!(v["exit_codes"], whole["exit_codes"]);
+    // spec を書くのは compose だけ、lint の条件の綴りが出るのは lint だけ
+    assert!(v.get("compose_spec").is_none(), "{}", v["compose_spec"]);
+    assert!(v.get("lint_checks").is_none(), "{}", v["lint_checks"]);
+    assert!(schema_json_with(&["compose"])["compose_spec"].is_array());
+    assert_eq!(
+        schema_json_with(&["lint"])["lint_checks"],
+        whole["lint_checks"]
+    );
+}
+
+fn fields_appearing_in(v: &Value, commands: &[&str]) -> Vec<Value> {
+    fields_of(v)
+        .into_iter()
+        .filter(|f| {
+            f["appears_in"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| commands.contains(&a.as_str().unwrap()))
+        })
+        .collect()
+}
+
+/// `kiri schema batch` は項目ごとの cutout の値の読み方も返す。
+///
+/// **batch の結果の本体は `results[].result` に入った cutout の結果である。**
+/// `appears_in` に batch を持つ値（`set.*`）だけに絞ると、項目の `mask.*` の
+/// しきい値が 1 つも読めない。
+#[test]
+fn schema_for_batch_carries_the_fields_of_each_cutout() {
+    let whole = schema_json();
+    let v = schema_json_with(&["batch"]);
+    assert_eq!(
+        v["fields"],
+        Value::Array(fields_appearing_in(&whole, &["batch", "cutout"]))
+    );
+    let paths: Vec<&str> = v["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert!(paths.iter().any(|p| p.starts_with("set.")), "{paths:?}");
+    assert!(paths.iter().any(|p| p.starts_with("mask.")), "{paths:?}");
+}
+
+/// 入れ子のコマンドは親の名前で引ける。`model` は葉の `model list` として並ぶ。
+#[test]
+fn schema_narrows_a_nested_command_by_its_parent() {
+    let v = schema_json_with(&["model"]);
+    assert_eq!(command_names(&v), vec!["model list"]);
+}
+
+/// `kiri schema` が受けるコマンド名は、実際に並ぶコマンドと同じ綴りである。
+///
+/// 候補は clap に持たせるために定数で置いてある。サブコマンドを足して候補を
+/// 足し忘れると、**そのコマンドだけ絞って引けない**。
+#[test]
+fn schema_accepts_every_command_name() {
+    let v = schema_json();
+    let mut expected: Vec<String> = command_names(&v)
+        .iter()
+        .map(|n| n.split(' ').next().unwrap().to_string())
+        .collect();
+    expected.dedup();
+
+    let schema = v["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "schema")
+        .unwrap();
+    let accepts: Vec<String> = schema["arguments"][0]["accepts"]
+        .as_array()
+        .expect("schema の COMMAND に候補が無い")
+        .iter()
+        .map(|a| a.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(accepts, expected);
+}
+
+/// `--brief` は長い説明だけを落とす。綴り・既定値・候補・しきい値は残る。
+#[test]
+fn schema_brief_drops_only_the_prose() {
+    let full = schema_json_with(&["cutout"]);
+    let brief = schema_json_with(&["cutout", "--brief"]);
+    assert_eq!(brief["scope"]["brief"], true);
+
+    let full_options = full["commands"][0]["options"].as_array().unwrap();
+    let brief_options = brief["commands"][0]["options"].as_array().unwrap();
+    assert_eq!(full_options.len(), brief_options.len());
+    assert!(
+        full_options.iter().any(|o| o.get("detail").is_some()),
+        "落とす対象がそもそも無い"
+    );
+    for (f, b) in full_options.iter().zip(brief_options) {
+        assert!(b.get("detail").is_none(), "{} が detail を持つ", b["name"]);
+        let mut f = f.clone();
+        f.as_object_mut().unwrap().remove("detail");
+        assert_eq!(&f, b);
+    }
+
+    let full_fields = full["fields"].as_array().unwrap();
+    let brief_fields = brief["fields"].as_array().unwrap();
+    assert_eq!(full_fields.len(), brief_fields.len());
+    for (f, b) in full_fields.iter().zip(brief_fields) {
+        assert!(b.get("notes").is_none(), "{} が notes を持つ", b["path"]);
+        assert_eq!(f["warns"], b["warns"]);
+    }
+
+    let size = |v: &Value| serde_json::to_string(v).unwrap().len();
+    assert!(size(&brief) * 2 < size(&full), "--brief が半分にもならない");
+}
+
+/// コマンドを絞らない `--brief` は、全コマンド共通のオプションの説明も落とし、
+/// 節は 1 つも落とさない。
+#[test]
+fn schema_brief_without_a_command_keeps_every_section() {
+    let v = schema_json_with(&["--brief"]);
+    assert_eq!(v["scope"]["command"], Value::Null);
+    for section in [
+        "errors",
+        "warnings",
+        "fields",
+        "lint_checks",
+        "compose_spec",
+    ] {
+        assert!(v[section].is_array(), "{section} が落ちている");
+    }
+    for o in v["global_options"].as_array().unwrap() {
+        assert!(o.get("detail").is_none(), "{o}");
+    }
+    assert_eq!(command_names(&v), command_names(&schema_json()));
+}
+
+/// `--summary` は入口だけを返す。何があるかを見て、続きを `<command>` で引く。
+#[test]
+fn schema_summary_is_the_entrance() {
+    let whole = schema_json();
+    let v = schema_json_with(&["--summary"]);
+
+    assert_eq!(v["scope"]["summary"], true);
+    // 入口は説明を持たないので、長い説明を落とした返答でもある
+    assert_eq!(v["scope"]["brief"], true);
+    assert_eq!(command_names(&v), command_names(&whole));
+    for c in v["commands"].as_array().unwrap() {
+        assert!(c["about"].is_string(), "{c}");
+        assert!(c.get("options").is_none(), "{c}");
+        assert!(c.get("arguments").is_none(), "{c}");
+    }
+    // 空の配列にせず、キーごと落とす。空だと「code が 1 つも無い」と読める
+    for section in [
+        "errors",
+        "warnings",
+        "fields",
+        "lint_checks",
+        "compose_spec",
+    ] {
+        assert!(v.get(section).is_none(), "{section} が載っている");
+    }
+    assert_eq!(v["exit_codes"], whole["exit_codes"]);
+    assert_eq!(v["profiles"], whole["profiles"]);
+
+    let size = serde_json::to_string(&v).unwrap().len();
+    assert!(size < 8 * 1024, "入口が {size} バイトある");
+}
+
+/// テキストの要約も、絞ったことと落としたことを名乗る。
+#[test]
+fn the_text_schema_says_what_it_left_out() {
+    let text = |args: &[&str]| {
+        let out = kiri().arg("schema").args(args).output().unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    let narrowed = text(&["cutout"]);
+    assert!(narrowed.contains("cutout の分だけ"), "{narrowed}");
+    assert!(narrowed.contains("LOW_UNIFORMITY"), "{narrowed}");
+
+    let summary = text(&["--summary"]);
+    assert!(!summary.contains("LOW_UNIFORMITY"), "{summary}");
+    assert!(
+        summary.contains("警告・エラーの一覧は kiri schema が返す"),
+        "{summary}"
+    );
+}
+
+/// 知らないコマンド名と、絞り込みと入口の同時指定は引数の誤りとして断る。
+#[test]
+fn schema_rejects_an_unknown_command_and_a_contradiction() {
+    kiri().args(["schema", "cutuot", "--json"]).assert().code(2);
+    kiri()
+        .args(["schema", "cutout", "--summary", "--json"])
+        .assert()
+        .code(2);
+}
+
 // --- 値の読み方（fields） ---
 
 fn fields_of(v: &Value) -> Vec<Value> {

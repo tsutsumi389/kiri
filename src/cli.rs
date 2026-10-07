@@ -93,8 +93,42 @@ pub enum Command {
     /// オプションと code の一覧（契約）を出力する
     ///
     /// **エージェントはまずこれを読む。** README を読み込まずに、呼び方と
-    /// 返ってきた code の意味を引ける
-    Schema,
+    /// 返ってきた code の意味を引ける。全体は大きいので、入口は
+    /// `--summary`、続きは `kiri schema <command> --brief` で引く
+    Schema(SchemaArgs),
+}
+
+/// `kiri schema` に渡せるコマンド名。**`Command` の綴りと同じでなければならない。**
+///
+/// clap に候補として持たせるために定数で置く（`PROFILE_NAMES` と同じ事情）。
+/// `Command` に足してここを忘れた日は、`schema_accepts_every_command_name` が落ちる
+pub const SCHEMA_COMMANDS: &[&str] = &[
+    "info", "convert", "resize", "rotate", "cutout", "batch", "compose", "lint", "model", "schema",
+];
+
+/// `kiri schema` の引数。
+///
+/// **何も付けなければ契約の全体を返す。** 全体は 220KB あり、エージェントの
+/// 文脈に載せると数万トークンを占める。呼ぶ前に要るのは使うコマンドの分だけ
+/// なので、そこまで絞る入口を用意する
+#[derive(Args, Debug)]
+pub struct SchemaArgs {
+    /// このコマンドの分だけ返す。commands[] と fields[] をこのコマンドのものに絞り、compose_spec は compose、lint_checks は lint のときだけ載せる。
+    /// exit code・エラー・警告・規格は絞らない
+    #[arg(
+        value_name = "COMMAND",
+        value_parser = clap::builder::PossibleValuesParser::new(SCHEMA_COMMANDS),
+        conflicts_with = "summary"
+    )]
+    pub command: Option<String>,
+
+    /// 長い説明を落とす（options[].detail と fields[].notes）。綴り・既定値・候補・しきい値は残る
+    #[arg(long)]
+    pub brief: bool,
+
+    /// 入口だけ返す。コマンドの名前と説明、exit code、規格、全コマンド共通のオプションに限り、各コマンドのオプション・エラー・警告・値の読み方は載せない
+    #[arg(long)]
+    pub summary: bool,
 }
 
 /// `kiri compose` の引数。

@@ -28,7 +28,7 @@ const MIN_ALPHA: u8 = 16;
 /// 引くのは**その場の背景色**である。照明の勾配がある背景で大域の 1 色を引くと、
 /// 明るい側では引きすぎ、暗い側では引き足りず、境界の 1px が画像の左右で
 /// 逆向きにずれる。`flat` の場では `rgb_at` が大域の 1 色を返すので、
-/// 1 色で引いていた頃と 1 ビットも変わらない。
+/// 大域の 1 色で引くのと 1 ビットも変わらない。
 pub fn despill(image: &mut RgbaImage, mask: &Mask, field: &BackgroundField) {
     for y in 0..image.height() {
         for x in 0..image.width() {
@@ -106,8 +106,8 @@ mod tests {
 
     #[test]
     fn a_pixel_that_is_pure_background_becomes_dark_not_garbage() {
-        // 背景そのものの色に中途半端なアルファが付いた場合、復元結果は
-        // 0 に張り付く。少なくとも範囲外の値やオーバーフローは起こさない
+        // 背景そのものの色に中途半端なアルファが付いた場合も、復元結果は
+        // 範囲内に収まり、オーバーフローは起こさない
         let mut img = single([255, 255, 255, 255]);
         despill(&mut img, &mask_with(64), &BackgroundField::flat(WHITE));
         let out = img.get_pixel(0, 0).0;

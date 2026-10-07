@@ -45,9 +45,9 @@ pub fn run(image: &RgbaImage, opts: &SegmentOptions) -> Result<SegmentRun> {
         // `batch --jobs 8` で 8 倍になるのは、いちばん避けたい壊れ方
         // （途中まで書き出して OOM で落ちる）である。
         //
-        // **止まるのはここだけ**で、復号・フィル・書き出しは今までどおり
-        // 並列に走る。推論を含む spec は 1 件 1.3 秒を並べられないぶん遅く
-        // なるが、その代わりピークは 1 件で回したときと変わらない
+        // **止まるのはここだけ**で、復号・フィル・書き出しは並列に走る。
+        // 推論を含む spec は 1 件 1.3 秒を並べられないぶん遅くなるが、
+        // その代わりピークは 1 件で回したときと変わらない
         let _one_at_a_time = INFER.lock().unwrap_or_else(|e| e.into_inner());
         plan.run(tvec!(input.into()))
             .map_err(|e| failed(format!("推論に失敗しました: {e}")))?

@@ -465,7 +465,7 @@ pub fn load(path: &Path) -> Result<BatchSpec> {
 /// 優先順位は **明示指定 > set > profile > 既定** の 1 本である。`fill_ratio` を
 /// 書いた人はその値を望んでいるので、`set` が上から別の値を配るなら
 /// 「指定したのに効かない」になる——数百点を書き切ってから仕上がりで気づく
-/// 種類の失敗で、`cli.rs` 全体が避けてきたものである。**どちらを消すかは
+/// 種類の失敗で、`cli.rs` 全体が避けているものである。**どちらを消すかは
 /// 書いた人にしか決められない**ので、黙ってどちらかを勝たせずに断る。
 ///
 /// 綴りと値域をここで見るのも同じ理由による。項目ごとに解くと、同じ 1 つの
@@ -513,39 +513,36 @@ fn validate_keys(raw: &serde_json::Value) -> Result<()> {
 
     // **`set` の中も同じ `check` を通す。** 綴り違いを黙って無視すると、
     // `fill_ration` と書いた spec が「中央値で揃えた」結果を返してしまう
-    if let Some(set) = object.get("set") {
-        let s = set.as_object().ok_or_else(|| {
-            Error::new(
-                ErrorCode::SpecInvalid,
-                "set はオブジェクトである必要があります",
-            )
-        })?;
-        check(s.keys(), SET_KEYS, "set")?;
-    }
-
-    if let Some(defaults) = object.get("defaults") {
-        let d = defaults.as_object().ok_or_else(|| {
-            Error::new(
-                ErrorCode::SpecInvalid,
-                "defaults はオブジェクトである必要があります",
-            )
-        })?;
-        check(d.keys(), SETTING_KEYS, "defaults")?;
+    for (key, allowed) in [("set", SET_KEYS), ("defaults", SETTING_KEYS)] {
+        if let Some(value) = object.get(key) {
+            check(expect_object(value, key)?.keys(), allowed, key)?;
+        }
     }
 
     let items = object.get("items").and_then(|v| v.as_array());
+    let mut item_keys: Vec<&str> = SETTING_KEYS.to_vec();
+    item_keys.extend_from_slice(&["input", "output"]);
     for (i, item) in items.into_iter().flatten().enumerate() {
-        let o = item.as_object().ok_or_else(|| {
-            Error::new(
-                ErrorCode::SpecInvalid,
-                format!("items[{i}] はオブジェクトである必要があります"),
-            )
-        })?;
-        let mut allowed: Vec<&str> = SETTING_KEYS.to_vec();
-        allowed.extend_from_slice(&["input", "output"]);
-        check(o.keys(), &allowed, &format!("items[{i}]"))?;
+        let location = format!("items[{i}]");
+        check(
+            expect_object(item, &location)?.keys(),
+            &item_keys,
+            &location,
+        )?;
     }
     Ok(())
+}
+
+fn expect_object<'a>(
+    value: &'a serde_json::Value,
+    location: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>> {
+    value.as_object().ok_or_else(|| {
+        Error::new(
+            ErrorCode::SpecInvalid,
+            format!("{location} はオブジェクトである必要があります"),
+        )
+    })
 }
 
 /// 未知のキーを、綴り違いの候補を添えて断る。
@@ -558,32 +555,27 @@ pub(crate) fn check<'a>(
     allowed: &[&str],
     location: &str,
 ) -> Result<()> {
-    for key in keys {
-        if allowed.contains(&key.as_str()) {
-            continue;
-        }
-        let suggestion = closest(key, allowed);
-        let mut err = Error::new(
-            ErrorCode::SpecUnknownField,
-            format!("{location} に未知のキー '{key}' があります"),
-        );
-        err = match suggestion {
-            Some(s) => err.with_hint(format!("'{s}' の綴り違いではありませんか")),
-            None => err.with_hint(format!(
-                "指定できるキー: {}",
-                allowed
-                    .iter()
-                    .collect::<BTreeSet<_>>()
-                    .iter()
-                    .copied()
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
-        };
-        return Err(err);
-    }
-    Ok(())
+    let Some(key) = keys.into_iter().find(|k| !allowed.contains(&k.as_str())) else {
+        return Ok(());
+    };
+    let hint = match closest(key, allowed) {
+        Some(s) => format!("'{s}' の綴り違いではありませんか"),
+        None => format!(
+            "指定できるキー: {}",
+            allowed
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    Err(Error::new(
+        ErrorCode::SpecUnknownField,
+        format!("{location} に未知のキー '{key}' があります"),
+    )
+    .with_hint(hint))
 }
 
 /// 綴り違いの候補を探す。編集距離 2 以内で最も近いものを返す。

@@ -140,7 +140,7 @@ fn resample(image: &RgbaImage, plan: &RotatePlan) -> RgbaImage {
 
     // 行き先の型を書く。`as_mut` の候補は依存グラフの中身で増えうるので、
     // ここを推論に任せると**別のクレートを足しただけで**「型注釈が要る」に
-    // 落ちる（`segment` feature を入れた途端に起きた）
+    // 落ちる（`segment` feature を入れるとそうなる）
     let rows: &mut [u8] = out.as_mut();
     rows.par_chunks_mut(row_bytes)
         .enumerate()
@@ -455,16 +455,23 @@ mod tests {
         assert_eq!([center[0], center[1], center[2]], [200, 60, 50]);
     }
 
-    #[test]
-    fn transparent_pixels_do_not_bleed_their_color_into_the_subject() {
-        // 透明部に「見えない緑」を仕込む。事前乗算せずに補間すると、
-        // 境界の画素がこの緑を吸って商品の輪郭が色づく
+    /// 透明部に「見えない緑」(0,255,0,0) を仕込み、中央に不透明な
+    /// (200,40,30) の正方形を置いた 40x40 の画像。
+    fn square_on_invisible_green() -> RgbaImage {
         let mut img = RgbaImage::from_pixel(40, 40, Rgba([0, 255, 0, 0]));
         for y in 10..30 {
             for x in 10..30 {
                 img.put_pixel(x, y, Rgba([200, 40, 30, 255]));
             }
         }
+        img
+    }
+
+    #[test]
+    fn transparent_pixels_do_not_bleed_their_color_into_the_subject() {
+        // 事前乗算せずに補間すると、境界の画素が透明部の緑を吸って商品の
+        // 輪郭が色づく
+        let img = square_on_invisible_green();
         let p = plan((40, 40), &spec(20.0)).unwrap();
         let out = apply(&img, &p).unwrap();
 
@@ -486,12 +493,7 @@ mod tests {
         // アルファが何であれ RGB はこの色を超えない。**オーバーシュートした
         // アルファを 255 で頭打ちしてから割ると、ここが 226 まで持ち上がる**
         // ——回しただけで商品に無い明るい縁が生まれる
-        let mut img = RgbaImage::from_pixel(40, 40, Rgba([0, 255, 0, 0]));
-        for y in 10..30 {
-            for x in 10..30 {
-                img.put_pixel(x, y, Rgba([200, 40, 30, 255]));
-            }
-        }
+        let img = square_on_invisible_green();
         let p = plan((40, 40), &spec(20.0)).unwrap();
         let out = apply(&img, &p).unwrap();
 
@@ -508,12 +510,7 @@ mod tests {
     fn a_pixel_that_rounds_to_transparent_carries_no_colour() {
         // アルファが 0 に丸まったのに RGB が残ると、「入力の外側は透明」という
         // 決めと食い違う。合成しても見えないので、気づけるのはここだけである
-        let mut img = RgbaImage::from_pixel(40, 40, Rgba([0, 255, 0, 0]));
-        for y in 10..30 {
-            for x in 10..30 {
-                img.put_pixel(x, y, Rgba([200, 40, 30, 255]));
-            }
-        }
+        let img = square_on_invisible_green();
         let p = plan((40, 40), &spec(20.0)).unwrap();
         let out = apply(&img, &p).unwrap();
 

@@ -11,9 +11,9 @@
 //!
 //! **新しい切り抜き経路は作らない。** モデルが出すのは 1024x1024 の確率マップ
 //! ——原寸 24MP に対して 1 画素が 24 画素ぶんを代表する粗さで、輪郭の位置は
-//! 信用できない。そこで確率マップを**トライマップに落とし**、Phase 2 の
-//! `Constraints` として既存の経路へ流す。確定前景・確定背景はモデルが言い、
-//! そのあいだの帯は今までどおり色と連結性とマッティングが決める。
+//! 信用できない。そこで確率マップを**トライマップに落とし**、`--trimap` などの
+//! 空間的な指示と同じ `Constraints` として既存の経路へ流す。確定前景・確定背景は
+//! モデルが言い、そのあいだの帯は色と連結性とマッティングが決める。
 //!
 //! 利用者の空間的な指示（`--trimap` など）はモデルより**勝つ**。モデルは提案で、
 //! 利用者は決定だからである。衝突しても `CONSTRAINT_CONFLICT` にはしない
@@ -23,7 +23,7 @@
 //!
 //! 推論は `tract-onnx`（pure Rust、MIT OR Apache-2.0）で行う。`cargo tree -e
 //! normal` に `*-sys` は 1 つも現れない。既存の Rust クレート（rembg-rs 等）は
-//! すべて onnxruntime（C）依存なので採れなかった。docs/design.md 3.1 / 3.6 を参照。
+//! すべて onnxruntime（C）依存なので採れない。docs/design.md 3.1 / 3.6 を参照。
 
 pub mod model;
 pub mod sha256;
@@ -31,6 +31,7 @@ pub mod sha256;
 #[cfg(feature = "segment")]
 mod isnet;
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use image::RgbaImage;
@@ -108,8 +109,9 @@ pub const SEG_UNCERTAIN_WARN: f64 = 0.3;
 
 /// 前処理で正方形へ落とすときの当てはめ方。
 ///
-/// **実写 2 枚で比べて `Stretch` を既定にした。** 設計の見込みでは
-/// 「アスペクト比を保ったほうが形が崩れない」はずだったが、実測は逆だった。
+/// **既定は `Stretch` で、根拠は実写 2 枚での実測である。** 「アスペクト比を
+/// 保ったほうが形が崩れない」という見込みに反して、実測では `Letterbox` の
+/// ほうが商品を欠く。
 ///
 /// | 画像 | 前処理 | 前景比率 | 目視 |
 /// |---|---|---|---|
@@ -382,7 +384,7 @@ fn nearest(image: &RgbaImage, width: u32, height: u32) -> RgbaImage {
     if image.width() == 0 || image.height() == 0 {
         return RgbaImage::new(width, height);
     }
-    let (sw, sh) = (image.width().max(1), image.height().max(1));
+    let (sw, sh) = (image.width(), image.height());
     RgbaImage::from_fn(width, height, |x, y| {
         let sx = ((u64::from(x) * u64::from(sw)) / u64::from(width.max(1))) as u32;
         let sy = ((u64::from(y) * u64::from(sh)) / u64::from(height.max(1))) as u32;
@@ -442,17 +444,17 @@ pub fn to_probability(
     Probability::new(cw, ch, data)
 }
 
-/// 確率マップを Phase 2 の制約へ落とす。
+/// 確率マップを `Constraints`（確定前景・確定背景）へ落とす。
 ///
 /// `p >= SEG_FG` を `r` 収縮したものが確定前景、`p <= SEG_BG` を `r` 収縮した
 /// ものが確定背景。**削るのは不明の帯を両側へ `r` ずつ広げることと同じである。**
 ///
 /// # 二値化も収縮も、確率マップ自身の格子で行う
 ///
-/// 設計では「原寸へ双線形で拡大してから収縮する」つもりだった。**実測で
-/// そこが処理時間の大半を占めた**——`erode` は窓を素直に舐めるので
-/// `O(n * r)` で、24.5MP・半径 33px では 1 枚あたり 5 秒近くかかる
-/// （実写リモコンで推論 2.4 秒に対してトライマップ化 9.7 秒）。
+/// 「原寸へ双線形で拡大してから収縮する」と、**そこが処理時間の大半を
+/// 占める**——`erode` は窓を素直に舐めるので `O(n * r)` で、24.5MP・
+/// 半径 33px では 1 枚あたり 5 秒近くかかる（実写リモコンで推論 2.4 秒に
+/// 対してトライマップ化 9.7 秒）。
 ///
 /// 格子の側で畳めば `1024^2 * 9` で済み、**同じことを言っている**。
 /// `SEG_MARGIN` は長辺 1000px 換算の値で、確率マップの長辺はちょうど
@@ -594,14 +596,14 @@ pub fn stats_of(probability: &Probability, width: u32, height: u32) -> SegmentSt
 ///
 /// # モデルの「確率が低い」は「背景」ではない
 ///
-/// **実写キーボードでこれが要ることが分かった。** ISNet は黒いキーキャップを
+/// **実写キーボードがその例である。** ISNet は黒いキーキャップを
 /// ほぼ確率 0 で返す——顕著性のモデルにとって、平坦で暗い内部は「目立たない」
 /// のであって「背景」ではない。そのまま確定背景にすると、キーが 1 つ残らず
-/// 穴として抜けた（確定背景は色によらず背景なので、フィルが届く必要すら無い）。
+/// 穴として抜ける（確定背景は色によらず背景なので、フィルが届く必要すら無い）。
 ///
 /// kiri は最初から**背景を「外周から到達できる領域」として定義している**
 /// （4.1 の連結フラッドフィル）。モデルの提案もその定義を通して読む。
-/// 囲まれた低確率の島は確定背景にせず**不明**のまま残し、そこは今までどおり
+/// 囲まれた低確率の島は確定背景にせず**不明**のまま残し、そこは
 /// 色と連結性が決める——キーキャップは商品の枠に囲まれているので前景に残る。
 ///
 /// **払うものがある。** 取っ手の内側のような「商品に囲まれた本物の背景」を
@@ -615,8 +617,8 @@ fn reachable_from_the_border(low: &Mask) -> Mask {
     if w == 0 || h == 0 {
         return out;
     }
-    let mut queue: std::collections::VecDeque<(u32, u32)> = std::collections::VecDeque::new();
-    let push = |queue: &mut std::collections::VecDeque<(u32, u32)>, out: &mut Mask, x, y| {
+    let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
+    let push = |queue: &mut VecDeque<(u32, u32)>, out: &mut Mask, x, y| {
         if low.get(x, y) == 255 && out.get(x, y) == 0 {
             out.set(x, y, 255);
             queue.push_back((x, y));
@@ -687,9 +689,9 @@ pub fn run(_image: &RgbaImage, opts: &SegmentOptions) -> Result<SegmentRun> {
 ///
 /// **`commands/` からも呼ぶ。** 推論に入る前（引数を畳む段階）で断るほうが、
 /// 24MP の読み込みを済ませてから「この build には無い」と言うより早い。
-pub fn unavailable(model: &str) -> crate::error::Error {
-    crate::error::Error::new(
-        crate::error::ErrorCode::SegmentUnavailable,
+pub fn unavailable(model: &str) -> Error {
+    Error::new(
+        ErrorCode::SegmentUnavailable,
         format!("この build には segment 機能が入っていないため --segment {model} は使えません"),
     )
     .with_hint("cargo install --path . --features segment で入れ直してください（MSRV は 1.91 に上がります）")
@@ -833,7 +835,7 @@ mod tests {
     /// **囲まれた低確率の島は確定背景にしない。**
     ///
     /// 実写キーボードの黒いキーキャップがこれで、モデルは確率ほぼ 0 を返す。
-    /// そのまま確定背景にすると、キーが 1 つ残らず穴として抜けた。
+    /// そのまま確定背景にすると、キーが 1 つ残らず穴として抜ける。
     #[test]
     fn a_low_probability_island_inside_the_object_stays_unknown() {
         // 40x40。外周 10px が背景（0.0）、中が物体（1.0）、その中心に

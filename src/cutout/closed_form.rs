@@ -17,7 +17,7 @@
 //! `guided` も逐次なので歩調が合うし、並列化は後から足せるが決定性は後から
 //! 足せない。
 
-use super::guided::{self, MIN_DET, Solved};
+use super::guided::{self, Solved, adjugate, build_background, linear_rgb};
 use super::integral::Integral;
 use super::mask::Mask;
 use image::RgbaImage;
@@ -47,10 +47,10 @@ const DELTA_FLOOR: f64 = 1.0 / 510.0;
 ///
 /// **「残差が減らなければ打ち切る」は前処理つき CG では誤りである。** 単調に
 /// 減るのは誤差の A ノルムで、残差の 2 ノルムは途中で増えてよい。それを停滞と
-/// 読んで打ち切る実装を最初に書き、合成 S5 / S5b と実写 R4 が 23 反復前後で
-/// `max|Δα|` 0.03〜0.07 のまま止まって `MATTING_NOT_CONVERGED` を出した
-/// （f32 のベクトルを f64 へ替えても 1 反復も変わらなかったので、丸めではなく
-/// 判定の側だと分かった）。**膨らみの上限だけを見る。**
+/// 読んで打ち切ると、合成 S5 / S5b と実写 R4 が 23 反復前後で `max|Δα|`
+/// 0.03〜0.07 のまま止まって `MATTING_NOT_CONVERGED` を出す（ベクトルを f64 に
+/// しても反復数は変わらないので、丸めではなく判定の問題である）。**膨らみの
+/// 上限だけを見る。**
 const DIVERGED: f64 = 10.0;
 
 /// 積分画像を張り直す単位(px)。`guided` の `TILE` と同じ理由で同じ値。
@@ -231,10 +231,7 @@ impl Pixels {
                 }
                 let index = pixels.linear.len() as u32;
                 slot[at] = index;
-                let p = image.get_pixel(x, y).0;
-                pixels
-                    .linear
-                    .push([lut[p[0] as usize], lut[p[1] as usize], lut[p[2] as usize]]);
+                pixels.linear.push(linear_rgb(image, lut, x, y));
                 pixels.initial.push(f32::from(alpha.get(x, y)) / 255.0);
                 if class[at] == CLASS_UNKNOWN {
                     pixels.unknown.push(index);
@@ -304,10 +301,8 @@ impl Windows {
         let mut behind: Vec<bool> = Vec::new();
         let mut linear: Vec<[f32; 3]> = Vec::new();
 
-        let mut ty = 0;
-        while ty < h {
-            let mut tx = 0;
-            while tx < w {
+        for ty in (0..h).step_by(TILE as usize) {
+            for tx in (0..w).step_by(TILE as usize) {
                 let tx1 = (tx + TILE - 1).min(w - 1);
                 let ty1 = (ty + TILE - 1).min(h - 1);
                 if let Some((cx0, cy0, cx1, cy1)) =
@@ -325,52 +320,26 @@ impl Windows {
                     for y in py0..=py1 {
                         for x in px0..=px1 {
                             let at = (y as usize) * stride + (x as usize);
-                            let p = image.get_pixel(x, y).0;
-                            linear.push([
-                                lut[p[0] as usize],
-                                lut[p[1] as usize],
-                                lut[p[2] as usize],
-                            ]);
+                            linear.push(linear_rgb(image, lut, x, y));
                             // 確定背景は「帯の外の、前景でない画素」。帯の中は
                             // 混色そのもので、背景のざらつきの材料にならない
                             behind.push(band[at] == 0 && !binary.is_foreground(x, y));
                         }
                     }
-                    let (bg, li) = (&behind, &linear);
-                    background.build(pw, ph, |i| {
-                        if !bg[i] {
-                            return [0.0; 5];
-                        }
-                        let c = li[i];
-                        let v = [f64::from(c[0]), f64::from(c[1]), f64::from(c[2])];
-                        [
-                            v[0],
-                            v[1],
-                            v[2],
-                            v[0] * v[0] + v[1] * v[1] + v[2] * v[2],
-                            1.0,
-                        ]
-                    });
+                    build_background(&mut background, pw, ph, &linear, &behind);
 
                     for y in cy0..=cy1 {
                         for x in cx0..=cx1 {
                             if class[(y as usize) * stride + (x as usize)] < CLASS_CENTRE {
                                 continue;
                             }
-                            let window = (
-                                (x.saturating_sub(radius).max(px0) - px0) as usize,
-                                (y.saturating_sub(radius).max(py0) - py0) as usize,
-                                ((x + radius).min(px1) - px0) as usize,
-                                ((y + radius).min(py1) - py0) as usize,
-                            );
+                            let window = guided::window((px0, py0, px1, py1), x, y, radius);
                             let eps = guided::epsilon(&background, window);
                             windows.push((x, y), &frame, pixels, eps);
                         }
                     }
                 }
-                tx += TILE;
             }
-            ty += TILE;
         }
         windows
     }
@@ -428,7 +397,7 @@ impl Windows {
     /// `out = L v`。既知のスロットの値は 0 で入ってくる前提で、
     /// 未知の行だけが `L_bb v` になる。
     ///
-    /// **ベクトルは f64 である。** f32 でも 21 点の反復数は 1 つも変わらなかった
+    /// **ベクトルは f64 である。** f32 でも 21 点の反復数は 1 つも変わらない
     /// ので、これは速さでも収束でもなく保険である——未知数は 24.5MP でも 25 万
     /// しかなく、倍にしても 10MB しか増えない。`linear` のような入力側は f32 の
     /// まま持つ。
@@ -513,26 +482,11 @@ impl Windows {
 
 /// 対称 3×3 の逆行列の上三角。退化していれば 0（＝その窓は色で何も言わない）。
 fn invert(m: &[f64; 6]) -> [f32; 6] {
-    let (m00, m01, m02, m11, m12, m22) = (m[0], m[1], m[2], m[3], m[4], m[5]);
-    let c00 = m11 * m22 - m12 * m12;
-    let c01 = m02 * m12 - m01 * m22;
-    let c02 = m01 * m12 - m02 * m11;
-    let det = m00 * c00 + m01 * c01 + m02 * c02;
-    if det.abs() < MIN_DET {
+    let Some((cofactors, det)) = adjugate(m) else {
         return [0.0; 6];
-    }
-    let c11 = m00 * m22 - m02 * m02;
-    let c12 = m01 * m02 - m00 * m12;
-    let c22 = m00 * m11 - m01 * m01;
+    };
     let d = 1.0 / det;
-    [
-        (c00 * d) as f32,
-        (c01 * d) as f32,
-        (c02 * d) as f32,
-        (c11 * d) as f32,
-        (c12 * d) as f32,
-        (c22 * d) as f32,
-    ]
+    cofactors.map(|c| (c * d) as f32)
 }
 
 /// タイルの中で `level` 以上の画素の外接矩形。

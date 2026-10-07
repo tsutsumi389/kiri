@@ -65,30 +65,32 @@ impl Transform {
     /// 複製を取らないのは、12MP で 48MB を余分に積むとバッチの並列度ぶんだけ
     /// ピークが膨らむため。アルファには触れない（ICC は色にしか効かない）。
     pub fn apply(&self, image: &mut RgbaImage) {
-        let m = &self.matrix;
-        let d = &self.decode;
         let enc: &[f32; ENCODE_STEPS + 1] = &ENCODE;
         let buf: &mut [u8] = image;
         // 画素ごとに分けると同期のほうが高くつくので、行に相当する塊で分ける
         buf.par_chunks_mut(4 * 8192).for_each(|block| {
             for px in block.chunks_exact_mut(4) {
-                let (r, g, b) = (
-                    d[0][px[0] as usize],
-                    d[1][px[1] as usize],
-                    d[2][px[2] as usize],
-                );
-                px[0] = encode(enc, m[0][0] * r + m[0][1] * g + m[0][2] * b);
-                px[1] = encode(enc, m[1][0] * r + m[1][1] * g + m[1][2] * b);
-                px[2] = encode(enc, m[2][0] * r + m[2][1] * g + m[2][2] * b);
+                let [r, g, b] = self.convert_with(enc, [px[0], px[1], px[2]]);
+                px[0] = r;
+                px[1] = g;
+                px[2] = b;
             }
         });
     }
 
     /// 1 画素だけ変換する。検証と診断のための入口。
     pub fn convert_pixel(&self, rgb: [u8; 3]) -> [u8; 3] {
+        self.convert_with(&ENCODE, rgb)
+    }
+
+    /// `apply` と `convert_pixel` が共有する 1 画素の変換。
+    ///
+    /// エンコード表は呼ぶ側から渡す。`LazyLock` の参照解決を画素ごとに
+    /// 繰り返さないため
+    #[inline]
+    fn convert_with(&self, enc: &[f32; ENCODE_STEPS + 1], rgb: [u8; 3]) -> [u8; 3] {
         let m = &self.matrix;
         let d = &self.decode;
-        let enc: &[f32; ENCODE_STEPS + 1] = &ENCODE;
         let (r, g, b) = (
             d[0][rgb[0] as usize],
             d[1][rgb[1] as usize],
@@ -425,12 +427,7 @@ fn parse_transform(bytes: &[u8]) -> Option<Transform> {
     ];
 
     // 列ベクトルを並べて「線形プロファイル RGB → XYZ(D50)」の行列にする
-    let mut to_pcs = [[0.0f64; 3]; 3];
-    for (i, row) in to_pcs.iter_mut().enumerate() {
-        for (j, v) in row.iter_mut().enumerate() {
-            *v = columns[j][i];
-        }
-    }
+    let to_pcs: [[f64; 3]; 3] = std::array::from_fn(|i| std::array::from_fn(|j| columns[j][i]));
     if !invertible(&to_pcs) {
         return None;
     }
@@ -444,12 +441,7 @@ fn parse_transform(bytes: &[u8]) -> Option<Transform> {
     // DCI 白の DCI-P3、D60 の ACES）で白が白でなくなる。`chad` が要るのは
     // 絶対比色のときだけで、kiri は相対比色しか扱わない。
     let matrix64 = mul(&XYZ_D65_TO_SRGB, &mul(&bradford(D50, D65), &to_pcs));
-    let mut matrix = [[0.0f32; 3]; 3];
-    for (i, row) in matrix.iter_mut().enumerate() {
-        for (j, v) in row.iter_mut().enumerate() {
-            *v = matrix64[i][j] as f32;
-        }
-    }
+    let matrix = matrix64.map(|row| row.map(|v| v as f32));
 
     let decode =
         std::array::from_fn(|c| std::array::from_fn(|i| curves[c].eval(i as f64 / 255.0) as f32));

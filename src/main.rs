@@ -17,9 +17,9 @@ use kiri::cutout::subject::TILT_SHAPE_MIN_FILL;
 use kiri::cutout::{Confidence, OptimizeFixed, bbox_argument};
 use kiri::error::{Error, ErrorCode, ErrorKind, Result};
 use kiri::report::{
-    BackgroundReport, BatchReport, ComplianceReport, CutoutReport, ErrorReport, InfoReport,
-    LintReport, ModelReport, ProcessReport, SchemaReport, SegmentReport, SettingsReport,
-    SubjectReport,
+    BackgroundReport, BatchReport, ComplianceReport, ComposeReport, CutoutReport, ErrorReport,
+    InfoReport, LintReport, ModelReport, OptimizeReport, ProcessReport, RotateReport, SchemaReport,
+    SegmentReport, SettingsReport, SubjectReport,
 };
 use kiri::warning::Warning;
 
@@ -88,61 +88,25 @@ fn from_command_line(matches: &ArgMatches, id: &str) -> bool {
 /// 「全体としては動いたが失敗がある」を表現する必要がある。
 fn dispatch(cli: &Cli) -> Result<i32> {
     match &cli.command {
-        Command::Info(args) => {
-            let report = commands::info::run(args)?;
-            if cli.json {
-                print_json(&report)?;
-            } else {
-                print_info(&report);
-            }
-        }
-        Command::Convert(args) => {
-            let report = commands::convert::run(args)?;
-            if cli.json {
-                print_json(&report)?;
-            } else {
-                print_process(&report);
-            }
-        }
-        Command::Resize(args) => {
-            let report = commands::resize::run(args)?;
-            if cli.json {
-                print_json(&report)?;
-            } else {
-                print_process(&report);
-            }
-        }
-        Command::Rotate(args) => {
-            let report = commands::rotate::run(args)?;
-            if cli.json {
-                print_json(&report)?;
-            } else {
-                print_process(&report);
-            }
-        }
+        Command::Info(args) => emit(cli.json, &commands::info::run(args)?, print_info)?,
+        Command::Convert(args) => emit(cli.json, &commands::convert::run(args)?, print_process)?,
+        Command::Resize(args) => emit(cli.json, &commands::resize::run(args)?, print_process)?,
+        Command::Rotate(args) => emit(cli.json, &commands::rotate::run(args)?, print_process)?,
         Command::Cutout(args) => {
             let report = commands::cutout::run(args)?;
-            if cli.json {
-                print_json(&report)?;
-            } else {
-                print_cutout(&report);
-            }
+            emit(cli.json, &report, print_cutout)?;
             // **`Err` 経路を通さない。** 処理は成功していて成果物も存在する。
             // `ErrorReport` へ差し替えると `outputs[]` も `mask` も消え、
             // 「何が不合格だったか」も「何が書かれたか」も追えなくなる。
-            // batch が `failed > 0` で 4 を返しつつ `BatchReport` を出している
-            // 既存の形をそのまま踏襲する
+            // batch が `failed > 0` で 4 を返しつつ `BatchReport` を出すのと
+            // 同じ形である
             if report.compliance.as_ref().is_some_and(|c| !c.passed) {
                 return Ok(ErrorKind::Compliance.exit_code());
             }
         }
         Command::Compose(args) => {
             let report = commands::compose::run(args)?;
-            if cli.json {
-                print_json(&report)?;
-            } else {
-                print_compose(&report);
-            }
+            emit(cli.json, &report, print_compose)?;
             // **`Err` 経路を通さない。** 組むのは成功していて、成果物もある。
             // `lint` とまったく同じ扱いで、名乗りは `compliance.code` が行う
             if report.compliance.as_ref().is_some_and(|c| !c.passed) {
@@ -151,11 +115,7 @@ fn dispatch(cli: &Cli) -> Result<i32> {
         }
         Command::Lint(args) => {
             let report = commands::lint::run(args)?;
-            if cli.json {
-                print_json(&report)?;
-            } else {
-                print_lint(&report);
-            }
+            emit(cli.json, &report, print_lint)?;
             // **`Err` 経路を通さない。** 検査は成功していて、対象のファイルも
             // そのままある。`ProfileViolation` を `Error::new` で作ると
             // `debug_assert!` で panic する設計になっている（exit 5 の code は
@@ -164,29 +124,15 @@ fn dispatch(cli: &Cli) -> Result<i32> {
                 return Ok(ErrorKind::Compliance.exit_code());
             }
         }
-        Command::Model(args) => {
-            let report = commands::model::run(&args.command)?;
-            if cli.json {
-                print_json(&report)?;
-            } else {
-                print_models(&report);
-            }
-        }
-        Command::Schema => {
-            let report = commands::schema::run();
-            if cli.json {
-                print_json(&report)?;
-            } else {
-                print_schema(&report);
-            }
-        }
+        Command::Model(args) => emit(
+            cli.json,
+            &commands::model::run(&args.command)?,
+            print_models,
+        )?,
+        Command::Schema => emit(cli.json, &commands::schema::run(), print_schema)?,
         Command::Batch(args) => {
             let report = commands::batch::run(args)?;
-            if cli.json {
-                print_json(&report)?;
-            } else {
-                print_batch(&report);
-            }
+            emit(cli.json, &report, print_batch)?;
             // 失敗した項目があれば処理失敗として知らせる。詳細は results[] にある。
             // **4 が 5 に優先する。** 両方あるときに 5 を返すと、成果物が
             // 1 つも無い項目があることが番号から消え、「見れば分かる結果」として
@@ -219,16 +165,14 @@ fn print_schema(report: &SchemaReport) {
         println!("  {}  {}", e.code, e.meaning);
     }
 
-    let width = |codes: Vec<&str>| codes.iter().map(|c| c.chars().count()).max().unwrap_or(0);
-
     println!("\n警告 ({})", report.warnings.len());
-    let w = width(report.warnings.iter().map(|e| e.code.as_str()).collect());
+    let w = column_width(report.warnings.iter().map(|e| e.code.as_str()));
     for e in &report.warnings {
         println!("  {:<w$}  {}", e.code.as_str(), e.summary, w = w);
     }
 
     println!("\nエラー ({})", report.errors.len());
-    let w = width(report.errors.iter().map(|e| e.code.as_str()).collect());
+    let w = column_width(report.errors.iter().map(|e| e.code.as_str()));
     for e in &report.errors {
         println!(
             "  {:<w$}  [{}]  {}",
@@ -246,7 +190,7 @@ fn print_schema(report: &SchemaReport) {
     // はここでしか読めない。行数も表の大きさで決まり（1 プリセット 2 行）、
     // 7 コマンド分のオプションのように膨らまない
     println!("\nプロファイル ({})", report.profiles.len());
-    let w = width(report.profiles.iter().map(|p| p.name).collect());
+    let w = column_width(report.profiles.iter().map(|p| p.name));
     for p in &report.profiles {
         println!("  {:<w$}  {}  {}", p.name, p.revision, p.summary, w = w);
         println!("  {:<w$}  出典 {}", "", p.source, w = w);
@@ -267,6 +211,11 @@ fn print_schema(report: &SchemaReport) {
     }
 
     println!("\nオプションの既定値と綴りは --json が返す（kiri schema --json）");
+}
+
+/// 表の 1 列目を揃える幅（文字数）。
+fn column_width<'a>(cells: impl Iterator<Item = &'a str>) -> usize {
+    cells.map(|c| c.chars().count()).max().unwrap_or(0)
 }
 
 /// モデルの一覧を人間向けに出す。
@@ -331,7 +280,7 @@ fn print_segment(segment: Option<&SegmentReport>) {
 ///
 /// 人間向けには「何通り試して、原寸で何回回して、何が選ばれたか」の 1 行で足りる。
 /// 候補の一覧は 20 行になるのでテキストには出さない——比べたい人は `--json` を読む。
-fn print_optimize(optimize: Option<&kiri::report::OptimizeReport>, settings: &SettingsReport) {
+fn print_optimize(optimize: Option<&OptimizeReport>, settings: &SettingsReport) {
     let Some(o) = optimize else {
         return;
     };
@@ -371,6 +320,16 @@ fn print_optimize(optimize: Option<&kiri::report::OptimizeReport>, settings: &Se
             ""
         }
     );
+}
+
+/// `--json` なら JSON を、そうでなければ人間向けの要約を stdout に出す。
+fn emit<T: Serialize>(json: bool, report: &T, print_text: fn(&T)) -> Result<()> {
+    if json {
+        print_json(report)
+    } else {
+        print_text(report);
+        Ok(())
+    }
 }
 
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
@@ -459,20 +418,27 @@ fn print_process(report: &ProcessReport) {
         );
     }
     print_color(&report.color_space, report.color_converted);
-    if let Some(r) = &report.rotate {
-        // 無劣化かどうかを添える。90 度単位とそれ以外では、同じ「回した」でも
-        // 出力の意味が違う（前者は色が 1 バイトも変わらない）
-        println!(
-            "  回転      {}°  ({})",
-            r.angle,
-            if r.resampled {
-                "再サンプリング"
-            } else {
-                "無劣化"
-            }
-        );
-    }
+    print_rotate(report.rotate.as_ref());
     print_warnings(&report.warnings);
+}
+
+/// 回したときだけ 1 行出す。
+///
+/// 無劣化かどうかを添える。90 度単位とそれ以外では、同じ「回した」でも
+/// 出力の意味が違う（前者は色が 1 バイトも変わらない）
+fn print_rotate(rotate: Option<&RotateReport>) {
+    let Some(r) = rotate else {
+        return;
+    };
+    println!(
+        "  回転      {}°  ({})",
+        r.angle,
+        if r.resampled {
+            "再サンプリング"
+        } else {
+            "無劣化"
+        }
+    );
 }
 
 /// 色を触ったときだけ知らせる。sRGB の素材で毎回 1 行増えても意味がない。
@@ -552,17 +518,7 @@ fn print_cutout(report: &CutoutReport) {
     }
     // 切り抜き → 回転 → キャンバス の順に並べる。**`前景範囲` は回す前の
     // 座標**なので、そのすぐ後に「この後で回した」と言う位置がここである
-    if let Some(r) = &report.rotate {
-        println!(
-            "  回転      {}°  ({})",
-            r.angle,
-            if r.resampled {
-                "再サンプリング"
-            } else {
-                "無劣化"
-            }
-        );
-    }
+    print_rotate(report.rotate.as_ref());
     if let Some(c) = &report.canvas {
         println!(
             "  キャンバス {}x{}  占有率 {:.0}%  配置 {}x{} @ {},{}  (倍率 {:.2})",
@@ -640,19 +596,12 @@ fn print_compliance(compliance: Option<&ComplianceReport>) {
     }
 }
 
-/// `kiri lint` の結果を人間向けに出す。
-///
-/// `print_compliance` を手本にしつつ、**通った条件も 1 行ずつ出す。**
-/// あちらが通った条件を畳むのは、`--fail-on default` が 20 行近くを埋めて
-/// 切り抜きの要約を押し流すからである。lint は検査そのものが用件で、
-/// 行数も規格の条件の数（多くても 9）で決まるので、押し流すものが無い。
-/// **何を見て何を見ていないかが一目で分かること**のほうがここでは重い。
 /// compose の人間向けの行。
 ///
 /// **実測を先に出す。** 書いた値は spec を見れば分かるが、置かれた矩形は
 /// 走らせないと分からない。はみ出しとコントラストはその場で読めるように
 /// 同じ行へ添える。
-fn print_compose(report: &kiri::report::ComposeReport) {
+fn print_compose(report: &ComposeReport) {
     println!("{}", report.spec);
     println!(
         "  canvas    {} x {}{}",
@@ -679,10 +628,8 @@ fn print_compose(report: &kiri::report::ComposeReport) {
             "    {:<10} {:<5} {:>7.1},{:>7.1} {:>7.1}x{:<7.1}",
             layer.id, layer.kind, x, y, w, h
         );
-        if let Some(over) = layer.text_overflow {
-            if over > 0.0 {
-                println!("               はみ出し {over:.1}px");
-            }
+        if let Some(over) = layer.text_overflow.filter(|&over| over > 0.0) {
+            println!("               はみ出し {over:.1}px");
         }
         if let Some(contrast) = layer.text_contrast {
             println!("               コントラスト {contrast:.2}");
@@ -707,11 +654,7 @@ fn print_compose(report: &kiri::report::ComposeReport) {
             }
         );
         for check in &compliance.checks {
-            let mark = match check.status {
-                kiri::compliance::PASS => "o",
-                kiri::compliance::FAIL => "x",
-                _ => "-",
-            };
+            let mark = status_mark(check.status);
             let actual = check
                 .actual
                 .as_ref()
@@ -722,6 +665,13 @@ fn print_compose(report: &kiri::report::ComposeReport) {
     print_warnings(&report.warnings);
 }
 
+/// `kiri lint` の結果を人間向けに出す。
+///
+/// `print_compliance` を手本にしつつ、**通った条件も 1 行ずつ出す。**
+/// あちらが通った条件を畳むのは、`--fail-on default` が 20 行近くを埋めて
+/// 切り抜きの要約を押し流すからである。lint は検査そのものが用件で、
+/// 行数も規格の条件の数（多くても 9）で決まるので、押し流すものが無い。
+/// **何を見て何を見ていないかが一目で分かること**のほうがここでは重い。
 fn print_lint(report: &LintReport) {
     println!("{}", report.input);
     println!(
@@ -735,13 +685,7 @@ fn print_lint(report: &LintReport) {
         report.format, report.width, report.height, report.file_size
     );
     for check in &report.checks {
-        // 印は 3 通りに分ける。`-` は「見ていない」で、`x` の
-        // 「見た上で落ちた」とは次の一手が違う
-        let mark = match check.status {
-            kiri::compliance::PASS => "o",
-            kiri::compliance::FAIL => "x",
-            _ => "-",
-        };
+        let mark = status_mark(check.status);
         let detail = match (&check.expected, &check.actual) {
             (Some(expected), Some(actual)) => format!("{actual}  (要求 {expected})"),
             (Some(expected), None) => format!("{}  (要求 {expected})", check.status),
@@ -753,6 +697,16 @@ fn print_lint(report: &LintReport) {
         println!("  code      {}", code.as_str());
     }
     print_warnings(&report.warnings);
+}
+
+/// 判定の印。3 通りに分ける。`-` は「見ていない」で、`x` の
+/// 「見た上で落ちた」とは次の一手が違う
+fn status_mark(status: &str) -> &'static str {
+    match status {
+        compliance::PASS => "o",
+        compliance::FAIL => "x",
+        _ => "-",
+    }
 }
 
 fn print_batch(report: &BatchReport) {
@@ -767,9 +721,9 @@ fn print_batch(report: &BatchReport) {
                     (_, true) => " ",
                     (_, false) => "!",
                 };
-                // **派生を全部並べる。** 1 本目だけを出していた頃は、
-                // `--sizes` を渡した実行で書かれたファイルの大半が画面から
-                // 消えていた。行そのものにも印を付けるのは、サマリが数百行の
+                // **派生を全部並べる。** 1 本目だけでは、`--sizes` を渡した
+                // 実行で書かれたファイルの大半が画面に出ない。行そのものにも
+                // 印を付けるのは、サマリが数百行の
                 // 後ろにあり、途中の 1 行だけを見た目には成果物が出来ている
                 // ように読めるためである。**行頭の印は項目ごとの警告を指す**
                 // ので、同じ項目の派生には同じ印が並ぶ

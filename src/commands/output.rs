@@ -1,4 +1,4 @@
-//! 出力処理の共通部分。convert と resize が同じ規約で書き出すために使う。
+//! 出力処理の共通部分。各コマンドが同じ規約で書き出すために使う。
 
 use std::path::Path;
 use std::time::Instant;
@@ -35,9 +35,9 @@ pub fn resolve_format(opts: &OutputOpts) -> Result<OutputFormat> {
 
 /// 多派生の指定があるか。
 ///
-/// **1 本しか書かない実行を今までとまったく同じ道へ通すための門である。**
+/// **1 本しか書かない実行を単純な道へ通すための門である。**
 /// `--derive` / `--sizes` / `--formats` / `--naming` のどれも無ければ、パスは
-/// `--output` そのもので、上書き検査も着手前の 1 回きり（Phase 19 と同じ）。
+/// `--output` そのもので、上書き検査も着手前の 1 回きりになる。
 /// どれかがあれば、パスは最終画像の寸法が決まるまで綴れないので、検査は
 /// 書き出しの直前へ寄せる
 pub fn has_derivations(opts: &OutputOpts) -> bool {
@@ -97,9 +97,9 @@ fn writable(path: &Path, force: bool, dry_run: bool) -> Result<Option<Warning>> 
             ),
         )
         .with_hint("本番実行には --force が要ります")
-        // **キーは `output` である**（`SCHEMA_VERSION` 2 で `path` から改名した）。
-        // 派生に紐づく警告が揃って `data.output` で「どの出力の話か」を名乗る
-        // 規約に合わせたもので、同じ意味のキーを 2 つ並べるほうが害が大きい
+        // **キーは `output` である。** 派生に紐づく警告が揃って `data.output` で
+        // 「どの出力の話か」を名乗る規約に合わせる。同じ意味のキーを 2 つ
+        // 並べると、受け手は両方を拾う分岐を書かされる
         .with_data("output", path.display().to_string()),
     ))
 }
@@ -167,19 +167,13 @@ pub fn background_report(
 /// `background_report` と同じ理由で組み立てを 1 箇所に置く。`info` と `cutout` が
 /// 別々に組むと、片方だけ丸め方や項目が食い違っていても誰も気づかない。
 ///
-/// `source` は「この矩形が何から出たか」である。**キーを足すだけで既存の値の
-/// 意味は変えない**——色から測ったものは今までどおり `"colour"` で、
+/// `source` は「この矩形が何から出たか」である。色から測ったものは `"colour"` で、
 /// `info --segment` でモデルから測ったときだけ `"segment"` になる。
 pub fn subject_report(subject: &SubjectHint, source: &'static str) -> SubjectReport {
     SubjectReport {
         source,
         bbox: subject.bbox,
-        normalized_bbox: [
-            round4(subject.normalized_bbox[0]),
-            round4(subject.normalized_bbox[1]),
-            round4(subject.normalized_bbox[2]),
-            round4(subject.normalized_bbox[3]),
-        ],
+        normalized_bbox: subject.normalized_bbox.map(round4),
         area_ratio: round4(subject.area_ratio),
         capture_ratio: round4(subject.capture_ratio),
         delta_e: round4(subject.delta_e),
@@ -207,8 +201,8 @@ pub struct Reserved<'a> {
 ///
 /// **3 通りの入口を 1 つの並びへ畳む。** `--derive` を書いたならそれ、
 /// `--sizes` / `--formats` を書いたならその直積（size が外、format が内）、
-/// どれも無ければ「何も上書きしない 1 本」になる。最後の枝が Phase 19 までと
-/// 同じ道で、**`DeriveSpec::default()` は 1 つも値を持たない**ので、下流は
+/// どれも無ければ「何も上書きしない 1 本」になる。最後の枝は派生を使わない
+/// 単一出力の道で、**`DeriveSpec::default()` は 1 つも値を持たない**ので、下流は
 /// すべて `OutputOpts` の値をそのまま継ぐ
 ///
 /// **`cutout::apply_profile` もこれを呼ぶ。** profile の許す形式の外へ出た
@@ -226,12 +220,12 @@ pub(crate) fn specs(opts: &OutputOpts) -> Vec<DeriveSpec> {
     let widths: Vec<Option<u32>> = if opts.sizes.is_empty() {
         vec![None]
     } else {
-        opts.sizes.iter().map(|w| Some(*w)).collect()
+        opts.sizes.iter().copied().map(Some).collect()
     };
     let formats: Vec<Option<OutputFormat>> = if opts.formats.is_empty() {
         vec![None]
     } else {
-        opts.formats.iter().map(|f| Some(*f)).collect()
+        opts.formats.iter().copied().map(Some).collect()
     };
     let mut out = Vec::with_capacity(widths.len() * formats.len());
     for width in &widths {
@@ -254,6 +248,32 @@ pub(crate) fn specs(opts: &OutputOpts) -> Vec<DeriveSpec> {
 pub struct OutputPlan {
     pub format: OutputFormat,
     pub naming: Option<Naming>,
+}
+
+/// 読み込みより前に済ませる出力の検査をまとめて行う。
+///
+/// 形式の解決・本出力と `--manifest` の上書き検査・`--naming` の解決を、
+/// **この順で**通す（どれかで落ちたときに返る code の優先順位がこの順になる）。
+/// 戻りの警告は上書き検査が dry-run で出したもので、読み込みの警告の後に並べる。
+///
+/// convert / resize / rotate はこれを `run()` の先頭で呼ぶ。cutout は付随出力の
+/// 検査を上書き検査と命名の間に挟むので、同じ部品を個別に呼ぶ
+pub fn prepare(opts: &OutputOpts) -> Result<(OutputPlan, Vec<Warning>)> {
+    let format = resolve_format(opts)?;
+    let overwrite_warning = ensure_writable(opts)?;
+    let manifest_warning =
+        ensure_manifest_writable(opts.manifest.as_deref(), opts.force, opts.dry_run)?;
+    // 命名は寸法を 1 つも見ないので、読み込みより前に解ける。綴り違いに
+    // 気づくのが画像を読んだ後では遅い
+    let plan = OutputPlan {
+        format,
+        naming: plan_naming(opts)?,
+    };
+    let warnings = overwrite_warning
+        .into_iter()
+        .chain(manifest_warning)
+        .collect();
+    Ok((plan, warnings))
 }
 
 /// `--naming` のうち、**寸法に依存しない検査だけ**を先に済ませる。
@@ -295,7 +315,7 @@ pub fn plan_naming(opts: &OutputOpts) -> Result<Option<Naming>> {
 ///
 /// **ここを通り抜けたら、あとは書くだけである。** 1 枚でも書いた後にエラーで
 /// 落ちると半端な成果物が残り、しかも結果 JSON は返らないので何が書けたのかを
-/// 追う手段が無い（計画 7.2）。検査は 3 つ——派生どうしの衝突、付随出力との衝突、
+/// 追う手段が無い。検査は 3 つ——派生どうしの衝突、付随出力との衝突、
 /// 上書きの可否——で、どれも重いエンコードの前に済ませる。
 ///
 /// `source` は最終画像の寸法である。`{width}` も `outputs[].width` も
@@ -427,10 +447,10 @@ fn check_reserved(derivations: &[Derivation], reserved: &[Reserved]) -> Result<(
 
 /// 派生のリサイズで元画像より大きくした。
 ///
-/// `kiri resize --allow-upscale` が出すものと同じ code だが、**こちらは
-/// `data.output` を持つ**——1 実行で複数の派生を書く以上、どの出力の話かが
-/// 分からない警告は分岐の材料にならない
-fn upscaled(from: (u32, u32), to: (u32, u32)) -> Warning {
+/// `kiri resize --allow-upscale` も同じものを出す。派生の側では呼ぶ側が
+/// `derive::tag` で **`data.output` を足す**——1 実行で複数の派生を書く以上、
+/// どの出力の話かが分からない警告は分岐の材料にならない
+pub(crate) fn upscaled(from: (u32, u32), to: (u32, u32)) -> Warning {
     Warning::new(
         WarningCode::Upscaled,
         format!(
@@ -447,8 +467,7 @@ fn upscaled(from: (u32, u32), to: (u32, u32)) -> Warning {
 /// 読み込み結果を受けるのは、**出力が何を名乗るかを画素の素性で決める**ため。
 /// `--no-color-convert` で変換しなかった画素に sRGB の ICC を付けると、名乗りが嘘になる。
 ///
-/// 派生を 1 つも指定しなければ戻りは 1 要素で、そのバイト列も出力パスも
-/// Phase 19 と 1 バイトも変わらない。
+/// 派生を 1 つも指定しなければ戻りは 1 要素で、出力パスは `--output` そのものになる。
 ///
 /// `plan` の `naming` は `plan_naming` が**重い処理の前に**解いたものである。
 /// ここで解き直さないのは、同じテンプレートを 2 度解いて片方だけが通る状態を
@@ -653,7 +672,7 @@ mod tests {
         }
     }
 
-    /// 派生も --naming も使わない、Phase 19 と同じ 1 本の計画
+    /// 派生も --naming も使わない、単一出力の計画
     fn plan(format: OutputFormat) -> OutputPlan {
         OutputPlan {
             format,

@@ -16,6 +16,8 @@
 
 use image::RgbaImage;
 
+use crate::cutout::edges::luma_of;
+
 /// 画素ごとの制約。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Constraint {
@@ -31,8 +33,7 @@ pub enum Constraint {
 pub const TRIMAP_FOREGROUND: u8 = 192;
 /// トライマップで確定背景とみなす輝度の上限。
 ///
-/// この 2 つの間（64〜191）は「不明」で、何も強制しない。Phase 3 の matting は
-/// この帯を作業領域にする。
+/// この 2 つの間（64〜191）は「不明」で、何も強制しない。
 pub const TRIMAP_BACKGROUND: u8 = 63;
 
 /// 切り抜き済みのアルファ（`--alpha-trimap`）で確定前景とみなす下限。
@@ -53,7 +54,7 @@ pub const ALPHA_BACKGROUND: u8 = 5;
 ///
 /// **「0 でない」では JPEG のリンギングを拾う。** 白く塗った矩形を q85 で
 /// 保存しただけで、黒いはずの周囲に 1〜数の値が散り、指示された面積が実測で
-/// 2.4 倍になった。中点で切れば、可逆でない形式を経由しても指示は動かない。
+/// 2.4 倍になる。中点で切れば、可逆でない形式を経由しても指示は動かない。
 ///
 /// トライマップの `TRIMAP_FOREGROUND` / `TRIMAP_BACKGROUND` と同じ向きで
 /// 「中間は指示ではない」を表す値でもある。
@@ -361,17 +362,7 @@ impl Constraints {
         image: &RgbaImage,
         decide: impl Fn(u8) -> Option<Constraint>,
     ) -> u64 {
-        if image.width() != self.width || image.height() != self.height {
-            return 0;
-        }
-        let mut marked = 0u64;
-        for (i, p) in image.pixels().enumerate() {
-            if let Some(kind) = decide(luma(p.0)) {
-                self.mark_index(i, kind);
-                marked += 1;
-            }
-        }
-        marked
+        self.mark_by(image, luma, decide)
     }
 
     /// 画素ごとの**アルファ**から印を付ける。`decide` が `None` を返した画素は
@@ -388,12 +379,23 @@ impl Constraints {
         image: &RgbaImage,
         decide: impl Fn(u8) -> Option<Constraint>,
     ) -> u64 {
+        self.mark_by(image, |p| p[3], decide)
+    }
+
+    /// `mark_by_luma` / `mark_by_alpha` の本体。`read` が画素から判定に使う
+    /// 1 チャンネルを取り出す。寸法が違えば何もしない。
+    fn mark_by(
+        &mut self,
+        image: &RgbaImage,
+        read: impl Fn([u8; 4]) -> u8,
+        decide: impl Fn(u8) -> Option<Constraint>,
+    ) -> u64 {
         if image.width() != self.width || image.height() != self.height {
             return 0;
         }
         let mut marked = 0u64;
         for (i, p) in image.pixels().enumerate() {
-            if let Some(kind) = decide(p.0[3]) {
+            if let Some(kind) = decide(read(p.0)) {
                 self.mark_index(i, kind);
                 marked += 1;
             }
@@ -523,13 +525,12 @@ pub(crate) fn disc_pixels(
     }
 }
 
-/// Rec.709 の輝度。`edges.rs` の堤防と同じ係数で測る。
+/// Rec.709 の輝度を 8bit に丸めたもの。式は `edges` の堤防と共有する。
 ///
 /// マスクを「1 チャンネルのグレー」として読むための唯一の窓口である。
 /// グレー PNG なら 3 チャンネルが同じ値なので、輝度はその値そのものになる。
 fn luma(p: [u8; 4]) -> u8 {
-    let v = 0.2126 * f32::from(p[0]) + 0.7152 * f32::from(p[1]) + 0.0722 * f32::from(p[2]);
-    v.round().clamp(0.0, 255.0) as u8
+    luma_of(p).round().clamp(0.0, 255.0) as u8
 }
 
 #[cfg(test)]

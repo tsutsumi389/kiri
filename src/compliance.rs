@@ -430,10 +430,10 @@ fn parse_rule(token: &str) -> Result<Rule, String> {
             threshold,
         });
     }
-    // **`=` は廃止した。** `touches_edge=true` / `=false` は「書いた値と一致
+    // **`=` は受けない。** `touches_edge=true` / `=false` は「書いた値と一致
     // したら不合格」で、`=false` は「接していなければ落とす」という誰も欲しがら
-    // ない指定になる。方向を選べる形にした結果、**唯一意味のある方向がどちらか
-    // 読めなくなった**ので、裸のトークンだけを受ける。断るときに綴りを案内する
+    // ない指定になる。方向を選べる形にすると**唯一意味のある方向がどちらか
+    // 読めなくなる**ので、裸のトークンだけを受ける。断るときに綴りを案内する
     if let Some((name, _)) = token.split_once('=') {
         let metric = metric_named(name.trim())?;
         return Err(if metric.is_flag() {
@@ -454,7 +454,7 @@ fn parse_rule(token: &str) -> Result<Rule, String> {
 
 /// 真偽の指標の綴りを案内する。
 ///
-/// `=true` / `=false` を廃したので、誤った書き方はすべてここへ来る。
+/// `=true` / `=false` は受けないので、誤った書き方はすべてここへ来る。
 /// **意味も一緒に言う**——裸の `touches_edge` がどちらの向きなのかは、綴りを
 /// 教わっただけでは分からない。
 fn bare_token_hint(metric: Metric, what: &str) -> String {
@@ -495,25 +495,23 @@ fn metric_named(name: &str) -> Result<Metric, String> {
 ///
 /// **逆向きの「必ず発火する門」（`foreground_ratio>=0.0`）も通す。** こちらは
 /// 1 枚目の exit 5 で気づくので黙って通り続けることがなく、「どの画像でも
-/// 落ちること」を確かめる使い方もある（受け入れ基準のテストがそう書く）。
+/// 落ちること」を確かめる使い方もある。
 fn check_range(metric: Metric, operator: Operator, value: f64) -> Result<(), String> {
     if !value.is_finite() {
         return Err(format!("'{value}' は有限な数値である必要があります"));
     }
+    let name = metric.as_str();
     let (low, high) = metric.range();
     if value < low || high.is_some_and(|h| value > h) {
         return Err(match high {
             Some(h) => format!(
-                "{} のしきい値は {low} 以上 {h} 以下である必要があります（{value} が指定されました）",
-                metric.as_str()
+                "{name} のしきい値は {low} 以上 {h} 以下である必要があります（{value} が指定されました）"
             ),
             None => format!(
-                "{} のしきい値は {low} 以上である必要があります（{value} が指定されました）",
-                metric.as_str()
+                "{name} のしきい値は {low} 以上である必要があります（{value} が指定されました）"
             ),
         });
     }
-    let name = metric.as_str();
     // **判定と文面を同じ場所で組む。** 断る向きは 2 つしかなく、`>=` / `<=` は
     // 端ちょうどで発火しうる（値域の外へ出た分は上の検査が既に拾っている）ので、
     // ここで断るものが残らない。2 つに分けて書くと、片方に当たらない向きへ
@@ -652,7 +650,7 @@ fn fixed_threshold(code: WarningCode) -> (Option<Operator>, Option<f64>) {
 }
 
 /// 数値を JSON の数値として出す。**文字列へ畳まない**——エージェントに
-/// 正規表現を書かせないための決めである（Phase 22 の `LintReport` も同じ形を使う）。
+/// 正規表現を書かせないための決めである（`LintReport` も同じ形を使う）。
 fn number(value: f64) -> Option<Value> {
     serde_json::Number::from_f64(value).map(Value::Number)
 }
@@ -866,7 +864,7 @@ mod tests {
 
     /// `=` を書いたら断り、**裸の綴りを案内する。**
     #[test]
-    fn the_old_equals_spelling_is_refused_with_the_bare_token_in_the_message() {
+    fn the_equals_spelling_is_refused_with_the_bare_token_in_the_message() {
         for spec in ["touches_edge=true", "touches_edge=false"] {
             let message = FailOn::parse(spec).unwrap_err();
             assert!(

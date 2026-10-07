@@ -8,6 +8,7 @@
 use image::RgbaImage;
 
 use crate::cli::SegmentOpts;
+use crate::commands::output::round4;
 use crate::cutout::{BackgroundSeen, see_background};
 use crate::error::Result;
 use crate::report::SegmentReport;
@@ -23,12 +24,12 @@ pub struct Decision {
     pub run: Option<SegmentRun>,
     /// 門が測った見立て。**切り抜きへそのまま渡す。**
     ///
-    /// `auto` の門は背景と主体を測って「色では解けないか」を決める。その後の
-    /// `cutout` は同じ画像・同じ `border` で同じものを測り直していた——
-    /// 24.5MP では 1 回 0.2 秒で、`auto` を渡したときだけ 2 度払う形になる。
+    /// `auto` の門は背景と主体を測って「色では解けないか」を決める。渡さないと
+    /// `cutout` が同じ画像・同じ `border` で同じものを測り直す——24.5MP では
+    /// 1 回 0.2 秒で、`auto` を渡したときだけ 2 度払う形になる。
     ///
     /// **門を通らなかった実行では `None`**（`off`、`isnet` の指定、feature
-    /// 無しの断り）。そのときは切り抜き側が今までどおり自分で測る
+    /// 無しの断り）。そのときは切り抜き側が自分で測る
     pub seen: Option<BackgroundSeen>,
     /// モデルを走らせる／走らせないの判断そのものから出た警告。
     /// **`run` の有無によらず出る**——`--segment off` に `--model-path` を
@@ -87,10 +88,10 @@ pub fn decide(
     let mut measured = None;
     if opts.segment == SegmentMode::Auto {
         // 渡されていればそれを使う（`info` は既に測っている）
-        let seen = match seen.filter(|s| s.border == border) {
-            Some(seen) => seen.clone(),
-            None => see_background(image, border),
-        };
+        let seen = seen
+            .filter(|s| s.border == border)
+            .cloned()
+            .unwrap_or_else(|| see_background(image, border));
         let hopeless = colour_is_hopeless(&seen);
         measured = Some(seen);
         if !hopeless {
@@ -170,7 +171,6 @@ fn colour_is_hopeless(seen: &BackgroundSeen) -> bool {
 
 /// 結果 JSON の `segment` ブロック。
 pub fn report(run: &SegmentRun, stats: &SegmentStats) -> SegmentReport {
-    use crate::commands::output::round4;
     SegmentReport {
         model: run.model,
         input_size: run.input_size,
@@ -187,7 +187,6 @@ pub fn report(run: &SegmentRun, stats: &SegmentStats) -> SegmentReport {
 /// モデルが掴めていない以上、同じモデルを別の設定で回しても変わらない。
 /// 打つ手は空間的な指示を自分で渡すことである。
 pub fn uncertain_warning(stats: &SegmentStats) -> Option<Warning> {
-    use crate::commands::output::round4;
     (stats.uncertain_ratio > SEG_UNCERTAIN_WARN).then(|| {
         Warning::new(
             WarningCode::SegmentUncertain,

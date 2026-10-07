@@ -2,7 +2,7 @@
 //!
 //! 組版そのものは resvg へ出す。kiri が自分で持つと禁則処理と字詰めとグリフ配置を
 //! 抱えることになり、しかも**必要な測定値（行ごとの送り幅、外接矩形）は
-//! まさに組版器が出すもの**なので、同じものを二度払うことになる（計画 §10.9）。
+//! まさに組版器が出すもの**なので、同じものを二度払うことになる。
 //!
 //! 外から SVG は見えない。SVG は spec を組版へ渡すための内部の表現で、利用者が
 //! 書くのは spec である——そうでなければ `kiri schema` が何も配れない。
@@ -14,20 +14,21 @@
 //! 組んで順に重ねると、順番が保たれるうえ、**重ねる直前のキャンバスが
 //! 「その文字の背後」そのもの**になる——コントラストを測るための描き直しが要らない。
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use image::RgbaImage;
 use resvg::tiny_skia;
 use resvg::usvg;
 
-use crate::compose::{Canvas, TextLayer};
+use crate::compose::{Align, Canvas, TextLayer};
 use crate::error::{Error, ErrorCode, Result};
 
 /// 組んだ 1 レイヤ。
 pub struct Layout {
     /// 組版後の外接矩形 `[x, y, 幅, 高さ]`。**spec が書いた rect ではない**
     pub bbox: [f64; 4],
-    /// 行ごとの実測幅(px)。**割る材料は返すが、割らない**（計画 §10.3.2）
+    /// 行ごとの実測幅(px)。**割る材料は返すが、割らない**
     pub line_widths: Vec<f64>,
     /// キャンバスと同じ大きさの、この文字だけを描いた画像（straight alpha）
     pub pixels: RgbaImage,
@@ -149,15 +150,17 @@ fn line_index(rest: &str) -> Option<usize> {
 fn to_svg(layer: &TextLayer, canvas: &Canvas, family: &str, ascent: f64) -> String {
     let [x, y, width, _] = layer.rect;
     let anchor_x = match layer.align {
-        crate::compose::Align::Start => x,
-        crate::compose::Align::Center => x + width / 2.0,
-        crate::compose::Align::End => x + width,
+        Align::Start => x,
+        Align::Center => x + width / 2.0,
+        Align::End => x + width,
     };
 
     let mut body = String::new();
     for (i, line) in layer.lines.iter().enumerate() {
         let baseline = y + layer.size * ascent + (i as f64) * layer.size * layer.line_height;
-        body.push_str(&format!(
+        // `String` への書き込みは失敗しない
+        let _ = write!(
+            body,
             "<text id=\"{id}#line-{i}\" x=\"{anchor_x}\" y=\"{baseline}\" \
              font-family=\"{family}\" font-size=\"{size}\" font-weight=\"{weight}\" \
              text-anchor=\"{anchor}\" fill=\"{color}\" xml:space=\"preserve\">{text}</text>",
@@ -168,7 +171,7 @@ fn to_svg(layer: &TextLayer, canvas: &Canvas, family: &str, ascent: f64) -> Stri
             anchor = layer.align.anchor(),
             color = escape(&layer.color),
             text = escape(line),
-        ));
+        );
     }
 
     format!(

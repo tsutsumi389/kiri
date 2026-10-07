@@ -147,11 +147,11 @@ pub fn apply(image: &RgbaImage, plan: &ResizePlan) -> Result<RgbaImage> {
 }
 
 fn scale(image: &RgbaImage, to: (u32, u32)) -> Result<RgbaImage> {
-    // 借用ビューで渡す。`from_vec_u8` に `as_raw().clone()` を渡すと、縮小の
-    // ためだけに元画像のフル RGBA をもう 1 枚持つことになる。20MP で 98MB、
-    // `info` のピーク RSS がそれだけで 1.7 倍になっていた。**`info` は
-    // 「着手前の安い見立て」であり、そこが重くなるのは設計意図と食い違う。**
-    // 読み出すだけなので所有権は要らない
+    // 借用ビューで渡す。読み出すだけなので所有権は要らない。`from_vec_u8` に
+    // `as_raw().clone()` を渡すと、縮小のためだけに元画像のフル RGBA をもう
+    // 1 枚持つことになり、20MP で 98MB、`info` のピーク RSS がそれだけで
+    // 1.7 倍になる。**`info` は「着手前の安い見立て」であり、そこが重くなるのは
+    // 設計意図と食い違う。**
     let src = FirImageRef::new(
         image.width(),
         image.height(),

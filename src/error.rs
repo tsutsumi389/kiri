@@ -305,7 +305,7 @@ impl Error {
     }
 
     pub fn exit_code(&self) -> i32 {
-        self.code.kind().exit_code()
+        self.kind().exit_code()
     }
 }
 
@@ -344,7 +344,7 @@ mod tests {
 
     /// exit 5 の code は `ErrorBody` として作れない。
     ///
-    /// カタログのコメントが宣言しているだけだった約束を、関門として確かめる。
+    /// カタログのコメントが宣言する約束を、`Error::new` の関門として確かめる。
     /// `debug_assert!` なので、`debug-assertions` を落とした build では関門が
     /// 無い——そのときはこの検査も回さない（ci-test は有効にしてある）。
     #[test]

@@ -64,7 +64,7 @@ pub const RIM_SIGMA_FLOOR: f64 = 0.015 * RIM_LINEAR_ONE as f64;
 /// 合成式 C = aF + (1-a)B の下では汚染の境目が a = (σ_B+σ0)/(k(σ_F+σ0)+σ_B+σ0)
 /// に来るので、k = 1 で σ_B ≒ σ_F なら境目はちょうど a = 0.5 ——帯の画素が
 /// いちばん集まっているところ——になる。実測でも 8px かけて溶ける輪郭
-/// （合成 S4、正解では汚染 0）が 0.263 と出た。
+/// （合成 S4、正解では汚染 0）が 0.263 と出る。
 ///
 /// **散らばりで正規化しても、この倍率は要る。** 正規化が効くのは σ が
 /// 素材ごとに違うとき（布の繊維は σ が大きく、無地の紙は σ0 に埋もれる）で
@@ -87,7 +87,7 @@ pub const RIM_NEARER: f64 = 2.0;
 /// 雑音を拾うだけで何も決められない。`refine` の `min_separation` と同じ思想で、
 /// 決められないものを 0 か 1 かに丸めないために要る。
 ///
-/// **絶対的な色差（旧 ΔE 6）ではなく散らばりに対する比で問う。** 繊維の
+/// **絶対的な色差（ΔE 6 のような固定値）ではなく散らばりに対する比で問う。** 繊維の
 /// ばらつきが ΔE 10 ある布の上では ΔE 6 の分離は何も分離していないし、
 /// 逆に無地の背景なら ΔE 4 でも 2 つの分布ははっきり割れている。2.0 は
 /// 「両側の散らばりを足して 2 倍してもなお届かない」水準で、白地に ΔE 2 の
@@ -417,36 +417,31 @@ fn box_sum(cells: &mut [Sums], gw: usize, gh: usize, radius: usize) {
     let mut line = vec![Sums::default(); gw.max(gh)];
     for y in 0..gh {
         line[..gw].copy_from_slice(&cells[y * gw..(y + 1) * gw]);
-        let mut acc = Sums::default();
-        for cell in line.iter().take(radius.min(gw - 1) + 1) {
-            acc.join(cell);
-        }
-        for x in 0..gw {
-            cells[y * gw + x] = acc;
-            if x >= radius {
-                acc.subtract(&line[x - radius]);
-            }
-            if x + radius + 1 < gw {
-                acc.join(&line[x + radius + 1]);
-            }
-        }
+        slide(&line[..gw], radius, |x, acc| cells[y * gw + x] = acc);
     }
     for x in 0..gw {
         for y in 0..gh {
             line[y] = cells[y * gw + x];
         }
-        let mut acc = Sums::default();
-        for cell in line.iter().take(radius.min(gh - 1) + 1) {
-            acc.join(cell);
+        slide(&line[..gh], radius, |y, acc| cells[y * gw + x] = acc);
+    }
+}
+
+/// `line` の各位置を中心とする半径 `radius` の箱和を、先頭から順に `put` へ渡す。
+/// 窓は列の外へはみ出さない。
+fn slide(line: &[Sums], radius: usize, mut put: impl FnMut(usize, Sums)) {
+    let len = line.len();
+    let mut acc = Sums::default();
+    for cell in line.iter().take(radius.min(len - 1) + 1) {
+        acc.join(cell);
+    }
+    for i in 0..len {
+        put(i, acc);
+        if i >= radius {
+            acc.subtract(&line[i - radius]);
         }
-        for y in 0..gh {
-            cells[y * gw + x] = acc;
-            if y >= radius {
-                acc.subtract(&line[y - radius]);
-            }
-            if y + radius + 1 < gh {
-                acc.join(&line[y + radius + 1]);
-            }
+        if i + radius + 1 < len {
+            acc.join(&line[i + radius + 1]);
         }
     }
 }
@@ -455,6 +450,20 @@ fn box_sum(cells: &mut [Sums], gw: usize, gh: usize, radius: usize) {
 mod tests {
     use super::*;
     use image::Rgba;
+
+    /// x = 29..=31 を挟んで、左を確定前景、右を確定背景として集める。
+    fn split_at_the_edge(image: &RgbaImage) -> LocalColours {
+        let (w, h) = (image.width(), image.height());
+        build(image, (0, 0, w - 1, h - 1), 1.0, |x, _| {
+            if x < 29 {
+                Role::Foreground
+            } else if x > 31 {
+                Role::Background
+            } else {
+                Role::Skip
+            }
+        })
+    }
 
     /// 左半分が濃色、右半分が白の画像。境界の 1 列だけを問う。
     fn scene(edge: [u8; 3]) -> (RgbaImage, LocalColours) {
@@ -467,15 +476,7 @@ mod tests {
             }
             image.put_pixel(30, y, Rgba([edge[0], edge[1], edge[2], 255]));
         }
-        let grid = build(&image, (0, 0, w - 1, h - 1), 1.0, |x, _| {
-            if x < 29 {
-                Role::Foreground
-            } else if x > 31 {
-                Role::Background
-            } else {
-                Role::Skip
-            }
-        });
+        let grid = split_at_the_edge(&image);
         (image, grid)
     }
 
@@ -526,15 +527,7 @@ mod tests {
                 image.put_pixel(x, y, Rgba([248, 248, 247, 255]));
             }
         }
-        let grid = build(&image, (0, 0, w - 1, h - 1), 1.0, |x, _| {
-            if x < 29 {
-                Role::Foreground
-            } else if x > 31 {
-                Role::Background
-            } else {
-                Role::Skip
-            }
-        });
+        let grid = split_at_the_edge(&image);
         let p = image.get_pixel(30, 20).0;
         assert_eq!(grid.classify(grid.cell(30, 20), &p[..3]), None);
     }

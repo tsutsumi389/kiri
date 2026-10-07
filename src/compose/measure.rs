@@ -120,7 +120,7 @@ pub fn outside(area: [f64; 4], placed: [f64; 4]) -> bool {
 /// `beneath` の画素は透明でありうる（`canvas.background` を書かなかった spec）。
 /// **RGB だけを見ると、それが黒として測られる**——白い文字が 1.0 を返して
 /// 「読めない」と言い、黒い文字が 21 を返して「読める」と言う。どちらも実物とは
-/// 逆である（計画 §10.11 の H5）。
+/// 逆である。
 ///
 /// `flatten_to` は、その透明が**最後に何色になるか**である。JPEG のように透過を
 /// 保持できない形式や `--flatten` では潰す色が決まっているので、そこへ重ねてから
@@ -230,55 +230,50 @@ pub fn warnings(report: &LayerReport) -> Vec<Warning> {
     let mut out = Vec::new();
     let id = &report.id;
 
-    if let Some(over) = report.text_overflow {
-        if over > 0.0 {
-            out.push(
-                Warning::new(
-                    WarningCode::TextOverflow,
-                    format!("'{id}' が rect からはみ出しています（{over:.1}px）"),
-                )
-                .with_hint(
-                    "kiri は縮めも折り返しもしません。lines を割るか、rect か size を\
+    if let Some(over) = report.text_overflow.filter(|&over| over > 0.0) {
+        out.push(
+            Warning::new(
+                WarningCode::TextOverflow,
+                format!("'{id}' が rect からはみ出しています（{over:.1}px）"),
+            )
+            .with_hint(
+                "kiri は縮めも折り返しもしません。lines を割るか、rect か size を\
                  変えてください",
-                )
-                .with_data("text_overflow", over)
-                .with_data("rect", report.rect.to_vec())
-                .with_data("placed", report.placed.to_vec()),
-            );
-        }
+            )
+            .with_data("text_overflow", over)
+            .with_data("rect", report.rect.to_vec())
+            .with_data("placed", report.placed.to_vec()),
+        );
     }
 
-    if let Some(ratio) = report.text_contrast {
-        if ratio < MIN_CONTRAST {
-            out.push(
-                Warning::new(
-                    WarningCode::TextContrastLow,
-                    format!(
-                        "'{id}' と背後のコントラスト比が {ratio:.2} です（{MIN_CONTRAST} 未満）"
-                    ),
-                )
-                .with_hint("文字色か、その文字が載っている場所の下地を変えてください")
-                .with_data("text_contrast", ratio)
-                .with_data("minimum", MIN_CONTRAST),
-            );
-        }
+    if let Some(ratio) = report.text_contrast.filter(|&ratio| ratio < MIN_CONTRAST) {
+        out.push(
+            Warning::new(
+                WarningCode::TextContrastLow,
+                format!("'{id}' と背後のコントラスト比が {ratio:.2} です（{MIN_CONTRAST} 未満）"),
+            )
+            .with_hint("文字色か、その文字が載っている場所の下地を変えてください")
+            .with_data("text_contrast", ratio)
+            .with_data("minimum", MIN_CONTRAST),
+        );
     }
 
-    if let Some(ratio) = report.layer_overlap {
-        if ratio > MAX_SUBJECT_OVERLAP {
-            out.push(
-                Warning::new(
-                    WarningCode::LayersOverlap,
-                    format!(
-                        "'{id}' の {:.1}% が subject と重なっています",
-                        ratio * 100.0
-                    ),
-                )
-                .with_hint("文字の rect を商品の外へ寄せてください")
-                .with_data("layer_overlap", ratio)
-                .with_data("maximum", MAX_SUBJECT_OVERLAP),
-            );
-        }
+    if let Some(ratio) = report
+        .layer_overlap
+        .filter(|&ratio| ratio > MAX_SUBJECT_OVERLAP)
+    {
+        out.push(
+            Warning::new(
+                WarningCode::LayersOverlap,
+                format!(
+                    "'{id}' の {:.1}% が subject と重なっています",
+                    ratio * 100.0
+                ),
+            )
+            .with_hint("文字の rect を商品の外へ寄せてください")
+            .with_data("layer_overlap", ratio)
+            .with_data("maximum", MAX_SUBJECT_OVERLAP),
+        );
     }
 
     if report.outside_safe_area == Some(true) {

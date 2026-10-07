@@ -332,16 +332,13 @@ fn read_exif(bytes: &[u8]) -> (u16, Option<u16>) {
 
 /// EXIF Orientation に従って回転・反転を適用する。
 /// 変換自体は image クレートの実装に委ねる（8 通りの取り違えは事故のもとであるため）。
-fn apply_orientation(image: DynamicImage, exif_orientation: u16) -> (DynamicImage, bool) {
-    if exif_orientation <= 1 || exif_orientation > 8 {
-        return (image, false);
-    }
-    let Ok(value) = u8::try_from(exif_orientation) else {
-        return (image, false);
-    };
-    match image::metadata::Orientation::from_exif(value) {
+fn apply_orientation(mut image: DynamicImage, exif_orientation: u16) -> (DynamicImage, bool) {
+    let orientation = u8::try_from(exif_orientation)
+        .ok()
+        .filter(|v| (2..=8).contains(v))
+        .and_then(image::metadata::Orientation::from_exif);
+    match orientation {
         Some(orientation) => {
-            let mut image = image;
             image.apply_orientation(orientation);
             (image, true)
         }
@@ -564,7 +561,7 @@ mod tests {
         );
     }
 
-    /// ICC が無い画像は今までどおり触らない。
+    /// ICC が無い画像の画素には触らない。
     #[test]
     fn an_image_without_a_profile_is_passed_through() {
         let dir = tempfile::tempdir().unwrap();

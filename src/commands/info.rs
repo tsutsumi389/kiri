@@ -43,7 +43,7 @@ pub fn run(args: &InfoArgs) -> Result<InfoReport> {
     // 差し替えるのは、`--segment` を渡した利用者が知りたいのが
     // 「モデルはどこを商品と見たか」だからである。何から出たかは
     // `subject.source` が必ず名乗るので、取り違えようがない
-    let decision = segment::decide(&loaded.image, &args.segment, args.border, Some(&seen))?;
+    let mut decision = segment::decide(&loaded.image, &args.segment, args.border, Some(&seen))?;
     let (subject, subject_source) = match decision.run.as_ref() {
         Some(run) => (
             detect_subject_from_probability(
@@ -58,7 +58,7 @@ pub fn run(args: &InfoArgs) -> Result<InfoReport> {
     };
     let mut warnings = loaded.warnings();
     // 判断そのものから出た警告（`--segment off` に添えた `--model-path` など）
-    warnings.extend(decision.warnings.iter().cloned());
+    warnings.append(&mut decision.warnings);
     // **`cutout` と同じ警告を出す。** `schema` は `segment.uncertain_ratio` を
     // `info` にも配ったうえで「0.3 を超えたら SEGMENT_UNCERTAIN」と言っている。
     // ここで黙ると、配った値を読んで自分で比べたエージェントだけが気づく——
@@ -383,7 +383,7 @@ mod tests {
         );
     }
 
-    /// モデルを使っていなければ、文面は 1 文字も変わらない。
+    /// モデルを使っていなければ、撮り直しを勧める文面のままである。
     #[test]
     fn without_the_model_the_wording_is_unchanged() {
         let w = low_uniformity_warnings(
@@ -469,7 +469,7 @@ mod tests {
         assert!(!hint.contains("--bbox"), "{hint}");
     }
 
-    /// 主体が 1 つも見つからなければ、今までどおりの一般的な説明に留める。
+    /// 主体が 1 つも見つからなければ、一般的な説明に留める。
     #[test]
     fn without_a_subject_the_hint_stays_generic() {
         let w = low_uniformity_warnings(

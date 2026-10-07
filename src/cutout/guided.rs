@@ -3,7 +3,7 @@
 //! 射影アルファ（`refine`）は画素ごとに独立に解く。**隣の画素と相談しない**ので、
 //! 局所背景 B が織り目で散らばる場所では、その散らばりがそのままアルファの
 //! 雑音になる。不織布の上の黒い商品では、輪郭に沿ってアルファが 1px ごとに
-//! 0.2 も上下し、それが「輪郭のギザギザ」として見えていた。
+//! 0.2 も上下し、それが「輪郭のギザギザ」として見える。
 //!
 //! ここでは射影アルファ p を入力、**線形 RGB の元画像 I を案内画像**として、
 //! カラー guided filter（He, Sun, Tang 2010 の色版）を帯に掛ける。窓ごとに
@@ -78,7 +78,7 @@ const TILE: u32 = 128;
 /// **ただの箱ぼかし**になる。形だけを見た平滑化を拒むのは (c) と同じ理由で、
 /// 「輪郭が滑らかになったのに真の位置からは遠のく」を招く（合成 S9 で
 /// 輪郭誤差 19.9 → 27.8、粗さ 2.49 → 0.02 と、**壊れた切り抜きが指標の上で
-/// だけ良く見える**状態が再現した）。
+/// だけ良く見える**状態が再現する）。
 ///
 /// 12MP で 1.5MB。画素ごとに 1 バイト持つと 12MB になる。
 ///
@@ -184,18 +184,14 @@ pub fn feather(
         return out;
     }
     let mut ws = Workspace::default();
-    let mut ty = 0;
-    while ty < h {
-        let mut tx = 0;
-        while tx < w {
+    for ty in (0..h).step_by(TILE as usize) {
+        for tx in (0..w).step_by(TILE as usize) {
             if let Some(tile) = plan_tile(band, (w, h), (tx, ty), radius) {
                 prepare(image, lut, binary, band, alpha, &mut ws, &tile);
                 solve(&mut ws, &tile, radius);
                 apply(band, solved, w, &ws, &tile, radius, &mut out);
             }
-            tx += TILE;
         }
-        ty += TILE;
     }
     out
 }
@@ -272,9 +268,7 @@ fn prepare(
     ws.behind.reserve(cells);
     for y in tile.py0..=tile.py1 {
         for x in tile.px0..=tile.px1 {
-            let p = image.get_pixel(x, y).0;
-            ws.linear
-                .push([lut[p[0] as usize], lut[p[1] as usize], lut[p[2] as usize]]);
+            ws.linear.push(linear_rgb(image, lut, x, y));
             ws.alpha.push(f32::from(alpha.get(x, y)) / 255.0);
             // 確定背景は「帯の外の、前景でない画素」。帯の中は混色そのもので、
             // 背景のざらつきを測る材料にならない
@@ -306,8 +300,27 @@ fn prepare(
             v[2] * a,
         ]
     });
-    let behind = &ws.behind;
-    ws.background.build(tile.pw, tile.ph, |i| {
+    build_background(&mut ws.background, tile.pw, tile.ph, linear, &ws.behind);
+}
+
+/// 画素を LUT で線形 RGB へ写す。
+#[inline]
+pub(crate) fn linear_rgb(image: &RgbaImage, lut: &[f32; 256], x: u32, y: u32) -> [f32; 3] {
+    let p = image.get_pixel(x, y).0;
+    [lut[p[0] as usize], lut[p[1] as usize], lut[p[2] as usize]]
+}
+
+/// 確定背景の色（3）/ 二乗和（1）/ 画素数（1）の積分画像を張る。`epsilon` の材料。
+///
+/// **`closed_form` も同じ材料で ε を決める**ので、張り方もここ 1 本にしておく。
+pub(crate) fn build_background(
+    integral: &mut Integral<5>,
+    w: usize,
+    h: usize,
+    linear: &[[f32; 3]],
+    behind: &[bool],
+) {
+    integral.build(w, h, |i| {
         if !behind[i] {
             return [0.0; 5];
         }
@@ -331,7 +344,8 @@ fn solve(ws: &mut Workspace, tile: &Tile, radius: u32) {
 
     for y in tile.ay0..=tile.ay1 {
         for x in tile.ax0..=tile.ax1 {
-            let (qx0, qy0, qx1, qy1) = window(tile, x, y, radius);
+            let (qx0, qy0, qx1, qy1) =
+                window((tile.px0, tile.py0, tile.px1, tile.py1), x, y, radius);
             let n = ((qx1 - qx0 + 1) * (qy1 - qy0 + 1)) as f64;
             let s = ws.moments.sum(qx0, qy0, qx1, qy1);
             let inv = 1.0 / n;
@@ -352,24 +366,18 @@ fn solve(ws: &mut Workspace, tile: &Tile, radius: u32) {
                 s[12] * inv - mu[2] * pbar,
             ];
 
-            let c00 = m11 * m22 - m12 * m12;
-            let c01 = m02 * m12 - m01 * m22;
-            let c02 = m01 * m12 - m02 * m11;
-            let det = m00 * c00 + m01 * c01 + m02 * c02;
-            let a = if det.abs() < MIN_DET {
+            let a = match adjugate(&[m00, m01, m02, m11, m12, m22]) {
                 // 案内画像が窓の中で完全に一様。傾きは決めようがないので
                 // 平均だけを返す（q = p̄）
-                [0.0; 3]
-            } else {
-                let c11 = m00 * m22 - m02 * m02;
-                let c12 = m01 * m02 - m00 * m12;
-                let c22 = m00 * m11 - m01 * m01;
-                let d = 1.0 / det;
-                [
-                    (c00 * cov[0] + c01 * cov[1] + c02 * cov[2]) * d,
-                    (c01 * cov[0] + c11 * cov[1] + c12 * cov[2]) * d,
-                    (c02 * cov[0] + c12 * cov[1] + c22 * cov[2]) * d,
-                ]
+                None => [0.0; 3],
+                Some(([c00, c01, c02, c11, c12, c22], det)) => {
+                    let d = 1.0 / det;
+                    [
+                        (c00 * cov[0] + c01 * cov[1] + c02 * cov[2]) * d,
+                        (c01 * cov[0] + c11 * cov[1] + c12 * cov[2]) * d,
+                        (c02 * cov[0] + c12 * cov[1] + c22 * cov[2]) * d,
+                    ]
+                }
             };
             let b = pbar - a[0] * mu[0] - a[1] * mu[1] - a[2] * mu[2];
             let slot = ((y - tile.ay0) as usize) * tile.aw + (x - tile.ax0) as usize;
@@ -408,13 +416,40 @@ pub(crate) fn epsilon(background: &Integral<5>, window: (usize, usize, usize, us
     (EPS_GAIN * variance).max(EPS_FLOOR)
 }
 
-/// 画像座標 (x, y) を中心とする窓を、積分画像の局所座標で返す。
-fn window(tile: &Tile, x: u32, y: u32, radius: u32) -> (usize, usize, usize, usize) {
+/// 対称 3×3 行列（上三角 m00, m01, m02, m11, m12, m22）の余因子行列の上三角と
+/// 行列式。行列式が `MIN_DET` を下回れば退化とみなして `None`。
+///
+/// **`closed_form` の逆行列と同じ式を使う。** 割り算をどこで掛けるかは呼び出し側が
+/// 決める（掛ける順で丸めが変わるので、ここでは割らない）。
+pub(crate) fn adjugate(m: &[f64; 6]) -> Option<([f64; 6], f64)> {
+    let [m00, m01, m02, m11, m12, m22] = *m;
+    let c00 = m11 * m22 - m12 * m12;
+    let c01 = m02 * m12 - m01 * m22;
+    let c02 = m01 * m12 - m02 * m11;
+    let det = m00 * c00 + m01 * c01 + m02 * c02;
+    if det.abs() < MIN_DET {
+        return None;
+    }
+    let c11 = m00 * m22 - m02 * m02;
+    let c12 = m01 * m02 - m00 * m12;
+    let c22 = m00 * m11 - m01 * m01;
+    Some(([c00, c01, c02, c11, c12, c22], det))
+}
+
+/// 画像座標 (x, y) を中心とする半径 `radius` の窓を領域 `region`（画像座標、
+/// 両端を含む）の中へ切り詰め、その領域の局所座標で返す。
+pub(crate) fn window(
+    region: (u32, u32, u32, u32),
+    x: u32,
+    y: u32,
+    radius: u32,
+) -> (usize, usize, usize, usize) {
+    let (x0, y0, x1, y1) = region;
     (
-        (x.saturating_sub(radius).max(tile.px0) - tile.px0) as usize,
-        (y.saturating_sub(radius).max(tile.py0) - tile.py0) as usize,
-        ((x + radius).min(tile.px1) - tile.px0) as usize,
-        ((y + radius).min(tile.py1) - tile.py0) as usize,
+        (x.saturating_sub(radius).max(x0) - x0) as usize,
+        (y.saturating_sub(radius).max(y0) - y0) as usize,
+        ((x + radius).min(x1) - x0) as usize,
+        ((y + radius).min(y1) - y0) as usize,
     )
 }
 
@@ -436,10 +471,8 @@ fn apply(
             if band[at] == 0 || !solved.get(at) {
                 continue;
             }
-            let qx0 = (x.saturating_sub(radius).max(tile.ax0) - tile.ax0) as usize;
-            let qy0 = (y.saturating_sub(radius).max(tile.ay0) - tile.ay0) as usize;
-            let qx1 = ((x + radius).min(tile.ax1) - tile.ax0) as usize;
-            let qy1 = ((y + radius).min(tile.ay1) - tile.ay0) as usize;
+            let (qx0, qy0, qx1, qy1) =
+                window((tile.ax0, tile.ay0, tile.ax1, tile.ay1), x, y, radius);
             let n = ((qx1 - qx0 + 1) * (qy1 - qy0 + 1)) as f64;
             let s = ws.averaged.sum(qx0, qy0, qx1, qy1);
             let inv = 1.0 / n;

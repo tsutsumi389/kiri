@@ -150,10 +150,7 @@ pub fn alpha(product: &RgbaImage, spec: &ShadowSpec) -> (Vec<u8>, ShadowBounds) 
                 continue;
             }
             touches_border |= x == 0 || y == 0 || x == w - 1 || y == h - 1;
-            rect = Some(match rect {
-                None => [x, y, x, y],
-                Some([x1, y1, x2, y2]) => [x1.min(x), y1.min(y), x2.max(x), y2.max(y)],
-            });
+            grow_rect(&mut rect, x, y);
         }
     }
 
@@ -165,10 +162,20 @@ pub fn alpha(product: &RgbaImage, spec: &ShadowSpec) -> (Vec<u8>, ShadowBounds) 
     // 落ちた画素があった、(b) 外周に影のインクが残っている。**ぼかしの台が
     // 縁を跨いだかどうかでは決めない**——箱型の台は約 3σ あるので、裾が
     // 丸めで 0 になって見えていない場合まで真になり、既定値で常に
-    // `clipped: true` が出る偽陽性になっていた
+    // `clipped: true` が出る偽陽性になる
     let clipped = spec.opacity > 0.0 && (shifted.dropped || touches_border);
 
     (alpha, ShadowBounds { rect, clipped })
+}
+
+/// 外接矩形 [x1, y1, x2, y2] を画素 (x, y) まで広げる。`None` は空の矩形。
+///
+/// `ReflectBounds` も同じ形の矩形を組むので、ここを共有する。
+pub(crate) fn grow_rect(rect: &mut Option<[u32; 4]>, x: u32, y: u32) {
+    *rect = Some(match *rect {
+        None => [x, y, x, y],
+        Some([x1, y1, x2, y2]) => [x1.min(x), y1.min(y), x2.max(x), y2.max(y)],
+    });
 }
 
 /// 箱型フィルタが実際に実現する σ。
@@ -242,9 +249,9 @@ pub(crate) fn compose(image: &mut RgbaImage, alpha: &[u8], color: [u8; 3]) {
 /// 幅は必ず奇数にする。偶数幅の箱型は重心が半画素ずれ、3 回重ねると影が
 /// オフセットの指定から 1.5px ずれる。
 ///
-/// **桁外れの σ でも算術を壊さない。** `as i64` の飽和と `wl + 2` の桁溢れが
-/// そのまま panic（debug）や幅 0（release）になっていた。飽和つきの演算で
-/// `MAX_BOX_WIDTH` へ丸める——σ 自体は `cli::SHADOW_BLUR_MAX` が断るので、
+/// **桁外れの σ でも算術を壊さない。** 素直に書くと `as i64` の飽和と
+/// `wl + 2` の桁溢れが panic（debug）や幅 0（release）になるので、飽和つきの
+/// 演算で `MAX_BOX_WIDTH` へ丸める——σ 自体は `cli::SHADOW_BLUR_MAX` が断るので、
 /// ここに当たるのは通らない経路ができたときだけである。
 fn box_widths(sigma: f64, n: usize) -> Vec<u32> {
     // 幅 1 の箱型は恒等。σ が 0（と nan——clap で弾いてあるが下流で守る）なら
@@ -257,10 +264,10 @@ fn box_widths(sigma: f64, n: usize) -> Vec<u32> {
     // f64 -> i64 の `as` は飽和するので、まず上限へ丸めてから偶奇を直す。
     // 先に 1 を引くと i64::MIN 付近で桁が溢れる
     let mut wl = (ideal.floor() as i64).clamp(1, MAX_BOX_WIDTH);
+    // `wl >= 1` なので、偶数なら 2 以上で、1 引いても 1 を下回らない
     if wl % 2 == 0 {
         wl -= 1;
     }
-    let wl = wl.max(1);
     let wu = (wl + 2).min(MAX_BOX_WIDTH | 1);
     let wlf = wl as f64;
     let m = ((12.0 * sigma * sigma - nf * wlf * wlf - 4.0 * nf * wlf - 3.0 * nf)
@@ -273,9 +280,8 @@ fn box_widths(sigma: f64, n: usize) -> Vec<u32> {
 
 /// 箱型フィルタの作業領域。
 ///
-/// **3 パスで毎回確保していた。** 24.5MP では 1 パスあたりの行のぶんを
-/// 確保し直すことになる。寸法はパスを通して変わらないので、`synth` が
-/// 1 度だけ持つ。
+/// 寸法はパスを通して変わらないので、`alpha` が 1 度だけ確保して 3 パスで
+/// 使い回す。
 ///
 /// # 原寸の出力バッファは持たない
 ///
@@ -284,11 +290,11 @@ fn box_widths(sigma: f64, n: usize) -> Vec<u32> {
 /// 同じ配列へ書き戻せる（`blur_pass`）。24.5MP・σ 57px では 24.5MB が
 /// 0.4MB になる。
 ///
-/// **プロセスのピークは動かない。** 24.5MP で 874MB → 873MB、8000x8000 の
-/// キャンバスでも 1381MB のままだった（`/usr/bin/time -l`）。峰を作っているのは
-/// 切り抜き本体と書き出しで、影の層はその後ろに隠れている。減らしたのは
-/// 確保であって峰ではない——**測って外れた見立てをそのまま残しておく**ほうが、
-/// 次に同じ場所を疑う人の時間を節約する。
+/// **ただしプロセスのピークは動かない。** 峰を作っているのは切り抜き本体と
+/// 書き出しで、影の層はその後ろに隠れている（`/usr/bin/time -l` で、出力
+/// バッファを持つ形と比べても 24.5MP で 874MB → 873MB、8000x8000 の
+/// キャンバスでも 1381MB のまま）。減るのは確保であって峰ではないので、
+/// ピークを下げたいときにここを疑っても得るものは無い。
 struct Scratch {
     prefix: Vec<u32>,
     row: Vec<u8>,
@@ -457,7 +463,7 @@ mod tests {
             offset: (6, 9),
             ..spec()
         };
-        let (out, bounds) = synth(product.clone(), &s);
+        let (out, bounds) = synth(product, &s);
         assert_eq!(
             bounds.rect,
             Some([26, 29, 35, 38]),
@@ -573,7 +579,7 @@ mod tests {
     fn a_shadow_running_off_the_image_is_clipped_and_reported() {
         let product = block(40, 40, 24, 24, 39, 39);
         let (out, bounds) = synth(
-            product.clone(),
+            product,
             &ShadowSpec {
                 offset: (10, 10),
                 sigma: 2.0,
@@ -597,7 +603,7 @@ mod tests {
     fn a_shadow_pushed_entirely_off_the_image_still_reports_the_clipping() {
         let product = block(32, 32, 4, 4, 11, 11);
         let (_, bounds) = synth(
-            product.clone(),
+            product,
             &ShadowSpec {
                 offset: (100, 100),
                 ..spec()
@@ -630,12 +636,12 @@ mod tests {
 
     /// `synth` は `alpha` と `compose` を順に呼ぶのと**バイト一致**する。
     ///
-    /// # これが Phase 25 の手術の担保である
+    /// # 影を `alpha` と `compose` に割ってあることの担保
     ///
-    /// 合成順（下地 → 影 → 反射 → 商品）のために `synth` を 2 つに割った。
+    /// 合成順（下地 → 影 → 反射 → 商品）のために `synth` は 2 つに割ってある。
     /// `commands/cutout.rs` の `compose_layers` は `synth` を呼ばずに
     /// `alpha` → （反射）→ `compose` の順で呼ぶので、**影だけの実行が
-    /// 以前と同じ出力になる根拠は「2 つを順に呼ぶことが `synth` と同じ」
+    /// `synth` と同じ出力になる根拠は「2 つを順に呼ぶことが `synth` と同じ」
     /// という等式そのもの**になる。`--reflect off` と `--reflect` 無しを
     /// 比べても、その 2 つは clap の既定値で同一の引数値になるだけなので、
     /// この等式の裏は取れない（同義反復になる）。
@@ -798,8 +804,8 @@ mod tests {
     ///
     /// `--shadow-blur` の関門（`cli::SHADOW_BLUR_MAX`）で実際には届かないが、
     /// **届いたときに panic したり幅が 0 に化けたりしない**ことを保つ。
-    /// 以前は `wl + 2` が i64 を溢れて debug で panic し、release では幅が
-    /// 負から `u32` へ飽和して「ぼかしていないのに σ を報告する」嘘になった。
+    /// 守りが無いと `wl + 2` が i64 を溢れて debug で panic し、release では幅が
+    /// 負から `u32` へ飽和して「ぼかしていないのに σ を報告する」嘘になる。
     #[test]
     fn an_absurd_sigma_neither_panics_nor_produces_a_bogus_width() {
         for sigma in [1.0e9, 8.0e9, 1.0e30, f64::MAX] {
@@ -823,7 +829,7 @@ mod tests {
     fn an_absurd_sigma_survives_a_whole_synth() {
         let product = block(32, 32, 8, 8, 23, 23);
         let (out, bounds) = synth(
-            product.clone(),
+            product,
             &ShadowSpec {
                 sigma: 1.0e9,
                 ..spec()
@@ -905,7 +911,7 @@ mod tests {
     ///
     /// **箱型の台（約 3σ）が縁を跨いだかどうかでは決めない。** 裾が丸めで 0 に
     /// なって見えていない場合まで真になり、既定値でも `clipped: true` が出る
-    /// 偽陽性になっていた。
+    /// 偽陽性になる。
     #[test]
     fn the_clipping_flag_follows_the_ink_that_actually_reaches_the_border() {
         let product = block(200, 200, 90, 40, 109, 59);
@@ -939,7 +945,7 @@ mod tests {
     fn a_zero_sigma_does_not_blur() {
         let product = block(40, 40, 10, 10, 19, 19);
         let (out, bounds) = synth(
-            product.clone(),
+            product,
             &ShadowSpec {
                 offset: (0, 12),
                 sigma: 0.0,
@@ -996,7 +1002,7 @@ mod tests {
     fn the_shadow_takes_the_requested_colour() {
         let product = block(40, 40, 10, 10, 19, 19);
         let (out, _) = synth(
-            product.clone(),
+            product,
             &ShadowSpec {
                 offset: (0, 15),
                 color: [10, 200, 30],

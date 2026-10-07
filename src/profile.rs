@@ -211,19 +211,18 @@ const fn spellings() -> [&'static str; ALL.len()] {
 
 /// `write_defaults` が canvas の長辺(px)を選ぶ段。**昇順であること。**
 ///
-/// # なぜ固定値をやめたか
+/// # 固定値にしない理由
 ///
-/// Phase 22 から Phase 25 までは固定の目標長辺 1600 という 1 つの数だった。
-/// その doc が挙げていた 3 つの根拠（1000px 以上でズームが効く／
-/// Shopify の 25MP に余裕がある／全プリセットの範囲に素で収まる）は、
-/// **1000〜5000 のどの値でも同じように立つ。** 1600 はその幅の中の任意の 1 点で、
-/// 上を選ばない理由がどこにも書かれていなかった。
+/// 固定の目標長辺を正当化する根拠（1000px 以上でズームが効く／Shopify の 25MP に
+/// 余裕がある／全プリセットの範囲に素で収まる）は、**1000〜5000 のどの値でも
+/// 同じように立つ。** どれか 1 点を選ぶ理由にはならない。
 ///
-/// 固定値である限り、入力が大きければ情報を捨て、小さければ捏造する
-/// （Phase 26 の実測）。
+/// そして固定値である限り、入力が大きければ情報を捨て、小さければ捏造する
+/// （長辺 1600 に固定したときの実測）。
 ///
 /// - 4284x5712 の実写に `--profile amazon` を当てると、商品は倍率 0.3354 まで
-///   潰れる。拡大が始まるのは canvas 約 4771 からで、そこまでは**まだ縮小である**
+///   潰れる。拡大が始まるのは canvas 約 4771 からで、そこまでは
+///   **まだ縮小である**
 /// - 700x525 の入力では倍率 2.6411 で拡大される（`--profile amazon --optimize
 ///   --rotate auto`。フラグを揃えないと商品の長辺が 1〜2px 動き、倍率も動く）。
 ///   Amazon の規格文
@@ -233,8 +232,7 @@ const fn spellings() -> [&'static str; ALL.len()] {
 /// # 段に丸める理由
 ///
 /// 入力ごとに連続の値を返すと、**同じ profile で処理したセットの寸法が 1 つも
-/// 揃わない。** これは固定値を選んでいた当時の doc が挙げていた懸念そのもので、
-/// 段に丸めるのがその答えである。
+/// 揃わない。** 段に丸めるのはそのためである。
 ///
 /// **ただし揃うのは同じ段に落ちる限りである。** 段の境界を跨ぐ素材が混ざれば
 /// 揃わない——選ぶ条件は `段 × 占有率 ≤ 商品の長辺` なので、占有率 0.86 では
@@ -250,8 +248,8 @@ const fn spellings() -> [&'static str; ALL.len()] {
 ///
 /// # 天井 3000 の根拠
 ///
-/// 1600 の 3 つの根拠と同じ構造を保ち、1 つ目だけを「ズームが効く最低ライン」から
-/// 「ズームで等倍を割らない上限」へ置き換えた。
+/// 上の 3 つの根拠と同じ構造で、1 つ目を「ズームが効く最低ライン」ではなく
+/// 「ズームで等倍を割らない上限」として立てる。
 ///
 /// - 占有率 0.86（amazon の下限 0.85 + `FILL_RATIO_MARGIN`）を通すと商品の長辺は
 ///   2580px になる。4K ディスプレイの短辺 2160px で全画面表示しても等倍を
@@ -264,8 +262,7 @@ const fn spellings() -> [&'static str; ALL.len()] {
 ///
 /// Amazon の「最長辺が 1,000px 以上の画像ではズーム機能が有効になります」。
 /// 最小の段でも拡大になる素材は**拡大したうえで `CANVAS_UPSCALED` で報せる**
-/// ——キャンバス配置で拡大を禁止しないという設計（docs/design.md 5.8）は
-/// 変えない。ただし倍率は 1600 のときより必ず小さくなる。
+/// ——キャンバス配置で拡大を禁止しないという設計（docs/design.md 5.8）に従う。
 pub const CANVAS_LADDER: [u32; 5] = [1000, 1500, 2000, 2500, 3000];
 
 /// **この規格向けに canvas を決める**という事実。寸法そのものではない。
@@ -278,9 +275,9 @@ pub const CANVAS_LADDER: [u32; 5] = [1000, 1500, 2000, 2500, 3000];
 /// `WriteDefaults::canvas` を `Option<(u32, u32)>` のままにして「決めるが値は
 /// まだ分からない」を `None` で表すと、**1 つの `Option` が 2 つの意味を運ぶ。**
 /// `commands::batch::attach_set` は `None` を「この規格は canvas を決めない」と
-/// 読んで `set` を断るので、profile だけで canvas を決めていた spec が
-/// `INVALID_SET` で落ちる。2 つを別の形で表すために、`Option` の中身のほうを
-/// 「決め方」に替えた——`is_some()` の意味は 1 つも変わらない。
+/// 読んで `set` を断るので、profile だけで canvas を決める spec が
+/// `INVALID_SET` で落ちる。2 つを別の形で表すために、`Option` の中身を
+/// 「決め方」にしてある——`is_some()` は「canvas を決めるか」だけを意味する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanvasChoice {
     /// 切り抜き後の商品の長辺から `CANVAS_LADDER` の段を選ぶ。
@@ -356,6 +353,7 @@ impl Profile {
     /// 書く側の設定を `Rules` から導く。
     pub fn write_defaults(&self) -> WriteDefaults {
         let r = &self.rules;
+        let flatten_color = self.flatten_color();
         WriteDefaults {
             // **現在のプリセットはすべて canvas を決める。** 寸法は商品を見て
             // から決まるので、ここで言えるのは「決める」ことだけである
@@ -369,8 +367,8 @@ impl Profile {
             // 透過を残してよい規格（shopify）では何も言わない——`--flatten` を
             // 勝手に立てると、PNG の透過を求めて profile を指定した利用者の
             // 成果物が黙って不透明になる
-            background: self.flatten_color(),
-            flatten: self.flatten_color().map(|_| true),
+            background: flatten_color,
+            flatten: flatten_color.map(|_| true),
             max_bytes: r.max_bytes,
         }
     }
@@ -379,10 +377,8 @@ impl Profile {
     ///
     /// 呼ぶ側が知りたいのはこの真偽 1 つで、`WriteDefaults::canvas` の
     /// `Option` を開くのはその手段にすぎない。`is_some()` を呼ぶ側に綴らせると、
-    /// **「決めるか」の判定が呼ぶ側の数だけ散る**——`Option` の中身を
-    /// `CanvasChoice` に割ったときに `attach_set` を救った判断
-    /// （`CanvasChoice` の doc）と同じ向きで、決め方が増えた日に直す場所を
-    /// 1 つに保つ。
+    /// **「決めるか」の判定が呼ぶ側の数だけ散る**——`CanvasChoice` の doc と
+    /// 同じ向きの判断で、決め方が増えた日に直す場所を 1 つに保つ。
     ///
     /// 寸法はここでは分からない。要るなら `canvas_for` を切り抜きの後で呼ぶ。
     pub fn decides_canvas(&self) -> bool {
@@ -450,14 +446,13 @@ impl Profile {
             1.0
         };
         let subject = f64::from(subject_long_side);
-        // 梯子は昇順なので、条件を満たした最後の段が最大の段になる。
-        // どれも満たさなければ最小段のまま（＝拡大する）
-        let mut side = CANVAS_LADDER[0];
-        for rung in CANVAS_LADDER {
-            if f64::from(rung) * fill <= subject {
-                side = rung;
-            }
-        }
+        // 梯子は昇順なので、後ろから見て最初に条件を満たした段が最大の段になる。
+        // どれも満たさなければ最小段（＝拡大する）
+        let mut side = CANVAS_LADDER
+            .into_iter()
+            .rev()
+            .find(|&rung| f64::from(rung) * fill <= subject)
+            .unwrap_or(CANVAS_LADDER[0]);
         if let Some(min) = r.longest_side_min {
             side = side.max(min);
         }
@@ -475,10 +470,7 @@ impl Profile {
 
     /// 潰すべき背景色。潰さないなら `None`。
     fn flatten_color(&self) -> Option<[u8; 3]> {
-        match (self.rules.background, self.rules.alpha_allowed) {
-            (Some(color), false) => Some(color),
-            _ => None,
-        }
+        self.rules.background.filter(|_| !self.rules.alpha_allowed)
     }
 }
 
@@ -597,7 +589,7 @@ mod tests {
     /// 回すのは、プリセットを足したときに**その 1 つだけが検査されない**状態を
     /// 作らないためである。
     ///
-    /// **canvas は入力依存になったので、1 つの寸法では足りない**（Phase 26）。
+    /// **canvas は入力依存なので、1 つの寸法では足りない。**
     /// 商品の長辺を極端な側まで振って、**どの段を選んでも** `Rules` に矛盾
     /// しないことを見る——段の選び方を変えた日に、上限を超える段が 1 つだけ
     /// 混ざる形の誤りを捕まえられるのはここである。
@@ -729,10 +721,7 @@ mod tests {
             let (side, _) = amazon.canvas_for(subject, ratio);
             let scale = f64::from(side) * ratio / f64::from(subject);
             if scale > 1.0 {
-                // 最小段では拡大が残りうる（`CANVAS_UPSCALED` が報せる）。
-                // **逃がすのは実際に拡大した実行だけにする**——「最小段を
-                // 選んだ」で逃がすと、最小段が正しく「拡大にならない最大の段」
-                // として選ばれた実行まで検査から外れる
+                // 最小段では拡大が残りうる（`CANVAS_UPSCALED` が報せる）
                 assert_eq!(
                     side, CANVAS_LADDER[0],
                     "商品 {subject}px で最小段でない段 {side} を選んで拡大している"

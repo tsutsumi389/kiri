@@ -95,7 +95,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     // 画像で測り直すと、当てたゲインぶんだけ白点が動いて意味を失う）。
     //
     // **off の実行ではこの見立てを 1 度も測らない。** 測れば費用が増え、乱れれば
-    // 既存の数値が動く。既定（両方 off）では新しいコードを 1 行も通らない
+    // 正規化しない実行の数値まで動く。既定（両方 off）ではこの経路を 1 行も通らない
     let colour = (args.white_balance.is_auto() || args.exposure.is_auto()).then(|| {
         let analysis = crate::cutout::analyse_background(
             &loaded.image,
@@ -115,10 +115,10 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     // **モデルは提案、利用者は決定。** 先にモデルの提案を敷いてから、利用者の
     // 指示を上から重ねる（`Constraints::overlay`）。重なった画素は利用者の
     // ものになり、`CONSTRAINT_CONFLICT` にはしない
-    let decision = segment::decide(&loaded.image, &args.segment, args.border, None)?;
+    let mut decision = segment::decide(&loaded.image, &args.segment, args.border, None)?;
     let mut segment_report = None;
     // 判断そのものから出た警告（`--segment off` に添えた `--model-path` など）
-    let mut segment_warnings = decision.warnings.clone();
+    let mut segment_warnings = std::mem::take(&mut decision.warnings);
     let constraints = match decision.run.as_ref() {
         Some(run) => {
             let (mut from_model, stats) = crate::segment::to_constraints(&run.probability, w, h);
@@ -154,10 +154,11 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     // **探索は 1 つの `CutoutResult` を返す。** 選ばれた候補は原寸で回し切った
     // ものなので、以降（キャンバス配置・書き出し・preview）はもう 1 回走らせずに
     // そのまま流す。`opts` も選ばれた候補で置き換える——`settings` と
-    // `applied_bbox` は効いた値を出す規約であり、渡した値では嘘になる
-    // 影を敷くときだけ `result.image` を取り出して使い回すので mut で持つ
+    // `applied_bbox` は効いた値を出す規約であり、渡した値では嘘になる。
+    // 影を敷くときだけ `result.image` を取り出して使い回すので mut で持つ。
+    //
     // **`auto` の門が測った見立てをそのまま渡す。** 門を通らなかった実行では
-    // `None` で、切り抜き側が今までどおり自分で測る
+    // `None` で、切り抜き側が自分で測る
     let seen = decision.seen.as_ref();
     let (mut result, optimize, optimize_warning) = if args.optimize {
         // 表を渡し切る（借りない）。借りると候補ごとに原寸の `Constraints`
@@ -194,7 +195,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     // ある。結果の警告より前に置くのは、正規化が効いたかどうかを知らずに
     // `background` や `mask` を読むと、数値の読み方そのものが変わるためである
     // （profile の警告を最初に置いているのと同じ理由）
-    warnings.extend(colour.iter().flat_map(|c| c.warnings.clone()));
+    warnings.extend(colour.iter().flat_map(|c| c.warnings.iter().cloned()));
     warnings.extend(overwrite_warning);
     warnings.extend(manifest_warning);
     // 指示についての警告は結果の警告より先に出す。渡したものがそのまま
@@ -215,7 +216,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     // **`--optimize` が選んだ候補のもの**なので、探索の警告より後に並べると
     // 「20 通りの中で選ばれた 1 つの見立てで測れなかった」という順に読める
     warnings.extend(rotate_auto_warning);
-    warnings.extend(result.warnings.clone());
+    warnings.append(&mut result.warnings);
 
     // **切り抜いてから回す。** 逆順にすると、回転が四隅に作った透過の余白が
     // 画像の外周に乗り、背景推定がその余白を背景色の標本として数える
@@ -287,16 +288,14 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     // 付随出力は本出力の後に書かれるので、派生のパスと重なっていないかを
     // 書き始める前に見る（`check_side_outputs` は `--output` との重なりしか
     // 見られない——多派生のパスは最終画像の寸法が決まるまで綴れない）
-    let mut reserved = Vec::new();
-    for (path, flag) in [
+    let reserved: Vec<output::Reserved> = [
         (args.preview.as_deref(), "--preview"),
         (args.debug_mask.as_deref(), "--debug-mask"),
         (args.out.manifest.as_deref(), "--manifest"),
-    ] {
-        if let Some(path) = path {
-            reserved.push(output::Reserved { path, flag });
-        }
-    }
+    ]
+    .into_iter()
+    .filter_map(|(path, flag)| path.map(|path| output::Reserved { path, flag }))
+    .collect();
     // **派生の寸法を照らせるのはここが最初である。** 形式と違って、派生が
     // 実際に何 px になるかは最終画像の縦横比が決まるまで 1 つに定まらない
     // （`derivation_size_warnings` の doc）。書き出しの前に出すので、文面は
@@ -647,14 +646,14 @@ fn apply_profile(args: &CutoutArgs, warnings: &mut Vec<Warning>) -> Option<Cutou
 /// # `PROFILE_OVERRIDDEN`（canvas）がここに来る理由
 ///
 /// `--canvas` を明示した実行では「profile が求めた値」と「実際に効いた値」を
-/// 並べるが、**前者が切り抜いた後にしか分からなくなった。** そのため canvas の
+/// 並べるが、**前者は切り抜いた後にしか分からない。** そのため canvas の
 /// 1 件だけが `run()` の先頭（`profile_warnings`）ではなくここで積まれ、
 /// 結果の警告の後・キャンバス配置の警告（`SET_SCALE_CLAMPED` /
 /// `CANVAS_UPSCALED`）の前に並ぶ。
 ///
-/// **他の項目の並びは変えない。** 「指示についての警告を先に出す」という規約を
-/// canvas だけが外れるのは、それが指示ではなく**結果が出てから分かる事実**に
-/// なったからである。並びとしても canvas の話が 1 箇所にまとまる。
+/// 他の項目は `run()` の先頭に並ぶ。「指示についての警告を先に出す」という規約を
+/// canvas だけが外れるのは、それが指示ではなく**結果が出てから分かる事実**
+/// だからである。並びとしても canvas の話が 1 箇所にまとまる。
 ///
 /// # 効かせる占有率
 ///
@@ -1290,8 +1289,8 @@ struct Placement {
 ///
 /// 4 つ目は**角度が出ているのに採らない**唯一の枝である。最小面積外接矩形が
 /// 「物の向き」を意味するのは、その物が実際に矩形に近いときだけで、円に取っ手が
-/// 1 本生えた形では最小の位置が輪郭の量子化で決まる（水平に置いたフライパンに
-/// `-21.7` 度を `high` で返していた）。`subject.level_fill_ratio` が
+/// 1 本生えた形では最小の位置が輪郭の量子化で決まる（水平に置いたフライパンでも
+/// `-21.7` 度が `high` で出る）。`subject.level_fill_ratio` が
 /// `TILT_SHAPE_MIN_FILL` を下回ったらここで止める。
 ///
 /// **`data` には測った値としきい値の両方を載せる。** 片方だけでは受け手が
@@ -1304,23 +1303,22 @@ fn resolve_rotate(arg: RotateArg, subject: Option<&SubjectHint>) -> (f64, Option
         return (d, None);
     }
 
+    // 適用しなかった枝はどれも 0 度で、同じ code に hint と `reason` を添えて報せる
     let skipped = |reason: &str, message: String, hint: &str| {
-        (
-            0.0,
-            Some(
-                Warning::new(WarningCode::RotateAutoSkipped, message)
-                    .with_hint(hint)
-                    .with_data("reason", reason),
-            ),
-        )
+        Warning::new(WarningCode::RotateAutoSkipped, message)
+            .with_hint(hint)
+            .with_data("reason", reason)
     };
 
     let Some(subject) = subject else {
-        return skipped(
-            "no_subject",
-            "主体が見つからないので --rotate auto を適用していません（0 度のまま）".to_string(),
-            "背景しか写っていないか、前景が 1 画素も残っていません。\
-             --tolerance を上げるか --bbox で主体を教えてください",
+        return (
+            0.0,
+            Some(skipped(
+                "no_subject",
+                "主体が見つからないので --rotate auto を適用していません（0 度のまま）".to_string(),
+                "背景しか写っていないか、前景が 1 画素も残っていません。\
+                 --tolerance を上げるか --bbox で主体を教えてください",
+            )),
         );
     };
 
@@ -1335,20 +1333,17 @@ fn resolve_rotate(arg: RotateArg, subject: Option<&SubjectHint>) -> (f64, Option
         return (
             0.0,
             Some(
-                Warning::new(
-                    WarningCode::RotateAutoSkipped,
+                skipped(
+                    "low_confidence",
                     format!(
                         "主体の信頼度が high でないので --rotate auto を適用していません\
                          （0 度のまま、面積 {:.1}%, 捕捉率 {:.1}%）",
                         subject.area_ratio * 100.0,
                         subject.capture_ratio * 100.0
                     ),
-                )
-                .with_hint(
                     "--bbox で主体の範囲を教えると信頼度が上がります。\
                      角度を自分で決めるなら --rotate <度> を渡してください",
                 )
-                .with_data("reason", "low_confidence")
                 .with_data("low_reason", low)
                 .with_data("area_ratio", round4(subject.area_ratio))
                 .with_data("capture_ratio", round4(subject.capture_ratio)),
@@ -1364,31 +1359,32 @@ fn resolve_rotate(arg: RotateArg, subject: Option<&SubjectHint>) -> (f64, Option
         (Some(_), Some(fill)) if fill < TILT_SHAPE_MIN_FILL => (
             0.0,
             Some(
-                Warning::new(
-                    WarningCode::RotateAutoSkipped,
+                skipped(
+                    "not_rectangular",
                     format!(
                         "主体の形が矩形から遠く、測った傾きが向きを語らないので \
                          --rotate auto を適用していません（0 度のまま、充填率 {:.3} < {:.2}）",
                         fill, TILT_SHAPE_MIN_FILL
                     ),
-                )
-                .with_hint(
                     "最小外接矩形が向きを語るのは、形が矩形に近いときだけです。\
                      円・取っ手つき・三角のような形では角度を自分で決めて \
                      --rotate <度> を渡してください",
                 )
-                .with_data("reason", "not_rectangular")
                 .with_data("level_fill_ratio", round4(fill))
                 .with_data("min_fill_ratio", TILT_SHAPE_MIN_FILL)
                 .with_data("level_rotation", subject.level_rotation.map(round4)),
             ),
         ),
         (Some(deg), Some(_)) => (deg, None),
-        _ => skipped(
-            "not_measurable",
-            "主体の傾きを測れないので --rotate auto を適用していません（0 度のまま）".to_string(),
-            "円や辺の多い形はどの角度でも外接矩形の面積が変わらず、\
-             最小の位置が雑音で決まります。角度を自分で決めて --rotate <度> を渡してください",
+        _ => (
+            0.0,
+            Some(skipped(
+                "not_measurable",
+                "主体の傾きを測れないので --rotate auto を適用していません（0 度のまま）"
+                    .to_string(),
+                "円や辺の多い形はどの角度でも外接矩形の面積が変わらず、\
+                 最小の位置が雑音で決まります。角度を自分で決めて --rotate <度> を渡してください",
+            )),
         ),
     }
 }
@@ -1428,8 +1424,10 @@ fn apply_rotation(image: &mut image::RgbaImage, angle: f64) -> Result<Option<Rot
 /// 透明**という画素が出る。そこはキャンバスの上で見えない余白であり、
 /// 中身として数える理由が無い。
 ///
-/// 費用は変わらない。`Mask::bbox_above` も同じだけの画素を舐めていた。
-fn content_bounds(image: &image::RgbaImage) -> Option<(u32, u32, u32, u32)> {
+/// 費用はマスクから測るのと変わらない（どちらも全画素を 1 度舐める）。
+///
+/// `kiri lint` もアルファの外接矩形をこれで測る（`lint::alpha_bbox`）。
+pub(crate) fn content_bounds(image: &image::RgbaImage) -> Option<(u32, u32, u32, u32)> {
     let (mut min, mut max) = ((u32::MAX, u32::MAX), (0u32, 0u32));
     let mut found = false;
     for (x, y, pixel) in image.enumerate_pixels() {
@@ -1469,7 +1467,7 @@ fn content_bounds(image: &image::RgbaImage) -> Option<(u32, u32, u32, u32)> {
 /// 400x400 の白地に 250,250,250 の矩形（白から ΔE 1.7）を置き、中央に
 /// 20px の黒い点だけを入れた画像を `--profile amazon --tolerance 1` へ
 /// 通すと、見える画素はその点だけなので占有率が 1.0 で止まり、
-/// `content` が 1376x1376 ではなく **1600x1600**（余白ゼロ）になった。
+/// `content` が 1376x1376 ではなく **1600x1600**（余白ゼロ）になる。
 ///
 /// そこで `FOREGROUND_THRESHOLD` 以上のアルファを持つ画素は、下地の上で
 /// 見えなくても数える。**補正が受け持つのは芯の外にあるフェザーだけ**で、
@@ -1550,12 +1548,12 @@ fn writes_opaque(out: &OutputOpts) -> bool {
 
 /// 見えない縁のぶんだけ占有率を上へ寄せる係数。補正が要らないなら `None`。
 ///
-/// # 直している失敗
+/// # 防いでいる失敗
 ///
-/// **`--profile amazon` で書いたものが同じ amazon の `kiri lint` で
-/// `fill_ratio` に落ちていた。** `FILL_RATIO_MARGIN` の doc が「最も高くつく
+/// **補正しないと、`--profile amazon` で書いたものが同じ amazon の `kiri lint` で
+/// `fill_ratio` に落ちる。** `FILL_RATIO_MARGIN` の doc が「最も高くつく
 /// 失敗」と呼んでいるものそのもので、**商品を拡大して配置したときだけ**
-/// 起きていた。
+/// 起きる。
 ///
 /// 原因は物差しの食い違いである。`content_bounds` が数える矩形には、
 /// フェザーと境界帯のアルファが 1 から立ち上がる**見えない縁**が
@@ -1563,7 +1561,7 @@ fn writes_opaque(out: &OutputOpts) -> bool {
 /// ので、書いた側が狙った占有率より痩せた矩形を測る。痩せる幅は
 /// **切り抜きの縁の厚み × 倍率 ÷ キャンバスの 1 辺**なので、拡大するほど
 /// 効く。合成シーン（`tests/common` の `edge_scene`、濃色商品・くっきりした
-/// 輪郭）を `--profile amazon`（1600px / 占有率 0.86）へ通した実測:
+/// 輪郭）を補正なしで `--profile amazon`（1600px / 占有率 0.86）へ通した実測:
 ///
 /// | 素材の 1 辺 | 倍率 | 見えない縁(幅/高さの合計 px) | 書いたものの占有率 | kiri lint |
 /// |---|---|---|---|---|
@@ -1578,7 +1576,7 @@ fn writes_opaque(out: &OutputOpts) -> bool {
 /// 決まる）。だから小さい素材ほど相対的に太く、拡大率もそこで上がる。
 /// `kiri lint` の列が書いたものより大きいのは、`detect_subject` が求めた
 /// 矩形を 1% 外へ広げるぶん（`BBOX_MARGIN`）が乗るからで、その +0.02 と
-/// `FILL_RATIO_MARGIN` の 0.01 が倍率 4 までは不足を飲んでいた。
+/// `FILL_RATIO_MARGIN` の 0.01 が倍率 4 までは不足を飲む。
 ///
 /// # なぜ余裕を広げるのでも lint を直すのでもないか
 ///
@@ -1654,7 +1652,7 @@ fn place_on_canvas(
     // **セット統一はここで 1 つの数に畳む。** `canvas.rs` には 1 行も触れない
     // ——狙った倍率は渡す `fill_ratio` のほうを組み替えれば出る
     // （`SetPlacement::fill_ratio` の doc に式がある）。`set` を渡さない実行では
-    // `requested` が `None` で、以降は今までどおり `args.fill_ratio` を読む
+    // `requested` が `None` で、`args.fill_ratio` をそのまま読む
     let content = (trimmed.width(), trimmed.height());
     let requested = args.set.map(|set| set.fill_ratio(content, (width, height)));
     // `plan()` は `(0, 1]` の外を `INVALID_FILL_RATIO` で断る。**断らせずに
@@ -1724,8 +1722,7 @@ fn place_on_canvas(
             height,
             // **効いた値を返す。** canvas ブロックは走った配置を語るもので、
             // `set` を使った実行では要求した `--fill-ratio` は読まれていない。
-            // `set` を使わない実行では要求値と同じなので、出力は 1 バイトも
-            // 変わらない。
+            // `set` を使わない実行では要求値と同じ数になる。
             //
             // **`visible_fill_correction` を掛ける前の数である。** ここが返す
             // のは「**見える商品**がキャンバスの何割を占めるか」で、補正後の
@@ -1749,7 +1746,7 @@ fn place_on_canvas(
 ///
 /// # これは「1 点だけ外れた異常」ではない
 ///
-/// 計画書は「揃えた結果 1 点だけが極端に外れるとき」と書いているが、実際には
+/// 「揃えた結果 1 点だけが極端に外れる」稀な事態ではなく、
 /// **横長の商品では常態である。** 正方キャンバスで `align: "height"` なら
 /// `f_i = T * max(1, cw/ch)` なので、`T = 0.85` では縦横比 1.18:1 を超える
 /// 横長で必ず当たる。式の誤りではなく物理で、高さ `0.85*CH` を与えれば横幅は
@@ -2397,7 +2394,7 @@ mod tests {
     }
 
     /// 見える画素が 1 つも無ければ `None`。**`content_bounds` と同じ規約**で、
-    /// 呼び出し側は補正を諦める（占有率は今までどおりの数で決まる）。
+    /// 呼び出し側は補正を諦める（占有率は補正前の数で決まる）。
     #[test]
     fn an_image_with_nothing_visible_has_no_visible_bounds() {
         let faint = image::RgbaImage::from_pixel(4, 4, image::Rgba([0, 0, 0, 2]));
@@ -2442,9 +2439,9 @@ mod tests {
     /// **前景の芯は、下地の上で見えなくても数える。**
     ///
     /// 芯が背景と同じ色（白い商品を白へ落とす）だと、床が無ければ矩形が
-    /// 見える画素だけまで縮み、補正が 1.0 で止まるほど大きくなる。実測では
-    /// 400x400 の白地に ΔE 1.7 の矩形と 20px の黒い点を置いた画像で、
-    /// `content` が 1376x1376 ではなく 1600x1600（余白ゼロ）になった。
+    /// 見える画素だけまで縮み、補正が 1.0 で止まるほど大きくなる。
+    /// 400x400 の白地に ΔE 1.7 の矩形と 20px の黒い点を置いた画像では、
+    /// `content` が 1376x1376 ではなく 1600x1600（余白ゼロ）になる。
     #[test]
     fn the_foreground_core_is_counted_even_when_it_cannot_be_seen() {
         // 芯は白（下地と同じ色）でアルファ 255、縁はアルファ 3
@@ -2477,7 +2474,7 @@ mod tests {
         );
     }
 
-    /// 受け入れ基準 (b) の 3 つ目。**主体そのものが無いときも 0 度のままにする。**
+    /// **主体そのものが無いときも 0 度のままにする。**
     ///
     /// 統合テスト（`cutout_rotate_auto_does_not_turn_what_it_cannot_trust`）は
     /// `low_confidence` と `not_measurable` を実画像で踏むが、`no_subject` は

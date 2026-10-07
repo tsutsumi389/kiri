@@ -1,19 +1,19 @@
 //! 主体（商品）の位置の推定。
 //!
-//! **kiri は既に、この推定に必要なものを全部持っていた。** 背景色と外周の ΔE 分布は
-//! `background.rs` が出しており、「背景色から遠い画素の、最大の塊」を採るだけで
-//! 商品の外接矩形が求まる。それを出力していなかったために、AI エージェントは
-//! 不均一な背景の画像で `--bbox` の値を自力では決められず、人間が目で見て
-//! 座標を打つしかなかった。
+//! 推定に必要なものは既に揃っている。背景色と外周の ΔE 分布は `background.rs`
+//! が出しており、「背景色から遠い画素の、最大の塊」を採るだけで商品の外接矩形が
+//! 求まる。これを出すことで、AI エージェントは不均一な背景の画像でも `--bbox` の
+//! 値を自力で決められる——人間が目で見て座標を打たなくて済む。
 //!
 //! 実写（白い不織布の上の黒いリモコン、uniformity 0.20）では、ここで導出した
 //! `0.00,0.35,0.98,0.67` が人手で決めた `0.02,0.33,0.98,0.64` と同じ結果
-//! （fg 0.2041 / halo 0.11% / sep 54.7）を出した。
+//! （fg 0.2041 / halo 0.11% / sep 54.7）を出す。
 //!
 //! **求めた bbox を自動で適用はしない。** bbox は構図の意思決定であり、
 //! 複数商品や意図的な見切れでは人／AI が決めるべきものである。堤防のしきい値
 //! （純粋な内部パラメータ）の自動調整とは性質が違う。ヒントとして返すに留める。
 
+use std::borrow::Cow;
 use std::f64::consts::FRAC_PI_4;
 
 use image::RgbaImage;
@@ -37,16 +37,15 @@ const MEASURE_LONG_EDGE: u32 = 250;
 /// また淡い輪郭は閾値を超えず、塊の外へはみ出して残る。どちらも「狭すぎる
 /// bbox」を生み、bbox の外は色によらず背景と確定されるため商品が削れる。
 /// 広すぎるぶんには背景が少し残るだけで、フィルが回収する。**外し方が
-/// 対称でないので、安全な側へ倒す。** Python 試作でも同じ 1% を足しており、
-/// 実写ではこれを足した結果が人手の矩形と一致した。
+/// 対称でないので、安全な側へ倒す。** 実写ではこれを足した結果が人手の矩形と
+/// 一致する。
 const BBOX_MARGIN: f64 = 0.01;
 
 /// 主体候補と認めるのに要る、画像に占める面積の下限。
 ///
 /// **この値と `MIN_CAPTURE_RATIO` は実写 2 枚と合成シーンで較正した。**
 ///
-/// 数値は**この実装**での実測である（試作の Python は 250px への縮小の仕方が
-/// 違い、キーボードで 0.017 / 0.542 を出していた。当てにしないこと）。
+/// 数値は**この実装**での実測である。
 ///
 /// | 素材 | area_ratio | capture_ratio | 正解 |
 /// |---|---|---|---|
@@ -76,7 +75,8 @@ pub const MIN_AREA_RATIO: f64 = 0.05;
 ///
 /// **較正は既定の `--border 2` を前提にしている。** `--border` は背景色の推定
 /// 範囲を決めると同時に、外周 ΔE の分布——つまり `far` の閾値そのもの——を
-/// 決めるので、帯を広げれば背景色も分布も別物になる。上限を置く前の実測。
+/// 決めるので、帯を広げれば背景色も分布も別物になる。帯に上限を置かずに
+/// 測った値:
 ///
 /// | 素材 | --border | p50 / p90 | area / capture | confidence |
 /// |---|---|---|---|---|
@@ -85,12 +85,9 @@ pub const MIN_AREA_RATIO: f64 = 0.05;
 /// | IMG_0251（救える） | 2（既定） | 11.9 / 26.8 | 0.234 / 0.979 | high |
 /// | IMG_0251（救える） | 110 | 12.4 / 27.2 | 0.234 / 0.982 | high |
 ///
-/// **いまは `calibrated_border` が帯に上限を置いて切り離してある。** 上の
-/// 110 は上限に掛かるので、既定と同じ判定（low）が出る。
-///
 /// 救えないほうだけが裏返る。**そこで主体は `--border` をそのまま使わず、
 /// 自分の帯を持つ**（`calibrated_border`）。上の 110 は帯の上限に掛かるので、
-/// いまは既定と同じ判定（low）が出る。
+/// 既定と同じ判定（low）が出る。
 pub const MIN_CAPTURE_RATIO: f64 = 0.70;
 
 /// 主体が統計を測る帯の上限（短辺に対する割合）。
@@ -135,7 +132,7 @@ pub fn calibrated_border(width: u32, height: u32, border: u32) -> u32 {
 /// 向きからしか出ない（最小面積外接矩形の定理）が、最大は辺の上には無い。
 /// 凸包がちょうど矩形なら 4 本の辺がすべて同じ面積を返すので、辺だけを見ると
 /// 振れ幅 0——つまり円と同じ——になる。**正面から撮った箱・本・パッケージが
-/// それで、測り切れているのに `None` を返していた。**
+/// それで、測り切れているのに `None` を返してしまう。**
 ///
 /// 2% は測った形の振れ幅の下から十分に離れている。
 ///
@@ -159,8 +156,8 @@ const TILT_AMBIGUOUS: f64 = 0.02;
 /// **最小面積外接矩形が「物の向き」を意味するのは、その物が実際に矩形に近い
 /// ときだけである。** `TILT_AMBIGUOUS` は「全向きで平ら」しか見ていないので、
 /// 円に取っ手が 1 本生えただけで通ってしまう——そして通った先の最小の位置は、
-/// 取っ手と円の接し方、つまり輪郭の量子化で決まる。水平に置いたフライパン
-/// （真値 0 度）に `-21.7` 度を `high` で返していたのがそれである。
+/// 取っ手と円の接し方、つまり輪郭の量子化で決まる。門が無いと、水平に置いた
+/// フライパン（真値 0 度）に `-21.7` 度を `high` で返す。
 ///
 /// **0.85 は谷の中央であって、当てはめた値ではない。** 誤って回す側の最大が
 /// 0.797（円 d=240）、正しく回せる側の最小が 0.881（マグ t=10）で、そのあいだに
@@ -194,26 +191,26 @@ const TILT_AMBIGUOUS: f64 = 0.02;
 /// 受け入れる。回してしまうほうは、仕上がりを目で見るまで誰も気づけない。
 ///
 /// **止めるのは `--rotate auto` だけである。** `level_rotation` の値そのものは
-/// 今までどおり返す（`info` を見て自分で判断する経路を塞がない）。
+/// そのまま返す（`info` を見て自分で判断する経路を塞がない）。
 pub const TILT_SHAPE_MIN_FILL: f64 = 0.85;
 
 /// 提案した矩形の外に残ってよい塊の上限（画像に占める割合）。
 ///
 /// **これは「外周が汚れているか」ではなく「出した答えが正しいか」を測る値である。**
 ///
-/// 外周統計から汚染を当てようとした前の規則（`p50` が小さいのに `p90` が大きい）は
-/// 捨てた。**外周だけでは「背景がざらついている」と「主体が外周に乗っている」を
+/// 外周統計から汚染を当てる規則（例えば「`p50` が小さいのに `p90` が大きい」）は
+/// 使わない。**外周だけでは「背景がざらついている」と「主体が外周に乗っている」を
 /// 区別できない。**
 ///
 /// - 偽陰性: `p50 < 5` は「背景にノイズが一切無い」ことを要求する。布・紙・
 ///   JPEG のノイズがあるだけで超えるので、**実写ではほぼ発火しない**
 ///   （リモコンの p50 は 11.9）。リポジトリ自身の織り目テクスチャ
 ///   （`woven_background_image`）の上に同じ汚染構図を置くと p50 が 6.30 まで
-///   上がり、判定は素通しして誤った矩形を勧めた。
+///   上がり、判定は素通しして誤った矩形を勧める。
 /// - 偽陽性: 下端に影の帯があるだけの画像（p50 0.00 / p90 17.7）は、主体を
 ///   完璧に捉えている（area 14.1% / capture 98.1%）のに Low へ落ち、
 ///   `cutout` の警告が `BBOX_RECOMMENDED` から `SUBJECT_TOUCHES_EDGE`
-///   ——誤診として潰したはずのもの——へ戻った。
+///   ——この構図では誤診——へ戻ってしまう。
 ///
 /// README が ΔE と勾配で既に突き当たったのと同型の限界である。
 ///
@@ -223,9 +220,7 @@ pub const TILT_SHAPE_MIN_FILL: f64 = 0.85;
 /// `max(p90, UNIFORM_DELTA_E)` は主体自身に汚染されている可能性があり、
 /// **汚染を検出するのに汚染された物差しを使うことになる**ため。
 ///
-/// 数値は**この実装**での実測である（判定を設計したときの Python 試作は 250px への
-/// 縮小の仕方が違い、実写 2 枚で capture / leftover が数ポイントずれる。
-/// 当てにしないこと。判定そのものは 13 行すべて一致した）。
+/// 数値は**この実装**での実測である。
 ///
 /// **合成の 11 枚は `tests/common` の `subject_scenes()` が作る。**
 /// `cargo test --release --test cli -- --ignored print_the_subject_calibration`
@@ -406,13 +401,7 @@ pub fn detect_subject(
     // その幅で測り直す（`calibrated_border`）。既定の `--border 2` では
     // 頭打ちに掛からないので、**1 度も測り直さない**
     let capped = calibrated_border(full_w, full_h, border);
-    let own;
-    let background = if capped == border {
-        background
-    } else {
-        own = crate::cutout::background::estimate_background(image, capped);
-        &own
-    };
+    let background = background_for(image, background, border, capped);
     let small = downscale(image)?;
     let (w, h) = (small.width(), small.height());
 
@@ -432,7 +421,7 @@ pub fn detect_subject(
     // まるごと外した矩形が capture 0.96 / confidence high で返る。
     // その助言に従えば大きいほうが丸ごと消える。
     //
-    // **それを外周統計から当てにいくのはやめた**（`MAX_LEFTOVER_RATIO` 参照）。
+    // **それを外周統計から当てにはいかない**（`MAX_LEFTOVER_RATIO` 参照）。
     // 代わりに、求めた矩形の外に何が残ったかを後段で検証する。数値は返す。
     // 「主体が無い」ではなく「この画像の主体は信用できない」だからで、
     // 助言に使わせなければ害は無い
@@ -460,7 +449,7 @@ pub fn detect_subject(
     hint_from(
         &small,
         (full_w, full_h),
-        background,
+        &background,
         capped,
         &far,
         far_count,
@@ -511,21 +500,31 @@ pub fn detect_subject_from_probability(
     // モデルが決める `far` は外周の帯に依らないが、`delta_e` と
     // `leftover_ratio` は色から測るので、帯の規約は色の経路と揃える
     let capped = calibrated_border(full_w, full_h, border);
-    let own;
-    let background = if capped == border {
-        background
-    } else {
-        own = crate::cutout::background::estimate_background(image, capped);
-        &own
-    };
+    let background = background_for(image, background, border, capped);
     hint_from(
         &small,
         (full_w, full_h),
-        background,
+        &background,
         capped,
         &far,
         far_count,
     )
+}
+
+/// 主体の帯（`capped`）で測った背景の見立て。帯が `border` と同じなら測り直さない。
+fn background_for<'a>(
+    image: &RgbaImage,
+    background: &'a BackgroundEstimate,
+    border: u32,
+    capped: u32,
+) -> Cow<'a, BackgroundEstimate> {
+    if capped == border {
+        Cow::Borrowed(background)
+    } else {
+        Cow::Owned(crate::cutout::background::estimate_background(
+            image, capped,
+        ))
+    }
 }
 
 /// 「背景でない画素」の集合から主体候補を組み立てる。
@@ -547,11 +546,7 @@ fn hint_from(
 
     let area_ratio = largest.area as f64 / (w as f64 * h as f64);
     let capture_ratio = largest.area as f64 / far_count as f64;
-    let mean = [
-        (largest.sum[0] / largest.area as u64) as u8,
-        (largest.sum[1] / largest.area as u64) as u8,
-        (largest.sum[2] / largest.area as u64) as u8,
-    ];
+    let mean = largest.sum.map(|s| (s / largest.area as u64) as u8);
     let delta_e = delta_e_rgb(mean, background.rgb);
 
     // 見切れの判定は**広げる前の**塊で行う。1% の余白は測定誤差を吸収する
@@ -662,20 +657,16 @@ fn downscale(image: &RgbaImage) -> Option<RgbaImage> {
     if w.max(h) <= MEASURE_LONG_EDGE {
         return Some(image.clone());
     }
-    let spec = if w >= h {
-        ResizeSpec {
-            width: Some(MEASURE_LONG_EDGE),
-            height: None,
-            fit: FitMode::Contain,
-            allow_upscale: false,
-        }
+    let (width, height) = if w >= h {
+        (Some(MEASURE_LONG_EDGE), None)
     } else {
-        ResizeSpec {
-            width: None,
-            height: Some(MEASURE_LONG_EDGE),
-            fit: FitMode::Contain,
-            allow_upscale: false,
-        }
+        (None, Some(MEASURE_LONG_EDGE))
+    };
+    let spec = ResizeSpec {
+        width,
+        height,
+        fit: FitMode::Contain,
+        allow_upscale: false,
     };
     // 主体の推定は付随情報であって成果物ではない。縮小に失敗しても
     // 切り抜き本体を巻き添えにせず、「測れなかった」として黙って引き下がる
@@ -698,7 +689,7 @@ struct Component {
 
 /// `far` の 4-連結成分のうち最大のものを返す。
 ///
-/// `morphology::remove_specks` の走査を流用しなかったのは、あちらが
+/// `morphology::remove_specks` の走査を流用しないのは、あちらが
 /// 「面積の下限に満たない成分を消した `Mask`」しか返さず、成分の同一性
 /// （どれが最大か、その外接矩形はどこか）を外へ出さないためである。
 /// 返す物が違うので、共有できるのは BFS の骨格だけになる。
@@ -867,7 +858,7 @@ fn level_tilt(rows: &[Option<(u32, u32)>]) -> Option<Tilt> {
         // 出ない（最小面積外接矩形の定理）が、最大は辺の上には無い。凸包が
         // ちょうど矩形なら 4 本の辺がすべて同じ面積を返すので、辺だけを見ると
         // 「どの角度でも面積が変わらない」＝円と同じ、と判じてしまう。
-        // 正面から撮った箱がまさにそれで、測り切れているのに `None` になっていた
+        // 正面から撮った箱がまさにそれで、測り切れているのに `None` になってしまう
         hi_area = hi_area.max(area).max(bbox_area(&hull, angle + FRAC_PI_4));
     }
     if !lo_area.is_finite() || lo_area <= 0.0 || hi_area <= 0.0 {
@@ -1171,9 +1162,6 @@ mod tests {
         assert_eq!(px, [0, 0, 4283, 5711]);
     }
 
-    /// 座標変換は、呼び出し側の性質に頼らず単体で安全であること。
-    ///
-    /// `clamp` は下限が上限を超えると panic する。左上が画像の右下端に
     /// 行の左右端から `level_rotation` を組み立てる小道具。
     ///
     /// `far` を作って BFS を通すのではなく、**`level_rotation` が受け取る形を
@@ -1232,8 +1220,8 @@ mod tests {
     /// **軸に揃った矩形は「測れない」ではなく 0 である。**
     ///
     /// 凸包がちょうど 4 点になると、4 本の辺がすべて同じ外接矩形を返す。
-    /// 辺の向きだけで曖昧さを測っていた頃は、そこが円と区別できずに `None` へ
-    /// 落ちていた——正面から撮った箱・本・パッケージという、EC でいちばん
+    /// 辺の向きだけで曖昧さを測ると、そこが円と区別できずに `None` へ
+    /// 落ちる——正面から撮った箱・本・パッケージという、EC でいちばん
     /// ありふれた主体がそれである。
     #[test]
     fn an_axis_aligned_rectangle_reports_zero_rather_than_nothing() {
@@ -1345,6 +1333,9 @@ mod tests {
         assert_eq!(level_rotation(&empty), None);
     }
 
+    /// 座標変換は、呼び出し側の性質に頼らず単体で安全であること。
+    ///
+    /// `clamp` は下限が上限を超えると panic する。左上が画像の右下端に
     /// 達した矩形（`[1.0, 1.0, 1.0, 1.0]`）はいま到達しないが、**到達しない
     /// ことに寄りかかった算術は、上流が 1 行変わった日に panic で返ってくる。**
     #[test]
@@ -1373,7 +1364,7 @@ mod tests {
         let img = poisoned_scene();
         let s = detect(&img).expect("数値そのものは返してよい");
 
-        // 前提：既存の 2 条件はどちらもこの構図を通してしまう
+        // 前提：面積と捕捉率の 2 条件はどちらもこの構図を通してしまう
         assert!(
             s.capture_ratio > MIN_CAPTURE_RATIO,
             "前提が崩れている: {s:?}"

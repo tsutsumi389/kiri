@@ -157,8 +157,8 @@ pub fn field_band(image: &RgbaImage, border: u32) -> u32 {
 /// なぜここで止めるかは、狭める理由と広げた理由の両方から決まる。
 ///
 /// - **広げた理由**（`kiri lint` の `measure_pixels` を参照）は「細い縁の
-///   中央値は背景を代表しない」ことだった。1600px の外周 2px（短辺の 0.125%）
-///   を見て「背景は純白」と答えていたのがそれで、1/132（0.76%）はその 6 倍ある。
+///   中央値は背景を代表しない」ことである。1600px の外周 2px（短辺の 0.125%）
+///   だけを見ると「背景は純白」と答えてしまう。1/132（0.76%）はその 6 倍ある。
 /// - **狭める理由**は「主体が帯に入ったなら、その画素は背景ではない」ことで、
 ///   帯 `1/132` は占有率 `1 - 2/132 ≒ 0.985` までの構図に対応する。これより
 ///   寄せた画像（占有率 0.99）に残る縁は、まさに上で「代表しない」と断じた
@@ -189,8 +189,8 @@ const SETTLE_FLOOR_DIVISOR: u32 = 4;
 /// | 0.98 | 0.6598 | 12 | 1.0 |
 ///
 /// どの profile にも占有率の**上限**は無いので、寄りのトリミングは全規格で
-/// 合法である。固定幅のままでは、`kiri cutout --profile amazon` が書いたものを
-/// 同じ amazon の `kiri lint` が「背景を測れない」と言って落としていた。
+/// 合法である。固定幅だと、`kiri cutout --profile amazon` が書いたものを
+/// 同じ amazon の `kiri lint` が「背景を測れない」と言って落とす。
 ///
 /// # なぜ主体の外接矩形を標本から除く形にしないか
 ///
@@ -201,14 +201,15 @@ const SETTLE_FLOOR_DIVISOR: u32 = 4;
 ///
 /// 加えて、主体は背景の推定値に対して検出される（`detect_subject`）。帯が
 /// 主体で汚れていると推定値そのものが商品の色へ倒れ、**主体が 1 つも
-/// 検出されなくなる**（上の表の 0.98 が実際にそれで、`fill_ratio` まで
-/// `unmeasurable` になっていた）。除く対象が消えるので、除く形では直らない。
+/// 検出されなくなる**（上の表の 0.98 がそれで、固定幅では `fill_ratio` まで
+/// `unmeasurable` になる）。除く対象が消えるので、除く形では直らない。
 ///
 /// # 細い縁で「純白」と答え直さないか
 ///
 /// 狭めるのは `SETTLE_FLOOR_DIVISOR` までで、しかも**広いほうから先に採る。**
 /// 外周 2px だけ白・残り一面が灰色の画像では `field_band` がそのまま均一
 /// （灰色の均一度 0.957）なので 48px で確定し、白い縁は 1 度も主役にならない。
+///
 /// # `wide` を受け取る理由
 ///
 /// 呼ぶ側は `field_band` の見立てを既に持っている（`see_background` を
@@ -390,8 +391,8 @@ pub fn field_gate(background: &BackgroundEstimate) -> f64 {
 struct ColourGate {
     /// 基準色の Lab。**1 度だけ測る。**
     ///
-    /// `delta_e_rgb(rgb, base)` は両辺を変換するので、基準色のほうを毎回
-    /// 測り直していた。`srgb_to_lab` は 1 回で `cbrt` を 3 度呼ぶので、
+    /// `delta_e_rgb(rgb, base)` は両辺を変換するので、基準色のほうまで毎回
+    /// 測り直すことになる。`srgb_to_lab` は 1 回で `cbrt` を 3 度呼ぶので、
     /// 境目の区画に落ちた画素のたびに半分が無駄になる
     base_lab: [f64; 3],
     limit: f64,
@@ -467,12 +468,6 @@ impl ColourGate {
 /// 追いきれない（輪郭誤差 1.99）。上側は費用である——核が狭いほど前線が
 /// 1 回で進まず、埋め直しの回数が増える。1/128 は 20MP で 34.9ms かかり、
 /// 設計の予算（30ms）を超える。1/32 は両側から離れている。
-///
-/// **上側の根拠は入れ替わった。** Phase 4 の最初の較正では「1/16 の核が
-/// 2 色の段差を塗り広げ、その帯がまとまった塊に見えて `subject` が誤って
-/// `high` を返す」を上限にしていたが、主体の検出は 1 色の背景に対して行うと
-/// 決めた（`cutout/mod.rs` の `analyse_background`）ので、**その測定は
-/// 出荷コードでは再現しない**。費用のほうは誰でも測り直せる。
 const FILL_SIGMA_DIVISOR: f32 = 32.0;
 
 /// 正規化畳み込みで「届いた」と認める重みの下限。
@@ -564,7 +559,7 @@ impl BackgroundField {
 
     /// 格子セルの線形 RGB そのもの。**`flat` では `None`**。
     ///
-    /// 場の中身を公開するのは Phase 24（`color::normalize`）が白点を
+    /// 場の中身を公開するのは `color::normalize` が白点を
     /// 「セルごとの線形 RGB のチャンネル中央値」として測るためである。
     /// **`rgb()`（外周の帯の中央値 1 色）では代われない**——帯は商品が
     /// 大きく写った画像では商品の色を混ぜるのに対し、標本を集められたセルは
@@ -578,8 +573,7 @@ impl BackgroundField {
     /// ——外挿の逃げ道が外周の中央値なので安全側だが、「背景だけから作られた
     /// 標本」として扱うと実装より強い主張になる。
     ///
-    /// **読み出し専用の窓であり、既存の挙動は 1 つも変わらない。** 補間して
-    /// 1 点を返す `linear_at` では中央値を取れない（どこを引くかで値が変わる）
+    /// **読み出し専用の窓である。** 補間して 1 点を返す `linear_at` では中央値を取れない（どこを引くかで値が変わる）
     /// ので、並びをそのまま貸す。
     pub fn cells_linear(&self) -> Option<&[[f32; 3]]> {
         Some(&self.grid.as_ref()?.linear)
@@ -648,8 +642,8 @@ fn clamp_index(v: f32, n: usize) -> usize {
 ///
 /// **式は `color::lab::linear_to_srgb_u8` が唯一持つ。** ここは名前だけを
 /// 残した委譲で、場の `rgb_at` から呼ぶ短い綴りを保つためにある。
-/// 同じ式を 3 箇所（ここ・`refine`・`color/normalize`）で綴っていた頃は、
-/// 片方だけを直せば境界帯の 1 画素が静かにずれる形だった。
+/// 同じ式を複数箇所（ここ・`refine`・`color/normalize`）で綴ると、片方だけを
+/// 直したときに境界帯の 1 画素が静かにずれる。
 #[inline]
 fn linear_to_srgb(v: f32) -> u8 {
     crate::color::lab::linear_to_srgb_u8(v)
@@ -727,30 +721,16 @@ impl KnownBackground<'_> {
 
     #[inline]
     fn holds(&self, x: u32, y: u32, i: usize, w: u32, h: u32) -> bool {
-        if self.on_band(x, y, w, h) {
-            return true;
-        }
-        if let Some((x1, y1, x2, y2)) = self.outside_bbox {
-            if x < x1 || x > x2 || y < y1 || y > y2 {
-                return true;
-            }
-        }
-        if let Some((x1, y1, x2, y2)) = self.outside_subject {
-            if x < x1 || x > x2 || y < y1 || y > y2 {
-                return true;
-            }
-        }
-        if let Some(c) = self.constraints {
-            if c.width() == w && c.height() == h && c.has_bg(i) {
-                return true;
-            }
-        }
-        if let Some(f) = self.filled {
-            if f.get(i).copied().unwrap_or(false) {
-                return true;
-            }
-        }
-        false
+        let outside = |r: Option<(u32, u32, u32, u32)>| {
+            r.is_some_and(|(x1, y1, x2, y2)| x < x1 || x > x2 || y < y1 || y > y2)
+        };
+        self.on_band(x, y, w, h)
+            || outside(self.outside_bbox)
+            || outside(self.outside_subject)
+            || self
+                .constraints
+                .is_some_and(|c| c.width() == w && c.height() == h && c.has_bg(i))
+            || self.filled.is_some_and(|f| f.get(i) == Some(&true))
     }
 }
 
@@ -775,7 +755,7 @@ pub struct FieldEstimate {
 ///    **中央値**を採る（平均だと商品の縁が引きずる）。標本がセル面積の
 ///    1/4 に満たないセルは「未知」とする
 /// 2. 未知のセルを正規化畳み込み（既知の値と重みを同じ核でぼかし、値 / 重み）で
-///    埋める。σ は格子の長辺の 1/8 から始め、全セルが埋まるまで 2 倍ずつ広げる
+///    埋める。σ は格子の長辺の 1/[`FILL_SIGMA_DIVISOR`] から始める（`fill_unknown`）
 /// 3. 既知のセルを自分の中央値で上書きし、最後に σ = 1 セルで全体を均す
 ///
 /// **どの源から来た画素にも同じ色の門が掛かる**（[`FIELD_GATE_FLOOR`]）。
@@ -798,7 +778,6 @@ pub fn estimate_field(
     if w == 0 || h == 0 {
         return flat(0.0);
     }
-    let (mut band_seen, mut band_kept) = (0u64, 0u64);
     let side = FIELD_LONG_SIDE;
     let long = w.max(h);
     let (cols, rows) = if long <= side {
@@ -822,7 +801,7 @@ pub fn estimate_field(
     let limit = field_gate(background);
 
     // **セルの行ごとに並列に測る。** セルは互いに独立で、書き先は自分の添字
-    // しかない。帯の計数は u64 の和なので足す順序で答えが動かない（計画 §11.5）。
+    // しかない。帯の計数は u64 の和なので足す順序で答えが動かない。
     //
     // 色の門は**スレッドごとに持つ**。中身は 6bit x 3 の区画ごとの判定を
     // 覚えるだけの純粋な表なので、何本持っても同じ答えが出る。`map_init` が
@@ -834,7 +813,7 @@ pub fn estimate_field(
     // 桁違いに重い。1 セルは 20MP / 49152 セルで 400 画素ほどにしかならない。
     //
     // 中央値は単調変換と交換できるので、8bit のまま採ってから線形へ移してよい
-    let (band_seen_total, band_kept_total) = value
+    let (band_seen, band_kept) = value
         .par_chunks_mut(cols)
         .zip(weight.par_chunks_mut(cols))
         .enumerate()
@@ -899,8 +878,6 @@ pub fn estimate_field(
             },
         )
         .reduce(|| (0u64, 0u64), |a, b| (a.0 + b.0, a.1 + b.1));
-    band_seen += band_seen_total;
-    band_kept += band_kept_total;
 
     let band_material = if band_seen == 0 {
         0.0
@@ -917,13 +894,8 @@ pub fn estimate_field(
         return flat(band_material);
     }
 
-    let fallback = [
-        lut[rgb[0] as usize],
-        lut[rgb[1] as usize],
-        lut[rgb[2] as usize],
-    ];
-    let filled = fill_unknown(cols, rows, &value, &weight, fallback);
-    let mut linear = filled;
+    let fallback = rgb.map(|c| lut[c as usize]);
+    let mut linear = fill_unknown(cols, rows, &value, &weight, fallback);
     // 既知のセルは自分の中央値へ戻す。畳み込みは未知を埋めるためのもので、
     // 測れた値を平らにならすためのものではない
     for (cell, slot) in linear.iter_mut().enumerate() {
@@ -1632,7 +1604,7 @@ mod tests {
         }
         // 勾配そのものが 1px あたり ΔE 0.2 前後で、8bit へ丸める段が 1 つ
         // 乗るので 0.4 前後までは避けられない。埋め直しの前線が残っていれば
-        // 軽く超える（順に確定させていた頃の実測は 2.21）
+        // 軽く超える（届いたセルから順に確定させる方式での実測は 2.21）
         assert!(worst < 1.0, "場に段差が残っている: 最大 ΔE {worst:.2}");
     }
 
@@ -1742,7 +1714,7 @@ mod tests {
         }
     }
 
-    /// **門が商品を場の材料から外す。** C1 そのものの単体版である。
+    /// **門が商品を場の材料から外す。**
     ///
     /// 白背景の下端に黒い商品が掛かっている。門が無ければ下端のセルは商品の
     /// 色を学び、そこだけ場が真っ黒になる。

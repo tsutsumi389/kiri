@@ -71,7 +71,7 @@ pub struct FloodOptions<'a> {
     /// 0 で無効。商品の輪郭は急峻、落ち影はなだらかという差を使って両者を分ける
     pub edge_threshold: f64,
     /// 第1段（確定背景の芯）の許容量(ΔE)。`core_tolerance()` で決める。
-    /// 0 なら 2 段階フィルを行わず、従来の 1 段フィルになる
+    /// 0 なら 2 段階フィルを行わず、1 段フィルになる
     pub core_tolerance: f64,
     /// 第2段で 1px あたりに許す色差(ΔE)。0 で 2 段階フィルを無効化する
     pub step_tolerance: f64,
@@ -91,8 +91,8 @@ pub struct FloodOptions<'a> {
 ///
 /// 基準を 1 色に対する分布ではなく残差に置くのは、**場が吸った後に残る散らばりが
 /// 「どこまでを背景と言い切れるか」を表す**からである。照明勾配のある背景では
-/// 1 色に対する p90 が勾配の幅そのものを指し、芯の許容量が不当に広がっていた。
-/// 1 色モデルでは残差＝1 色に対する分布なので、値は変わらない。
+/// 1 色に対する p90 が勾配の幅そのものを指し、芯の許容量が不当に広がる。
+/// 1 色モデルでは残差＝1 色に対する分布なので、どちらで測っても同じ値になる。
 ///
 /// 上限を tolerance の 1/3 に置くのは、芯が緩い許容量に近づくと 2 段に分けた
 /// 意味が消えるため。下限 1.0 は、ノイズの無い合成画像（p90 が 0）で芯が
@@ -132,9 +132,9 @@ fn shadow_reach(width: u32, height: u32) -> u32 {
 ///
 /// 切り抜きは同じ画像を 2 度フィルする（`cutout_seen` の `second_pass`）。
 /// 2 回で変わるのは場と `core_tolerance` の 2 つだけで、Lab の表・堤防・種の
-/// 保護円は 1 ビットも違わない。それでも `foreground_mask` が 1 関数の中で
-/// 作って捨てていたため、24.5MP では Lab の表（147MB）と Sobel（作業域
-/// 220MB）を 2 度建てていた。**場に依らないものはここに集め、1 度だけ作る。**
+/// 保護円は 1 ビットも違わない。フィルのたびに作って捨てると、24.5MP では
+/// Lab の表（147MB）と Sobel（作業域 220MB）を 2 度建てることになる。
+/// **場に依らないものはここに集め、1 度だけ作る。**
 pub struct Terrain {
     /// 画素ごとの Lab（固定小数）
     lab: Vec<LabQ>,
@@ -270,7 +270,7 @@ pub fn fill(
             }
         } else {
             // 芯が 1 画素も取れなかった＝外周が推定背景色から離れている。
-            // ここで諦めると全面が前景になってしまうので、従来の 1 段フィルへ落とす
+            // ここで諦めると全面が前景になってしまうので、1 段フィルへ落とす
             fill_from_border(w, h, |i| candidates.has(i, LOOSE), opts.bbox, forced)
         }
     } else {
@@ -283,8 +283,8 @@ pub fn fill(
     // 測地的オープニングより先に効かせる。bbox の外側は「外周につながった
     // 確実な背景」なので、隙間の判定でも背景として数えるのが正しい。
     //
-    // **矩形の外側だけを舐める。** 全画素を回して内側を捨てていたが、内側は
-    // 必ず何もしない。24.5MP では 1 回のフィルにつき 2450 万回の比較になる
+    // **矩形の外側だけを舐める。** 内側は必ず何もしないので、全画素を回すと
+    // 24.5MP では 1 回のフィルにつき 2450 万回の比較が無駄になる
     if let Some((x1, y1, x2, y2)) = opts.bbox {
         let stride = w as usize;
         for y in 0..h {
@@ -299,10 +299,10 @@ pub fn fill(
         }
     }
 
-    // **確定背景をここで塗り直してはいない。** `fill_from_border` が種を作る
+    // **確定背景をここで塗り直す必要は無い。** `fill_from_border` が種を作る
     // 前に `has_bg` の画素を立てており、`expand` も `seal_narrow_gaps` も真を
-    // 偽へ戻さない。ここに「念のため」の全画素走査を置いていたが、1 画素も
-    // 変えずに 24.5MP を 2 度（2 回のフィルで）舐めるだけだった
+    // 偽へ戻さない。「念のため」の全画素走査は 1 画素も変えずに 24.5MP を
+    // 2 度（2 回のフィルで）舐めるだけになる
 
     if opts.seal > 0 {
         is_background = seal_narrow_gaps(w, h, &is_background, opts.seal, &candidates, forced);
@@ -341,7 +341,7 @@ const LAB_SCALE: f32 = 256.0;
 /// 固定小数の Lab。
 ///
 /// `[f32; 3]` で持つと 12MP で 144MB になり、これ 1 本でピーク RSS の
-/// 半分近くを占めていた。判定に要る精度は上のとおり桁違いに粗いので、
+/// 半分近くを占める。判定に要る精度は上のとおり桁違いに粗いので、
 /// i16 に落として 72MB にする。
 type LabQ = [i16; 3];
 
@@ -351,9 +351,9 @@ type LabQ = [i16; 3];
 /// 同じ画素を何度も変換することになる。一度だけ作って引く。
 ///
 /// **画素ごとに独立なので塊に割って並列に作る。** 24.5MP では `cbrt` を
-/// 7350 万回呼ぶ段で、ここが 1 スレッドで回っていた。rayon の `collect` は
-/// 入力順を保つので、割り方を変えても並びは同じである——**浮動小数を畳む
-/// 箇所が 1 つも無い**ことがこの段を安全にしている（計画 §11.5）。
+/// 7350 万回呼ぶ段である。rayon の `collect` は入力順を保つので、割り方を
+/// 変えても並びは同じである——**浮動小数を畳む箇所が 1 つも無い**ことが
+/// この段を安全にしている。
 fn lab_map(image: &RgbaImage, lut: &[f32; 256]) -> Vec<LabQ> {
     image
         .as_raw()
@@ -447,7 +447,7 @@ impl Protected<'_> {
 /// 格子から双線形で引く。判定側（`classify`）はどちらかを知らずに `at` を呼ぶ。
 ///
 /// 1 色のときに `BackgroundField` から線形 RGB を取り直さないのは、`refine` と
-/// ここが別の sRGB→線形の表を持っているからである。ここでは従来どおり
+/// ここが別の sRGB→線形の表を持っているからである。ここでは
 /// `srgb_linear_lut` から作った値を使い、**1 色モデルの出力を 1 バイトも
 /// 動かさない**。
 enum FieldLab<'a> {
@@ -497,8 +497,8 @@ impl<'a> FieldLab<'a> {
 /// 必ず飲み込まれてしまう。
 ///
 /// **影の判定も場に対して行う。** 照明の勾配は「その場の背景より暗い」には
-/// ならないので、勾配を影と取り違えなくなる（1 色で測っていた頃は、画像の
-/// 暗い側が丸ごと影候補だった）。
+/// ならないので、勾配を影と取り違えない（1 色で測ると、画像の暗い側が
+/// 丸ごと影候補になる）。
 #[allow(clippy::too_many_arguments)]
 fn classify(
     image: &RgbaImage,
@@ -526,7 +526,7 @@ fn classify(
     // **行ごとに割って並列に判定する。** 画素の判定は `protected` / `dam` /
     // `lab` / `bg` を読むだけで、書き先は自分の添字しかない。影が 1 つでも
     // あったかは行ごとの真偽を OR で畳む——真偽の畳み込みなので、分割の
-    // 仕方で答えが動かない（計画 §11.5）。
+    // 仕方で答えが動かない。
     //
     // 座標は行の中で数えながら進める。添字から割り算で戻すと、場を持たない
     // 実行でも 20MP ぶんの除算を払うことになる
@@ -574,12 +574,9 @@ fn classify(
                     // 堤防に関わらず立てる。堤防が食べた背景を後から見分けるため
                     f |= NEAR_BG;
                 }
-                // let-chain は Rust 1.88 以降。MSRV 1.85 を保つためネストで書く
-                if let Some(g) = dam {
-                    if g.get(i) {
-                        *slot = f;
-                        continue;
-                    }
+                if dam.is_some_and(|g| g.get(i)) {
+                    *slot = f;
+                    continue;
                 }
                 if d <= core {
                     f |= STRICT;
@@ -690,20 +687,7 @@ fn expand(w: u32, h: u32, seed: BitPlane, stage: &Expansion) -> BitPlane {
     // `VecDeque` の倍化だけで 100MB を超えるが、隣がすべて埋まっている画素を
     // 取り出しても何も起きないので、結果は変わらない
     let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
-    for y in 0..h {
-        for x in 0..w {
-            if !filled.get(idx(x, y)) {
-                continue;
-            }
-            let open = (x > 0 && !filled.get(idx(x - 1, y)))
-                || (y > 0 && !filled.get(idx(x, y - 1)))
-                || (x + 1 < w && !filled.get(idx(x + 1, y)))
-                || (y + 1 < h && !filled.get(idx(x, y + 1)));
-            if open {
-                queue.push_back((x, y));
-            }
-        }
-    }
+    push_frontier(w, h, &filled, &mut queue);
 
     // 進行方向の先で続いている変化量。画像の外へ出る向きでは測れないので、
     // その場合は「いくらでも続いている」とみなして段差の検査を見送る。
@@ -788,13 +772,13 @@ fn expand(w: u32, h: u32, seed: BitPlane, stage: &Expansion) -> BitPlane {
 /// 堤防は隙間の**両側 1px** を背景候補から外す。稜線は輪郭の片側 1px に絞って
 /// あるが、隙間には輪郭が 2 本あるので合計で最大 2px が欠ける。そのままだと
 /// 物理的に 3px ある通路が背景マスクの上では 1px になり、半径 1 の収縮で
-/// 消えてしまう。実効の封鎖幅が `2k` ではなく `2k+2` になっていて、
-/// 「取っ手の内側は塞がない」という約束と食い違っていた。
+/// 消えてしまう。実効の封鎖幅が `2k` ではなく `2k+2` になり、
+/// 「取っ手の内側は塞がない」という約束と食い違う。
 ///
 /// そこで、色だけで見れば背景に十分近い画素（`NEAR_BG`）が背景に隣接している
 /// なら、収縮の入力では背景として数える。復元されるのは「背景色なのに堤防で
 /// 外された画素」だけなので、輪郭そのもの（商品の色をした画素）は戻らない。
-/// 1px の破れは両脇が商品の色なので通路が広がらず、これまでどおり塞がる。
+/// 1px の破れは両脇が商品の色なので通路が広がらず、塞がる。
 ///
 /// 復元した分はここでしか使わない。最後に元の背景マスクと交差させるので、
 /// 出力に背景が増えることはない。
@@ -898,9 +882,8 @@ fn fill_from_border(
     // 確定背景を先に埋め、**縁の画素だけ**をキューへ積む。
     //
     // 種を全部積むと、トライマップのように画像の 7 割を背景だと言い切った指示で
-    // キューが数百万要素になる（12MP の実測でピーク RSS が 160MB 増えた）。
-    // 隣がすべて埋まっている画素を取り出しても何も起きないので、結果は
-    // 変わらない（`expand` が同じ理由で同じことをしている）。
+    // キューが数百万要素になる（12MP の実測でピーク RSS が 160MB 増える）。
+    // 縁だけを積んでも結果は変わらない（`push_frontier`）。
     //
     // 確定背景が 1 画素も無ければ走査そのものを省く。`--fg-polygon` だけを
     // 渡した実行や、渡したのに空だった指示で、12MP の表を 2 度舐める理由が無い
@@ -910,22 +893,10 @@ fn fill_from_border(
                 filled.insert(i);
             }
         }
-        for y in 0..h {
-            for x in 0..w {
-                if !filled.get(idx(x, y)) {
-                    continue;
-                }
-                let open = (x > 0 && !filled.get(idx(x - 1, y)))
-                    || (y > 0 && !filled.get(idx(x, y - 1)))
-                    || (x + 1 < w && !filled.get(idx(x + 1, y)))
-                    || (y + 1 < h && !filled.get(idx(x, y + 1)));
-                if open {
-                    queue.push_back((x, y));
-                }
-            }
-        }
+        push_frontier(w, h, &filled, &mut queue);
     }
 
+    // 起点の種まきと塗り広げは同じ規則（候補で、まだ埋まっていない）で積む
     let seed = |x: u32, y: u32, filled: &mut BitPlane, queue: &mut VecDeque<(u32, u32)>| {
         let i = idx(x, y);
         if candidate(i) && !filled.get(i) {
@@ -959,28 +930,43 @@ fn fill_from_border(
     }
 
     while let Some((x, y)) = queue.pop_front() {
-        let visit = |nx: u32, ny: u32, filled: &mut BitPlane, q: &mut VecDeque<(u32, u32)>| {
-            let i = idx(nx, ny);
-            if candidate(i) && !filled.get(i) {
-                filled.insert(i);
-                q.push_back((nx, ny));
-            }
-        };
         if x > 0 {
-            visit(x - 1, y, &mut filled, &mut queue);
+            seed(x - 1, y, &mut filled, &mut queue);
         }
         if y > 0 {
-            visit(x, y - 1, &mut filled, &mut queue);
+            seed(x, y - 1, &mut filled, &mut queue);
         }
         if x + 1 < w {
-            visit(x + 1, y, &mut filled, &mut queue);
+            seed(x + 1, y, &mut filled, &mut queue);
         }
         if y + 1 < h {
-            visit(x, y + 1, &mut filled, &mut queue);
+            seed(x, y + 1, &mut filled, &mut queue);
         }
     }
 
     filled
+}
+
+/// 埋まった画素のうち、まだ埋まっていない 4 近傍を持つものだけをキューへ積む。
+///
+/// 隣がすべて埋まっている画素を取り出しても何も起きないので、結果は変わらない。
+/// 種が画像の大半を占めるとき、全部積むとキューだけで 3 桁 MB になる。
+fn push_frontier(w: u32, h: u32, filled: &BitPlane, queue: &mut VecDeque<(u32, u32)>) {
+    let idx = |x: u32, y: u32| (y as usize) * (w as usize) + (x as usize);
+    for y in 0..h {
+        for x in 0..w {
+            if !filled.get(idx(x, y)) {
+                continue;
+            }
+            let open = (x > 0 && !filled.get(idx(x - 1, y)))
+                || (y > 0 && !filled.get(idx(x, y - 1)))
+                || (x + 1 < w && !filled.get(idx(x + 1, y)))
+                || (y + 1 < h && !filled.get(idx(x, y + 1)));
+            if open {
+                queue.push_back((x, y));
+            }
+        }
+    }
 }
 
 /// `--fg-seed` の周囲を保護領域として塗る。種が無ければ表そのものを作らない。
@@ -1014,7 +1000,7 @@ mod tests {
 
     const BG: [u8; 3] = [250, 250, 250];
 
-    /// 1 色の場。既存の試験は「背景 1 色」の性質を測っているので、場としては
+    /// 1 色の場。ここの試験は「背景 1 色」の性質を測っているので、場としては
     /// 全画素で同じ値を返すものを渡す
     fn flat(rgb: [u8; 3]) -> BackgroundField {
         BackgroundField::flat(rgb)
@@ -1604,7 +1590,7 @@ mod tests {
     /// 比例だけだと 3000x4000 の素材で 125px まで伸びる。影の段は堤防を無視する
     /// ので、柔らかい輪郭を 1 箇所でも通り抜けられればそこから商品の内部へ
     /// 125px 進んでしまう。実測（2400px・無彩色商品・柔らかい輪郭）で商品の
-    /// 2.4% が削れていた。
+    /// 2.4% が削れる。
     #[test]
     fn the_shadow_reach_grows_with_the_image_but_stops_at_a_ceiling() {
         assert_eq!(shadow_reach(120, 120), 16, "小さな画像でも 16px は進める");
@@ -1612,7 +1598,7 @@ mod tests {
         assert_eq!(shadow_reach(3000, 4000), 64, "12MP でも 64px で頭打ち");
     }
 
-    /// 案Bの核心。同じ「1px あたり ΔE 1 前後」でも、傾斜は越えられて段差は越えられない。
+    /// 2 段フィルの核心。同じ「1px あたり ΔE 1 前後」でも、傾斜は越えられて段差は越えられない。
     #[test]
     fn a_gentle_ramp_is_crossed_but_a_step_of_the_same_slope_is_not() {
         // 250 から 20px かけて 190 まで落ちる傾斜。落ち影の裾に相当する
@@ -1661,7 +1647,7 @@ mod tests {
         );
     }
 
-    /// 芯が取れないときは従来の 1 段フィルへ落ちる。全面前景にしてはいけない。
+    /// 芯が取れないときは 1 段フィルへ落ちる。全面前景にしてはいけない。
     #[test]
     fn a_border_far_from_the_estimated_background_falls_back_to_a_single_pass() {
         // 推定背景色 250 に対して、画像全体が 240（芯の許容量の外）
@@ -1859,7 +1845,7 @@ mod tests {
 
     /// 堤防と測地的オープニングを**同時に**効かせたときの封鎖幅。
     ///
-    /// 単体ではどちらも正しく振る舞うのに、組み合わせると壊れていた。堤防は
+    /// 単体ではどちらも正しく振る舞うのに、組み合わせると壊れうる。堤防は
     /// 隙間の両側 1px を背景候補から外すので、物理的に 3px ある通路が背景
     /// マスクの上では 1px になり、半径 1 の収縮で消えてしまう。実効の封鎖幅が
     /// `2N` ではなく `2N+2` になり、「幅 2N px 以下」という約束と食い違う。

@@ -1,13 +1,13 @@
 //! 1 枚の最終画像から、書き出す派生を作る。
 //!
-//! Phase 19（--max-bytes）と Phase 20（多派生）はどちらも「エンコードして書く」を
-//! 奪い合う。先に 1 本の道へ畳み、N = 1 で ICC を付けない（`IccPolicy::None`）とき
-//! Phase 17 と同じバイト列になることを固定してから、その上へ機能を載せる。既定の
-//! `Embed` との差は iCCP / APP2 の 1 つだけで、それは `save.rs` のテストが見ている。
+//! `--max-bytes` と多派生はどちらも「エンコードして書く」を通るので、1 本の道へ
+//! 畳んである。派生が 1 本で ICC を付けない（`IccPolicy::None`）とき、書き出す
+//! バイト列は ICC を埋めない素のエンコーダ出力と同じになる。既定の `Embed` との
+//! 差は iCCP / APP2 の 1 つだけで、それは `save.rs` のテストが見ている。
 //!
-//! Phase 20 で派生が N 本になったが、**N = 1 の道は 1 バイトも変わっていない。**
 //! 指定が無ければ `DeriveSpec::default()` が 1 本だけ立ち、`resize` は `None`、
-//! パスは `--output` そのものになる。増えたのは `outputs[].role` の 1 キーだけで、
+//! パスは `--output` そのものになる。**この 1 本の道は派生を足さない実行と
+//! 1 バイトも変わらない。** 多派生で報告に加わるキーは `outputs[].role` だけで、
 //! それは `SCHEMA_VERSION` 2 の側で名乗る
 
 use std::path::{Path, PathBuf};
@@ -211,7 +211,7 @@ pub struct Derivation {
     pub flatten: bool,
     pub icc: IccPolicy,
     /// 出力の上限バイト数。品質を梯子状に落として収める（`QUALITY_LADDER`）。
-    /// `None` なら 1 回エンコードして終わりで、Phase 18 と 1 バイトも変わらない
+    /// `None` なら 1 回エンコードして終わりで、上限を探す処理は 1 つも走らない
     pub max_bytes: Option<u64>,
     /// この派生だけのリサイズ。`None` なら最終画像をそのまま書く。
     ///
@@ -249,7 +249,7 @@ impl Derivation {
 #[derive(Debug)]
 pub struct Rendered {
     pub report: OutputReport,
-    /// 派生ごとに分けて持つ。Phase 20 で全警告の `data` に `output` を付けるため
+    /// 派生ごとに分けて持つ。全警告の `data` に `output`（どの派生か）を付けるため
     pub warnings: Vec<Warning>,
 }
 
@@ -279,7 +279,7 @@ struct Encoded {
 /// 派生を順にリサイズ・エンコードし、`dry_run` でなければ書く。
 ///
 /// **ICC はエンコーダの内側で埋まる**ので、`report.bytes` は ICC 込みの大きさで
-/// ある（Phase 19 の探索はこの値だけを見ればよい）。dry-run でもエンコードまでは
+/// ある（`--max-bytes` の探索はこの値だけを見ればよい）。dry-run でもエンコードまでは
 /// 同じ道を通る。
 ///
 /// **1 本ずつ「リサイズ → エンコード → 書き出し → 解放」を回す。** リサイズ済みの
@@ -288,7 +288,7 @@ struct Encoded {
 /// なる（計画 7.2 の「逐次処理して都度解放する」）。並列は batch の項目単位に任せる。
 ///
 /// リサイズの要らない派生（`resize` が `None`、または計画寸法が元と同じ）では
-/// 元画像を借りる。無駄な複製をしないのは Phase 18 から変わらない約束である。
+/// 元画像を借りる。リサイズしない派生のために画像を複製しない。
 ///
 /// **最初の失敗でそこから先を書かない。** 1 入力の中の派生は部分失敗を許さない
 /// ——黙って 1 枚落とすと成果物の欠けに気づけない。部分失敗を扱うのは batch の
@@ -358,7 +358,7 @@ pub fn tag(warning: Warning, path: &Path) -> Warning {
 /// `max_bytes` に収まるバイト列を探す。
 ///
 /// **1 回目は必ず要求品質である。** `max_bytes` が無ければそこで返すので、
-/// 指定しない実行は Phase 18 と 1 バイトも変わらず、`attempts` も 1 のままになる。
+/// 指定しない実行は素の 1 回のエンコードと 1 バイトも変わらず、`attempts` も 1 のままになる。
 ///
 /// 収まらなければ `QUALITY_LADDER` のうち**要求品質より小さい段だけ**を上から
 /// 順に試し、最初に収まった段で止める。全部外したら**1 回目のバッファを書く**
@@ -388,25 +388,18 @@ fn encode_within_budget(image: &RgbaImage, d: &Derivation) -> Result<Encoded> {
         warnings,
     };
 
-    let Some(max) = d.max_bytes else {
+    // 上限が無いか、要求品質で既に収まっていればここで終わる
+    let Some(max) = d.max_bytes.filter(|&max| first.len() as u64 > max) else {
         return Ok(done(first, asked, 1, warnings));
     };
-    if first.len() as u64 <= max {
-        return Ok(done(first, asked, 1, warnings));
-    }
 
     // 降りられる段。**要求品質より下だけ**を上から順に試す。PNG は無損失で
     // バイト列が動かないので空になり、`--quality 20` のように梯子の下限より
     // 低い要求でも空になる。どちらも 1 回で降参する
-    let rungs: Vec<f32> = if d.format.has_quality() {
-        QUALITY_LADDER
-            .iter()
-            .copied()
-            .filter(|&q| q < d.quality)
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let rungs = QUALITY_LADDER
+        .iter()
+        .copied()
+        .filter(|&q| d.format.has_quality() && q < d.quality);
 
     // 「あとどれだけ足りないか」を言えるのは**実際に降りた段**で測った値だけ。
     // **JPEG は品質を下げてもサイズが単調に減らない区間がある**ので、最下段が
@@ -533,9 +526,9 @@ mod tests {
     use super::*;
     use crate::image_io::save::{DEFAULT_QUALITY, encode};
 
-    /// **要求品質は `DEFAULT_QUALITY` を引く。** ここに数を手書きしていたので、
-    /// Phase 26 で既定が 75 → 90 へ動いた後も派生の検査だけが旧既定で回り続け、
-    /// **実際に効く既定値で梯子を降りる経路が 1 度も通らなくなっていた。**
+    /// **要求品質は `DEFAULT_QUALITY` を引く。** 数を手書きすると、既定が動いた
+    /// ときに派生の検査だけが古い値で回り続け、**実際に効く既定値で梯子を降りる
+    /// 経路が 1 度も通らなくなる。**
     fn derivation(path: PathBuf, format: OutputFormat, icc: IccPolicy) -> Derivation {
         Derivation {
             path,
@@ -635,7 +628,7 @@ mod tests {
     ///
     /// **「基準の半分」のような割合で決め打ちにしない。** 素材が小さいと
     /// 下限まで落としても半分に届かず、達成を見るはずの検査が未達の道を通った
-    /// まま緑になる（実際に一度そうなった）。下限で何バイトになるかを測ってから
+    /// まま緑になる。下限で何バイトになるかを測ってから
     /// 決める
     fn reachable_budget(img: &RgbaImage, d: &Derivation) -> u64 {
         let baseline = bytes_at(img, d, d.quality);
@@ -647,8 +640,8 @@ mod tests {
         (baseline + floor) / 2
     }
 
-    /// 受け入れ基準 (a)。render は encode の結果に何も足さず、何も引かない。
-    /// ここがずれると、Phase 19 の探索が見た大きさと書かれたファイルが食い違う
+    /// render は encode の結果に何も足さず、何も引かない。
+    /// ここがずれると、`--max-bytes` の探索が見た大きさと書かれたファイルが食い違う
     #[test]
     fn render_with_one_derivation_writes_what_encode_returns() {
         let img = RgbaImage::from_fn(20, 16, |x, y| {
@@ -680,7 +673,7 @@ mod tests {
                     codes(&expected_warnings),
                     "{name}"
                 );
-                // 受け入れ基準 (d)。**--max-bytes を渡さない実行は 1 回で終わる。**
+                // **--max-bytes を渡さない実行は 1 回で終わる。**
                 // ここが 1 を超えたら、指定していない機能が時間を食っている
                 assert_eq!(report.attempts, 1, "{name}");
                 assert_eq!(
@@ -747,7 +740,7 @@ mod tests {
         );
     }
 
-    /// 受け入れ基準 (a) と (i)。収まった段は梯子の値で、報告と実ファイルの
+    /// 収まった段は梯子の値で、報告と実ファイルの
     /// 両方が上限以下になる
     #[test]
     fn the_ladder_stops_at_the_first_rung_that_fits() {
@@ -806,7 +799,7 @@ mod tests {
         assert!(rendered[0].warnings[0].hint.is_none(), "直すものは無い");
     }
 
-    /// 受け入れ基準 (b)。**未達なら要求品質のものを書く。**
+    /// **未達なら要求品質のものを書く。**
     /// 書いたバイト列が `--max-bytes` 無しの出力と 1 バイトも違わないことで、
     /// 「どうせ制約は破れているので画質まで捨てない」という決定を固定する
     #[test]
@@ -874,7 +867,7 @@ mod tests {
         assert!(w.hint.is_some());
     }
 
-    /// 受け入れ基準 (e)。PNG は無損失なので段を降りない。
+    /// PNG は無損失なので段を降りない。
     /// ファイルは `--max-bytes` 無しの PNG と 1 バイトも変わらない
     #[test]
     fn png_never_walks_down_the_ladder() {
@@ -910,7 +903,7 @@ mod tests {
         );
     }
 
-    /// 受け入れ基準 (c)。同じ入力からは毎回同じ着地点になる。
+    /// 同じ入力からは毎回同じ着地点になる。
     /// 梯子が時刻やタイムアウトを見た瞬間にここが割れる。
     ///
     /// **段で止まる経路を必ず通す。** 未達の上限を渡すと 3 回とも「要求品質へ

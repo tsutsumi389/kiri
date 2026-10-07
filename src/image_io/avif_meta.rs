@@ -52,12 +52,11 @@ const MAX_BOXES: usize = 4096;
 /// grid 本体 2 つを足した **131074 が理論上の最大**である（Exif / XMP が
 /// 数個乗る）。
 ///
-/// **その倍に届かない最小の 2 冪として 262144 を上限に置く。** かつて
-/// `1 << 17`（131072）を置いていたが、それは「65536 の倍」という数え方から
-/// 出た数で、**アルファ側の grid を数え落としていた**——上の 131074 は
-/// そのすぐ上にあり、理論上の最大構成をちょうど弾く位置に上限があった。
-/// 現実の AVIF が届く見込みが無いことは変わらず、かつ `ipma` の 1 要素は
-/// 最小 3 バイトなので、ここへ届くには 786KB の `ipma` が要る。
+/// **これを超える最小の 2 冪として 262144 を上限に置く。** 「65536 の倍」の
+/// `1 << 17`（131072）では**アルファ側の grid を数え落とし**、131074 の
+/// 理論上の最大構成をちょうど弾いてしまう。現実の AVIF が届く見込みは無く、
+/// かつ `ipma` の 1 要素は最小 3 バイトなので、ここへ届くには 786KB の
+/// `ipma` が要る。
 ///
 /// 上限が要るのは、`ipma` の `entry_count` が 32bit で、ファイルの大きさに
 /// 対して要素数がいくらでも増やせるため。`MAX_BOXES` と同じ思想で、
@@ -75,7 +74,7 @@ const MAX_ASSOCIATIONS: usize = 1 << 18;
 /// 要素数とは別に数える必要がある。`ipma` の 1 要素が持てるプロパティ数は
 /// 8bit（255）なので、要素数だけを見ていると 262144 × 255 = 6600 万本の
 /// 参照が素通りする。**実測ではそれが 1.5MB の入力で 31 秒 / RSS 2.4GB
-/// になっていた。**
+/// になる。**
 const MAX_PROPERTY_REFS: usize = 1 << 20;
 
 /// `iref` の `auxl` が並べられる対応（from → to）の総数の上限。
@@ -92,9 +91,9 @@ const MAX_PROPERTY_REFS: usize = 1 << 20;
 /// （version 0）なので、ここへ届くには 256KB の `iref` が要る。
 ///
 /// **実測**（`auxl` を 4000 箱 × 10000 対応、524MB の入力）では、上限が無いと
-/// `kiri lint` が 8.85 秒 / 最大 RSS 3.68GB を使っていた。`BTreeSet` で
-/// item ごとの線形探索を潰したのは正しい変更だが、**潰した先の集合そのものに
-/// 際限が無かった**ので、時間もメモリも入力の大きさに比例して伸び続けていた。
+/// `kiri lint` が 8.85 秒 / 最大 RSS 3.68GB を使う。`BTreeSet` で item ごとの
+/// 線形探索を潰しても、**集合そのものに際限が無ければ**時間もメモリも入力の
+/// 大きさに比例して伸び続ける。
 const MAX_AUXL_LINKS: usize = MAX_ASSOCIATIONS;
 
 /// コンテナから読み取れた事実。
@@ -269,16 +268,12 @@ fn color_naming(
     };
     // AV1CodecConfigurationRecord の先頭 4 バイト（marker/version、profile、
     // bitdepth などのビット）は CICP を持たない。欲しいのはその後ろの configOBUs
-    if let Some(obus) = av1c.payload.get(4..) {
-        let naming = sequence_header_cicp(obus);
-        if naming != ColorNaming::Unknown {
-            return Ok(naming);
-        }
+    if let Some(naming) = av1c.payload.get(4..).and_then(sequence_header_cicp) {
+        return Ok(naming);
     }
-    match primary_bitstream_head(file, meta, primary)? {
-        Some(head) => Ok(sequence_header_cicp(&head)),
-        None => Ok(ColorNaming::Unknown),
-    }
+    Ok(primary_bitstream_head(file, meta, primary)?
+        .and_then(|head| sequence_header_cicp(&head))
+        .unwrap_or(ColorNaming::Unknown))
 }
 
 /// 色を読むために mdat から切り出す最大量。
@@ -337,7 +332,7 @@ fn primary_bitstream_head(
     // extent 1 つが読み進めるバイト数が 0 になる組み合わせをここで断る。
     // `uint(data, at, 0)` は `data.get(at..at)` で必ず `Some(0)` を返すので、
     // 内側のループは脱出もせずに extent_count 回（u16 なので 1 エントリ
-    // あたり最大 65535 回）空回りする。実測で 360KB の入力に 3.6 秒かかった。
+    // あたり最大 65535 回）空回りする。実測で 360KB の入力に 3.6 秒かかる。
     //
     // `children()` が 0 長ボックスを「進めない以上どう解釈しても無限ループに
     // なる」として断っているのと**同じ判断**である。位置が進まない繰り返しは、
@@ -367,27 +362,12 @@ fn iloc_primary_head(
         index: index_size,
     } = *widths;
 
+    let wide = version >= 2;
     let mut at = 2usize;
-    let count = if version < 2 {
-        let v = u32::from(be16(body, at).ok()?);
-        at = add(at, 2).ok()?;
-        v
-    } else {
-        let v = be32(body, at).ok()?;
-        at = add(at, 4).ok()?;
-        v
-    };
+    let count = read_id(body, &mut at, wide).ok()?;
 
     for _ in 0..count {
-        let item = if version < 2 {
-            let v = u32::from(be16(body, at).ok()?);
-            at = add(at, 2).ok()?;
-            v
-        } else {
-            let v = be32(body, at).ok()?;
-            at = add(at, 4).ok()?;
-            v
-        };
+        let item = read_id(body, &mut at, wide).ok()?;
         let method = if version >= 1 {
             let v = be16(body, at).ok()? & 0xF;
             at = add(at, 2).ok()?;
@@ -499,35 +479,25 @@ fn aux_urn(payload: &[u8]) -> Option<&str> {
 /// 対して素直に効かない**（`item_properties` の 2 つの上限と同じ形）。
 fn auxl_links(iref: &[u8]) -> Result<Vec<(u32, u32)>> {
     let (version, _, body) = full_box(iref)?;
+    let wide = version >= 1;
     let mut out = Vec::new();
     let mut links = 0usize;
     for reference in children(body)? {
         if reference.kind != *b"auxl" {
             continue;
         }
-        let wide = version >= 1;
-        let step = if wide { 4 } else { 2 };
-        let from = if wide {
-            be32(reference.payload, 0)?
-        } else {
-            be16(reference.payload, 0)? as u32
-        };
-        let count = be16(reference.payload, step)?;
+        let mut at = 0usize;
+        let from = read_id(reference.payload, &mut at, wide)?;
+        let count = be16(reference.payload, at)?;
         // **読む前に数える。** 1 箱ぶんを読み切ってから足すと、`auxl` を
         // 何万箱も並べた入力で「1 箱ずつは上限の内側」のまま総量だけが伸びる
         links = add(links, usize::from(count))?;
         if links > MAX_AUXL_LINKS {
             return Err(broken("iref の auxl 対応が多すぎます"));
         }
-        let mut at = add(step, 2)?;
+        at = add(at, 2)?;
         for _ in 0..count {
-            let to = if wide {
-                be32(reference.payload, at)?
-            } else {
-                be16(reference.payload, at)? as u32
-            };
-            out.push((from, to));
-            at = add(at, step)?;
+            out.push((from, read_id(reference.payload, &mut at, wide)?));
         }
     }
     Ok(out)
@@ -537,11 +507,7 @@ fn auxl_links(iref: &[u8]) -> Result<Vec<(u32, u32)>> {
 fn primary_item_id(meta: &[Child<'_>]) -> Result<u32> {
     let pitm = find(meta, b"pitm").ok_or_else(|| broken("pitm ボックスがありません"))?;
     let (version, _, body) = full_box(pitm)?;
-    if version == 0 {
-        Ok(be16(body, 0)? as u32)
-    } else {
-        be32(body, 0)
-    }
+    read_id(body, &mut 0, version != 0)
 }
 
 /// item_ID から、その item に割り当てられたプロパティ番号の並びを引く索引。
@@ -573,15 +539,7 @@ fn item_properties(iprp: &[Child<'_>]) -> Result<Associations> {
             if entries > MAX_ASSOCIATIONS {
                 return Err(broken("ipma の割り当てが多すぎます"));
             }
-            let item = if version < 1 {
-                let v = be16(body, at)? as u32;
-                at = add(at, 2)?;
-                v
-            } else {
-                let v = be32(body, at)?;
-                at = add(at, 4)?;
-                v
-            };
+            let item = read_id(body, &mut at, version >= 1)?;
             let n = *body
                 .get(at)
                 .ok_or_else(|| broken("ipma が途中で終わっています"))?;
@@ -656,9 +614,7 @@ fn find<'a>(children: &[Child<'a>], kind: &[u8; 4]) -> Option<&'a [u8]> {
 ///
 /// **入れ子はここで再帰しない。** 降りる先は `probe` が `meta` → `iprp` →
 /// `ipco` と 1 段ずつ書き下しているだけなので、どんな入力でもスタックは
-/// 入力の内容で深くならない。以前ここには深さの上限（`MAX_DEPTH`）が
-/// 置いてあったが、深さは呼び出し側が定数で渡していたので一度も効かず、
-/// 「上限がある」という見かけだけが残っていた。入力の量に効く関門は
+/// 入力の内容で深くならない（だから深さの上限は置かない）。入力の量に効く関門は
 /// `MAX_BOXES`（1 階層の数）と `MAX_ASSOCIATIONS` / `MAX_PROPERTY_REFS`
 /// （`ipma` の量）、`MAX_AUXL_LINKS`（`iref` の `auxl` の量）が持つ。
 fn children(data: &[u8]) -> Result<Vec<Child<'_>>> {
@@ -727,6 +683,17 @@ fn be32(data: &[u8], at: usize) -> Result<u32> {
     Ok(u32::from_be_bytes(bytes_at::<4>(data, at)?))
 }
 
+/// 版数で幅が 16bit / 32bit に変わる item_ID などを読み、`at` を進める。
+fn read_id(data: &[u8], at: &mut usize, wide: bool) -> Result<u32> {
+    let (value, width) = if wide {
+        (be32(data, *at)?, 4)
+    } else {
+        (u32::from(be16(data, *at)?), 2)
+    };
+    *at = add(*at, width)?;
+    Ok(value)
+}
+
 /// 位置の足し算。ci-test は `overflow-checks = true` なので、素の `+` は
 /// 細工した size で panic しうる。**panic させない**のがこのモジュールの約束
 fn add(a: usize, b: usize) -> Result<usize> {
@@ -750,46 +717,32 @@ fn broken(what: &str) -> Error {
 ///
 /// **ここでエラーを返さない。** 色が読めないことは「AVIF として壊れている」
 /// ことではない（未知の profile、将来の拡張でも起こりうる）ので、
-/// `Unknown` に落として寸法の報告を守る。
-fn sequence_header_cicp(obus: &[u8]) -> ColorNaming {
+/// `None`（呼び出し側で `Unknown`）に落として寸法の報告を守る。
+fn sequence_header_cicp(obus: &[u8]) -> Option<ColorNaming> {
     let mut at = 0usize;
     while at < obus.len() {
-        let Some(&header) = obus.get(at) else {
-            return ColorNaming::Unknown;
-        };
+        let header = *obus.get(at)?;
         let kind = (header >> 3) & 0xF;
         let has_extension = header & 0b100 != 0;
         let has_size = header & 0b10 != 0;
-        let Ok(mut cursor) = add(at, 1 + usize::from(has_extension)) else {
-            return ColorNaming::Unknown;
-        };
+        let mut cursor = add(at, 1 + usize::from(has_extension)).ok()?;
 
         let size = if has_size {
-            match leb128(obus, &mut cursor) {
-                Some(size) => size,
-                None => return ColorNaming::Unknown,
-            }
+            leb128(obus, &mut cursor)?
         } else {
             // obu_has_size_field が 0 のときは残り全部が 1 つの OBU
             obus.len() - cursor.min(obus.len())
         };
-        let Ok(end) = add(cursor, size) else {
-            return ColorNaming::Unknown;
-        };
-        let Some(payload) = obus.get(cursor..end) else {
-            return ColorNaming::Unknown;
-        };
+        let end = add(cursor, size).ok()?;
+        let payload = obus.get(cursor..end)?;
 
         // OBU_SEQUENCE_HEADER
         if kind == 1 {
-            return match parse_sequence_header(payload) {
-                Some(naming) => naming,
-                None => ColorNaming::Unknown,
-            };
+            return parse_sequence_header(payload);
         }
         at = end;
     }
-    ColorNaming::Unknown
+    None
 }
 
 /// leb128（AV1 仕様 4.10.5）。8 バイトで打ち切る。
@@ -1343,11 +1296,11 @@ mod tests {
 
     /// `ipma` の量が上限を超えたら、時間をかけずに断る。
     ///
-    /// 索引が無かった頃、`has_alpha` は item ごとに `ipma` 全体を走査して
-    /// いたので、要素数の二乗になっていた。**実測で 960KB / 26 秒、
-    /// 1.5MB（4000 件 × 255 プロパティ）で 31 秒・最大 RSS 2.4GB。**
-    /// どちらもエラーではなく `Ok` を返していた——だから「断ること」自体が
-    /// 退行の検出になる。時間の上限はその上に重ねた歯止めで、
+    /// 索引を持たずに `has_alpha` が item ごとに `ipma` 全体を走査すると、
+    /// 要素数の二乗になる。**実測で 960KB / 26 秒、1.5MB（4000 件 × 255
+    /// プロパティ）で 31 秒・最大 RSS 2.4GB。** しかもどちらもエラーではなく
+    /// `Ok` を返す——だから「断ること」自体が退行の検出になる。時間の上限は
+    /// その上に重ねた歯止めで、
     /// 二乗に戻れば桁で超える
     #[test]
     fn an_ipma_beyond_the_limits_is_refused_without_burning_time() {
@@ -1423,11 +1376,10 @@ mod tests {
 
     /// `iref` の `auxl` が上限を超えたら、時間もメモリも使わずに断る。
     ///
-    /// `has_alpha` が対応を `BTreeSet` にしたことで item ごとの線形探索は
-    /// 消えたが、**集合そのものの大きさに上限が無かった。** 実測（`auxl` を
-    /// 4000 箱 × 10000 対応、524MB の入力）で 8.85 秒・最大 RSS 3.68GB で、
-    /// しかもエラーではなく `Ok` が返っていた——だから「断ること」自体が
-    /// 退行の検出になる。
+    /// `has_alpha` が対応を `BTreeSet` にしても、**集合そのものの大きさに上限が
+    /// 無ければ**、実測（`auxl` を 4000 箱 × 10000 対応、524MB の入力）で
+    /// 8.85 秒・最大 RSS 3.68GB を使い、しかもエラーではなく `Ok` を返す——
+    /// だから「断ること」自体が退行の検出になる。
     ///
     /// **1 箱あたりは上限の内側**（10000 < `MAX_AUXL_LINKS`）にしてある。
     /// 箱ごとにしか数えない実装ではここが素通りする。
@@ -1456,7 +1408,6 @@ mod tests {
     /// ループは `at` を 1 バイトも進めないまま `extent_count` 回（u16 なので
     /// 65535 回）まわり、`uint(_, _, 0)` が必ず `Some(0)` を返すので脱出も
     /// しない。**実測で 360KB / 3.6 秒、36MB なら約 6 分。**
-    /// これも以前は `Ok`（色は `Unknown`）で返っていた。
     #[test]
     fn an_iloc_whose_extents_read_nothing_is_refused() {
         // version 0 の item_count は 16bit なので、ここが詰められる上限

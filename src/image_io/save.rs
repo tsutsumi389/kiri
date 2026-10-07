@@ -4,6 +4,7 @@
 //! Web 配信ではサイズと個人情報の両面で不要なため、これを既定の挙動とする。
 //! ただし sRGB の ICC だけは例外で、既定で埋める（出力の色の名乗り。`IccPolicy`）。
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use image::{ExtendedColorType, ImageEncoder, RgbaImage};
@@ -38,9 +39,9 @@ impl OutputFormat {
     /// この形式のエンコーダが**実際に受け取る**品質。持たない形式では `None`。
     ///
     /// **JPEG はここで丸める。** `image` の JPEG エンコーダは `u8` しか受けず、
-    /// `--quality 33.3` は 33 として効く。丸めを `encode_jpeg` の中に閉じていた
-    /// ときは、報告の `quality_used` が 33.3 を名乗って「実際に使った品質」が
-    /// 嘘になっていた。**丸める場所は 1 つだけにする**——`encode_jpeg` も
+    /// `--quality 33.3` は 33 として効く。丸めを `encode_jpeg` の中に閉じると、
+    /// 報告の `quality_used` が 33.3 を名乗って「実際に使った品質」が嘘になる。
+    /// **丸める場所は 1 つだけにする**——`encode_jpeg` も
     /// `--max-bytes` の報告もここを引く。
     ///
     /// AVIF は `ravif` が f32 をそのまま受けるので手を入れない。PNG は無損失で、
@@ -68,8 +69,8 @@ impl OutputFormat {
     ///
     /// `as_str()` は報告の `outputs[].format` に出る名乗りで、JPEG は `"jpeg"`。
     /// 一方ファイル名の慣習は `.jpg` なので、`--naming` の `{ext}` はこちらを使う。
-    /// 2 つが食い違って見えるのは今日の `--output out.jpg` も同じで
-    /// （`format` は `"jpeg"` を返している）、**新しい不揃いを作ってはいない**。
+    /// `--output out.jpg` でも `format` は `"jpeg"` を名乗るので、この不揃いは
+    /// **既存の規約どおりである**。
     ///
     /// `from_path(extension())` が必ず自分へ戻ることは
     /// `the_extension_round_trips_through_from_path` が固定する
@@ -93,13 +94,7 @@ impl OutputFormat {
 
     /// 拡張子から出力形式を推論する。
     pub fn from_path(path: &Path) -> Option<Self> {
-        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-        match ext.as_str() {
-            "avif" => Some(OutputFormat::Avif),
-            "png" => Some(OutputFormat::Png),
-            "jpg" | "jpeg" => Some(OutputFormat::Jpeg),
-            _ => None,
-        }
+        Self::from_name(path.extension()?.to_str()?)
     }
 }
 
@@ -109,7 +104,8 @@ pub enum IccPolicy {
     /// PNG は iCCP、JPEG は APP2 に sRGB の ICC を埋める。AVIF は ICC を入れず、
     /// ravif が AV1 の色情報で名乗る（外す口が無い）
     Embed,
-    /// 埋めない。PNG / JPEG のバイト列は Phase 17 と 1 バイトも変わらない
+    /// 埋めない。PNG / JPEG のバイト列は ICC を渡さない素のエンコーダ出力と
+    /// 1 バイトも変わらない
     None,
 }
 
@@ -146,11 +142,11 @@ impl IccSignal {
 
 /// `--quality` の既定値。**この 1 箇所だけが持ち主である。**
 ///
-/// 同じ数が clap の `default_value_t`、`SaveOptions::default()`、batch spec の
-/// `unwrap_or` の 3 箇所に手書きされていた。片方だけ動かしてもコンパイルは通り、
-/// テストも「その値でたまたま通る」ので気づけない
+/// clap の `default_value_t`、`SaveOptions::default()`、batch spec の
+/// `unwrap_or` の 3 箇所ともここを引く。数を手書きすると片方だけ動かしても
+/// コンパイルは通り、テストも「その値でたまたま通る」ので気づけない
 /// （`the_cli_defaults_match_the_library_defaults` が押さえているのと同じ罠で、
-/// quality はそこを通らない）。3 箇所ともここを引く。
+/// quality はそこを通らない）。
 ///
 /// **90 の根拠は「商品領域の PSNR が 40 dB に最も近づく q」である。** 40 dB は
 /// 視覚的無損失の目安で、実写 3 通りで q90 のときに測れたのは 39.90 dB /
@@ -167,17 +163,15 @@ impl IccSignal {
 /// avif は 52 KB → 129 KB。時間は 12.2MP の avif で 0.95 秒 → 1.06 秒、
 /// jpeg で 0.19 秒 → 0.20 秒。バイトを詰めたいときは `--max-bytes` を使う。
 ///
-/// Phase 25 までの既定は 75 で、根拠は design.md 3.4 の「avif は 85 にすると
-/// サイズが約 4 倍」だった。**その 4 倍は合成画像でしか起きない**（同じ節が
-/// 「実画像での再計測を実装フェーズで行うこと」を宿題に残していた）。実写では
-/// avif 52 → 94 KB の 1.8 倍にとどまり、しかも上がった先の avif 129 KB は
+/// design.md 3.4 の「avif は 85 にするとサイズが約 4 倍」は 75 を推す根拠に
+/// ならない。**その 4 倍は合成画像でしか起きない。** 実写では q75 → q85 で
+/// avif 52 → 94 KB の 1.8 倍にとどまり、しかも q90 の avif 129 KB は
 /// 同画質の jpeg 219 KB より小さい
 pub const DEFAULT_QUALITY: f32 = 90.0;
 
 /// `--effort` の既定値。持ち主は `DEFAULT_QUALITY` と同じ理由でここ 1 箇所。
 ///
-/// 実測で effort 1 は 7.7MP の AVIF で 40 秒に達する。6 はその妥協点で、
-/// **Phase 26 でも値は動かしていない**——動かしたのは quality だけである。
+/// 実測で effort 1 は 7.7MP の AVIF で 40 秒に達する。6 はその妥協点である。
 pub const DEFAULT_EFFORT: u8 = 6;
 
 #[derive(Debug, Clone)]
@@ -219,9 +213,9 @@ pub struct SaveOutcome {
 /// 品質だけ変えて何度もエンコードするので、アルファの全画素走査と合成を段ごとに
 /// やり直すと、24.5MP の JPEG では 1 段あたり 98MB の複製と全画素走査が積む。
 /// 合成が要らなければ入力を借りたままにする（`Cow::Borrowed`）ので、
-/// **単発のエンコードでは今までと 1 バイトも 1 回の複製も変わらない。**
+/// **単発のエンコードでも余計な複製は 1 回も起きない。**
 pub struct Prepared<'a> {
-    image: std::borrow::Cow<'a, RgbaImage>,
+    image: Cow<'a, RgbaImage>,
     pub warnings: Vec<Warning>,
 }
 
@@ -266,9 +260,9 @@ pub fn prepare<'a>(image: &'a RgbaImage, opts: &SaveOptions) -> Result<Prepared<
     }
 
     let image = if must_flatten {
-        std::borrow::Cow::Owned(flatten_image(image, opts.background))
+        Cow::Owned(flatten_image(image, opts.background))
     } else {
-        std::borrow::Cow::Borrowed(image)
+        Cow::Borrowed(image)
     };
     Ok(Prepared { image, warnings })
 }
@@ -397,8 +391,8 @@ fn encode_jpeg(image: &RgbaImage, opts: &SaveOptions) -> Result<Vec<u8>> {
 fn flatten_image(image: &RgbaImage, background: [u8; 3]) -> RgbaImage {
     let rgb = flatten_onto(image, background);
     let mut out = RgbaImage::new(image.width(), image.height());
-    for (i, pixel) in out.pixels_mut().enumerate() {
-        *pixel = image::Rgba([rgb[i * 3], rgb[i * 3 + 1], rgb[i * 3 + 2], 255]);
+    for (pixel, c) in out.pixels_mut().zip(rgb.chunks_exact(3)) {
+        *pixel = image::Rgba([c[0], c[1], c[2], 255]);
     }
     out
 }
@@ -824,12 +818,12 @@ mod tests {
         None
     }
 
-    /// 受け入れ基準 (a)。ICC を抜けば Phase 17 の `encode_png` と 1 バイトも違わない
+    /// ICC を抜けば `image` の素の PNG エンコーダと 1 バイトも違わない
     #[test]
-    fn icc_none_png_is_the_phase17_encoder_output() {
+    fn icc_none_png_is_the_plain_encoder_output() {
         let img = gradient(true);
-        let mut phase17 = Vec::new();
-        image::codecs::png::PngEncoder::new(&mut phase17)
+        let mut plain = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut plain)
             .write_image(
                 img.as_raw(),
                 img.width(),
@@ -837,24 +831,24 @@ mod tests {
                 ExtendedColorType::Rgba8,
             )
             .unwrap();
-        assert_eq!(encoded(&img, OutputFormat::Png, IccPolicy::None), phase17);
+        assert_eq!(encoded(&img, OutputFormat::Png, IccPolicy::None), plain);
     }
 
     /// **品質は `DEFAULT_QUALITY` から引く。** ここが見ているのは「ICC を抜けば
     /// `image` の素のエンコーダと一致する」という性質であって、特定の品質値では
-    /// ない。数を手書きしていたので Phase 26 で既定を 90 へ動かしたときだけ落ちた
+    /// ない。数を手書きすると、既定を動かしたときだけ落ちる
     #[test]
-    fn icc_none_jpeg_is_the_phase17_encoder_output() {
+    fn icc_none_jpeg_is_the_plain_encoder_output() {
         let img = gradient(true);
         let rgb = flatten_onto(&img, [255, 255, 255]);
-        let mut phase17 = Vec::new();
+        let mut plain = Vec::new();
         let quality = OutputFormat::Jpeg
             .effective_quality(DEFAULT_QUALITY)
             .expect("JPEG は品質を持つ") as u8;
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut phase17, quality)
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut plain, quality)
             .write_image(&rgb, img.width(), img.height(), ExtendedColorType::Rgb8)
             .unwrap();
-        assert_eq!(encoded(&img, OutputFormat::Jpeg, IccPolicy::None), phase17);
+        assert_eq!(encoded(&img, OutputFormat::Jpeg, IccPolicy::None), plain);
     }
 
     /// AVIF は ICC の口を持たない。ポリシーで何かが変わったら、名乗りの説明が嘘になる
@@ -870,7 +864,7 @@ mod tests {
         }
     }
 
-    /// 受け入れ基準 (c)。iCCP は 1 個だけ、IHDR の直後（PLTE / IDAT より前が規格の要求）
+    /// iCCP は 1 個だけ、IHDR の直後（PLTE / IDAT より前が規格の要求）
     #[test]
     fn png_carries_exactly_one_iccp_right_after_ihdr() {
         let png = encoded(&gradient(true), OutputFormat::Png, IccPolicy::Embed);

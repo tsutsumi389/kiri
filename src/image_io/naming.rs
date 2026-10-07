@@ -67,6 +67,11 @@ impl Naming {
         let mut literal = String::new();
         // `Some` なら置換子の中を読んでいる（`{` を見てから `}` を見るまで）
         let mut placeholder: Option<String> = None;
+        let unclosed = || {
+            invalid(format!(
+                "'{template}' の '{{' が閉じていません（置換子は {{stem}} のように書きます）"
+            ))
+        };
 
         for ch in template.chars() {
             match (&mut placeholder, ch) {
@@ -82,11 +87,7 @@ impl Naming {
                     )));
                 }
                 (None, ch) => literal.push(ch),
-                (Some(_), '{') => {
-                    return Err(invalid(format!(
-                        "'{template}' の '{{' が閉じていません（置換子は {{stem}} のように書きます）"
-                    )));
-                }
+                (Some(_), '{') => return Err(unclosed()),
                 (Some(name), '}') => {
                     pieces.push(placeholder_piece(name, template)?);
                     placeholder = None;
@@ -95,9 +96,7 @@ impl Naming {
             }
         }
         if placeholder.is_some() {
-            return Err(invalid(format!(
-                "'{template}' の '{{' が閉じていません（置換子は {{stem}} のように書きます）"
-            )));
+            return Err(unclosed());
         }
         if !literal.is_empty() {
             pieces.push(Piece::Literal(literal));

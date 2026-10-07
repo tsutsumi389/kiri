@@ -108,7 +108,7 @@ pub fn apply(content: &RgbaImage, spec: &CanvasSpec) -> Result<RgbaImage> {
 ///
 /// **`u32` で足さない。** `compose` の層は spec が座標を書くので、キャンバスの外や
 /// 負の位置が普通に来る。`u32` へ飽和させてから足すと、release ビルドでは
-/// 検査が無いまま巻き戻り、**画像が反対側の端に描かれる**（計画 §10.11 の C2）。
+/// 検査が無いまま巻き戻り、**画像が反対側の端に描かれる**。
 pub(crate) fn composite_clipped(canvas: &mut RgbaImage, src: &RgbaImage, offset: (i64, i64)) {
     let (cw, ch) = (i64::from(canvas.width()), i64::from(canvas.height()));
     for y in 0..i64::from(src.height()) {

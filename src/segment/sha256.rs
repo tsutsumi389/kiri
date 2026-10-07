@@ -6,7 +6,7 @@
 //! kiri 自身が持ち、それと突き合わせる。配布元の MD5 は `kiri model list` が
 //! そのまま配る（利用者が `curl` で取った直後に確かめられるように）。
 //!
-//! 依存を足さないのは 3.1 の方針どおりである。FIPS 180-4 の定義そのままで、
+//! 依存を足さないのは docs/design.md 3.1 の方針どおりである。FIPS 180-4 の定義そのままで、
 //! 60 行に収まる。**速さを狙っていない**——176MB を数百 ms で舐められれば
 //! 足りる用途にしか使わない。
 
@@ -70,9 +70,7 @@ impl Sha256 {
         }
         let mut chunks = data.chunks_exact(64);
         for block in &mut chunks {
-            let mut fixed = [0u8; 64];
-            fixed.copy_from_slice(block);
-            self.compress(&fixed);
+            self.compress(block.try_into().expect("chunks_exact は 64 バイトずつ切る"));
         }
         let rest = chunks.remainder();
         self.buffer[..rest.len()].copy_from_slice(rest);
@@ -92,11 +90,10 @@ impl Sha256 {
         let block = self.buffer;
         self.compress(&block);
 
-        let mut out = String::with_capacity(64);
-        for word in self.state {
-            out.push_str(&format!("{word:08x}"));
-        }
-        out
+        self.state
+            .iter()
+            .map(|word| format!("{word:08x}"))
+            .collect()
     }
 
     fn compress(&mut self, block: &[u8; 64]) {

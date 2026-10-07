@@ -18,6 +18,7 @@
 use image::RgbaImage;
 
 use crate::transform::canvas::over;
+use crate::transform::shadow::grow_rect;
 
 /// 反射を合成するか。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -171,10 +172,7 @@ pub fn synth(mut product: RgbaImage, spec: &ReflectSpec) -> (RgbaImage, ReflectB
             // 触れているという意味で、反射が切られたわけではない
             // （`ReflectBounds::clipped` の doc）
             touches_border |= x == 0 || x == w - 1 || y == h - 1;
-            rect = Some(match rect {
-                None => [x, y, x, y],
-                Some([x1, y1, x2, y2]) => [x1.min(x), y1.min(y), x2.max(x), y2.max(y)],
-            });
+            grow_rect(&mut rect, x, y);
             let q = product.get_pixel_mut(x, y);
             // **商品のアルファが 255 の画素には触れない。**
             //
@@ -207,14 +205,9 @@ pub fn synth(mut product: RgbaImage, spec: &ReflectSpec) -> (RgbaImage, ReflectB
 /// では最初の数行で見つかり、画像全体を舐めるのは商品が 1 画素も無いときだけ
 /// である。
 fn baseline(product: &RgbaImage) -> Option<u32> {
-    for y in (0..product.height()).rev() {
-        for x in 0..product.width() {
-            if product.get_pixel(x, y).0[3] > 0 {
-                return Some(y);
-            }
-        }
-    }
-    None
+    (0..product.height())
+        .rev()
+        .find(|&y| (0..product.width()).any(|x| product.get_pixel(x, y).0[3] > 0))
 }
 
 #[cfg(test)]

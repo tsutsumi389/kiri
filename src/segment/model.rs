@@ -122,16 +122,12 @@ pub fn dir_from(
         return Some(cache.join("kiri").join("models"));
     }
     let home = set(home)?;
-    if cfg!(target_os = "macos") {
-        Some(
-            home.join("Library")
-                .join("Caches")
-                .join("kiri")
-                .join("models"),
-        )
+    let cache = if cfg!(target_os = "macos") {
+        home.join("Library").join("Caches")
     } else {
-        Some(home.join(".cache").join("kiri").join("models"))
-    }
+        home.join(".cache")
+    };
+    Some(cache.join("kiri").join("models"))
 }
 
 /// 読み込むファイルを決める。`--model-path` が指定されていればそれを使う。
@@ -191,17 +187,12 @@ pub fn resolve_path(model: &KnownModel, explicit: Option<&Path>) -> Result<PathB
 /// 同じ構造の別の重みがそれである。既知のバイト数しか受けないと、kiri の表に
 /// 載っているファイル以外は一切使えない。
 ///
-/// 既定の置き場所から拾った場合は今までどおり断る。そちらは利用者が選んだ
+/// 既定の置き場所から拾った場合は断る。そちらは利用者が選んだ
 /// ファイルではなく「kiri が探し当てたもの」なので、想定と違えば取得が途中で
 /// 切れている疑いのほうが強い。
 pub fn check_size(model: &KnownModel, path: &Path, explicit: bool) -> Result<Option<Warning>> {
     let actual = std::fs::metadata(path)
-        .map_err(|e| {
-            Error::new(
-                ErrorCode::ModelUnreadable,
-                format!("{} を読めません: {e}", path.display()),
-            )
-        })?
+        .map_err(|e| cannot_read(path, e))?
         .len();
     if actual == model.bytes {
         return Ok(None);
@@ -255,8 +246,7 @@ pub const VERIFIED_SUFFIX: &str = ".verified";
 ///
 /// # なぜ大きさだけでは足りないか
 ///
-/// 切り抜きの経路は長さしか見ていなかった（`check_size`）ので、**想定と同じ
-/// 長さの壊れたファイル**は tract の解析失敗まで落ちない。そこで出るのは
+/// `check_size` は長さしか見ないので、**想定と同じ長さの壊れたファイル**は tract の解析失敗まで落ちない。そこで出るのは
 /// 「ONNX として解析できません」で、原因が取得の失敗なのかモデルの構造なのか
 /// を利用者が分けられない。
 ///
@@ -334,7 +324,7 @@ pub struct Stamp {
     /// 更新時刻（UNIX エポックからのナノ秒）。取れない環境では 0。
     ///
     /// **秒では粗すぎる。** 同じ大きさのファイルを同じ秒のうちに差し替えると、
-    /// 秒だけでは同じ素性に見えてしまう（実際に検査で捕まえた）。APFS も ext4 も
+    /// 秒だけでは同じ素性に見えてしまう（`a_replaced_file_is_measured_again` が実際に踏む）。APFS も ext4 も
     /// ナノ秒まで持っているので、そこまで見る。1 秒刻みしか持たない
     /// ファイルシステムでは同じ穴が残るが、そこは**計り直しても答えが
     /// 変わらない**側の危険なので、断る理由にはしない
@@ -343,12 +333,7 @@ pub struct Stamp {
 
 impl Stamp {
     pub fn of(path: &Path) -> Result<Self> {
-        let meta = std::fs::metadata(path).map_err(|e| {
-            Error::new(
-                ErrorCode::ModelUnreadable,
-                format!("{} を読めません: {e}", path.display()),
-            )
-        })?;
+        let meta = std::fs::metadata(path).map_err(|e| cannot_read(path, e))?;
         let mtime = meta
             .modified()
             .ok()
@@ -418,12 +403,7 @@ fn write_mark(path: &Path, stamp: &Stamp, digest: &str) {
 pub fn digest(path: &Path) -> Result<String> {
     use std::io::Read;
 
-    let mut file = std::fs::File::open(path).map_err(|e| {
-        Error::new(
-            ErrorCode::ModelUnreadable,
-            format!("{} を読めません: {e}", path.display()),
-        )
-    })?;
+    let mut file = std::fs::File::open(path).map_err(|e| cannot_read(path, e))?;
     let mut hasher = super::sha256::Sha256::new();
     let mut buffer = vec![0u8; 1 << 20];
     loop {
@@ -439,6 +419,14 @@ pub fn digest(path: &Path) -> Result<String> {
         hasher.update(&buffer[..read]);
     }
     Ok(hasher.finish())
+}
+
+/// モデルファイルを開けない・素性を取れない。exit 3。
+fn cannot_read(path: &Path, error: std::io::Error) -> Error {
+    Error::new(
+        ErrorCode::ModelUnreadable,
+        format!("{} を読めません: {error}", path.display()),
+    )
 }
 
 #[cfg(test)]
@@ -639,7 +627,7 @@ mod tests {
         assert_eq!(warning.data["expected_bytes"], ISNET.bytes);
     }
 
-    /// 既定の置き場所から拾ったファイルは今までどおり断る。
+    /// 既定の置き場所から拾ったファイルは断る。
     ///
     /// そちらは利用者が選んだものではなく kiri が探し当てたもので、想定と
     /// 違えば取得が途中で切れている疑いのほうが強い。

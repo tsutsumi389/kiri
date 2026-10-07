@@ -92,7 +92,7 @@ impl Metric {
     /// **「測れなかった」と「測る対象がそもそも無い」を分ける。** 文字を 1 つも
     /// 置かない spec に `text_contrast` を当てても、落とせる相手が居ない——
     /// それを `unmeasurable` として不合格に数えると、`--fail-on default` が
-    /// **誰にも通せない門**になる（計画 §10.11 の H6）。
+    /// **誰にも通せない門**になる。
     ///
     /// `kiri lint` が規定の無い条件を `checks[]` に 1 行も出さないのと同じ
     /// 考え方だが、こちらは**書いた条件を黙って消さない**ために行は出し、
@@ -131,12 +131,8 @@ impl Metric {
         });
         match self {
             // 小さいほど悪い
-            Metric::TextContrast => values.fold(None, |acc: Option<f64>, v| {
-                Some(acc.map_or(v, |a| a.min(v)))
-            }),
-            _ => values.fold(None, |acc: Option<f64>, v| {
-                Some(acc.map_or(v, |a| a.max(v)))
-            }),
+            Metric::TextContrast => values.reduce(f64::min),
+            _ => values.reduce(f64::max),
         }
     }
 }
@@ -192,8 +188,8 @@ impl FailOn {
     ///
     /// **`default` は旗として持つ。** 4 つの条件へ展開してから重複を見ると、
     /// `default,text_contrast<4.5` が「`text_contrast` に 2 つの条件」として
-    /// 断られる——`--help` が例として挙げている綴りそのものである
-    /// （計画 §10.11 の H6）。`compliance::FailOn` は旗にしてあり、README も
+    /// 断られる——`--help` が例として挙げている綴りそのものである。
+    /// `compliance::FailOn` は旗にしてあり、README も
     /// 「明示が勝つ」と書いている。**同じ語に 2 つの効き方を持たせない。**
     pub fn parse(spec: &str) -> Result<FailOn, String> {
         let mut default = false;
@@ -304,7 +300,7 @@ impl FailOn {
                 threshold: threshold.and_then(number),
                 // **真偽の指標は真偽で返す。** 0.0/1.0 にすると、同じ事実が
                 // `layers[].outside_safe_area`（bool）と `checks[].actual`
-                // （数）の 2 通りで配られる（計画 §10.11 の M2）
+                // （数）の 2 通りで配られる
                 actual: actual.and_then(|v| {
                     if metric.is_flag() {
                         Some(Value::Bool(v > 0.0))

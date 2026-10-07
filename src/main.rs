@@ -628,9 +628,7 @@ fn print_compose(report: &ComposeReport) {
             "    {:<10} {:<5} {:>7.1},{:>7.1} {:>7.1}x{:<7.1}",
             layer.id, layer.kind, x, y, w, h
         );
-        if let Some(over) = layer.text_overflow
-            && over > 0.0
-        {
+        if let Some(over) = layer.text_overflow.filter(|&over| over > 0.0) {
             println!("               はみ出し {over:.1}px");
         }
         if let Some(contrast) = layer.text_contrast {

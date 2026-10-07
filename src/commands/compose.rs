@@ -9,10 +9,10 @@
 //!
 //! 背後だけを見ると、**その文字の上に不透明な層が来た場合に気づけない。**
 //! 「背後は白、文字は黒、よってコントラスト 21」と報告した絵の中で、文字が
-//! 1 画素も見えていないことが起こりうる（計画 §10.11 の H2）。
+//! 1 画素も見えていないことが起こりうる。
 //!
 //! だから画素ごとに**最後に書いた層**を覚えておき、文字が覆う画素のうち自分より
-//! 後の層に塗られた割合を数える。重ねる順に 1 回walk するだけで済み、層ごとの
+//! 後の層に塗られた割合を数える。重ねる順に 1 回歩くだけで済み、層ごとの
 //! 画像を持ち回らずに後から言える。
 
 use std::path::Path;
@@ -54,10 +54,11 @@ pub fn run(args: &ComposeArgs) -> Result<ComposeReport> {
     // **フォントは 1 画素も描く前に決める。** 見つからなければここで断るので、
     // 半端な成果物が残らない
     let mut warnings: Vec<Warning> = Vec::new();
-    let font = match &spec.font {
-        Some(f) => Some(compose::font::resolve(f, &base, &spec, &mut warnings)?),
-        None => None,
-    };
+    let font = spec
+        .font
+        .as_ref()
+        .map(|f| compose::font::resolve(f, &base, &spec, &mut warnings))
+        .transpose()?;
     let fontdb = font.as_ref().map(|(db, _)| std::sync::Arc::clone(db));
 
     // **透過のまま書けるか。** コントラストを測るときに、下地が透明な画素を
@@ -179,15 +180,19 @@ fn build(
     // **全部重ね終わってから数える。** 覆った層は後から来るので、重ねる途中では
     // 答えが出ない
     for entry in covered {
-        let id = reports[entry.index as usize].id.clone();
+        let report = &mut reports[entry.index as usize];
         let ratio = obscured(&entry, &painter);
-        reports[entry.index as usize].text_obscured = ratio;
+        report.text_obscured = ratio;
         if let Some(ratio) = ratio {
             if ratio > measure::MAX_OBSCURED {
                 warnings.push(
                     Warning::new(
                         WarningCode::TextObscured,
-                        format!("'{id}' の {:.1}% が後の層に覆われています", ratio * 100.0),
+                        format!(
+                            "'{}' の {:.1}% が後の層に覆われています",
+                            report.id,
+                            ratio * 100.0
+                        ),
                     )
                     .with_hint(
                         "text_contrast は背後を測った値なので、覆われた文字でも高い値を\
@@ -223,7 +228,7 @@ fn obscured(entry: &Covered, painter: &[u16]) -> Option<f64> {
 /// 画像を枠へ当てはめて重ね、**実際に置かれた矩形**を返す。
 ///
 /// **原点を 0 で止めない。** 止めると「枠の外へ置いた」という事実が結果から
-/// 消え、`placed` が spec と違う位置を名乗る（計画 §10.11 の H1）。はみ出した分は
+/// 消え、`placed` が spec と違う位置を名乗る。はみ出した分は
 /// 切り落とし、返す矩形は要求どおりの位置を言う。
 fn draw_image(
     canvas: &mut RgbaImage,

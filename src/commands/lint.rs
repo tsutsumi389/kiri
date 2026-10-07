@@ -31,6 +31,7 @@ use serde_json::{Value, json};
 
 use crate::cli::LintArgs;
 use crate::color::lab::delta_e_rgb;
+use crate::commands::cutout::content_bounds;
 use crate::commands::output::{SUBJECT_FROM_COLOUR, round4};
 use crate::compliance::{FAIL, PASS, UNMEASURABLE};
 use crate::cutout::background::{field_band, settled_band};
@@ -412,7 +413,7 @@ fn regulates_composition(rules: &Rules) -> bool {
 /// 出ていても最後に見るのは全画素である。lint にはその後段が無く、外周の
 /// 中央値が**そのまま合否になる**——1600px の画像の外周 2px は縁の 0.125% で、
 /// 額装の白枠やレタッチの縁 1 本がそこを占めているだけで「背景は純白」と
-/// 答えてしまう（灰色一面の画像が全項目 pass になる実例があった）。
+/// 答えてしまう（灰色一面の画像が全項目 pass になりうる）。
 ///
 /// そこで背景と主体は `field_band`（`max(短辺/33, --border)`）の帯**から**測る。
 /// **新しい定数は置かない**——これは「場の推定で『ここは背景だ』と信じて
@@ -428,7 +429,7 @@ fn regulates_composition(rules: &Rules) -> bool {
 /// サンプルの半分近くが商品の色になる。そこで落ちた `uniformity` は
 /// 「背景が単色でない」ではなく「背景でないものを混ぜて測った」であり、
 /// **同じレポートの `fill_ratio` が主体と背景を分離できていると言っている
-/// 横で、`background` だけが「測れない」と言う**矛盾になっていた。
+/// 横で、`background` だけが「測れない」と言う**矛盾になる。
 ///
 /// そこで帯は `settled_band` が決める——`field_band` から始めて、均一と
 /// 言えるまで半分ずつ（`field_band` の 1/4 まで）狭め、言えた最も広い帯を
@@ -441,7 +442,7 @@ fn regulates_composition(rules: &Rules) -> bool {
 /// **`--border 2` と書けば「外周 2px は純白です」と言わせられる**ということ
 /// である。この doc の冒頭が塞いだ穴をオプション 1 つで開け直すことになるので
 /// 採らない。占有率を寄せた画像が測れないという実害のほうは `settled_band` が
-/// 直したので、逃げ道そのものが要らなくなった。
+/// 解くので、逃げ道そのものが要らない。
 ///
 /// # `kiri info` と食い違わせない
 ///
@@ -494,29 +495,25 @@ fn measure_pixels(args: &LintArgs, file_size: u64) -> Result<(Facts, Vec<Warning
         })),
     };
 
-    let width = loaded.width();
-    let height = loaded.height();
-    let format = match loaded.format {
-        image::ImageFormat::Png => OutputFormat::Png,
-        // `load_with` が通すのは JPEG と PNG だけである
-        // （それ以外は `UNSUPPORTED_FORMAT` で断られてここへ来ない）
-        _ => OutputFormat::Jpeg,
+    let (width, height) = (loaded.width(), loaded.height());
+    let mut facts = Facts {
+        width,
+        height,
+        file_size,
+        format: match loaded.format {
+            image::ImageFormat::Png => OutputFormat::Png,
+            // `load_with` が通すのは JPEG と PNG だけである
+            // （それ以外は `UNSUPPORTED_FORMAT` で断られてここへ来ない）
+            _ => OutputFormat::Jpeg,
+        },
+        has_alpha: loaded.has_alpha,
+        naming,
+        pixels: None,
     };
     // **構図を規定しない規格では 1 画素も見立てない**（`regulates_composition`）。
     // 出力は 1 バイトも変わらず、5.29MP で 0.08s を落とせる
     if !regulates_composition(&args.profile.rules) {
-        return Ok((
-            Facts {
-                width,
-                height,
-                file_size,
-                format,
-                has_alpha: loaded.has_alpha,
-                naming,
-                pixels: None,
-            },
-            loaded.warnings(),
-        ));
+        return Ok((facts, loaded.warnings()));
     }
 
     // **`info` とまったく同じ経路で見立てる。** 1 度だけ測って両方に使う
@@ -568,26 +565,16 @@ fn measure_pixels(args: &LintArgs, file_size: u64) -> Result<(Facts, Vec<Warning
         })
     };
 
-    Ok((
-        Facts {
-            width,
-            height,
-            file_size,
-            format,
-            has_alpha: loaded.has_alpha,
-            naming,
-            pixels: Some(Pixels {
-                background: analysis.estimate.rgb,
-                border,
-                uniformity: analysis.estimate.uniformity,
-                background_from_opaque: analysis.estimate.from_opaque,
-                // `cutout` が `LOW_UNIFORMITY` を出すのに使っている判定そのもの
-                background_uniform: analysis.estimate.is_uniform(),
-                fill,
-            }),
-        },
-        loaded.warnings(),
-    ))
+    facts.pixels = Some(Pixels {
+        background: analysis.estimate.rgb,
+        border,
+        uniformity: analysis.estimate.uniformity,
+        background_from_opaque: analysis.estimate.from_opaque,
+        // `cutout` が `LOW_UNIFORMITY` を出すのに使っている判定そのもの
+        background_uniform: analysis.estimate.is_uniform(),
+        fill,
+    });
+    Ok((facts, loaded.warnings()))
 }
 
 /// 1 つの条件を判定する。
@@ -633,16 +620,15 @@ fn judge(check: Check, rules: &Rules, facts: &Facts) -> LintCheck {
         Check::ColorSpace => (facts.naming.status, facts.naming.actual.clone()),
         Check::Background => {
             // `regulated` が `Some` を確かめてからここへ来る
-            let (want, pixels) = match (rules.background, facts.pixels.as_ref()) {
-                (Some(want), Some(pixels)) => (want, pixels),
-                _ => return unregulated(check, expected),
+            let (Some(want), Some(pixels)) = (rules.background, facts.pixels.as_ref()) else {
+                return unregulated(check, expected);
             };
             // **外周に不透明な画素が 1 つも無い。** `estimate_background` は
             // そのときだけ透明画素の RGB をやむなく使う（`from_opaque` が偽）。
             // アルファ 0 の画素が持つ RGB は表示に使われず、書いたエンコーダが
             // 何を詰めたかで決まる値なので、**それを「測った背景色」として
-            // 配るのは作り話である**——透過 PNG に対して `rgb: [0,0,0]` /
-            // `delta_e: 100.0` を返していたのがこれだった。
+            // 配るのは作り話である**——透過 PNG なら `rgb: [0,0,0]` /
+            // `delta_e: 100.0` のような値が出る。
             //
             // **不透明な外周画素だけで中央値を取り直す道は採らない。** それは
             // lint が `info` と別の測り方を持つことで、モジュール冒頭の宣言に
@@ -702,9 +688,8 @@ fn judge(check: Check, rules: &Rules, facts: &Facts) -> LintCheck {
             (flag(delta_e <= BACKGROUND_DELTA_E_TOLERANCE), Some(actual))
         }
         Check::FillRatio => {
-            let min = match rules.fill_ratio_min {
-                Some(min) => min,
-                None => return unregulated(check, expected),
+            let Some(min) = rules.fill_ratio_min else {
+                return unregulated(check, expected);
             };
             match facts.pixels.as_ref().and_then(|p| p.fill.as_ref()) {
                 Some(fill) => (
@@ -829,21 +814,11 @@ fn avif_naming(color: ColorNaming) -> Naming {
 ///
 /// **完全に透明な画像では `None`。** 0 を返すと「1 画素だけの商品」と
 /// 見分けが付かない。
+///
+/// 書く側がキャンバスへ載せる範囲を測るのと同じ関数（`cutout::content_bounds`）を
+/// 通す。2 つの定義を持つと、書いた矩形と測る矩形が別の規則で決まりうる
 fn alpha_bbox(image: &image::RgbaImage) -> Option<[u32; 4]> {
-    let (mut x1, mut y1) = (u32::MAX, u32::MAX);
-    let (mut x2, mut y2) = (0u32, 0u32);
-    let mut found = false;
-    for (x, y, pixel) in image.enumerate_pixels() {
-        if pixel[3] == 0 {
-            continue;
-        }
-        found = true;
-        x1 = x1.min(x);
-        y1 = y1.min(y);
-        x2 = x2.max(x);
-        y2 = y2.max(y);
-    }
-    found.then_some([x1, y1, x2, y2])
+    content_bounds(image).map(|(x1, y1, x2, y2)| [x1, y1, x2, y2])
 }
 
 /// 占有率を**書く側とまったく同じ測り方で**出す。
@@ -867,8 +842,8 @@ fn alpha_bbox(image: &image::RgbaImage) -> Option<[u32; 4]> {
 ///
 /// **書く側はその 2 通りに合わせて占有率を数えている**
 /// （`commands::cutout` の `writes_opaque` と `visible_fill_correction`）。
-/// 揃えていなかったときは、拡大して配置した画像で書いた側だけが縁を数え、
-/// 倍率に比例して測る矩形が痩せていた（倍率 6.4 で 0.86 が 0.837 と出た）。
+/// 揃えないと、拡大して配置した画像で書いた側だけが縁を数え、倍率に比例して
+/// 測る矩形が痩せる（倍率 6.4 で 0.86 が 0.837 と出る）。
 fn fill_ratio(bbox: [u32; 4], width: u32, height: u32) -> f64 {
     // 両端を含む矩形なので、幅は差に 1 を足したもの
     let w = f64::from(bbox[2].saturating_sub(bbox[0]) + 1);
@@ -1030,7 +1005,7 @@ mod tests {
 
     /// **外周に不透明な画素が 1 つも無ければ、背景色は測れていない。**
     ///
-    /// 透過 PNG で `rgb: [0,0,0]` / `delta_e: 100.0` を配っていたのがこれで、
+    /// 透過 PNG では `rgb: [0,0,0]` / `delta_e: 100.0` のような値が出うるが、
     /// アルファ 0 の画素が持つ RGB は表示に使われない値である。合否はたまたま
     /// 正しくても、`actual` は機械可読な値として配る契約なので作り話は置けない。
     #[test]
@@ -1054,10 +1029,9 @@ mod tests {
     /// しきい値は `cutout` が `LOW_UNIFORMITY` を出すのに使っている
     /// `BackgroundEstimate::is_uniform` そのもので、2 つ目の数を置かない。
     ///
-    /// **`rgb` と `delta_e` を落とさない。** 落としていたときは、実写の
-    /// ベージュの布を検査した人の手元に「測れませんでした」だけが残り、
-    /// 「白から ΔE 40 外れている」という**次の一手を決める唯一の数**が
-    /// 結果から消えていた。合格でないことは `status` が言い切っているので、
+    /// **`rgb` と `delta_e` を落とさない。** 落とすと、実写のベージュの布を
+    /// 検査した人の手元に「測れませんでした」だけが残り、「白から ΔE 40
+    /// 外れている」という**次の一手を決める唯一の数**が結果から消える。合格でないことは `status` が言い切っているので、
     /// 数を添えても「測れたことにする」ことにはならない
     /// （`LintCheck::actual` の doc と、`color_space` の `unmeasurable` が
     /// CICP を残しているのと同じ作法である）。
@@ -1308,12 +1282,13 @@ mod tests {
 
     /// **`write_defaults` で書いたものが同じ profile の lint で落ちない。**
     ///
-    /// これが Phase 22 でいちばん高くつく失敗である。`profile.rs` の
+    /// profile で書いたものを同じ profile の lint が落とすのは、いちばん高くつく
+    /// 失敗である。`profile.rs` の
     /// `the_write_defaults_never_contradict_the_rules` は表と設定の整合を
     /// 見るが、**lint の判定を通していない**——占有率の測り方や背景の許容が
     /// ずれていれば、そちらは通ったままここが落ちる。
     ///
-    /// **canvas が入力依存になった後も、選びうる段を全部通す**（Phase 26）。
+    /// **canvas は入力で段が変わるので、選びうる段を全部通す。**
     /// 1 つの寸法だけを見ると、`profile::CANVAS_LADDER` のどれかの段でだけ
     /// 落ちる誤り——たとえば最小段で占有率の丸めが下限を割る——を見逃す。
     #[test]
@@ -1336,14 +1311,14 @@ mod tests {
         }
     }
 
-    /// 1 つの寸法について、書いたものが lint を通ることを見る。
-    ///
-    /// 段ごとに回すために切り出しただけで、判定は Phase 22 のままである。
+    /// 1 つの寸法について、書いたものが lint を通ることを見る（段ごとに回すために
+    /// 切り出したもの）。
     fn what_a_profile_writes_passes_its_lint(p: &profile::Profile, cw: u32, ch: u32, ratio: f64) {
         let w = p.write_defaults();
         // 占有率どおりに置かれた外接矩形
         let side = (f64::from(cw) * ratio).round() as u32;
         let margin = (cw - side) / 2;
+        let bbox = [margin, margin, margin + side - 1, margin + side - 1];
         let f = Facts {
             width: cw,
             height: ch,
@@ -1366,13 +1341,9 @@ mod tests {
                 background_from_opaque: true,
                 background_uniform: true,
                 fill: Some(Fill {
-                    ratio: fill_ratio(
-                        [margin, margin, margin + side - 1, margin + side - 1],
-                        cw,
-                        ch,
-                    ),
+                    ratio: fill_ratio(bbox, cw, ch),
                     source: FILL_FROM_ALPHA,
-                    bbox: [margin, margin, margin + side - 1, margin + side - 1],
+                    bbox,
                 }),
             }),
         };

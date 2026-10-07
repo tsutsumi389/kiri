@@ -67,8 +67,8 @@ pub fn run(args: &BatchArgs) -> Result<BatchReport> {
         )
     };
 
-    // **pass 1。** `--dry-run` でも走る（Phase 19 の「--dry-run でも探索は
-    // 走る」と同じ規約で、1 バイトも書かずに「何が起きるか」を返すのが
+    // **pass 1。** `--dry-run` でも走る（`--max-bytes` の品質探索が dry-run でも
+    // 走るのと同じ規約で、1 バイトも書かずに「何が起きるか」を返すのが
     // その旗の約束である）
     let (set, set_warnings) = resolve_set(&spec, &base, pool.as_ref());
 
@@ -127,8 +127,7 @@ pub fn run(args: &BatchArgs) -> Result<BatchReport> {
         // **丸めない。** `align: "bbox"` では `f_i = T` なので、ここと
         // `results[].result.canvas.fill_ratio` は同じ 1 つの数である。片方だけを
         // 小数第 4 位で畳むと、受け手が等値で比べたときに食い違う。
-        // `canvas.fill_ratio` は要求値をそのまま返してきた側なので、丸めを
-        // 足すほうが規約を動かすことになる
+        // `canvas.fill_ratio` は要求値を丸めずに返す側なので、こちらも丸めない
         fill_ratio: set.placement.target,
         source: set.source,
         measured: set.measured,
@@ -151,8 +150,8 @@ pub fn run(args: &BatchArgs) -> Result<BatchReport> {
         spec: args.spec.display().to_string(),
         total: results.len(),
         // **不合格は成功に数える。** 処理は通っていて成果物も書かれており、
-        // `succeeded` を「書けた件数」として読んでいる既存の読み手にとって
-        // それは今も正しい。人が見るべき件数は `rejected` が別に言う
+        // `succeeded` は「書けた件数」である。人が見るべき件数は `rejected` が
+        // 別に言う
         succeeded: results.len() - failed,
         failed,
         rejected,
@@ -295,12 +294,9 @@ fn occupancy(
     align: batch::SetAlign,
 ) -> Option<f64> {
     let input = batch::resolve(base, &item.input);
-    // **読み込みの設定は pass 2 と同じものを使う。** `color_convert` を
-    // 取り違えると、測った画素と切り抜く画素が違う色空間になる
-    let color = ColorOpts {
-        no_color_convert: !settings.color_convert.unwrap_or(true),
-    };
-    let loaded = load::load_with(&input, &color.to_load_options()).ok()?;
+    // **読み込みの設定は pass 2 と同じもの（`color_opts`）を使う。**
+    // `color_convert` を取り違えると、測った画素と切り抜く画素が違う色空間になる
+    let loaded = load::load_with(&input, &color_opts(settings).to_load_options()).ok()?;
     let border = settings.border.unwrap_or(DEFAULT_BORDER);
     let bbox = see_background(&loaded.image, border)
         .subject?
@@ -451,12 +447,7 @@ fn to_cutout_args(
         .map(|s| parse_size(s).map_err(|e| Error::new(ErrorCode::InvalidCanvas, e)))
         .transpose()?;
 
-    let background = settings
-        .background
-        .as_deref()
-        .map(|s| parse_hex_color(s).map_err(|e| Error::new(ErrorCode::InvalidColor, e)))
-        .transpose()?
-        .unwrap_or([255, 255, 255]);
+    let background = color(settings.background.as_deref(), [255, 255, 255])?;
 
     let max_bytes = max_bytes(settings.max_bytes.as_ref())?;
 
@@ -562,15 +553,12 @@ fn to_cutout_args(
             bbox: settings.bbox.is_some(),
             background_model: settings.background_model.is_some(),
         },
-        color: ColorOpts {
-            no_color_convert: !settings.color_convert.unwrap_or(true),
-        },
-        // **spec からも segment を受ける。** 断っていたのは 1 件ごとに
-        // 176MB を読み直し、ピーク RSS 1.6GB を並列度ぶん積む形だったため
-        // である。いまは計画をプロセスで 1 つ持ち（`segment::isnet`）、
-        // 推論そのものは 1 本ずつ通すので、`--jobs` を上げてもモデルのぶんは
-        // 増えない。**時間は増える**——1 件あたり 1.3 秒は並べられないので、
-        // 数百点に一律で付ける値ではないことは変わらない
+        color: color_opts(settings),
+        // **spec からも segment を受ける。** 計画をプロセスで 1 つ持ち
+        // （`segment::isnet`）、推論そのものは 1 本ずつ通すので、`--jobs` を
+        // 上げてもモデルのぶんは増えない（1 件ごとに 176MB を読み直し、ピーク
+        // RSS 1.6GB を並列度ぶん積む形にはならない）。**時間は増える**——
+        // 1 件あたり 1.3 秒は並べられないので、数百点に一律で付ける値ではない
         segment: SegmentOpts {
             segment: value_enum(settings.segment.as_deref(), SegmentMode::Off, "segment")?,
             model_path: path(&settings.model_path),
@@ -590,12 +578,7 @@ fn to_cutout_args(
             crate::cli::SHADOW_BLUR_MAX,
             "shadow_blur",
         )?,
-        shadow_color: settings
-            .shadow_color
-            .as_deref()
-            .map(|s| parse_hex_color(s).map_err(|e| Error::new(ErrorCode::InvalidColor, e)))
-            .transpose()?
-            .unwrap_or([0, 0, 0]),
+        shadow_color: color(settings.shadow_color.as_deref(), [0, 0, 0])?,
         shadow_opacity: ratio(settings.shadow_opacity, 0.25, "shadow_opacity")?,
         // **spec は clap を通らないので、CLI と同じ関門をここでも掛ける。**
         // 抜けていると `--reflect-height` では断る値が spec 経由でだけ通り、
@@ -667,6 +650,22 @@ fn to_cutout_args(
             dry_run,
         },
     })
+}
+
+/// 読み込みの設定。**pass 1（`occupancy`）と pass 2（`to_cutout_args`）が
+/// 同じ 1 つを通る。**
+fn color_opts(settings: &ItemSettings) -> ColorOpts {
+    ColorOpts {
+        no_color_convert: !settings.color_convert.unwrap_or(true),
+    }
+}
+
+/// spec の `#RRGGBB` を色へ落とす。CLI と同じ `parse_hex_color` を通す。
+fn color(value: Option<&str>, default: [u8; 3]) -> Result<[u8; 3]> {
+    value
+        .map(|s| parse_hex_color(s).map_err(|e| Error::new(ErrorCode::InvalidColor, e)))
+        .transpose()
+        .map(|c| c.unwrap_or(default))
 }
 
 /// spec の `derive[]` を 1 本ずつ解く。
@@ -849,10 +848,7 @@ fn checked(value: Option<f64>, default: f64, key: &str) -> Result<f64> {
 fn capped(value: Option<u32>, default: u32, max: u32, key: &str) -> Result<u32> {
     let value = value.unwrap_or(default);
     if value > max {
-        return Err(Error::new(
-            ErrorCode::InvalidSetting,
-            format!("{key} は 0 から {max} の範囲で指定してください（{value} が指定されました）"),
-        ));
+        return Err(out_of_range(key, format!("0 から {max}"), value));
     }
     Ok(value)
 }
@@ -864,10 +860,7 @@ fn capped(value: Option<u32>, default: u32, max: u32, key: &str) -> Result<u32> 
 fn capped_f64(value: Option<f64>, default: f64, max: f64, key: &str) -> Result<f64> {
     let value = validate(value.unwrap_or(default), key)?;
     if value > max {
-        return Err(Error::new(
-            ErrorCode::InvalidSetting,
-            format!("{key} は 0 から {max} の範囲で指定してください（{value} が指定されました）"),
-        ));
+        return Err(out_of_range(key, format!("0 から {max}"), value));
     }
     Ok(value)
 }
@@ -879,12 +872,17 @@ fn capped_f64(value: Option<f64>, default: f64, max: f64, key: &str) -> Result<f
 fn ratio(value: Option<f64>, default: f64, key: &str) -> Result<f64> {
     let value = validate(value.unwrap_or(default), key)?;
     if value > 1.0 {
-        return Err(Error::new(
-            ErrorCode::InvalidSetting,
-            format!("{key} は 0.0 から 1.0 の範囲で指定してください（{value} が指定されました）"),
-        ));
+        return Err(out_of_range(key, "0.0 から 1.0", value));
     }
     Ok(value)
+}
+
+/// 上限を超えた設定の断り。`capped` / `capped_f64` / `ratio` が同じ文面で言う。
+fn out_of_range(key: &str, range: impl std::fmt::Display, value: impl std::fmt::Display) -> Error {
+    Error::new(
+        ErrorCode::InvalidSetting,
+        format!("{key} は {range} の範囲で指定してください（{value} が指定されました）"),
+    )
 }
 
 /// spec の `rotate` を解く。**数値でも文字列でも受ける。**

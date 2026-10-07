@@ -241,8 +241,7 @@ fn collect_command(command: &clap::Command, prefix: &str, out: &mut Vec<CommandE
     } else {
         format!("{prefix} {}", command.get_name())
     };
-    let mut children = command.get_subcommands().peekable();
-    if children.peek().is_some() {
+    if command.has_subcommands() {
         for child in command.get_subcommands() {
             collect_command(child, &name, out);
         }
@@ -1070,8 +1069,8 @@ fn fields() -> Vec<FieldEntry> {
         },
         // `color` ブロックは `--white-balance` / `--exposure` のどちらかに
         // `auto` を渡した実行にしか現れない（`optimize` / `shadow` と同じ規約）。
-        // **要求したモードもここが持つ**——`settings` へ足すと既定の実行の
-        // JSON が変わり、「既定 off なら 1 バイトも変わらない」が破れる
+        // **要求したモードもここが持つ**——`settings` へ足すと、正規化を
+        // 使わない既定の実行の JSON にまで項目が増える
         FieldEntry {
             path: "color.white_balance",
             appears_in: vec!["cutout"],
@@ -1711,7 +1710,7 @@ fn fields() -> Vec<FieldEntry> {
         },
         // kiri lint の結果。**`LintReport` が結果 JSON の根そのもの**なので、
         // path にコマンド名の接頭辞は付かない（`compliance.*` は `CutoutReport`
-        // の中のブロックだった、という違いである）。どのコマンドの話かは
+        // の中のブロックである点が違う）。どのコマンドの話かは
         // `appears_in` が言う
         FieldEntry {
             path: "profile",

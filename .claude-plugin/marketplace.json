@@ -1,0 +1,14 @@
+{
+  "name": "kiri",
+  "description": "kiri（EC 商品画像の切り抜き CLI）を Claude Code から使うためのプラグイン",
+  "owner": {
+    "name": "tsutsumi389"
+  },
+  "plugins": [
+    {
+      "name": "kiri",
+      "source": "./plugins/kiri",
+      "description": "EC 商品画像の切り抜き・規格対応を kiri CLI で行うための Skill"
+    }
+  ]
+}

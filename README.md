@@ -51,6 +51,21 @@ $ kiri cutout product.jpg -o out.jpg --profile amazon --fail-on default
 オプションと警告・エラー code の一覧はそれが返すので、この README を文脈へ載せる
 必要はない（全体は 220KB あり、[絞り方](docs/commands/01-schema.md#必要な分だけ引く)を参照）。
 
+### Claude Code から使う
+
+このリポジトリは Claude Code のプラグインとして Skill を配っている。入れておくと、
+「商品写真の背景を抜いて」「Amazon 用の画像を作って」と頼むだけで、Claude が
+`info` → `cutout --dry-run --preview` → preview を目で確かめる → 面の指示で直す、
+という手順で kiri を使う。
+
+```
+/plugin marketplace add tsutsumi389/kiri
+/plugin install kiri@kiri
+```
+
+中身は [plugins/kiri/skills/kiri/SKILL.md](plugins/kiri/skills/kiri/SKILL.md) の 1 枚で、
+kiri 本体は別に入れておく（`cargo install --path .`）。
+
 ## コマンド
 
 | コマンド | 何をするか | 詳細 |

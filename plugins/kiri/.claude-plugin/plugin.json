@@ -1,0 +1,11 @@
+{
+  "name": "kiri",
+  "description": "EC 商品画像の切り抜き・規格対応を kiri CLI で行うための Skill",
+  "version": "0.1.0",
+  "author": {
+    "name": "tsutsumi389"
+  },
+  "homepage": "https://github.com/tsutsumi389/kiri",
+  "repository": "https://github.com/tsutsumi389/kiri",
+  "license": "MIT"
+}

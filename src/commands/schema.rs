@@ -107,6 +107,7 @@ pub fn run(args: &SchemaArgs) -> SchemaReport {
                 .map(|&code| WarningCodeEntry {
                     code,
                     summary: code.summary(),
+                    remedy: code.remedy(),
                 })
                 .collect()
         }),

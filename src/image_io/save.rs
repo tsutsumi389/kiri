@@ -253,7 +253,10 @@ pub fn prepare<'a>(image: &'a RgbaImage, opts: &SaveOptions) -> Result<Prepared<
                     opts.format.as_str()
                 ),
             )
-            .with_hint("透過を残すには --format png を指定してください")
+            // **`--format png` を勧めない。** `-o out.jpg --format png` は `.jpg` という
+            // 名前の PNG を書き、compose には `--format` そのものが無い。拡張子なら
+            // どのコマンドでも効く
+            .with_hint("透過を残すには、出力先の拡張子を .png か .avif にしてください")
             .with_data("format", opts.format.as_str())
             .with_data("background", vec![r, g, b]),
         );

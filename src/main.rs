@@ -175,6 +175,9 @@ fn print_schema(report: &SchemaReport) {
         let w = column_width(warnings.iter().map(|e| e.code.as_str()));
         for e in warnings {
             println!("  {:<w$}  {}", e.code.as_str(), e.summary, w = w);
+            if let Some(remedy) = e.remedy {
+                println!("  {:<w$}  → {}", "", remedy, w = w);
+            }
         }
     }
 

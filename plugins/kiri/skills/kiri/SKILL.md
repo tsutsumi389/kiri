@@ -35,6 +35,8 @@ kiri schema cutout --brief --json     # 使うコマンドの綴り・既定値�
 - **常に `--json` を付ける。** ログは stderr に出るので、stdout をそのまま JSON として読む
 - 失敗は `{"error": {"code", "message", "hint"}}`、注意は `warnings[]` の `{code, message, hint}`。
   **`hint` は次の一手そのもの**なので、まず従う
+- `hint` の無い警告は、`kiri schema <command> --brief --json` の `warnings[].remedy` が
+  何を試すかを言う。`remedy` も無い警告は、知らせるだけで直すものは無い
 - exit code の意味は次のとおり
 
 | code | 意味 | どうするか |
@@ -86,7 +88,8 @@ kiri cutout in.jpg -o out.png --dry-run --preview /tmp/kiri-preview.png --force 
 
 上から順に試す。
 
-1. **`warnings[].hint` に従う**（例: `--tolerance を上げると背景の残りが減ります`）
+1. **`warnings[].hint` に従う**（例: `--tolerance を上げると背景の残りが減ります`）。
+   hint が無ければ schema の `warnings[].remedy` を見る
 2. **どこが商品かを面で教える。** 数値の調整では直らない輪郭も、これで直る。
    preview の元画像パネルのグリッドから座標を読み、正規化座標で渡す
    ```bash

@@ -201,9 +201,12 @@ sRGB のまま比べると**ガンマぶんだけ暗い側へ偏る**（黒い�
       輪郭に背景のテクスチャが張り付いている可能性があります
 ```
 
-`CONTOUR_ROUGH` には**ヒントを付けない**。今の kiri に粗さを直すノブは無く、
+`CONTOUR_ROUGH` には**実行時のヒントを付けない**。粗さを直す数値のノブは無く、
 **実行できない助言は助言が無いより悪い**（信頼度 low で bbox を勧めないのと
-同じ判断である）。`RIM_CONTAMINATED` のヒント（`--tolerance` を上げる、文面は
+同じ判断である）。直す手は面の指示——輪郭の帯だけを不明にした `--trimap`——で、
+渡す画像は素材ごとに作るものなので、その手順は `kiri schema` の
+`warnings[].remedy` が配る
+（[警告と次の一手](#警告と次の一手remedy)）。`RIM_CONTAMINATED` のヒント（`--tolerance` を上げる、文面は
 `HALO_REMAINS` と同じ）は、**`HALO_REMAINS` が一緒に出ているときだけ**付く。
 縁が「背景色のまま」残っているなら上げれば減るが、汚染だけが出ている状態は別物で、
 中間グレーの商品に落ち影がかかったケースでは tolerance をどちらへ動かしても値が
@@ -295,6 +298,29 @@ sRGB のまま比べると**ガンマぶんだけ暗い側へ偏る**（黒い�
 
 この表は `kiri schema --json` の `warnings[]` が同じものを返す。**README を読ませる
 代わりにそれを引けばよい。**
+
+### 警告と次の一手（remedy）
+
+`hint` が付かない警告でも、次の一手は `kiri schema` の `warnings[].remedy` に
+ある。**実行時の `hint` と役目が違う。** `hint` はその実行の数値を埋めた 1 手
+（`--bbox 0,0.354,0.9834,0.662 --normalized`）で、`remedy` は数値を持たない
+一般の手順である（`hint の --bbox <値> --normalized をそのまま渡す`）。
+
+```
+$ kiri schema cutout --brief --json | jq '.warnings[] | select(.code == "CONTOUR_ROUGH")'
+{
+  "code": "CONTOUR_ROUGH",
+  "summary": "輪郭がギザギザに蛇行している。背景のテクスチャが輪郭に乗っている",
+  "remedy": "数値の調整では直らない。--debug-mask のマスクを外部の道具で縮めて --trimap を作る。…"
+}
+```
+
+- **欄は全警告で必須である。** 書き忘れるとコンパイルが通らない。直すものが無い警告は
+  `None` と明示し、そのときだけ `remedy` をキーごと持たない（`BACKGROUND_FIELD_USED` /
+  `BACKGROUND_FIELD_SKIPPED` / `EDGE_THRESHOLD_RAISED` / `COLOR_CONVERSION_SKIPPED` /
+  `QUALITY_REDUCED`）
+- **勧めるオプションの綴りは実在する。** remedy に書いた `--オプション` がどの
+  コマンドにも無ければテストが落ちる。改名した日に古い綴りを勧め続けることは無い
 
 ## 合否を exit code で返す（`--fail-on`）
 

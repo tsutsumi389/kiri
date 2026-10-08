@@ -10629,6 +10629,14 @@ fn the_published_prose_has_no_stray_spaces() {
             check(format!("{section}/{code}/remedy"), e["remedy"].as_str());
         }
     }
+    for e in v["compose_spec"].as_array().unwrap() {
+        let at = e["at"].as_str().unwrap();
+        check(format!("compose_spec/{at}"), e["summary"].as_str());
+    }
+    for p in v["profiles"].as_array().unwrap() {
+        let name = p["name"].as_str().unwrap();
+        check(format!("profiles/{name}"), p["summary"].as_str());
+    }
     let empty = vec![];
     for c in v["commands"].as_array().unwrap() {
         let name = c["name"].as_str().unwrap();

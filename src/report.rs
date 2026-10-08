@@ -1330,6 +1330,9 @@ pub struct ErrorCodeEntry {
 pub struct WarningCodeEntry {
     pub code: WarningCode,
     pub summary: &'static str,
+    /// 出たら何を試すか。**無ければキーごと消える**——直すものが無い警告である
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remedy: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]

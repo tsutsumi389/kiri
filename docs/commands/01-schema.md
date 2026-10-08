@@ -12,7 +12,7 @@ $ kiri schema --json
   "scope": { "command": null, "brief": false, "summary": false },
   "exit_codes": [{ "code": 0, "meaning": "成功" }, ...],
   "errors":   [{ "code": "OUTPUT_EXISTS",  "exit_code": 2, "summary": "出力先が既に存在する。--force が要る" }, ...],
-  "warnings": [{ "code": "LOW_UNIFORMITY", "summary": "背景の均一度が低い（単色背景ではない）" }, ...],
+  "warnings": [{ "code": "HALO_REMAINS", "summary": "境界に背景色のままの縁が残っている。...", "remedy": "--tolerance を上げる（...）" }, ...],
   "profiles":  [{ "name": "amazon", "revision": "2026-09", "rules": { ... } }, ...],
   "lint_checks": [{ "name": "format", "needs_pixels": false }, ...],
   "global_options": [{ "name": "--json", "global": true, "takes_value": false, ... }],
@@ -43,6 +43,11 @@ $ kiri schema --json
   返すことはない。**「この失敗なら何番」で分岐が書ける
 - `warnings[]` / `errors[]` は実装と同じ表から生成される。警告もエラーもそこへ足す以外に
   作る方法が無いので、**載っていない code が飛んでくることは構造的に起こらない**
+- `warnings[].remedy` は**出たら何を試すか**。実行時の `hint` はその実行の数値を埋めた
+  1 手で、付かない警告も多い（`CONTOUR_ROUGH` など）。remedy は数値を持たない一般の
+  手順である。カタログの欄が全警告で必須で、直すものが無い警告（`BACKGROUND_FIELD_USED`
+  など 5 件）は `None` と明示してあり、そのときだけキーごと消える。勧めるオプションの
+  綴りが実在することはテストが見ている
 - `fields[]` は結果の値の読み方（しきい値と `null` の意味）。後述
 - `profiles[]` は `--profile` / `kiri lint` が見る規格の表（条件・出典・版）、
   `lint_checks[]` は `kiri lint` が見る条件の一覧（`{name, needs_pixels}`）。

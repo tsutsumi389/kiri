@@ -132,7 +132,7 @@ $ kiri rotate product.jpg -o rotated.jpg --angle 30
 rotated.jpg  2386x2533  jpeg  688.4 KB  (78 ms)
   回転      30°  (再サンプリング)
 警告: jpeg は透過を保持できないため #FFFFFF で合成しました
-      透過を残すには --format png を指定してください
+      透過を残すには、出力先の拡張子を .png か .avif にしてください
 ```
 
 ### EXIF の向きとの関係

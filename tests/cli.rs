@@ -9417,6 +9417,108 @@ fn schema_returns_the_whole_contract() {
     }
 }
 
+/// 警告は「出たら何を試すか」を `remedy` で伴う。
+///
+/// 実行時の `hint` は付かない警告が多く（`CONTOUR_ROUGH` など）、付いても
+/// その実行の 1 手しか言わない。**事前に引ける手順が無いと、エージェントは
+/// 警告を読んでも次の一手を docs に探しに行く。** 直すものが無い警告だけが
+/// remedy を持たず、その顔ぶれをここで固定する——足した警告に remedy を
+/// 書かずに済ませると、ここが落ちる。
+#[test]
+fn every_warning_says_what_to_try_unless_there_is_nothing_to_fix() {
+    let v = schema_json();
+    let mut without: Vec<&str> = Vec::new();
+    for w in v["warnings"].as_array().unwrap() {
+        let code = w["code"].as_str().unwrap();
+        match w.get("remedy") {
+            Some(remedy) => assert!(
+                !remedy.as_str().unwrap().trim().is_empty(),
+                "{code} の remedy が空"
+            ),
+            None => without.push(code),
+        }
+    }
+    without.sort();
+    assert_eq!(
+        without,
+        vec![
+            "BACKGROUND_FIELD_SKIPPED",
+            "BACKGROUND_FIELD_USED",
+            "COLOR_CONVERSION_SKIPPED",
+            "EDGE_THRESHOLD_RAISED",
+            "QUALITY_REDUCED",
+        ]
+    );
+}
+
+/// remedy が勧めるオプションは、実際にどこかのコマンドが受ける綴りである。
+///
+/// オプションを改名した日に remedy だけが古い綴りを勧め続けると、従った
+/// エージェントは code 無しの exit 2 を踏み、**助言のどこが間違っているかを
+/// 知る手段が無い**。
+#[test]
+fn remedies_name_only_options_that_exist() {
+    let v = schema_json();
+    let globals: Vec<String> = v["global_options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["name"].as_str().unwrap().to_string())
+        .collect();
+    let options_of = |only: Option<&str>| -> Vec<String> {
+        let mut out = globals.clone();
+        for c in v["commands"].as_array().unwrap() {
+            if only.is_some_and(|name| c["name"] != name) {
+                continue;
+            }
+            for o in c["options"].as_array().unwrap() {
+                out.push(o["name"].as_str().unwrap().to_string());
+            }
+        }
+        out
+    };
+    // **compose だけが出す警告は compose の綴りで照合する。** 全コマンドの和で
+    // 見ると、compose に無い `--format` を勧める誤りを通してしまう
+    const COMPOSE_ONLY: &[&str] = &[
+        "TEXT_OVERFLOW",
+        "TEXT_CONTRAST_LOW",
+        "LAYERS_OVERLAP",
+        "TEXT_OBSCURED",
+        "TEXT_NOT_RENDERED",
+        "FONT_GLYPHS_MISSING",
+        "OUTSIDE_SAFE_AREA",
+    ];
+    let any_command = options_of(None);
+    let compose = options_of(Some("compose"));
+
+    let mut checked = 0;
+    for w in v["warnings"].as_array().unwrap() {
+        let Some(remedy) = w["remedy"].as_str() else {
+            continue;
+        };
+        let known = if COMPOSE_ONLY.contains(&w["code"].as_str().unwrap()) {
+            &compose
+        } else {
+            &any_command
+        };
+        let mut rest = remedy;
+        while let Some(at) = rest.find("--") {
+            let name: String = rest[at..]
+                .chars()
+                .take_while(|c| *c == '-' || c.is_ascii_alphanumeric())
+                .collect();
+            assert!(
+                known.contains(&name),
+                "{} の remedy が存在しないオプション {name} を勧めている",
+                w["code"]
+            );
+            checked += 1;
+            rest = &rest[at + name.len()..];
+        }
+    }
+    assert!(checked > 20, "検査したオプションが {checked} 個しかない");
+}
+
 /// エラーの code は exit code を伴う。
 ///
 /// `errors[]` を引けば「この失敗で何番が返るか」が分かる。実際に起こして
@@ -10524,6 +10626,7 @@ fn the_published_prose_has_no_stray_spaces() {
         for e in v[section].as_array().unwrap() {
             let code = e["code"].as_str().unwrap();
             check(format!("{section}/{code}"), e["summary"].as_str());
+            check(format!("{section}/{code}/remedy"), e["remedy"].as_str());
         }
     }
     let empty = vec![];

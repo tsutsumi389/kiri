@@ -140,7 +140,8 @@ fn compose_spec_entries() -> Vec<ComposeSpecEntry> {
         ComposeSpecEntry {
             at: "font",
             keys: keys::FONT.to_vec(),
-            summary: "字体。文字のレイヤが 1 つでもあれば要る。                      見つからなければ FONT_NOT_FOUND で断る（代替へ落ちない）",
+            summary: "字体。文字のレイヤが 1 つでもあれば要る。\
+                      見つからなければ FONT_NOT_FOUND で断る（代替へ落ちない）",
         },
         ComposeSpecEntry {
             at: "layers[type=image]",
@@ -150,7 +151,8 @@ fn compose_spec_entries() -> Vec<ComposeSpecEntry> {
         ComposeSpecEntry {
             at: "layers[type=text]",
             keys: keys::TEXT_LAYER.to_vec(),
-            summary: "文字のレイヤ。lines は行の配列で、kiri は折り返さない                      （行ごとの実測幅は結果の line_widths が返す）",
+            summary: "文字のレイヤ。lines は行の配列で、kiri は折り返さない\
+                      （行ごとの実測幅は結果の line_widths が返す）",
         },
     ]
 }

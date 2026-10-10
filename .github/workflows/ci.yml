@@ -40,6 +40,42 @@ jobs:
       - run: rustup component add rustfmt
       - run: cargo fmt --check
 
+  clippy:
+    # test と別のジョブにして並べて走らせる。clippy が作るのは rmeta だけで、
+    # test のビルドにはほとんど流用されない（同じジョブで直列にしても得が無い）。
+    name: clippy (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: default
+            features: ""
+          - label: segment
+            features: "--features segment"
+    steps:
+      - uses: actions/checkout@v7
+      # rav1e の asm ビルドに要る（理由は test ジョブのコメント）。
+      - name: nasm を入れる（rav1e の asm ビルド用）
+        run: sudo apt-get update && sudo apt-get install -y nasm
+      - run: rustup component add clippy
+      # 鍵に rustc の版を混ぜる理由は test ジョブのコメント。
+      - id: rustc
+        run: echo "hash=$(rustc -V | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: clippy-${{ runner.os }}-${{ matrix.label }}-${{ steps.rustc.outputs.hash }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: clippy-${{ runner.os }}-${{ matrix.label }}-${{ steps.rustc.outputs.hash }}-
+      - run: cargo clippy --profile ci-test --locked --all-targets ${{ matrix.features }} -- -D warnings
+      # kiri 自身の生成物はキャッシュに載せない（毎回作り直すので太るだけ）。
+      - run: cargo clean --profile ci-test -p kiri
+
   test:
     # feature `segment` の有無で 2 系統要る。既定は無効なので、既定のまま壊れて
     # いないことと、有効にしても壊れないことを別々に見る。
@@ -53,9 +89,10 @@ jobs:
     # なる。
     name: test (${{ matrix.label }})
     runs-on: ubuntu-latest
-    # 実測は `default` が 6 分 32 秒、`segment` が 8 分 51 秒（`ci-test`
-    # プロファイル。debug では 55 分と 24 分 51 秒かかっていた）。**枠は最長の
-    # 3 倍強を取ってある**——標準ランナーは同じジョブでも 3 割ほどぶれる。
+    # `target/` のキャッシュが無いときの実測は `default` が 6 分 32 秒、
+    # `segment` が 8 分 51 秒（`ci-test` プロファイル。debug では 55 分と
+    # 24 分 51 秒かかっていた）。**枠はキャッシュが外れたときの最長の 3 倍強を
+    # 取ってある**——標準ランナーは同じジョブでも 3 割ほどぶれる。
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -63,8 +100,16 @@ jobs:
         include:
           - label: default
             features: ""
+            targets: ""
+          # **segment では feature に触れるテストだけを回す。** `edge_quality`・
+          # `color_normalize`・`compose` は feature を見ておらず、
+          # `real_backgrounds` でモデルの要る検査は CI では飛ぶ。どちらの
+          # build でも同じ検査になるので、default だけで回す（重複していた
+          # 3 分弱が消える）。CI にモデルを置く日が来たら `real_backgrounds` を
+          # ここへ戻すこと。
           - label: segment
             features: "--features segment"
+            targets: "--lib --bins --test cli --test segment"
     steps:
       - uses: actions/checkout@v7
       # **`rav1e` の `asm` feature は x86_64 で NASM を要る。** `ravif` が既定で
@@ -80,22 +125,27 @@ jobs:
       # 基準はそのまま保たれている。
       - name: nasm を入れる（rav1e の asm ビルド用）
         run: sudo apt-get update && sudo apt-get install -y nasm
-      - run: rustup component add clippy
-      # `target` をまるごとではなく依存だけを載せる（キャッシュはリポジトリ
-      # あたり 10GB）。
+      # **`target/` も載せる。** 毎回 tract や rav1e を一から建てており、
+      # segment ではビルドだけで 6 分かかっていた。鍵に rustc の版を混ぜるのは、
+      # 標準ランナーの stable が上がったときに古い生成物を引かないためである
+      # （版が違えば cargo はどのみち全部建て直すので、載せても無駄になる）。
+      # キャッシュはリポジトリあたり 10GB で、溢れれば古いものから消える。
+      - id: rustc
+        run: echo "hash=$(rustc -V | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: cargo-${{ runner.os }}-${{ matrix.label }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-${{ matrix.label }}-
+            target
+          key: test-${{ runner.os }}-${{ matrix.label }}-${{ steps.rustc.outputs.hash }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: test-${{ runner.os }}-${{ matrix.label }}-${{ steps.rustc.outputs.hash }}-
       # **`ci-test` プロファイルで回す（Cargo.toml を見よ）。** debug のままだと
-      # `tests/real_backgrounds.rs` だけで 36 分かかる。clippy と test で同じ
-      # プロファイルを指すのは、中間生成物を捨てずに共有するためである。
-      - run: cargo clippy --profile ci-test --locked --all-targets ${{ matrix.features }} -- -D warnings
-      - run: cargo test --profile ci-test --locked ${{ matrix.features }}
+      # `tests/real_backgrounds.rs` だけで 36 分かかる。
+      - run: cargo test --profile ci-test --locked ${{ matrix.features }} ${{ matrix.targets }}
+      # kiri 自身の生成物はキャッシュに載せない（毎回作り直すので太るだけ）。
+      - run: cargo clean --profile ci-test -p kiri
 
   msrv:
     # 宣言だけ置いても検査しなければ守られない。実際に一度、`rust-version =

@@ -218,7 +218,7 @@ impl Check {
 
 /// 検査に使える事実。**形式によって `pixels` が無い。**
 ///
-/// 測定と判定を分けてあるのは、AVIF と JPEG/PNG で**測り方だけが違い、
+/// 測定と判定を分けてあるのは、AVIF と JPEG/PNG/WebP で**測り方だけが違い、
 /// 判定は 1 通りしかない**ためである。判定の側を形式で分岐させると、
 /// 「AVIF のときだけ緩い条件で通る」という枝をいつでも作れてしまう。
 struct Facts {
@@ -266,7 +266,7 @@ struct Fill {
 
 /// 色の名乗りの判定。**`status` と根拠を組で持つ。**
 ///
-/// 形式ごとに根拠の形が違う（JPEG/PNG は色空間名と ICC の有無、AVIF は
+/// 形式ごとに根拠の形が違う（JPEG/PNG/WebP は色空間名と ICC の有無、AVIF は
 /// CICP の 4 つ）ので、判定した場所でそのまま `actual` を組む。上位で
 /// 組み直すと、名乗りの出所ごとに分岐が増えるだけで答えは変わらない。
 struct Naming {
@@ -397,7 +397,7 @@ fn regulates_composition(rules: &Rules) -> bool {
         .any(|c| c.needs_pixels() && c.regulated(rules))
 }
 
-/// JPEG / PNG を画素まで読んで測る。
+/// JPEG / PNG / WebP を画素まで読んで測る。
 ///
 /// **バイト列を 2 度読むことになる**（`measure` が AVIF の判別のために
 /// 1 度、`load_with` がもう 1 度）。それでもパスを渡す形を崩さないのは、
@@ -500,12 +500,9 @@ fn measure_pixels(args: &LintArgs, file_size: u64) -> Result<(Facts, Vec<Warning
         width,
         height,
         file_size,
-        format: match loaded.format {
-            image::ImageFormat::Png => OutputFormat::Png,
-            // `load_with` が通すのは JPEG と PNG だけである
-            // （それ以外は `UNSUPPORTED_FORMAT` で断られてここへ来ない）
-            _ => OutputFormat::Jpeg,
-        },
+        // 読めた形式は `OutputFormat` で来る。読めない形式は `load_with` が
+        // `UNSUPPORTED_FORMAT` で断っているので、ここに「それ以外」の枝は無い
+        format: loaded.format,
         has_alpha: loaded.has_alpha,
         naming,
         pixels: None,
@@ -873,7 +870,7 @@ fn uncheckable(skipped: &[&str], format: OutputFormat) -> Option<Warning> {
         )
         .with_hint(
             "飛ばした項目も合格ではないので passed は false です。構図まで見るなら \
-             JPEG か PNG を渡してください",
+             JPEG / PNG / WebP を渡してください",
         )
         .with_data("checks", json!(skipped))
         .with_data("format", format.as_str()),

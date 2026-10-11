@@ -136,7 +136,8 @@ pub const ALL: &[Profile] = &[
     },
     Profile {
         name: "shopify",
-        revision: "2026-09",
+        // 2026-09 → 2026-10: 許す形式に WebP を足した（`formats` の注）
+        revision: "2026-10",
         summary: "Shopify の商品メディアの要件（長辺 5000px 以下・25MP 以下）",
         source: "https://help.shopify.com/en/manual/products/product-media/product-media-types",
         rules: Rules {
@@ -156,8 +157,12 @@ pub const ALL: &[Profile] = &[
             // したのと同じ決め方）
             max_bytes: Some(19_999_999),
             // AVIF を Shopify が受け付けるかは一次情報で確認できていない。
-            // 確かめられないものは載せない（楽天を載せないのと同じ理由）
-            formats: &[OutputFormat::Png, OutputFormat::Jpeg],
+            // 確かめられないものは載せない（楽天を載せないのと同じ理由）。
+            // WebP は `source` のページが受け付ける形式として名指ししている
+            // （2026-10 に確認）。kiri が lossless の WebP を書けるようになったので
+            // 並べる。**末尾に足す**——先頭は profile が既定に選ぶ形式で、
+            // そこを動かすと `--profile shopify` の成果物が変わる
+            formats: &[OutputFormat::Png, OutputFormat::Jpeg, OutputFormat::WebP],
             alpha_allowed: true,
             srgb_required: false,
         },

@@ -436,7 +436,7 @@ fn to_cutout_args(
                     ErrorCode::UnknownOutputFormat,
                     format!("'{name}' は未対応の形式です"),
                 )
-                .with_hint("avif / png / jpeg のいずれかを指定してください")
+                .with_hint("avif / png / jpeg / webp のいずれかを指定してください")
             })
         })
         .transpose()?;
@@ -729,7 +729,7 @@ fn formats(names: Option<&[String]>) -> Result<Vec<OutputFormat>> {
                     ErrorCode::UnknownOutputFormat,
                     format!("formats に未対応の形式 '{name}' があります"),
                 )
-                .with_hint("avif / png / jpeg / jpg のいずれかを指定してください")
+                .with_hint("avif / png / jpeg / jpg / webp のいずれかを指定してください")
             })
         })
         .collect()

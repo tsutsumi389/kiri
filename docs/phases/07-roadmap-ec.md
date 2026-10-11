@@ -136,6 +136,13 @@ N 個の派生」という内部型を通し、**N = 1 のときに 1 バイト�
   1 つ。tmp + rename で書く
 - ※ **WebP は足さない。** 7.1 の 3 のとおり pure Rust では可逆しか書けず、写真素材の
   可逆 WebP は AVIF / JPEG にサイズで負ける。必要になったら独立した調査項目として切る
+  - **後日、lossless に限って足した。** サイズの利点が小さいことを承知のうえで、
+    WebP を指定してくる入稿先のために入力（静止画の lossy / lossless）と lossless の
+    出力を持つ。依存は `image` の `webp` feature（pure Rust の `image-webp`、
+    `-sys` 無し）だけで、**lossy は libwebp（C）が要るので引き続き入れない**。
+    品質を持たない形式として PNG と同じ扱い（`--quality` は効かず、`--max-bytes` は
+    段を降りない）。アニメーション WebP は 1 枚目を黙って使わず `UNSUPPORTED_FORMAT`
+    で断る
 
 規模 L。衝突リスク:
 
@@ -476,7 +483,8 @@ batch spec には `profile` / `max_bytes` / `derive` / `naming` / `fail_on` /
   - **(d) 無害性の回帰**（`render_with_one_derivation_writes_what_encode_returns` が
     `attempts == 1` まで見る / `a_budget_that_already_fits_changes_nothing`）
   - **(e) PNG は段を降りない**（`png_ignores_the_budget_but_says_why` /
-    `png_never_walks_down_the_ladder` / `png_bytes_do_not_move_with_quality`）
+    `lossless_formats_never_walk_down_the_ladder` / `lossless_bytes_do_not_move_with_quality`。
+    WebP（lossless）を足したときに 2 つとも PNG と WebP の両方を見る形へ改名した）
   - **(f) `--dry-run` でも探索は走る**（`a_dry_run_searches_for_the_budget_without_writing`）
   - **(g) 書式の解釈**（`parses_a_byte_budget_with_and_without_a_unit` /
     `the_decimal_units_never_exceed_the_binary_ones` / `rejects_a_malformed_byte_budget` /
@@ -745,6 +753,8 @@ batch spec には `profile` / `max_bytes` / `derive` / `naming` / `fail_on` /
 - ※ **多派生の形式に WebP を足す。** 7.1 の 3 のとおり pure Rust では可逆しか
   書けず、写真素材では AVIF / JPEG にサイズで負ける。lossy には libwebp（C）が要り、
   `Cargo.toml` が `tract-onnx` について立てた基準を崩す
+  - **後日、lossless の WebP だけを足した**（上の Phase 20 の注を参照）。lossy を
+    入れない判断は変わっていない
 - ※ **`kiri lint` を AVIF も含めた完全な検査として設計する。** pure Rust の AVIF
   デコーダが実質存在しない以上、C 依存か巨大な自前実装のどちらかになる。
   **検査できる範囲を正直に返す**ほうが、黙って合格を出すより安全である

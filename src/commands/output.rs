@@ -10,6 +10,7 @@ use crate::cutout::{BackgroundEstimate, DeltaEQuantiles, ResolvedModel, SubjectH
 use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::derive::{self, Derivation, DeriveSpec, Rendered, render};
 use crate::image_io::naming::{self, Naming};
+use crate::image_io::save;
 use crate::image_io::{IccPolicy, IccSignal, LoadedImage, OutputFormat};
 use crate::report::{
     BackgroundReport, Dimensions, Manifest, ManifestItem, OutputReport, PerimeterDeltaE,
@@ -29,7 +30,7 @@ pub fn resolve_format(opts: &OutputOpts) -> Result<OutputFormat> {
                     opts.output.display()
                 ),
             )
-            .with_hint("--format で avif / png / jpeg を明示してください")
+            .with_hint("--format で avif / png / jpeg / webp を明示してください")
         })
 }
 
@@ -349,6 +350,9 @@ fn resolve(
             role: spec.role.clone(),
         };
         let (width, height) = derivation.dimensions(source)?;
+        // 形式の上限は寸法が決まった時点で見る。エンコードまで待つと、
+        // 先に並んだ派生だけが書かれてから落ちる
+        save::check_dimensions(format, width, height)?;
         let path = match naming {
             Some(naming) => naming::beside(
                 &opts.output,
@@ -572,7 +576,7 @@ fn icc_not_embedded(loaded: &LoadedImage, format: OutputFormat, signal: IccSigna
             "入力の ICC プロファイル {label} を sRGB へ変換していませんが、AVIF は AV1 の\
              色情報で sRGB を名乗ったままです（外す手段がありません）"
         ),
-        OutputFormat::Png | OutputFormat::Jpeg => format!(
+        OutputFormat::Png | OutputFormat::Jpeg | OutputFormat::WebP => format!(
             "入力の ICC プロファイル {label} を sRGB へ変換していないため、sRGB の ICC を\
              埋め込みませんでした"
         ),
@@ -715,6 +719,7 @@ mod tests {
         let cases = [
             (OutputFormat::Png, IccSignal::None),
             (OutputFormat::Jpeg, IccSignal::None),
+            (OutputFormat::WebP, IccSignal::None),
             (OutputFormat::Avif, IccSignal::Nclx),
         ];
         for (format, signal) in cases {
@@ -738,7 +743,12 @@ mod tests {
 
         let converted = load_with(&input, &LoadOptions::default()).unwrap();
         assert!(converted.srgb_pixels);
-        for format in [OutputFormat::Png, OutputFormat::Jpeg, OutputFormat::Avif] {
+        for format in [
+            OutputFormat::Png,
+            OutputFormat::Jpeg,
+            OutputFormat::WebP,
+            OutputFormat::Avif,
+        ] {
             let out = dir.path().join(format!("out.{}", format.as_str()));
             let (reports, warnings) =
                 write_images(&converted.image, &converted, &opts(out), &plan(format), &[]).unwrap();

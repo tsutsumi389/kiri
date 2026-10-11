@@ -110,7 +110,9 @@ impl DeriveSpec {
             }
             "format" => {
                 self.format = Some(OutputFormat::from_name(value).ok_or_else(|| {
-                    format!("format には avif / png / jpeg / jpg を指定してください（'{value}'）")
+                    format!(
+                        "format には avif / png / jpeg / jpg / webp を指定してください（'{value}'）"
+                    )
                 })?)
             }
             "quality" => {
@@ -270,7 +272,7 @@ pub const QUALITY_LADDER: &[f32] = &[85.0, 75.0, 65.0, 55.0, 45.0, 35.0, 25.0];
 /// 1 派生ぶんの探索の結果。
 struct Encoded {
     bytes: Vec<u8>,
-    /// エンコーダが実際に受け取った品質。持たない形式（PNG）では None
+    /// エンコーダが実際に受け取った品質。持たない形式（PNG と WebP）では None
     quality_used: Option<f32>,
     attempts: u32,
     warnings: Vec<Warning>,
@@ -393,7 +395,7 @@ fn encode_within_budget(image: &RgbaImage, d: &Derivation) -> Result<Encoded> {
         return Ok(done(first, asked, 1, warnings));
     };
 
-    // 降りられる段。**要求品質より下だけ**を上から順に試す。PNG は無損失で
+    // 降りられる段。**要求品質より下だけ**を上から順に試す。PNG と WebP は無損失で
     // バイト列が動かないので空になり、`--quality 20` のように梯子の下限より
     // 低い要求でも空になる。どちらも 1 回で降参する
     let rungs = QUALITY_LADDER
@@ -458,7 +460,7 @@ fn reduced(d: &Derivation, max: u64, bytes: u64, quality: f32, attempts: u32) ->
 ///
 /// `smallest` は**実際に降りた段**で得た最小の大きさとその品質で、「あとどれ
 /// だけ足りないか」が分かる唯一の値である。段を 1 つも降りていないとき
-/// （PNG、要求品質が下限より低いとき）は入れない。書いたものと同じ数を「最小」と
+/// （PNG と WebP、要求品質が下限より低いとき）は入れない。書いたものと同じ数を「最小」と
 /// 名乗ると「品質を落とせばあと少し」という読み方を誘うためで、これは
 /// 2 つの枝に同じ理由で効く
 fn unreachable(
@@ -494,13 +496,18 @@ fn unreachable(
         OutputFormat::Png => {
             "PNG は無損失で品質を持ちません。--format jpeg / avif なら品質で収められます"
         }
+        // kiri の WebP は lossless だけなので PNG と同じ立場にある。lossy の WebP を
+        // 勧めないのは、それを書くエンコーダが kiri に無いため
+        OutputFormat::WebP => {
+            "kiri の WebP は lossless のみで品質を持ちません。--format jpeg / avif なら品質で収められます"
+        }
     };
     let mut warning = Warning::new(WarningCode::MaxBytesUnreachable, message)
         .with_hint(hint)
         .with_data("max_bytes", max)
         .with_data("bytes", bytes)
         // 書いたものの品質。`QUALITY_REDUCED` と同じキーが同じ意味を持つ
-        // （どちらも `outputs[].quality_used` と一致する）。PNG では null
+        // （どちらも `outputs[].quality_used` と一致する）。PNG と WebP では null
         .with_data("quality_used", used.map(quality_number))
         .with_data("attempts", attempts)
         .with_data("format", d.format.as_str());
@@ -653,7 +660,12 @@ mod tests {
             ])
         });
         let dir = tempfile::tempdir().unwrap();
-        for format in [OutputFormat::Png, OutputFormat::Jpeg, OutputFormat::Avif] {
+        for format in [
+            OutputFormat::Png,
+            OutputFormat::Jpeg,
+            OutputFormat::WebP,
+            OutputFormat::Avif,
+        ] {
             for icc in [IccPolicy::Embed, IccPolicy::None] {
                 let name = format!("{}-{icc:?}.{}", format.as_str(), format.as_str());
                 let d = derivation(dir.path().join("out").join(&name), format, icc);
@@ -692,7 +704,12 @@ mod tests {
     fn dry_run_encodes_but_writes_nothing() {
         let img = RgbaImage::from_pixel(8, 8, image::Rgba([10, 20, 30, 255]));
         let dir = tempfile::tempdir().unwrap();
-        for format in [OutputFormat::Png, OutputFormat::Jpeg, OutputFormat::Avif] {
+        for format in [
+            OutputFormat::Png,
+            OutputFormat::Jpeg,
+            OutputFormat::WebP,
+            OutputFormat::Avif,
+        ] {
             let d = derivation(
                 dir.path().join(format!("dry.{}", format.as_str())),
                 format,
@@ -867,40 +884,47 @@ mod tests {
         assert!(w.hint.is_some());
     }
 
-    /// PNG は無損失なので段を降りない。
-    /// ファイルは `--max-bytes` 無しの PNG と 1 バイトも変わらない
+    /// 無損失の形式（PNG と lossless の WebP）は段を降りない。
+    /// ファイルは `--max-bytes` 無しのものと 1 バイトも変わらない
     #[test]
-    fn png_never_walks_down_the_ladder() {
+    fn lossless_formats_never_walk_down_the_ladder() {
         let img = noisy(64, 64);
         let dir = tempfile::tempdir().unwrap();
-        let mut d = derivation(
-            dir.path().join("lossless.png"),
-            OutputFormat::Png,
-            IccPolicy::Embed,
-        );
-        let (plain, _) = encode(&img, &d.save_options()).unwrap();
-        d.max_bytes = Some(32);
+        for format in [OutputFormat::Png, OutputFormat::WebP] {
+            let mut d = derivation(
+                dir.path().join(format!("lossless.{}", format.extension())),
+                format,
+                IccPolicy::Embed,
+            );
+            let (plain, _) = encode(&img, &d.save_options()).unwrap();
+            d.max_bytes = Some(32);
 
-        let rendered = render(&img, std::slice::from_ref(&d), false).unwrap();
-        assert_eq!(std::fs::read(&d.path).unwrap(), plain);
-        let report = &rendered[0].report;
-        assert_eq!(report.attempts, 1, "段を降りてはいけない");
-        assert_eq!(report.quality_used, None, "PNG に品質は無い");
-        assert_eq!(
-            codes(&rendered[0].warnings),
-            vec![WarningCode::MaxBytesUnreachable]
-        );
-        let w = &rendered[0].warnings[0];
-        assert!(
-            !w.data.contains_key("smallest_bytes") && !w.data.contains_key("smallest_quality"),
-            "段を降りていないので最小は語れない: {:?}",
-            w.data
-        );
-        assert!(
-            w.data["quality_used"].is_null(),
-            "PNG の品質は報告と同じく null: {:?}",
-            w.data
-        );
+            let rendered = render(&img, std::slice::from_ref(&d), false).unwrap();
+            assert_eq!(std::fs::read(&d.path).unwrap(), plain, "{format:?}");
+            let report = &rendered[0].report;
+            assert_eq!(report.attempts, 1, "{format:?} は段を降りてはいけない");
+            assert_eq!(report.quality_used, None, "{format:?} に品質は無い");
+            assert_eq!(
+                codes(&rendered[0].warnings),
+                vec![WarningCode::MaxBytesUnreachable]
+            );
+            let w = &rendered[0].warnings[0];
+            assert!(
+                !w.data.contains_key("smallest_bytes") && !w.data.contains_key("smallest_quality"),
+                "段を降りていないので最小は語れない: {:?}",
+                w.data
+            );
+            assert!(
+                w.data["quality_used"].is_null(),
+                "{format:?} の品質は報告と同じく null: {:?}",
+                w.data
+            );
+            assert!(
+                w.hint.as_deref().unwrap().contains("品質を持ちません"),
+                "{format:?}: {:?}",
+                w.hint
+            );
+        }
     }
 
     /// 同じ入力からは毎回同じ着地点になる。

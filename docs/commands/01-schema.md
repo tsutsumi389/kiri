@@ -54,7 +54,7 @@ $ kiri schema --json
   **`checks[].name` の綴りを散文から抜き直さずに済ませる**ためで、
   `needs_pixels` が真の項目は AVIF では必ず `skipped` になる——渡す前に
   どれが飛ぶかを予測できる
-- `accepts` は受け付ける値の一覧（`--format` なら avif / png / jpeg）。**綴りを外すと
+- `accepts` は受け付ける値の一覧（`--format` なら avif / png / jpeg / webp）。**綴りを外すと
   clap が code 無しの exit 2 で落ちる**ので、呼ぶ前に知れる必要がある。自由な値を取る
   項目ではキーごと消える。数値の範囲は clap から読めないため、必要なものは `summary`
   の文面に書いてある（`--preview-size` は 32-4096）

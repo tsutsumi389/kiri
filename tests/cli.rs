@@ -664,6 +664,7 @@ fn convert_writes_each_supported_format() {
         ("out.avif", "avif"),
         ("out.png", "png"),
         ("out.jpg", "jpeg"),
+        ("out.webp", "webp"),
     ] {
         let output = dir.path().join(name);
         let out = kiri()
@@ -1030,6 +1031,7 @@ fn file_carries_icc(path: &Path) -> Option<bool> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("png") => Some(png_chunk_kinds(&bytes).contains(b"iCCP")),
         Some("jpg") => Some(jpeg_icc_segments(&bytes) > 0),
+        Some("webp") => Some(webp_chunk_kinds(&bytes).contains(b"ICCP")),
         _ => None,
     }
 }
@@ -1051,7 +1053,12 @@ fn unconverted_pixels_are_written_without_the_srgb_icc() {
     });
     let input = write_jpeg_with_icc(dir.path(), "wide.jpg", &img, swapped_primaries_icc());
 
-    for (ext, unconverted) in [("png", "none"), ("jpg", "none"), ("avif", "nclx")] {
+    for (ext, unconverted) in [
+        ("png", "none"),
+        ("jpg", "none"),
+        ("webp", "none"),
+        ("avif", "nclx"),
+    ] {
         for convert in [true, false] {
             let output = dir.path().join(format!("out-{convert}.{ext}"));
             let mut args = vec![
@@ -2229,7 +2236,7 @@ fn a_malformed_derivation_on_the_command_line_is_refused_by_the_parser() {
         "quality=200",
         "effort=0",
         "fit=exact",
-        "format=webp",
+        "format=gif",
         "max_bytes=1.5m",
         "",
     ] {
@@ -2854,7 +2861,7 @@ fn unknown_output_extension_exits_with_argument_error() {
         ..Default::default()
     });
     let input = write_png(dir.path(), "in.png", &img);
-    let output = dir.path().join("out.webp");
+    let output = dir.path().join("out.gif");
 
     let out = kiri()
         .args([
@@ -3970,6 +3977,22 @@ fn write_gray(dir: &Path, name: &str, width: u32, height: u32, value: u8) -> Pat
     write_png(dir, name, &img)
 }
 
+/// Orientation ただ 1 つを持つ EXIF（TIFF 構造そのもの）。
+///
+/// JPEG は APP1 に `Exif\0\0` を前置して、WebP は EXIF チャンクにそのまま入れる
+fn orientation_tiff(orientation: u16) -> Vec<u8> {
+    // TIFF ヘッダ（リトルエンディアン）+ IFD0 に Orientation ただ 1 つ
+    let [lo, hi] = orientation.to_le_bytes();
+    let mut tiff: Vec<u8> = vec![0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00];
+    tiff.extend_from_slice(&[0x01, 0x00]); // エントリ数
+    tiff.extend_from_slice(&[0x12, 0x01]); // タグ 0x0112 = Orientation
+    tiff.extend_from_slice(&[0x03, 0x00]); // 型 3 = SHORT
+    tiff.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // 個数 1
+    tiff.extend_from_slice(&[lo, hi, 0x00, 0x00]); // 値（4 バイト枠の先頭 2 バイト）
+    tiff.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // 次の IFD は無し
+    tiff
+}
+
 /// EXIF Orientation を持つ JPEG を書く。
 ///
 /// APP1 セグメントを SOI の直後へ差し込むだけ。**画素は回さない**ので、
@@ -3994,16 +4017,7 @@ fn write_jpeg_with_orientation(
         )
         .unwrap();
 
-    // TIFF ヘッダ（リトルエンディアン）+ IFD0 に Orientation ただ 1 つ
-    let [lo, hi] = orientation.to_le_bytes();
-    let mut tiff: Vec<u8> = vec![0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00];
-    tiff.extend_from_slice(&[0x01, 0x00]); // エントリ数
-    tiff.extend_from_slice(&[0x12, 0x01]); // タグ 0x0112 = Orientation
-    tiff.extend_from_slice(&[0x03, 0x00]); // 型 3 = SHORT
-    tiff.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // 個数 1
-    tiff.extend_from_slice(&[lo, hi, 0x00, 0x00]); // 値（4 バイト枠の先頭 2 バイト）
-    tiff.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // 次の IFD は無し
-
+    let tiff = orientation_tiff(orientation);
     let mut app1: Vec<u8> = vec![0xFF, 0xE1];
     let length = u16::try_from(tiff.len() + 8).unwrap();
     app1.extend_from_slice(&length.to_be_bytes());
@@ -7927,7 +7941,7 @@ fn an_unknown_preview_extension_is_an_argument_error() {
             "-o",
             dir.path().join("cut.png").to_str().unwrap(),
             "--preview",
-            dir.path().join("p.webp").to_str().unwrap(),
+            dir.path().join("p.gif").to_str().unwrap(),
             "--json",
         ])
         .output()
@@ -10043,7 +10057,7 @@ fn schema_lists_the_accepted_values_for_enum_options() {
         .iter()
         .map(|x| x.as_str().unwrap().to_string())
         .collect();
-    assert_eq!(format, vec!["avif", "png", "jpeg"]);
+    assert_eq!(format, vec!["avif", "png", "jpeg", "webp"]);
 
     assert!(
         find("resize", "--fit")["accepts"].is_array(),
@@ -16611,4 +16625,723 @@ fn a_set_does_not_push_the_chosen_rung_into_upscaling() {
     // 倍率 1.125 で拡大していた
     assert_eq!(canvas["width"], 1000, "{canvas}");
     assert_eq!(canvas["height"], 1000, "{canvas}");
+}
+
+// --- WebP（入力は静止画の lossy / lossless、出力は lossless のみ）---
+
+/// WebP のチャンクの型を並べる。奇数長のチャンクには 1 バイトの詰め物が付く
+fn webp_chunk_kinds(bytes: &[u8]) -> Vec<[u8; 4]> {
+    assert_eq!(&bytes[..4], b"RIFF", "WebP ではない");
+    assert_eq!(&bytes[8..12], b"WEBP", "WebP ではない");
+    let mut kinds = Vec::new();
+    let mut i = 12;
+    while i < bytes.len() {
+        let len = u32::from_le_bytes(bytes[i + 4..i + 8].try_into().unwrap()) as usize;
+        kinds.push(bytes[i..i + 4].try_into().unwrap());
+        i += 8 + len + (len & 1);
+    }
+    kinds
+}
+
+/// lossless の WebP を書く。ICC と EXIF は渡したときだけ付く（付けば VP8X になる）
+fn write_webp(
+    dir: &Path,
+    name: &str,
+    img: &image::RgbaImage,
+    icc: Option<Vec<u8>>,
+    exif: Option<Vec<u8>>,
+) -> PathBuf {
+    use image::ImageEncoder;
+
+    let mut webp = Vec::new();
+    let mut encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut webp);
+    if let Some(icc) = icc {
+        encoder.set_icc_profile(icc).unwrap();
+    }
+    if let Some(exif) = exif {
+        encoder.set_exif_metadata(exif).unwrap();
+    }
+    encoder
+        .write_image(
+            img.as_raw(),
+            img.width(),
+            img.height(),
+            image::ExtendedColorType::Rgba8,
+        )
+        .unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, webp).unwrap();
+    path
+}
+
+/// RIFF のチャンクを 1 つ積む。奇数長なら詰め物を足す
+fn push_riff_chunk(out: &mut Vec<u8>, kind: &[u8; 4], payload: &[u8]) {
+    out.extend_from_slice(kind);
+    out.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+    out.extend_from_slice(payload);
+    if payload.len() % 2 == 1 {
+        out.push(0);
+    }
+}
+
+fn u24(v: u32) -> [u8; 3] {
+    let [a, b, c, _] = v.to_le_bytes();
+    [a, b, c]
+}
+
+/// アニメーション WebP を手で組む。
+///
+/// `image-webp` はアニメーションを書けないので、各フレームを lossless で
+/// 書いた VP8L チャンクを ANMF に包み、VP8X のアニメーション旗を立てる
+/// （WebP Container Specification の Extended File Format）
+fn animated_webp(frames: &[image::RgbaImage]) -> Vec<u8> {
+    use image::ImageEncoder;
+
+    let (w, h) = frames[0].dimensions();
+    let mut body = b"WEBP".to_vec();
+    let mut vp8x = vec![0x02 | 0x10, 0, 0, 0]; // アニメーション + アルファ
+    vp8x.extend_from_slice(&u24(w - 1));
+    vp8x.extend_from_slice(&u24(h - 1));
+    push_riff_chunk(&mut body, b"VP8X", &vp8x);
+    // 背景色 4 バイト + ループ回数 2 バイト（0 = 無限）
+    push_riff_chunk(&mut body, b"ANIM", &[255, 255, 255, 255, 0, 0]);
+    for frame in frames {
+        let mut still = Vec::new();
+        image::codecs::webp::WebPEncoder::new_lossless(&mut still)
+            .write_image(frame.as_raw(), w, h, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        // 素の WebP は "RIFF" + 長さ + "WEBP" の後に VP8L チャンクが 1 つだけ続く
+        assert_eq!(&still[12..16], b"VP8L");
+        let mut anmf = Vec::new();
+        anmf.extend_from_slice(&u24(0)); // x / 2
+        anmf.extend_from_slice(&u24(0)); // y / 2
+        anmf.extend_from_slice(&u24(w - 1));
+        anmf.extend_from_slice(&u24(h - 1));
+        anmf.extend_from_slice(&u24(100)); // 表示時間(ms)
+        anmf.push(0); // 合成と破棄の旗
+        anmf.extend_from_slice(&still[12..]);
+        push_riff_chunk(&mut body, b"ANMF", &anmf);
+    }
+    let mut out = b"RIFF".to_vec();
+    out.extend_from_slice(&u32::try_from(body.len()).unwrap().to_le_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+fn info_json(input: &Path) -> Value {
+    let out = kiri()
+        .args(["info", input.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    json_stdout(&out)
+}
+
+/// WebP を入力に取れる。info / convert / cutout の 3 つが同じ読み込みを通る
+#[test]
+fn a_webp_input_is_read_by_every_command() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        ..Default::default()
+    });
+    let input = write_webp(dir.path(), "in.webp", &img, None, None);
+
+    let v = info_json(&input);
+    assert_eq!(v["format"], "webp", "{v}");
+    assert_eq!(
+        (v["width"].as_u64(), v["height"].as_u64()),
+        (Some(120), Some(120))
+    );
+    assert_eq!(v["color_space"], "sRGB");
+
+    // lossless なので、PNG へ移しても 1 画素も変わらない
+    let png = dir.path().join("out.png");
+    let v = convert_json(&input, &png, &[]);
+    assert_eq!(v["outputs"][0]["format"], "png");
+    assert_eq!(image::open(&png).unwrap().to_rgba8(), img);
+
+    let cut = dir.path().join("cut.png");
+    let out = run_cutout(&[input.to_str().unwrap(), "-o", cut.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    assert!(cut.exists());
+    assert_eq!(v["outputs"][0]["format"], "png");
+}
+
+/// WebP の EXIF Orientation も JPEG と同じく適用する。
+///
+/// **ここが効かないと `--bbox` の座標がすべてずれる**（`load.rs` の冒頭）。
+/// 読み手は kamadak-exif の `read_from_container` で、JPEG と同じ 1 本を通る
+#[test]
+fn a_webp_exif_orientation_is_applied() {
+    let dir = fixture_dir();
+    // 横 30 x 縦 20、左上に赤い目印
+    let mut img = image::RgbaImage::from_pixel(30, 20, image::Rgba([0, 0, 0, 255]));
+    img.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+    let input = write_webp(
+        dir.path(),
+        "rotated.webp",
+        &img,
+        None,
+        Some(orientation_tiff(6)),
+    );
+
+    let v = info_json(&input);
+    assert_eq!(v["exif_orientation"], 6, "{v}");
+    assert_eq!(v["orientation_applied"], true, "{v}");
+    assert_eq!(
+        (v["width"].as_u64(), v["height"].as_u64()),
+        (Some(20), Some(30))
+    );
+
+    // 90 度時計回り: 左上の目印は右上へ移る
+    let png = dir.path().join("out.png");
+    convert_json(&input, &png, &[]);
+    let out = image::open(&png).unwrap().to_rgba8();
+    assert_eq!(out.dimensions(), (20, 30));
+    assert_eq!(out.get_pixel(19, 0).0, [255, 0, 0, 255]);
+    assert_eq!(out.get_pixel(0, 0).0, [0, 0, 0, 255]);
+}
+
+/// EXIF チャンクが `Exif\0\0` の接頭辞付きでも向きを読む。
+///
+/// 規格は TIFF 構造をそのまま入れると定めているが、JPEG の APP1 の中身を
+/// 丸ごと写す道具がこの接頭辞を残す。kamadak-exif 0.6.1 はそれを読めず、
+/// **向きが黙って 1 になる**——`--bbox` の座標が全部ずれる失敗である
+#[test]
+fn a_webp_exif_with_the_jpeg_style_prefix_is_still_applied() {
+    let dir = fixture_dir();
+    let mut img = image::RgbaImage::from_pixel(30, 20, image::Rgba([0, 0, 0, 255]));
+    img.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+    let mut exif = b"Exif\0\0".to_vec();
+    exif.extend_from_slice(&orientation_tiff(6));
+    let input = write_webp(dir.path(), "prefixed.webp", &img, None, Some(exif));
+
+    let v = info_json(&input);
+    assert_eq!(v["exif_orientation"], 6, "{v}");
+    assert_eq!(v["orientation_applied"], true, "{v}");
+    assert_eq!(
+        (v["width"].as_u64(), v["height"].as_u64()),
+        (Some(20), Some(30))
+    );
+}
+
+/// WebP の ICC も JPEG / PNG と同じく解釈して sRGB へ寄せる
+#[test]
+fn a_webp_icc_profile_is_converted_to_srgb() {
+    let dir = fixture_dir();
+    let img = image::RgbaImage::from_pixel(16, 16, image::Rgba([200, 40, 40, 255]));
+    let input = write_webp(
+        dir.path(),
+        "wide.webp",
+        &img,
+        Some(swapped_primaries_icc()),
+        None,
+    );
+
+    let v = info_json(&input);
+    assert_eq!(v["icc_profile"], true, "{v}");
+    assert_eq!(v["color_profile"], SWAPPED_PROFILE_NAME);
+    assert_eq!(v["color_converted"], true);
+
+    // 赤と緑の原色を入れ替えたプロファイルなので、変換後は緑が勝つ
+    let png = dir.path().join("out.png");
+    convert_json(&input, &png, &[]);
+    let px = image::open(&png).unwrap().to_rgba8().get_pixel(8, 8).0;
+    assert!(px[1] > px[0], "変換されていない: {px:?}");
+}
+
+/// 透過を持つ WebP は、透過のまま読む
+#[test]
+fn a_transparent_webp_input_keeps_its_alpha() {
+    let dir = fixture_dir();
+    let img = transparent_product(120, 120);
+    let input = write_webp(dir.path(), "cut.webp", &img, None, None);
+
+    let v = info_json(&input);
+    assert_eq!(v["has_alpha"], true, "{v}");
+
+    let png = dir.path().join("out.png");
+    convert_json(&input, &png, &[]);
+    assert_eq!(image::open(&png).unwrap().to_rgba8(), img);
+}
+
+/// アニメーション WebP は**黙って 1 枚目を使わず**断る。
+///
+/// 1 枚目が商品を代表している保証は無い。取り出し方を hint で示す
+#[test]
+fn an_animated_webp_is_refused() {
+    let dir = fixture_dir();
+    let first = image::RgbaImage::from_pixel(24, 16, image::Rgba([255, 255, 255, 255]));
+    let second = image::RgbaImage::from_pixel(24, 16, image::Rgba([200, 40, 40, 255]));
+    let bytes = animated_webp(&[first, second]);
+
+    // 組んだファイルが本当にアニメーション WebP として読めること。ここが
+    // 崩れていると、下の断りは「壊れたファイル」を断っているだけになる
+    {
+        use image::AnimationDecoder;
+        let decoder = image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(&bytes)).unwrap();
+        assert!(decoder.has_animation());
+        assert_eq!(decoder.into_frames().count(), 2);
+    }
+
+    let input = dir.path().join("anim.webp");
+    std::fs::write(&input, &bytes).unwrap();
+    for command in ["info", "convert", "cutout"] {
+        let mut args = vec![command, input.to_str().unwrap()];
+        let output = dir.path().join(format!("{command}.png"));
+        if command != "info" {
+            args.extend(["-o", output.to_str().unwrap()]);
+        }
+        args.push("--json");
+        let out = kiri().args(&args).output().unwrap();
+        assert_eq!(out.status.code(), Some(3), "{command}");
+        let v = json_stdout(&out);
+        assert_eq!(v["error"]["code"], "UNSUPPORTED_FORMAT", "{command}: {v}");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("アニメーション"),
+            "{command}: {v}"
+        );
+        assert!(
+            v["error"]["hint"].as_str().unwrap().contains("webpmux"),
+            "{command}: {v}"
+        );
+        assert!(!output.exists(), "{command}: 断ったのに書いている");
+    }
+
+    // フレームが 1 枚しかなくても、アニメーションを名乗る限り断る（旗で判定する）
+    let single = dir.path().join("single.webp");
+    std::fs::write(
+        &single,
+        animated_webp(&[image::RgbaImage::from_pixel(
+            24,
+            16,
+            image::Rgba([200, 40, 40, 255]),
+        )]),
+    )
+    .unwrap();
+    let out = kiri()
+        .args(["info", single.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(json_stdout(&out)["error"]["code"], "UNSUPPORTED_FORMAT");
+}
+
+/// `--format webp` は lossless で書く。**デコードすれば元の画素と 1 つも違わず、
+/// 半透明も完全透明の画素の RGB も残る**
+#[test]
+fn webp_output_is_lossless_and_keeps_alpha() {
+    let dir = fixture_dir();
+    let mut img = transparent_product(80, 60);
+    img.put_pixel(0, 0, image::Rgba([12, 34, 56, 0]));
+    img.put_pixel(1, 0, image::Rgba([90, 80, 70, 128]));
+    let input = write_png(dir.path(), "in.png", &img);
+
+    // 拡張子から決まる道と --format の道の両方
+    for (name, extra) in [
+        ("out.webp", &[][..]),
+        ("named.png", &["--format", "webp"][..]),
+    ] {
+        let output = dir.path().join(name);
+        let v = convert_json(&input, &output, extra);
+        let report = &v["outputs"][0];
+        assert_eq!(report["format"], "webp", "{name}");
+        assert!(report["quality_used"].is_null(), "{name}: {report}");
+        assert_eq!(report["icc"], "embedded", "{name}");
+        assert_eq!(report["attempts"], 1, "{name}");
+
+        let bytes = std::fs::read(&output).unwrap();
+        assert_eq!(report["bytes"].as_u64(), Some(bytes.len() as u64));
+        let kinds = webp_chunk_kinds(&bytes);
+        assert!(kinds.contains(b"VP8L"), "{name}: {kinds:?}");
+        assert!(!kinds.contains(b"VP8 "), "{name}: lossy を書いている");
+        assert!(
+            kinds.contains(b"ICCP"),
+            "{name}: 既定で sRGB を名乗っていない"
+        );
+
+        let decoded = image::load_from_memory_with_format(&bytes, image::ImageFormat::WebP)
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(decoded, img, "{name}");
+    }
+}
+
+/// WebP は品質を持たない。`--quality` を両端まで振ってもバイト列は動かない
+#[test]
+fn webp_bytes_do_not_move_with_quality() {
+    let dir = fixture_dir();
+    let input = budget_input(dir.path());
+    let mut seen = Vec::new();
+    for quality in ["0", "50", "100"] {
+        let output = dir.path().join(format!("q{quality}.webp"));
+        let v = convert_json(&input, &output, &["--quality", quality]);
+        assert!(v["outputs"][0]["quality_used"].is_null());
+        seen.push(std::fs::read(&output).unwrap());
+    }
+    assert_eq!(seen[0], seen[1]);
+    assert_eq!(seen[1], seen[2]);
+
+    // --max-bytes も段を降りず、PNG と同じく理由を言う
+    let output = dir.path().join("budget.webp");
+    let v = convert_json(&input, &output, &["--max-bytes", "1k"]);
+    assert_eq!(std::fs::read(&output).unwrap(), seen[0]);
+    assert_eq!(v["outputs"][0]["attempts"], 1);
+    let warning = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "MAX_BYTES_UNREACHABLE")
+        .unwrap_or_else(|| panic!("MAX_BYTES_UNREACHABLE が無い: {v}"));
+    assert!(warning["data"]["quality_used"].is_null());
+    let hint = warning["hint"].as_str().unwrap();
+    assert!(hint.contains("lossless"), "{hint}");
+}
+
+/// `--formats` / `--derive` / batch spec の format がどれも webp を受ける
+#[test]
+fn webp_is_accepted_wherever_a_format_is_named() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+
+    let out = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        dir.path().join("multi/item.png").to_str().unwrap(),
+        "--sizes",
+        "40,80",
+        "--formats",
+        "webp,png",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    let outputs: Vec<(String, u64)> = v["outputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| {
+            (
+                o["format"].as_str().unwrap().to_string(),
+                o["width"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        outputs,
+        vec![
+            ("webp".to_string(), 40),
+            ("png".to_string(), 40),
+            ("webp".to_string(), 80),
+            ("png".to_string(), 80),
+        ]
+    );
+    for o in v["outputs"].as_array().unwrap() {
+        let path = o["path"].as_str().unwrap();
+        if o["format"] == "webp" {
+            assert!(path.ends_with(".webp"), "{{ext}} が webp でない: {path}");
+        }
+        assert!(Path::new(path).exists(), "{path}");
+    }
+
+    let derived = dir.path().join("derived.png");
+    let out = run_cutout(&[
+        input.to_str().unwrap(),
+        "-o",
+        derived.to_str().unwrap(),
+        "--derive",
+        "width=50,format=webp",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    assert_eq!(v["outputs"][0]["format"], "webp");
+
+    let spec = write_spec(
+        dir.path(),
+        r#"{"items":[{"input":"in.png","output":"b/one.webp"},
+                     {"input":"in.png","output":"b/two.out","format":"webp"}]}"#,
+    );
+    let out = run_batch(&spec, &[]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    for i in 0..2 {
+        assert_eq!(
+            v["results"][i]["result"]["outputs"][0]["format"], "webp",
+            "{v}"
+        );
+    }
+}
+
+/// kiri が書いた WebP を kiri lint が読める（入力と同じ読み込みを通る）
+#[test]
+fn lint_reads_a_webp_that_kiri_wrote() {
+    let dir = fixture_dir();
+    let source = write_conforming(dir.path(), "source.png", &profile_rules("shopify"));
+    let webp = dir.path().join("out.webp");
+    convert_json(&source, &webp, &[]);
+
+    let (code, v) = lint(&webp, "shopify");
+    assert_eq!(v["format"], "webp", "{v}");
+    assert_eq!(lint_check(&v, "format")["status"], "pass", "{v}");
+    assert_eq!(code, 0, "{v}");
+    assert!(!has_warning(&v, "PROFILE_UNCHECKABLE"), "{v}");
+
+    // amazon は WebP を許していない。**画素は読めている**ので、構図と色の
+    // 項目は AVIF のように skipped へ倒れず、format だけが落ちる
+    let amazon = profile_rules("amazon");
+    let source = write_conforming(dir.path(), "amazon.png", &amazon);
+    let webp = dir.path().join("amazon.webp");
+    convert_json(&source, &webp, &[]);
+    let (_, v) = lint(&webp, "amazon");
+    assert_eq!(not_passing(&v), vec!["format=\"fail\"".to_string()], "{v}");
+    assert_eq!(lint_check(&v, "color_space")["status"], "pass", "{v}");
+    assert!(!has_warning(&v, "PROFILE_UNCHECKABLE"), "{v}");
+}
+
+/// `kiri schema` が webp を候補として配る
+#[test]
+fn the_schema_offers_webp() {
+    let v = schema_json();
+    let text = v.to_string();
+    assert!(
+        v["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["code"] == "WEBP_ENCODE_FAILED"),
+        "WEBP_ENCODE_FAILED が errors に無い"
+    );
+    for command in ["convert", "resize", "rotate", "cutout"] {
+        let options = v["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == command)
+            .unwrap_or_else(|| panic!("{command} が無い"))["options"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let accepts = |name: &str| -> Vec<String> {
+            options
+                .iter()
+                .find(|o| o["name"] == name)
+                .and_then(|o| o["accepts"].as_array())
+                .map(|a| a.iter().map(|x| x.as_str().unwrap().to_string()).collect())
+                .unwrap_or_default()
+        };
+        assert!(
+            accepts("--format").contains(&"webp".to_string()),
+            "{command} --format: {text}"
+        );
+        if command == "cutout" {
+            assert!(accepts("--formats").contains(&"webp".to_string()));
+        }
+    }
+    // **表を書き換えたら版を上げる**（`profile.rs` のモジュール doc）。WebP を
+    // 足した shopify だけが 2026-10 で、触っていない規格は版も動かさない
+    for (name, revision) in [
+        ("amazon", "2026-09"),
+        ("shopify", "2026-10"),
+        ("square-white", "2026-09"),
+    ] {
+        let entry = v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap_or_else(|| panic!("{name} が profiles[] に無い"));
+        assert_eq!(entry["revision"], revision, "{name}");
+    }
+    let shopify = profile_rules("shopify");
+    assert!(
+        shopify["formats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "webp"),
+        "{shopify}"
+    );
+}
+
+/// WebP の 1 辺の上限（16384px）を超える派生は、**1 本も書く前に**断る。
+///
+/// エンコードの段で断ると、先に並んだ PNG だけが書かれて結果 JSON はエラーだけに
+/// なる——何が書けたかを追えず、再実行すると `OUTPUT_EXISTS` で詰まる。寸法は
+/// 拡大を許した `--derive` で稼ぐ（巨大な入力を用意しなくてよい）
+#[test]
+fn an_oversized_webp_derivation_is_refused_before_anything_is_written() {
+    let dir = fixture_dir();
+    let img = image::RgbaImage::from_pixel(200, 2, image::Rgba([90, 80, 70, 255]));
+    let input = write_png(dir.path(), "wide.png", &img);
+    let output = dir.path().join("out/wide.png");
+
+    let out = kiri()
+        .args([
+            "convert",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--derive",
+            "width=16400,allow_upscale=true,format=png",
+            "--derive",
+            "width=16400,allow_upscale=true,format=webp",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let v = json_stdout(&out);
+    assert_eq!(v["error"]["code"], "WEBP_ENCODE_FAILED", "{v}");
+    assert!(
+        v["error"]["message"].as_str().unwrap().contains("16384"),
+        "{v}"
+    );
+    let written: Vec<_> = std::fs::read_dir(dir.path().join("out"))
+        .map(|d| d.map(|e| e.unwrap().file_name()).collect())
+        .unwrap_or_default();
+    assert!(written.is_empty(), "断ったのに書いている: {written:?}");
+}
+
+/// Pillow（libwebp）で作った lossy の WebP。作り方は `tests/fixtures/README.md`。
+///
+/// **kiri は lossy の WebP を書けない**ので、入力の lossy 経路（VP8 と ALPH）は
+/// 外の道具で作った素材でしか確かめられない
+fn lossy_webp_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/webp")
+        .join(name)
+}
+
+/// 透過付きの lossy WebP（VP8 + ALPH）を、透過のまま読む
+#[test]
+fn a_lossy_webp_with_alpha_is_read_by_every_command() {
+    let input = lossy_webp_fixture("lossy_alpha.webp");
+    let bytes = std::fs::read(&input).unwrap();
+    let kinds = webp_chunk_kinds(&bytes);
+    assert!(kinds.contains(b"VP8 "), "lossy ではない: {kinds:?}");
+    assert!(
+        kinds.contains(b"ALPH"),
+        "アルファが別チャンクでない: {kinds:?}"
+    );
+
+    let v = info_json(&input);
+    assert_eq!(v["format"], "webp", "{v}");
+    assert_eq!(v["has_alpha"], true, "{v}");
+
+    let dir = fixture_dir();
+    let png = dir.path().join("out.png");
+    convert_json(&input, &png, &[]);
+    let out = image::open(&png).unwrap().to_rgba8();
+    assert_eq!(out.dimensions(), (96, 96));
+    assert_eq!(out.get_pixel(2, 2)[3], 0, "外周の透明が消えた");
+    assert_eq!(out.get_pixel(48, 48)[3], 255, "商品の不透明が消えた");
+
+    let cut = dir.path().join("cut.png");
+    let out = run_cutout(&[input.to_str().unwrap(), "-o", cut.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(cut.exists());
+}
+
+/// ICC 付きの lossy WebP（VP8X + ICCP + VP8）も、ICC を解釈して sRGB へ寄せる
+#[test]
+fn a_lossy_webp_with_an_icc_profile_is_converted() {
+    let input = lossy_webp_fixture("lossy_icc.webp");
+    let bytes = std::fs::read(&input).unwrap();
+    let kinds = webp_chunk_kinds(&bytes);
+    assert!(kinds.contains(b"VP8 "), "lossy ではない: {kinds:?}");
+    assert!(kinds.contains(b"ICCP"), "ICC が無い: {kinds:?}");
+
+    let v = info_json(&input);
+    assert_eq!(v["format"], "webp", "{v}");
+    assert_eq!(v["icc_profile"], true, "{v}");
+    assert_eq!(v["color_profile"], SWAPPED_PROFILE_NAME, "{v}");
+    assert_eq!(v["color_converted"], true, "{v}");
+
+    // 赤い商品は、赤と緑の原色を入れ替えたプロファイルの下では緑へ寄る
+    let dir = fixture_dir();
+    let png = dir.path().join("out.png");
+    convert_json(&input, &png, &[]);
+    let px = image::open(&png).unwrap().to_rgba8().get_pixel(48, 48).0;
+    assert!(px[1] > px[0], "変換されていない: {px:?}");
+
+    let cut = dir.path().join("cut.png");
+    let out = run_cutout(&[input.to_str().unwrap(), "-o", cut.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(json_stdout(&out)["color_converted"], true);
+}
+
+/// `--debug-mask` の形式は拡張子で決まる。`.webp` なら lossless の WebP で、
+/// `.png` と同じ画素になる（マスクを lossy で書くと目視の判断を誤らせる）
+#[test]
+fn the_debug_mask_format_follows_the_extension() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 120,
+        height: 120,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let mut masks = Vec::new();
+    for ext in ["png", "webp"] {
+        let mask = dir.path().join(format!("mask.{ext}"));
+        let out = run_cutout(&[
+            input.to_str().unwrap(),
+            "-o",
+            dir.path().join(format!("cut-{ext}.png")).to_str().unwrap(),
+            "--debug-mask",
+            mask.to_str().unwrap(),
+        ]);
+        assert!(
+            out.status.success(),
+            "{ext}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let bytes = std::fs::read(&mask).unwrap();
+        if ext == "webp" {
+            assert!(
+                webp_chunk_kinds(&bytes).contains(b"VP8L"),
+                "lossless でない"
+            );
+        }
+        masks.push(image::load_from_memory(&bytes).unwrap().to_luma8());
+    }
+    assert_eq!(masks[0], masks[1]);
 }

@@ -342,7 +342,7 @@ pub struct OutputReport {
     pub icc: IccSignal,
     /// 実際に使った品質（エンコーダが受け取った値。JPEG は整数へ丸めた後）。
     /// **キーは常に出す**（省くと「古い版で走った」と「品質を持たない形式
-    /// だった」が同じ形になる）。PNG は無損失なので null。
+    /// だった」が同じ形になる）。PNG と WebP は無損失なので null。
     ///
     /// `f32` ではなく `quality_number` を通した `f64` を持つ。`f32` のまま
     /// `serde_json::Value` にすると `33.3` が `33.29999923706055` と綴られ、
@@ -1073,7 +1073,7 @@ pub struct LintReport {
     pub file_size: u64,
     pub width: u32,
     pub height: u32,
-    /// 実ファイルの形式（`jpeg` / `png` / `avif`）。**拡張子ではない**
+    /// 実ファイルの形式（`jpeg` / `png` / `webp` / `avif`）。**拡張子ではない**
     pub format: String,
     /// `checks[]` が**すべて `pass`** であること。
     ///
@@ -1254,7 +1254,7 @@ pub struct LintCheckEntry {
     ///
     /// **真なら AVIF では必ず `skipped` になる**（kiri は AVIF をデコード
     /// できない）。渡す前にどの項目が飛ぶかを予測できるので、構図まで見たい
-    /// 呼び出し側は JPEG / PNG を選び直せる
+    /// 呼び出し側は JPEG / PNG / WebP を選び直せる
     pub needs_pixels: bool,
 }
 
@@ -1302,7 +1302,7 @@ pub struct ProfileRules {
     /// 1 バイト引いた値がここに入る）
     pub max_bytes: Option<u64>,
     /// 許される出力形式。**空なら規定なし。** 綴りは `outputs[].format` と
-    /// 同じ（"jpeg" / "png" / "avif"）にしてあるので、書いたものが許容の中に
+    /// 同じ（"jpeg" / "png" / "webp" / "avif"）にしてあるので、書いたものが許容の中に
     /// あるかを綴りの変換なしに突き合わせられる。
     ///
     /// **kiri が書けない形式は並べない。** 規格が TIFF を許していても、

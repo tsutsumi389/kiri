@@ -459,7 +459,7 @@ out.jpg  2000x2000  jpeg  125.0 KB  (544 ms)
 | name | revision | 何を要求するか | 出典 |
 |---|---|---|---|
 | `amazon` | 2026-09 | 長辺 500〜10000px／純白背景（ΔE76 2.0 以内）／占有率 85% 以上／JPEG・PNG／透過なし／sRGB | [Amazon Seller Central](https://sellercentral.amazon.com/help/hub/reference/external/G1881) |
-| `shopify` | 2026-09 | 長辺 5000px 以下／25MP 以下／20MB 未満／PNG・JPEG（構図の規定なし） | [Shopify Help Center](https://help.shopify.com/en/manual/products/product-media/product-media-types) |
+| `shopify` | 2026-10 | 長辺 5000px 以下／25MP 以下／20MB 未満／PNG・JPEG・WebP（構図の規定なし） | [Shopify Help Center](https://help.shopify.com/en/manual/products/product-media/product-media-types) |
 | `square-white` | 2026-09 | 正方形／長辺 1000px 以上／純白背景／占有率 85% 以上／JPEG・PNG／透過なし／sRGB | kiri 自身の定義（モール規格ではない） |
 
 条件そのもの（数値・出典・版）は `kiri schema --json` の `profiles[]` が機械可読で

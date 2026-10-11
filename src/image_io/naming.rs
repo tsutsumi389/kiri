@@ -50,7 +50,7 @@ pub struct Name<'a> {
     /// その派生が実際に書き出す寸法
     pub width: u32,
     pub height: u32,
-    /// 形式の拡張子（avif / png / jpg）
+    /// 形式の拡張子（avif / png / jpg / webp）
     pub ext: &'a str,
     pub role: Option<&'a str>,
 }

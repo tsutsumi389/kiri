@@ -25,7 +25,7 @@ AIエージェントから使われることを前提とした画像編集CLI。
 |---|---|
 | 複雑背景（生活シーン・屋外撮影） | 古典的画素処理では品質が出ない。MLモデルが必要になり pure Rust 方針と衝突する |
 | 髪の毛レベルの精密マッティング | 要求は「輪郭レベル」で足りると判断 |
-| WebP 出力 | 実用的なロッシー圧縮には libwebp（C）が必要 |
+| WebP の lossy 出力 | 実用的なロッシー圧縮には libwebp（C）が必要（lossless の WebP は書く。3.3 を参照） |
 | AVIF 入力 | デコードに dav1d（C）が必要 |
 | MCPサーバーモード | CLIに専念する |
 
@@ -37,7 +37,7 @@ AIエージェントから使われることを前提とした画像編集CLI。
 
 **pure Rust のみ。実行時に C のライブラリを引くクレートは採用しない。**
 
-理由は3つ。単一バイナリで配布できること、クロスコンパイルが素直に通ること、そしてビルドの容易さがOSSの採用障壁を直接下げること。この方針が対応形式の選択（WebP非対応）を規定している。
+理由は3つ。単一バイナリで配布できること、クロスコンパイルが素直に通ること、そしてビルドの容易さがOSSの採用障壁を直接下げること。この方針が対応形式の選択（WebP は lossless の出力だけ）を規定している。
 
 検査できる形で言い直すと、**`cargo tree -e normal` に `*-sys` クレートが 1 つも現れない**
 ことである。`-sys` クレートは C のライブラリに橋を架けるためだけに存在するので、
@@ -69,7 +69,7 @@ Phase 5 が新しく持ち込んだ悪化ではない。
 
 | クレート | バージョン | 用途 |
 |---|---|---|
-| `image` | 0.25 | JPEG/PNG のデコード、PNG/JPEG のエンコード |
+| `image` | 0.25 | JPEG/PNG/WebP のデコード、PNG/JPEG/WebP（lossless のみ）のエンコード。WebP は `webp` feature の pure Rust 実装 `image-webp` |
 | `ravif` | 0.13 | AVIF エンコード（内部で `rav1e` 0.8） |
 | `fast_image_resize` | 6.1 | SIMD リサイズ（Lanczos3） |
 | `kamadak-exif` | 0.6 | EXIF Orientation の読み取り |
@@ -81,8 +81,15 @@ Phase 5 が新しく持ち込んだ悪化ではない。
 
 ### 3.3 対応形式
 
-- **入力**: JPEG, PNG
-- **出力**: AVIF（既定）, PNG, JPEG。どの形式も sRGB を名乗る（PNG / JPEG は ICC、AVIF は AV1 の色情報。3.5 の末尾を参照）
+- **入力**: JPEG, PNG, WebP（静止画。lossy / lossless とも）
+- **出力**: AVIF（既定）, PNG, JPEG, WebP（lossless のみ）。どの形式も sRGB を名乗る（PNG / JPEG / WebP は ICC、AVIF は AV1 の色情報。3.5 の末尾を参照）
+
+**WebP は後から足した。** 当初は「実用的な lossy に libwebp（C）が要る」として
+非対応にしていたが、`image` の `webp` feature が引く `image-webp` は pure Rust
+（`-sys` 無し）で、lossy / lossless を読めて lossless を書ける。lossless の WebP は
+写真素材では AVIF / JPEG にサイズで負けるので既定にはせず、**WebP を指定してくる
+入稿先のためだけに持つ**。lossy の出力は引き続き入れない。アニメーション WebP は
+1 枚目を黙って使わず `UNSUPPORTED_FORMAT` で断る。
 
 入出力が非対称だが、用途（撮影素材を受け取ってWeb配信形式で出す）を考えれば問題にならない。
 
@@ -811,7 +818,8 @@ AIに輪郭のポリゴン頂点列を出させる案は採らない。ビジョ
 | 決定 | 根拠 |
 |---|---|
 | Rust / pure Rust（C依存なし） | 単一バイナリ配布、クロスコンパイルの容易さ、OSS採用障壁の低減 |
-| WebP 非対応 | 実用的なロッシー圧縮に libwebp（C）が必要 |
+| WebP は入力（静止画）と lossless 出力だけ | lossy のエンコーダは libwebp（C）にしか無い。pure Rust の `image-webp` は lossy / lossless を読めて lossless を書ける（`-sys` 無し）。lossless の WebP は写真では AVIF に負けるが、WebP を指定する入稿先のために持つ |
+| アニメーション WebP は断る | 黙って 1 枚目を使うと、商品を代表しないフレームでも気づけない。どのフレームかは呼び出し側にしか決められない |
 | HEIC 入力 非対応（ただし手順を返す） | HEVC デコーダが pure Rust に無い。読めない事実より、原因が分からないメッセージのほうが害が大きいため |
 | ICC は行列 + TRC 型だけ解釈する | 実写で問題になる Display P3 と AdobeRGB がこの型に収まり、LUT 型まで背負うと得るものに対してバグの入る面積が大きすぎるため |
 | 色変換を既定で有効にする | iPhone 素材が Display P3 で入るのが常態で、素通しは彩度の誇張として必ず出るため |

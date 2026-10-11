@@ -1845,7 +1845,7 @@ fn check_side_outputs(args: &CutoutArgs) -> Result<Option<OutputFormat>> {
             ErrorCode::UnknownOutputFormat,
             format!("{} の拡張子から出力形式を判別できません", preview.display()),
         )
-        .with_hint("--preview には avif / png / jpeg のいずれかの拡張子を指定してください")
+        .with_hint("--preview には avif / png / jpeg / webp のいずれかの拡張子を指定してください")
     })?;
     Ok(Some(format))
 }

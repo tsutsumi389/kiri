@@ -91,12 +91,26 @@ kiri 本体は別に入れておく（`cargo install --path .`）。
 
 ## 対応形式
 
-- **入力**: JPEG, PNG
-- **出力**: AVIF, PNG, JPEG
-- 出力は sRGB を名乗る（PNG / JPEG は ICC、AVIF は AV1 の色情報）
+- **入力**: JPEG, PNG, WebP（静止画。lossy / lossless とも読む）
+- **出力**: AVIF, PNG, JPEG, WebP（**lossless のみ**）
+- 出力は sRGB を名乗る（PNG / JPEG / WebP は ICC、AVIF は AV1 の色情報）
 
-WebP は実用的なロッシー圧縮に libwebp（C）が必要なため、AVIF入力はデコードに dav1d（C）が
-必要なため、いずれも非対応とした。依存ゼロの単一バイナリを優先した結果である。
+**WebP の出力は lossless だけである。** lossy の WebP を書けるエンコーダは
+libwebp（C）にしか無く、依存ゼロの単一バイナリを崩してまでは入れない。
+lossless の WebP は写真素材では AVIF にも JPEG にもサイズで負けるので、
+**WebP を指定してくる入稿先のための形式**と考えてほしい。品質を持たないので
+`--quality` は効かず、`--max-bytes` も PNG と同じく段を降りない。
+1 辺 16384px が形式の上限で、超えると `WEBP_ENCODE_FAILED` で断る。
+
+**アニメーション WebP は入力にできない**（`UNSUPPORTED_FORMAT`）。黙って
+1 枚目を使うと、それが商品を代表していなくても気づけないためで、使うフレームを
+`webpmux -get frame 1 in.webp -o frame.webp` のように取り出してから渡す。
+**フレームが 1 枚しかないアニメーションも断る。** 判定はアニメーションを名乗る旗
+（VP8X）で行い、枚数は数えない——1 枚なら代表の問題は無いが、そのフレームは
+キャンバスの一部に置かれた矩形でありうる（ANMF のオフセット）ので、静止画として
+読むと寸法と位置がずれうる。取り出せば静止画になるので、手順は同じである。
+
+AVIF 入力はデコードに dav1d（C）が必要なため非対応とした。
 
 ### HEIC / HEIF は読めない
 

@@ -134,13 +134,13 @@ warning_catalog! {
         remedy: Some("results[] の status が error の項目を直して、流し直す"),
     AlphaFlattened = "ALPHA_FLATTENED"
         => "出力形式が透過を保持できないので背景色で合成した",
-        remedy: Some("透過を残すなら、出力先の拡張子を .png か .avif にする（batch では spec の format）"),
+        remedy: Some("透過を残すなら、出力先の拡張子を .png / .webp / .avif のどれかにする（batch では spec の format）"),
     QualityReduced = "QUALITY_REDUCED"
         => "--max-bytes に収めるため要求品質から品質を落とした",
         remedy: None,
     MaxBytesUnreachable = "MAX_BYTES_UNREACHABLE"
         => "下限品質でも --max-bytes に届かなかった（要求品質のまま書いた）",
-        remedy: Some("PNG なら jpeg か avif に、JPEG なら avif に変える。それでも届かなければ寸法を落とすか --max-bytes を緩める"),
+        remedy: Some("PNG / WebP なら jpeg か avif に、JPEG なら avif に変える。それでも届かなければ寸法を落とすか --max-bytes を緩める"),
     IccNotEmbedded = "ICC_NOT_EMBEDDED"
         => "画素が sRGB でないので sRGB の ICC を埋め込まなかった（AVIF は AV1 の色情報で sRGB を名乗ったまま）",
         remedy: Some("--no-color-convert を外す"),
@@ -164,7 +164,7 @@ warning_catalog! {
         remedy: Some("意図した上書きでなければ、明示した指定を外すか、出力先の拡張子を profile の形式に揃える"),
     ProfileUncheckable = "PROFILE_UNCHECKABLE"
         => "lint が検査できない項目を飛ばした（AVIF の画素など）。黙って合格にはしていない",
-        remedy: Some("飛ばした項目（data.checks）を検査するなら、同じ設定で PNG か JPEG に書き出して kiri lint に掛ける"),
+        remedy: Some("飛ばした項目（data.checks）を検査するなら、同じ設定で PNG / JPEG / WebP のどれかに書き出して kiri lint に掛ける"),
     RotateAutoSkipped = "ROTATE_AUTO_SKIPPED"
         => "--rotate auto を適用しなかった（0 度のまま）。data.reason が no_subject / low_confidence / not_measurable / not_rectangular のどれかを言う",
         remedy: Some("回したいなら --rotate <度> で角度を明示する"),

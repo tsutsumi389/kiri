@@ -36,7 +36,12 @@ default = []
 segment = ["dep:tract-onnx"]
 
 [dependencies]
-image = { version = "0.25.6", default-features = false, features = ["jpeg", "png"] }
+# `webp` は pure Rust の `image-webp`（MSRV 1.80.1）を引く。`cargo tree -e normal` に
+# `*-sys` は 1 つも増えない。読むのは lossy / lossless の両方、**書けるのは lossless
+# だけ**である。lossy の WebP エンコーダは libwebp（C）にしか無く、それを持ち込むと
+# 「C 依存なし」の基準を崩すので入れない。lossless の WebP は写真では AVIF に
+# サイズで負ける——WebP を指定してくる入稿先のためだけに持つ
+image = { version = "0.25.6", default-features = false, features = ["jpeg", "png", "webp"] }
 ravif = "0.13"
 rgb = "0.8"
 imgref = "1.10"

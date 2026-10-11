@@ -62,7 +62,7 @@ product.png  1600x2000  png  841.4 KB  (338 ms)
 | `--fill-ratio` | 0.85 | 商品がキャンバスの何割を占めるか |
 | `--flatten` | | 透過を残さず `--background` の色で塗り潰す |
 | `--no-color-convert` | | 埋め込み ICC を解釈せず、画素の値をそのまま使う |
-| `--debug-mask PATH` | — | 生成したマスクを PNG で書き出す |
+| `--debug-mask PATH` | — | 生成したマスクを書き出す。形式は拡張子で決まる（`.png` / `.webp` は無損失、`.jpg` は非可逆なので目視の判断には向かない） |
 | `--preview PATH` | — | 「元画像 \| マスク \| 結果」を1枚に並べた検証用画像を書き出す |
 | `--preview-size` | 512 | プレビューのパネル1枚あたりの長辺(px) |
 | `--no-preview-grid` | | プレビューの元画像に座標グリッドを重ねない |

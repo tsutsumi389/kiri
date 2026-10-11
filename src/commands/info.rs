@@ -3,8 +3,6 @@
 //! AI エージェントが座標を出す前に寸法を知る必要があるため、また `uniformity` で
 //! 対象画像が処理可能かを事前判断できるようにするために存在する。
 
-use image::ImageFormat;
-
 use crate::cli::InfoArgs;
 use crate::commands::output::{
     SUBJECT_FROM_COLOUR, SUBJECT_FROM_SEGMENT, background_report, round4, subject_report,
@@ -89,7 +87,7 @@ pub fn run(args: &InfoArgs) -> Result<InfoReport> {
         input: args.input.display().to_string(),
         width: loaded.width(),
         height: loaded.height(),
-        format: format_name(loaded.format).to_string(),
+        format: loaded.format.as_str().to_string(),
         exif_orientation: loaded.exif_orientation,
         orientation_applied: loaded.orientation_applied,
         color_space: loaded.color_space.clone(),
@@ -251,14 +249,6 @@ fn low_confidence_hint(s: &SubjectHint) -> String {
              取りこぼしています。商品だけが写るように撮り直すか、\
              切り抜く範囲を目視で確かめてください"
         ),
-    }
-}
-
-fn format_name(format: ImageFormat) -> &'static str {
-    match format {
-        ImageFormat::Jpeg => "jpeg",
-        ImageFormat::Png => "png",
-        _ => "unknown",
     }
 }
 

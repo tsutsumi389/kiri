@@ -121,6 +121,8 @@ error_catalog! {
         => "PNG のエンコードに失敗した",
     JpegEncodeFailed = "JPEG_ENCODE_FAILED", General
         => "JPEG のエンコードに失敗した",
+    WebpEncodeFailed = "WEBP_ENCODE_FAILED", General
+        => "WebP（lossless）のエンコードに失敗した。WebP は 1 辺 16384px が上限で、超えると必ずここに落ちる",
     JsonEncodeFailed = "JSON_ENCODE_FAILED", General
         => "結果を JSON にできなかった",
     ThreadPoolFailed = "THREAD_POOL_FAILED", General

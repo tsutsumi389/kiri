@@ -12,7 +12,7 @@ $ kiri convert product.jpg -o product.avif --json
 
 | オプション | 既定値 | 説明 |
 |---|---|---|
-| `--format` | 拡張子から推論 | `avif` / `png` / `jpeg` |
+| `--format` | 拡張子から推論 | `avif` / `png` / `jpeg` / `webp`（WebP は lossless のみで `--quality` は効かない） |
 | `--quality` | 90 | 0-100。既定は実写で商品領域の PSNR が 40 dB（視覚的無損失の目安）に最も近づく値。バイトを詰めるなら `--max-bytes` |
 | `--effort` | 6 | AVIFのエンコード速度 1-10。小さいほど高品質・低速 |
 | `--max-bytes` | — | 出力の上限バイト数（例 `500k`）。収まるまで品質を梯子状に落とす |
@@ -66,7 +66,7 @@ $ kiri resize small.jpg -o out.avif --width 3000 --json
 | `--width` / `--height` | — | 出力の枠。一方だけならアスペクト比を保つ |
 | `--fit` | `contain` | 両方指定したときの枠への当てはめ方 |
 | `--allow-upscale` | | 元画像より大きくすることを許す |
-| `--format` | 拡張子から推論 | `avif` / `png` / `jpeg` |
+| `--format` | 拡張子から推論 | `avif` / `png` / `jpeg` / `webp`（WebP は lossless のみで `--quality` は効かない） |
 | `--quality` | 90 | 0-100。既定は実写で商品領域の PSNR が 40 dB（視覚的無損失の目安）に最も近づく値。バイトを詰めるなら `--max-bytes` |
 | `--effort` | 6 | AVIFのエンコード速度 1-10。小さいほど高品質・低速 |
 | `--max-bytes` | — | 出力の上限バイト数（例 `500k`）。収まるまで品質を梯子状に落とす |
@@ -132,7 +132,7 @@ $ kiri rotate product.jpg -o rotated.jpg --angle 30
 rotated.jpg  2386x2533  jpeg  688.4 KB  (78 ms)
   回転      30°  (再サンプリング)
 警告: jpeg は透過を保持できないため #FFFFFF で合成しました
-      透過を残すには、出力先の拡張子を .png か .avif にしてください
+      透過を残すには、出力先の拡張子を .png / .webp / .avif のどれかにしてください
 ```
 
 ### EXIF の向きとの関係
@@ -152,7 +152,7 @@ rotated.jpg  2386x2533  jpeg  688.4 KB  (78 ms)
 | オプション | 既定値 | 説明 |
 |---|---|---|
 | `--angle` | — | 時計回りに回す角度(度)。負値は反時計回り。90の倍数のみ無劣化 |
-| `--format` | 拡張子から推論 | `avif` / `png` / `jpeg` |
+| `--format` | 拡張子から推論 | `avif` / `png` / `jpeg` / `webp`（WebP は lossless のみで `--quality` は効かない） |
 | `--quality` | 90 | 0-100。既定は実写で商品領域の PSNR が 40 dB（視覚的無損失の目安）に最も近づく値。バイトを詰めるなら `--max-bytes` |
 | `--effort` | 6 | AVIFのエンコード速度 1-10。小さいほど高品質・低速 |
 | `--max-bytes` | — | 出力の上限バイト数（例 `500k`）。収まるまで品質を梯子状に落とす |

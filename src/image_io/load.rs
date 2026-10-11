@@ -6,11 +6,12 @@
 use std::path::Path;
 
 use exif::{In, Tag};
-use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, RgbaImage};
+use image::{DynamicImage, ImageDecoder, ImageReader, RgbaImage};
 
 use crate::color::icc::{self, Interpretation};
 use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::heif;
+use crate::image_io::save::OutputFormat;
 use crate::warning::{Warning, WarningCode};
 
 /// 読み込み時の振る舞い。
@@ -56,7 +57,9 @@ pub const COLOR_SPACE_UNCALIBRATED: &str = "uncalibrated";
 pub struct LoadedImage {
     /// EXIF Orientation 適用済み・必要なら sRGB へ変換済みの RGBA 画像
     pub image: RgbaImage,
-    pub format: ImageFormat,
+    /// 読めた形式。**読める形式だけが値を持つ型**にしてあるので、使う側に
+    /// 「それ以外」の枝が要らない（`OutputFormat::from_decoded`）
+    pub format: OutputFormat,
     /// 元ファイルの EXIF Orientation 値（1 = 回転なし）
     pub exif_orientation: u16,
     /// 実際に回転・反転を適用したか
@@ -110,6 +113,12 @@ impl LoadedImage {
     }
 }
 
+/// 入力形式を断るときの hint。2 箇所で同じ一覧を言うので 1 つにしておく。
+///
+/// WebP は lossy / lossless のどちらも読む（読むのは pure Rust の `image-webp`）。
+/// 書けるのが lossless だけなのは出力側の事情で、入力には関係しない
+const SUPPORTED_INPUTS: &str = "対応入力形式は JPEG / PNG / WebP（静止画）です";
+
 pub fn load(path: &Path) -> Result<LoadedImage> {
     load_with(path, &LoadOptions::default())
 }
@@ -134,20 +143,23 @@ pub fn load_with(path: &Path, opts: &LoadOptions) -> Result<LoadedImage> {
         .with_guessed_format()
         .map_err(|e| Error::new(ErrorCode::InputUnreadable, e.to_string()))?;
 
-    let format = reader.format().ok_or_else(|| {
+    let image_format = reader.format().ok_or_else(|| {
         Error::new(
             ErrorCode::UnsupportedFormat,
             format!("{} の形式を判別できません", path.display()),
         )
-        .with_hint("対応入力形式は JPEG と PNG です")
+        .with_hint(SUPPORTED_INPUTS)
     })?;
 
-    if !matches!(format, ImageFormat::Jpeg | ImageFormat::Png) {
-        return Err(Error::new(
+    let format = OutputFormat::from_decoded(image_format).ok_or_else(|| {
+        Error::new(
             ErrorCode::UnsupportedFormat,
-            format!("{format:?} は入力として未対応です"),
+            format!("{image_format:?} は入力として未対応です"),
         )
-        .with_hint("対応入力形式は JPEG と PNG です"));
+        .with_hint(SUPPORTED_INPUTS)
+    })?;
+    if format == OutputFormat::WebP {
+        refuse_animated_webp(&bytes, path)?;
     }
 
     let mut decoder = reader
@@ -160,11 +172,21 @@ pub fn load_with(path: &Path, opts: &LoadOptions) -> Result<LoadedImage> {
         .flatten()
         .filter(|p| !p.is_empty());
     let icc_profile = icc.is_some();
+    // WebP の EXIF はデコーダからチャンクの中身を受け取って自分で読む
+    // （`read_webp_exif` の doc）。JPEG / PNG は従来どおりコンテナから読む
+    let webp_exif = if format == OutputFormat::WebP {
+        decoder.exif_metadata().ok().flatten()
+    } else {
+        None
+    };
 
     let dynamic = DynamicImage::from_decoder(decoder)
         .map_err(|e| Error::new(ErrorCode::InputDecodeFailed, e.to_string()))?;
 
-    let (exif_orientation, exif_color_space) = read_exif(&bytes);
+    let (exif_orientation, exif_color_space) = match format {
+        OutputFormat::WebP => webp_exif.as_deref().map_or((1, None), read_webp_exif),
+        _ => read_exif(&bytes),
+    };
     let (image, orientation_applied) = if opts.apply_orientation {
         apply_orientation(dynamic, exif_orientation)
     } else {
@@ -192,6 +214,41 @@ pub fn load_with(path: &Path, opts: &LoadOptions) -> Result<LoadedImage> {
         has_alpha,
         color_warnings: color.warnings,
     })
+}
+
+/// アニメーション WebP を断る。
+///
+/// **黙って 1 枚目を使わない。** `image` はアニメーションでも静止画として
+/// デコードでき、そのときは 1 枚目のフレームを返す。だが 1 枚目が商品を
+/// 代表している保証は無く（フェードインの真っ白な 1 枚目はよくある）、
+/// 切り抜いた結果を見て初めて「別の絵だった」と気づくことになる。
+/// どのフレームを使うかは呼び出し側にしか決められないので、取り出し方を
+/// 示して断る。
+///
+/// **フレームが 1 枚でも断る。** 判定は旗で行い枚数を数えない。1 枚なら「どれが
+/// 代表か」の問題は無いが、そのフレームはキャンバスの一部に置かれた矩形で
+/// ありうる（ANMF のオフセット）。静止画の契約（寸法 = 画素の矩形）に載せるには
+/// 取り出してもらうのが確実で、手順も複数枚のときと同じである。
+///
+/// 判定は `image-webp` のヘッダ解析（VP8X のアニメーションフラグ）に任せる。
+/// RIFF を自前で読むと、壊れたファイルの扱いがデコーダ本体と割れうる
+fn refuse_animated_webp(bytes: &[u8], path: &Path) -> Result<()> {
+    let decoder = image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(bytes))
+        .map_err(|e| Error::new(ErrorCode::InputDecodeFailed, e.to_string()))?;
+    if decoder.has_animation() {
+        return Err(Error::new(
+            ErrorCode::UnsupportedFormat,
+            format!(
+                "{} はアニメーション WebP です。静止画だけを入力として受け付けます",
+                path.display()
+            ),
+        )
+        .with_hint(
+            "使うフレームを静止画として取り出してから渡してください\
+             （例: webpmux -get frame 1 in.webp -o frame.webp）",
+        ));
+    }
+    Ok(())
 }
 
 /// 色空間の判定と変換の結果。
@@ -319,9 +376,28 @@ fn normalize_color(
 /// EXIF から Orientation と ColorSpace を読む。EXIF がなければ既定値を返す。
 fn read_exif(bytes: &[u8]) -> (u16, Option<u16>) {
     let mut cursor = std::io::Cursor::new(bytes);
-    let Ok(exif) = exif::Reader::new().read_from_container(&mut cursor) else {
-        return (1, None);
-    };
+    match exif::Reader::new().read_from_container(&mut cursor) {
+        Ok(exif) => exif_fields(&exif),
+        Err(_) => (1, None),
+    }
+}
+
+/// WebP の EXIF チャンクの中身から Orientation と ColorSpace を読む。
+///
+/// **`Exif\0\0` の接頭辞を剥がしてから読む。** 規格は TIFF 構造をそのまま入れると
+/// 定めているが、JPEG の APP1 の中身を丸ごと写す道具がこの接頭辞を残す。
+/// kamadak-exif 0.6.1 の `read_from_container` はそれを TIFF として読めずに
+/// 失敗し、**向きが黙って 1 になる**——`--bbox` の座標がすべてずれる。
+/// 接頭辞の無い正しい形はそのまま読むので、どちらの書き手でも同じ結果になる
+fn read_webp_exif(raw: &[u8]) -> (u16, Option<u16>) {
+    let tiff = raw.strip_prefix(b"Exif\0\0").unwrap_or(raw);
+    match exif::Reader::new().read_raw(tiff.to_vec()) {
+        Ok(exif) => exif_fields(&exif),
+        Err(_) => (1, None),
+    }
+}
+
+fn exif_fields(exif: &exif::Exif) -> (u16, Option<u16>) {
     let field = |tag| {
         exif.get_field(tag, In::PRIMARY)
             .and_then(|f| f.value.get_uint(0))
@@ -428,6 +504,28 @@ mod tests {
             assert!(!applied, "orientation {value} を適用してはいけない");
             assert_eq!((img.width(), img.height()), (2, 3));
         }
+    }
+
+    /// Orientation ただ 1 つを持つ TIFF 構造（リトルエンディアン）
+    fn orientation_tiff(orientation: u16) -> Vec<u8> {
+        let [lo, hi] = orientation.to_le_bytes();
+        let mut tiff = vec![0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00];
+        tiff.extend_from_slice(&[0x01, 0x00, 0x12, 0x01, 0x03, 0x00]);
+        tiff.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, lo, hi, 0x00, 0x00]);
+        tiff.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        tiff
+    }
+
+    /// 規格どおりの素の TIFF も、JPEG 流の `Exif\0\0` 付きも同じ向きになる
+    #[test]
+    fn webp_exif_is_read_with_or_without_the_jpeg_style_prefix() {
+        let tiff = orientation_tiff(6);
+        assert_eq!(read_webp_exif(&tiff), (6, None));
+        let mut prefixed = b"Exif\0\0".to_vec();
+        prefixed.extend_from_slice(&tiff);
+        assert_eq!(read_webp_exif(&prefixed), (6, None));
+        // 読めない中身は既定値へ倒れる（読み込み全体は止めない。JPEG と同じ）
+        assert_eq!(read_webp_exif(b"garbage"), (1, None));
     }
 
     /// 読み込みの入口で HEIC が弾かれること。検出そのものの網羅は `heif` 側にある。

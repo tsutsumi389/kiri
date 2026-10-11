@@ -47,7 +47,7 @@ pub fn run(args: &ComposeArgs) -> Result<ComposeReport> {
             ErrorCode::UnknownOutputFormat,
             format!("{} の拡張子から形式を判別できません", args.output.display()),
         )
-        .with_hint("avif / png / jpg のいずれかの拡張子を付けてください")
+        .with_hint("avif / png / jpg / webp のいずれかの拡張子を付けてください")
     })?;
     crate::commands::output::ensure_path_writable(&args.output, args.force)?;
 

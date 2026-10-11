@@ -1071,7 +1071,7 @@ fn fields() -> Vec<FieldEntry> {
             notes: Some(
                 "**outputs[] は派生ごとに 1 要素である**（schema_version 2）。名乗りは形式で\
                  変わるので、AVIF と PNG を同時に書く実行ではここが要素ごとに違う。\
-                 embedded は PNG の iCCP か JPEG の APP2 に sRGB の ICC を埋めた。nclx は AVIF で、\
+                 embedded は PNG の iCCP、JPEG の APP2、WebP の ICCP のどれかに sRGB の ICC を埋めた。nclx は AVIF で、\
                  ICC ではなく AV1 の色情報（BT.709 の原色と sRGB の転送特性）で sRGB を名乗る——\
                  colr ボックスは既定値と同じなので省かれ、コンテナには現れない。none は何も名乗って\
                  いない。--no-color-convert で画素を sRGB へ変換しなかったときだけこうなり、\
@@ -1086,7 +1086,9 @@ fn fields() -> Vec<FieldEntry> {
             // 読めてしまうので、`delta_e` / `px_at_1000` と同じく専用の綴りを置く
             unit: "quality",
             nullable: true,
-            null_means: Some("PNG は無損失で品質を持たない（--quality も --max-bytes も効かない）"),
+            null_means: Some(
+                "PNG と WebP（kiri は lossless のみ書く）は無損失で品質を持たない（--quality も --max-bytes も効かない）",
+            ),
             // **しきい値では出ない警告なので warns には載せない。**
             // ここは「この値がいくつを超えたら鳴るか」を配る欄で、
             // QUALITY_REDUCED / MAX_BYTES_UNREACHABLE はどちらも
@@ -1121,7 +1123,7 @@ fn fields() -> Vec<FieldEntry> {
                  --max-bytes が無ければ必ず 1 である。探索が走ると、要求品質の 1 回に\
                  降りた段の数が積む（既定の --quality 90 なら降りる段は 85 から下の 7 つで\
                  最大 8 回。既定が梯子の最上段 85 より上にあるので、**これが上限でもある**\
-                 ——--quality 100 でも 8 回を超えない）。PNG は品質を持たず\
+                 ——--quality 100 でも 8 回を超えない）。PNG と WebP は品質を持たず\
                  段を降りないので --max-bytes を渡しても 1 のまま。**時間の見積もりに使える\
                  唯一の値**で、24.5MP の AVIF では 1 回あたり数秒かかる。\
                  --optimize と併せても掛け算にはならない——候補はマスクの指標で選ばれ、\
@@ -1855,7 +1857,7 @@ fn fields() -> Vec<FieldEntry> {
                  skipped はこの形式では構造的に測れない（AVIF の画素）。\
                  **skipped が 1 つでもあれば \
                  PROFILE_UNCHECKABLE が出て、飛ばした項目を data.checks に配列で並べる**\
-                 ——黙って合格にはしていない。skipped を消したければ JPEG か PNG を渡す",
+                 ——黙って合格にはしていない。skipped を消したければ JPEG / PNG / WebP を渡す",
             ),
         },
         // セット内のスケール・余白の統一。**`BatchReport` の根に付くブロック**

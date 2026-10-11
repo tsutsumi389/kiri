@@ -250,7 +250,7 @@ pub enum ModelCommand {
 
 #[derive(Args, Debug)]
 pub struct InfoArgs {
-    /// 入力画像（JPEG または PNG）
+    /// 入力画像（JPEG / PNG / WebP）
     pub input: PathBuf,
 
     /// 背景色推定に使う外周の幅(px)
@@ -281,7 +281,7 @@ pub struct InfoArgs {
 /// 同じ指定で同じ数になっていなければならない。
 #[derive(Args, Debug)]
 pub struct LintArgs {
-    /// 検査する画像（JPEG / PNG / AVIF）
+    /// 検査する画像（JPEG / PNG / WebP / AVIF）
     pub input: PathBuf,
 
     /// 照らす規格。**必須**
@@ -466,7 +466,7 @@ fn shadow_long_help() -> String {
      長辺いっぱい。これ以上広げると影は一様に 0 まで薄まる）。\n\
      --flatten と併せると「下地 → 影 → 商品」の順に重なる（--reflect on を\
      併せるなら「下地 → 影 → 反射 → 商品」で、影は最下層のままである）。\
-     透過を保てる形式（PNG / AVIF）では影も半透明のアルファとして残る。\n\
+     透過を保てる形式（PNG / WebP / AVIF）では影も半透明のアルファとして残る。\n\
      mask ブロックの統計と診断値は影を足す前の商品だけで測る"
         .to_string()
 }
@@ -643,7 +643,7 @@ pub struct OutputOpts {
 /// `OutputFormat::from_name` に合わせたためで、`{ext}` の綴りとも揃う
 fn format_name_parser() -> impl clap::builder::TypedValueParser<Value = OutputFormat> {
     use clap::builder::TypedValueParser;
-    clap::builder::PossibleValuesParser::new(["avif", "png", "jpeg", "jpg"])
+    clap::builder::PossibleValuesParser::new(["avif", "png", "jpeg", "jpg", "webp"])
         .map(|name| OutputFormat::from_name(&name).expect("候補は from_name が読める綴りだけ"))
 }
 
@@ -678,7 +678,7 @@ pub fn parse_derive(s: &str) -> Result<DeriveSpec, String> {
 
 #[derive(Args, Debug)]
 pub struct ConvertArgs {
-    /// 入力画像（JPEG または PNG）
+    /// 入力画像（JPEG / PNG / WebP）
     pub input: PathBuf,
 
     #[command(flatten)]
@@ -690,7 +690,7 @@ pub struct ConvertArgs {
 
 #[derive(Args, Debug)]
 pub struct ResizeArgs {
-    /// 入力画像（JPEG または PNG）
+    /// 入力画像（JPEG / PNG / WebP）
     pub input: PathBuf,
 
     /// 出力の幅(px)。height と併せて枠を指定する
@@ -718,7 +718,7 @@ pub struct ResizeArgs {
 
 #[derive(Args, Debug)]
 pub struct RotateArgs {
-    /// 入力画像（JPEG または PNG）
+    /// 入力画像（JPEG / PNG / WebP）
     pub input: PathBuf,
 
     /// 時計回りに回す角度(度)。負値は反時計回り。
@@ -904,7 +904,7 @@ const MAX_BYTES_HELP: &str = "出力の上限バイト数。10 進の整数に�
      MAX_BYTES_UNREACHABLE を出す。成果物は残り、終了コードも変わらない\
      （data.smallest_bytes が最小で何バイトまで縮んだかを言う）。\
      kiri resize で寸法を落とすほうへ進むための値である。\n\
-     PNG は無損失で品質を持たないので効かない。1 回のエンコードで収まらなければ\
+     PNG と WebP は無損失で品質を持たないので効かない。1 回のエンコードで収まらなければ\
      段を降りずに MAX_BYTES_UNREACHABLE を出す（quality_used は null、attempts は 1）。\n\
      **--optimize と併せても時間は積にならない。** 探索はマスクの指標で候補を選び、\
      エンコードするのは決まった 1 枚だけなので、掛かる時間は探索 + 最大 8 回の\
@@ -934,7 +934,7 @@ fn derive_long_help() -> String {
          fit … 両方書いたときの当てはめ方（contain / cover、既定 contain）。\n\
          allow_upscale … 元画像より大きくすることを許す（true / false、既定 false）。\
          許した拡大は UPSCALED が言い、許していない拡大は UPSCALE_NOT_ALLOWED で断る。\n\
-         format … avif / png / jpeg / jpg。quality … 0-100。effort … 1-10。\
+         format … avif / png / jpeg / jpg / webp。quality … 0-100。effort … 1-10。\
          max_bytes … --max-bytes と同じ書式（500k など）。\n\
          role … この派生の役目を表す自由な短い文字列。outputs[].role に出て、\
          --naming の {{role}} で名前にも使える。\n\
@@ -975,7 +975,7 @@ fn naming_long_help() -> String {
          OUTPUT_EXISTS の規約と両立しない。\n\
          {{index}} は 0 起点の通し番号（outputs[] の添字と一致する）。\
          {{width}} / {{height}} はその派生が実際に書き出す寸法。\
-         {{ext}} は形式の拡張子で avif / png / jpg（outputs[].format は従来どおり \
+         {{ext}} は形式の拡張子で avif / png / jpg / webp（outputs[].format は従来どおり \
          \"jpeg\" のまま）。\n\
          {{role}} を書いたのに役目を持たない派生があれば INVALID_NAMING_TEMPLATE で\
          断る。未知の置換子と閉じていない括弧も同じで、どれも書き始める前に断る。\n\
@@ -1321,7 +1321,7 @@ fn image_constraint_notes() -> String {
      画像を渡すと MASK_ORIENTATION_IGNORED で報せるので、向きを適用済みの\
      マスクを渡すこと。\n\
      アルファは見ない。1 チャンネルのグレーとして読み、RGB なら輝度を使う。\n\
-     可逆形式（PNG）で渡すこと。JPEG のリンギングは、黒く塗ったはずの場所へ\
+     可逆形式（PNG か lossless の WebP）で渡すこと。JPEG のリンギングは、黒く塗ったはずの場所へ\
      小さな値を散らす。\n"
         .to_string()
         + shared_constraint_notes()
@@ -1532,7 +1532,7 @@ pub fn finite(s: &str) -> Result<f64, String> {
 
 #[derive(Args, Debug, Clone)]
 pub struct CutoutArgs {
-    /// 入力画像（JPEG または PNG）
+    /// 入力画像（JPEG / PNG / WebP）
     pub input: PathBuf,
 
     /// 切り抜く範囲 x1,y1,x2,y2（左上原点）。この外側は無条件に背景とする
@@ -1884,7 +1884,7 @@ pub struct CutoutArgs {
     )]
     pub fail_on: Option<FailOn>,
 
-    /// 生成したマスクを PNG として書き出す（目視確認用）
+    /// 生成したマスクを書き出す（目視確認用）。形式は拡張子で決まる（png / webp / jpg）
     #[arg(long, value_name = "PATH")]
     pub debug_mask: Option<PathBuf>,
 

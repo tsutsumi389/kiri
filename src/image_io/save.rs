@@ -20,6 +20,14 @@ pub enum OutputFormat {
     Avif,
     Png,
     Jpeg,
+    /// **lossless のみ。** pure Rust の `image-webp` が書けるのは VP8L だけで、
+    /// lossy（VP8）のエンコーダは libwebp（C）にしか無い。サイズでは AVIF に
+    /// 負けるので、WebP を求める入稿先のためだけにある。
+    ///
+    /// 綴りは明示する。clap の既定は `WebP` を `web-p` にしてしまい、
+    /// `--format webp` が通らなくなる
+    #[value(name = "webp")]
+    WebP,
 }
 
 impl OutputFormat {
@@ -28,6 +36,7 @@ impl OutputFormat {
             OutputFormat::Avif => "avif",
             OutputFormat::Png => "png",
             OutputFormat::Jpeg => "jpeg",
+            OutputFormat::WebP => "webp",
         }
     }
 
@@ -44,17 +53,18 @@ impl OutputFormat {
     /// **丸める場所は 1 つだけにする**——`encode_jpeg` も
     /// `--max-bytes` の報告もここを引く。
     ///
-    /// AVIF は `ravif` が f32 をそのまま受けるので手を入れない。PNG は無損失で、
-    /// `SaveOptions::quality` を何に変えてもバイト列は 1 バイトも動かない
+    /// AVIF は `ravif` が f32 をそのまま受けるので手を入れない。PNG と WebP は
+    /// 無損失で、`SaveOptions::quality` を何に変えてもバイト列は 1 バイトも動かない
+    /// （WebP は lossless しか書かないため。lossy を書けない理由は `WebP` の項）
     pub fn effective_quality(self, quality: f32) -> Option<f32> {
         match self {
             OutputFormat::Avif => Some(quality),
             OutputFormat::Jpeg => Some(quality.round()),
-            OutputFormat::Png => None,
+            OutputFormat::Png | OutputFormat::WebP => None,
         }
     }
 
-    /// 品質というつまみを持つ形式か。**PNG だけが持たない。**
+    /// 品質というつまみを持つ形式か。**無損失の PNG と WebP は持たない。**
     ///
     /// `--max-bytes` の探索が段を降りられるかはこれで決まる。「試したが
     /// 変わらなかった」と「試す意味が無い」は結果が同じでも報告が違う
@@ -79,6 +89,7 @@ impl OutputFormat {
             OutputFormat::Avif => "avif",
             OutputFormat::Png => "png",
             OutputFormat::Jpeg => "jpg",
+            OutputFormat::WebP => "webp",
         }
     }
 
@@ -88,6 +99,24 @@ impl OutputFormat {
             "avif" => Some(OutputFormat::Avif),
             "png" => Some(OutputFormat::Png),
             "jpeg" | "jpg" => Some(OutputFormat::Jpeg),
+            "webp" => Some(OutputFormat::WebP),
+            _ => None,
+        }
+    }
+
+    /// `image` が判別した形式のうち、**kiri が画素まで読めるもの**だけを返す。
+    ///
+    /// **入力として受け付ける形式の一覧はここ 1 つである。** `load` はこれが
+    /// None の形式を `UNSUPPORTED_FORMAT` で断り、読めた画像の形式（`info` の
+    /// `format`、`lint` の format 検査）もここから引く。呼ぶ側ごとに match を
+    /// 書くと、`_ => Jpeg` のような「読めないはずの形式を黙って何かとして扱う」
+    /// 枝がそれぞれに生える。AVIF は書けても読めない（デコーダが C の dav1d に
+    /// しか無い）ので None
+    pub fn from_decoded(format: image::ImageFormat) -> Option<Self> {
+        match format {
+            image::ImageFormat::Jpeg => Some(OutputFormat::Jpeg),
+            image::ImageFormat::Png => Some(OutputFormat::Png),
+            image::ImageFormat::WebP => Some(OutputFormat::WebP),
             _ => None,
         }
     }
@@ -101,10 +130,11 @@ impl OutputFormat {
 /// 出力に sRGB を名乗らせるか。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IccPolicy {
-    /// PNG は iCCP、JPEG は APP2 に sRGB の ICC を埋める。AVIF は ICC を入れず、
+    /// PNG は iCCP、JPEG は APP2、WebP は ICCP チャンクに sRGB の ICC を埋める。
+    /// AVIF は ICC を入れず、
     /// ravif が AV1 の色情報で名乗る（外す口が無い）
     Embed,
-    /// 埋めない。PNG / JPEG のバイト列は ICC を渡さない素のエンコーダ出力と
+    /// 埋めない。PNG / JPEG / WebP のバイト列は ICC を渡さない素のエンコーダ出力と
     /// 1 バイトも変わらない
     None,
 }
@@ -256,7 +286,9 @@ pub fn prepare<'a>(image: &'a RgbaImage, opts: &SaveOptions) -> Result<Prepared<
             // **`--format png` を勧めない。** `-o out.jpg --format png` は `.jpg` という
             // 名前の PNG を書き、compose には `--format` そのものが無い。拡張子なら
             // どのコマンドでも効く
-            .with_hint("透過を残すには、出力先の拡張子を .png か .avif にしてください")
+            .with_hint(
+                "透過を残すには、出力先の拡張子を .png / .webp / .avif のどれかにしてください",
+            )
             .with_data("format", opts.format.as_str())
             .with_data("background", vec![r, g, b]),
         );
@@ -280,6 +312,7 @@ pub fn encode_prepared(prepared: &Prepared, opts: &SaveOptions) -> Result<Vec<u8
         OutputFormat::Avif => encode_avif(target, opts),
         OutputFormat::Png => encode_png(target, opts.icc),
         OutputFormat::Jpeg => encode_jpeg(target, opts),
+        OutputFormat::WebP => encode_webp(target, opts.icc),
     }
 }
 
@@ -370,6 +403,53 @@ fn encode_png(image: &RgbaImage, icc: IccPolicy) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// WebP が 1 辺に持てる最大の画素数。VP8L のヘッダが幅と高さを 14 bit で持つ。
+pub const WEBP_MAX_SIDE: u32 = 16384;
+
+/// この形式でこの寸法を書けるか。**書ける寸法に形式の上限があるのは WebP だけ。**
+///
+/// 多派生の実行は `commands::output::resolve` で**書き始める前に**全派生へ
+/// これを掛ける。エンコードの段で初めて断ると、先に並んだ派生だけが書かれ、
+/// 結果 JSON はエラーだけになる（何が書けたかを追えず、再実行は
+/// `OUTPUT_EXISTS` で詰まる）。`encode_webp` も同じ検査を通すが、それは
+/// compose のように resolve を通らない道のための保険である
+pub fn check_dimensions(format: OutputFormat, width: u32, height: u32) -> Result<()> {
+    if format != OutputFormat::WebP || (width <= WEBP_MAX_SIDE && height <= WEBP_MAX_SIDE) {
+        return Ok(());
+    }
+    // image-webp は超えても `InvalidDimensions` を返すだけで、何を直せばよいかが
+    // 読めない。形式そのものの上限なので、寸法と次の一手まで示す
+    Err(Error::new(
+        ErrorCode::WebpEncodeFailed,
+        format!("WebP は 1 辺 {WEBP_MAX_SIDE}px までしか書けません（{width}x{height}）"),
+    )
+    .with_hint("--sizes や resize で縮めるか、出力を avif / png にしてください"))
+}
+
+fn encode_webp(image: &RgbaImage, icc: IccPolicy) -> Result<Vec<u8>> {
+    check_dimensions(OutputFormat::WebP, image.width(), image.height())?;
+    let mut buf = Vec::new();
+    let mut encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut buf);
+    if icc == IccPolicy::Embed {
+        // ICC を渡すと image-webp は VP8X の拡張形式で書き、ICCP チャンクを
+        // 画像データより前に置く（規格の要求する並び）
+        encoder
+            .set_icc_profile(srgb_icc().to_vec())
+            .map_err(|e| Error::new(ErrorCode::WebpEncodeFailed, e.to_string()))?;
+    }
+    // 完全透明部の RGB も捨てずに書く。lossless を名乗る以上、デコードすれば
+    // 渡した画素がそのまま返ることを崩さない（AVIF の UnassociatedClean とは違う）
+    encoder
+        .write_image(
+            image.as_raw(),
+            image.width(),
+            image.height(),
+            ExtendedColorType::Rgba8,
+        )
+        .map_err(|e| Error::new(ErrorCode::WebpEncodeFailed, e.to_string()))?;
+    Ok(buf)
+}
+
 fn encode_jpeg(image: &RgbaImage, opts: &SaveOptions) -> Result<Vec<u8>> {
     let rgb = flatten_onto(image, opts.background);
     let mut buf = Vec::new();
@@ -437,7 +517,11 @@ mod tests {
             OutputFormat::from_path(Path::new("a.jpeg")),
             Some(OutputFormat::Jpeg)
         );
-        assert_eq!(OutputFormat::from_path(Path::new("a.webp")), None);
+        assert_eq!(
+            OutputFormat::from_path(Path::new("a.WebP")),
+            Some(OutputFormat::WebP)
+        );
+        assert_eq!(OutputFormat::from_path(Path::new("a.gif")), None);
         assert_eq!(OutputFormat::from_path(Path::new("noext")), None);
     }
 
@@ -448,7 +532,12 @@ mod tests {
     /// 形式を決める既存の規約と綴りが揃わない
     #[test]
     fn the_extension_round_trips_through_from_path() {
-        for format in [OutputFormat::Avif, OutputFormat::Png, OutputFormat::Jpeg] {
+        for format in [
+            OutputFormat::Avif,
+            OutputFormat::Png,
+            OutputFormat::Jpeg,
+            OutputFormat::WebP,
+        ] {
             let name = format!("out.{}", format.extension());
             assert_eq!(
                 OutputFormat::from_path(Path::new(&name)),
@@ -465,23 +554,59 @@ mod tests {
         assert_eq!(OutputFormat::from_name("avif"), Some(OutputFormat::Avif));
         assert_eq!(OutputFormat::from_name("JPEG"), Some(OutputFormat::Jpeg));
         assert_eq!(OutputFormat::from_name("jpg"), Some(OutputFormat::Jpeg));
-        assert_eq!(OutputFormat::from_name("webp"), None);
+        assert_eq!(OutputFormat::from_name("WEBP"), Some(OutputFormat::WebP));
+        assert_eq!(OutputFormat::from_name("gif"), None);
+    }
+
+    /// `--format` の綴りは clap の `ValueEnum` が決める。既定の綴りは
+    /// `web-p` なので、`#[value(name)]` が外れると `--format webp` だけが通らない
+    #[test]
+    fn the_cli_spelling_of_each_format_is_its_name() {
+        use clap::ValueEnum;
+        for format in OutputFormat::value_variants() {
+            let value = format.to_possible_value().expect("隠した候補は無い");
+            assert_eq!(value.get_name(), format.as_str(), "{format:?}");
+        }
+    }
+
+    /// kiri が画素まで読める形式だけが対応を持つ。**AVIF は書けても読めない**ので
+    /// None——ここが Some を返すと、`load` が AVIF を受け入れてデコードで落ちる
+    #[test]
+    fn only_the_formats_kiri_can_decode_map_from_an_image_format() {
+        use image::ImageFormat;
+        assert_eq!(
+            OutputFormat::from_decoded(ImageFormat::Jpeg),
+            Some(OutputFormat::Jpeg)
+        );
+        assert_eq!(
+            OutputFormat::from_decoded(ImageFormat::Png),
+            Some(OutputFormat::Png)
+        );
+        assert_eq!(
+            OutputFormat::from_decoded(ImageFormat::WebP),
+            Some(OutputFormat::WebP)
+        );
+        for format in [ImageFormat::Avif, ImageFormat::Gif, ImageFormat::Tiff] {
+            assert_eq!(OutputFormat::from_decoded(format), None, "{format:?}");
+        }
     }
 
     #[test]
     fn only_jpeg_lacks_alpha_support() {
         assert!(OutputFormat::Avif.supports_alpha());
         assert!(OutputFormat::Png.supports_alpha());
+        assert!(OutputFormat::WebP.supports_alpha());
         assert!(!OutputFormat::Jpeg.supports_alpha());
     }
 
-    /// PNG だけが品質を持たない。ここが反転すると `--max-bytes` が
-    /// 無損失の形式で梯子を降り、同じバイト列を 8 回作る
+    /// 無損失の PNG と WebP だけが品質を持たない。ここが反転すると
+    /// `--max-bytes` が無損失の形式で梯子を降り、同じバイト列を 8 回作る
     #[test]
-    fn only_png_lacks_a_quality_knob() {
+    fn only_lossless_formats_lack_a_quality_knob() {
         assert!(OutputFormat::Avif.has_quality());
         assert!(OutputFormat::Jpeg.has_quality());
         assert!(!OutputFormat::Png.has_quality());
+        assert!(!OutputFormat::WebP.has_quality());
     }
 
     /// **JPEG の丸めは 1 箇所にしかない。** エンコーダへ渡る値と
@@ -492,6 +617,7 @@ mod tests {
         assert_eq!(OutputFormat::Jpeg.effective_quality(33.7), Some(34.0));
         assert_eq!(OutputFormat::Avif.effective_quality(33.3), Some(33.3));
         assert_eq!(OutputFormat::Png.effective_quality(33.3), None);
+        assert_eq!(OutputFormat::WebP.effective_quality(33.3), None);
 
         // 丸めた先と同じ値を渡したエンコードは 1 バイトも違わない
         let img = gradient(false);
@@ -510,24 +636,130 @@ mod tests {
         assert_eq!(at(33.3), at(33.0));
     }
 
-    /// PNG の「品質を持たない」は主張であって、実装が追随していなければ嘘になる。
-    /// 梯子の両端で同じバイト列が出ることをここで固定する
+    /// PNG と WebP の「品質を持たない」は主張であって、実装が追随していなければ
+    /// 嘘になる。梯子の両端で同じバイト列が出ることをここで固定する
     #[test]
-    fn png_bytes_do_not_move_with_quality() {
+    fn lossless_bytes_do_not_move_with_quality() {
+        for format in [OutputFormat::Png, OutputFormat::WebP] {
+            let img = gradient(true);
+            let at = |quality: f32| {
+                encode(
+                    &img,
+                    &SaveOptions {
+                        format,
+                        quality,
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .0
+            };
+            assert_eq!(at(85.0), at(25.0), "{format:?}");
+            assert_eq!(at(100.0), at(0.0), "{format:?}");
+        }
+    }
+
+    /// **lossless を名乗るなら、デコードすれば渡した画素がそのまま返る。**
+    /// 完全透明の画素の RGB も残す——AVIF の `UnassociatedClean` のように
+    /// 捨てると、無損失の看板と食い違う
+    #[test]
+    fn webp_round_trips_every_pixel_including_alpha() {
+        let mut img = gradient(true);
+        img.put_pixel(20, 0, image::Rgba([12, 34, 56, 0]));
+        for icc in [IccPolicy::Embed, IccPolicy::None] {
+            let webp = encoded(&img, OutputFormat::WebP, icc);
+            let decoded = image::load_from_memory_with_format(&webp, image::ImageFormat::WebP)
+                .unwrap()
+                .to_rgba8();
+            assert_eq!(decoded, img, "{icc:?}");
+        }
+    }
+
+    /// WebP のチャンクを (型, データ) で並べる。RIFF ヘッダの長さも確かめる
+    fn webp_chunks(bytes: &[u8]) -> Vec<([u8; 4], &[u8])> {
+        assert_eq!(&bytes[..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WEBP");
+        let riff = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        assert_eq!(riff + 8, bytes.len(), "RIFF の長さがファイル末尾と合わない");
+        let mut out = Vec::new();
+        let mut i = 12;
+        while i < bytes.len() {
+            let len = u32::from_le_bytes(bytes[i + 4..i + 8].try_into().unwrap()) as usize;
+            let kind: [u8; 4] = bytes[i..i + 4].try_into().unwrap();
+            out.push((kind, &bytes[i + 8..i + 8 + len]));
+            // 奇数長のチャンクは 1 バイトの詰め物が付く
+            i += 8 + len + (len & 1);
+        }
+        assert_eq!(i, bytes.len(), "チャンクの長さがファイル末尾と合わない");
+        out
+    }
+
+    /// 書くのは VP8L（lossless）だけ。ICC は VP8X の旗を立てて画像データより前に置く
+    #[test]
+    fn webp_carries_the_srgb_icc_before_the_lossless_bitstream() {
+        let webp = encoded(&gradient(true), OutputFormat::WebP, IccPolicy::Embed);
+        let chunks = webp_chunks(&webp);
+        let kinds: Vec<[u8; 4]> = chunks.iter().map(|(k, _)| *k).collect();
+        assert_eq!(kinds, vec![*b"VP8X", *b"ICCP", *b"VP8L"]);
+        let flags = chunks[0].1[0];
+        assert_ne!(flags & 0x20, 0, "ICC の旗が立っていない");
+        assert_eq!(flags & 0x02, 0, "アニメーションを名乗ってはいけない");
+        assert_eq!(chunks[1].1, srgb_icc());
+
+        use image::ImageDecoder;
+        let mut decoder =
+            image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(&webp)).unwrap();
+        assert_eq!(decoder.icc_profile().unwrap().as_deref(), Some(srgb_icc()));
+    }
+
+    /// ICC を抜けば `image` の素の WebP エンコーダと 1 バイトも違わず、
+    /// 拡張形式（VP8X）にもならない
+    #[test]
+    fn icc_none_webp_is_the_plain_encoder_output() {
         let img = gradient(true);
-        let at = |quality: f32| {
+        let mut plain = Vec::new();
+        image::codecs::webp::WebPEncoder::new_lossless(&mut plain)
+            .write_image(
+                img.as_raw(),
+                img.width(),
+                img.height(),
+                ExtendedColorType::Rgba8,
+            )
+            .unwrap();
+        let none = encoded(&img, OutputFormat::WebP, IccPolicy::None);
+        assert_eq!(none, plain);
+        let kinds: Vec<[u8; 4]> = webp_chunks(&none).iter().map(|(k, _)| *k).collect();
+        assert_eq!(kinds, vec![*b"VP8L"]);
+    }
+
+    /// 形式の上限を超えたら、エンコーダの素の誤りではなく次の一手を添えて断る
+    #[test]
+    fn webp_refuses_a_side_longer_than_the_format_allows() {
+        let img = RgbaImage::new(WEBP_MAX_SIDE + 1, 1);
+        let err = encode(
+            &img,
+            &SaveOptions {
+                format: OutputFormat::WebP,
+                ..Default::default()
+            },
+        )
+        .expect_err("16385px は書けない");
+        assert_eq!(err.code.as_str(), "WEBP_ENCODE_FAILED");
+        assert!(err.message.contains("16384"), "{}", err.message);
+        assert!(err.hint.is_some());
+
+        // ちょうど上限なら書ける
+        let edge = RgbaImage::new(WEBP_MAX_SIDE, 1);
+        assert!(
             encode(
-                &img,
+                &edge,
                 &SaveOptions {
-                    format: OutputFormat::Png,
-                    quality,
+                    format: OutputFormat::WebP,
                     ..Default::default()
                 },
             )
-            .unwrap()
-            .0
-        };
-        assert_eq!(at(85.0), at(25.0));
+            .is_ok()
+        );
     }
 
     #[test]
@@ -972,6 +1204,8 @@ mod tests {
             (OutputFormat::Png, IccPolicy::None, IccSignal::None),
             (OutputFormat::Jpeg, IccPolicy::Embed, IccSignal::Embedded),
             (OutputFormat::Jpeg, IccPolicy::None, IccSignal::None),
+            (OutputFormat::WebP, IccPolicy::Embed, IccSignal::Embedded),
+            (OutputFormat::WebP, IccPolicy::None, IccSignal::None),
             // ravif に名乗りを外す口が無いので、None でも nclx
             (OutputFormat::Avif, IccPolicy::Embed, IccSignal::Nclx),
             (OutputFormat::Avif, IccPolicy::None, IccSignal::Nclx),

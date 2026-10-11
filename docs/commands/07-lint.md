@@ -164,7 +164,7 @@ $ kiri lint product_amazon.jpg --profile amazon --json
 |---|---|---|
 | `pass` | 見た上で規格を満たしている | — |
 | `fail` | 規格に触れている | その項目を直す |
-| `skipped` | **この形式では構造的に測れない**（AVIF の画素） | JPEG か PNG で渡し直す |
+| `skipped` | **この形式では構造的に測れない**（AVIF の画素） | JPEG / PNG / WebP で渡し直す |
 | `unmeasurable` | 測ろうとしたが、この画像からは出なかった（主体が見つからない、外周に不透明な画素が 1 つも無い、背景が単色でない、色空間を何も名乗っていない） | 素材を見る。形式を変えても同じ結果になる |
 
 不合格なら **exit 5**、`code` は `PROFILE_VIOLATION`。処理そのものは成功していて
@@ -191,7 +191,7 @@ product.avif
     - fill_ratio    skipped  (要求 0.85)
   code      PROFILE_VIOLATION
 警告: background / fill_ratio は画素を読まないと測れないため検査していません（kiri は avif をデコードできないので、コンテナから読める事実だけで判定しました）
-      飛ばした項目も合格ではないので passed は false です。構図まで見るなら JPEG か PNG を渡してください
+      飛ばした項目も合格ではないので passed は false です。構図まで見るなら JPEG / PNG / WebP を渡してください
 ```
 
 **黙って合格にしない。** 飛ばした項目は `pass` ではないので `passed` は落ち、

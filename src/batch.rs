@@ -291,7 +291,7 @@ pub struct ItemSettings {
     pub derive: Option<Vec<serde_json::Value>>,
     /// 幅の並び。`formats` との直積で派生を組む
     pub sizes: Option<Vec<u32>>,
-    /// 形式の並び（"avif" / "png" / "jpeg" / "jpg"）
+    /// 形式の並び（"avif" / "png" / "jpeg" / "jpg" / "webp"）
     pub formats: Option<Vec<String>>,
     /// 派生のファイル名の付け方。既定は `{stem}_{width}.{ext}`
     pub naming: Option<String>,

@@ -63,11 +63,12 @@ sRGB 相当のプロファイルは変換しない。判定は名前ではなく
 |---|---|---|
 | PNG | `embedded` | `iCCP` チャンクに sRGB の ICC（`sRGB` チャンクは併記しない） |
 | JPEG | `embedded` | APP0（JFIF）の直後の APP2 に sRGB の ICC |
+| WebP | `embedded` | VP8X の拡張形式で、画像データ（VP8L）より前の `ICCP` チャンクに sRGB の ICC |
 | AVIF | `nclx` | ICC ではなく AV1 の色情報（BT.709 の原色 / sRGB の転送特性）。`colr` ボックスは既定値と同じなので省かれる |
 
 AVIF に ICC を入れないのは、AV1 の色情報だけで sRGB を言い切れるうえ、使っている
 エンコーダ（ravif）に ICC を渡す口が無いため。**kiri は AVIF を読めないので、`kiri info` で名乗りを確かめられるのは
-PNG / JPEG だけ**である。`--no-color-convert` で画素を sRGB へ変換しなかったときは、PNG / JPEG
+PNG / JPEG / WebP だけ**である。`--no-color-convert` で画素を sRGB へ変換しなかったときは、PNG / JPEG / WebP
 は ICC を埋めず `icc: "none"` と `ICC_NOT_EMBEDDED` を返す（名乗りが嘘になるため）。AVIF は
 名乗りを外す手段が無いので `nclx` のまま、警告だけが出る。プロファイルは kiri が自前で組む
 516 バイトの v2 プロファイルで、外部ファイルや `lcms2` / `qcms` には頼らない。
@@ -105,7 +106,8 @@ PNG / JPEG だけ**である。`--no-color-convert` で画素を sRGB へ変換�
 「最小で何バイトまで縮んだか」）。成果物は残り、終了コードも変わらないので、次は
 `kiri resize` で寸法を落とすか、`--format avif` へ移る。
 
-PNG は無損失で品質を持たないため効かない。1 回のエンコードで収まらなければ段を降りずに
+PNG と WebP は無損失で品質を持たないため効かない（kiri が書く WebP は lossless だけ。
+lossy のエンコーダは libwebp（C）にしか無い）。1 回のエンコードで収まらなければ段を降りずに
 `MAX_BYTES_UNREACHABLE` を出す（`quality_used` は `null`、`attempts` は 1）。
 
 `cutout --optimize` と併せても**時間は積にならない**。探索はマスクの指標で候補を選んで
@@ -131,7 +133,7 @@ $ kiri cutout product.jpg -o out/product.png \
 |---|---|---|
 | `--derive SPEC` | — | 派生を 1 本ずつ指定する。複数回指定可。`--sizes` / `--formats` とは併用不可 |
 | `--sizes N,N,N` | — | 幅の並び。`--formats` との直積になる |
-| `--formats f,f` | — | 形式の並び。`avif` / `png` / `jpeg` / `jpg` |
+| `--formats f,f` | — | 形式の並び。`avif` / `png` / `jpeg` / `jpg` / `webp` |
 | `--naming TEMPLATE` | `{stem}_{width}.{ext}` | 派生のファイル名の付け方 |
 | `--manifest PATH` | — | 書いたものを列挙する JSON |
 
@@ -149,7 +151,7 @@ $ kiri cutout product.jpg -o out/product.png \
 | `width` / `height` | 1 以上の整数 | 出力寸法(px)。**どちらも書かなければリサイズしない** |
 | `fit` | `contain`（既定） / `cover` | 両方書いたときの当てはめ方 |
 | `allow_upscale` | `true` / `false`（既定） | 元画像より大きくすることを許す |
-| `format` | `avif` / `png` / `jpeg` / `jpg` | 出力形式 |
+| `format` | `avif` / `png` / `jpeg` / `jpg` / `webp` | 出力形式 |
 | `quality` | 0-100 | 品質 |
 | `effort` | 1-10 | AVIF のエンコード速度 |
 | `max_bytes` | `500k` など | 出力の上限バイト数（`--max-bytes` と同じ書式） |

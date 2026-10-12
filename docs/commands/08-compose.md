@@ -88,6 +88,91 @@ $ kiri compose layout.json -o thumb.png --fail-on text_overflow>0,text_contrast<
 見る。同じ表に混ぜると `cutout --fail-on text_overflow` が書式として通り、cutout に
 文字は 1 つも無いので**永久に発火しない門**になる。
 
+## note の見出し画像を組む（`--profile note`）
+
+```
+$ kiri compose header.json -o header.png --profile note
+$ kiri compose header.json -o header.png --profile note --fail-on default
+```
+
+**note の規定をキャンバスへ当て、一覧に縮んだときに読めるかを測る。** 原寸の
+測りだけでは足りない——見出し画像が原寸で見られることはほとんど無く、note の
+一覧では横 144〜192px に縮んで並ぶ。原寸で 4.5 を超えたコントラストも、64px の
+見出しも、そこでは読めないことがある。
+
+| 項目 | spec に書いてある | spec に無い |
+|---|---|---|
+| `canvas.width` / `height` | spec の値。比が 1280:670 から 0.5% 以上外れたら `PROFILE_ASPECT_MISMATCH` | 1280 x 670 |
+| `safe_area` | spec の値 | 上下中央の `[0, 108, 1280, 454]` をキャンバスへ比で合わせた値 |
+
+**明示 > profile。** cutout の `--profile` と同じ約束である。1920 x 1006 は比が
+同じ（0.1% 差）なので黙って通る。`canvas` の寸法を省けるのは `--profile` を
+渡したときだけで、渡さずに省けば今までどおり `SPEC_INVALID` で断る。
+書いたバイト数が 10MB（10,000,000 バイト）を超えたら
+`PROFILE_MAX_BYTES_EXCEEDED` が出る。**`--dry-run` でも出る**——dry-run も
+エンコードまでは通してバイト数を返している。
+
+**cutout / lint の `--profile` とは別の表である。** `kiri compose --profile amazon`
+も `kiri cutout --profile note` も書式の段階で断る。表そのもの（出典・安全領域・
+上限・表示幅）は `kiri schema --json` の `compose_profiles[]` が配る。
+
+### 縮小表示での読みやすさ
+
+全層を重ね終えた**実際に見える絵**を、2 つの表示幅へ面積平均で縮めて、
+文字の層ごとに測り直す。
+
+| 表示 | 幅（CSS px） | 根拠 |
+|---|---|---|
+| `pc_list` | 192 | PC の一覧で最も多かった描画幅 |
+| `mobile_list` | 144 | スマホの一覧で最も多かった描画幅 |
+
+**表示幅は note が公表していない。** note.com を開いて測った値なので、改修で
+変わりうる。結果の `profile.revision` が測った年月を言う。
+
+```
+$ kiri compose header.json -o header.png --profile note --json | jq '.layers[1].display'
+[
+  { "name": "pc_list",     "width": 192, "size_px": 9.6, "contrast": 11.2,
+    "legible": false, "reasons": ["too_small"] },
+  { "name": "mobile_list", "width": 144, "size_px": 7.2, "contrast": 6.69,
+    "legible": false, "reasons": ["too_small"] }
+]
+```
+
+| 理由 | いつ | 直し方 |
+|---|---|---|
+| `too_small` | `size_px`（= `size × 表示幅 / canvas の幅`）が 11 未満 | `size` を `11 × canvas の幅 / 表示幅` 以上にする（1280 幅なら mobile_list で 98） |
+| `strokes_lost` | 縮めた被覆が 0.5 に届く画素が 1 つも無い（線が 1px 未満に潰れた） | `weight` を上げる |
+| `low_contrast` | 縮めた絵での前景と背景のコントラスト比が 4.5 未満 | 文字色か、その文字が載っている下地を変える |
+
+1 つでも当たれば `legible: false` で、`TEXT_ILLEGIBLE_AT_DISPLAY` が出る。
+11 は Apple の Human Interface Guidelines が本文の最小とする 11pt で、kiri が
+決めた数ではない（4.5 が WCAG の数であるのと同じ扱い）。**大きさは em で測る**
+——CSS の font-size と同じ量で、spec の `size` から逆算できる。
+
+**原寸の `text_contrast` とは別の量である。** あちらは文字色と背後、こちらは
+縮めた絵で見えている前景（その文字の被覆が 0.5 以上の画素）と背景（外接矩形の
+中で 0.05 未満の画素）の相対輝度の中央値を比べる。中間色の地（#767676）に白の
+100px は原寸で 4.54 だが、縮めると線が地の色と混ざって 3〜3.9 まで落ちる——
+**原寸の値だけを読んだ呼び出し側は「読める」と判断する。**
+
+透過の画素は、出力が透過を保てるなら**白**（note の一覧の地）へ、保てないなら
+潰す色へ重ねてから縮める。縮小は box（面積平均）で、Lanczos のように輪郭を
+立たせて細い線を実際より読めるように見せることはしない。`role` が `decoration`
+の文字と画像の層は測らず、`display` のキーごと出ない。
+
+`--fail-on` には縮小表示の指標が 3 つ増える。
+
+| 指標 | 量 | `default` の門 |
+|---|---|---|
+| `display_text_size` | 全文字層・全表示での `size_px` の最小 | `< 11` |
+| `display_contrast` | 同じく `contrast` の最小（null は数えない） | `< 4.5` |
+| `display_strokes_lost` | `strokes_lost` に当たった表示があるか（旗） | 立ったら |
+
+**`--profile` を渡さない `default` はこの 3 つを足さない。** 足すと、これまで
+通っていた `--fail-on default` が「測っていない」で一斉に落ちる。明示して
+書いた場合は、測っていないので `unmeasurable`（exit 5）になる。
+
 ## 持っていないもの
 
 `--derive` / `--manifest` / `--max-bytes` は無い。1 枚を組んで 1 枚を書く

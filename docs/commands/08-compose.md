@@ -103,7 +103,12 @@ $ kiri compose header.json -o header.png --profile note --fail-on default
 | 項目 | spec に書いてある | spec に無い |
 |---|---|---|
 | `canvas.width` / `height` | spec の値。比が 1280:670 から 0.5% 以上外れたら `PROFILE_ASPECT_MISMATCH` | 1280 x 670 |
-| `safe_area` | spec の値 | 上下中央の `[0, 108, 1280, 454]` をキャンバスへ比で合わせた値 |
+| `safe_area` | spec の値 | 上下中央の `[0, 108, 1280, 454]`。キャンバスが違えば合わせる（下を参照） |
+
+**`"safe_area": null` は書かなかったのと同じ**で、profile の範囲が入る。
+キャンバスの比が規格と同じ（`PROFILE_ASPECT_MISMATCH` が出ない）なら範囲を比で
+拡大する。外れていれば、**note が中央を規格の比へ切り取った後に残る範囲**を
+使う——1280 x 720 なら上下 25px ずつ切られるので `[0, 133, 1280, 454]` になる。
 
 **明示 > profile。** cutout の `--profile` と同じ約束である。1920 x 1006 は比が
 同じ（0.1% 差）なので黙って通る。`canvas` の寸法を省けるのは `--profile` を
@@ -158,8 +163,18 @@ $ kiri compose header.json -o header.png --profile note --json | jq '.layers[1].
 
 透過の画素は、出力が透過を保てるなら**白**（note の一覧の地）へ、保てないなら
 潰す色へ重ねてから縮める。縮小は box（面積平均）で、Lanczos のように輪郭を
-立たせて細い線を実際より読めるように見せることはしない。`role` が `decoration`
-の文字と画像の層は測らず、`display` のキーごと出ない。
+立たせて細い線を実際より読めるように見せることはしない。
+
+測らないものは次の 3 つで、**測ったように見せない。**
+
+- `role` が `decoration` の文字と画像の層——`display` のキーごと出ない
+- **原寸で 1 画素も描かれなかった文字**——同じく `display` が無い（原因は
+  `TEXT_NOT_RENDERED` が言う。縮めて線が潰れたのではない）
+- **表示幅がキャンバスの幅以上の表示**——縮小にならないので測らず、`display[]` に
+  行ごと出ない（1 つも測らなければ空の配列）
+
+背景の画素が 1 つも無ければ `contrast` は null で、低コントラストとは言わない。
+門の `display_*` は、測れた値が 1 つも無ければ `unmeasurable` になる。
 
 `--fail-on` には縮小表示の指標が 3 つ増える。
 

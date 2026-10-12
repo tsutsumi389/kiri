@@ -77,6 +77,12 @@ pub struct LayerReport {
     pub outside_safe_area: Option<bool>,
     /// 文字の揃え。画像では null
     pub align: Option<Align>,
+    /// 縮小表示での読みやすさ（`compose::display`）。**`--profile` を渡し、
+    /// 読めることを要求する文字の層にだけ出る。** それ以外ではキーごと出さない
+    /// ——`--profile` を渡さない実行の結果 JSON を 1 バイトも動かさないためである
+    /// （12-phase-31.md §12.1 の 3）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display: Option<Vec<crate::compose::display::DisplayReport>>,
 }
 
 /// 文字が枠からはみ出した量。**どの向きであれ最も大きい 1 つ**を返す。
@@ -168,7 +174,7 @@ pub fn contrast(
 ///
 /// **`transform::canvas::over` と同じ算術である。** 別々に書くと、測った色と
 /// 書き出した色が半透明の縁で食い違う。
-fn flatten(src: [u8; 4], base: [u8; 3]) -> [u8; 3] {
+pub(crate) fn flatten(src: [u8; 4], base: [u8; 3]) -> [u8; 3] {
     let a = f64::from(src[3]) / 255.0;
     let mix = |s: u8, b: u8| (f64::from(s) * a + f64::from(b) * (1.0 - a)).round() as u8;
     [
@@ -213,7 +219,7 @@ pub fn overlap(pixels: &[u32], subject: &[u8]) -> f64 {
 /// **`color/lab.rs` の明度とは別物である。** あちらは知覚的な色差（ΔE）のための
 /// L* で、こちらはコントラスト比の分母分子に入る量。同じ「明るさ」でも定義が
 /// 違うので、片方を流用すると比の意味が変わる。
-fn relative_luminance(rgb: [u8; 3]) -> f64 {
+pub(crate) fn relative_luminance(rgb: [u8; 3]) -> f64 {
     let f = |v: u8| {
         let c = f64::from(v) / 255.0;
         if c <= 0.03928 {

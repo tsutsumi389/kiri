@@ -11193,6 +11193,31 @@ fn every_published_field_exists_in_the_result() {
             "--json",
         ])
     };
+    // **縮小表示の測り（`layers[].display[]`）は文字の層にしか出ない。** 上の
+    // 実行は字体を避けているので、`--profile` を付けた文字の実行を別に持つ。
+    // 字体が無い機械ではその path だけを飛ばす（`segment.*` と同じ扱い）
+    let displayed = common::any_font(&['A']).map(|family| {
+        let spec = write_spec(
+            dir.path(),
+            &format!(
+                r##"{{"canvas":{{"background":"#ffffff"}},
+                     "font":{{"family":"{family}"}},
+                     "layers":[{{"id":"t","type":"text","role":"heading",
+                                "lines":["A"],"rect":[80,200,600,200],
+                                "size":110,"color":"#000000"}}]}}"##
+            ),
+        );
+        run(&[
+            "compose",
+            spec.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--dry-run",
+            "--json",
+            "--profile",
+            "note",
+        ])
+    });
     let segmented = segment_ready().then(|| {
         (
             run(&[
@@ -11227,6 +11252,9 @@ fn every_published_field_exists_in_the_result() {
         if path.starts_with("segment.") && segmented.is_none() {
             continue;
         }
+        if path.starts_with("layers[].display") && displayed.is_none() {
+            continue;
+        }
 
         for command in commands {
             let report = match command {
@@ -11244,6 +11272,7 @@ fn every_published_field_exists_in_the_result() {
                 "cutout" if path.starts_with("settings.") => &profiled,
                 "cutout" if path.starts_with("rotate.") => &rotated,
                 "lint" => &linted,
+                "compose" if path.starts_with("layers[].display") => displayed.as_ref().unwrap(),
                 "compose" => &composed,
                 "batch" => &batched,
                 "rotate" => &turned,

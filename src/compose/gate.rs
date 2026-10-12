@@ -18,6 +18,7 @@ use serde_json::Value;
 
 use crate::commands::lint::SKIPPED;
 use crate::compliance::{FAIL, Operator, PASS};
+use crate::compose::display::{MIN_DISPLAY_SIZE, Reason};
 use crate::compose::measure::{LayerReport, MAX_OBSCURED, MAX_SUBJECT_OVERLAP, MIN_CONTRAST};
 use crate::error::ErrorCode;
 
@@ -26,6 +27,9 @@ use crate::error::ErrorCode;
 pub use crate::compliance::DEFAULT_TOKEN;
 
 /// 見る指標。**名前は結果 JSON の `compose.layers[]` のキーそのままである。**
+///
+/// `display_*` の 3 つだけは例外で、`layers[].display[]` の値を全層・全表示に
+/// わたって畳んだものである（キーが入れ子なので、そのままの綴りでは書けない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Metric {
     TextOverflow,
@@ -33,17 +37,30 @@ pub enum Metric {
     TextObscured,
     LayerOverlap,
     OutsideSafeArea,
+    /// 全文字層・全表示での `size_px` の最小
+    DisplayTextSize,
+    /// 全文字層・全表示での `contrast` の最小（null は数えない）
+    DisplayContrast,
+    /// `strokes_lost` に当たった表示が 1 つでもあるか
+    DisplayStrokesLost,
 }
 
 impl Metric {
     /// **この並びがそのまま `checks[]` の並びになる。** 指定の順に依存させない
     /// （`compliance::Metric::ALL` と同じ理由）。
-    pub const ALL: [Metric; 5] = [
+    ///
+    /// `display_*` は**末尾に足す。** 先頭へ混ぜると、`--profile` を渡さない
+    /// 実行の `checks[]` の並びは同じでも、指標の綴りの一覧（`kiri schema` の
+    /// `accepts`）の既存の位置が動く。
+    pub const ALL: [Metric; 8] = [
         Metric::TextOverflow,
         Metric::TextContrast,
         Metric::TextObscured,
         Metric::LayerOverlap,
         Metric::OutsideSafeArea,
+        Metric::DisplayTextSize,
+        Metric::DisplayContrast,
+        Metric::DisplayStrokesLost,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -53,6 +70,9 @@ impl Metric {
             Metric::TextObscured => "text_obscured",
             Metric::LayerOverlap => "layer_overlap",
             Metric::OutsideSafeArea => "outside_safe_area",
+            Metric::DisplayTextSize => "display_text_size",
+            Metric::DisplayContrast => "display_contrast",
+            Metric::DisplayStrokesLost => "display_strokes_lost",
         }
     }
 
@@ -62,14 +82,25 @@ impl Metric {
 
     /// 真偽で報告される指標。しきい値を置けない。
     pub const fn is_flag(self) -> bool {
-        matches!(self, Metric::OutsideSafeArea)
+        matches!(self, Metric::OutsideSafeArea | Metric::DisplayStrokesLost)
     }
 
     pub const fn flag_meaning(self) -> Option<&'static str> {
         match self {
             Metric::OutsideSafeArea => Some("safe_area の外へ出ていたら不合格"),
+            Metric::DisplayStrokesLost => {
+                Some("--profile の縮小表示で線が潰れた文字があれば不合格")
+            }
             _ => None,
         }
+    }
+
+    /// `--profile` の縮小表示でしか測らない指標か。
+    pub const fn needs_profile(self) -> bool {
+        matches!(
+            self,
+            Metric::DisplayTextSize | Metric::DisplayContrast | Metric::DisplayStrokesLost
+        )
     }
 
     /// `default` が当てる条件。**較正済みの値はここ 1 箇所から来る。**
@@ -82,8 +113,10 @@ impl Metric {
             Metric::TextContrast => Some((Operator::Lt, MIN_CONTRAST)),
             Metric::TextObscured => Some((Operator::Gt, MAX_OBSCURED)),
             Metric::LayerOverlap => Some((Operator::Gt, MAX_SUBJECT_OVERLAP)),
+            Metric::DisplayTextSize => Some((Operator::Lt, MIN_DISPLAY_SIZE)),
+            Metric::DisplayContrast => Some((Operator::Lt, MIN_CONTRAST)),
             // 真偽の指標はしきい値を取らない
-            Metric::OutsideSafeArea => None,
+            Metric::OutsideSafeArea | Metric::DisplayStrokesLost => None,
         }
     }
 
@@ -113,6 +146,13 @@ impl Metric {
             }
             // spec が範囲を書いていなければ、どの層にも値が入らない
             Metric::OutsideSafeArea => layers.iter().any(|l| l.outside_safe_area.is_some()),
+            // 縮小表示は読めることを要求する文字にだけ測る。**`--profile` が
+            // 無い実行はここへ来ない**（`evaluate` が先に `unmeasurable` にする）
+            Metric::DisplayTextSize | Metric::DisplayContrast | Metric::DisplayStrokesLost => {
+                layers
+                    .iter()
+                    .any(|l| l.kind == "text" && l.role.wants_contrast())
+            }
         }
     }
 
@@ -122,16 +162,34 @@ impl Metric {
     /// 測れた層が 1 つも無ければ `None`——`checks[].status` が
     /// `unmeasurable` になり、**合格としては数えない**
     fn worst(self, layers: &[LayerReport]) -> Option<f64> {
-        let values = layers.iter().filter_map(|l| match self {
-            Metric::TextOverflow => l.text_overflow,
-            Metric::TextContrast => l.text_contrast,
-            Metric::TextObscured => l.text_obscured,
-            Metric::LayerOverlap => l.layer_overlap,
-            Metric::OutsideSafeArea => l.outside_safe_area.map(|out| if out { 1.0 } else { 0.0 }),
-        });
+        let displays = || layers.iter().flat_map(|l| l.display.iter().flatten());
+        let values: Vec<f64> = match self {
+            Metric::TextOverflow => layers.iter().filter_map(|l| l.text_overflow).collect(),
+            Metric::TextContrast => layers.iter().filter_map(|l| l.text_contrast).collect(),
+            Metric::TextObscured => layers.iter().filter_map(|l| l.text_obscured).collect(),
+            Metric::LayerOverlap => layers.iter().filter_map(|l| l.layer_overlap).collect(),
+            Metric::OutsideSafeArea => layers
+                .iter()
+                .filter_map(|l| l.outside_safe_area.map(|out| if out { 1.0 } else { 0.0 }))
+                .collect(),
+            Metric::DisplayTextSize => displays().map(|d| d.size_px).collect(),
+            Metric::DisplayContrast => displays().filter_map(|d| d.contrast).collect(),
+            Metric::DisplayStrokesLost => displays()
+                .map(|d| {
+                    if d.reasons.contains(&Reason::StrokesLost) {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                })
+                .collect(),
+        };
+        let values = values.into_iter();
         match self {
             // 小さいほど悪い
-            Metric::TextContrast => values.reduce(f64::min),
+            Metric::TextContrast | Metric::DisplayTextSize | Metric::DisplayContrast => {
+                values.reduce(f64::min)
+            }
             _ => values.reduce(f64::max),
         }
     }
@@ -231,11 +289,18 @@ impl FailOn {
     }
 
     /// その指標に当てる条件。**明示 > default** の 1 本である。
-    fn rule_for(&self, metric: Metric) -> Option<Rule> {
+    ///
+    /// **`default` は `--profile` の無い実行に `display_*` を足さない。**
+    /// 足すと、測っていない 3 行が `unmeasurable` で並び、これまで通っていた
+    /// `--fail-on default` が一斉に exit 5 へ変わる——`--profile` を渡さない
+    /// 実行の結果を動かさないという約束（12-phase-31.md §12.1 の 3）が破れる。
+    /// 明示して書いた `display_*` は、測っていないので `unmeasurable` として
+    /// 残す（`evaluate`）。
+    fn rule_for(&self, metric: Metric, profiled: bool) -> Option<Rule> {
         if let Some(rule) = self.rules.iter().find(|r| r.metric() == metric) {
             return Some(*rule);
         }
-        if !self.default {
+        if !self.default || (metric.needs_profile() && !profiled) {
             return None;
         }
         Some(match metric.calibrated() {
@@ -249,13 +314,17 @@ impl FailOn {
     }
 
     /// 測りに照らす。**`checks[]` の並びは `Metric::ALL` の順である。**
-    pub fn evaluate(&self, layers: &[LayerReport]) -> GateReport {
+    ///
+    /// `profiled` は `--profile` を渡したか。渡していなければ縮小表示を測って
+    /// いないので、明示した `display_*` は相手の有無によらず `unmeasurable`
+    /// になる——**測っていないものを `skipped`（合格）にしない**。
+    pub fn evaluate(&self, layers: &[LayerReport], profiled: bool) -> GateReport {
         let mut checks = Vec::new();
         for metric in Metric::ALL {
-            let Some(rule) = self.rule_for(metric) else {
+            let Some(rule) = self.rule_for(metric, profiled) else {
                 continue;
             };
-            let applicable = metric.applicable(layers);
+            let applicable = metric.applicable(layers) || (metric.needs_profile() && !profiled);
             let actual = metric.worst(layers);
             let (operator, threshold) = match rule {
                 Rule::Number {
@@ -406,4 +475,103 @@ pub struct Check {
     pub actual: Option<Value>,
     /// `pass` / `fail` / `unmeasurable`
     pub status: &'static str,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compose::Role;
+    use crate::compose::display::DisplayReport;
+
+    fn text(display: Option<Vec<DisplayReport>>) -> LayerReport {
+        LayerReport {
+            id: "t".to_string(),
+            kind: "text",
+            role: Role::Heading,
+            rect: [0.0, 0.0, 10.0, 10.0],
+            placed: [0.0, 0.0, 10.0, 10.0],
+            line_widths: Some(vec![10.0]),
+            text_overflow: Some(0.0),
+            text_contrast: Some(21.0),
+            text_obscured: Some(0.0),
+            layer_overlap: None,
+            outside_safe_area: None,
+            align: None,
+            display,
+        }
+    }
+
+    fn shown(size_px: f64, contrast: Option<f64>, reasons: Vec<Reason>) -> DisplayReport {
+        DisplayReport {
+            name: "mobile_list",
+            width: 144,
+            size_px,
+            contrast,
+            legible: reasons.is_empty(),
+            reasons,
+        }
+    }
+
+    fn metrics(report: &GateReport) -> Vec<&'static str> {
+        report.checks.iter().map(|c| c.metric).collect()
+    }
+
+    /// **`--profile` の無い `default` は縮小表示の行を足さない**——足すと、
+    /// これまで通っていた `--fail-on default` が `unmeasurable` で落ちる。
+    #[test]
+    fn default_without_a_profile_keeps_the_old_checks() {
+        let gate = FailOn::parse("default").unwrap();
+        let report = gate.evaluate(&[text(None)], false);
+        // 相手の居ない行も `skipped` として並ぶが、`display_*` は 1 行も無い
+        assert_eq!(
+            metrics(&report),
+            [
+                "text_overflow",
+                "text_contrast",
+                "text_obscured",
+                "layer_overlap",
+                "outside_safe_area"
+            ]
+        );
+        assert!(report.passed);
+    }
+
+    /// profile があれば `default` が 3 行を足し、最も悪い表示で判定する。
+    #[test]
+    fn default_with_a_profile_gates_the_worst_display() {
+        let gate = FailOn::parse("default").unwrap();
+        let layer = text(Some(vec![
+            shown(9.6, Some(11.2), vec![Reason::TooSmall]),
+            shown(7.2, None, vec![Reason::TooSmall, Reason::StrokesLost]),
+        ]));
+        let report = gate.evaluate(&[layer], true);
+        let check = |m: &str| report.checks.iter().find(|c| c.metric == m).unwrap();
+        assert_eq!(check("display_text_size").status, FAIL);
+        assert_eq!(
+            check("display_text_size").actual,
+            Some(serde_json::json!(7.2))
+        );
+        // null は数えない
+        assert_eq!(check("display_contrast").status, PASS);
+        assert_eq!(check("display_strokes_lost").status, FAIL);
+        assert_eq!(
+            check("display_strokes_lost").actual,
+            Some(Value::Bool(true))
+        );
+        assert!(!report.passed);
+    }
+
+    /// 明示した `display_*` は、profile が無ければ測っていないので合格にしない。
+    #[test]
+    fn an_explicit_display_metric_without_a_profile_is_unmeasurable() {
+        let gate = FailOn::parse("display_strokes_lost").unwrap();
+        let report = gate.evaluate(&[], false);
+        assert_eq!(report.checks[0].status, crate::compliance::UNMEASURABLE);
+        assert!(!report.passed);
+
+        // profile があって文字が無ければ、相手が居ないので飛ばす
+        let report = gate.evaluate(&[], true);
+        assert_eq!(report.checks[0].status, SKIPPED);
+        assert!(report.passed);
+    }
 }

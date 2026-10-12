@@ -14,6 +14,14 @@
 //! だから画素ごとに**最後に書いた層**を覚えておき、文字が覆う画素のうち自分より
 //! 後の層に塗られた割合を数える。重ねる順に 1 回歩くだけで済み、層ごとの
 //! 画像を持ち回らずに後から言える。
+//!
+//! # `--profile` の縮小表示は重ね終えてから測る
+//!
+//! 縮めるのは**最終のキャンバス**である（`compose::display` の doc）。文字ごとに
+//! 要るのはその文字の被覆だけで、被覆は後の層に依らないので、`--profile` が
+//! あるときに限り**組んだその場で表示の大きさへ縮めて**取っておく（原寸の
+//! グリフを層の数だけ抱えない）。無いときは何もしない——**渡さない実行の
+//! 費用も出力も変えない。**
 
 use std::path::Path;
 use std::time::Instant;
@@ -22,10 +30,13 @@ use image::RgbaImage;
 
 use crate::cli::ComposeArgs;
 use crate::compose::measure::{self, COVERAGE, LayerReport};
-use crate::compose::{self, ComposeSpec, ImageLayer, Layer, Role, TextLayer};
+use crate::compose::profile::ComposeProfile;
+use crate::compose::{self, ComposeSpec, ImageLayer, Layer, Role, TextLayer, display};
 use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::{load, save};
-use crate::report::{ComposeCanvasReport, ComposeOutputReport, ComposeReport, SCHEMA_VERSION};
+use crate::report::{
+    ComposeCanvasReport, ComposeOutputReport, ComposeProfileRef, ComposeReport, SCHEMA_VERSION,
+};
 use crate::transform::{ResizeSpec, canvas as canvas_mod};
 use crate::warning::{Warning, WarningCode};
 
@@ -37,7 +48,8 @@ const UNPAINTED: u16 = u16::MAX;
 
 pub fn run(args: &ComposeArgs) -> Result<ComposeReport> {
     let started = Instant::now();
-    let spec = compose::load(&args.spec)?;
+    let profile = args.profile;
+    let spec = compose::load_with(&args.spec, profile)?;
     // 素材のパスは **spec からの相対**で解く。実行時の作業ディレクトリに
     // 依らせると、同じ spec が置き場所によって別のものを読む
     let base = args.spec.parent().unwrap_or(Path::new(".")).to_path_buf();
@@ -54,6 +66,9 @@ pub fn run(args: &ComposeArgs) -> Result<ComposeReport> {
     // **フォントは 1 画素も描く前に決める。** 見つからなければここで断るので、
     // 半端な成果物が残らない
     let mut warnings: Vec<Warning> = Vec::new();
+    if let Some(profile) = profile {
+        warnings.extend(aspect_warning(profile, &spec));
+    }
     let font = spec
         .font
         .as_ref()
@@ -65,18 +80,66 @@ pub fn run(args: &ComposeArgs) -> Result<ComposeReport> {
     // 何色として扱うかがここで決まる（`measure::contrast` の doc）
     let flatten_to = (args.flatten || !format.supports_alpha()).then_some(args.background);
 
-    let (canvas, layers) = build(&spec, &base, fontdb.as_ref(), flatten_to, &mut warnings)?;
+    let built = build(
+        &spec,
+        &base,
+        fontdb.as_ref(),
+        flatten_to,
+        profile,
+        &mut warnings,
+    )?;
+    let canvas = built.canvas;
+    let mut layers = built.layers;
+
+    if let Some(profile) = profile {
+        // **透過は白として縮める**——note の一覧の地は白で、透過の PNG を上げた
+        // ときに見えるのはその白である（12-phase-31.md §12.6 の 2）。透過を
+        // 保てない出力なら、実際に潰される色のほうが見える
+        let base = flatten_to.unwrap_or([255, 255, 255]);
+        measure_displays(profile, &canvas, base, &built.glyphs, &spec, &mut layers);
+    }
 
     for layer in &layers {
         warnings.extend(measure::warnings(layer));
+        for report in layer.display.iter().flatten() {
+            warnings.extend(display::warning(&layer.id, report, spec.canvas.width));
+        }
     }
 
-    let compliance = args.fail_on.as_ref().map(|f| f.evaluate(&layers));
+    let compliance = args
+        .fail_on
+        .as_ref()
+        .map(|f| f.evaluate(&layers, profile.is_some()));
     let output = write(&canvas, &args.output, format, args, &mut warnings)?;
+
+    // **`--dry-run` でも判定する。** dry-run はエンコードまで通し、書いたはずの
+    // バイト数を `output.bytes` に返している（`write` の doc）——数が決まって
+    // いるのに黙るのは、本番で初めて上限に当たる形を残すだけである
+    if let Some(max) = profile.and_then(|p| p.max_bytes) {
+        if output.bytes > max {
+            warnings.push(
+                Warning::new(
+                    WarningCode::ProfileMaxBytesExceeded,
+                    format!(
+                        "{} バイトは --profile の上限 {max} バイトを超えています",
+                        output.bytes
+                    ),
+                )
+                .with_hint("出力先の拡張子を .jpg か .avif にするか、--quality を下げてください")
+                .with_data("bytes", output.bytes)
+                .with_data("max_bytes", max),
+            );
+        }
+    }
 
     Ok(ComposeReport {
         schema_version: SCHEMA_VERSION,
         spec: args.spec.display().to_string(),
+        profile: profile.map(|p| ComposeProfileRef {
+            name: p.name,
+            revision: p.revision,
+            source: p.source,
+        }),
         canvas: ComposeCanvasReport {
             width: spec.canvas.width,
             height: spec.canvas.height,
@@ -90,6 +153,86 @@ pub fn run(args: &ComposeArgs) -> Result<ComposeReport> {
         elapsed_ms: started.elapsed().as_millis(),
         warnings,
     })
+}
+
+/// キャンバスの比が profile の比から外れていたら言う。
+///
+/// **spec が書いた寸法にだけ当たる。** profile が埋めた寸法は profile の比
+/// そのものなので、ここで外れることは無い。
+fn aspect_warning(profile: &ComposeProfile, spec: &ComposeSpec) -> Option<Warning> {
+    let (w, h) = (spec.canvas.width, spec.canvas.height);
+    if !profile.aspect_mismatch(w, h) {
+        return None;
+    }
+    let (pw, ph) = profile.canvas;
+    Some(
+        Warning::new(
+            WarningCode::ProfileAspectMismatch,
+            format!(
+                "canvas {w}x{h} の比が {} の {pw}x{ph} と違います。表示側でトリミングされます",
+                profile.name
+            ),
+        )
+        .with_hint(format!(
+            "canvas の width / height を消すと {pw}x{ph} で組みます"
+        ))
+        .with_data("expected", vec![pw, ph])
+        .with_data("actual", vec![w, h]),
+    )
+}
+
+/// 全層を重ねたキャンバスを profile の表示ごとに縮め、文字の層ごとに測る。
+///
+/// **表示ごとに 1 回だけ縮める。** 縮めた絵は文字の層をまたいで同じなので、
+/// 層ごとに縮め直すと同じ計算を層の数だけ払う。
+fn measure_displays(
+    profile: &ComposeProfile,
+    canvas: &RgbaImage,
+    base: [u8; 3],
+    glyphs: &[Glyphs],
+    spec: &ComposeSpec,
+    layers: &mut [LayerReport],
+) {
+    let (w, h) = (spec.canvas.width, spec.canvas.height);
+    for entry in glyphs {
+        layers[entry.index].display = Some(Vec::with_capacity(profile.displays.len()));
+    }
+    for (d, target) in profile.displays.iter().enumerate() {
+        let height = display::display_height(w, h, target.width);
+        let shrunk = display::shrink_canvas(canvas, base, target.width, height);
+        for entry in glyphs {
+            let layer = &mut layers[entry.index];
+            let report = display::measure(
+                &shrunk,
+                &entry.coverage[d],
+                layer.placed,
+                entry.size,
+                (w, h),
+                target,
+            );
+            if let Some(list) = layer.display.as_mut() {
+                list.push(report);
+            }
+        }
+    }
+}
+
+/// 組み上がったもの。
+struct Built {
+    canvas: RgbaImage,
+    layers: Vec<LayerReport>,
+    /// 縮小表示で測る文字の層のグリフ。`--profile` が無ければ空
+    glyphs: Vec<Glyphs>,
+}
+
+/// 縮小表示で測るために取っておく、1 つの文字の層。
+struct Glyphs {
+    /// `layers` の中での位置
+    index: usize,
+    /// spec の `size`。表示上の大きさはここから計算で出す
+    size: f64,
+    /// この文字の被覆を表示ごとに縮めたもの。並びは `displays` の並び
+    coverage: Vec<Vec<f64>>,
 }
 
 /// 文字の層について、後から覆われた割合を数えるために取っておくもの。
@@ -106,8 +249,9 @@ fn build(
     base: &Path,
     fontdb: Option<&std::sync::Arc<resvg::usvg::fontdb::Database>>,
     flatten_to: Option<[u8; 3]>,
+    profile: Option<&ComposeProfile>,
     warnings: &mut Vec<Warning>,
-) -> Result<(RgbaImage, Vec<LayerReport>)> {
+) -> Result<Built> {
     let (w, h) = (spec.canvas.width, spec.canvas.height);
     let area = (w as usize) * (h as usize);
     let mut canvas = match &spec.canvas.background {
@@ -128,6 +272,7 @@ fn build(
 
     let mut reports = Vec::with_capacity(spec.layers.len());
     let mut covered: Vec<Covered> = Vec::new();
+    let mut glyphs: Vec<Glyphs> = Vec::new();
 
     for (i, layer) in spec.layers.iter().enumerate() {
         let index = i as u16;
@@ -155,10 +300,11 @@ fn build(
                     layer_overlap: None,
                     outside_safe_area: spec.safe_area.map(|a| measure::outside(a, placed)),
                     align: None,
+                    display: None,
                 }
             }
             Layer::Text(text) => {
-                let (report, pixels) = draw_text(
+                let (report, pixels, drawn) = draw_text(
                     &mut canvas,
                     text,
                     spec,
@@ -171,6 +317,22 @@ fn build(
                     warnings,
                 )?;
                 covered.push(Covered { index, pixels });
+                // **読めることを要求しない層は測らない**（`text_contrast` と同じ線引き）
+                if let Some(profile) = profile.filter(|_| text.role.wants_contrast()) {
+                    let coverage = profile
+                        .displays
+                        .iter()
+                        .map(|d| {
+                            let height = display::display_height(w, h, d.width);
+                            display::shrink_coverage(&drawn, d.width, height)
+                        })
+                        .collect();
+                    glyphs.push(Glyphs {
+                        index: i,
+                        size: text.size,
+                        coverage,
+                    });
+                }
                 report
             }
         };
@@ -205,7 +367,11 @@ fn build(
         }
     }
 
-    Ok((canvas, reports))
+    Ok(Built {
+        canvas,
+        layers: reports,
+        glyphs,
+    })
 }
 
 /// 文字が覆う画素のうち、自分より後の層に塗られた割合。
@@ -278,7 +444,7 @@ fn draw_image(
     Ok([at.0 as f64, at.1 as f64, f64::from(fw), f64::from(fh)])
 }
 
-/// 文字を組んで重ね、測りと「覆った画素」を返す。
+/// 文字を組んで重ね、測りと「覆った画素」と、この文字だけを描いた画像を返す。
 #[allow(clippy::too_many_arguments)]
 fn draw_text(
     canvas: &mut RgbaImage,
@@ -291,7 +457,7 @@ fn draw_text(
     has_subject: bool,
     painter: &mut [u16],
     warnings: &mut Vec<Warning>,
-) -> Result<(LayerReport, Vec<u32>)> {
+) -> Result<(LayerReport, Vec<u32>, RgbaImage)> {
     // `compose::validate` が「文字があるのに font が無い」を既に断っているので、
     // ここへ `None` で来ることは無い。**それでも unwrap しない**——届かない
     // はずの経路が届いたときに、panic ではなく code で言えるほうがよい
@@ -353,8 +519,9 @@ fn draw_text(
         layer_overlap,
         outside_safe_area: spec.safe_area.map(|a| measure::outside(a, layout.bbox)),
         align: Some(layer.align),
+        display: None,
     };
-    Ok((report, pixels))
+    Ok((report, pixels, layout.pixels))
 }
 
 /// `subject` の覆いを記録する。**1 画素でも書けたら真を返す。**

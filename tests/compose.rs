@@ -45,21 +45,7 @@ fn json_stdout(output: &std::process::Output) -> Value {
 /// あり、そのとき `A` は豆腐にも成らずに消える——`FONT_GLYPHS_MISSING` と
 /// `TEXT_NOT_RENDERED` が出て、字体とは関係のない表明まで落ちる。
 fn any_font() -> Option<String> {
-    let mut db = resvg::usvg::fontdb::Database::new();
-    db.load_system_fonts();
-    let ids: Vec<_> = db
-        .faces()
-        .map(|f| (f.id, f.families.first().map(|(n, _)| n.clone())))
-        .collect();
-    ids.into_iter().find_map(|(id, family)| {
-        let family = family?;
-        let draws = db.with_face_data(id, |data, index| {
-            ttf_parser::Face::parse(data, index)
-                .map(|f| TEST_CHARS.iter().all(|&c| f.glyph_index(c).is_some()))
-                .unwrap_or(false)
-        })?;
-        draws.then_some(family)
-    })
+    common::any_font(&TEST_CHARS)
 }
 
 /// このファイルが組ませる文字。`any_font` が覆いを確かめる相手である。
@@ -1205,5 +1191,620 @@ fn the_published_warning_summaries_name_the_keys_that_are_emitted() {
                 "{code} が data.{key} を出すのに、配っている説明は '{text}'"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 31: `--profile note` と縮小表示での読みやすさ（12-phase-31.md §12.5）
+// ---------------------------------------------------------------------------
+
+/// 見出し 1 行を `size` で組む spec。**キャンバスは書かない**——note の寸法は
+/// `--profile` から来る。
+fn heading_spec(dir: &Path, family: &str, size: u32, color: &str, background: &str) -> PathBuf {
+    write_spec(
+        dir,
+        &format!(
+            r##"{{"canvas":{{"background":"{background}"}},
+                 "font":{{"family":"{family}"}},
+                 "layers":[{{"id":"heading","type":"text","role":"heading",
+                            "lines":["ABAB"],"rect":[80,200,1100,240],
+                            "size":{size},"color":"{color}"}}]}}"##
+        ),
+    )
+}
+
+fn display_of<'a>(layer: &'a Value, name: &str) -> &'a Value {
+    layer["display"]
+        .as_array()
+        .unwrap_or_else(|| panic!("display が配列でない: {layer}"))
+        .iter()
+        .find(|d| d["name"] == name)
+        .unwrap_or_else(|| panic!("表示 '{name}' が無い: {layer}"))
+}
+
+fn reasons(display: &Value) -> Vec<String> {
+    display["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap().to_string())
+        .collect()
+}
+
+fn check_of<'a>(report: &'a Value, metric: &str) -> Option<&'a Value> {
+    report["compliance"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["metric"] == metric)
+}
+
+/// `canvas` を省いた spec が `--profile note` で 1280x670 になり、安全領域が
+/// 上下中央の 1280x454 になる（§12.5 の 2）。
+#[test]
+fn a_spec_without_a_canvas_takes_the_note_size_and_safe_area() {
+    let dir = TempDir::new().unwrap();
+    portrait(dir.path());
+    // 安全領域 [0,108,1280,454] の内と外に 1 枚ずつ置く
+    let spec = write_spec(
+        dir.path(),
+        r#"{"layers":[
+             {"id":"inside","type":"image","role":"subject",
+              "source":"product.png","rect":[100,108,200,454]},
+             {"id":"above","type":"image","role":"decoration",
+              "source":"product.png","rect":[600,0,50,100]},
+             {"id":"edge","type":"image","role":"decoration",
+              "source":"product.png","rect":[900,100,200,400]}]}"#,
+    );
+    let out = dir.path().join("out.png");
+    let result = compose(&spec, &out, &["--profile", "note", "--dry-run"]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+    let report = json_stdout(&result);
+
+    assert_eq!(report["canvas"]["width"], 1280);
+    assert_eq!(report["canvas"]["height"], 670);
+    assert_eq!(report["output"]["width"], 1280);
+    assert_eq!(report["output"]["height"], 670);
+    assert_eq!(report["profile"]["name"], "note");
+    assert_eq!(report["profile"]["revision"], "2026-10");
+    assert!(
+        report["profile"]["source"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://")
+    );
+
+    assert_eq!(layer(&report, "inside")["outside_safe_area"], false);
+    assert_eq!(layer(&report, "above")["outside_safe_area"], true);
+    // 108 の 8px 上から始まる
+    assert_eq!(layer(&report, "edge")["outside_safe_area"], true);
+    // 画像の層は縮小表示を測らない
+    assert!(layer(&report, "inside").get("display").is_none());
+    assert!(!codes(&report).contains(&"PROFILE_ASPECT_MISMATCH".to_string()));
+}
+
+/// **`--profile` を渡さなければ、省いた canvas は今までどおり断る。**
+#[test]
+fn without_a_profile_a_missing_canvas_is_still_refused() {
+    let dir = TempDir::new().unwrap();
+    portrait(dir.path());
+    let spec = write_spec(
+        dir.path(),
+        r#"{"layers":[{"id":"a","type":"image","role":"subject",
+                       "source":"product.png","rect":[0,0,100,100]}]}"#,
+    );
+    let out = dir.path().join("out.png");
+    let result = compose(&spec, &out, &[]);
+    assert_eq!(result.status.code(), Some(3), "spec の不正は入力の失敗");
+    assert_eq!(json_stdout(&result)["error"]["code"], "SPEC_INVALID");
+}
+
+/// 1920x1006 は比が同じなので黙り、1280x720 は比の違いを言う（§12.5 の 3）。
+#[test]
+fn the_larger_recommendation_passes_and_16_9_is_named() {
+    let dir = TempDir::new().unwrap();
+    portrait(dir.path());
+    let run = |w: u32, h: u32| {
+        let spec = write_spec(
+            dir.path(),
+            &format!(
+                r#"{{"canvas":{{"width":{w},"height":{h}}},
+                     "layers":[{{"id":"a","type":"image","role":"subject",
+                                "source":"product.png","rect":[0,0,100,100]}}]}}"#
+            ),
+        );
+        let out = dir.path().join("out.png");
+        let result = compose(&spec, &out, &["--profile", "note", "--dry-run"]);
+        assert!(result.status.success());
+        json_stdout(&result)
+    };
+
+    let large = run(1920, 1006);
+    assert!(
+        !codes(&large).contains(&"PROFILE_ASPECT_MISMATCH".to_string()),
+        "{}",
+        large["warnings"]
+    );
+
+    let wide = run(1280, 720);
+    let warning = wide["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "PROFILE_ASPECT_MISMATCH")
+        .unwrap_or_else(|| panic!("16:9 が通った: {}", wide["warnings"]));
+    assert_eq!(warning["data"]["expected"], serde_json::json!([1280, 670]));
+    assert_eq!(warning["data"]["actual"], serde_json::json!([1280, 720]));
+    // 書いた寸法が勝つ（明示 > profile）
+    assert_eq!(wide["canvas"]["height"], 720);
+}
+
+/// compose と cutout の `--profile` は**別の表**を引く。互いの名前を断る。
+#[test]
+fn the_compose_and_cutout_profiles_do_not_accept_each_other() {
+    let dir = TempDir::new().unwrap();
+    portrait(dir.path());
+    let spec = write_spec(
+        dir.path(),
+        r#"{"layers":[{"id":"a","type":"image","role":"subject",
+                       "source":"product.png","rect":[0,0,100,100]}]}"#,
+    );
+    let out = dir.path().join("out.png");
+    let to_compose = compose(&spec, &out, &["--profile", "amazon"]);
+    assert_eq!(
+        to_compose.status.code(),
+        Some(2),
+        "compose が amazon を受けた"
+    );
+
+    let input = dir.path().join("product.png");
+    let to_cutout = kiri()
+        .args(["cutout", input.to_str().unwrap(), "-o"])
+        .arg(dir.path().join("cut.png"))
+        .args(["--profile", "note"])
+        .output()
+        .unwrap();
+    assert_eq!(to_cutout.status.code(), Some(2), "cutout が note を受けた");
+}
+
+/// `--profile` を渡さない結果には `profile` も `display` もキーごと出ない
+/// （§12.1 の 3。既存の出力を 1 バイトも動かさない）。
+#[test]
+fn without_a_profile_no_new_keys_appear() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let spec = write_spec(
+        dir.path(),
+        &format!(
+            r##"{{"canvas":{{"width":400,"height":200,"background":"#ffffff"}},
+                 "font":{{"family":"{family}"}},
+                 "layers":[{{"id":"t","type":"text","role":"heading",
+                            "lines":["AB"],"rect":[10,10,380,180],
+                            "size":40,"color":"#000000"}}]}}"##
+        ),
+    );
+    let out = dir.path().join("out.png");
+    let report = json_stdout(&compose(&spec, &out, &["--fail-on", "default"]));
+    assert!(report.get("profile").is_none(), "{report}");
+    assert!(layer(&report, "t").get("display").is_none(), "{report}");
+    let metrics: Vec<&str> = report["compliance"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["metric"].as_str().unwrap())
+        .collect();
+    assert!(
+        metrics.iter().all(|m| !m.starts_with("display_")),
+        "profile の無い default が縮小表示の行を足した: {metrics:?}"
+    );
+    assert_eq!(report["compliance"]["passed"], true);
+}
+
+/// 白地に黒 64px の見出しは原寸では黙り、`mobile_list` では 7.2px で
+/// `too_small` になる（§12.5 の 4）。
+#[test]
+fn a_64px_heading_is_fine_at_full_size_but_too_small_on_mobile() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let spec = heading_spec(dir.path(), &family, 64, "#000000", "#ffffff");
+    let out = dir.path().join("out.png");
+
+    // 原寸の測りだけなら何も言わない。canvas を書いていないので、比べるために
+    // 寸法を書いた spec を別に作る
+    let full = write_spec(
+        dir.path(),
+        &std::fs::read_to_string(&spec)
+            .unwrap()
+            .replace(r#""canvas":{"#, r#""canvas":{"width":1280,"height":670,"#),
+    );
+    let plain = json_stdout(&compose(&full, &out, &["--dry-run"]));
+    assert!(codes(&plain).is_empty(), "{}", plain["warnings"]);
+
+    let spec = heading_spec(dir.path(), &family, 64, "#000000", "#ffffff");
+    let report = json_stdout(&compose(&spec, &out, &["--profile", "note", "--dry-run"]));
+    let heading = layer(&report, "heading");
+    let mobile = display_of(heading, "mobile_list");
+    assert_eq!(mobile["width"], 144);
+    assert_eq!(mobile["size_px"].as_f64().unwrap(), 7.2);
+    assert_eq!(mobile["legible"], false);
+    assert!(reasons(mobile).contains(&"too_small".to_string()));
+
+    let warning = report["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "TEXT_ILLEGIBLE_AT_DISPLAY" && w["data"]["display"] == "mobile_list")
+        .unwrap_or_else(|| panic!("mobile_list の警告が無い: {}", report["warnings"]));
+    assert_eq!(warning["data"]["layer"], "heading");
+    assert_eq!(warning["data"]["width"], 144);
+    assert_eq!(warning["data"]["size_px"].as_f64().unwrap(), 7.2);
+    // 直す側が逆算できる数を hint が言う。11 × 1280 / 144 = 97.8 → 98
+    assert!(
+        warning["hint"].as_str().unwrap().contains("98"),
+        "{warning}"
+    );
+}
+
+/// 白地に黒 110px の見出しは両方の表示で読める（§12.5 の 5）。
+#[test]
+fn a_110px_heading_is_legible_on_both_displays() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let spec = heading_spec(dir.path(), &family, 110, "#000000", "#ffffff");
+    let out = dir.path().join("out.png");
+    let report = json_stdout(&compose(&spec, &out, &["--profile", "note", "--dry-run"]));
+    let heading = layer(&report, "heading");
+    let displays = heading["display"].as_array().unwrap();
+    let names: Vec<&str> = displays
+        .iter()
+        .map(|d| d["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["pc_list", "mobile_list"], "並びは表の順");
+    for d in displays {
+        assert_eq!(d["legible"], true, "{family}: {d}");
+        assert!(d["reasons"].as_array().unwrap().is_empty());
+        assert!(d["contrast"].as_f64().unwrap() >= 4.5, "{d}");
+    }
+    assert!(
+        !codes(&report).contains(&"TEXT_ILLEGIBLE_AT_DISPLAY".to_string()),
+        "{}",
+        report["warnings"]
+    );
+}
+
+/// **縮小の測りが原寸の測りと違うことの証拠**（§12.5 の 6）。
+///
+/// 中間色の地（#767676）に白の文字は、原寸のコントラストが 4.54 で 4.5 を
+/// わずかに超える。表示幅へ縮めると線が地の色と混ざって前景が薄まり、
+/// 大きさは足りていても（100px → 11.25px）`low_contrast` か `strokes_lost` に
+/// なる。原寸の `text_contrast` だけを読んだ呼び出し側は「読める」と判断する。
+#[test]
+fn a_line_that_passes_at_full_size_fails_when_shrunk() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let spec = heading_spec(dir.path(), &family, 100, "#ffffff", "#767676");
+    let out = dir.path().join("out.png");
+    let report = json_stdout(&compose(&spec, &out, &["--profile", "note", "--dry-run"]));
+    let heading = layer(&report, "heading");
+
+    let full = heading["text_contrast"].as_f64().unwrap();
+    assert!((4.5..4.6).contains(&full), "原寸 {full}");
+    assert!(!codes(&report).contains(&"TEXT_CONTRAST_LOW".to_string()));
+
+    let mut caught = false;
+    for d in heading["display"].as_array().unwrap() {
+        assert!(
+            d["size_px"].as_f64().unwrap() >= 11.0,
+            "大きさで落ちては証拠にならない: {d}"
+        );
+        let r = reasons(d);
+        if r.contains(&"low_contrast".to_string()) || r.contains(&"strokes_lost".to_string()) {
+            caught = true;
+        }
+    }
+    assert!(
+        caught,
+        "{family}: 縮めても読めると言った: {}",
+        heading["display"]
+    );
+    assert!(codes(&report).contains(&"TEXT_ILLEGIBLE_AT_DISPLAY".to_string()));
+}
+
+/// 同じ入力から同じ結果（§12.5 の 7）。
+#[test]
+fn the_display_measurement_is_deterministic() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let spec = heading_spec(dir.path(), &family, 100, "#ffffff", "#767676");
+    let strip = |mut v: Value| {
+        v.as_object_mut().unwrap().remove("elapsed_ms");
+        v
+    };
+    let a_out = dir.path().join("a.png");
+    let b_out = dir.path().join("b.png");
+    let a = strip(json_stdout(&compose(&spec, &a_out, &["--profile", "note"])));
+    let mut b = strip(json_stdout(&compose(&spec, &b_out, &["--profile", "note"])));
+    b["output"]["path"] = a["output"]["path"].clone();
+    assert_eq!(a, b);
+    assert_eq!(
+        std::fs::read(&a_out).unwrap(),
+        std::fs::read(&b_out).unwrap()
+    );
+}
+
+/// `--fail-on` の縮小表示の指標（§12.4.6）。
+///
+/// profile があれば `default` が 3 行を足し、無ければ足さない。**明示して
+/// 書いた指標は、測っていないので `unmeasurable`**——合格にはしない。
+#[test]
+fn the_display_metrics_are_gated_only_when_measured() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let spec = heading_spec(dir.path(), &family, 64, "#000000", "#ffffff");
+    let out = dir.path().join("out.png");
+
+    let result = compose(
+        &spec,
+        &out,
+        &["--profile", "note", "--dry-run", "--fail-on", "default"],
+    );
+    assert_eq!(result.status.code(), Some(5), "7.2px が門を通った");
+    let report = json_stdout(&result);
+    let size =
+        check_of(&report, "display_text_size").expect("default が display_text_size を当てない");
+    assert_eq!(size["status"], "fail");
+    assert_eq!(size["operator"], "lt");
+    assert_eq!(size["threshold"].as_f64().unwrap(), 11.0);
+    assert_eq!(size["actual"].as_f64().unwrap(), 7.2, "全表示の最小");
+    assert_eq!(
+        check_of(&report, "display_contrast").unwrap()["status"],
+        "pass"
+    );
+    let lost = check_of(&report, "display_strokes_lost").unwrap();
+    assert_eq!(lost["status"], "pass");
+    assert_eq!(lost["actual"], false, "旗は真偽で返る");
+
+    // profile 無しで明示したら測っていない
+    let full = write_spec(
+        dir.path(),
+        &std::fs::read_to_string(&spec)
+            .unwrap()
+            .replace(r#""canvas":{"#, r#""canvas":{"width":1280,"height":670,"#),
+    );
+    let result = compose(
+        &full,
+        &out,
+        &["--dry-run", "--fail-on", "display_text_size<11"],
+    );
+    assert_eq!(
+        result.status.code(),
+        Some(5),
+        "測っていない指標が合格になった"
+    );
+    let report = json_stdout(&result);
+    assert_eq!(
+        check_of(&report, "display_text_size").unwrap()["status"],
+        "unmeasurable"
+    );
+}
+
+/// 測る相手（読めることを要求する文字）が居なければ `skipped`。
+#[test]
+fn display_metrics_without_text_are_skipped() {
+    let dir = TempDir::new().unwrap();
+    portrait(dir.path());
+    let spec = write_spec(
+        dir.path(),
+        r#"{"layers":[{"id":"a","type":"image","role":"subject",
+                       "source":"product.png","rect":[0,0,100,100]}]}"#,
+    );
+    let out = dir.path().join("out.png");
+    let result = compose(
+        &spec,
+        &out,
+        &[
+            "--profile",
+            "note",
+            "--dry-run",
+            "--fail-on",
+            "display_contrast<4.5",
+        ],
+    );
+    assert!(result.status.success());
+    let report = json_stdout(&result);
+    assert_eq!(
+        check_of(&report, "display_contrast").unwrap()["status"],
+        "skipped"
+    );
+}
+
+/// 書いたバイト数が 10MB を超えたら言う。**`--dry-run` でも言う**——dry-run は
+/// エンコードまで通してバイト数を返している。
+#[test]
+fn bytes_over_the_note_limit_are_named_even_in_a_dry_run() {
+    let dir = TempDir::new().unwrap();
+    // 圧縮の効かない雑音。2800x1466 の RGB で 12MB を超える（比は 1.910）
+    let (w, h) = (2800u32, 1466u32);
+    let mut state: u32 = 0x1234_5678;
+    let noise = image::RgbaImage::from_fn(w, h, |_, _| {
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state & 0xff) as u8
+        };
+        image::Rgba([next(), next(), next(), 255])
+    });
+    write_png(dir.path(), "noise.png", &noise);
+    let spec = write_spec(
+        dir.path(),
+        &format!(
+            r#"{{"canvas":{{"width":{w},"height":{h}}},
+                 "layers":[{{"id":"n","type":"image","role":"decoration",
+                            "source":"noise.png","rect":[0,0,{w},{h}]}}]}}"#
+        ),
+    );
+    let out = dir.path().join("out.png");
+    let result = compose(&spec, &out, &["--profile", "note", "--dry-run"]);
+    assert!(result.status.success());
+    let report = json_stdout(&result);
+    let bytes = report["output"]["bytes"].as_u64().unwrap();
+    assert!(bytes > 10_000_000, "前提が崩れた: {bytes}");
+    let warning = report["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "PROFILE_MAX_BYTES_EXCEEDED")
+        .unwrap_or_else(|| panic!("{}", report["warnings"]));
+    assert_eq!(warning["data"]["bytes"], bytes);
+    assert_eq!(warning["data"]["max_bytes"], 10_000_000);
+
+    // profile が無ければ上限そのものが無い
+    let plain = json_stdout(&compose(&spec, &out, &["--dry-run"]));
+    assert!(!codes(&plain).contains(&"PROFILE_MAX_BYTES_EXCEEDED".to_string()));
+}
+
+/// 新しい 3 つの警告も、data のキーを `kiri schema` の summary が名指しする
+/// （`the_published_warning_summaries_name_the_keys_that_are_emitted` と同じ契約）。
+#[test]
+fn the_profile_warnings_name_their_keys_in_the_schema() {
+    let schema = json_stdout(&kiri().args(["schema", "--json"]).output().unwrap());
+    let summary = |code: &str| -> String {
+        schema["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["code"] == code)
+            .unwrap_or_else(|| panic!("{code} が schema に無い"))["summary"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    for (code, keys) in [
+        (
+            "TEXT_ILLEGIBLE_AT_DISPLAY",
+            &[
+                "layer", "display", "width", "size_px", "contrast", "reasons",
+            ][..],
+        ),
+        ("PROFILE_ASPECT_MISMATCH", &["expected", "actual"][..]),
+        ("PROFILE_MAX_BYTES_EXCEEDED", &["bytes", "max_bytes"][..]),
+    ] {
+        let text = summary(code);
+        for key in keys {
+            assert!(
+                text.contains(key),
+                "{code} の説明が {key} を言わない: {text}"
+            );
+        }
+    }
+}
+
+/// `kiri schema` が compose の規格の表と `--profile` を配る（§12.4.7）。
+#[test]
+fn the_schema_publishes_the_compose_profiles() {
+    let check = |schema: &Value| {
+        let note = schema["compose_profiles"]
+            .as_array()
+            .expect("compose_profiles が無い")
+            .iter()
+            .find(|p| p["name"] == "note")
+            .expect("note が無い");
+        assert_eq!(note["canvas"], serde_json::json!([1280, 670]));
+        assert_eq!(
+            note["safe_area"],
+            serde_json::json!([0.0, 108.0, 1280.0, 454.0])
+        );
+        assert_eq!(note["max_bytes"], 10_000_000);
+        assert_eq!(
+            note["displays"],
+            serde_json::json!([{"name":"pc_list","width":192},{"name":"mobile_list","width":144}])
+        );
+        for key in ["revision", "summary", "source"] {
+            assert!(note[key].is_string(), "{key}");
+        }
+        // cutout / lint の表には混ざらない
+        assert!(
+            schema["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| p["name"] != "note")
+        );
+    };
+    let whole = json_stdout(&kiri().args(["schema", "--json"]).output().unwrap());
+    check(&whole);
+    check(&json_stdout(
+        &kiri()
+            .args(["schema", "--summary", "--json"])
+            .output()
+            .unwrap(),
+    ));
+    check(&json_stdout(
+        &kiri()
+            .args(["schema", "compose", "--brief", "--json"])
+            .output()
+            .unwrap(),
+    ));
+
+    let compose = whole["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "compose")
+        .unwrap();
+    let option = |name: &str| {
+        compose["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["name"] == name)
+            .unwrap_or_else(|| panic!("{name} が compose に無い"))
+            .clone()
+    };
+    assert_eq!(option("--profile")["accepts"], serde_json::json!(["note"]));
+    let fail_on = option("--fail-on")["accepts"].clone();
+    for metric in [
+        "display_text_size",
+        "display_contrast",
+        "display_strokes_lost",
+    ] {
+        assert!(
+            fail_on
+                .as_array()
+                .is_some_and(|a| a.iter().any(|m| m == metric))
+                || option("--fail-on").to_string().contains(metric),
+            "{metric} が --fail-on に配られていない: {fail_on}"
+        );
+    }
+    for code in [
+        "TEXT_ILLEGIBLE_AT_DISPLAY",
+        "PROFILE_ASPECT_MISMATCH",
+        "PROFILE_MAX_BYTES_EXCEEDED",
+    ] {
+        assert!(
+            whole["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w["code"] == code),
+            "{code}"
+        );
     }
 }

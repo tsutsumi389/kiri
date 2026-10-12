@@ -2186,3 +2186,29 @@ fn two_product_scene(width: u32, height: u32) -> RgbaImage {
     }
     img
 }
+
+/// `chars` を**実際に描ける**システムの字体を 1 つ借りる。無ければ `None`。
+///
+/// 字体はリポジトリに置いていない（`tests/compose.rs` の doc）。返すのは
+/// 「この機械に在る family」で、どれが在るかは機械ごとに違うので、借りた側は
+/// 字体の綴りに依存する数を表明しない。
+///
+/// **グリフの有無まで見る。** 1 面目をそのまま採ると記号だけの字体を掴むことが
+/// あり、そのとき文字は豆腐にも成らずに消える。
+pub fn any_font(chars: &[char]) -> Option<String> {
+    let mut db = resvg::usvg::fontdb::Database::new();
+    db.load_system_fonts();
+    let ids: Vec<_> = db
+        .faces()
+        .map(|f| (f.id, f.families.first().map(|(n, _)| n.clone())))
+        .collect();
+    ids.into_iter().find_map(|(id, family)| {
+        let family = family?;
+        let draws = db.with_face_data(id, |data, index| {
+            ttf_parser::Face::parse(data, index)
+                .map(|f| chars.iter().all(|&c| f.glyph_index(c).is_some()))
+                .unwrap_or(false)
+        })?;
+        draws.then_some(family)
+    })
+}

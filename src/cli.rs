@@ -189,6 +189,70 @@ pub struct ComposeArgs {
     /// 同じ表に混ぜると cutout --fail-on text_overflow が書式として通り、文字が 1 つも無いので永久に発火しない門になる
     #[arg(long, value_parser = parse_compose_fail_on, long_help = compose_fail_on_long_help())]
     pub fail_on: Option<crate::compose::gate::FailOn>,
+
+    /// 見出し画像の規格を当て、縮小表示での読みやすさを測る (例 note)
+    ///
+    /// ヘルプの本文は `compose_profile_long_help` が表から組む
+    #[arg(
+        long,
+        value_parser = compose_profile_parser(),
+        long_help = compose_profile_long_help()
+    )]
+    pub profile: Option<&'static crate::compose::profile::ComposeProfile>,
+}
+
+/// `kiri compose --profile` の値を読む。**cutout / lint の `--profile` とは別の表**
+/// （`compose::profile` の doc）を引くので、`--profile amazon` はここで断られる。
+///
+/// 候補を clap に持たせる理由は `profile_parser` と同じで、`kiri schema` の
+/// `accepts` に綴りを載せるためである。
+fn compose_profile_parser()
+-> impl clap::builder::TypedValueParser<Value = &'static crate::compose::profile::ComposeProfile> {
+    use clap::builder::TypedValueParser;
+    clap::builder::PossibleValuesParser::new(crate::compose::profile::NAMES)
+        .map(|name| crate::compose::profile::named(&name).expect("候補は named が引ける綴りだけ"))
+}
+
+/// `kiri compose --profile` の長いヘルプ。寸法も表示幅も表から組む。
+fn compose_profile_long_help() -> String {
+    let mut lines = vec![
+        "見出し画像の規格を当て、縮小表示での読みやすさを測る。".to_string(),
+        String::new(),
+        "spec に書いた値は profile より強い（明示 > profile）。canvas の width / height \
+         と safe_area を spec で省くと profile の値を使い、canvas を書いた場合は比が 0.5% \
+         以上外れると PROFILE_ASPECT_MISMATCH が出る。書いたバイト数が上限を超えると \
+         PROFILE_MAX_BYTES_EXCEEDED が出る。"
+            .to_string(),
+        String::new(),
+        "**原寸の測りに加えて、** 全層を重ねた絵を profile の表示幅へ面積平均で縮め、\
+         文字の層ごとに表示上の大きさ（11px 未満で too_small）・線の残り（strokes_lost）・\
+         コントラスト（4.5 未満で low_contrast）を layers[].display[] に返す。\
+         読めなければ TEXT_ILLEGIBLE_AT_DISPLAY が出る。"
+            .to_string(),
+        String::new(),
+        "規格:".to_string(),
+    ];
+    for p in crate::compose::profile::ALL {
+        let displays: Vec<String> = p
+            .displays
+            .iter()
+            .map(|d| format!("{} {}px", d.name, d.width))
+            .collect();
+        lines.push(format!(
+            "  {} ({}) — {}x{}、表示 {}",
+            p.name,
+            p.revision,
+            p.canvas.0,
+            p.canvas.1,
+            displays.join(" / ")
+        ));
+    }
+    lines.push(String::new());
+    lines.push(
+        "表そのもの（出典の URL・安全領域・上限）は kiri schema の compose_profiles[] が配る。"
+            .to_string(),
+    );
+    lines.join("\n")
 }
 
 fn parse_compose_fail_on(spec: &str) -> std::result::Result<crate::compose::gate::FailOn, String> {
@@ -212,7 +276,14 @@ fn compose_fail_on_long_help() -> String {
     ];
     for metric in Metric::ALL {
         match metric.flag_meaning() {
-            Some(meaning) => lines.push(format!("  {} — {meaning}", metric.as_str())),
+            // 行末を `(...)` で閉じる。**日本語で終わる行の次に字下げした行が
+            // 来ると、schema が配る文面では日本語の直後に空白が並ぶ**
+            // （`the_published_prose_has_no_stray_spaces`）。真偽の指標が
+            // 最後の行でなくなった（`display_*` を後ろに足した）ので要る
+            Some(meaning) => lines.push(format!(
+                "  {} — {meaning} (しきい値を取らない)",
+                metric.as_str()
+            )),
             None => lines.push(format!(
                 "  {} — 演算子としきい値が要る (例 {}>0)",
                 metric.as_str(),

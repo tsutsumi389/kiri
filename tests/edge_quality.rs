@@ -704,6 +704,41 @@ fn fastest(image: &RgbaImage, refine: bool) -> f64 {
     best
 }
 
+/// 帯幅を `small` と `large` に固定して refine を回し、それぞれの最短時間(ms)を返す。
+///
+/// 2 つを**交互に**回すのは、他のテストやプロセスに邪魔された時間帯が片方にだけ
+/// 偏らないようにするため。最短を採るのは、邪魔された回を混ぜないため。
+fn fastest_at_two_widths(image: &RgbaImage, small: u32, large: u32) -> (f64, f64) {
+    // 二値マスクと背景は refine の入力として 1 度だけ作る。測るのは refine だけ
+    let base = cutout(
+        image,
+        &CutoutOptions {
+            refine: false,
+            ..Default::default()
+        },
+    );
+    let binary = base.mask.binarized();
+    let field = kiri::cutout::BackgroundField::flat(base.background.rgb);
+    let run = |radius: u32| {
+        // 上限と下限を揃えると、帯の全画素がこの帯幅（＝この窓）になる
+        let opts = kiri::cutout::RefineOptions {
+            min_radius: radius,
+            max_radius: radius,
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let refined = kiri::cutout::refine::refine(image, &binary, &field, &opts);
+        std::hint::black_box(refined.band_min_radius);
+        started.elapsed().as_secs_f64() * 1000.0
+    };
+    let (mut best_small, mut best_large) = (f64::MAX, f64::MAX);
+    for _ in 0..5 {
+        best_small = best_small.min(run(small));
+        best_large = best_large.min(run(large));
+    }
+    (best_small, best_large)
+}
+
 /// 境界帯の推定が窓の面積ぶんだけ膨らんでいないこと。
 ///
 /// 帯画素ごとに窓を全走査していた頃は、構造が帯より細い素材で計算量が
@@ -711,22 +746,28 @@ fn fastest(image: &RgbaImage, refine: bool) -> f64 {
 /// +9.4 秒に達していたが、これは「帯は周長ぶんしか立たない」という前提が
 /// 崩れた形でしか現れず、滑らかなシルエットの計測では一切見えない。
 ///
-/// 絶対時間は機械によって何倍も違うので、同じ画像を refine 抜きで回した時間との
-/// 比で見る。実測はこの実装で release 0.5 / debug 0.9、崩れていた頃は同じ形の
-/// 320x320 で release 5.9 / debug 14.9 だった。3.0 はその間に置いた緩い上限である。
+/// **refine を refine 自身と比べる。** 以前は同じ画像を refine 抜きで回した時間
+/// との比を見ていたが、この比は崩れていなくても 1 を超え、しかも機械で動く——
+/// 手元の release で 1.2、`ci-test` プロファイルで 1.9、並列度を変えても動き、
+/// GitHub Actions の混んだランナーでは 3.15 まで出て上限 3.0 を割った。refine と
+/// refine 抜きでは中身が違うので、最適化の効き方も並列化の効き方も揃わない。
+/// 崩れた実装を再現して測ると、手元の多コアでは逆に 2.5 しか出ず、見逃していた。
 ///
-/// 画像を 640x640 にしてあるのは、320x320 だと release の計測対象が 10ms しか
-/// 残らず、暖機を含む最短 2 回の比が 0.5 と 0.8 の間で振れたためである。
-/// 1 回あたりの時間を稼いだほうが、試行回数を増やすより安い。
+/// そこで帯幅だけを 2 と 30（窓 7 と 63）に変え、同じ refine の時間の比を見る。
+/// 中身が同じなので、プロファイル・コア数・CPU の違いは分子と分母で打ち消し合う。
+/// 正しい実装では帯の面積とタイルの余白が広がるぶんしか伸びず、実測は
+/// release・`ci-test`、1 スレッド・全スレッドのどれでも 2.9〜3.7 に収まる
+/// （並列度が低いほど高い）。窓を全走査する実装では窓²（81 倍）が掛かり、
+/// 確定背景の平均だけを全走査に戻した再現でも 19（全スレッド）〜39（1 スレッド）
+/// になった。8.0 はその間の、どちらからも 2 倍以上離れた上限である。
 #[test]
 fn refine_does_not_scale_with_the_area_of_the_window() {
     let image = comb_image(640, 640, 12);
-    let with = fastest(&image, true);
-    let without = fastest(&image, false);
-    let ratio = (with - without) / without;
+    let (narrow, wide) = fastest_at_two_widths(&image, 2, 30);
+    let ratio = wide / narrow;
     assert!(
-        ratio < 3.0,
-        "refine の追加コストが膨らんでいる: {with:.1} ms vs {without:.1} ms (比 {ratio:.2})"
+        ratio < 8.0,
+        "帯幅を 2 → 30 にしたら refine が窓の面積ぶん膨らんだ: {narrow:.1} ms → {wide:.1} ms (比 {ratio:.2})"
     );
 }
 

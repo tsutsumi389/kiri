@@ -1,11 +1,12 @@
 ---
 name: kiri
-description: EC 商品画像を kiri CLI で加工する。背景透過の切り抜き、白背景化、モール規格（Amazon / Shopify など）に合わせたキャンバス配置、落ち影・反射の合成、AVIF / JPEG / PNG / WebP（lossless）への変換、リサイズ、回転、既存画像の規格検査、複数枚の一括処理。「商品写真の背景を抜いて」「白背景にして」「Amazon 用の画像を作って」「この画像は規格を満たす？」のような依頼で使う。
+description: EC 商品画像を kiri CLI で加工する。背景透過の切り抜き、白背景化、モール規格（Amazon / Shopify など）に合わせたキャンバス配置、落ち影・反射の合成、AVIF / JPEG / PNG / WebP（lossless）への変換、リサイズ、回転、既存画像の規格検査、複数枚の一括処理、切り抜いた素材と文字を 1 枚へ組む合成（note の見出し画像・サムネイル・EC の説明画像）。「商品写真の背景を抜いて」「白背景にして」「Amazon 用の画像を作って」「この画像は規格を満たす？」「note の見出し画像を作って」「サムネイルに文字を入れて」のような依頼で使う。
 ---
 
 # kiri で商品画像を作る
 
 kiri は単色背景の商品写真を切り抜いて、Web 配信用に仕上げる CLI である。
+切り抜いた素材と文字を 1 枚へ組む（`kiri compose`）こともできる。
 **エージェントから呼ばれることを前提に作ってあり**、`--json` を付ければ stdout は JSON だけ、
 exit code にも意味がある。README を読む必要はない。
 
@@ -136,6 +137,63 @@ kiri lint existing.jpg --profile amazon --json      # 既にある画像を検�
 1 枚ずつ回すより `kiri batch` がよい。セットの中で、商品の大きさと余白を揃えられる。
 spec の書き方は `kiri schema batch --brief --json` が返す。
 batch は `--preview` を受けないので、うまくいかない素材は 1 枚だけ `cutout` で直してから spec に戻す。
+
+## 素材と文字を 1 枚へ組む（見出し画像・サムネイル）
+
+`kiri compose` は spec（JSON）に書いた通りに素材と文字を置き、**測って返す**。
+組版器ではない。収まらない文字を縮めも折り返しもしない。
+
+```bash
+kiri schema compose --brief --json    # compose_spec[] が spec の形、warnings[].remedy が直し方（約 45KB）
+kiri compose layout.json -o thumb.png --dry-run --json      # 画素を書かずに幾何と測りだけ
+kiri compose layout.json -o thumb.png --fail-on default --json
+```
+
+- **spec の形は推測しない。** `compose_spec[]` を引いて書く。素材とフォントのパスは
+  **spec からの相対**で解かれるので、spec は素材の近くに置く
+- 商品の素材は先に `kiri cutout` で透過 PNG にしておき、`role: "subject"` の画像層で置く
+- **字体はファイルで指す**（`font.path`）。見つからなければ `FONT_NOT_FOUND` で 1 枚も書かない。
+  代わりの字体へ黙って落ちることはない。`FONT_GLYPHS_MISSING` が出たら、
+  `data.missing` の文字を持つ字体に替える
+- **`lines` は行の配列である。** 長い見出しはどこで割るかを自分で決めて行に分ける。
+  行ごとの実測幅は `layers[]` に返る
+- `rect` は枠で、画像は内接して縮む。実際に置かれた矩形は `layers[].placed` を見る
+- 後の層ほど上に描かれる。文字は `layers` の末尾側に置く
+- 警告はどれも `remedy` が直し方を言う。よく出るのは次のとおり
+
+| 警告 | 直し方 |
+|---|---|
+| `TEXT_OVERFLOW` | `rect` を広げる、`size` を下げる、`lines` を短くする |
+| `TEXT_CONTRAST_LOW` | 文字の `color` か、その文字が載っている下地を変える（背後の実測で、しきい値は WCAG の 4.5） |
+| `LAYERS_OVERLAP` | 文字の `rect` を商品の外へ寄せる |
+| `TEXT_OBSCURED` | 文字の層を、覆っている層より後ろ（配列の末尾側）へ移す |
+| `OUTSIDE_SAFE_AREA` | 層を `safe_area` の内側へ入れる |
+
+**書き出した絵を Read で開いて目で確かめる。** 見出し画像は小さいので、出力そのものを見ればよい
+（compose に `--preview` は無い）。利用者にも見せる。
+
+### note の見出し画像
+
+```bash
+kiri compose header.json -o header.png --profile note --fail-on default --json
+```
+
+- `--profile note` を付けると、`canvas` の寸法と `safe_area` を省ける（1280 x 670、
+  上下中央の `[0, 108, 1280, 454]`）。書けば書いた値が勝つ。比が 1280:670 から外れると
+  `PROFILE_ASPECT_MISMATCH`（表示側で切り取られる）
+- **一覧での縮小表示（PC 192px / スマホ 144px）でも読めるかを測る。** 結果は
+  `layers[].display[]` に出て、読めなければ `TEXT_ILLEGIBLE_AT_DISPLAY` が理由を言う
+
+| 理由 | 直し方 |
+|---|---|
+| `too_small` | `size` を `11 × canvas の幅 / 表示幅` 以上にする（1280 幅ならスマホで 98） |
+| `strokes_lost` | `weight` を上げる |
+| `low_contrast` | 文字色か下地を変える。原寸の `text_contrast` が通っていても、縮めると落ちることがある |
+
+- 原寸で読めても一覧では読めないことが多い。**見出しは大きく、短く、太く**が出発点になる
+- `role: "decoration"` の文字は縮小表示の測りから外れる。読めなくてよい飾りにだけ使う
+- compose の `--profile` は cutout / lint の `--profile` とは別の表である。
+  `kiri compose --profile amazon` は断られる。compose で使える規格は `kiri schema --summary --json` の `compose_profiles[]` にある
 
 ## 切り抜けないもの
 

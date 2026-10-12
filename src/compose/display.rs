@@ -461,6 +461,36 @@ mod tests {
         }
     }
 
+    /// **どの入力画素も同じ重みで数える**（§12.9 の R4）。
+    ///
+    /// 出力の各画素で重みの合計が 1 になるだけでは足りない——入力の側で、
+    /// ある画素の重みの合計が他より大きければ、その画素だけが平均を引く。
+    /// 面積平均なら、どの入力画素の重みの合計も `dst / src` に揃う。
+    #[test]
+    fn every_input_pixel_weighs_the_same() {
+        for (src, dst) in [
+            (1280usize, 144usize),
+            (1280, 192),
+            (670, 75),
+            (670, 101),
+            (7, 3),
+        ] {
+            let mut sum = vec![0.0; src];
+            for taps in taps(src, dst) {
+                for (s, w) in taps {
+                    sum[s] += w;
+                }
+            }
+            let expected = dst as f64 / src as f64;
+            for (s, total) in sum.iter().enumerate() {
+                assert!(
+                    (total - expected).abs() < 1e-9,
+                    "{src}→{dst}: 入力 {s} の重み {total}（期待 {expected}）"
+                );
+            }
+        }
+    }
+
     /// 表示幅がキャンバスの幅以上なら測らない（§12.9 の R3）。拡大になるうえ、
     /// 高さが際限なく伸びる。
     #[test]

@@ -2187,6 +2187,10 @@ fn two_product_scene(width: u32, height: u32) -> RgbaImage {
     img
 }
 
+/// 立てると、字体が無いときに字体を要する検査を飛ばさずに落とす環境変数
+/// （`any_font`）。文書が名指しする綴りなので定数で置く。
+pub const KIRI_REQUIRE_FONT: &str = "KIRI_REQUIRE_FONT";
+
 /// `chars` を**実際に描ける**システムの字体を 1 つ借りる。無ければ `None`。
 ///
 /// 字体はリポジトリに置いていない（`tests/compose.rs` の doc）。返すのは
@@ -2195,7 +2199,29 @@ fn two_product_scene(width: u32, height: u32) -> RgbaImage {
 ///
 /// **グリフの有無まで見る。** 1 面目をそのまま採ると記号だけの字体を掴むことが
 /// あり、そのとき文字は豆腐にも成らずに消える。
+///
+/// # 飛ばしたことを黙らない
+///
+/// 字体が無ければ、字体を要する検査は飛ぶ。**飛んだことが stderr に出ないと、
+/// 字体の無い CI で検査が 1 本も走っていないのに緑が並ぶ。** `KIRI_REQUIRE_FONT=1`
+/// なら飛ばさずに落とす——CI は字体を入れたうえでこれを立てる
+/// （`.github/workflows/ci.yml`）。
 pub fn any_font(chars: &[char]) -> Option<String> {
+    let found = find_font(chars);
+    if found.is_none() {
+        let required = std::env::var(KIRI_REQUIRE_FONT).is_ok_and(|v| v == "1");
+        assert!(
+            !required,
+            "KIRI_REQUIRE_FONT=1 だが {chars:?} を描ける字体がシステムに無い"
+        );
+        eprintln!(
+            "字体が無いので、{chars:?} を要する検査を飛ばす（KIRI_REQUIRE_FONT=1 で落とせる）"
+        );
+    }
+    found
+}
+
+fn find_font(chars: &[char]) -> Option<String> {
     let mut db = resvg::usvg::fontdb::Database::new();
     db.load_system_fonts();
     let ids: Vec<_> = db

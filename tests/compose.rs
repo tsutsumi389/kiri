@@ -1503,6 +1503,13 @@ fn a_line_that_passes_at_full_size_fails_when_shrunk() {
     assert!((4.5..4.6).contains(&full), "原寸 {full}");
     assert!(!codes(&report).contains(&"TEXT_CONTRAST_LOW".to_string()));
 
+    // **字体に依らない余白を取って表明する。** 縮小で前景が地の色と混ざる
+    // 量は線の太さで決まり、太い字体ほど 4.5 に近づく。手元の 4 字体
+    // （Arial Unicode MS / Hiragino Sans / Helvetica / Arial）は 3.0〜4.0 で、
+    // 4.5 を超えるには表示上で線がほぼ 2px 以上ぶ厚く残る必要がある（100px の
+    // 文字で幹が 20px 前後）。DejaVu Sans（CI の字体）の幹は 100px でおよそ
+    // 13px なので、同じ向きに落ちる。表明は「どれか 1 つの表示が、原寸より
+    // 0.5 以上低く 4.5 を下回るか、線を失った」
     let mut caught = false;
     for d in heading["display"].as_array().unwrap() {
         assert!(
@@ -1510,7 +1517,12 @@ fn a_line_that_passes_at_full_size_fails_when_shrunk() {
             "大きさで落ちては証拠にならない: {d}"
         );
         let r = reasons(d);
-        if r.contains(&"low_contrast".to_string()) || r.contains(&"strokes_lost".to_string()) {
+        let lower = d["contrast"]
+            .as_f64()
+            .is_some_and(|c| c < 4.5 && c <= full - 0.5);
+        if (lower && r.contains(&"low_contrast".to_string()))
+            || r.contains(&"strokes_lost".to_string())
+        {
             caught = true;
         }
     }
@@ -1909,3 +1921,178 @@ fn a_canvas_narrower_than_the_display_is_not_measured() {
         assert_eq!(names, expected, "{w}x{h}");
     }
 }
+
+/// 透過の下地は**白**として縮め、透過を保てない出力では潰す色として縮める
+/// （§12.6 の 2）。
+///
+/// 白い文字は、白の上では読めず（`low_contrast`）、黒へ潰されれば読める。
+#[test]
+fn a_transparent_backdrop_is_shrunk_over_white_or_the_flatten_colour() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let spec = write_spec(
+        dir.path(),
+        &format!(
+            r##"{{"font":{{"family":"{family}"}},
+                 "layers":[{{"id":"t","type":"text","role":"heading",
+                            "lines":["ABAB"],"rect":[80,200,1100,240],
+                            "size":110,"color":"#ffffff"}}]}}"##
+        ),
+    );
+    let run = |name: &str, extra: &[&str]| {
+        let out = dir.path().join(name);
+        let mut args = vec!["--profile", "note", "--dry-run"];
+        args.extend_from_slice(extra);
+        let report = json_stdout(&compose(&spec, &out, &args));
+        layer(&report, "t")["display"].clone()
+    };
+
+    for d in run("clear.png", &[]).as_array().unwrap() {
+        assert!(reasons(d).contains(&"low_contrast".to_string()), "{d}");
+    }
+    for (name, extra) in [
+        ("dark.jpg", &["--background", "#000000"][..]),
+        ("dark.png", &["--flatten", "--background", "#000000"][..]),
+    ] {
+        for d in run(name, extra).as_array().unwrap() {
+            assert_eq!(d["legible"], true, "{name}: {d}");
+        }
+    }
+}
+
+/// `decoration` の文字は読めることを要求しないので、縮小表示でも測らない。
+#[test]
+fn a_decoration_has_no_display() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let spec = write_spec(
+        dir.path(),
+        &format!(
+            r##"{{"canvas":{{"background":"#ffffff"}},
+                 "font":{{"family":"{family}"}},
+                 "layers":[{{"id":"d","type":"text","role":"decoration",
+                            "lines":["AB"],"rect":[80,200,600,240],
+                            "size":20,"color":"#eeeeee"}}]}}"##
+        ),
+    );
+    let out = dir.path().join("out.png");
+    let report = json_stdout(&compose(&spec, &out, &["--profile", "note", "--dry-run"]));
+    assert!(layer(&report, "d").get("display").is_none(), "{report}");
+    assert!(!codes(&report).contains(&"TEXT_ILLEGIBLE_AT_DISPLAY".to_string()));
+}
+
+/// **`--profile` を渡さない出力を main の build に釘で留める**（§12.5 の 1）。
+///
+/// 字体の要らない spec（画像 1 枚、枠と素材が同じ寸法なので縮小も走らない）を
+/// 組み、書いたバイト列の SHA-256 と結果 JSON のキーの集合を、Phase 31 の前の
+/// build（6c380ec）で取った値と比べる。**手で並べて確かめた一致を、次の変更で
+/// 黙って失わないため**である。
+#[test]
+fn without_a_profile_the_output_matches_the_build_before_phase_31() {
+    let dir = TempDir::new().unwrap();
+    // **素材は整数の算術だけで作る。** `common::product_image` は `hypot` を使い、
+    // libm の実装（macOS と glibc）で末位がずれうる——素材が 1 ビット違えば
+    // 釘の値が機械ごとに変わる。縁に半透明を持たせ、合成の算術も通す
+    let material = image::RgbaImage::from_fn(200, 400, |x, y| {
+        let inside = (30..170).contains(&x) && (40..360).contains(&y);
+        let edge = (20..180).contains(&x) && (30..370).contains(&y);
+        let alpha = if inside {
+            255
+        } else if edge {
+            128
+        } else {
+            0
+        };
+        image::Rgba([
+            (x % 256) as u8,
+            ((x * 3 + y) % 256) as u8,
+            (y % 256) as u8,
+            alpha,
+        ])
+    });
+    write_png(dir.path(), "product.png", &material);
+    let spec = write_spec(
+        dir.path(),
+        r##"{"canvas":{"width":400,"height":400,"background":"#f5f2ec"},
+             "safe_area":[0,0,400,400],
+             "layers":[{"id":"subject","type":"image","role":"subject",
+                        "source":"product.png","rect":[100,0,200,400]}]}"##,
+    );
+    let out = dir.path().join("out.png");
+    let result = compose(&spec, &out, &["--fail-on", "default"]);
+    assert!(result.status.success());
+    let report = json_stdout(&result);
+
+    let mut hasher = kiri::segment::sha256::Sha256::new();
+    hasher.update(&std::fs::read(&out).unwrap());
+    assert_eq!(
+        hasher.finish(),
+        PRE_PHASE_31_SHA256,
+        "書いたバイト列が変わった"
+    );
+    assert_eq!(report["output"]["bytes"], PRE_PHASE_31_BYTES);
+
+    let keys = |v: &Value| -> Vec<String> {
+        let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        k.sort();
+        k
+    };
+    assert_eq!(
+        keys(&report),
+        [
+            "canvas",
+            "compliance",
+            "dry_run",
+            "elapsed_ms",
+            "font",
+            "layers",
+            "output",
+            "schema_version",
+            "spec",
+            "warnings"
+        ]
+    );
+    assert_eq!(
+        keys(&report["layers"][0]),
+        [
+            "align",
+            "id",
+            "kind",
+            "layer_overlap",
+            "line_widths",
+            "outside_safe_area",
+            "placed",
+            "rect",
+            "role",
+            "text_contrast",
+            "text_obscured",
+            "text_overflow"
+        ]
+    );
+    let metrics: Vec<&str> = report["compliance"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["metric"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        metrics,
+        [
+            "text_overflow",
+            "text_contrast",
+            "text_obscured",
+            "layer_overlap",
+            "outside_safe_area"
+        ]
+    );
+}
+
+/// 6c380ec の build で `without_a_profile_the_output_matches_the_build_before_phase_31`
+/// の spec を組んだときの値。
+const PRE_PHASE_31_SHA256: &str =
+    "e71520e62be951f84aff8decc1ed4d704d2946d9273b2f8f1549546bd178268e";
+const PRE_PHASE_31_BYTES: u64 = 63235;

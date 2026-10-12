@@ -209,7 +209,7 @@ warning_catalog! {
         remedy: Some("canvas の width / height を消して profile の大きさにする（または同じ比の大きさにする）"),
     ProfileMaxBytesExceeded = "PROFILE_MAX_BYTES_EXCEEDED"
         => "compose が書いたバイト数（data.bytes）が --profile の上限（data.max_bytes）を超えた",
-        remedy: Some("出力先の拡張子を .jpg か .avif にするか、--quality を下げる"),
+        remedy: Some("PNG / WebP（どちらも可逆）なら出力先の拡張子を .jpg か .avif にする。JPEG / AVIF なら --quality を下げ、それでも収まらなければ canvas を小さくする"),
 }
 
 impl Serialize for WarningCode {

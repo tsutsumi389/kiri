@@ -125,7 +125,7 @@ pub fn run(args: &ComposeArgs) -> Result<ComposeReport> {
                         output.bytes
                     ),
                 )
-                .with_hint("出力先の拡張子を .jpg か .avif にするか、--quality を下げてください")
+                .with_hint(max_bytes_hint(format))
                 .with_data("bytes", output.bytes)
                 .with_data("max_bytes", max),
             );
@@ -153,6 +153,22 @@ pub fn run(args: &ComposeArgs) -> Result<ComposeReport> {
         elapsed_ms: started.elapsed().as_millis(),
         warnings,
     })
+}
+
+/// `PROFILE_MAX_BYTES_EXCEEDED` の hint。**いまの形式で効く手だけを言う。**
+///
+/// JPEG / AVIF に「JPEG か AVIF で書け」と言っても次の手にならない。PNG と kiri の
+/// WebP は可逆で `--quality` が効かないので、そちらには形式を変える手だけを言う
+/// （12-phase-31.md §12.9 の R5）。
+fn max_bytes_hint(format: save::OutputFormat) -> &'static str {
+    match format {
+        save::OutputFormat::Jpeg | save::OutputFormat::Avif => {
+            "--quality を下げてください。それでも収まらなければ canvas を小さくしてください"
+        }
+        save::OutputFormat::Png | save::OutputFormat::WebP => {
+            "出力先の拡張子を .jpg か .avif にしてください（PNG と WebP は可逆なので、品質を下げても小さくなりません）"
+        }
+    }
 }
 
 /// キャンバスの比が profile の比から外れていたら言う。
@@ -198,18 +214,20 @@ fn measure_displays(
         layers[entry.index].display = Some(Vec::with_capacity(profile.displays.len()));
     }
     for (d, target) in profile.displays.iter().enumerate() {
+        // 表示幅がキャンバスより広い表示は測らず、`display[]` に行ごと出さない
+        // （`display::measurable`）
+        if !display::measurable(w, target) {
+            continue;
+        }
         let height = display::display_height(w, h, target.width);
         let shrunk = display::shrink_canvas(canvas, base, target.width, height);
         for entry in glyphs {
+            let Some(coverage) = entry.coverage[d].as_deref() else {
+                continue;
+            };
             let layer = &mut layers[entry.index];
-            let report = display::measure(
-                &shrunk,
-                &entry.coverage[d],
-                layer.placed,
-                entry.size,
-                (w, h),
-                target,
-            );
+            let report =
+                display::measure(&shrunk, coverage, layer.placed, entry.size, (w, h), target);
             if let Some(list) = layer.display.as_mut() {
                 list.push(report);
             }
@@ -231,8 +249,9 @@ struct Glyphs {
     index: usize,
     /// spec の `size`。表示上の大きさはここから計算で出す
     size: f64,
-    /// この文字の被覆を表示ごとに縮めたもの。並びは `displays` の並び
-    coverage: Vec<Vec<f64>>,
+    /// この文字の被覆を表示ごとに縮めて区分へ畳んだもの。並びは `displays` の
+    /// 並びで、測らない表示（`display::measurable`）は `None`
+    coverage: Vec<Option<Vec<u8>>>,
 }
 
 /// 文字の層について、後から覆われた割合を数えるために取っておくもの。
@@ -316,15 +335,25 @@ fn build(
                     &mut painter,
                     warnings,
                 )?;
+                // **原寸で 1 画素も描かれなかった層は測らない。** 縮めた前景が
+                // 0 画素になるのは当然で、それを `strokes_lost` と呼ぶと
+                // `TEXT_NOT_RENDERED` と並んで「weight を上げる」と嘘の手を
+                // 勧める（12-phase-31.md §12.9 の R1）。`text_contrast` が null に
+                // なるのと同じく、`display` を持たない
+                let drawn_at_full_size = !pixels.is_empty();
                 covered.push(Covered { index, pixels });
                 // **読めることを要求しない層は測らない**（`text_contrast` と同じ線引き）
-                if let Some(profile) = profile.filter(|_| text.role.wants_contrast()) {
+                if let Some(profile) =
+                    profile.filter(|_| text.role.wants_contrast() && drawn_at_full_size)
+                {
                     let coverage = profile
                         .displays
                         .iter()
                         .map(|d| {
-                            let height = display::display_height(w, h, d.width);
-                            display::shrink_coverage(&drawn, d.width, height)
+                            display::measurable(w, d).then(|| {
+                                let height = display::display_height(w, h, d.width);
+                                display::shrink_coverage(&drawn, d.width, height)
+                            })
                         })
                         .collect();
                     glyphs.push(Glyphs {
@@ -605,4 +634,27 @@ fn write(
         height: canvas.height(),
         bytes: bytes.len() as u64,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 容量の hint は**いまの形式で効く手**を言う（§12.9 の R5）。JPEG / AVIF に
+    /// 「JPEG / AVIF で書け」と言っても次の手にならない。PNG と kiri の WebP は
+    /// 可逆なので、`--quality` は効かない。
+    #[test]
+    fn the_max_bytes_hint_depends_on_the_format() {
+        use save::OutputFormat;
+        for lossy in [OutputFormat::Jpeg, OutputFormat::Avif] {
+            let hint = max_bytes_hint(lossy);
+            assert!(hint.contains("--quality"), "{hint}");
+            assert!(!hint.contains(".jpg"), "{hint}");
+        }
+        for lossless in [OutputFormat::Png, OutputFormat::WebP] {
+            let hint = max_bytes_hint(lossless);
+            assert!(hint.contains(".jpg") && hint.contains(".avif"), "{hint}");
+            assert!(!hint.contains("--quality"), "{hint}");
+        }
+    }
 }

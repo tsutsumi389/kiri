@@ -1808,3 +1808,104 @@ fn the_schema_publishes_the_compose_profiles() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 31 のレビューで出た欠陥（12-phase-31.md §12.9）
+// ---------------------------------------------------------------------------
+
+/// **原寸で 1 画素も描かれなかった文字は、縮小表示で測らない**（§12.9 の R1）。
+///
+/// 測ると前景が 0 画素なので `strokes_lost` が立ち、`TEXT_NOT_RENDERED` と並んで
+/// 「weight を上げる」と勧める——**原因について嘘をつく。** `text_contrast` が
+/// null になるのと同じく `display` を持たず、門も `text_contrast` と同じく
+/// 「測れた層が無い」として `unmeasurable` にする。
+#[test]
+fn text_drawn_off_canvas_is_not_measured_at_display_size() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let spec = write_spec(
+        dir.path(),
+        &format!(
+            r##"{{"canvas":{{"background":"#ffffff"}},
+                 "font":{{"family":"{family}"}},
+                 "layers":[{{"id":"gone","type":"text","role":"heading",
+                            "lines":["ABAB"],"rect":[2000,200,600,240],
+                            "size":110,"color":"#000000"}}]}}"##
+        ),
+    );
+    let out = dir.path().join("out.png");
+    let result = compose(
+        &spec,
+        &out,
+        &[
+            "--profile",
+            "note",
+            "--dry-run",
+            "--fail-on",
+            "display_strokes_lost",
+        ],
+    );
+    let report = json_stdout(&result);
+    let found = codes(&report);
+    assert!(
+        found.contains(&"TEXT_NOT_RENDERED".to_string()),
+        "{found:?}"
+    );
+    assert!(
+        !found.contains(&"TEXT_ILLEGIBLE_AT_DISPLAY".to_string()),
+        "描かれていない文字の線が潰れたと言った: {}",
+        report["warnings"]
+    );
+    let gone = layer(&report, "gone");
+    assert_eq!(gone["text_contrast"], Value::Null);
+    assert!(gone.get("display").is_none(), "{gone}");
+
+    assert_eq!(
+        result.status.code(),
+        Some(5),
+        "測れていないものが合格になった"
+    );
+    assert_eq!(
+        check_of(&report, "display_strokes_lost").unwrap()["status"],
+        "unmeasurable"
+    );
+}
+
+/// **表示幅がキャンバスの幅以上なら、その表示は測らない**（§12.9 の R3）。
+///
+/// 縮小ではなく拡大になり、高さが際限なく伸びる（16x16384 を 192 幅へ
+/// 「縮める」と 192x196608 になる）。測った表示が 1 つも無ければ `display` は
+/// 空の配列で、**測ったように見せない。**
+#[test]
+fn a_canvas_narrower_than_the_display_is_not_measured() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    for (w, h) in [(100u32, 52u32), (16, 16384), (160, 84)] {
+        let spec = write_spec(
+            dir.path(),
+            &format!(
+                r##"{{"canvas":{{"width":{w},"height":{h},"background":"#ffffff"}},
+                     "font":{{"family":"{family}"}},
+                     "layers":[{{"id":"t","type":"text","role":"heading",
+                                "lines":["A"],"rect":[0,0,{w},40],
+                                "size":30,"color":"#000000"}}]}}"##
+            ),
+        );
+        let out = dir.path().join("out.png");
+        let result = compose(&spec, &out, &["--profile", "note", "--dry-run"]);
+        assert!(result.status.success(), "{w}x{h}");
+        let report = json_stdout(&result);
+        let names: Vec<&str> = layer(&report, "t")["display"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{w}x{h}: display が配列でない: {report}"))
+            .iter()
+            .map(|d| d["name"].as_str().unwrap())
+            .collect();
+        let expected: Vec<&str> = if w > 144 { vec!["mobile_list"] } else { vec![] };
+        assert_eq!(names, expected, "{w}x{h}");
+    }
+}

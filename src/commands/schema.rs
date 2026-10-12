@@ -131,7 +131,9 @@ fn compose_spec_entries() -> Vec<ComposeSpecEntry> {
         ComposeSpecEntry {
             at: "spec",
             keys: keys::SPEC.to_vec(),
-            summary: "最上位。layers は重ねる順に並べる",
+            summary: "最上位。layers は重ねる順に並べる。--profile を渡したとき、\
+                      safe_area を省くか null と書くと profile の範囲を使う\
+                      （null は書かなかったのと同じ）",
         },
         ComposeSpecEntry {
             at: "canvas",
@@ -2099,7 +2101,10 @@ fn fields() -> Vec<FieldEntry> {
             notes: Some(
                 "**範囲は spec が書く**——どこまでが切られずに残るかは媒体ごとに違い、\
                  出典も媒体の側にある。--profile を渡して spec が省いたときは、\
-                 profile の範囲をキャンバスへ比で合わせて使う",
+                 profile の範囲を使う（null と書いても同じ）。比が profile と同じ\
+                 （PROFILE_ASPECT_MISMATCH が出ない）なら比で合わせ、外れていれば\
+                 表示側が中央を規格の比へ切り取った後に残る範囲になる\
+                 （1280x720 の note なら [0, 133, 1280, 454]）",
             ),
         },
         // 縮小表示の測り。`--fail-on` の綴りは `display_*` で、path の末尾とは
@@ -2118,8 +2123,11 @@ fn fields() -> Vec<FieldEntry> {
             gates: None,
             summary: "--profile の表示幅へ縮めたときの文字の大きさ（size × 表示幅 / canvas の幅）",
             notes: Some(
-                "**--profile を渡し、role が decoration でない文字の層にだけ出る**\
-                 （それ以外では display のキーごと無い）。em で測るので CSS の font-size と\
+                "**--profile を渡し、role が decoration でなく、原寸で 1 画素でも\
+                 描かれた文字の層にだけ出る**（それ以外では display のキーごと無い。\
+                 描かれなかった層は TEXT_NOT_RENDERED が言う）。表示幅がキャンバスの\
+                 幅以上の表示は縮小にならないので測らず、display[] に行ごと出ない\
+                 （1 つも測らなければ空の配列）。em で測るので CSS の font-size と\
                  同じ量で、spec の size から逆算できる。11 は Apple の HIG が本文の最小と\
                  する 11pt（kiri が決めた数ではない）。--fail-on では display_text_size \
                  が全層・全表示の最小を見る",

@@ -103,16 +103,37 @@ pub fn named(name: &str) -> Option<&'static ComposeProfile> {
 }
 
 impl ComposeProfile {
-    /// そのキャンバスに当てる安全領域。**規格の範囲を比で合わせる。**
+    /// そのキャンバスに当てる安全領域。**表示側に実際に残る範囲を返す。**
     ///
-    /// 1920x1006 なら同じ比で拡大する（§12.2）。x と y を別々の倍率で合わせるので、
-    /// 比の違うキャンバスでも「規格のキャンバスの中でその範囲が占めていた割合」を
-    /// 保つ——そのときは `PROFILE_ASPECT_MISMATCH` が別に出る。
+    /// # 比が許容の内なら、比で合わせる
+    ///
+    /// 1920x1006 は note が並べる推奨サイズで、同じ比として扱う（§12.2）。x と y を
+    /// それぞれの倍率で合わせる。`PROFILE_ASPECT_MISMATCH` を出さないのと同じ
+    /// 判定で、ここで「切り取りがある」とは言わない。
+    ///
+    /// # 外れたら、note が切り取った後の範囲を返す
+    ///
+    /// note は推奨と違う比の画像を**中央で規格の比へ切り取ってから**表示する
+    /// （「推奨と異なるサイズ: トリミングされて表示される」）。切り取られて
+    /// 残るのは、規格の比の矩形をキャンバスへ内接させたもの——倍率
+    /// `s = min(w / pw, h / ph)` で、余った側を左右か上下へ等分に捨てる。
+    /// 安全領域はその矩形の中で規格どおりの位置にある。1280x720 なら上下 25px
+    /// ずつ捨てて [0, 133, 1280, 454] になる。
+    ///
+    /// x と y を別々の倍率で伸ばすと [0, 116.06, 1280, 487.88] になり、**捨てられる
+    /// 帯の中まで「安全」と言う**（12-phase-31.md §12.9 の R2）。
     pub fn safe_area_for(&self, width: u32, height: u32) -> [f64; 4] {
-        let sx = f64::from(width) / f64::from(self.canvas.0);
-        let sy = f64::from(height) / f64::from(self.canvas.1);
+        let (pw, ph) = (f64::from(self.canvas.0), f64::from(self.canvas.1));
+        let (cw, ch) = (f64::from(width), f64::from(height));
         let [x, y, w, h] = self.safe_area;
-        [x * sx, y * sy, w * sx, h * sy]
+        if !self.aspect_mismatch(width, height) {
+            let (sx, sy) = (cw / pw, ch / ph);
+            return [x * sx, y * sy, w * sx, h * sy];
+        }
+        let s = (cw / pw).min(ch / ph);
+        let ox = (cw - pw * s) / 2.0;
+        let oy = (ch - ph * s) / 2.0;
+        [ox + x * s, oy + y * s, w * s, h * s]
     }
 
     /// キャンバスの比が規格の比から外れているか。`|(w/h) / (pw/ph) − 1| >= 0.005`。
@@ -164,6 +185,29 @@ mod tests {
         assert_eq!(w, 1920.0);
         assert!((y - 108.0 * 1006.0 / 670.0).abs() < 1e-9, "{y}");
         assert!((h - 454.0 * 1006.0 / 670.0).abs() < 1e-9, "{h}");
+    }
+
+    /// **比の違うキャンバスでは、note が中央を切り取った後の範囲を返す**
+    /// （§12.9 の R2）。1280x720 は上下 25px ずつ切られて 1280x670 になり、
+    /// その中央の 454 が見える。x と y を別々の倍率で合わせると
+    /// [0, 116.06, 1280, 487.88] になり、切られて見えない帯まで安全と言う。
+    #[test]
+    fn a_mismatched_canvas_gets_the_band_that_survives_the_crop() {
+        let note = named("note").unwrap();
+        assert_eq!(note.safe_area_for(1280, 720), [0.0, 133.0, 1280.0, 454.0]);
+        // 横長に外れたら左右が切られる。2560x670 の見える幅は 1280
+        assert_eq!(note.safe_area_for(2560, 670), [640.0, 108.0, 1280.0, 454.0]);
+    }
+
+    /// 比が許容の内なら切り取りは無いとみなす（`PROFILE_ASPECT_MISMATCH` を出さない
+    /// のと同じ判定）。1920x1006 は Phase 31 の最初の実装と同じ値のまま。
+    #[test]
+    fn a_canvas_within_the_tolerance_is_scaled_not_cropped() {
+        let note = named("note").unwrap();
+        let [x, y, w, h] = note.safe_area_for(1920, 1006);
+        assert_eq!([x, w], [0.0, 1920.0]);
+        assert_eq!(y, 108.0 * (1006.0 / 670.0));
+        assert_eq!(h, 454.0 * (1006.0 / 670.0));
     }
 
     /// note が並べる 2 つの推奨サイズは通り、16:9 は外れる（§12.5 の 3）。

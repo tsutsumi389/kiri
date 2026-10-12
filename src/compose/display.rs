@@ -138,12 +138,41 @@ pub fn shrink_canvas(canvas: &RgbaImage, base: [u8; 3], width: u32, height: u32)
     }
 }
 
-/// 1 つの文字の被覆（グリフのアルファ）を、**絵と同じ縮小で**縮める。0〜1。
+/// 縮めた被覆の区分。**測りが見るのはこの 3 つだけである**——前景（0.5 以上）、
+/// 背景（0.05 未満）、どちらでもない縁。`f64` のまま持つと、文字の層の数 ×
+/// 表示の数だけ 8 倍の器を抱える（12-phase-31.md §12.9 の R3）。
+pub const BACKGROUND: u8 = 0;
+pub const PARTIAL: u8 = 1;
+pub const FOREGROUND: u8 = 2;
+
+/// 縮めた被覆 0〜1 を区分へ畳む。
+pub fn classify(coverage: f64) -> u8 {
+    if coverage >= FOREGROUND_COVERAGE {
+        FOREGROUND
+    } else if coverage < BACKGROUND_COVERAGE {
+        BACKGROUND
+    } else {
+        PARTIAL
+    }
+}
+
+/// その表示を測るか。**表示幅がキャンバスの幅より狭いときだけ測る。**
+///
+/// 等しいか広ければ、それは縮小ではなく拡大（か素通し）で、「一覧に縮んで
+/// 読めなくなる」はそもそも起きない。測ろうとすると高さ `H × W / canvas_w` が
+/// 際限なく伸びる——16x16384 のキャンバスを 192 幅へ「縮める」と 192x196608 に
+/// なり、1x16384 なら約 3 億画素を確保しに行く（12-phase-31.md §12.9 の R3）。
+/// 測らなかった表示は `layers[].display[]` に**行ごと出さない**。
+pub fn measurable(canvas_w: u32, display: &Display) -> bool {
+    display.width < canvas_w
+}
+
+/// 1 つの文字の被覆（グリフのアルファ）を、**絵と同じ縮小で**縮め、区分へ畳む。
 ///
 /// 同じ縮小をかけないと、縮めた絵のどの画素が「その文字の画素」なのかが
 /// 決まらない。
-pub fn shrink_coverage(glyphs: &RgbaImage, width: u32, height: u32) -> Vec<f64> {
-    box_resample(
+pub fn shrink_coverage(glyphs: &RgbaImage, width: u32, height: u32) -> Vec<u8> {
+    let shrunk = box_resample(
         glyphs.width(),
         glyphs.height(),
         1,
@@ -154,7 +183,8 @@ pub fn shrink_coverage(glyphs: &RgbaImage, width: u32, height: u32) -> Vec<f64> 
                 *out = f64::from(glyphs.get_pixel(x as u32, y as u32).0[3]) / 255.0;
             }
         },
-    )
+    );
+    shrunk.into_iter().map(classify).collect()
 }
 
 /// 面積平均の縮小。**縦横を分けて 2 回歩く。**
@@ -232,9 +262,15 @@ fn taps(src: usize, dst: usize) -> Vec<Vec<(usize, f64)>> {
 ///
 /// `coverage` は `shrink_coverage` の結果、`placed` はその文字の原寸の外接矩形、
 /// `size` は spec の `size`。
+///
+/// **原寸で 1 画素でも描かれた文字だけを渡すこと。** 前景が 0 画素なら
+/// `strokes_lost`（縮めて線が潰れた）と言うが、原寸で描かれていなければ原因は
+/// 縮小ではない——`TEXT_NOT_RENDERED` の側の事実で、「weight を上げる」は
+/// 嘘の勧めになる（12-phase-31.md §12.9 の R1）。呼ぶ側
+/// （`commands::compose::build`）がその層を測りから外す。
 pub fn measure(
     shrunk: &Shrunk,
-    coverage: &[f64],
+    coverage: &[u8],
     placed: [f64; 4],
     size: f64,
     canvas: (u32, u32),
@@ -246,7 +282,7 @@ pub fn measure(
         .luminance
         .iter()
         .zip(coverage)
-        .filter(|(_, c)| **c >= FOREGROUND_COVERAGE)
+        .filter(|(_, c)| **c == FOREGROUND)
         .map(|(l, _)| *l)
         .collect();
 
@@ -265,7 +301,7 @@ pub fn measure(
     for y in y0..y1 {
         for x in x0..x1 {
             let i = y * dw + x;
-            if coverage[i] < BACKGROUND_COVERAGE {
+            if coverage[i] == BACKGROUND {
                 back.push(shrunk.luminance[i]);
             }
         }
@@ -386,7 +422,7 @@ mod tests {
     fn size_px_is_the_size_scaled_by_the_width() {
         let canvas = RgbaImage::from_pixel(1280, 670, Rgba([255, 255, 255, 255]));
         let shrunk = shrink_canvas(&canvas, [255, 255, 255], 144, 75);
-        let coverage = vec![0.0; 144 * 75];
+        let coverage = vec![BACKGROUND; 144 * 75];
         let r = measure(
             &shrunk,
             &coverage,
@@ -423,6 +459,29 @@ mod tests {
             let sum: f64 = taps.iter().map(|(_, w)| w).sum();
             assert!((sum - 1.0).abs() < 1e-12, "{sum}");
         }
+    }
+
+    /// 表示幅がキャンバスの幅以上なら測らない（§12.9 の R3）。拡大になるうえ、
+    /// 高さが際限なく伸びる。
+    #[test]
+    fn only_a_narrower_display_is_measured() {
+        assert!(measurable(1280, &MOBILE));
+        assert!(!measurable(144, &MOBILE));
+        assert!(!measurable(100, &PC));
+        assert!(measurable(160, &MOBILE));
+        assert!(!measurable(160, &PC));
+    }
+
+    /// 被覆は 3 つの区分にだけ畳む。測りが見るのは 0.5 以上・0.05 未満・その間の
+    /// 3 つだけなので、`f64` で持つ理由が無い（§12.9 の R3）。
+    #[test]
+    fn coverage_is_kept_as_three_classes() {
+        assert_eq!(classify(0.0), BACKGROUND);
+        assert_eq!(classify(0.049), BACKGROUND);
+        assert_eq!(classify(0.05), PARTIAL);
+        assert_eq!(classify(0.499), PARTIAL);
+        assert_eq!(classify(0.5), FOREGROUND);
+        assert_eq!(classify(1.0), FOREGROUND);
     }
 
     /// 白地に黒の太い帯は、縮めても読める。

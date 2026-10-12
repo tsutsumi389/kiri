@@ -26,9 +26,9 @@ use crate::cutout::{MAX_FOREGROUND_RATIO, MIN_FOREGROUND_RATIO, background, diag
 use crate::error::{ErrorCode, ErrorKind};
 use crate::profile;
 use crate::report::{
-    ArgEntry, CommandEntry, ComposeSpecEntry, ErrorCodeEntry, ExitCodeEntry, FieldEntry, FieldGate,
-    FieldThreshold, LintCheckEntry, ProfileEntry, ProfileRules, SCHEMA_VERSION, SchemaReport,
-    SchemaScope, WarningCodeEntry,
+    ArgEntry, CommandEntry, ComposeDisplayEntry, ComposeProfileEntry, ComposeSpecEntry,
+    ErrorCodeEntry, ExitCodeEntry, FieldEntry, FieldGate, FieldThreshold, LintCheckEntry,
+    ProfileEntry, ProfileRules, SCHEMA_VERSION, SchemaReport, SchemaScope, WarningCodeEntry,
 };
 use crate::warning::WarningCode;
 
@@ -114,6 +114,7 @@ pub fn run(args: &SchemaArgs) -> SchemaReport {
         fields: full.then_some(fields),
         lint_checks: (full && wants_lint_checks).then(lint_checks),
         profiles: profiles(),
+        compose_profiles: compose_profiles(),
         global_options,
         commands,
         compose_spec: (full && wants_compose_spec).then(compose_spec_entries),
@@ -130,12 +131,16 @@ fn compose_spec_entries() -> Vec<ComposeSpecEntry> {
         ComposeSpecEntry {
             at: "spec",
             keys: keys::SPEC.to_vec(),
-            summary: "最上位。layers は重ねる順に並べる",
+            summary: "最上位。layers は重ねる順に並べる。--profile を渡したとき、\
+                      safe_area を省くか null と書くと profile の範囲を使う\
+                      （null は書かなかったのと同じ）",
         },
         ComposeSpecEntry {
             at: "canvas",
             keys: keys::CANVAS.to_vec(),
-            summary: "組む 1 枚の寸法と下地。background を省くと透明のまま組む",
+            summary: "組む 1 枚の寸法と下地。background を省くと透明のまま組む。\
+                      width / height は --profile を渡したときだけ省ける（profile の寸法になる）。\
+                      渡さずに省くと SPEC_INVALID で断る",
         },
         ComposeSpecEntry {
             at: "font",
@@ -278,6 +283,32 @@ fn profiles() -> Vec<ProfileEntry> {
                 alpha_allowed: p.rules.alpha_allowed,
                 srgb_required: p.rules.srgb_required,
             },
+        })
+        .collect()
+}
+
+/// `kiri compose --profile` の規格の表を配る。
+///
+/// **`compose::profile::ALL` から組む。書き写さない**（`profiles` と同じ作法）。
+fn compose_profiles() -> Vec<ComposeProfileEntry> {
+    crate::compose::profile::ALL
+        .iter()
+        .map(|p| ComposeProfileEntry {
+            name: p.name,
+            revision: p.revision,
+            summary: p.summary,
+            source: p.source,
+            canvas: [p.canvas.0, p.canvas.1],
+            safe_area: p.safe_area,
+            max_bytes: p.max_bytes,
+            displays: p
+                .displays
+                .iter()
+                .map(|d| ComposeDisplayEntry {
+                    name: d.name,
+                    width: d.width,
+                })
+                .collect(),
         })
         .collect()
 }
@@ -2069,7 +2100,78 @@ fn fields() -> Vec<FieldEntry> {
             summary: "そのレイヤが safe_area の外へ出たか",
             notes: Some(
                 "**範囲は spec が書く**——どこまでが切られずに残るかは媒体ごとに違い、\
-                 出典も媒体の側にある",
+                 出典も媒体の側にある。--profile を渡して spec が省いたときは、\
+                 profile の範囲を使う（null と書いても同じ）。比が profile と同じ\
+                 （PROFILE_ASPECT_MISMATCH が出ない）なら比で合わせ、外れていれば\
+                 表示側が中央を規格の比へ切り取った後に残る範囲になる\
+                 （1280x720 の note なら [0, 133, 1280, 454]）",
+            ),
+        },
+        // 縮小表示の測り。`--fail-on` の綴りは `display_*` で、path の末尾とは
+        // 違う（入れ子のキーを全層・全表示にわたって畳んだ量なので）
+        FieldEntry {
+            path: "layers[].display[].size_px",
+            appears_in: compose(),
+            unit: "px",
+            nullable: false,
+            null_means: None,
+            warns: vec![FieldThreshold {
+                code: WarningCode::TextIllegibleAtDisplay,
+                operator: "lt",
+                threshold: crate::compose::display::MIN_DISPLAY_SIZE,
+            }],
+            gates: None,
+            summary: "--profile の表示幅へ縮めたときの文字の大きさ（size × 表示幅 / canvas の幅）",
+            notes: Some(
+                "**--profile を渡し、role が decoration でなく、原寸で 1 画素でも\
+                 描かれた文字の層にだけ出る**（それ以外では display のキーごと無い。\
+                 描かれなかった層は TEXT_NOT_RENDERED が言う）。表示幅がキャンバスの\
+                 幅以上の表示は縮小にならないので測らず、display[] に行ごと出ない\
+                 （1 つも測らなければ空の配列）。em で測るので CSS の font-size と\
+                 同じ量で、spec の size から逆算できる。11 は Apple の HIG が本文の最小と\
+                 する 11pt（kiri が決めた数ではない）。--fail-on では display_text_size \
+                 が全層・全表示の最小を見る",
+            ),
+        },
+        FieldEntry {
+            path: "layers[].display[].contrast",
+            appears_in: compose(),
+            unit: "ratio",
+            nullable: true,
+            null_means: Some(
+                "縮めた絵に前景（被覆 0.5 以上）か背景（被覆 0.05 未満）の画素が 1 つも無い",
+            ),
+            warns: vec![FieldThreshold {
+                code: WarningCode::TextIllegibleAtDisplay,
+                operator: "lt",
+                threshold: crate::compose::measure::MIN_CONTRAST,
+            }],
+            gates: None,
+            summary: "--profile の表示幅へ縮めた絵での、見えている前景と背景のコントラスト比",
+            notes: Some(
+                "**text_contrast とは量の定義が違う。** あちらは原寸の文字色と背後、\
+                 こちらは全層を重ねた絵を面積平均で縮めてから、その文字の被覆が 0.5 以上の\
+                 画素（前景）と、外接矩形の中で 0.05 未満の画素（背景）の相対輝度の中央値を\
+                 比べる。細い線は地の色と混ざって前景が薄まるので、原寸で 4.5 を超えても\
+                 ここで下回ることがある。透過は出力が透過を保てるなら白（note の一覧の地）、\
+                 保てないなら潰す色へ重ねてから縮める。--fail-on では display_contrast \
+                 が全層・全表示の最小を見る（null は数えない）",
+            ),
+        },
+        FieldEntry {
+            path: "layers[].display[].reasons",
+            appears_in: compose(),
+            unit: "list",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "読めないと判断した理由。too_small / strokes_lost / low_contrast",
+            notes: Some(
+                "**1 つでも当たれば legible は false** で、TEXT_ILLEGIBLE_AT_DISPLAY が\
+                 出る。strokes_lost は縮めた被覆が 0.5 に届く画素が 1 つも無い\
+                 （線が 1px 未満に潰れた）ことで、--fail-on では display_strokes_lost が\
+                 旗として見る",
             ),
         },
     ]);

@@ -287,7 +287,7 @@ test / MSRV を GitHub Actions へ移した。**新規のコードは無い**—
 14 コアのうち 1 つしか動いていない。最初の作業は測る道具を作ることで、
 段ごとの基準値と分け方は [11. Phase 30](phases/11-phase-30.md) にある。
 
-## 7〜11. 段ごとの計画
+## 7〜12. 段ごとの計画
 
 狙い・順序の根拠・受け入れ条件は段ごとに `phases/` へ分けた。節番号は
 分割前のまま変えていない。
@@ -299,3 +299,4 @@ test / MSRV を GitHub Actions へ移した。**新規のコードは無い**—
 | 9 | Phase 28: 帯を遷移と厚みから引き直す | [09-phase-28.md](phases/09-phase-28.md) |
 | 10 | Phase 29: 素材と文字を spec から組む | [10-phase-29.md](phases/10-phase-29.md) |
 | 11 | Phase 30: 切り抜きを速く、軽くする | [11-phase-30.md](phases/11-phase-30.md) |
+| 12 | Phase 31: note の見出し画像を規格として組む | [12-phase-31.md](phases/12-phase-31.md) |

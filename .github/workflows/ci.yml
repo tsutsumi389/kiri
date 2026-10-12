@@ -125,6 +125,12 @@ jobs:
       # 基準はそのまま保たれている。
       - name: nasm を入れる（rav1e の asm ビルド用）
         run: sudo apt-get update && sudo apt-get install -y nasm
+      # **字体を明示して入れる。** compose の検査は字体をリポジトリに置かず
+      # システムのものを借りる（tests/compose.rs の doc）。標準ランナーに何が
+      # 入っているかに任せると、無い日に字体を要する検査が黙って飛ぶ。
+      # 入れたうえで `KIRI_REQUIRE_FONT=1` を立て、見つからなければ落とす
+      - name: 字体を入れる（compose の検査用）
+        run: sudo apt-get install -y fonts-dejavu-core
       # **`target/` も載せる。** 毎回 tract や rav1e を一から建てており、
       # segment ではビルドだけで 6 分かかっていた。鍵に rustc の版を混ぜるのは、
       # 標準ランナーの stable が上がったときに古い生成物を引かないためである
@@ -144,6 +150,8 @@ jobs:
       # **`ci-test` プロファイルで回す（Cargo.toml を見よ）。** debug のままだと
       # `tests/real_backgrounds.rs` だけで 36 分かかる。
       - run: cargo test --profile ci-test --locked ${{ matrix.features }} ${{ matrix.targets }}
+        env:
+          KIRI_REQUIRE_FONT: "1"
       # kiri 自身の生成物はキャッシュに載せない（毎回作り直すので太るだけ）。
       - run: cargo clean --profile ci-test -p kiri
 

@@ -213,6 +213,17 @@ fn print_schema(report: &SchemaReport) {
         println!("  {:<w$}  出典 {}", "", p.source, w = w);
     }
 
+    // compose の規格は別の表である（cutout / lint の --profile では書けない）
+    println!(
+        "\ncompose のプロファイル ({})",
+        report.compose_profiles.len()
+    );
+    let w = column_width(report.compose_profiles.iter().map(|p| p.name));
+    for p in &report.compose_profiles {
+        println!("  {:<w$}  {}  {}", p.name, p.revision, p.summary, w = w);
+        println!("  {:<w$}  出典 {}", "", p.source, w = w);
+    }
+
     if !report.global_options.is_empty() {
         let names: Vec<&str> = report
             .global_options
@@ -620,6 +631,9 @@ fn print_compliance(compliance: Option<&ComplianceReport>) {
 /// 同じ行へ添える。
 fn print_compose(report: &ComposeReport) {
     println!("{}", report.spec);
+    if let Some(profile) = &report.profile {
+        println!("  規格      {} ({})", profile.name, profile.revision);
+    }
     println!(
         "  canvas    {} x {}{}",
         report.canvas.width,
@@ -650,6 +664,24 @@ fn print_compose(report: &ComposeReport) {
         }
         if let Some(contrast) = layer.text_contrast {
             println!("               コントラスト {contrast:.2}");
+        }
+        for d in layer.display.iter().flatten() {
+            println!(
+                "               {} {}px  {:.1}px  {}{}",
+                d.name,
+                d.width,
+                d.size_px,
+                d.contrast.map_or_else(
+                    || "コントラスト -".to_string(),
+                    |c| format!("コントラスト {c:.2}")
+                ),
+                if d.legible {
+                    String::new()
+                } else {
+                    let reasons: Vec<&str> = d.reasons.iter().map(|r| r.as_str()).collect();
+                    format!("  読めない ({})", reasons.join(", "))
+                }
+            );
         }
     }
     println!(

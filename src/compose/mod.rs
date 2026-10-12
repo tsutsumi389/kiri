@@ -21,9 +21,11 @@
 //! 候補（`batch::closest`）を添えられない。未知のキーは `SPEC_UNKNOWN_FIELD` で
 //! 断る——spec を数百行書いてから仕上がりで気づく種類の失敗を作らないためである。
 
+pub mod display;
 pub mod font;
 pub mod gate;
 pub mod measure;
+pub mod profile;
 pub mod text;
 
 use std::path::{Path, PathBuf};
@@ -31,6 +33,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::batch::check;
+use crate::compose::profile::ComposeProfile;
 use crate::error::{Error, ErrorCode, Result};
 use crate::transform::FitMode;
 
@@ -92,6 +95,8 @@ pub struct ComposeSpec {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Canvas {
+    /// **`--profile` を渡したときだけ省ける**（`parse_with` が埋める）。
+    /// 渡さずに省けば今までどおり `SPEC_INVALID` で断る
     pub width: u32,
     pub height: u32,
     /// 下地。**無ければ透明のまま**——`--canvas` の `background` と同じ約束である
@@ -269,18 +274,46 @@ fn default_line_height() -> f64 {
 
 /// spec を読む。
 pub fn load(path: &Path) -> Result<ComposeSpec> {
+    load_with(path, None)
+}
+
+/// spec を読み、`--profile` の値で**書かれていない項目だけを**埋める。
+pub fn load_with(path: &Path, profile: Option<&ComposeProfile>) -> Result<ComposeSpec> {
     let text = std::fs::read_to_string(path).map_err(|e| {
         Error::new(
             ErrorCode::SpecUnreadable,
             format!("{} を読めません: {e}", path.display()),
         )
     })?;
-    parse(&text, &path.display().to_string())
+    parse_with(&text, &path.display().to_string(), profile)
 }
 
 /// 読んだ文字列を spec にする。**ファイルを読む経路とテストが同じ関門を通る。**
 pub fn parse(text: &str, origin: &str) -> Result<ComposeSpec> {
-    let raw: serde_json::Value = serde_json::from_str(text).map_err(|e| {
+    parse_with(text, origin, None)
+}
+
+/// `parse` に `--profile` を足したもの。**明示 > profile の順で勝つ**
+/// （cutout の `--profile` と同じ約束）。
+///
+/// # 埋めるのは型へ落とす前である
+///
+/// `canvas.width` / `canvas.height` は型の上では必須のまま置く。profile が
+/// あるときだけ、**生の JSON の欠けたキーへ profile の値を書き込んでから**
+/// 型へ落とす。型を `Option` にすると、profile の無い経路で欠けた寸法を
+/// どこで断るかという分岐が増える——いまは serde が「width が無い」と言って
+/// `SPEC_INVALID` で断っており、**profile を渡さない spec の断り方は 1 文字も
+/// 変わらない。**
+///
+/// `safe_area` は型へ落とした後に埋める。キャンバスの寸法が決まらないと
+/// 比で合わせられないからである。どちらも `validate` の前なので、profile が
+/// 埋めた値も spec に書いた値と同じ関門を通る。
+pub fn parse_with(
+    text: &str,
+    origin: &str,
+    profile: Option<&ComposeProfile>,
+) -> Result<ComposeSpec> {
+    let mut raw: serde_json::Value = serde_json::from_str(text).map_err(|e| {
         Error::new(
             ErrorCode::SpecInvalidJson,
             format!("{origin} は JSON として不正です: {e}"),
@@ -288,16 +321,46 @@ pub fn parse(text: &str, origin: &str) -> Result<ComposeSpec> {
     })?;
 
     validate_keys(&raw)?;
+    if let Some(profile) = profile {
+        fill_canvas(&mut raw, profile);
+    }
 
-    let spec: ComposeSpec = serde_json::from_value(raw).map_err(|e| {
+    let mut spec: ComposeSpec = serde_json::from_value(raw).map_err(|e| {
         Error::new(
             ErrorCode::SpecInvalid,
             format!("{origin} の内容が不正です: {e}"),
         )
     })?;
 
+    if let Some(profile) = profile {
+        if spec.safe_area.is_none() {
+            spec.safe_area = Some(profile.safe_area_for(spec.canvas.width, spec.canvas.height));
+        }
+    }
+
     validate(&spec)?;
     Ok(spec)
+}
+
+/// spec が書かなかったキャンバスの寸法を profile から埋める。
+///
+/// **1 辺ずつ埋める。** 幅だけを書いた spec は、高さを profile から受け取る
+/// ——比が外れていれば `PROFILE_ASPECT_MISMATCH` が言う。`canvas` そのものが
+/// 無ければ作る。`canvas` がオブジェクトでなければ触らない（型へ落とすところで
+/// 今までどおり断られる）。
+fn fill_canvas(raw: &mut serde_json::Value, profile: &ComposeProfile) {
+    let Some(object) = raw.as_object_mut() else {
+        return;
+    };
+    let canvas = object
+        .entry("canvas")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let Some(canvas) = canvas.as_object_mut() else {
+        return;
+    };
+    let (width, height) = profile.canvas;
+    canvas.entry("width").or_insert_with(|| width.into());
+    canvas.entry("height").or_insert_with(|| height.into());
 }
 
 /// 未知のキーを、型へ落とす前に断る。
@@ -524,4 +587,77 @@ pub fn parse_color(text: &str) -> Result<[u8; 3]> {
         )
         .with_hint("3 桁の短縮形は受けません。#ffffff のように 6 桁で書いてください")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const IMAGE_ONLY: &str = r#"{"layers":[{"id":"a","type":"image","role":"subject",
+        "source":"a.png","rect":[0,0,10,10]}]}"#;
+
+    fn note() -> &'static ComposeProfile {
+        profile::named("note").unwrap()
+    }
+
+    /// `canvas` を省いた spec は profile の寸法と安全領域で組む（§12.5 の 2）。
+    #[test]
+    fn a_missing_canvas_takes_the_profile_values() {
+        let spec = parse_with(IMAGE_ONLY, "t", Some(note())).unwrap();
+        assert_eq!((spec.canvas.width, spec.canvas.height), (1280, 670));
+        assert_eq!(spec.safe_area, Some([0.0, 108.0, 1280.0, 454.0]));
+        assert_eq!(spec.canvas.background, None);
+    }
+
+    /// **profile を渡さなければ、省いた寸法は今までどおり断る。**
+    #[test]
+    fn without_a_profile_a_missing_canvas_is_still_refused() {
+        let err = parse(IMAGE_ONLY, "t").unwrap_err();
+        assert_eq!(err.code, ErrorCode::SpecInvalid);
+        let err = parse(
+            r#"{"canvas":{"width":10},"layers":[{"id":"a","type":"image",
+               "role":"subject","source":"a.png","rect":[0,0,10,10]}]}"#,
+            "t",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::SpecInvalid);
+    }
+
+    /// 書いた値は profile より強い。安全領域は書いたキャンバスへ比で合わせる。
+    #[test]
+    fn written_values_win_over_the_profile() {
+        let spec = parse_with(
+            r##"{"canvas":{"width":1920,"height":1006,"background":"#ffffff"},
+                "layers":[{"id":"a","type":"image","role":"subject",
+                           "source":"a.png","rect":[0,0,10,10]}]}"##,
+            "t",
+            Some(note()),
+        )
+        .unwrap();
+        assert_eq!((spec.canvas.width, spec.canvas.height), (1920, 1006));
+        assert_eq!(spec.safe_area, Some(note().safe_area_for(1920, 1006)));
+
+        let spec = parse_with(
+            r#"{"canvas":{"width":1280,"height":670},"safe_area":[10,10,100,100],
+                "layers":[{"id":"a","type":"image","role":"subject",
+                           "source":"a.png","rect":[0,0,10,10]}]}"#,
+            "t",
+            Some(note()),
+        )
+        .unwrap();
+        assert_eq!(spec.safe_area, Some([10.0, 10.0, 100.0, 100.0]));
+    }
+
+    /// 1 辺だけ書けば、もう 1 辺を profile から受け取る。
+    #[test]
+    fn one_written_side_keeps_the_other_from_the_profile() {
+        let spec = parse_with(
+            r#"{"canvas":{"height":720},"layers":[{"id":"a","type":"image",
+               "role":"subject","source":"a.png","rect":[0,0,10,10]}]}"#,
+            "t",
+            Some(note()),
+        )
+        .unwrap();
+        assert_eq!((spec.canvas.width, spec.canvas.height), (1280, 720));
+    }
 }

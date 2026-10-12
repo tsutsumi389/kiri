@@ -201,6 +201,15 @@ warning_catalog! {
     OutsideSafeArea = "OUTSIDE_SAFE_AREA"
         => "compose の要素が safe_area の外へ出た（表示側で切られる範囲にある）",
         remedy: Some("要素の rect を safe_area の中へ収める"),
+    TextIllegibleAtDisplay = "TEXT_ILLEGIBLE_AT_DISPLAY"
+        => "compose --profile の縮小表示で文字が読めない。data.layer の文字を data.display（幅 data.width px）へ縮めた絵で測った。data.reasons が too_small（data.size_px が 11 未満）/ strokes_lost（線が 1px 未満に潰れた）/ low_contrast（data.contrast が 4.5 未満）のどれかを言う",
+        remedy: Some("too_small なら size を上げる（要る size は 11 × canvas の幅 / data.width）。low_contrast なら文字色か、その文字が載っている下地を変える。strokes_lost なら weight を上げる"),
+    ProfileAspectMismatch = "PROFILE_ASPECT_MISMATCH"
+        => "compose の canvas の縦横比が --profile の比から 0.5% 以上外れている。表示側でトリミングされる（data.expected と data.actual が [幅, 高さ]）",
+        remedy: Some("canvas の width / height を消して profile の大きさにする（または同じ比の大きさにする）"),
+    ProfileMaxBytesExceeded = "PROFILE_MAX_BYTES_EXCEEDED"
+        => "compose が書いたバイト数（data.bytes）が --profile の上限（data.max_bytes）を超えた",
+        remedy: Some("PNG / WebP（どちらも可逆）なら出力先の拡張子を .jpg か .avif にする。JPEG / AVIF なら --quality を下げ、それでも収まらなければ canvas を小さくする"),
 }
 
 impl Serialize for WarningCode {

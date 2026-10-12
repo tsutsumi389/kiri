@@ -78,7 +78,7 @@ kiri 本体は別に入れておく（`cargo install --path .`）。
 | `kiri cutout` | **背景を透過して切り抜く。**キャンバス配置・影・反射・規格判定まで | [05-cutout.md](docs/commands/05-cutout.md) |
 | `kiri batch` | spec を渡してまとめて処理する。セット内で大きさと余白を揃える | [06-batch.md](docs/commands/06-batch.md) |
 | `kiri lint` | 既存の画像をモール規格で検査する | [07-lint.md](docs/commands/07-lint.md) |
-| `kiri compose` | 素材と文字を 1 枚へ組む | [08-compose.md](docs/commands/08-compose.md) |
+| `kiri compose` | 素材と文字を 1 枚へ組む。`--profile note` で note の見出し画像の規格を当て、一覧に縮んだときに読めるかを測る | [08-compose.md](docs/commands/08-compose.md) |
 | `kiri model` | セグメンテーションモデルの素性と置き場所を返す | [09-model.md](docs/commands/09-model.md) |
 
 入力を読んで出力を書くコマンドに共通する事柄——**色空間の扱い**、出力が sRGB を

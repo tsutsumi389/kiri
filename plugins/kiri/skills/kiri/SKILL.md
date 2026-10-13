@@ -155,6 +155,10 @@ kiri compose layout.json -o thumb.png --fail-on default --json
 - **字体はファイルで指す**（`font.path`）。見つからなければ `FONT_NOT_FOUND` で 1 枚も書かない。
   代わりの字体へ黙って落ちることはない。`FONT_GLYPHS_MISSING` が出たら、
   `data.missing` の文字を持つ字体に替える
+- **太さは字体のファイルが持つ face でしか描けない。** 1 ウェイトのファイル（W4 など）では
+  `weight` を変えても絵が変わらず、`FONT_WEIGHT_UNAVAILABLE` が出る。見出しを W8、補足を W4 に
+  するような強弱は、**文字の層ごとに `font` を書いて別のファイルを指す**（書かない層は最上位の
+  `font` を継ぐ）。実際に組んだ字体と描かれた太さは `layers[].font` に返る
 - **`lines` は行の配列である。** 長い見出しはどこで割るかを自分で決めて行に分ける。
   行ごとの実測幅は `layers[]` に返る
 - `rect` は枠で、画像は内接して縮む。実際に置かれた矩形は `layers[].placed` を見る
@@ -168,6 +172,7 @@ kiri compose layout.json -o thumb.png --fail-on default --json
 | `LAYERS_OVERLAP` | 文字の `rect` を商品の外へ寄せる |
 | `TEXT_OBSCURED` | 文字の層を、覆っている層より後ろ（配列の末尾側）へ移す |
 | `OUTSIDE_SAFE_AREA` | 層を `safe_area` の内側へ入れる |
+| `FONT_WEIGHT_UNAVAILABLE` | その太さの face を持つファイル（または可変フォント）を `layers[].font` で指す。無ければ `weight` を `data.actual` に合わせる |
 
 **書き出した絵を Read で開いて目で確かめる。** 見出し画像は小さいので、出力そのものを見ればよい
 （compose に `--preview` は無い）。利用者にも見せる。
@@ -187,7 +192,7 @@ kiri compose header.json -o header.png --profile note --fail-on default --json
 | 理由 | 直し方 |
 |---|---|
 | `too_small` | `size` を `11 × canvas の幅 / 表示幅` 以上にする（1280 幅ならスマホで 98） |
-| `strokes_lost` | `weight` を上げる |
+| `strokes_lost` | `weight` を上げる（`FONT_WEIGHT_UNAVAILABLE` が出ていれば効かないので、太いファイルを `layers[].font` で指す） |
 | `low_contrast` | 文字色か下地を変える。原寸の `text_contrast` が通っていても、縮めると落ちることがある |
 
 - 原寸で読めても一覧では読めないことが多い。**見出しは大きく、短く、太く**が出発点になる

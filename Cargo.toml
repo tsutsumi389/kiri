@@ -77,8 +77,12 @@ resvg = { version = "0.48.1", default-features = false, features = [
 # 絞っても、無い文字は豆腐（.notdef）として**描けてしまう**ので、描く前に
 # 自分で見るしかない（計画 §10.11 の H3）。
 #
-# MSRV 1.63、依存ゼロ、`-sys` も無い。resvg と同じ作者の pure Rust 実装である
-ttf-parser = { version = "0.25.1", default-features = false, features = ["std"] }
+# MSRV 1.63、依存ゼロ、`-sys` も無い。resvg と同じ作者の pure Rust 実装である。
+#
+# `variable-fonts` は wght 軸の範囲を読むために要る。可変フォントの face の太さは
+# 既定の位置の 1 つでしかなく、それと比べると `FONT_WEIGHT_UNAVAILABLE` が
+# 可変フォントで毎回誤検出する（`compose::font` の doc）
+ttf-parser = { version = "0.25.1", default-features = false, features = ["std", "variable-fonts"] }
 
 [dev-dependencies]
 assert_cmd = "2"

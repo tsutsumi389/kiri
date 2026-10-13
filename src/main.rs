@@ -662,6 +662,25 @@ fn print_compose(report: &ComposeReport) {
         if let Some(over) = layer.text_overflow.filter(|&over| over > 0.0) {
             println!("               はみ出し {over:.1}px");
         }
+        // **最上位と違うファイルで組んだ層だけ**名乗る（同じ family でも weight で
+        // 別ファイルの face を引いた層を含む）。全部の層に同じ行を並べると、
+        // 違う 1 行が埋もれる
+        if let Some(font) = layer.font.as_ref().filter(|f| {
+            report
+                .font
+                .as_ref()
+                .is_none_or(|top| top.family != f.family || top.path != f.path)
+        }) {
+            println!(
+                "               字体 {} ({}){}",
+                font.family,
+                font.weight,
+                match &font.path {
+                    Some(path) => format!("  {path}"),
+                    None => String::new(),
+                }
+            );
+        }
         if let Some(contrast) = layer.text_contrast {
             println!("               コントラスト {contrast:.2}");
         }

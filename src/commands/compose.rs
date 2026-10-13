@@ -29,6 +29,7 @@ use std::time::Instant;
 use image::RgbaImage;
 
 use crate::cli::ComposeArgs;
+use crate::compose::font::LayerFont;
 use crate::compose::measure::{self, COVERAGE, LayerReport};
 use crate::compose::profile::ComposeProfile;
 use crate::compose::{self, ComposeSpec, ImageLayer, Layer, Role, TextLayer, display};
@@ -69,12 +70,7 @@ pub fn run(args: &ComposeArgs) -> Result<ComposeReport> {
     if let Some(profile) = profile {
         warnings.extend(aspect_warning(profile, &spec));
     }
-    let font = spec
-        .font
-        .as_ref()
-        .map(|f| compose::font::resolve(f, &base, &spec, &mut warnings))
-        .transpose()?;
-    let fontdb = font.as_ref().map(|(db, _)| std::sync::Arc::clone(db));
+    let fonts = compose::font::resolve(&spec, &base, &mut warnings)?;
 
     // **透過のまま書けるか。** コントラストを測るときに、下地が透明な画素を
     // 何色として扱うかがここで決まる（`measure::contrast` の doc）
@@ -83,7 +79,7 @@ pub fn run(args: &ComposeArgs) -> Result<ComposeReport> {
     let built = build(
         &spec,
         &base,
-        fontdb.as_ref(),
+        &fonts.layers,
         flatten_to,
         profile,
         &mut warnings,
@@ -145,7 +141,7 @@ pub fn run(args: &ComposeArgs) -> Result<ComposeReport> {
             height: spec.canvas.height,
             background: spec.canvas.background.clone(),
         },
-        font: font.map(|(_, resolved)| resolved),
+        font: fonts.top,
         output,
         dry_run: args.dry_run,
         layers,
@@ -266,7 +262,7 @@ struct Covered {
 fn build(
     spec: &ComposeSpec,
     base: &Path,
-    fontdb: Option<&std::sync::Arc<resvg::usvg::fontdb::Database>>,
+    fonts: &[Option<LayerFont>],
     flatten_to: Option<[u8; 3]>,
     profile: Option<&ComposeProfile>,
     warnings: &mut Vec<Warning>,
@@ -319,6 +315,7 @@ fn build(
                     layer_overlap: None,
                     outside_safe_area: spec.safe_area.map(|a| measure::outside(a, placed)),
                     align: None,
+                    font: None,
                     display: None,
                 }
             }
@@ -327,7 +324,7 @@ fn build(
                     &mut canvas,
                     text,
                     spec,
-                    fontdb,
+                    fonts.get(i).and_then(Option::as_ref),
                     flatten_to,
                     index,
                     &subject,
@@ -479,7 +476,7 @@ fn draw_text(
     canvas: &mut RgbaImage,
     layer: &TextLayer,
     spec: &ComposeSpec,
-    fontdb: Option<&std::sync::Arc<resvg::usvg::fontdb::Database>>,
+    font: Option<&LayerFont>,
     flatten_to: Option<[u8; 3]>,
     index: u16,
     subject: &[u8],
@@ -490,17 +487,14 @@ fn draw_text(
     // `compose::validate` が「文字があるのに font が無い」を既に断っているので、
     // ここへ `None` で来ることは無い。**それでも unwrap しない**——届かない
     // はずの経路が届いたときに、panic ではなく code で言えるほうがよい
-    let (family, db) = match (&spec.font, fontdb) {
-        (Some(f), Some(db)) => (f.family.as_str(), db),
-        _ => {
-            return Err(Error::new(
-                ErrorCode::FontNotFound,
-                format!("'{}' を組むための字体が決まっていません", layer.id),
-            ));
-        }
+    let Some(font) = font else {
+        return Err(Error::new(
+            ErrorCode::FontNotFound,
+            format!("'{}' を組むための字体が決まっていません", layer.id),
+        ));
     };
 
-    let layout = compose::text::layout(layer, &spec.canvas, family, db)?;
+    let layout = compose::text::layout(layer, &spec.canvas, &font.family, &font.db)?;
     let color = compose::parse_color(&layer.color)?;
 
     // **重ねる前に測る。** いまのキャンバスがこの文字の背後そのものである
@@ -548,6 +542,7 @@ fn draw_text(
         layer_overlap,
         outside_safe_area: spec.safe_area.map(|a| measure::outside(a, layout.bbox)),
         align: Some(layer.align),
+        font: Some(font.used.clone()),
         display: None,
     };
     Ok((report, pixels, layout.pixels))

@@ -295,6 +295,7 @@ sRGB のまま比べると**ガンマぶんだけ暗い側へ偏る**（黒い�
 | `TEXT_OBSCURED` | `compose` の文字が**後の層に覆われている**。`text_contrast` は背後を測った値なので、覆われた文字でも高い値を返す（`data.text_obscured` が覆われた比） |
 | `TEXT_NOT_RENDERED` | `compose` の文字が 1 画素も描かれなかった。`rect` がキャンバスの外にあるか、字体にその文字のグリフが無い |
 | `FONT_GLYPHS_MISSING` | `compose` が要求した字体に、spec の文字のグリフが無い。描けば豆腐が並ぶ（`data.missing` が欠けている文字を言う） |
+| `FONT_WEIGHT_UNAVAILABLE` | `compose` の文字の `weight`（`data.requested`）に合う face が字体に無く、別の太さ（`data.actual`）で描かれる。太さは合成しないので `weight` を変えても絵が変わらない。可変フォントは wght 軸の範囲の中なら出ない |
 
 この表は `kiri schema --json` の `warnings[]` が同じものを返す。**README を読ませる
 代わりにそれを引けばよい。**

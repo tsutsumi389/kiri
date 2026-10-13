@@ -63,6 +63,45 @@ spec に書いた指定が黙って消える向きの親切で、`--fill-ratio` 
 `font.path` を書けばそのファイルだけを読む。実際に使った字体のパスと SHA-256 は
 結果 JSON の `font` に出るので、**後から「何で組まれたか」を辿れる。**
 
+## 層ごとに字体を選ぶ
+
+最上位の `font` は**既定**である。文字の層に `font` を書けば、その層だけ
+それで組む（書かない層は最上位を継ぐ）。見出しを W8、補足を W4 にするような
+強弱は、1 ウェイトのファイルを層ごとに指して付ける。
+
+```json
+{
+  "font": { "family": "Hiragino Sans", "path": "fonts/ヒラギノ角ゴシック W4.ttc" },
+  "layers": [
+    { "id": "heading", "type": "text", "role": "heading", "lines": ["見出し"],
+      "rect": [80, 150, 560, 120], "size": 96, "weight": 800, "color": "#1f2328",
+      "font": { "family": "Hiragino Sans", "path": "fonts/ヒラギノ角ゴシック W8.ttc" } },
+    { "id": "note", "type": "text", "role": "caption", "lines": ["補足"],
+      "rect": [80, 300, 560, 60], "size": 40, "color": "#1f2328" }
+  ]
+}
+```
+
+全部の文字の層が自分の `font` を持てば、最上位の `font` は省ける（結果の最上位の
+`font` は null になる）。層ごとに**実際に組んだ字体**は結果の `layers[].font` が
+名乗る——その層の `weight` で引いた face のパスと SHA-256、それに**実際に描かれる
+太さ**（`weight`）である。
+
+## 太さも黙って代替しない
+
+**`weight` に合う face が字体に無ければ、近い太さの face で描かれる。kiri も
+組版の resvg も太さを合成しない。** 1 ウェイトのファイル（W4）を指して `weight` を
+100 と 900 にすると、2 枚はバイト単位で一致する。そのときは
+`FONT_WEIGHT_UNAVAILABLE` が層を名指しし、`data.requested`（指定）と
+`data.actual`（実際に描かれる太さを 100 刻みへ丸めた値）を返す。**その層では `weight` を変えても絵が
+変わらない**ので、太さを変えたければその太さのファイルを `layers[].font` で指す。
+
+可変フォント（wght 軸を持つ字体）は、軸の範囲の中なら指定どおりの太さで描かれ、
+警告は出ない。範囲の外は端で止まるので出る。
+
+`weight` は **100〜900 の 100 刻み**で書く。それ以外（450 など）は `SPEC_INVALID`
+で断る——組版の resvg は 9 つの値しか太さとして読まず、450 は黙って 400 で組まれる。
+
 ## 測って返す（`--fail-on`）
 
 | 指標 | 警告 | 何を見るか |
@@ -147,7 +186,7 @@ $ kiri compose header.json -o header.png --profile note --json | jq '.layers[1].
 | 理由 | いつ | 直し方 |
 |---|---|---|
 | `too_small` | `size_px`（= `size × 表示幅 / canvas の幅`）が 11 未満 | `size` を `11 × canvas の幅 / 表示幅` 以上にする（1280 幅なら mobile_list で 98） |
-| `strokes_lost` | 縮めた被覆が 0.5 に届く画素が 1 つも無い（線が 1px 未満に潰れた） | `weight` を上げる |
+| `strokes_lost` | 縮めた被覆が 0.5 に届く画素が 1 つも無い（線が 1px 未満に潰れた） | `weight` を上げる。同じ層に `FONT_WEIGHT_UNAVAILABLE` が出ていれば `weight` は効かないので、太い face のファイルを `layers[].font` で指す |
 | `low_contrast` | 縮めた絵での前景と背景のコントラスト比が 4.5 未満 | 文字色か、その文字が載っている下地を変える |
 
 1 つでも当たれば `legible: false` で、`TEXT_ILLEGIBLE_AT_DISPLAY` が出る。

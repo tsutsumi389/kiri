@@ -31,7 +31,7 @@ use image::RgbaImage;
 use crate::cli::ComposeArgs;
 use crate::compose::measure::{self, COVERAGE, LayerReport};
 use crate::compose::profile::ComposeProfile;
-use crate::compose::{self, ComposeSpec, ImageLayer, Layer, Role, TextLayer, display};
+use crate::compose::{self, ComposeSpec, ImageLayer, Layer, Role, TextLayer, Trim, display};
 use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::{load, save};
 use crate::report::{
@@ -297,7 +297,7 @@ fn build(
         let index = i as u16;
         let report = match layer {
             Layer::Image(image) => {
-                let placed = draw_image(
+                let (placed, opaque_rect) = draw_image(
                     &mut canvas,
                     image,
                     base,
@@ -312,12 +312,17 @@ fn build(
                     role: image.role,
                     rect: image.rect,
                     placed,
+                    opaque_rect,
                     line_widths: None,
                     text_overflow: None,
                     text_contrast: None,
                     text_obscured: None,
                     layer_overlap: None,
-                    outside_safe_area: spec.safe_area.map(|a| measure::outside(a, placed)),
+                    // **不透明な画素で判定する。** 透過の余白が外へ出ても、表示で
+                    // 切られるものは無い。描く画素が無ければ外へは出ようがない
+                    outside_safe_area: spec
+                        .safe_area
+                        .map(|a| opaque_rect.is_some_and(|r| measure::outside(a, r))),
                     align: None,
                     display: None,
                 }
@@ -420,7 +425,8 @@ fn obscured(entry: &Covered, painter: &[u16]) -> Option<f64> {
     Some(hidden as f64 / entry.pixels.len() as f64)
 }
 
-/// 画像を枠へ当てはめて重ね、**実際に置かれた矩形**を返す。
+/// 画像を枠へ当てはめて重ね、**実際に置かれた矩形**と、そのうち不透明な画素が
+/// 占める矩形を返す。
 ///
 /// **原点を 0 で止めない。** 止めると「枠の外へ置いた」という事実が結果から
 /// 消え、`placed` が spec と違う位置を名乗る。はみ出した分は
@@ -433,9 +439,25 @@ fn draw_image(
     subject: &mut [u8],
     has_subject: &mut bool,
     painter: &mut [u16],
-) -> Result<[f64; 4]> {
+) -> Result<([f64; 4], Option<[f64; 4]>)> {
     let path = base.join(&layer.source);
     let loaded = load::load_with(&path, &Default::default())?;
+    // 透過の余白を落としてから当てはめる（`compose::Trim` の doc）。1 画素も
+    // 不透明でない素材は切り詰める先が無いので、そのまま当てはめる
+    //
+    // 元の絵はこのブロックで手放す。切り詰めた複製と当てはめた絵が並ぶ間まで
+    // 持つと、24MP で 100MB 近くを無駄に抱える
+    let (source, bounds) = {
+        let original = loaded.image;
+        let bounds = measure::opaque_bounds(&original);
+        match (layer.trim, bounds) {
+            (Trim::Alpha, Some([bx, by, bw, bh])) if (bw, bh) != original.dimensions() => (
+                image::imageops::crop_imm(&original, bx, by, bw, bh).to_image(),
+                Some([0, 0, bw, bh]),
+            ),
+            _ => (original, bounds),
+        }
+    };
 
     let [x, y, width, height] = layer.rect;
     // 枠の寸法は `compose::check_rect` が `MAX_CANVAS_SIDE` 以下だと確かめている
@@ -448,8 +470,8 @@ fn draw_image(
         // 呼ぶ側の仕事という分担は `canvas::apply` と同じ
         allow_upscale: true,
     };
-    let plan = crate::transform::plan((loaded.image.width(), loaded.image.height()), &spec)?;
-    let fitted = crate::transform::apply(&loaded.image, &plan)?;
+    let plan = crate::transform::plan((source.width(), source.height()), &spec)?;
+    let fitted = crate::transform::apply(&source, &plan)?;
 
     // 枠の中央へ寄せる。**枠より小さく収まるのは `contain` の約束**で、
     // そのぶんの余白をどちらへ寄せるかは決めなければならない
@@ -470,7 +492,38 @@ fn draw_image(
     paint(painter, canvas.width(), canvas.height(), &fitted, at, index);
     canvas_mod::composite_clipped(canvas, &fitted, at);
 
-    Ok([at.0 as f64, at.1 as f64, f64::from(fw), f64::from(fh)])
+    let opaque = bounds
+        .and_then(|b| opaque_in_fitted(b, source.dimensions(), &plan))
+        .map(|[ox, oy, ow, oh]| [at.0 as f64 + ox, at.1 as f64 + oy, ow, oh]);
+    Ok((
+        [at.0 as f64, at.1 as f64, f64::from(fw), f64::from(fh)],
+        opaque,
+    ))
+}
+
+/// 素材の不透明な外接矩形を、当てはめた後の絵の座標へ写す。`cover` で
+/// 切り落とされて何も残らなければ `None`。
+///
+/// **縮めた絵の画素を数え直さない。** Lanczos は縁の外へ不透明度 1〜3 の裾を
+/// 数画素ぶん作り、それを数えると見えない画素のせいで矩形が膨らむ——
+/// `safe_area` の偽陽性を直すための値が、別の偽陽性を作る。
+///
+/// 写した矩形は**外向きに画素の格子へ丸める**。`placed` と同じく整数で返し、
+/// 広がるのは 1px 未満なので裾の問題は戻らない。
+fn opaque_in_fitted(
+    bounds: [u32; 4],
+    source: (u32, u32),
+    plan: &crate::transform::ResizePlan,
+) -> Option<[f64; 4]> {
+    let sx = f64::from(plan.scaled.0) / f64::from(source.0);
+    let sy = f64::from(plan.scaled.1) / f64::from(source.1);
+    let (cx, cy, cw, ch) = plan.crop.unwrap_or((0, 0, plan.scaled.0, plan.scaled.1));
+    let [bx, by, bw, bh] = bounds.map(f64::from);
+    let x0 = (bx * sx - f64::from(cx)).floor().max(0.0);
+    let y0 = (by * sy - f64::from(cy)).floor().max(0.0);
+    let x1 = ((bx + bw) * sx - f64::from(cx)).ceil().min(f64::from(cw));
+    let y1 = ((by + bh) * sy - f64::from(cy)).ceil().min(f64::from(ch));
+    (x0 < x1 && y0 < y1).then_some([x0, y0, x1 - x0, y1 - y0])
 }
 
 /// 文字を組んで重ね、測りと「覆った画素」と、この文字だけを描いた画像を返す。
@@ -540,6 +593,7 @@ fn draw_text(
         role: layer.role,
         rect: layer.rect,
         placed: layout.bbox,
+        opaque_rect: None,
         line_widths: Some(layout.line_widths),
         text_overflow: Some(measure::overflow(layer.rect, layout.bbox)),
         text_contrast: contrast,
@@ -639,6 +693,39 @@ fn write(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `cover` で切り落とされた部分は、不透明な矩形からも落ちる。
+    #[test]
+    fn the_opaque_rect_is_clipped_by_the_cover_crop() {
+        // 200x100 の素材を 2 倍の 400x200 へ広げ、中央の 200x200 を残す
+        let plan = crate::transform::ResizePlan {
+            scaled: (400, 200),
+            crop: Some((100, 0, 200, 200)),
+            output: (200, 200),
+        };
+        // 左端の 60x100 だけが不透明 → 拡大後 [0,0,120,200] → 切り取り後 [0,0,20,200]
+        assert_eq!(
+            opaque_in_fitted([0, 0, 60, 100], (200, 100), &plan),
+            Some([0.0, 0.0, 20.0, 200.0])
+        );
+        // 左端の 40x100 は切り取りで全部落ちる
+        assert_eq!(opaque_in_fitted([0, 0, 40, 100], (200, 100), &plan), None);
+    }
+
+    /// 割り切れない倍率でも、返す矩形は画素の格子に乗り、不透明な範囲を覆う。
+    #[test]
+    fn the_opaque_rect_is_rounded_outward_to_whole_pixels() {
+        // 300 → 100 の 1/3 倍。[10, 10, 50, 50] は x 3.33〜20 に写り、[3, 3, 17, 17] へ丸まる
+        let plan = crate::transform::ResizePlan {
+            scaled: (100, 100),
+            crop: None,
+            output: (100, 100),
+        };
+        assert_eq!(
+            opaque_in_fitted([10, 10, 50, 50], (300, 300), &plan),
+            Some([3.0, 3.0, 17.0, 17.0])
+        );
+    }
 
     /// 容量の hint は**いまの形式で効く手**を言う（§12.9 の R5）。JPEG / AVIF に
     /// 「JPEG / AVIF で書け」と言っても次の手にならない。PNG と kiri の WebP は

@@ -1991,6 +1991,11 @@ fn a_decoration_has_no_display() {
 /// 組み、書いたバイト列の SHA-256 と結果 JSON のキーの集合を、Phase 31 の前の
 /// build（6c380ec）で取った値と比べる。**手で並べて確かめた一致を、次の変更で
 /// 黙って失わないため**である。
+///
+/// 素材は透過の余白を持つので、`"trim": "none"` を書いて**`trim` を足す前の
+/// 振る舞い**で組む。既定（`alpha`）では余白を落として拡大するのでバイト列が
+/// 変わる——それは意図した互換の変化で、`none` で前と同じバイトに戻ることを
+/// ここで留める。結果 JSON の層には `opaque_rect` が 1 つ増えた。
 #[test]
 fn without_a_profile_the_output_matches_the_build_before_phase_31() {
     let dir = TempDir::new().unwrap();
@@ -2020,7 +2025,8 @@ fn without_a_profile_the_output_matches_the_build_before_phase_31() {
         r##"{"canvas":{"width":400,"height":400,"background":"#f5f2ec"},
              "safe_area":[0,0,400,400],
              "layers":[{"id":"subject","type":"image","role":"subject",
-                        "source":"product.png","rect":[100,0,200,400]}]}"##,
+                        "source":"product.png","rect":[100,0,200,400],
+                        "trim":"none"}]}"##,
     );
     let out = dir.path().join("out.png");
     let result = compose(&spec, &out, &["--fail-on", "default"]);
@@ -2064,6 +2070,7 @@ fn without_a_profile_the_output_matches_the_build_before_phase_31() {
             "kind",
             "layer_overlap",
             "line_widths",
+            "opaque_rect",
             "outside_safe_area",
             "placed",
             "rect",
@@ -2096,3 +2103,244 @@ fn without_a_profile_the_output_matches_the_build_before_phase_31() {
 const PRE_PHASE_31_SHA256: &str =
     "e71520e62be951f84aff8decc1ed4d704d2946d9273b2f8f1549546bd178268e";
 const PRE_PHASE_31_BYTES: u64 = 63235;
+
+// ---------------------------------------------------------------------------
+// 透過の余白: image 層の `trim` と `opaque_rect`
+// ---------------------------------------------------------------------------
+
+/// 透明なキャンバスの `[x, y, w, h]` だけを不透明にした素材を置く。
+///
+/// **`cutout --canvas` / `--rotate` の出力の形である。** 商品は素材の一部しか
+/// 占めず、残りは透過の余白になる。
+fn padded(dir: &Path, name: &str, size: (u32, u32), opaque: [u32; 4]) -> PathBuf {
+    let [ox, oy, ow, oh] = opaque;
+    let image = image::RgbaImage::from_fn(size.0, size.1, |x, y| {
+        if x >= ox && x < ox + ow && y >= oy && y < oy + oh {
+            image::Rgba([190, 70, 55, 255])
+        } else {
+            image::Rgba([0, 0, 0, 0])
+        }
+    });
+    write_png(dir, name, &image)
+}
+
+fn assert_close(actual: [f64; 4], expected: [f64; 4], tolerance: f64, what: &str) {
+    for i in 0..4 {
+        assert!(
+            (actual[i] - expected[i]).abs() <= tolerance,
+            "{what}: {actual:?} が {expected:?} から ±{tolerance} を外れた"
+        );
+    }
+}
+
+/// **既定では透過の余白を切り詰めてから枠へ当てはめる。**
+///
+/// 余白ごと内接させると、横幅の 24% しか占めない商品は枠の中で豆粒になる
+/// （2026-10-14 のサムネ検証で再現した事故）。
+#[test]
+fn a_transparent_margin_is_trimmed_before_fitting_by_default() {
+    let dir = TempDir::new().unwrap();
+    padded(dir.path(), "cut.png", (400, 400), [100, 50, 100, 300]);
+    let spec = write_spec(
+        dir.path(),
+        r##"{"canvas":{"width":400,"height":400,"background":"#ffffff"},
+             "layers":[{"id":"p","type":"image","role":"subject",
+                        "source":"cut.png","rect":[0,0,200,200]}]}"##,
+    );
+    let out = dir.path().join("out.png");
+    let report = json_stdout(&compose(&spec, &out, &["--dry-run"]));
+    let p = layer(&report, "p");
+
+    // 100x300 の商品が 200x200 の枠へ内接して 67x200 になり、中央へ寄る
+    assert_close(
+        rect_of(&p["placed"]),
+        [66.0, 0.0, 67.0, 200.0],
+        1.0,
+        "placed は切り詰めた素材の矩形",
+    );
+    assert_close(
+        rect_of(&p["opaque_rect"]),
+        rect_of(&p["placed"]),
+        1.0,
+        "切り詰めた素材では、不透明画素の矩形は placed とほぼ一致する",
+    );
+}
+
+/// `"trim": "none"` は余白ごと内接させる——今までの振る舞いである。
+#[test]
+fn trim_none_keeps_the_transparent_margin() {
+    let dir = TempDir::new().unwrap();
+    padded(dir.path(), "cut.png", (400, 400), [100, 50, 100, 300]);
+    let spec = write_spec(
+        dir.path(),
+        r##"{"canvas":{"width":400,"height":400,"background":"#ffffff"},
+             "layers":[{"id":"p","type":"image","role":"subject",
+                        "source":"cut.png","rect":[0,0,200,200],"trim":"none"}]}"##,
+    );
+    let out = dir.path().join("out.png");
+    let report = json_stdout(&compose(&spec, &out, &["--dry-run"]));
+    let p = layer(&report, "p");
+
+    assert_eq!(rect_of(&p["placed"]), [0.0, 0.0, 200.0, 200.0]);
+    assert_close(
+        rect_of(&p["opaque_rect"]),
+        [50.0, 25.0, 50.0, 150.0],
+        1.0,
+        "余白を残しても、不透明画素が占める矩形は別に返る",
+    );
+}
+
+/// `safe_area` は**不透明画素**で判定する。透過の余白がはみ出しても言わない。
+///
+/// `cutout --canvas 1400 --fill-ratio 0.9` の素材を note のヘッダーへ置くと、
+/// 余白込みの矩形だけが safe_area の上へ出て、偽の警告になっていた。
+#[test]
+fn the_safe_area_is_judged_by_the_opaque_pixels_not_the_margin() {
+    let dir = TempDir::new().unwrap();
+    padded(dir.path(), "cut.png", (100, 100), [25, 25, 50, 50]);
+    let spec = write_spec(
+        dir.path(),
+        r##"{"canvas":{"width":100,"height":100,"background":"#ffffff"},
+             "safe_area":[20,20,60,60],
+             "layers":[{"id":"p","type":"image","role":"subject",
+                        "source":"cut.png","rect":[0,0,100,100],"trim":"none"}]}"##,
+    );
+    let out = dir.path().join("out.png");
+    let report = json_stdout(&compose(&spec, &out, &["--dry-run"]));
+    let p = layer(&report, "p");
+
+    assert_eq!(rect_of(&p["placed"]), [0.0, 0.0, 100.0, 100.0]);
+    assert_eq!(p["outside_safe_area"], Value::Bool(false));
+    assert!(
+        !codes(&report).contains(&"OUTSIDE_SAFE_AREA".to_string()),
+        "見えない余白だけが外へ出ているのに警告した: {report}"
+    );
+}
+
+/// 不透明画素が safe_area の外へ出れば、今までどおり言う。
+#[test]
+fn opaque_pixels_outside_the_safe_area_are_still_named() {
+    let dir = TempDir::new().unwrap();
+    padded(dir.path(), "cut.png", (100, 100), [25, 25, 50, 50]);
+    let spec = write_spec(
+        dir.path(),
+        r##"{"canvas":{"width":100,"height":100,"background":"#ffffff"},
+             "safe_area":[30,30,40,40],
+             "layers":[{"id":"p","type":"image","role":"subject",
+                        "source":"cut.png","rect":[0,0,100,100],"trim":"none"}]}"##,
+    );
+    let out = dir.path().join("out.png");
+    let report = json_stdout(&compose(&spec, &out, &["--dry-run"]));
+
+    assert_eq!(layer(&report, "p")["outside_safe_area"], Value::Bool(true));
+    let warning = report["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "OUTSIDE_SAFE_AREA")
+        .expect("OUTSIDE_SAFE_AREA が出ていない");
+    assert!(
+        warning["data"].get("opaque_rect").is_some(),
+        "判定に使った矩形を data に添えていない: {warning}"
+    );
+}
+
+/// 1 画素も不透明でない素材は、切り詰めず、`opaque_rect` は null。
+/// **描く画素が無いので safe_area の外へは出ようがない。**
+#[test]
+fn a_fully_transparent_image_has_no_opaque_rect() {
+    let dir = TempDir::new().unwrap();
+    padded(dir.path(), "empty.png", (50, 50), [0, 0, 0, 0]);
+    let spec = write_spec(
+        dir.path(),
+        r##"{"canvas":{"width":100,"height":100},
+             "safe_area":[40,40,20,20],
+             "layers":[{"id":"p","type":"image","role":"decoration",
+                        "source":"empty.png","rect":[0,0,100,100]}]}"##,
+    );
+    let out = dir.path().join("out.png");
+    let result = compose(&spec, &out, &["--dry-run"]);
+    assert!(result.status.success());
+    let report = json_stdout(&result);
+    let p = layer(&report, "p");
+
+    assert_eq!(rect_of(&p["placed"]), [0.0, 0.0, 100.0, 100.0]);
+    assert_eq!(p["opaque_rect"], Value::Null);
+    assert_eq!(p["outside_safe_area"], Value::Bool(false));
+}
+
+/// `trim` に知らない値を書けば断る。
+#[test]
+fn an_unknown_trim_value_is_refused() {
+    let dir = TempDir::new().unwrap();
+    portrait(dir.path());
+    let spec = write_spec(
+        dir.path(),
+        r##"{"canvas":{"width":100,"height":100},
+             "layers":[{"id":"p","type":"image","role":"subject",
+                        "source":"product.png","rect":[0,0,100,100],"trim":"alfa"}]}"##,
+    );
+    let out = dir.path().join("out.png");
+    let result = compose(&spec, &out, &["--dry-run"]);
+    assert!(!result.status.success());
+    assert_eq!(json_stdout(&result)["error"]["code"], "SPEC_INVALID");
+}
+
+/// `kiri schema` が `trim` と `opaque_rect` を配る。
+#[test]
+fn the_schema_publishes_trim_and_opaque_rect() {
+    let schema = json_stdout(&kiri().args(["schema", "--json"]).output().unwrap());
+    let image_keys = schema["compose_spec"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["at"] == "layers[type=image]")
+        .unwrap()["keys"]
+        .clone();
+    assert!(
+        image_keys.as_array().unwrap().iter().any(|k| k == "trim"),
+        "{image_keys}"
+    );
+    assert!(
+        schema["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["path"] == "layers[].opaque_rect"),
+        "fields に layers[].opaque_rect が無い"
+    );
+}
+
+/// `cover` では、切り詰めた後に枠からはみ出す分が切り落とされる。**落ちるのは
+/// 余白ではなく商品である。** 余白のほうを落としたければ `"trim": "none"`。
+#[test]
+fn cover_after_trimming_crops_the_product_itself() {
+    let dir = TempDir::new().unwrap();
+    // 100x300 の商品を 400x400 の余白の中に置いた素材
+    padded(dir.path(), "cut.png", (400, 400), [100, 50, 100, 300]);
+    let spec = |trim: &str| {
+        write_spec(
+            dir.path(),
+            &format!(
+                r##"{{"canvas":{{"width":200,"height":200}},
+                     "layers":[{{"id":"p","type":"image","role":"subject",
+                                "source":"cut.png","rect":[0,0,200,200],
+                                "fit":"cover","trim":"{trim}"}}]}}"##
+            ),
+        )
+    };
+    let out = dir.path().join("out.png");
+
+    // 切り詰めると 100x300 が 200x600 に広がり、中央の 200x200 が残る——商品で埋まる
+    let report = json_stdout(&compose(&spec("alpha"), &out, &["--dry-run"]));
+    let p = layer(&report, "p");
+    assert_eq!(rect_of(&p["placed"]), [0.0, 0.0, 200.0, 200.0]);
+    assert_eq!(rect_of(&p["opaque_rect"]), [0.0, 0.0, 200.0, 200.0]);
+
+    // 余白ごとなら 400x400 が 200x200 に縮むだけで、商品は [50, 25, 50, 150]
+    let report = json_stdout(&compose(&spec("none"), &out, &["--dry-run"]));
+    assert_eq!(
+        rect_of(&layer(&report, "p")["opaque_rect"]),
+        [50.0, 25.0, 50.0, 150.0]
+    );
+}

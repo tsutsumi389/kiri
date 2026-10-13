@@ -199,7 +199,7 @@ warning_catalog! {
         => "compose が要求した字体に、spec の文字のグリフが無い。描けば豆腐が並ぶ（data.missing が欠けている文字を言う）",
         remedy: Some("data.missing の文字を持つ字体を font で指す"),
     OutsideSafeArea = "OUTSIDE_SAFE_AREA"
-        => "compose の要素が safe_area の外へ出た（表示側で切られる範囲にある）",
+        => "compose の要素が safe_area の外へ出た（表示側で切られる範囲にある）。画像は data.opaque_rect（不透明な画素の矩形）で判定する（文字は data.placed で判定し、opaque_rect は添えない）",
         remedy: Some("要素の rect を safe_area の中へ収める"),
     TextIllegibleAtDisplay = "TEXT_ILLEGIBLE_AT_DISPLAY"
         => "compose --profile の縮小表示で文字が読めない。data.layer の文字を data.display（幅 data.width px）へ縮めた絵で測った。data.reasons が too_small（data.size_px が 11 未満）/ strokes_lost（線が 1px 未満に潰れた）/ low_contrast（data.contrast が 4.5 未満）のどれかを言う",

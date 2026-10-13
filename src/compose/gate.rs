@@ -490,6 +490,7 @@ mod tests {
             role: Role::Heading,
             rect: [0.0, 0.0, 10.0, 10.0],
             placed: [0.0, 0.0, 10.0, 10.0],
+            opaque_rect: None,
             line_widths: Some(vec![10.0]),
             text_overflow: Some(0.0),
             text_contrast: Some(21.0),

@@ -72,6 +72,13 @@ pub struct LayerReport {
     /// **実際に置かれた矩形。** 画像は枠に内接して縮むので枠とは違う値になり、
     /// 文字は組んだ結果の外接矩形になる。**呼ぶ側が余白を計算できるのはこちら**
     pub placed: [f64; 4],
+    /// **不透明な画素が実際に占める矩形** `[x, y, 幅, 高さ]`。画像の層にだけ出る。
+    ///
+    /// `placed` は素材の矩形なので、透過の余白（`trim: "none"` の素材や、
+    /// `cover` で残った縁）まで含む。`outside_safe_area` はこちらで判定する
+    /// ——見えない余白が safe_area の外へ出ても、表示で切られるものは無い。
+    /// 文字の層と、1 画素も不透明でない画像では null
+    pub opaque_rect: Option<[f64; 4]>,
     /// 行ごとの実測幅(px)。画像では null。**割る材料は返すが、割らない**
     pub line_widths: Option<Vec<f64>>,
     /// 枠からはみ出した量(px)。**どの向きであれ最も大きい 1 つ**で、
@@ -138,6 +145,25 @@ pub fn overflow(rect: [f64; 4], placed: [f64; 4]) -> f64 {
 /// 「はみ出していない」のに「safe_area の外」と言われる。
 pub fn outside(area: [f64; 4], placed: [f64; 4]) -> bool {
     overflow(area, placed) > 0.0
+}
+
+/// 不透明度が 0 でない画素の外接矩形 `[x, y, 幅, 高さ]`。1 つも無ければ `None`。
+///
+/// **しきい値を 0 に置く。** `trim` が捨ててよいのは完全に透明な画素だけで、
+/// 半透明の影や縁を落とすと見た目が変わる。`safe_area` の判定も同じ線で引く
+/// ——薄くても見える画素は、表示で切られれば欠ける。
+pub fn opaque_bounds(image: &RgbaImage) -> Option<[u32; 4]> {
+    let (w, h) = image.dimensions();
+    let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0, 0);
+    for (x, y, p) in image.enumerate_pixels() {
+        if p[3] > 0 {
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x + 1);
+            y1 = y1.max(y + 1);
+        }
+    }
+    (x0 < x1).then(|| [x0, y0, x1 - x0, y1 - y0])
 }
 
 /// 文字が覆う画素だけを見て、背後とのコントラスト比を出す。
@@ -311,14 +337,17 @@ pub fn warnings(report: &LayerReport) -> Vec<Warning> {
     }
 
     if report.outside_safe_area == Some(true) {
-        out.push(
-            Warning::new(
-                WarningCode::OutsideSafeArea,
-                format!("'{id}' が safe_area の外へ出ています"),
-            )
-            .with_hint("表示側で切られる範囲にあります。safe_area の中へ収めてください")
-            .with_data("placed", report.placed.to_vec()),
-        );
+        let mut warning = Warning::new(
+            WarningCode::OutsideSafeArea,
+            format!("'{id}' が safe_area の外へ出ています"),
+        )
+        .with_hint("表示側で切られる範囲にあります。safe_area の中へ収めてください")
+        .with_data("placed", report.placed.to_vec());
+        // 判定に使った矩形を添える。文字は `placed` で判定するので添えない
+        if let Some(rect) = report.opaque_rect {
+            warning = warning.with_data("opaque_rect", rect.to_vec());
+        }
+        out.push(warning);
     }
 
     out
@@ -327,6 +356,15 @@ pub fn warnings(report: &LayerReport) -> Vec<Warning> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opaque_bounds_counts_any_non_zero_alpha() {
+        let mut image = RgbaImage::new(10, 8);
+        assert_eq!(opaque_bounds(&image), None, "全部透明なら矩形は無い");
+        image.put_pixel(2, 3, image::Rgba([0, 0, 0, 1]));
+        image.put_pixel(6, 5, image::Rgba([0, 0, 0, 255]));
+        assert_eq!(opaque_bounds(&image), Some([2, 3, 5, 3]));
+    }
 
     /// 2026-10-14 のサムネ検証で出た値そのもの（ヒラギノ角ゴ W8、size 104）。
     /// `usvg` の f32 から上がってきた y が 190 の 1 ulp 手前に落ちる。

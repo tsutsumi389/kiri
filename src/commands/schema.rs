@@ -152,7 +152,10 @@ fn compose_spec_entries() -> Vec<ComposeSpecEntry> {
         ComposeSpecEntry {
             at: "layers[type=image]",
             keys: keys::IMAGE_LAYER.to_vec(),
-            summary: "画像のレイヤ。rect は枠で、実際に置かれた矩形は結果の placed が返す",
+            summary: "画像のレイヤ。rect は枠で、実際に置かれた矩形は結果の placed が返す。\
+                      trim は当てはめる前の切り詰めで、既定の alpha は透過の余白\
+                      （不透明度 0 の画素）を落としてから fit する。none は素材の\
+                      キャンバスごと fit する（trim を足す前の振る舞い）",
         },
         ComposeSpecEntry {
             at: "layers[type=text]",
@@ -2028,6 +2031,22 @@ fn fields() -> Vec<FieldEntry> {
             ),
         },
         FieldEntry {
+            path: "layers[].opaque_rect",
+            appears_in: compose(),
+            unit: "list",
+            nullable: true,
+            null_means: Some("文字のレイヤ、または 1 画素も不透明でない画像"),
+            warns: vec![],
+            gates: None,
+            summary: "画像の不透明な画素（不透明度が 0 でない）が実際に占める矩形 [x, y, 幅, 高さ]",
+            notes: Some(
+                "画素の格子へ外向きに丸めた整数。placed は素材の矩形なので、\
+                 trim: none の素材の透過の余白まで含む。\
+                 **商品が実際にどこを占めるかはこちらで見る。** outside_safe_area は\
+                 この矩形で判定する",
+            ),
+        },
+        FieldEntry {
             path: "layers[].text_overflow",
             appears_in: compose(),
             unit: "px",
@@ -2128,7 +2147,9 @@ fn fields() -> Vec<FieldEntry> {
             gates: None,
             summary: "そのレイヤが safe_area の外へ出たか",
             notes: Some(
-                "**範囲は spec が書く**——どこまでが切られずに残るかは媒体ごとに違い、\
+                "画像は opaque_rect（不透明な画素）で判定し、透過の余白が外へ出ても\
+                 言わない。1 画素も不透明でない画像は false。文字は placed で判定する。\
+                 **範囲は spec が書く**——どこまでが切られずに残るかは媒体ごとに違い、\
                  出典も媒体の側にある。--profile を渡して spec が省いたときは、\
                  profile の範囲を使う（null と書いても同じ）。比が profile と同じ\
                  （PROFILE_ASPECT_MISMATCH が出ない）なら比で合わせ、外れていれば\

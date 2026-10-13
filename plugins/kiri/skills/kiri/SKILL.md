@@ -162,6 +162,11 @@ kiri compose layout.json -o thumb.png --fail-on default --json
 - **`lines` は行の配列である。** 長い見出しはどこで割るかを自分で決めて行に分ける。
   行ごとの実測幅は `layers[]` に返る
 - `rect` は枠で、画像は内接して縮む。実際に置かれた矩形は `layers[].placed` を見る
+- **画像は透過の余白を切り詰めてから枠へ当てはめる**（既定の `"trim": "alpha"`）。`cutout` の
+  `--canvas` や `--rotate` で余白が付いた素材でも、商品そのものが `rect` いっぱいに置かれる。
+  余白ごと置きたいときだけ `"trim": "none"` を書く
+- 商品が実際に占める矩形は `layers[].opaque_rect` を見る。`outside_safe_area` もこれで判定するので、
+  透過の余白が `safe_area` の外へ出ても警告されない
 - 後の層ほど上に描かれる。文字は `layers` の末尾側に置く
 - 警告はどれも `remedy` が直し方を言う。よく出るのは次のとおり
 

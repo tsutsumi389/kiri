@@ -47,7 +47,7 @@ pub mod keys {
     pub const SPEC: &[&str] = &["canvas", "font", "safe_area", "layers"];
     pub const CANVAS: &[&str] = &["width", "height", "background"];
     pub const FONT: &[&str] = &["family", "path"];
-    pub const IMAGE_LAYER: &[&str] = &["id", "type", "role", "source", "rect", "fit"];
+    pub const IMAGE_LAYER: &[&str] = &["id", "type", "role", "source", "rect", "fit", "trim"];
     pub const TEXT_LAYER: &[&str] = &[
         "id",
         "type",
@@ -237,10 +237,41 @@ pub struct ImageLayer {
     /// 枠への当てはめ方。既定は `contain`（枠に収まるまで縮める）
     #[serde(default = "default_fit")]
     pub fit: FitMode,
+    /// 当てはめる前に何を切り詰めるか。既定は `alpha`（透過の余白）
+    #[serde(default)]
+    pub trim: Trim,
 }
 
 fn default_fit() -> FitMode {
     FitMode::Contain
+}
+
+/// 素材を枠へ当てはめる前の切り詰め方。
+///
+/// # 既定が `alpha` である理由
+///
+/// **`cutout` の出力は、商品の外が透過の余白である。** `--canvas` は余白を
+/// 意図して足し、`--rotate` は回した四隅のぶんだけ余白を広げる（-91 度で
+/// 回した 5788x4386 の出力では、商品は横幅の 24% しか占めない）。余白ごと
+/// `contain` で内接させると、**枠を書いた側が置きたかった商品が枠の中で
+/// 豆粒になる**——枠は商品を置く場所として書かれるのであって、素材の
+/// キャンバスを置く場所として書かれるのではない。
+///
+/// 切り詰めは**見た目を 1 画素も消さない**：不透明度が 1 でもある画素の
+/// 外接矩形で切るので、捨てるのは完全に透明な画素だけである。不透明な写真
+/// （背景の層）では何も起きない。ただし `fit` の後は別で、`cover` が枠から
+/// はみ出して切り落とすのは余白ではなく商品になる。
+///
+/// 素材の余白そのものを構図として使いたいとき（余白込みで位置を揃えた
+/// 素材など）は `none` を書く。0.x までの振る舞いはこちらである。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Trim {
+    /// 不透明度が 0 でない画素の外接矩形で切り詰めてから当てはめる
+    #[default]
+    Alpha,
+    /// 素材をそのまま当てはめる（透過の余白も枠に内接させる）
+    None,
 }
 
 #[derive(Debug, Clone, Deserialize)]

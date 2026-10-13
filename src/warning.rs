@@ -202,7 +202,7 @@ warning_catalog! {
         => "compose の文字の weight（data.requested）に合う face が字体に無く、別の太さ（data.actual）で描かれる。kiri も usvg も太さを合成しないので、weight を変えても絵が変わらない。可変フォントは wght 軸の範囲の中なら出ない",
         remedy: Some("data.requested の太さの face を持つファイル（W8 など別ウェイトのファイルか、可変フォント）を layers[].font で指す。合わせられなければ weight を data.actual（100 刻みへ丸めた値）にして、指定と絵を一致させる"),
     OutsideSafeArea = "OUTSIDE_SAFE_AREA"
-        => "compose の要素が safe_area の外へ出た（表示側で切られる範囲にある）",
+        => "compose の要素が safe_area の外へ出た（表示側で切られる範囲にある）。画像は data.opaque_rect（不透明な画素の矩形）で判定する（文字は data.placed で判定し、opaque_rect は添えない）",
         remedy: Some("要素の rect を safe_area の中へ収める"),
     TextIllegibleAtDisplay = "TEXT_ILLEGIBLE_AT_DISPLAY"
         => "compose --profile の縮小表示で文字が読めない。data.layer の文字を data.display（幅 data.width px）へ縮めた絵で測った。data.reasons が too_small（data.size_px が 11 未満）/ strokes_lost（線が 1px 未満に潰れた）/ low_contrast（data.contrast が 4.5 未満）のどれかを言う",

@@ -449,6 +449,55 @@ fn an_element_outside_the_safe_area_is_named() {
     assert!(codes(&report).contains(&"OUTSIDE_SAFE_AREA".to_string()));
 }
 
+/// **描画の端数ははみ出しではない**（2026-10-14 のサムネ検証の再現）。
+///
+/// ヒラギノ角ゴ W8 の size 104 を y=190 に置くと、外接矩形の y が f32 の
+/// 丸めで 189.99998 になる。これを 1.5e-5px のはみ出しと数えると、
+/// `--fail-on text_overflow>0` が見た目に何も起きていない構図で exit 5 を返す。
+/// `safe_area` の上辺をちょうど 190 にして、`outside` の側も同じ端数で見る。
+///
+/// 字体はこの機械の綴りに依る値なので、**在る機械でだけ走る**（モジュールの doc）。
+#[test]
+fn a_rounding_error_in_the_glyph_box_is_neither_overflow_nor_outside() {
+    const W8: &str = "/System/Library/Fonts/ヒラギノ角ゴシック W8.ttc";
+    if !Path::new(W8).exists() {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let spec = write_spec(
+        dir.path(),
+        &format!(
+            r##"{{"canvas":{{"width":1280,"height":670,"background":"#ffffff"}},
+                 "safe_area":[0,190,1280,300],
+                 "font":{{"family":"Hiragino Sans","path":"{W8}"}},
+                 "layers":[{{"id":"h1","type":"text","role":"heading",
+                            "lines":["切り抜き"],
+                            "rect":[70,190,780,120],"size":104,"color":"#000000"}}]}}"##
+        ),
+    );
+    let out = dir.path().join("out.png");
+    let result = compose(&spec, &out, &["--fail-on", "text_overflow>0"]);
+    let report = json_stdout(&result);
+    let h1 = layer(&report, "h1");
+    // **前提の確かめ。** 字体や `usvg` の版で y がちょうど 190 に戻ると、
+    // 端数の経路を通らないまま緑になる
+    assert_ne!(
+        h1["placed"][1].as_f64(),
+        Some(190.0),
+        "端数が再現していない: {h1}"
+    );
+
+    assert_eq!(h1["text_overflow"].as_f64(), Some(0.0), "{h1}");
+    assert_eq!(h1["outside_safe_area"], Value::Bool(false), "{h1}");
+    let codes = codes(&report);
+    assert!(!codes.contains(&"TEXT_OVERFLOW".to_string()), "{codes:?}");
+    assert!(
+        !codes.contains(&"OUTSIDE_SAFE_AREA".to_string()),
+        "{codes:?}"
+    );
+    assert_eq!(result.status.code(), Some(0), "{report}");
+}
+
 /// `safe_area` を書いていなければ測らない。**null であってキーは出る。**
 #[test]
 fn without_a_safe_area_the_key_is_null_but_present() {

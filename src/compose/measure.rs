@@ -42,6 +42,24 @@ pub const COVERAGE: u8 = 128;
 /// 「読める」と判断する。**
 pub const MAX_OBSCURED: f64 = 0.10;
 
+/// 描画の端数として見逃す幅(px)。**これ以下のはみ出しは 0 と数える。**
+///
+/// 外接矩形は `usvg` の f32 から上がってくる。f32 の刻みは 128〜256px で
+/// 2⁻¹⁶（1.5e-5）、16384px でも 2⁻⁹（0.002）で、`rect` の y=190 に置いた字が
+/// 189.99998 に落ちる、といったことが普通に起こる（2026-10-14、ヒラギノ角ゴ W8
+/// の size 104）。これを数えると `text_overflow>0` の門が何も起きていない構図を
+/// 落とし、**門そのものが信用されなくなる。**
+///
+/// 1/64px は組版で広く使われる最小単位（FreeType の 26.6 固定小数点の 1 刻み）
+/// である。kiri の経路がこれで量子化しているわけではない。16384px の f32 の
+/// 刻みの 8 倍あるので積み重なった丸めも吸い、1 画素の覆いを高々 1/64
+/// （約 4/255）しか変えないので、見て分かるはみ出しは見逃さない。
+///
+/// **丸めずに許容幅にする。** 量を丸めると、許容幅を超えた本物のはみ出しまで
+/// 値が動き、返す数が `rect` と `placed` の差から出せなくなる。許容幅以下だけを
+/// 0 にし、超えたものは測ったとおりに返す。
+pub const SUBPIXEL_TOLERANCE: f64 = 1.0 / 64.0;
+
 /// 1 層の測り。**結果 JSON の `compose.layers[]` そのものである。**
 #[derive(Debug, Clone, Serialize)]
 pub struct LayerReport {
@@ -101,22 +119,29 @@ pub struct LayerReport {
 ///
 /// 負にはしない。収まっている側の余裕は 0 である——余裕を負のはみ出しとして
 /// 配ると、`text_overflow>0` と書いた門の意味が向きに依って変わる。
+///
+/// `SUBPIXEL_TOLERANCE` 以下は描画の端数で、0 と数える。
 pub fn overflow(rect: [f64; 4], placed: [f64; 4]) -> f64 {
     let right = (placed[0] + placed[2]) - (rect[0] + rect[2]);
     let bottom = (placed[1] + placed[3]) - (rect[1] + rect[3]);
     let left = rect[0] - placed[0];
     let top = rect[1] - placed[1];
-    [right, bottom, left, top]
+    let worst = [right, bottom, left, top]
         .into_iter()
-        .fold(0.0_f64, f64::max)
+        .fold(0.0_f64, f64::max);
+    if worst <= SUBPIXEL_TOLERANCE {
+        0.0
+    } else {
+        worst
+    }
 }
 
 /// その矩形が `safe_area` に収まっていないか。
+///
+/// **`overflow` と同じ端数を見逃す。** 片方だけが端数を数えると、同じ矩形が
+/// 「はみ出していない」のに「safe_area の外」と言われる。
 pub fn outside(area: [f64; 4], placed: [f64; 4]) -> bool {
-    placed[0] < area[0]
-        || placed[1] < area[1]
-        || placed[0] + placed[2] > area[0] + area[2]
-        || placed[1] + placed[3] > area[1] + area[3]
+    overflow(area, placed) > 0.0
 }
 
 /// 不透明度が 0 でない画素の外接矩形 `[x, y, 幅, 高さ]`。1 つも無ければ `None`。
@@ -266,7 +291,7 @@ pub fn warnings(report: &LayerReport) -> Vec<Warning> {
         out.push(
             Warning::new(
                 WarningCode::TextOverflow,
-                format!("'{id}' が rect からはみ出しています（{over:.1}px）"),
+                format!("'{id}' が rect からはみ出しています（{over:.2}px）"),
             )
             .with_hint(
                 "kiri は縮めも折り返しもしません。lines を割るか、rect か size を\
@@ -336,5 +361,42 @@ mod tests {
         image.put_pixel(2, 3, image::Rgba([0, 0, 0, 1]));
         image.put_pixel(6, 5, image::Rgba([0, 0, 0, 255]));
         assert_eq!(opaque_bounds(&image), Some([2, 3, 5, 3]));
+    }
+
+    /// 2026-10-14 のサムネ検証で出た値そのもの（ヒラギノ角ゴ W8、size 104）。
+    /// `usvg` の f32 から上がってきた y が 190 の 1 ulp 手前に落ちる。
+    const RECT: [f64; 4] = [70.0, 190.0, 780.0, 120.0];
+    const PLACED: [f64; 4] = [70.0, 189.999_984_741_210_94, 416.0, 104.000_015_258_789_06];
+
+    #[test]
+    fn an_f32_rounding_error_is_not_an_overflow() {
+        assert_eq!(overflow(RECT, PLACED), 0.0);
+    }
+
+    #[test]
+    fn a_real_overflow_is_still_reported_as_measured() {
+        let placed = [70.0, 189.5, 416.0, 104.0];
+        assert_eq!(overflow(RECT, placed), 0.5);
+    }
+
+    /// 許容幅をわずかに超えたら、**その量をそのまま**返す。許容幅を差し引くと、
+    /// 返す数が `placed` と `rect` の差から出せなくなる
+    #[test]
+    fn just_beyond_the_tolerance_is_an_overflow_of_the_full_amount() {
+        let over = SUBPIXEL_TOLERANCE * 2.0;
+        let placed = [70.0, 190.0 - over, 416.0, 104.0];
+        assert_eq!(overflow(RECT, placed), over);
+    }
+
+    #[test]
+    fn an_f32_rounding_error_is_not_outside_the_safe_area() {
+        let area = [0.0, 190.0, 1280.0, 300.0];
+        assert!(!outside(area, PLACED));
+    }
+
+    #[test]
+    fn a_real_step_outside_the_safe_area_is_still_caught() {
+        let area = [0.0, 190.0, 1280.0, 300.0];
+        assert!(outside(area, [70.0, 189.5, 416.0, 104.0]));
     }
 }

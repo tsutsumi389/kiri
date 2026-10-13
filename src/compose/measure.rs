@@ -95,6 +95,9 @@ pub struct LayerReport {
     pub outside_safe_area: Option<bool>,
     /// 文字の揃え。画像では null
     pub align: Option<Align>,
+    /// この層を実際に組んだ字体（weight で引いた face と、描かれる太さ）。
+    /// 画像では null。**キーは常に出す**——最上位の `font` と同じ約束である
+    pub font: Option<crate::compose::font::UsedFont>,
     /// 縮小表示での読みやすさ（`compose::display`）。**`--profile` を渡し、
     /// 読めることを要求する文字の層にだけ出る。** それ以外ではキーごと出さない
     /// ——`--profile` を渡さない実行の結果 JSON を 1 バイトも動かさないためである

@@ -145,7 +145,8 @@ fn compose_spec_entries() -> Vec<ComposeSpecEntry> {
         ComposeSpecEntry {
             at: "font",
             keys: keys::FONT.to_vec(),
-            summary: "字体。文字のレイヤが 1 つでもあれば要る。\
+            summary: "既定の字体。文字の層が自分の font（layers[type=text].font）を持たなければ\
+                      これで組む。自分の font を持たない文字の層が 1 つでもあれば要る。\
                       見つからなければ FONT_NOT_FOUND で断る（代替へ落ちない）",
         },
         ComposeSpecEntry {
@@ -157,7 +158,17 @@ fn compose_spec_entries() -> Vec<ComposeSpecEntry> {
             at: "layers[type=text]",
             keys: keys::TEXT_LAYER.to_vec(),
             summary: "文字のレイヤ。lines は行の配列で、kiri は折り返さない\
-                      （行ごとの実測幅は結果の line_widths が返す）",
+                      （行ごとの実測幅は結果の line_widths が返す）。weight は 100〜900 の 100 刻み\
+                      （それ以外は SPEC_INVALID）。weight に合う face が\
+                      字体に無ければ近い太さで描かれ、FONT_WEIGHT_UNAVAILABLE が言う\
+                      （kiri は太さを合成しない）",
+        },
+        ComposeSpecEntry {
+            at: "layers[type=text].font",
+            keys: keys::FONT.to_vec(),
+            summary: "この層だけの字体。書けば最上位の font より強く、書かなければ最上位を継ぐ。\
+                      見出しを W8、補足を W4 にするように、1 ウェイトのファイルを層ごとに\
+                      指して強弱を付ける。形と断り方は最上位の font と同じ",
         },
     ]
 }
@@ -2069,6 +2080,24 @@ fn fields() -> Vec<FieldEntry> {
             notes: Some(
                 "**text_contrast と対で読む。** あちらは背後しか見ないので、\
 上から塗り潰された文字でも高い値を返す",
+            ),
+        },
+        FieldEntry {
+            path: "layers[].font.path",
+            appears_in: compose(),
+            unit: "path",
+            nullable: true,
+            null_means: Some(
+                "画像のレイヤ（layers[].font ごと null）、または字体がファイルとして辿れない",
+            ),
+            warns: vec![],
+            gates: None,
+            summary: "この文字の層を実際に組んだ字体のファイル",
+            notes: Some(
+                "**その層の weight で引いた face のファイルである**（最上位の font.path は\
+                 最上位の指定を weight 400 で引いたもの）。layers[].font には family / \
+                 sha256 / weight も並び、weight は**実際に描かれる太さ**で spec の weight \
+                 ではない。違えば FONT_WEIGHT_UNAVAILABLE が出ている",
             ),
         },
         FieldEntry {

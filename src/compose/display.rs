@@ -366,7 +366,10 @@ pub fn warning(layer: &str, report: &DisplayReport, canvas_w: u32) -> Option<War
                 "size を {} 以上にする（表示上 {MIN_DISPLAY_SIZE}px に届く大きさ）",
                 required_size(canvas_w, report.width)
             ),
-            Reason::StrokesLost => "weight を上げる（線が 1px 未満に潰れている）".to_string(),
+            Reason::StrokesLost => "weight を上げる（線が 1px 未満に潰れている。\
+                                    FONT_WEIGHT_UNAVAILABLE が出ていれば weight は効かないので、\
+                                    太い face を持つ字体を layers[].font で指す）"
+                .to_string(),
             Reason::LowContrast => "文字色か、その文字が載っている下地を変える".to_string(),
         });
     }

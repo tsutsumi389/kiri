@@ -9500,6 +9500,7 @@ fn remedies_name_only_options_that_exist() {
         "TEXT_OBSCURED",
         "TEXT_NOT_RENDERED",
         "FONT_GLYPHS_MISSING",
+        "FONT_WEIGHT_UNAVAILABLE",
         "OUTSIDE_SAFE_AREA",
     ];
     let any_command = options_of(None);
@@ -11252,7 +11253,9 @@ fn every_published_field_exists_in_the_result() {
         if path.starts_with("segment.") && segmented.is_none() {
             continue;
         }
-        if path.starts_with("layers[].display") && displayed.is_none() {
+        // `layers[].font` も文字の層にしか値を持たない（画像の層では null）
+        let wants_text = path.starts_with("layers[].display") || path.starts_with("layers[].font");
+        if wants_text && displayed.is_none() {
             continue;
         }
 
@@ -11272,7 +11275,7 @@ fn every_published_field_exists_in_the_result() {
                 "cutout" if path.starts_with("settings.") => &profiled,
                 "cutout" if path.starts_with("rotate.") => &rotated,
                 "lint" => &linted,
-                "compose" if path.starts_with("layers[].display") => displayed.as_ref().unwrap(),
+                "compose" if wants_text => displayed.as_ref().unwrap(),
                 "compose" => &composed,
                 "batch" => &batched,
                 "rotate" => &turned,

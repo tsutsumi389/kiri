@@ -197,13 +197,16 @@ warning_catalog! {
         remedy: Some("rect がキャンバスの中にあるか、字体がその文字を持つかを確かめる"),
     FontGlyphsMissing = "FONT_GLYPHS_MISSING"
         => "compose が要求した字体に、spec の文字のグリフが無い。描けば豆腐が並ぶ（data.missing が欠けている文字を言う）",
-        remedy: Some("data.missing の文字を持つ字体を font で指す"),
+        remedy: Some("data.missing の文字を持つ字体を font（その層だけなら layers[].font）で指す"),
+    FontWeightUnavailable = "FONT_WEIGHT_UNAVAILABLE"
+        => "compose の文字の weight（data.requested）に合う face が字体に無く、別の太さ（data.actual）で描かれる。kiri も usvg も太さを合成しないので、weight を変えても絵が変わらない。可変フォントは wght 軸の範囲の中なら出ない",
+        remedy: Some("data.requested の太さの face を持つファイル（W8 など別ウェイトのファイルか、可変フォント）を layers[].font で指す。合わせられなければ weight を data.actual（100 刻みへ丸めた値）にして、指定と絵を一致させる"),
     OutsideSafeArea = "OUTSIDE_SAFE_AREA"
         => "compose の要素が safe_area の外へ出た（表示側で切られる範囲にある）",
         remedy: Some("要素の rect を safe_area の中へ収める"),
     TextIllegibleAtDisplay = "TEXT_ILLEGIBLE_AT_DISPLAY"
         => "compose --profile の縮小表示で文字が読めない。data.layer の文字を data.display（幅 data.width px）へ縮めた絵で測った。data.reasons が too_small（data.size_px が 11 未満）/ strokes_lost（線が 1px 未満に潰れた）/ low_contrast（data.contrast が 4.5 未満）のどれかを言う",
-        remedy: Some("too_small なら size を上げる（要る size は 11 × canvas の幅 / data.width）。low_contrast なら文字色か、その文字が載っている下地を変える。strokes_lost なら weight を上げる"),
+        remedy: Some("too_small なら size を上げる（要る size は 11 × canvas の幅 / data.width）。low_contrast なら文字色か、その文字が載っている下地を変える。strokes_lost なら weight を上げる（FONT_WEIGHT_UNAVAILABLE が同じ層に出ていれば weight は効かないので、太い face を持つ字体を layers[].font で指す）"),
     ProfileAspectMismatch = "PROFILE_ASPECT_MISMATCH"
         => "compose の canvas の縦横比が --profile の比から 0.5% 以上外れている。表示側でトリミングされる（data.expected と data.actual が [幅, 高さ]）",
         remedy: Some("canvas の width / height を消して profile の大きさにする（または同じ比の大きさにする）"),

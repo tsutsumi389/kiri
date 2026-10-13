@@ -36,9 +36,9 @@ pub struct Layout {
 
 /// 1 つの文字レイヤを組む。
 ///
-/// `family` を spec の最上位から受け取るのは、**1 枚の中で字体を混ぜないため**で
-/// ある。レイヤごとに字体を選べる形にすると、素性（`ResolvedFont`）が層の数だけ
-/// 増え、「何で組まれたか」が 1 行で言えなくなる。
+/// `family` と `db` は**その層の字体**である（`font::resolve` が層ごとに決める）。
+/// 見出しと補足で字体を分けるのはサムネの基本の強弱で、1 ウェイトのファイルでは
+/// weight だけでは書けない。素性は層ごとに `layers[].font` が名乗る。
 pub fn layout(
     layer: &TextLayer,
     canvas: &Canvas,
@@ -145,7 +145,7 @@ fn line_index(rest: &str) -> Option<usize> {
 /// **ascent を使う。** 「上端 + size」という字体に依らない規則のほうが単純だが、
 /// ascent が em を超える字体では字の天が枠の上へ出て、`text_overflow` が 4 辺を
 /// 見る以上**枠の上端に置いただけの文字が毎回はみ出しを報告する**。縦位置が
-/// 字体に依ることは受け入れる——字体は spec が 1 つに固定しており、実際に
+/// 字体に依ることは受け入れる——字体は spec が層ごとに固定しており、実際に
 /// どこへ置かれたかは `bbox` が返す。
 fn to_svg(layer: &TextLayer, canvas: &Canvas, family: &str, ascent: f64) -> String {
     let [x, y, width, _] = layer.rect;

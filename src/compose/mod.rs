@@ -59,6 +59,7 @@ pub mod keys {
         "color",
         "line_height",
         "align",
+        "font",
     ];
 }
 
@@ -79,8 +80,9 @@ pub const MIN_FONT_SIZE: f64 = 1.0;
 #[derive(Debug, Clone, Deserialize)]
 pub struct ComposeSpec {
     pub canvas: Canvas,
-    /// 文字のレイヤが 1 つでもあれば要る。**既定のフォントは持たない**
-    /// （`font::resolve` の doc を参照）
+    /// 既定の字体。文字の層が自分の `font` を持たなければこれで組む。
+    /// 文字の層のどれかが `font` を持たなければ要る。**kiri は既定のフォントを
+    /// 持たない**（`font::resolve` の doc を参照）
     #[serde(default)]
     pub font: Option<FontSpec>,
     /// 表示側で切られずに残る範囲 `[x, y, 幅, 高さ]`。
@@ -104,7 +106,9 @@ pub struct Canvas {
     pub background: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// 字体の指定。**family と path の組で同じ指定かが決まる**（`font::resolve` は
+/// 同じ指定を 1 度しか読まない）。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct FontSpec {
     pub family: String,
     /// 読むファイルを 1 つに固定する。**与えられたらシステムは見に行かない**
@@ -253,7 +257,7 @@ pub struct TextLayer {
     /// 枠 `[x, y, 幅, 高さ]`。**収まらなければ縮めずに言う**
     pub rect: [f64; 4],
     pub size: f64,
-    /// 字の太さ（100〜900）。既定 400
+    /// 字の太さ（100〜900 の 100 刻み）。既定 400
     #[serde(default = "default_weight")]
     pub weight: u16,
     pub color: String,
@@ -262,6 +266,11 @@ pub struct TextLayer {
     pub line_height: f64,
     #[serde(default)]
     pub align: Align,
+    /// この層だけの字体。**書けば最上位の `font` より強い。** 見出しを W8、
+    /// 補足を W4 にするような強弱は、1 つの字体の weight では書けないことがある
+    /// （1 ウェイトのファイルでは weight が効かない。`font` の doc）
+    #[serde(default)]
+    pub font: Option<FontSpec>,
 }
 
 fn default_weight() -> u16 {
@@ -409,6 +418,9 @@ fn validate_keys(raw: &serde_json::Value) -> Result<()> {
             }
         };
         check(o.keys(), allowed, &format!("layers[{i}]"))?;
+        if let Some(font) = o.get("font").and_then(|v| v.as_object()) {
+            check(font.keys(), keys::FONT, &format!("layers[{i}].font"))?;
+        }
     }
     Ok(())
 }
@@ -487,30 +499,34 @@ fn validate(spec: &ComposeSpec) -> Result<()> {
                     ),
                 ));
             }
-            if !(100..=900).contains(&t.weight) {
+            // **100 刻みでない weight は断る。** usvg は "100"〜"900" の 9 つしか
+            // 太さとして読まず、450 は黙って 400 で組まれる——`FONT_WEIGHT_UNAVAILABLE`
+            // が塞いだ穴が、綴りの側から開く
+            if !(100..=900).contains(&t.weight) || t.weight % 100 != 0 {
                 return Err(Error::new(
                     ErrorCode::SpecInvalid,
                     format!(
-                        "layers[{i}] ({id}) の weight は 100〜900 です（指定: {}）",
+                        "layers[{i}] ({id}) の weight は 100〜900 の 100 刻みです（指定: {}）",
                         t.weight
                     ),
                 ));
             }
             parse_color(&t.color)?;
-        }
-    }
 
-    // **文字があるのにフォントが無い spec は、読む前に断る。** 既定のフォントへ
-    // 落とすと、同じ spec が機械ごとに違う絵になる（`font::resolve` の doc）
-    if spec.layers.iter().any(|l| matches!(l, Layer::Text(_))) && spec.font.is_none() {
-        return Err(Error::new(
-            ErrorCode::FontNotFound,
-            "文字のレイヤがありますが font が指定されていません",
-        )
-        .with_hint(
-            "font.family か font.path を書いてください。kiri は既定のフォントを持ちません\
-             ——持つと同じ spec が機械ごとに違う絵になります",
-        ));
+            // **文字があるのにフォントが無い層は、読む前に断る。** 既定のフォントへ
+            // 落とすと、同じ spec が機械ごとに違う絵になる（`font::resolve` の doc）
+            if t.font.is_none() && spec.font.is_none() {
+                return Err(Error::new(
+                    ErrorCode::FontNotFound,
+                    format!("layers[{i}] ({id}) は文字のレイヤですが font が指定されていません"),
+                )
+                .with_hint(
+                    "最上位の font か layers[].font に family か path を書いてください。\
+                     kiri は既定のフォントを持ちません——持つと同じ spec が機械ごとに\
+                     違う絵になります",
+                ));
+            }
+        }
     }
     Ok(())
 }

@@ -22,9 +22,24 @@
 //!
 //! 使った字体の素性（パスと SHA-256）は結果 JSON に載せる。モデルの素性を
 //! `settings` に載せているのと同じ扱いで、**後から「何で組まれたか」を辿れる**
-//! ようにするためである。
+//! ようにするためである。字体は層ごとに選べるので、素性も層ごとに
+//! （`layers[].font`）載せる。最上位の `font` は最上位の指定の素性で、互換のために残す。
+//!
+//! # 太さも黙って代替しない
+//!
+//! usvg は weight に合う face が無ければ**最も近い face で組み、太さを合成しない。**
+//! 1 ウェイトのファイル（`ヒラギノ角ゴシック W4.ttc`）を指して weight を 100 と
+//! 900 にした 2 枚は、バイト単位で一致した（2026-10-14 のサムネ検証）。
+//! family の代替と同じ穴なので、**実際に描かれる太さが spec と違えば
+//! `FONT_WEIGHT_UNAVAILABLE` で名指しする。** 断らないのは、近い太さで組んだ絵は
+//! 読めるもので、太さ 1 つのために spec 全体を止めるのは強すぎるからである
+//! （`FONT_GLYPHS_MISSING` と同じ判断）。
+//!
+//! 可変フォントは wght 軸の範囲の中なら指定どおりに描かれる（usvg が
+//! font-weight を wght へ当てる）。**軸を見ずに face の太さだけで比べると、
+//! 可変フォントで毎回誤検出する**——`query` が太さを見ないのと同じ罠である。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use resvg::usvg::fontdb;
@@ -50,26 +65,222 @@ pub struct ResolvedFont {
     pub sha256: Option<String>,
 }
 
-/// 字体を 1 つに決める。
+/// 1 つの文字の層が実際に組まれた字体。**結果 JSON の `layers[].font` である。**
+///
+/// 最上位の `font`（`ResolvedFont`）と違い、**その層の weight で引いた face** を
+/// 名乗る。同じ family でも W3 と W6 が別ファイルの字体では、層ごとに読む
+/// ファイルが違う——最上位の 1 つだけでは「何で組まれたか」が辿れない。
+#[derive(Debug, Clone, Serialize)]
+pub struct UsedFont {
+    pub family: String,
+    /// `ResolvedFont::path` と同じ約束
+    pub path: Option<String>,
+    pub sha256: Option<String>,
+    /// **実際に描かれる太さ**を 100 刻みへ丸めたもの。spec の weight ではない。
+    ///
+    /// 静的な字体ではその face の太さ（OS/2 の usWeightClass）、可変フォントでは
+    /// spec の weight を wght 軸の範囲へ収めた値になる（`drawn_weight`）。spec の
+    /// weight と違えば `FONT_WEIGHT_UNAVAILABLE` が出ている
+    pub weight: u16,
+}
+
+/// 文字の層 1 つぶんの、組むための字体。
+pub struct LayerFont {
+    /// この層の字体だけを積んだ db（`retain_family` の後）
+    pub db: Arc<fontdb::Database>,
+    pub family: String,
+    pub used: UsedFont,
+}
+
+/// spec 全体の字体。
+pub struct Fonts {
+    /// 最上位の `font`。**書かれていなければ `None`**——層がすべて自分の
+    /// `font` を持つ spec で、最上位の結果を作り話で埋めない
+    pub top: Option<ResolvedFont>,
+    /// `spec.layers` と同じ並び。文字の層にだけ `Some`
+    pub layers: Vec<Option<LayerFont>>,
+}
+
+/// spec が書いた字体を全部決める。**1 画素も描く前に呼ぶ。**
+///
+/// 層の `font` は最上位の `font` より強く、書かない層は最上位を継ぐ。同じ指定
+/// （family と path の組）は 1 度しか読まない——見出しと本文が同じ字体を
+/// 書いても、ファイルを 2 度読まない。システムの字体も 1 度しか積まない。
+pub fn resolve(document: &ComposeSpec, base: &Path, warnings: &mut Vec<Warning>) -> Result<Fonts> {
+    let mut opened: Vec<(&FontSpec, Arc<fontdb::Database>)> = Vec::new();
+    let mut system: Option<fontdb::Database> = None;
+
+    // 同じファイルを 2 度読んで 2 度ハッシュしない。ヒラギノの TTC は数十 MB ある
+    let mut digests: Vec<(PathBuf, String)> = Vec::new();
+
+    let top = match &document.font {
+        Some(spec) => {
+            let db = open_once(spec, "font", base, &mut opened, &mut system)?;
+            let source = query(&db, &spec.family).and_then(|id| file_of(&db, id));
+            let sha256 = source
+                .as_deref()
+                .map(|p| cached_digest(p, &mut digests))
+                .transpose()?;
+            Some(ResolvedFont {
+                family: spec.family.clone(),
+                path: source.map(|p| p.display().to_string()),
+                sha256,
+            })
+        }
+        None => None,
+    };
+
+    // 層ごとの指定を先に全部開き、**その層の weight で組まれる face** まで決める。
+    // グリフの欠けは face ごとに、その face で組む層の文字だけで見るので、
+    // どの層がどの face かが決まってからでないと数えられない
+    let mut chosen: Vec<Option<Chosen>> = Vec::with_capacity(document.layers.len());
+    for (i, layer) in document.layers.iter().enumerate() {
+        let Layer::Text(text) = layer else {
+            chosen.push(None);
+            continue;
+        };
+        // `compose::validate` が「どちらにも無い」を既に断っている。**それでも
+        // unwrap しない**——届かないはずの経路が届いたときに、code で言う
+        let spec = text
+            .font
+            .as_ref()
+            .or(document.font.as_ref())
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorCode::FontNotFound,
+                    format!("'{}' を組むための字体が決まっていません", text.id),
+                )
+            })?;
+        let whose = format!("layers[{i}] ({}) の font", text.id);
+        let db = open_once(spec, &whose, base, &mut opened, &mut system)?;
+        let face = query_weight(&db, &spec.family, text.weight);
+        chosen.push(Some(Chosen {
+            family: &spec.family,
+            db,
+            face,
+        }));
+    }
+
+    // **W3 と W6 が別ファイルの字体では、収める文字が face ごとに違いうる。**
+    // weight 400 の face だけで見ると、太い層の豆腐を見逃す
+    let mut checked: Vec<(*const fontdb::Database, fontdb::ID)> = Vec::new();
+    for c in chosen.iter().flatten() {
+        let Some(face) = c.face else {
+            continue;
+        };
+        let key = (Arc::as_ptr(&c.db), face);
+        if checked.contains(&key) {
+            continue;
+        }
+        checked.push(key);
+        let lines = document
+            .layers
+            .iter()
+            .zip(&chosen)
+            .filter_map(|(layer, other)| match (layer, other) {
+                (Layer::Text(t), Some(o))
+                    if (Arc::as_ptr(&o.db), o.face) == (key.0, Some(face)) =>
+                {
+                    Some(t.lines.iter())
+                }
+                _ => None,
+            })
+            .flatten();
+        report_missing_glyphs(&c.db, face, c.family, lines, warnings);
+    }
+
+    let mut layers = Vec::with_capacity(document.layers.len());
+    for (layer, c) in document.layers.iter().zip(chosen) {
+        let (Layer::Text(text), Some(c)) = (layer, c) else {
+            layers.push(None);
+            continue;
+        };
+        let source = c.face.and_then(|id| file_of(&c.db, id));
+        let sha256 = source
+            .as_deref()
+            .map(|p| cached_digest(p, &mut digests))
+            .transpose()?;
+        let weight = c
+            .face
+            .map_or(text.weight, |id| drawn_weight(&c.db, id, text.weight));
+        if weight != text.weight {
+            warnings.push(weight_warning(
+                &text.id,
+                c.family,
+                text.weight,
+                weight,
+                source.as_deref(),
+            ));
+        }
+        layers.push(Some(LayerFont {
+            family: c.family.to_string(),
+            used: UsedFont {
+                family: c.family.to_string(),
+                path: source.map(|p| p.display().to_string()),
+                sha256,
+                weight,
+            },
+            db: c.db,
+        }));
+    }
+
+    Ok(Fonts { top, layers })
+}
+
+/// 1 つの文字の層について、組む前に決めたもの。
+struct Chosen<'a> {
+    family: &'a str,
+    db: Arc<fontdb::Database>,
+    /// その層の weight で引いた face。family は `open` が確かめてあるので、
+    /// `None` は字体がメモリ上にしか無いような届かない経路である
+    face: Option<fontdb::ID>,
+}
+
+/// 読んだことのあるファイルならそのダイジェストを返す。
+fn cached_digest(path: &Path, cache: &mut Vec<(PathBuf, String)>) -> Result<String> {
+    if let Some((_, d)) = cache.iter().find(|(p, _)| p == path) {
+        return Ok(d.clone());
+    }
+    let d = digest(path)?;
+    cache.push((path.to_path_buf(), d.clone()));
+    Ok(d)
+}
+
+/// 同じ指定を既に開いていればそれを返し、無ければ開いて覚える。
+fn open_once<'a>(
+    spec: &'a FontSpec,
+    whose: &str,
+    base: &Path,
+    opened: &mut Vec<(&'a FontSpec, Arc<fontdb::Database>)>,
+    system: &mut Option<fontdb::Database>,
+) -> Result<Arc<fontdb::Database>> {
+    if let Some((_, db)) = opened.iter().find(|(s, _)| *s == spec) {
+        return Ok(Arc::clone(db));
+    }
+    let db = Arc::new(open(spec, whose, base, system)?);
+    opened.push((spec, Arc::clone(&db)));
+    Ok(db)
+}
+
+/// 字体を 1 つ開き、**その family だけを残した db** を返す。
 ///
 /// **`path` があればそれしか読まない。** システムのフォント群を一緒に積むと、
 /// spec が指した family がそのファイルに無いときに、システム側の同名の字体で
 /// 黙って組まれる。「このファイルで組む」と書いた指定の意味が消える。
-pub fn resolve(
+fn open(
     spec: &FontSpec,
+    whose: &str,
     base: &Path,
-    document: &ComposeSpec,
-    warnings: &mut Vec<Warning>,
-) -> Result<(Arc<fontdb::Database>, ResolvedFont)> {
-    let mut db = fontdb::Database::new();
-
-    match &spec.path {
+    system: &mut Option<fontdb::Database>,
+) -> Result<fontdb::Database> {
+    let mut db = match &spec.path {
         Some(path) => {
             let path = base.join(path);
+            let mut db = fontdb::Database::new();
             db.load_font_file(&path).map_err(|e| {
                 Error::new(
                     ErrorCode::FontUnreadable,
-                    format!("{} を字体として読めません: {e}", path.display()),
+                    format!("{whose}: {} を字体として読めません: {e}", path.display()),
                 )
                 .with_hint("TrueType / OpenType のファイルを指してください")
             })?;
@@ -79,7 +290,7 @@ pub fn resolve(
                 return Err(Error::new(
                     ErrorCode::FontNotFound,
                     format!(
-                        "{} に family '{}' がありません",
+                        "{whose}: {} に family '{}' がありません",
                         path.display(),
                         spec.family
                     ),
@@ -89,39 +300,70 @@ pub fn resolve(
                     families(&db).join(", ")
                 )));
             }
+            db
         }
         None => {
-            db.load_system_fonts();
+            // **システムの字体は 1 度だけ積み、指定ごとに複製する。** 積むのは
+            // 数百のファイルを開く仕事で、層の数だけ繰り返す理由が無い
+            let db = system
+                .get_or_insert_with(|| {
+                    let mut db = fontdb::Database::new();
+                    db.load_system_fonts();
+                    db
+                })
+                .clone();
             if query(&db, &spec.family).is_none() {
                 return Err(Error::new(
                     ErrorCode::FontNotFound,
-                    format!("family '{}' がこの環境にありません", spec.family),
+                    format!("{whose}: family '{}' がこの環境にありません", spec.family),
                 )
-                .with_hint(
-                    "font.path でファイルを直接指すと、環境に依らず同じ字体で組めます\
+                .with_hint(format!(
+                    "{}.path でファイルを直接指すと、環境に依らず同じ字体で組めます\
                      （kiri は代替の字体へ落としません）",
-                ));
+                    if whose == "font" {
+                        "font"
+                    } else {
+                        "layers[].font"
+                    }
+                )));
             }
+            db
         }
-    }
+    };
 
     // **ここから先、db にはこの family しか残らない。** 残すとグリフ単位で
     // 他の字体へ落ちる（モジュールの doc）
     retain_family(&mut db, &spec.family);
+    Ok(db)
+}
 
-    let source = query(&db, &spec.family).and_then(|id| file_of(&db, id));
-    let sha256 = source.as_deref().map(digest).transpose()?;
-
-    report_missing_glyphs(&db, spec, document, warnings);
-
-    Ok((
-        Arc::new(db),
-        ResolvedFont {
-            family: spec.family.clone(),
-            path: source.map(|p| p.display().to_string()),
-            sha256,
-        },
+/// 指定と違う太さで描かれることを報せる。
+fn weight_warning(
+    layer: &str,
+    family: &str,
+    requested: u16,
+    actual: u16,
+    source: Option<&Path>,
+) -> Warning {
+    let mut warning = Warning::new(
+        WarningCode::FontWeightUnavailable,
+        format!(
+            "'{layer}' の weight {requested} に合う face が '{family}' に無く、\
+             {actual} で描かれます"
+        ),
+    )
+    .with_hint(format!(
+        "weight {requested} の face を持つファイルを layers[].font で指すか、\
+         weight を {actual} にしてください（kiri は太さを合成しません）"
     ))
+    .with_data("layer", layer)
+    .with_data("family", family)
+    .with_data("requested", requested)
+    .with_data("actual", actual);
+    if let Some(path) = source {
+        warning = warning.with_data("path", path.display().to_string());
+    }
+    warning
 }
 
 /// 求めた family 以外の face を落とす。
@@ -147,29 +389,26 @@ fn retain_family(db: &mut fontdb::Database, family: &str) {
 /// ——記号 1 つのために spec 全体が止まる。一方で黙って豆腐を並べるのは、
 /// この段が最も避けたい「黙って別のものが出る」そのものなので、
 /// `FONT_GLYPHS_MISSING` で名指しする。
-fn report_missing_glyphs(
+///
+/// `lines` は**この face で組む層の行だけ**である。別の字体で組む層の文字を
+/// 数えると、和文の層を持つ spec で欧文の字体に毎回欠けを言う。
+fn report_missing_glyphs<'a>(
     db: &fontdb::Database,
-    spec: &FontSpec,
-    document: &ComposeSpec,
+    id: fontdb::ID,
+    family: &str,
+    lines: impl Iterator<Item = &'a String>,
     warnings: &mut Vec<Warning>,
 ) {
-    let Some(id) = query(db, &spec.family) else {
-        return;
-    };
-    let mut wanted: Vec<char> = document
-        .layers
-        .iter()
-        .filter_map(|l| match l {
-            Layer::Text(t) => Some(t.lines.iter()),
-            Layer::Image(_) => None,
-        })
-        .flatten()
+    let mut wanted: Vec<char> = lines
         .flat_map(|line| line.chars())
         // 空白は字面を持たない字体が普通にある。**欠けとして数えない**
         .filter(|c| !c.is_whitespace())
         .collect();
     wanted.sort_unstable();
     wanted.dedup();
+    if wanted.is_empty() {
+        return;
+    }
 
     let missing = db
         .with_face_data(id, |data, index| {
@@ -192,8 +431,7 @@ fn report_missing_glyphs(
         Warning::new(
             WarningCode::FontGlyphsMissing,
             format!(
-                "'{}' に {} 文字のグリフがありません: {shown}",
-                spec.family,
+                "'{family}' に {} 文字のグリフがありません: {shown}",
                 missing.len()
             ),
         )
@@ -242,6 +480,55 @@ fn query(db: &fontdb::Database, family: &str) -> Option<fontdb::ID> {
         stretch: fontdb::Stretch::Normal,
         style: fontdb::Style::Normal,
     })
+}
+
+/// usvg が組むときと**同じ引き方**で、その weight の face を引く。
+///
+/// usvg は font-weight をそのまま `fontdb::Query` の weight へ渡し、CSS の規則で
+/// 最も近い face を選ぶ（`usvg::text::default_font_selector`）。db にはこの family
+/// しか残っていないので、ここで引いた face が実際に組まれる face である。
+fn query_weight(db: &fontdb::Database, family: &str, weight: u16) -> Option<fontdb::ID> {
+    db.query(&fontdb::Query {
+        families: &[fontdb::Family::Name(family)],
+        weight: fontdb::Weight(weight),
+        stretch: fontdb::Stretch::Normal,
+        style: fontdb::Style::Normal,
+    })
+}
+
+/// その face で `requested` を求めたとき、**実際に描かれる太さ**を、spec に
+/// 書ける 100 刻みへ丸めて返す。
+///
+/// wght 軸を持つ face は、軸の範囲へ収めた値で描かれる（usvg が font-weight を
+/// wght の位置へ当て、範囲の外は端で止まる）。軸を持たない face は、face
+/// そのものの太さ（usWeightClass）でしか描けない。
+///
+/// **丸めるのは、返した値が spec に書ける値でなければならないから**である。
+/// 275（Avenir Next の Light）をそのまま返すと、weight 300 の層——実際に最も近い
+/// face で描かれている——が毎回警告を出し、しかも「275 にせよ」という書けない手を
+/// 勧める。
+///
+/// **CSS の単位でない wght 軸（Apple の GX 由来で 0.48〜3.2 のようなもの）は
+/// 軸として読まない。** clamp すると「3」が返り、書けない手を勧める。その face の
+/// 太さで代える。
+fn drawn_weight(db: &fontdb::Database, id: fontdb::ID, requested: u16) -> u16 {
+    let axis = db
+        .with_face_data(id, |data, index| {
+            let face = ttf_parser::Face::parse(data, index).ok()?;
+            face.variation_axes()
+                .into_iter()
+                .find(|a| a.tag == ttf_parser::Tag::from_bytes(b"wght"))
+                .map(|a| (a.min_value, a.max_value))
+        })
+        .flatten()
+        .filter(|&(lo, hi)| lo >= 1.0 && hi <= 1000.0);
+    let raw = match axis {
+        Some((lo, hi)) => f32::from(requested).clamp(lo, hi),
+        None => db
+            .face(id)
+            .map_or(f32::from(requested), |f| f32::from(f.weight.0)),
+    };
+    ((raw / 100.0).round() * 100.0).clamp(100.0, 900.0) as u16
 }
 
 /// その face の実体のパス。メモリ上の face なら `None`。

@@ -497,6 +497,7 @@ mod tests {
             layer_overlap: None,
             outside_safe_area: None,
             align: None,
+            font: None,
             display,
         }
     }

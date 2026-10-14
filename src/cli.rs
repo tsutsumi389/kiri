@@ -199,6 +199,16 @@ pub struct ComposeArgs {
         long_help = compose_profile_long_help()
     )]
     pub profile: Option<&'static crate::compose::profile::ComposeProfile>,
+
+    /// 縮小表示の測りが見た絵を、出力の隣へ <出力の stem>.<表示名>.png で書く（--profile が要る）
+    ///
+    /// **測りが縮めた絵そのもの**を書く（透過は白か潰す色へ重ね、面積平均で縮め、8bit へ丸めた RGB）。大きさは表示の CSS px で、拡大しない
+    ///
+    /// 表示幅がキャンバスの幅以上の表示は測らないので書かない。出力とプレビューの先は描く前に全部確かめ、既存のファイルは --force が無ければ、ディレクトリは --force があっても断る。全部をエンコードしてから書き、書く途中で失敗したらこの実行が新しく作ったファイルを消す（--force で上書きしたファイルは戻せない）
+    ///
+    /// --dry-run とは併用できない（dry-run は 1 バイトも書かない約束である）
+    #[arg(long, requires = "profile", conflicts_with = "dry_run")]
+    pub preview: bool,
 }
 
 /// `kiri compose --profile` の値を読む。**cutout / lint の `--profile` とは別の表**

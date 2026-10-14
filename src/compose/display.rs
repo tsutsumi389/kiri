@@ -67,6 +67,16 @@ impl Reason {
     }
 }
 
+/// 縁取りのある層で、背景として何と比べたか（13-phase-32.md §13.2.2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Against {
+    /// 縮めても残った縁（塗りの被覆が 0.05 未満、塗り + 縁の被覆が 0.5 以上）
+    Stroke,
+    /// 縁が縮小で潰れたので、縁の外の地（塗り + 縁の被覆が 0.05 未満）
+    Ground,
+}
+
 /// 1 つの表示での測り。**結果 JSON の `layers[].display[]` そのものである。**
 #[derive(Debug, Clone, Serialize)]
 pub struct DisplayReport {
@@ -83,14 +93,31 @@ pub struct DisplayReport {
     /// `reasons` が空か
     pub legible: bool,
     pub reasons: Vec<Reason>,
+    /// 背景として何と比べたか。**縁取りのある層にだけ出る**——無い層の
+    /// `display[]` は Phase 31 と同じ形のまま（キーごと出さない）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub against: Option<Against>,
 }
 
-/// 縮めた最終のキャンバス。**画素ごとの相対輝度だけを持つ**——測りに要るのは
-/// それだけである。
+/// 縮めた最終のキャンバス。
+///
+/// **8bit へ丸めた RGB と、そこから出した相対輝度を持つ。** 測りに要るのは
+/// 輝度だけだが、`--preview` は**測りが見た絵そのもの**を書く（13-phase-32.md
+/// §13.2.4）。輝度を RGB から出しておけば、書いた PNG の画素から計算し直した
+/// 輝度が測りの輝度と必ず一致する——別の縮小で作り直すと、見た絵と測った絵が
+/// 食い違う。
 pub struct Shrunk {
     pub width: u32,
     pub height: u32,
+    rgb: Vec<u8>,
     luminance: Vec<f64>,
+}
+
+impl Shrunk {
+    /// 測りが見た絵（不透明の RGB、行優先）。
+    pub fn rgb(&self) -> &[u8] {
+        &self.rgb
+    }
 }
 
 /// 表示幅 `width` での高さ。`round(H × W / canvas_w)`、1 を下回らない。
@@ -124,16 +151,18 @@ pub fn shrink_canvas(canvas: &RgbaImage, base: [u8; 3], width: u32, height: u32)
             }
         }
     });
-    let luminance = shrunk
+    let rgb: Vec<u8> = shrunk
+        .iter()
+        .map(|v| v.round().clamp(0.0, 255.0) as u8)
+        .collect();
+    let luminance = rgb
         .chunks_exact(3)
-        .map(|c| {
-            let q = |v: f64| v.round().clamp(0.0, 255.0) as u8;
-            relative_luminance([q(c[0]), q(c[1]), q(c[2])])
-        })
+        .map(|c| relative_luminance([c[0], c[1], c[2]]))
         .collect();
     Shrunk {
         width,
         height,
+        rgb,
         luminance,
     }
 }
@@ -260,8 +289,26 @@ fn taps(src: usize, dst: usize) -> Vec<Vec<(usize, f64)>> {
 
 /// 1 つの文字を 1 つの表示で測る。
 ///
-/// `coverage` は `shrink_coverage` の結果、`placed` はその文字の原寸の外接矩形、
-/// `size` は spec の `size`。
+/// `coverage` は**塗りだけの**被覆を `shrink_coverage` で縮めたもの、`halo` は
+/// 縁取りのある層でだけ渡す**塗り + 縁の**被覆、`placed` はその文字の原寸の
+/// 外接矩形（縁を含む）、`size` は spec の `size`。
+///
+/// # 縁取りのある層の背景
+///
+/// 背景を「外接矩形の中で塗りの被覆が 0.05 未満の画素」のままにすると、そこには
+/// 縁と地の両方が入り、中央値がどちらに付くかが字の形で決まる。だから次の順で
+/// 選ぶ（13-phase-32.md §13.2.2）：
+///
+/// 1. 塗りが 0.05 未満で、塗り + 縁が 0.5 以上の画素（**縁が縮小で残った**）。
+///    1 つでもあれば縁と比べる
+/// 2. 無ければ、塗り + 縁が 0.05 未満の画素（**地**）と比べる
+///
+/// 1 で縁と比べた比が `MIN_CONTRAST` に届かなければ、地とも比べて良いほうを
+/// 採る。`against` は採ったほうを名乗る。
+/// **縁が潰れたら地と比べるのが要点である。** 1280 幅を 144 へ縮めると 1 画素は
+/// 原寸の約 8.9px 四方で、1〜2px の縁はそこで地に溶ける。そのとき「縁がある
+/// から読める」と言えば嘘になる。前景は縁の有無に依らず塗りの被覆で選ぶ——
+/// 縁は字の線を太らせないので、`strokes_lost` の判定も変わらない。
 ///
 /// **原寸で 1 画素でも描かれた文字だけを渡すこと。** 前景が 0 画素なら
 /// `strokes_lost`（縮めて線が潰れた）と言うが、原寸で描かれていなければ原因は
@@ -271,6 +318,7 @@ fn taps(src: usize, dst: usize) -> Vec<Vec<(usize, f64)>> {
 pub fn measure(
     shrunk: &Shrunk,
     coverage: &[u8],
+    halo: Option<&[u8]>,
     placed: [f64; 4],
     size: f64,
     canvas: (u32, u32),
@@ -297,23 +345,47 @@ pub fn measure(
     let y0 = clamp((placed[1] * sy).floor(), shrunk.height);
     let y1 = clamp(((placed[1] + placed[3]) * sy).ceil(), shrunk.height);
     let dw = shrunk.width as usize;
-    let mut back: Vec<f64> = Vec::new();
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let i = y * dw + x;
-            if coverage[i] == BACKGROUND {
-                back.push(shrunk.luminance[i]);
+    let inside = || (y0..y1).flat_map(move |y| (x0..x1).map(move |x| y * dw + x));
+    let pick = |keep: &dyn Fn(usize) -> bool| -> Vec<f64> {
+        inside()
+            .filter(|&i| keep(i))
+            .map(|i| shrunk.luminance[i])
+            .collect()
+    };
+    let strokes_lost = front.is_empty();
+    let front = median(&mut front);
+    let ratio = |mut back: Vec<f64>| -> Option<f64> {
+        match (front, median(&mut back)) {
+            (Some(f), Some(b)) => {
+                let (hi, lo) = if f > b { (f, b) } else { (b, f) };
+                Some((hi + 0.05) / (lo + 0.05))
+            }
+            _ => None,
+        }
+    };
+    let ground = |halo: &[u8]| ratio(pick(&|i| halo[i] == BACKGROUND));
+    let (contrast, against) = match halo {
+        None => (ratio(pick(&|i| coverage[i] == BACKGROUND)), None),
+        Some(halo) => {
+            let ring = pick(&|i| coverage[i] == BACKGROUND && halo[i] == FOREGROUND);
+            if ring.is_empty() {
+                (ground(halo), Some(Against::Ground))
+            } else {
+                // **縁と比べて足りなければ、地とも比べて良いほうを採る。** 縁が塗りと
+                // 同じ色（黒地に白の字と白の縁）なら縁との比は 1 で、字を地から
+                // 分けているのは縁の外の地である（13-phase-32.md §13.7）
+                let stroke = ratio(ring);
+                if stroke.is_some_and(|c| c >= MIN_CONTRAST) {
+                    (stroke, Some(Against::Stroke))
+                } else {
+                    match (stroke, ground(halo)) {
+                        (Some(s), Some(g)) if g > s => (Some(g), Some(Against::Ground)),
+                        (None, Some(g)) => (Some(g), Some(Against::Ground)),
+                        _ => (stroke, Some(Against::Stroke)),
+                    }
+                }
             }
         }
-    }
-
-    let strokes_lost = front.is_empty();
-    let contrast = match (median(&mut front), median(&mut back)) {
-        (Some(f), Some(b)) => {
-            let (hi, lo) = if f > b { (f, b) } else { (b, f) };
-            Some((hi + 0.05) / (lo + 0.05))
-        }
-        _ => None,
     };
 
     let mut reasons = Vec::new();
@@ -333,6 +405,7 @@ pub fn measure(
         contrast,
         legible: reasons.is_empty(),
         reasons,
+        against,
     }
 }
 
@@ -353,6 +426,13 @@ pub fn required_size(canvas_w: u32, width: u32) -> f64 {
     (MIN_DISPLAY_SIZE * f64::from(canvas_w) / f64::from(width)).ceil()
 }
 
+/// 縮小で縁が地に溶けずに残る `stroke.width`。表示上 1px、つまり
+/// `canvas_w / width` px を整数へ切り上げる——`required_size` と同じく、spec に
+/// 書く値なので書いたら確実に届く数を返す。
+pub fn required_stroke(canvas_w: u32, width: u32) -> f64 {
+    (f64::from(canvas_w) / f64::from(width)).ceil()
+}
+
 /// 読めなかった表示を警告にする。読めたなら `None`。
 pub fn warning(layer: &str, report: &DisplayReport, canvas_w: u32) -> Option<Warning> {
     if report.legible {
@@ -370,7 +450,27 @@ pub fn warning(layer: &str, report: &DisplayReport, canvas_w: u32) -> Option<War
                                     FONT_WEIGHT_UNAVAILABLE が出ていれば weight は効かないので、\
                                     太い face を持つ字体を layers[].font で指す）"
                 .to_string(),
-            Reason::LowContrast => "文字色か、その文字が載っている下地を変える".to_string(),
+            // **縁取りと帯を足す。** 写真の上に置いた見出しでは、文字色も下地も
+            // 選べないことが多い（13-phase-32.md §13.2.5）。**既に縁を持つ層に
+            // 「縁取る」と言わない**——`against` が、縁が縮小で潰れたのか、
+            // 残ったのに足りないのかを言うので、それぞれの手を返す
+            Reason::LowContrast => match report.against {
+                None => format!(
+                    "文字色か、その文字が載っている下地を変える。変えられなければ stroke で\
+                     縁取る（width {} 以上——表示上 1px 以上残る太さ）か、文字の下に \
+                     shape の帯を敷く",
+                    required_stroke(canvas_w, report.width)
+                ),
+                Some(Against::Ground) => format!(
+                    "縁が縮小で地に溶けている。stroke の width を {} 以上にする\
+                     （表示上 1px 以上残る太さ）か、文字の下に shape の帯を敷く",
+                    required_stroke(canvas_w, report.width)
+                ),
+                Some(Against::Stroke) => "縁と比べても足りない。文字色と stroke の color を\
+                                          離すか、size か weight を上げて塗りが縁に埋もれない\
+                                          ようにするか、文字の下に shape の帯を敷く"
+                    .to_string(),
+            },
         });
     }
     Some(
@@ -429,6 +529,7 @@ mod tests {
         let r = measure(
             &shrunk,
             &coverage,
+            None,
             [0.0, 0.0, 10.0, 10.0],
             64.0,
             (1280, 670),
@@ -534,6 +635,7 @@ mod tests {
         let r = measure(
             &shrunk,
             &coverage,
+            None,
             [100.0, 280.0, 1000.0, 140.0],
             120.0,
             (1280, 670),
@@ -541,6 +643,199 @@ mod tests {
         );
         assert!(r.legible, "{r:?}");
         assert!(r.contrast.unwrap() > 20.0, "{r:?}");
+    }
+
+    /// 灰色の地に、白い帯を幅 `ring` の黒い縁で囲んだ絵と、塗りだけ・塗り + 縁の
+    /// 被覆を作る。
+    fn haloed(ring: u32) -> (RgbaImage, RgbaImage, RgbaImage) {
+        haloed_in(ring, [0, 0, 0], [0x76, 0x76, 0x76])
+    }
+
+    /// `haloed` の縁の色と地の色を選べる形。
+    fn haloed_in(ring: u32, edge: [u8; 3], ground: [u8; 3]) -> (RgbaImage, RgbaImage, RgbaImage) {
+        let [er, eg, eb] = edge;
+        let [gr, gg, gb] = ground;
+        let mut canvas = RgbaImage::from_pixel(1280, 670, Rgba([gr, gg, gb, 255]));
+        let mut fill = RgbaImage::new(1280, 670);
+        let mut halo = RgbaImage::new(1280, 670);
+        for y in 300 - ring..400 + ring {
+            for x in 100 - ring..1100 + ring {
+                let core = (300..400).contains(&y) && (100..1100).contains(&x);
+                canvas.put_pixel(
+                    x,
+                    y,
+                    if core {
+                        Rgba([255; 4])
+                    } else {
+                        Rgba([er, eg, eb, 255])
+                    },
+                );
+                halo.put_pixel(x, y, Rgba([0, 0, 0, 255]));
+                if core {
+                    fill.put_pixel(x, y, Rgba([255; 4]));
+                }
+            }
+        }
+        (canvas, fill, halo)
+    }
+
+    fn measure_haloed(ring: u32, display: &Display) -> DisplayReport {
+        measure_picture(haloed(ring), ring, display)
+    }
+
+    fn measure_picture(
+        (canvas, fill, halo): (RgbaImage, RgbaImage, RgbaImage),
+        ring: u32,
+        display: &Display,
+    ) -> DisplayReport {
+        let (dw, dh) = (display.width, display_height(1280, 670, display.width));
+        let shrunk = shrink_canvas(&canvas, [255, 255, 255], dw, dh);
+        let coverage = shrink_coverage(&fill, dw, dh);
+        let halo = shrink_coverage(&halo, dw, dh);
+        // 字間と行間の地を外接矩形に含める。**塗りつぶした帯だけでは矩形の中に
+        // 地が無く**、実際の字（字間に地を挟む）と形が違う
+        let margin = 40;
+        let placed = [
+            f64::from(100 - ring - margin),
+            f64::from(300 - ring - margin),
+            f64::from(1000 + 2 * (ring + margin)),
+            f64::from(100 + 2 * (ring + margin)),
+        ];
+        measure(
+            &shrunk,
+            &coverage,
+            Some(&halo),
+            placed,
+            120.0,
+            (1280, 670),
+            display,
+        )
+    }
+
+    /// **縮めても残る太さの縁は、縁と比べる**（§13.2.2 の 1）。白と黒なので比は高い。
+    #[test]
+    fn a_thick_halo_is_the_background() {
+        let r = measure_haloed(16, &PC);
+        assert_eq!(r.against, Some(Against::Stroke), "{r:?}");
+        assert!(r.contrast.unwrap() > 10.0, "{r:?}");
+        assert!(r.legible, "{r:?}");
+    }
+
+    /// **縁が地に溶けたら、地と比べる**（§13.2.2 の 2）。白と #767676 は 4.54 で、
+    /// 縁があるから読めるとは言わない。
+    #[test]
+    fn a_halo_lost_in_the_shrink_falls_back_to_the_ground() {
+        let r = measure_haloed(1, &MOBILE);
+        assert_eq!(r.against, Some(Against::Ground), "{r:?}");
+        assert!(r.contrast.unwrap() < 10.0, "{r:?}");
+    }
+
+    /// **縁が塗りと同じ色なら、地と比べる。** 黒地に白の字と白の縁は、縁との比が
+    /// 1 でも読める——縁が字を地から分けていないだけで、地が分けている（§13.7）。
+    #[test]
+    fn a_stroke_the_colour_of_the_fill_is_judged_against_the_ground() {
+        let picture = haloed_in(16, [255, 255, 255], [0, 0, 0]);
+        let r = measure_picture(picture, 16, &PC);
+        assert_eq!(r.against, Some(Against::Ground), "{r:?}");
+        assert!(r.contrast.unwrap() > 10.0, "{r:?}");
+        assert!(r.legible, "{r:?}");
+    }
+
+    /// 縁と比べて足りず、地と比べても良くならなければ、縁のほうを名乗る。
+    #[test]
+    fn a_weak_stroke_is_kept_when_the_ground_is_no_better() {
+        let picture = haloed_in(16, [0xe0, 0xe0, 0xe0], [0xf0, 0xf0, 0xf0]);
+        let r = measure_picture(picture, 16, &PC);
+        assert_eq!(r.against, Some(Against::Stroke), "{r:?}");
+        assert!(r.contrast.unwrap() < MIN_CONTRAST, "{r:?}");
+    }
+
+    /// 縁の無い層は `against` を持たず、結果 JSON にキーが出ない（§13.2.2）。
+    #[test]
+    fn without_a_halo_against_is_not_serialized() {
+        let canvas = RgbaImage::from_pixel(1280, 670, Rgba([255, 255, 255, 255]));
+        let shrunk = shrink_canvas(&canvas, [255, 255, 255], 144, 75);
+        let coverage = vec![BACKGROUND; 144 * 75];
+        let r = measure(
+            &shrunk,
+            &coverage,
+            None,
+            [0.0, 0.0, 10.0, 10.0],
+            64.0,
+            (1280, 670),
+            &MOBILE,
+        );
+        assert_eq!(r.against, None);
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v.get("against").is_none(), "{v}");
+    }
+
+    /// 縮めた RGB から出した輝度が、測りの輝度そのものである（`--preview` の約束）。
+    #[test]
+    fn the_luminance_is_derived_from_the_kept_rgb() {
+        let (canvas, _, _) = haloed(8);
+        let shrunk = shrink_canvas(&canvas, [255, 255, 255], 192, 101);
+        assert_eq!(shrunk.rgb().len(), 192 * 101 * 3);
+        for (c, l) in shrunk.rgb().chunks_exact(3).zip(&shrunk.luminance) {
+            assert_eq!(relative_luminance([c[0], c[1], c[2]]), *l);
+        }
+    }
+
+    /// **既に縁を持つ層に「縁取る」と言わない。** 縁が潰れたなら太らせる手を、
+    /// 残ったのに足りないなら色を離すか塗りを太らせる手を言う（実写の検証で、
+    /// 幅 4 の縁を持つキャプションに「stroke で縁取る」と返していた）。
+    #[test]
+    fn a_stroked_layer_is_not_told_to_add_a_stroke() {
+        let hint_for = |against| {
+            let report = DisplayReport {
+                name: "mobile_list",
+                width: 144,
+                size_px: 6.6,
+                contrast: Some(2.7),
+                legible: false,
+                reasons: vec![Reason::LowContrast],
+                against: Some(against),
+            };
+            let w = warning("caption", &report, 1280).unwrap();
+            serde_json::to_value(&w).unwrap()["hint"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let ground = hint_for(Against::Ground);
+        assert!(ground.contains("stroke の width を 9 以上"), "{ground}");
+        let stroke = hint_for(Against::Stroke);
+        assert!(stroke.contains("stroke の color"), "{stroke}");
+        for hint in [ground, stroke] {
+            assert!(!hint.contains("縁取る"), "{hint}");
+            assert!(hint.contains("shape"), "{hint}");
+        }
+    }
+
+    /// `low_contrast` の手に縁取りと帯を足す。縁の幅は表示上 1px に届く値（§13.2.5）。
+    #[test]
+    fn the_low_contrast_hint_offers_a_stroke_and_a_band() {
+        assert_eq!(required_stroke(1280, 192), 7.0);
+        assert_eq!(required_stroke(1280, 144), 9.0);
+        let report = DisplayReport {
+            name: "pc_list",
+            width: 192,
+            size_px: 15.0,
+            contrast: Some(3.9),
+            legible: false,
+            reasons: vec![Reason::LowContrast],
+            against: None,
+        };
+        let w = warning("heading", &report, 1280).unwrap();
+        let hint = serde_json::to_value(&w).unwrap()["hint"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            hint.contains("stroke") && hint.contains("width 7"),
+            "{hint}"
+        );
+        assert!(hint.contains("shape"), "{hint}");
     }
 
     /// 1px の線は縮めると前景が 1 画素も残らない（`strokes_lost`）。
@@ -557,6 +852,7 @@ mod tests {
         let r = measure(
             &shrunk,
             &coverage,
+            None,
             [640.0, 300.0, 1.0, 100.0],
             200.0,
             (1280, 670),
@@ -585,6 +881,7 @@ mod tests {
             contrast: Some(21.0),
             legible: false,
             reasons: vec![Reason::TooSmall],
+            against: None,
         };
         let w = warning("heading", &report, 1280).unwrap();
         let v = serde_json::to_value(&w).unwrap();

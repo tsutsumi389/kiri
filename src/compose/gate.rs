@@ -511,6 +511,7 @@ mod tests {
             contrast,
             legible: reasons.is_empty(),
             reasons,
+            against: None,
         }
     }
 

@@ -686,7 +686,7 @@ fn print_compose(report: &ComposeReport) {
         }
         for d in layer.display.iter().flatten() {
             println!(
-                "               {} {}px  {:.1}px  {}{}",
+                "               {} {}px  {:.1}px  {}{}{}",
                 d.name,
                 d.width,
                 d.size_px,
@@ -694,6 +694,12 @@ fn print_compose(report: &ComposeReport) {
                     || "コントラスト -".to_string(),
                     |c| format!("コントラスト {c:.2}")
                 ),
+                // 縁取りのある層だけ、何と比べたかを添える
+                match d.against {
+                    Some(kiri::compose::display::Against::Stroke) => "（縁と）",
+                    Some(kiri::compose::display::Against::Ground) => "（地と）",
+                    None => "",
+                },
                 if d.legible {
                     String::new()
                 } else {
@@ -711,6 +717,12 @@ fn print_compose(report: &ComposeReport) {
         report.output.bytes,
         if report.dry_run { "  (dry-run)" } else { "" }
     );
+    for p in report.previews.iter().flatten() {
+        println!(
+            "  preview   {} {} x {}  {}",
+            p.display, p.width, p.height, p.path
+        );
+    }
     if let Some(compliance) = &report.compliance {
         println!(
             "  fail-on   {}  {}",

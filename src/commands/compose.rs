@@ -22,8 +22,23 @@
 //! あるときに限り**組んだその場で表示の大きさへ縮めて**取っておく（原寸の
 //! グリフを層の数だけ抱えない）。無いときは何もしない——**渡さない実行の
 //! 費用も出力も変えない。**
+//!
+//! # `--preview` は測った絵を書く
+//!
+//! 縮小の測りは数を返すが、数だけでは「どこが潰れたか」が分からない。
+//! **測りが縮めた絵そのもの**を `<出力の stem>.<表示名>.png` へ書く
+//! （13-phase-32.md §13.2.4）。別の縮小で作り直すと、見た絵と測った絵が
+//! 食い違う。
+//!
+//! # 書く約束
+//!
+//! `--preview` を渡した実行は、出力とプレビューの全部の先を**画素を 1 つも描く前に**
+//! 確かめ（既存のファイルは `--force` が無ければ断り、ディレクトリは `--force`
+//! があっても断る）、**全部をエンコードし終えてから**書き始める。書く途中で
+//! 失敗したら、この実行が新しく作ったファイルを消す。**`--force` で上書きした
+//! ファイルは戻せない**——前の中身を持っていないからである（13-phase-32.md §13.7）。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use image::RgbaImage;
@@ -32,11 +47,14 @@ use crate::cli::ComposeArgs;
 use crate::compose::font::LayerFont;
 use crate::compose::measure::{self, COVERAGE, LayerReport};
 use crate::compose::profile::ComposeProfile;
-use crate::compose::{self, ComposeSpec, ImageLayer, Layer, Role, TextLayer, Trim, display};
+use crate::compose::{
+    self, ComposeSpec, ImageLayer, Layer, Role, ShapeLayer, TextLayer, Trim, display,
+};
 use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::{load, save};
 use crate::report::{
-    ComposeCanvasReport, ComposeOutputReport, ComposeProfileRef, ComposeReport, SCHEMA_VERSION,
+    ComposeCanvasReport, ComposeOutputReport, ComposePreviewReport, ComposeProfileRef,
+    ComposeReport, SCHEMA_VERSION,
 };
 use crate::transform::{ResizeSpec, canvas as canvas_mod};
 use crate::warning::{Warning, WarningCode};
@@ -63,6 +81,20 @@ pub fn run(args: &ComposeArgs) -> Result<ComposeReport> {
         .with_hint("avif / png / jpg / webp のいずれかの拡張子を付けてください")
     })?;
     crate::commands::output::ensure_path_writable(&args.output, args.force)?;
+    // **プレビューの先も、描く前に確かめる。** 出力を書いてからプレビューで
+    // 断ると、半端な成果物が残る（モジュールの doc の「書く約束」）
+    if let Some(profile) = profile.filter(|_| args.preview) {
+        let previews = profile
+            .displays
+            .iter()
+            .filter(|d| display::measurable(spec.canvas.width, d))
+            .map(|d| preview_path(&args.output, d.name));
+        for path in previews {
+            crate::commands::output::ensure_path_writable(&path, args.force)?;
+            refuse_directory(&path)?;
+        }
+        refuse_directory(&args.output)?;
+    }
 
     // **フォントは 1 画素も描く前に決める。** 見つからなければここで断るので、
     // 半端な成果物が残らない
@@ -86,13 +118,14 @@ pub fn run(args: &ComposeArgs) -> Result<ComposeReport> {
     )?;
     let canvas = built.canvas;
     let mut layers = built.layers;
+    let mut shrunk: Vec<(&'static str, display::Shrunk)> = Vec::new();
 
     if let Some(profile) = profile {
         // **透過は白として縮める**——note の一覧の地は白で、透過の PNG を上げた
         // ときに見えるのはその白である（12-phase-31.md §12.6 の 2）。透過を
         // 保てない出力なら、実際に潰される色のほうが見える
         let base = flatten_to.unwrap_or([255, 255, 255]);
-        measure_displays(profile, &canvas, base, &built.glyphs, &spec, &mut layers);
+        shrunk = measure_displays(profile, &canvas, base, &built.glyphs, &spec, &mut layers);
     }
 
     for layer in &layers {
@@ -106,10 +139,32 @@ pub fn run(args: &ComposeArgs) -> Result<ComposeReport> {
         .fail_on
         .as_ref()
         .map(|f| f.evaluate(&layers, profile.is_some()));
-    let output = write(&canvas, &args.output, format, args, &mut warnings)?;
+    // **全部をエンコードしてから書く。** エンコードで断られる（形式の制約）のを
+    // 書いた後に知ると、出力だけが残る
+    let (output, bytes) = encode_output(&canvas, &args.output, format, args, &mut warnings)?;
+    let encoded_previews = if args.preview {
+        encode_previews(&args.output, &shrunk, args, &mut warnings)?
+    } else {
+        Vec::new()
+    };
+    if !args.dry_run {
+        let mut files: Vec<(&Path, &[u8])> = vec![(&args.output, &bytes)];
+        files.extend(
+            encoded_previews
+                .iter()
+                .map(|(path, bytes, _)| (path.as_path(), bytes.as_slice())),
+        );
+        write_all(&files)?;
+    }
+    let previews = args.preview.then(|| {
+        encoded_previews
+            .into_iter()
+            .map(|(_, _, report)| report)
+            .collect()
+    });
 
     // **`--dry-run` でも判定する。** dry-run はエンコードまで通し、書いたはずの
-    // バイト数を `output.bytes` に返している（`write` の doc）——数が決まって
+    // バイト数を `output.bytes` に返している（`encode_output`）——数が決まって
     // いるのに黙るのは、本番で初めて上限に当たる形を残すだけである
     if let Some(max) = profile.and_then(|p| p.max_bytes) {
         if output.bytes > max {
@@ -143,6 +198,7 @@ pub fn run(args: &ComposeArgs) -> Result<ComposeReport> {
         },
         font: fonts.top,
         output,
+        previews,
         dry_run: args.dry_run,
         layers,
         compliance,
@@ -193,10 +249,125 @@ fn aspect_warning(profile: &ComposeProfile, spec: &ComposeSpec) -> Option<Warnin
     )
 }
 
+/// `--preview` が書く先。出力の隣に `<出力の stem>.<表示名>.png`。
+///
+/// 形式は出力に依らず PNG に固定する——非可逆で書くと、画素から計算し直した
+/// 輝度が測りの輝度と合わなくなる。**名前は `OsString` のまま組む。** UTF-8 で
+/// ない stem を `to_string_lossy` で通すと `�` に化け、出力と違う名前の隣に書く。
+fn preview_path(output: &Path, display: &str) -> PathBuf {
+    let mut name = output
+        .file_stem()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(".");
+    name.push(display);
+    name.push(".png");
+    output.with_file_name(name)
+}
+
+/// 書く先が既にあるディレクトリなら断る。**`--force` でも断る**——ディレクトリを
+/// ファイルで置き換えることは無く、書く段で必ず失敗する。描く前に言えば、
+/// 何も書かずに済む。
+fn refuse_directory(path: &Path) -> Result<()> {
+    if path.is_dir() {
+        return Err(Error::new(
+            ErrorCode::OutputWriteFailed,
+            format!(
+                "{} はディレクトリなので、ファイルとして書けません",
+                path.display()
+            ),
+        )
+        .with_hint("出力先の名前を変えるか、そのディレクトリを移してください"));
+    }
+    Ok(())
+}
+
+/// 測りが縮めた絵を PNG にエンコードする。**縮め直さない**——`Shrunk` が持つ
+/// RGB をそのまま渡す。
+///
+/// **縮めた絵の一覧だけから組む。** 書く先の確かめ（`run`）と同じく
+/// `display::measurable` で選ばれた表示の一覧なので、確かめた先と書く先が
+/// 食い違わない。
+fn encode_previews(
+    output: &Path,
+    shrunk: &[(&'static str, display::Shrunk)],
+    args: &ComposeArgs,
+    warnings: &mut Vec<Warning>,
+) -> Result<Vec<(PathBuf, Vec<u8>, ComposePreviewReport)>> {
+    let options = save::SaveOptions {
+        format: save::OutputFormat::Png,
+        quality: args.quality,
+        effort: args.effort,
+        background: args.background,
+        flatten: false,
+        icc: save::IccPolicy::Embed,
+    };
+    let mut out = Vec::with_capacity(shrunk.len());
+    for (name, image) in shrunk {
+        let rgba = RgbaImage::from_fn(image.width, image.height, |x, y| {
+            let i = ((y * image.width + x) * 3) as usize;
+            let c = &image.rgb()[i..i + 3];
+            image::Rgba([c[0], c[1], c[2], 255])
+        });
+        let (bytes, encode_warnings) = save::encode(&rgba, &options)?;
+        warnings.extend(encode_warnings);
+        let path = preview_path(output, name);
+        let report = ComposePreviewReport {
+            display: name,
+            path: path.display().to_string(),
+            width: image.width,
+            height: image.height,
+        };
+        out.push((path, bytes, report));
+    }
+    Ok(out)
+}
+
+/// エンコード済みのファイルを順に書く。**途中で失敗したら、この呼び出しが
+/// 新しく作ったファイルを消す。**
+///
+/// 上書きしたファイルは戻せない（前の中身を持っていない）。そのときは hint で
+/// そう言う——黙ると、消えた前の版を利用者が探すことになる。
+fn write_all(files: &[(&Path, &[u8])]) -> Result<()> {
+    let mut created: Vec<&Path> = Vec::new();
+    let mut overwritten: Vec<&Path> = Vec::new();
+    for &(path, bytes) in files {
+        let fresh = !path.exists();
+        if let Err(error) = save::write_encoded(path, bytes) {
+            // 書きかけのファイルが残っていることがある。新しく作った先なら消す
+            if fresh {
+                created.push(path);
+            }
+            for p in &created {
+                let _ = std::fs::remove_file(p);
+            }
+            if overwritten.is_empty() {
+                return Err(error);
+            }
+            let names: Vec<String> = overwritten
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            return Err(error.with_hint(format!(
+                "この実行が新しく作ったファイルは消しました。--force で上書きした {} は\
+                 元に戻せません",
+                names.join(", ")
+            )));
+        }
+        if fresh {
+            created.push(path);
+        } else {
+            overwritten.push(path);
+        }
+    }
+    Ok(())
+}
+
 /// 全層を重ねたキャンバスを profile の表示ごとに縮め、文字の層ごとに測る。
 ///
 /// **表示ごとに 1 回だけ縮める。** 縮めた絵は文字の層をまたいで同じなので、
-/// 層ごとに縮め直すと同じ計算を層の数だけ払う。
+/// 層ごとに縮め直すと同じ計算を層の数だけ払う。縮めた絵は `--preview` の
+/// ために返す（表示 1 つで高々 192x101 の RGB である）。
 fn measure_displays(
     profile: &ComposeProfile,
     canvas: &RgbaImage,
@@ -204,7 +375,8 @@ fn measure_displays(
     glyphs: &[Glyphs],
     spec: &ComposeSpec,
     layers: &mut [LayerReport],
-) {
+) -> Vec<(&'static str, display::Shrunk)> {
+    let mut kept = Vec::new();
     let (w, h) = (spec.canvas.width, spec.canvas.height);
     for entry in glyphs {
         layers[entry.index].display = Some(Vec::with_capacity(profile.displays.len()));
@@ -221,14 +393,24 @@ fn measure_displays(
             let Some(coverage) = entry.coverage[d].as_deref() else {
                 continue;
             };
+            let halo = entry.halo.as_ref().and_then(|halo| halo[d].as_deref());
             let layer = &mut layers[entry.index];
-            let report =
-                display::measure(&shrunk, coverage, layer.placed, entry.size, (w, h), target);
+            let report = display::measure(
+                &shrunk,
+                coverage,
+                halo,
+                layer.placed,
+                entry.size,
+                (w, h),
+                target,
+            );
             if let Some(list) = layer.display.as_mut() {
                 list.push(report);
             }
         }
+        kept.push((target.name, shrunk));
     }
+    kept
 }
 
 /// 組み上がったもの。
@@ -245,9 +427,12 @@ struct Glyphs {
     index: usize,
     /// spec の `size`。表示上の大きさはここから計算で出す
     size: f64,
-    /// この文字の被覆を表示ごとに縮めて区分へ畳んだもの。並びは `displays` の
-    /// 並びで、測らない表示（`display::measurable`）は `None`
+    /// この文字の**塗りの**被覆を表示ごとに縮めて区分へ畳んだもの。並びは
+    /// `displays` の並びで、測らない表示（`display::measurable`）は `None`
     coverage: Vec<Option<Vec<u8>>>,
+    /// 縁取りのある層だけ、**塗り + 縁の**被覆を同じく縮めたもの。縮小での
+    /// 背景を縁と地から選ぶのに使う（`display::measure` の doc）
+    halo: Option<Vec<Option<Vec<u8>>>>,
 }
 
 /// 文字の層について、後から覆われた割合を数えるために取っておくもの。
@@ -324,12 +509,14 @@ fn build(
                     display: None,
                 }
             }
+            Layer::Shape(shape) => draw_shape(&mut canvas, shape, spec, index, &mut painter)?,
             Layer::Text(text) => {
+                let font = fonts.get(i).and_then(Option::as_ref);
                 let (report, pixels, drawn) = draw_text(
                     &mut canvas,
                     text,
                     spec,
-                    fonts.get(i).and_then(Option::as_ref),
+                    font,
                     flatten_to,
                     index,
                     &subject,
@@ -348,20 +535,33 @@ fn build(
                 if let Some(profile) =
                     profile.filter(|_| text.role.wants_contrast() && drawn_at_full_size)
                 {
-                    let coverage = profile
-                        .displays
-                        .iter()
-                        .map(|d| {
-                            display::measurable(w, d).then(|| {
-                                let height = display::display_height(w, h, d.width);
-                                display::shrink_coverage(&drawn, d.width, height)
+                    let shrink = |pixels: &RgbaImage| -> Vec<Option<Vec<u8>>> {
+                        profile
+                            .displays
+                            .iter()
+                            .map(|d| {
+                                display::measurable(w, d).then(|| {
+                                    let height = display::display_height(w, h, d.width);
+                                    display::shrink_coverage(pixels, d.width, height)
+                                })
                             })
-                        })
-                        .collect();
+                            .collect()
+                    };
+                    // **縁取りのある層は、塗りだけを組み直して前景を取る。** 前景は
+                    // 塗りの被覆で選ぶ（縁は線を太らせない）ので、塗り + 縁の絵からは
+                    // 取れない。組み直すのは `--profile` を渡した実行だけである
+                    let (coverage, halo) = match text.stroke {
+                        None => (shrink(&drawn), None),
+                        Some(_) => {
+                            let fill = fill_only(text, spec, font)?;
+                            (shrink(&fill), Some(shrink(&drawn)))
+                        }
+                    };
                     glyphs.push(Glyphs {
                         index: i,
                         size: text.size,
                         coverage,
+                        halo,
                     });
                 }
                 report
@@ -402,6 +602,62 @@ fn build(
         canvas,
         layers: reports,
         glyphs,
+    })
+}
+
+/// 縁取りのある文字の、**塗りだけ**を描いた画像。縁付きと同じ位置に組み
+/// （`text::layout_fill`）、縁の属性だけを落とす——塗りの形は縁の有無で
+/// 変わらないので、縁付きの絵の塗りと画素まで一致する。
+fn fill_only(layer: &TextLayer, spec: &ComposeSpec, font: Option<&LayerFont>) -> Result<RgbaImage> {
+    let Some(font) = font else {
+        return Err(Error::new(
+            ErrorCode::FontNotFound,
+            format!("'{}' を組むための字体が決まっていません", layer.id),
+        ));
+    };
+    Ok(compose::text::layout_fill(layer, &spec.canvas, &font.family, &font.db)?.pixels)
+}
+
+/// 図形を描いて重ね、層の測りを返す（13-phase-32.md §13.2.3）。
+///
+/// **`painter` を塗り、`subject` は塗らない。** 後から置いた図形は文字を覆う
+/// （`text_obscured`）が、図形は商品ではないので文字が重なってもよい相手である。
+/// 測りのキーは全部 null で、`outside_safe_area` も null——端まで敷いた帯が
+/// 表示で切られても欠ける情報は無く、測ると普通の構図が毎回
+/// `OUTSIDE_SAFE_AREA` を出す。
+fn draw_shape(
+    canvas: &mut RgbaImage,
+    layer: &ShapeLayer,
+    spec: &ComposeSpec,
+    index: u16,
+    painter: &mut [u16],
+) -> Result<LayerReport> {
+    let pixels = compose::shape::render(layer, &spec.canvas)?;
+    paint(
+        painter,
+        canvas.width(),
+        canvas.height(),
+        &pixels,
+        (0, 0),
+        index,
+    );
+    canvas_mod::composite_clipped(canvas, &pixels, (0, 0));
+    Ok(LayerReport {
+        id: layer.id.clone(),
+        kind: "shape",
+        role: Role::Decoration,
+        rect: layer.rect,
+        placed: layer.rect,
+        opaque_rect: None,
+        line_widths: None,
+        text_overflow: None,
+        text_contrast: None,
+        text_obscured: None,
+        layer_overlap: None,
+        outside_safe_area: None,
+        align: None,
+        font: None,
+        display: None,
     })
 }
 
@@ -549,14 +805,32 @@ fn draw_text(
 
     let layout = compose::text::layout(layer, &spec.canvas, &font.family, &font.db)?;
     let color = compose::parse_color(&layer.color)?;
+    let stroke = layer
+        .stroke
+        .as_ref()
+        .map(|s| compose::parse_color(&s.color))
+        .transpose()?;
+    // 覆う画素は**縁を含む**——縁は見えるインクで、重なりも覆いもそこまで数える
+    let pixels = measure::covered_pixels(&layout.pixels);
 
-    // **重ねる前に測る。** いまのキャンバスがこの文字の背後そのものである
+    // **重ねる前に測る。** いまのキャンバスがこの文字の背後そのものである。
+    // 縁取りのある層では縁が背後になる（`measure::stroked_contrast`）。ただし
+    // **縁が塗りと同じ色なら、縁は字を何からも分けていない**——黒地に白の字へ
+    // 白の縁を付けて 1.0 と言えば、読める字に「読めない」と言う。そのとき字を
+    // 分けているのは縁の下の地なので、塗り + 縁が覆う画素の背後とも比べ、
+    // 良いほうを採る（13-phase-32.md §13.7）
     let contrast = layer
         .role
         .wants_contrast()
-        .then(|| measure::contrast(&layout.pixels, canvas, color, flatten_to))
+        .then(|| match stroke {
+            None => measure::contrast(&layout.pixels, canvas, color, flatten_to),
+            Some(stroke) => (!pixels.is_empty()).then(|| {
+                let halo = measure::stroked_contrast(color, stroke);
+                measure::contrast(&layout.pixels, canvas, color, flatten_to)
+                    .map_or(halo, |ground| halo.max(ground))
+            }),
+        })
         .flatten();
-    let pixels = measure::covered_pixels(&layout.pixels);
     let layer_overlap = has_subject.then(|| measure::overlap(&pixels, subject));
 
     if pixels.is_empty() {
@@ -652,13 +926,15 @@ fn for_each_pixel(
     }
 }
 
-fn write(
+/// 出力をエンコードする。**書くのは `write_all` である**——プレビューと一緒に、
+/// 全部をエンコードし終えてから書く（モジュールの doc の「書く約束」）。
+fn encode_output(
     canvas: &RgbaImage,
     path: &Path,
     format: save::OutputFormat,
     args: &ComposeArgs,
     warnings: &mut Vec<Warning>,
-) -> Result<ComposeOutputReport> {
+) -> Result<(ComposeOutputReport, Vec<u8>)> {
     let options = save::SaveOptions {
         format,
         quality: args.quality,
@@ -672,17 +948,15 @@ fn write(
     // 言うと、本番で初めて形式の制約に当たることになる
     let (bytes, encode_warnings) = save::encode(canvas, &options)?;
     warnings.extend(encode_warnings);
-    if !args.dry_run {
-        save::write_encoded(path, &bytes)?;
-    }
 
-    Ok(ComposeOutputReport {
+    let report = ComposeOutputReport {
         path: path.display().to_string(),
         format: format.as_str().to_string(),
         width: canvas.width(),
         height: canvas.height(),
         bytes: bytes.len() as u64,
-    })
+    };
+    Ok((report, bytes))
 }
 
 #[cfg(test)]
@@ -719,6 +993,49 @@ mod tests {
         assert_eq!(
             opaque_in_fitted([10, 10, 50, 50], (300, 300), &plan),
             Some([3.0, 3.0, 17.0, 17.0])
+        );
+    }
+
+    /// 書く途中で失敗したら、新しく作ったファイルを消す。上書きしたものは
+    /// 戻せないので、そう言う（13-phase-32.md §13.7）。
+    #[test]
+    fn a_failed_write_removes_the_files_it_created() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fresh = dir.path().join("out.png");
+        let kept = dir.path().join("kept.png");
+        std::fs::write(&kept, b"old").unwrap();
+        // 親がファイルなので、ディレクトリを作れず書けない
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"").unwrap();
+        let blocked = blocker.join("out.pc_list.png");
+
+        let err = write_all(&[
+            (fresh.as_path(), b"new"),
+            (kept.as_path(), b"newer"),
+            (blocked.as_path(), b"x"),
+        ])
+        .unwrap_err();
+        assert!(!fresh.exists(), "新しく作った出力が残った");
+        assert_eq!(std::fs::read(&kept).unwrap(), b"newer", "上書きは戻せない");
+        let hint = err.hint.clone().unwrap_or_default();
+        assert!(hint.contains("kept.png"), "{hint}");
+
+        // 上書きが無ければ hint を足さない
+        let err = write_all(&[(fresh.as_path(), b"new"), (blocked.as_path(), b"x")]).unwrap_err();
+        assert!(!fresh.exists());
+        assert!(err.hint.is_none(), "{:?}", err.hint);
+    }
+
+    /// プレビューの名前は stem を `OsString` のまま組む。
+    #[test]
+    fn the_preview_name_keeps_the_stem() {
+        assert_eq!(
+            preview_path(Path::new("dir/header.png"), "pc_list"),
+            Path::new("dir/header.pc_list.png")
+        );
+        assert_eq!(
+            preview_path(Path::new("a.b.jpg"), "mobile_list"),
+            Path::new("a.b.mobile_list.png")
         );
     }
 

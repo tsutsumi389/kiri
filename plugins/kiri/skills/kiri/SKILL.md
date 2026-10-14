@@ -168,19 +168,25 @@ kiri compose layout.json -o thumb.png --fail-on default --json
 - 商品が実際に占める矩形は `layers[].opaque_rect` を見る。`outside_safe_area` もこれで判定するので、
   透過の余白が `safe_area` の外へ出ても警告されない
 - 後の層ほど上に描かれる。文字は `layers` の末尾側に置く
+- **文字の縁取りは `"stroke": {"color": "#000000", "width": 8}`。** 外側にだけ付き、字は細らない。
+  `width` は 1 以上 `size` 以下。字は縁の幅だけ `rect` の内側へ寄せて組まれるので、`rect` は
+  縁を含めた大きさで書く
+- **帯や札は `"type": "shape"` の層**（`rect` / `color` / `opacity` / `radius`。`role` は書けない）。
+  写真の上の見出しは、文字の**前**に半透明の帯を敷くと読める。文字の**後**に置くと文字を覆い、
+  `TEXT_OBSCURED` が出る
 - 警告はどれも `remedy` が直し方を言う。よく出るのは次のとおり
 
 | 警告 | 直し方 |
 |---|---|
 | `TEXT_OVERFLOW` | `rect` を広げる、`size` を下げる、`lines` を短くする |
-| `TEXT_CONTRAST_LOW` | 文字の `color` か、その文字が載っている下地を変える（背後の実測で、しきい値は WCAG の 4.5） |
+| `TEXT_CONTRAST_LOW` | 文字の `color` か、その文字が載っている下地を変える（背後の実測で、しきい値は WCAG の 4.5）。写真の上で変えられなければ `stroke` で縁取るか、文字の下に `shape` の帯を敷く |
 | `LAYERS_OVERLAP` | 文字の `rect` を商品の外へ寄せる |
 | `TEXT_OBSCURED` | 文字の層を、覆っている層より後ろ（配列の末尾側）へ移す |
 | `OUTSIDE_SAFE_AREA` | 層を `safe_area` の内側へ入れる |
 | `FONT_WEIGHT_UNAVAILABLE` | その太さの face を持つファイル（または可変フォント）を `layers[].font` で指す。無ければ `weight` を `data.actual` に合わせる |
 
-**書き出した絵を Read で開いて目で確かめる。** 見出し画像は小さいので、出力そのものを見ればよい
-（compose に `--preview` は無い）。利用者にも見せる。
+**書き出した絵を Read で開いて目で確かめる。** 見出し画像は小さいので、出力そのものを見ればよい。
+利用者にも見せる。一覧に縮んだ姿は `--profile` と `--preview` で書き出せる（下の節）。
 
 ### note の見出し画像
 
@@ -198,7 +204,13 @@ kiri compose header.json -o header.png --profile note --fail-on default --json
 |---|---|
 | `too_small` | `size` を `11 × canvas の幅 / 表示幅` 以上にする（1280 幅ならスマホで 98） |
 | `strokes_lost` | `weight` を上げる（`FONT_WEIGHT_UNAVAILABLE` が出ていれば効かないので、太いファイルを `layers[].font` で指す） |
-| `low_contrast` | 文字色か下地を変える。原寸の `text_contrast` が通っていても、縮めると落ちることがある |
+| `low_contrast` | 文字色か下地を変える。変えられなければ `stroke` で縁取る（`width` は `canvas の幅 / 表示幅` 以上。1280 幅ならスマホで 9）か、文字の下に `shape` の帯を敷く。原寸の `text_contrast` が通っていても、縮めると落ちることがある |
+
+- 縁取りのある層の `display[]` には `against` が出る。`stroke` なら縁が縮小で残って縁と比べた、
+  **`ground` なら縁が地に溶けて効いていない**（`width` を太くする）
+- **`--preview` を付けると、測りが見た縮小の絵を `<出力の stem>.<表示名>.png`
+  （`header.pc_list.png` / `header.mobile_list.png`）に書く。** Read で開けば「一覧でどう潰れたか」が
+  見える。書いた先は結果の `previews[]` に出る。`--profile` が要り、`--dry-run` とは併用できない
 
 - 原寸で読めても一覧では読めないことが多い。**見出しは大きく、短く、太く**が出発点になる
 - `role: "decoration"` の文字は縮小表示の測りから外れる。読めなくてよい飾りにだけ使う

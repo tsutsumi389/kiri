@@ -11205,18 +11205,23 @@ fn every_published_field_exists_in_the_result() {
                      "font":{{"family":"{family}"}},
                      "layers":[{{"id":"t","type":"text","role":"heading",
                                 "lines":["A"],"rect":[80,200,600,200],
-                                "size":110,"color":"#000000"}}]}}"##
+                                "size":110,"color":"#000000",
+                                "stroke":{{"color":"#ffffff","width":8}}}}]}}"##
             ),
         );
+        // `display[].against` は縁取りのある層にだけ、`previews[]` は `--preview`
+        // を渡したときにだけ出る。`--preview` は `--dry-run` と併用できないので
+        // 書く（出力は他の実行と別の名前にする）
+        let previewed = dir.path().join("displayed.png");
         run(&[
             "compose",
             spec.to_str().unwrap(),
             "-o",
-            output.to_str().unwrap(),
-            "--dry-run",
+            previewed.to_str().unwrap(),
             "--json",
             "--profile",
             "note",
+            "--preview",
         ])
     });
     let segmented = segment_ready().then(|| {
@@ -11253,8 +11258,11 @@ fn every_published_field_exists_in_the_result() {
         if path.starts_with("segment.") && segmented.is_none() {
             continue;
         }
-        // `layers[].font` も文字の層にしか値を持たない（画像の層では null）
-        let wants_text = path.starts_with("layers[].display") || path.starts_with("layers[].font");
+        // `layers[].font` も文字の層にしか値を持たない（画像の層では null）。
+        // `previews[]` は同じ実行が `--preview` で書く
+        let wants_text = path.starts_with("layers[].display")
+            || path.starts_with("layers[].font")
+            || path.starts_with("previews");
         if wants_text && displayed.is_none() {
             continue;
         }

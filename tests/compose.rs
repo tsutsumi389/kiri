@@ -1300,9 +1300,9 @@ fn a_spec_without_a_canvas_takes_the_note_size_and_safe_area() {
         r#"{"layers":[
              {"id":"inside","type":"image","role":"subject",
               "source":"product.png","rect":[100,108,200,454]},
-             {"id":"above","type":"image","role":"decoration",
+             {"id":"above","type":"image","role":"subject",
               "source":"product.png","rect":[600,0,50,100]},
-             {"id":"edge","type":"image","role":"decoration",
+             {"id":"edge","type":"image","role":"subject",
               "source":"product.png","rect":[900,100,200,400]}]}"#,
     );
     let out = dir.path().join("out.png");
@@ -2302,6 +2302,70 @@ fn opaque_pixels_outside_the_safe_area_are_still_named() {
     );
 }
 
+/// **decoration の画像は safe_area を測らない。** 全面に `cover` で敷いた背景の
+/// 写真は外へ出るのが当然で、測ると普通の構図が毎回 `OUTSIDE_SAFE_AREA` を出し、
+/// `--fail-on default` を落としていた（13-phase-32.md §13.8）。
+#[test]
+fn a_full_bleed_decoration_image_is_not_judged_against_the_safe_area() {
+    let dir = TempDir::new().unwrap();
+    padded(dir.path(), "bg.png", (100, 100), [0, 0, 100, 100]);
+    let spec = write_spec(
+        dir.path(),
+        r##"{"canvas":{"width":100,"height":100,"background":"#ffffff"},
+             "safe_area":[20,20,60,60],
+             "layers":[{"id":"bg","type":"image","role":"decoration",
+                        "source":"bg.png","rect":[0,0,100,100],"fit":"cover"}]}"##,
+    );
+    let out = dir.path().join("out.png");
+    let result = compose(&spec, &out, &["--fail-on", "default"]);
+    let report = json_stdout(&result);
+    let bg = layer(&report, "bg");
+
+    assert_eq!(rect_of(&bg["opaque_rect"]), [0.0, 0.0, 100.0, 100.0]);
+    assert_eq!(bg["outside_safe_area"], Value::Null, "{bg}");
+    assert!(
+        !codes(&report).contains(&"OUTSIDE_SAFE_AREA".to_string()),
+        "全面に敷いた背景を外と言った: {report}"
+    );
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stdout)
+    );
+}
+
+/// 同じ spec で背景の上に置いた subject がはみ出せば、今までどおり言う。
+/// decoration を測らないのは role で分けた振る舞いで、画像の層全体ではない。
+#[test]
+fn a_subject_image_beside_a_decoration_background_is_still_judged() {
+    let dir = TempDir::new().unwrap();
+    padded(dir.path(), "bg.png", (100, 100), [0, 0, 100, 100]);
+    padded(dir.path(), "cut.png", (100, 100), [25, 25, 50, 50]);
+    let spec = write_spec(
+        dir.path(),
+        r##"{"canvas":{"width":100,"height":100,"background":"#ffffff"},
+             "safe_area":[30,30,40,40],
+             "layers":[{"id":"bg","type":"image","role":"decoration",
+                        "source":"bg.png","rect":[0,0,100,100],"fit":"cover"},
+                       {"id":"p","type":"image","role":"subject",
+                        "source":"cut.png","rect":[0,0,100,100],"trim":"none"}]}"##,
+    );
+    let out = dir.path().join("out.png");
+    let result = compose(&spec, &out, &["--fail-on", "default"]);
+    let report = json_stdout(&result);
+
+    assert_eq!(layer(&report, "bg")["outside_safe_area"], Value::Null);
+    assert_eq!(layer(&report, "p")["outside_safe_area"], Value::Bool(true));
+    let named: Vec<&Value> = report["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|w| w["code"] == "OUTSIDE_SAFE_AREA")
+        .collect();
+    assert_eq!(named.len(), 1, "subject だけを言うはず: {report}");
+    assert_eq!(result.status.code(), Some(5));
+}
+
 /// 1 画素も不透明でない素材は、切り詰めず、`opaque_rect` は null。
 /// **描く画素が無いので safe_area の外へは出ようがない。**
 #[test]
@@ -2312,7 +2376,7 @@ fn a_fully_transparent_image_has_no_opaque_rect() {
         dir.path(),
         r##"{"canvas":{"width":100,"height":100},
              "safe_area":[40,40,20,20],
-             "layers":[{"id":"p","type":"image","role":"decoration",
+             "layers":[{"id":"p","type":"image","role":"subject",
                         "source":"empty.png","rect":[0,0,100,100]}]}"##,
     );
     let out = dir.path().join("out.png");

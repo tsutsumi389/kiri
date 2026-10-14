@@ -500,9 +500,12 @@ fn build(
                     text_obscured: None,
                     layer_overlap: None,
                     // **不透明な画素で判定する。** 透過の余白が外へ出ても、表示で
-                    // 切られるものは無い。描く画素が無ければ外へは出ようがない
+                    // 切られるものは無い。描く画素が無ければ外へは出ようがない。
+                    // **decoration は測らない**——全面に敷いた背景の写真は外へ出る
+                    // のが当然で、図形の層と同じく切られても欠ける情報は無い
                     outside_safe_area: spec
                         .safe_area
+                        .filter(|_| image.role != Role::Decoration)
                         .map(|a| opaque_rect.is_some_and(|r| measure::outside(a, r))),
                     align: None,
                     font: None,

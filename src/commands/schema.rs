@@ -2168,13 +2168,14 @@ fn fields() -> Vec<FieldEntry> {
             appears_in: compose(),
             unit: "bool",
             nullable: true,
-            null_means: Some("spec に safe_area が無い、または図形のレイヤ"),
+            null_means: Some("spec に safe_area が無い、図形のレイヤ、または role が decoration の画像"),
             warns: vec![],
             gates: None,
             summary: "そのレイヤが safe_area の外へ出たか",
             notes: Some(
                 "画像は opaque_rect（不透明な画素）で判定し、透過の余白が外へ出ても\
-                 言わない。1 画素も不透明でない画像は false。文字は placed で判定する。\
+                 言わない。role が decoration の画像は測らない——全面に敷いた背景の\
+                 写真は外へ出るのが当然で、切られても欠ける情報は無い。1 画素も不透明でない画像は false。文字は placed で判定する。\
                  **範囲は spec が書く**——どこまでが切られずに残るかは媒体ごとに違い、\
                  出典も媒体の側にある。--profile を渡して spec が省いたときは、\
                  profile の範囲を使う（null と書いても同じ）。比が profile と同じ\

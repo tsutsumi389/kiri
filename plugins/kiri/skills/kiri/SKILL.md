@@ -167,6 +167,8 @@ kiri compose layout.json -o thumb.png --fail-on default --json
   余白ごと置きたいときだけ `"trim": "none"` を書く
 - 商品が実際に占める矩形は `layers[].opaque_rect` を見る。`outside_safe_area` もこれで判定するので、
   透過の余白が `safe_area` の外へ出ても警告されない
+- **全面に敷く背景の写真は `role: "decoration"` で置く。** decoration の画像は `safe_area` を測らない
+  （`outside_safe_area` は null）ので、外へ出ても `OUTSIDE_SAFE_AREA` は出ない。切られては困る画像は `subject`
 - 後の層ほど上に描かれる。文字は `layers` の末尾側に置く
 - **文字の縁取りは `"stroke": {"color": "#000000", "width": 8}`。** 外側にだけ付き、字は細らない。
   `width` は 1 以上 `size` 以下。字は縁の幅だけ `rect` の内側へ寄せて組まれるので、`rect` は

@@ -380,6 +380,10 @@ pub struct ComposeReport {
     /// 同じ形になる
     pub font: Option<crate::compose::font::ResolvedFont>,
     pub output: ComposeOutputReport,
+    /// `--preview` が書いた縮小表示の絵。**渡さなければキーごと出さない**——
+    /// `profile` と同じ扱いで、渡さない実行の結果を 1 バイトも動かさない
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previews: Option<Vec<ComposePreviewReport>>,
     /// この実行が実際に書き出したか。`--dry-run` なら true で、
     /// `output.path` にファイルは無い（`ProcessReport::dry_run` と同じ約束）
     pub dry_run: bool,
@@ -426,6 +430,18 @@ pub struct ComposeOutputReport {
     pub width: u32,
     pub height: u32,
     pub bytes: u64,
+}
+
+/// `--preview` が書いた 1 枚。**縮小の測りが見た絵そのもの**である
+/// （`commands::compose` の doc）。
+#[derive(Debug, Serialize)]
+pub struct ComposePreviewReport {
+    /// 表示の名前（`layers[].display[].name` と同じ綴り）
+    pub display: &'static str,
+    pub path: String,
+    /// 表示の CSS px。拡大はしない
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Debug, Serialize)]

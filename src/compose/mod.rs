@@ -26,6 +26,7 @@ pub mod font;
 pub mod gate;
 pub mod measure;
 pub mod profile;
+pub mod shape;
 pub mod text;
 
 use std::path::{Path, PathBuf};
@@ -60,7 +61,13 @@ pub mod keys {
         "line_height",
         "align",
         "font",
+        "stroke",
     ];
+    pub const STROKE: &[&str] = &["color", "width"];
+    /// **`role` を持たない。** 図形は情報を持たないので測る理由が無く、結果では
+    /// 常に `decoration` を名乗る。書けば `SPEC_UNKNOWN_FIELD` で断る——書いた
+    /// role が効いたと思わせない
+    pub const SHAPE_LAYER: &[&str] = &["id", "type", "rect", "color", "opacity", "radius"];
 }
 
 /// キャンバスの 1 辺の上限(px)。
@@ -71,6 +78,13 @@ pub mod keys {
 /// 規格の寸法は `profile.rs` が持つ——**出典のある数と kiri の都合の数を同じ表に
 /// 混ぜない**（`Rules` の doc と同じ理由）。
 pub const MAX_CANVAS_SIDE: u32 = 16384;
+
+/// 縁取りの幅の下限(px)。
+///
+/// **見えない縁を信じない。** 0.01px の縁は 1 画素も塗らないのに、原寸の
+/// `text_contrast` は塗りと縁の色の比を返す——白地に白の文字が縁 0.01 で 21 を
+/// 名乗る。1px は原寸で 1 画素を確実に塗る最小の幅である。
+pub const MIN_STROKE_WIDTH: f64 = 1.0;
 
 /// 文字の大きさの下限(px)。0 や負を通すと usvg がグリフを 1 つも返さず、
 /// **「書いたのに何も出ない」が無言で成立する。**
@@ -194,6 +208,7 @@ impl Align {
 pub enum Layer {
     Image(ImageLayer),
     Text(TextLayer),
+    Shape(ShapeLayer),
 }
 
 impl Layer {
@@ -201,6 +216,7 @@ impl Layer {
         match self {
             Layer::Image(l) => &l.id,
             Layer::Text(l) => &l.id,
+            Layer::Shape(l) => &l.id,
         }
     }
 
@@ -208,6 +224,7 @@ impl Layer {
         match self {
             Layer::Image(l) => l.role,
             Layer::Text(l) => l.role,
+            Layer::Shape(_) => Role::Decoration,
         }
     }
 
@@ -215,6 +232,7 @@ impl Layer {
         match self {
             Layer::Image(l) => l.rect,
             Layer::Text(l) => l.rect,
+            Layer::Shape(l) => l.rect,
         }
     }
 
@@ -222,6 +240,7 @@ impl Layer {
         match self {
             Layer::Image(_) => "image",
             Layer::Text(_) => "text",
+            Layer::Shape(_) => "shape",
         }
     }
 }
@@ -302,6 +321,46 @@ pub struct TextLayer {
     /// （1 ウェイトのファイルでは weight が効かない。`font` の doc）
     #[serde(default)]
     pub font: Option<FontSpec>,
+    /// 字の縁取り。**書かなければ縁の無い SVG を出す**——Phase 31 までと
+    /// 1 画素も変わらない
+    #[serde(default)]
+    pub stroke: Option<Stroke>,
+}
+
+/// 文字の縁取り（13-phase-32.md §13.2.1）。
+///
+/// **外側にだけ付く。** SVG の stroke は輪郭の内外に半分ずつ乗るので、内側の
+/// 半分は塗りに隠す（`text::to_svg`）。内側まで見せると字の線が細り、縁を
+/// 付けた分だけ縮小で `strokes_lost` に近づく——読めるようにするための手が、
+/// 読めなくする向きに効く。
+#[derive(Debug, Clone, Deserialize)]
+pub struct Stroke {
+    /// 縁の色。**不透明だけを受ける**——`#rrggbb` に不透明度を書く口は無い
+    pub color: String,
+    /// 字の輪郭から外へ見える幅(px)。`MIN_STROKE_WIDTH` 以上 `size` 以下
+    pub width: f64,
+}
+
+/// 図形の層（13-phase-32.md §13.2.3）。**矩形だけを持つ。**
+///
+/// 帯・座布団・丸い札はこれで足りる。円や多角形は要る日に種類を足す——既定を
+/// 矩形にしておけば、足しても書いた spec の意味は変わらない。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShapeLayer {
+    pub id: String,
+    /// 枠 `[x, y, 幅, 高さ]`。**置かれる矩形そのもの**で、`placed` もこれになる
+    pub rect: [f64; 4],
+    pub color: String,
+    /// 塗りの不透明度。0 < x ≤ 1、既定 1
+    #[serde(default = "default_opacity")]
+    pub opacity: f64,
+    /// 角の丸み(px)。幅か高さの半分を超えれば SVG の規則どおり半分で止まる
+    #[serde(default)]
+    pub radius: f64,
+}
+
+fn default_opacity() -> f64 {
+    1.0
 }
 
 fn default_weight() -> u16 {
@@ -434,10 +493,11 @@ fn validate_keys(raw: &serde_json::Value) -> Result<()> {
         let allowed = match o.get("type").and_then(|v| v.as_str()) {
             Some("image") => keys::IMAGE_LAYER,
             Some("text") => keys::TEXT_LAYER,
+            Some("shape") => keys::SHAPE_LAYER,
             Some(other) => {
                 return Err(Error::new(
                     ErrorCode::SpecInvalid,
-                    format!("layers[{i}] の type '{other}' は image か text ではありません"),
+                    format!("layers[{i}] の type '{other}' は image / text / shape ではありません"),
                 ));
             }
             None => {
@@ -451,6 +511,9 @@ fn validate_keys(raw: &serde_json::Value) -> Result<()> {
         check(o.keys(), allowed, &format!("layers[{i}]"))?;
         if let Some(font) = o.get("font").and_then(|v| v.as_object()) {
             check(font.keys(), keys::FONT, &format!("layers[{i}].font"))?;
+        }
+        if let Some(stroke) = o.get("stroke").and_then(|v| v.as_object()) {
+            check(stroke.keys(), keys::STROKE, &format!("layers[{i}].stroke"))?;
         }
     }
     Ok(())
@@ -543,6 +606,26 @@ fn validate(spec: &ComposeSpec) -> Result<()> {
                 ));
             }
             parse_color(&t.color)?;
+            if let Some(stroke) = &t.stroke {
+                parse_color(&stroke.color)?;
+                // **上限は size である。** 字の大きさを超える縁は字そのものより
+                // 太く、桁違いの書き損じとしか読めない。下限は `MIN_STROKE_WIDTH`
+                // （見えない縁に比を名乗らせない）。有限でない値は usvg が黙って
+                // 捨て、縁の無い字が「縁を付けた」結果として返る
+                if !(stroke.width.is_finite()
+                    && stroke.width >= MIN_STROKE_WIDTH
+                    && stroke.width <= t.size)
+                {
+                    return Err(Error::new(
+                        ErrorCode::SpecInvalid,
+                        format!(
+                            "layers[{i}] ({id}) の stroke.width は {MIN_STROKE_WIDTH} 以上 \
+                             size（{}）以下である必要があります（指定: {}）",
+                            t.size, stroke.width
+                        ),
+                    ));
+                }
+            }
 
             // **文字があるのにフォントが無い層は、読む前に断る。** 既定のフォントへ
             // 落とすと、同じ spec が機械ごとに違う絵になる（`font::resolve` の doc）
@@ -555,6 +638,32 @@ fn validate(spec: &ComposeSpec) -> Result<()> {
                     "最上位の font か layers[].font に family か path を書いてください。\
                      kiri は既定のフォントを持ちません——持つと同じ spec が機械ごとに\
                      違う絵になります",
+                ));
+            }
+        }
+
+        if let Layer::Shape(s) = layer {
+            parse_color(&s.color)?;
+            // **0 は断る。** 見えない図形は何も敷かず、何も覆わない——書いた側の
+            // 意図は「薄く敷く」のほうで、0 は書き損じである
+            if !(s.opacity.is_finite() && s.opacity > 0.0 && s.opacity <= 1.0) {
+                return Err(Error::new(
+                    ErrorCode::SpecInvalid,
+                    format!(
+                        "layers[{i}] ({id}) の opacity は 0 より大きく 1 以下である必要が\
+                         あります（指定: {}）",
+                        s.opacity
+                    ),
+                ));
+            }
+            if !(s.radius.is_finite() && s.radius >= 0.0) {
+                return Err(Error::new(
+                    ErrorCode::SpecInvalid,
+                    format!(
+                        "layers[{i}] ({id}) の radius は 0 以上の有限の数である必要が\
+                         あります（指定: {}）",
+                        s.radius
+                    ),
                 ));
             }
         }
@@ -693,6 +802,103 @@ mod tests {
         )
         .unwrap();
         assert_eq!(spec.safe_area, Some([10.0, 10.0, 100.0, 100.0]));
+    }
+
+    /// 文字の層 1 つに `stroke` を足した spec（13-phase-32.md §13.4 の 9）。
+    fn stroked(stroke: &str) -> String {
+        format!(
+            r##"{{"canvas":{{"width":100,"height":100}},"font":{{"family":"X"}},
+                 "layers":[{{"id":"t","type":"text","role":"heading","lines":["A"],
+                            "rect":[0,0,100,100],"size":40,"color":"#ffffff",
+                            "stroke":{stroke}}}]}}"##
+        )
+    }
+
+    /// 図形の層 1 つの spec。`extra` は `"color"` の後ろへ足すキー。
+    fn shaped(extra: &str) -> String {
+        format!(
+            r##"{{"canvas":{{"width":100,"height":100}},
+                 "layers":[{{"id":"s","type":"shape","rect":[0,0,50,50],
+                            "color":"#000000"{extra}}}]}}"##
+        )
+    }
+
+    #[test]
+    fn a_valid_stroke_and_shape_are_accepted() {
+        let spec = parse(&stroked(r##"{"color":"#000000","width":40}"##), "t").unwrap();
+        let Layer::Text(t) = &spec.layers[0] else {
+            panic!("文字の層");
+        };
+        let stroke = t.stroke.as_ref().unwrap();
+        assert_eq!((stroke.color.as_str(), stroke.width), ("#000000", 40.0));
+
+        let spec = parse(&shaped(""), "t").unwrap();
+        let Layer::Shape(s) = &spec.layers[0] else {
+            panic!("図形の層");
+        };
+        assert_eq!((s.opacity, s.radius), (1.0, 0.0), "既定は不透明・角なし");
+        assert_eq!(spec.layers[0].role(), Role::Decoration);
+        assert_eq!(spec.layers[0].kind(), "shape");
+        parse(&shaped(r#","opacity":0.6,"radius":1000"#), "t").unwrap();
+    }
+
+    #[test]
+    fn a_stroke_width_outside_one_to_size_is_refused() {
+        for width in ["0", "-1", "0.01", "0.99", "40.5", "1e9"] {
+            let err = parse(
+                &stroked(&format!(r##"{{"color":"#000000","width":{width}}}"##)),
+                "t",
+            )
+            .unwrap_err();
+            assert_eq!(err.code, ErrorCode::SpecInvalid, "width {width}");
+        }
+        let err = parse(&stroked(r##"{"color":"#000","width":2}"##), "t").unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidColor);
+        let err = parse(&stroked(r#"{"width":2}"#), "t").unwrap_err();
+        assert_eq!(err.code, ErrorCode::SpecInvalid, "color は必須");
+    }
+
+    #[test]
+    fn an_unknown_stroke_key_is_refused() {
+        let err = parse(
+            &stroked(r##"{"color":"#000000","width":2,"opacity":0.5}"##),
+            "t",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::SpecUnknownField);
+    }
+
+    #[test]
+    fn shape_values_outside_their_range_are_refused() {
+        for extra in [
+            r#","opacity":0"#,
+            r#","opacity":1.01"#,
+            r#","opacity":-0.5"#,
+            r#","radius":-1"#,
+        ] {
+            let err = parse(&shaped(extra), "t").unwrap_err();
+            assert_eq!(err.code, ErrorCode::SpecInvalid, "{extra}");
+        }
+        let err = parse(
+            r#"{"canvas":{"width":100,"height":100},
+                "layers":[{"id":"s","type":"shape","rect":[0,0,50,50],"color":"black"}]}"#,
+            "t",
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidColor);
+    }
+
+    /// **`role` は図形に書けない。** 書けば効いたと思わせるので、未知のキーとして断る。
+    #[test]
+    fn a_role_on_a_shape_is_an_unknown_field() {
+        for extra in [
+            r#","role":"heading""#,
+            r#","stroke":{}"#,
+            r#","lines":["a"]"#,
+        ] {
+            let err = parse(&shaped(extra), "t").unwrap_err();
+            assert_eq!(err.code, ErrorCode::SpecUnknownField, "{extra}");
+        }
     }
 
     /// 1 辺だけ書けば、もう 1 辺を profile から受け取る。

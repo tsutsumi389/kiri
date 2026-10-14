@@ -64,7 +64,7 @@ pub const SUBPIXEL_TOLERANCE: f64 = 1.0 / 64.0;
 #[derive(Debug, Clone, Serialize)]
 pub struct LayerReport {
     pub id: String,
-    /// `image` か `text`
+    /// `image` / `text` / `shape`
     pub kind: &'static str,
     pub role: Role,
     /// spec が書いた枠 `[x, y, 幅, 高さ]`
@@ -88,7 +88,9 @@ pub struct LayerReport {
     /// 配らない**——片方だけ読んだ受け手が別の結論に至る
     pub text_overflow: Option<f64>,
     /// 文字と、その文字が実際に載っている背後とのコントラスト比。
-    /// `decoration` と画像、1 画素も描かれなかった層では null
+    /// **縁取りのある層では、塗りと縁の色の比（`stroked_contrast`）と、塗りと
+    /// 縁の下の地の比の良いほう**（`commands::compose::draw_text`）。
+    /// `decoration` と画像・図形、1 画素も描かれなかった層では null
     pub text_contrast: Option<f64>,
     /// 文字が覆う画素のうち、**自分より後の層に塗られた**割合。画像では null。
     ///
@@ -224,6 +226,22 @@ pub fn contrast(
     Some((hi + 0.05) / (lo + 0.05))
 }
 
+/// 縁取りのある文字の原寸のコントラスト。**塗りの色と縁の色の比である。**
+///
+/// 縁は字のすぐ周りを必ず囲むので、字が接する「背後」は縁である。背後の画素を
+/// 数え直す（`contrast` と同じ測り方をする）と、太い字の内側——縁が届かない
+/// 画素——が地の色として混ざり、縁を付けたのに数が動かない
+/// （13-phase-32.md §13.2.1）。縁は不透明しか受けないので、色だけで決まる。
+///
+/// **これだけを `text_contrast` にしない。** 縁が塗りと同じ色なら比は 1 だが、
+/// そのとき字を分けているのは縁の下の地である。呼ぶ側が地との比とも比べて、
+/// 良いほうを採る（13-phase-32.md §13.7）。
+pub fn stroked_contrast(fill: [u8; 3], stroke: [u8; 3]) -> f64 {
+    let (a, b) = (relative_luminance(fill), relative_luminance(stroke));
+    let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
 /// straight alpha の画素を下地の色へ重ねた結果。
 ///
 /// **`transform::canvas::over` と同じ算術である。** 別々に書くと、測った色と
@@ -312,7 +330,12 @@ pub fn warnings(report: &LayerReport) -> Vec<Warning> {
                 WarningCode::TextContrastLow,
                 format!("'{id}' と背後のコントラスト比が {ratio:.2} です（{MIN_CONTRAST} 未満）"),
             )
-            .with_hint("文字色か、その文字が載っている場所の下地を変えてください")
+            // 写真の上の見出しでは文字色も下地も選べないことが多いので、縁取りと
+            // 帯を並べる（13-phase-32.md §13.2.5）
+            .with_hint(
+                "文字色か、その文字が載っている場所の下地を変えてください。変えられなければ \
+                 stroke で縁取るか、文字の下に shape の帯を敷いてください",
+            )
             .with_data("text_contrast", ratio)
             .with_data("minimum", MIN_CONTRAST),
         );
@@ -395,6 +418,17 @@ mod tests {
     fn an_f32_rounding_error_is_not_outside_the_safe_area() {
         let area = [0.0, 190.0, 1280.0, 300.0];
         assert!(!outside(area, PLACED));
+    }
+
+    /// 白と黒の縁は 21、同じ色なら 1（§13.4 の 2）。
+    #[test]
+    fn a_stroked_contrast_is_the_fill_against_the_stroke() {
+        assert!((stroked_contrast([255; 3], [0; 3]) - 21.0).abs() < 1e-9);
+        assert_eq!(
+            stroked_contrast([0; 3], [255; 3]),
+            stroked_contrast([255; 3], [0; 3])
+        );
+        assert_eq!(stroked_contrast([0x76; 3], [0x76; 3]), 1.0);
     }
 
     #[test]

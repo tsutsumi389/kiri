@@ -164,7 +164,28 @@ fn compose_spec_entries() -> Vec<ComposeSpecEntry> {
                       （行ごとの実測幅は結果の line_widths が返す）。weight は 100〜900 の 100 刻み\
                       （それ以外は SPEC_INVALID）。weight に合う face が\
                       字体に無ければ近い太さで描かれ、FONT_WEIGHT_UNAVAILABLE が言う\
-                      （kiri は太さを合成しない）",
+                      （kiri は太さを合成しない）。stroke で縁取れる",
+        },
+        ComposeSpecEntry {
+            at: "layers[type=text].stroke",
+            keys: keys::STROKE.to_vec(),
+            summary: "字の縁取り。color は #rrggbb（不透明のみ）、width は字の輪郭から外へ\
+                      見える幅(px)で 1 以上 size 以下（見えない縁は断る）。**外側にだけ付く**（字は細らない）。\
+                      placed・text_overflow・outside_safe_area・重なりと覆いは縁を含めて測り、\
+                      text_contrast は塗りの色と縁の色の比と、塗りと地の比の良いほう。字は縁の幅\
+                      だけ rect の内側へ寄せて組む（start は右へ、end は左へ、最初の行は下へ）。\
+                      --profile の縮小表示では、縁が縮めても残れば縁と、潰れれば地と比べる\
+                      （display[].against）",
+        },
+        ComposeSpecEntry {
+            at: "layers[type=shape]",
+            keys: keys::SHAPE_LAYER.to_vec(),
+            summary: "図形のレイヤ（角を丸められる矩形）。文字の下に敷く帯や、札に使う。\
+                      color は必須の #rrggbb、opacity は 0 < x ≤ 1（既定 1）、radius は 0 以上の px\
+                      （既定 0。幅か高さの半分で止まる）。**role は書けない**（結果では decoration）。\
+                      測りのキーは全部 null で、outside_safe_area も null。下に敷けば文字の\
+                      コントラストの測りに入り、文字の上に不透明度 0.5 以上で置けば \
+                      TEXT_OBSCURED が言う",
         },
         ComposeSpecEntry {
             at: "layers[type=text].font",
@@ -2027,7 +2048,8 @@ fn fields() -> Vec<FieldEntry> {
             summary: "実際に置かれた矩形 [x, y, 幅, 高さ]",
             notes: Some(
                 "spec が書いた rect とは違う値になる。画像は枠へ内接して縮み、文字は\
-                 組んだ結果の外接矩形になる。**余白を計算できるのはこちらである**",
+                 組んだ結果の外接矩形になる（stroke があれば縁を含む）。図形は rect\
+                 そのもの。**余白を計算できるのはこちらである**",
             ),
         },
         FieldEntry {
@@ -2035,7 +2057,7 @@ fn fields() -> Vec<FieldEntry> {
             appears_in: compose(),
             unit: "list",
             nullable: true,
-            null_means: Some("文字のレイヤ、または 1 画素も不透明でない画像"),
+            null_means: Some("文字・図形のレイヤ、または 1 画素も不透明でない画像"),
             warns: vec![],
             gates: None,
             summary: "画像の不透明な画素（不透明度が 0 でない）が実際に占める矩形 [x, y, 幅, 高さ]",
@@ -2051,7 +2073,7 @@ fn fields() -> Vec<FieldEntry> {
             appears_in: compose(),
             unit: "px",
             nullable: true,
-            null_means: Some("画像のレイヤ（はみ出しは文字にだけ測る）"),
+            null_means: Some("画像・図形のレイヤ（はみ出しは文字にだけ測る）"),
             warns: vec![FieldThreshold {
                 code: WarningCode::TextOverflow,
                 operator: "gt",
@@ -2069,7 +2091,9 @@ fn fields() -> Vec<FieldEntry> {
             appears_in: compose(),
             unit: "ratio",
             nullable: true,
-            null_means: Some("role が decoration、画像のレイヤ、または 1 画素も描かれなかった"),
+            null_means: Some(
+                "role が decoration、画像・図形のレイヤ、または 1 画素も描かれなかった",
+            ),
             warns: vec![FieldThreshold {
                 code: WarningCode::TextContrastLow,
                 operator: "lt",
@@ -2080,7 +2104,9 @@ fn fields() -> Vec<FieldEntry> {
             notes: Some(
                 "**背景色の指定からではなく実測である**\
                  ——下に画像が敷いてあればそこが背後で、ちょうどそこが読めなくなる。\
-                 しきい値 4.5 は WCAG 2.1 の AA（kiri が決めた数ではない）",
+                 しきい値 4.5 は WCAG 2.1 の AA（kiri が決めた数ではない）。\
+                 **stroke のある層では塗りの色と縁の色の比と、塗りと縁の下の地の比の\
+                 良いほう**（縁は字の背後になるが、塗りと同じ色の縁は字を分けない）",
             ),
         },
         FieldEntry {
@@ -2088,7 +2114,7 @@ fn fields() -> Vec<FieldEntry> {
             appears_in: compose(),
             unit: "ratio",
             nullable: true,
-            null_means: Some("画像のレイヤ、または 1 画素も描かれなかった"),
+            null_means: Some("画像・図形のレイヤ、または 1 画素も描かれなかった"),
             warns: vec![FieldThreshold {
                 code: WarningCode::TextObscured,
                 operator: "gt",
@@ -2107,7 +2133,7 @@ fn fields() -> Vec<FieldEntry> {
             unit: "path",
             nullable: true,
             null_means: Some(
-                "画像のレイヤ（layers[].font ごと null）、または字体がファイルとして辿れない",
+                "画像・図形のレイヤ（layers[].font ごと null）、または字体がファイルとして辿れない",
             ),
             warns: vec![],
             gates: None,
@@ -2124,7 +2150,7 @@ fn fields() -> Vec<FieldEntry> {
             appears_in: compose(),
             unit: "ratio",
             nullable: true,
-            null_means: Some("role が subject のレイヤが 1 つも無い"),
+            null_means: Some("role が subject のレイヤが 1 つも無い、または図形のレイヤ"),
             warns: vec![FieldThreshold {
                 code: WarningCode::LayersOverlap,
                 operator: "gt",
@@ -2142,7 +2168,7 @@ fn fields() -> Vec<FieldEntry> {
             appears_in: compose(),
             unit: "bool",
             nullable: true,
-            null_means: Some("spec に safe_area が無い"),
+            null_means: Some("spec に safe_area が無い、または図形のレイヤ"),
             warns: vec![],
             gates: None,
             summary: "そのレイヤが safe_area の外へ出たか",
@@ -2223,6 +2249,81 @@ fn fields() -> Vec<FieldEntry> {
                  （線が 1px 未満に潰れた）ことで、--fail-on では display_strokes_lost が\
                  旗として見る",
             ),
+        },
+        FieldEntry {
+            path: "layers[].display[].against",
+            appears_in: compose(),
+            unit: "enum",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "縁取りのある層で、縮めた絵の背景として何と比べたか。stroke / ground",
+            notes: Some(
+                "**layers[].stroke を書いた層にだけ出る**（無い層ではキーごと無い）。\
+                 stroke は縮めても残った縁（塗りの被覆が 0.05 未満で、塗り + 縁の被覆が\
+                 0.5 以上の画素）と比べた、ground は縁の外の地（塗り + 縁の被覆が 0.05 未満）\
+                 と比べた。縁が縮小で地に溶けたときは ground になる。縁が残っても縁との比が\
+                 4.5 に届かなければ地とも比べ、良いほうを採って名乗る（塗りと同じ色の縁は\
+                 字を地から分けていないので、地と比べる）。**縁が溶けての ground なら縁は\
+                 効いていない**——縮小で 1px 以上残るには、width が canvas の幅 / 表示幅（px）\
+                 以上要る",
+            ),
+        },
+        FieldEntry {
+            path: "previews[].display",
+            appears_in: compose(),
+            unit: "enum",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "--preview が書いた絵の表示の名前（layers[].display[].name と同じ綴り）",
+            notes: Some(
+                "**--preview を渡したときだけ previews のキーが出る。** 並びは \
+                 compose_profiles[].displays[] の並びで、表示幅がキャンバスの幅以上の表示は\
+                 測らないので並ばない",
+            ),
+        },
+        FieldEntry {
+            path: "previews[].path",
+            appears_in: compose(),
+            unit: "path",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "--preview が書いた PNG。出力の隣の <出力の stem>.<display>.png",
+            notes: Some(
+                "縮小の測りが見た絵そのもの（透過を白か潰す色へ重ね、面積平均で縮め、\
+                 8bit へ丸めた RGB）で、画素から計算した相対輝度は display[] の測りが使った\
+                 輝度と一致する。出力とプレビューの先は描く前に全部確かめ（既存のファイルは \
+                 --force が無ければ、ディレクトリは --force があっても断る）、全部を\
+                 エンコードしてから書く。書く途中で失敗したら、その実行が新しく作った\
+                 ファイルは消す（--force で上書きしたファイルは戻せない）",
+            ),
+        },
+        FieldEntry {
+            path: "previews[].width",
+            appears_in: compose(),
+            unit: "px",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "プレビューの幅。表示の CSS px（拡大しない）",
+            notes: None,
+        },
+        FieldEntry {
+            path: "previews[].height",
+            appears_in: compose(),
+            unit: "px",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "プレビューの高さ。round(canvas の高さ × 表示幅 / canvas の幅)",
+            notes: None,
         },
     ]);
     out

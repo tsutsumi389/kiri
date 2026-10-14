@@ -2401,3 +2401,752 @@ fn cover_after_trimming_crops_the_product_itself() {
         [50.0, 25.0, 50.0, 150.0]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Phase 32: 縁取り・図形の層・縮小表示のプレビュー（13-phase-32.md §13.4）
+// ---------------------------------------------------------------------------
+
+/// Phase 31 の条件 6 の見出し（#767676 の地に白 100px）に、`stroke` を足す。
+/// `stroke` が `None` なら Phase 31 と同じ spec である。
+fn stroked_heading_spec(dir: &Path, family: &str, stroke: Option<u32>) -> PathBuf {
+    let stroke = stroke
+        .map(|w| format!(r##","stroke":{{"color":"#000000","width":{w}}}"##))
+        .unwrap_or_default();
+    write_spec(
+        dir,
+        &format!(
+            r##"{{"canvas":{{"background":"#767676"}},
+                 "font":{{"family":"{family}"}},
+                 "layers":[{{"id":"heading","type":"text","role":"heading",
+                            "lines":["ABAB"],"rect":[80,200,1100,240],
+                            "size":100,"color":"#ffffff"{stroke}}}]}}"##
+        ),
+    )
+}
+
+/// 幅 8 の黒い縁は `pc_list` へ縮めても残り、縁と比べて読める（§13.4 の 2）。
+/// 原寸の `text_contrast` は塗りと縁の比で 21。
+#[test]
+fn a_thick_stroke_survives_the_shrink_and_makes_the_heading_legible() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let out = dir.path().join("out.png");
+
+    // 縁が無ければ low_contrast（Phase 31 の条件 6 のまま）
+    let bare = stroked_heading_spec(dir.path(), &family, None);
+    let report = json_stdout(&compose(&bare, &out, &["--profile", "note", "--dry-run"]));
+    let pc = display_of(layer(&report, "heading"), "pc_list");
+    assert!(reasons(pc).contains(&"low_contrast".to_string()), "{pc}");
+    assert!(
+        pc.get("against").is_none(),
+        "縁の無い層に against が出た: {pc}"
+    );
+
+    let spec = stroked_heading_spec(dir.path(), &family, Some(8));
+    let report = json_stdout(&compose(&spec, &out, &["--profile", "note", "--dry-run"]));
+    let heading = layer(&report, "heading");
+    let full = heading["text_contrast"].as_f64().unwrap();
+    assert!((full - 21.0).abs() < 1e-9, "原寸 {full}");
+
+    let pc = display_of(heading, "pc_list");
+    assert_eq!(pc["against"], "stroke", "{family}: {pc}");
+    assert!(pc["contrast"].as_f64().unwrap() >= 4.5, "{family}: {pc}");
+    assert_eq!(pc["legible"], true, "{family}: {pc}");
+}
+
+/// 幅 1 の縁は `mobile_list` で地に溶け、**縁が効いたとは言わない**（§13.4 の 3）。
+#[test]
+fn a_hairline_stroke_lost_in_the_shrink_is_compared_with_the_ground() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let spec = stroked_heading_spec(dir.path(), &family, Some(1));
+    let out = dir.path().join("out.png");
+    let report = json_stdout(&compose(&spec, &out, &["--profile", "note", "--dry-run"]));
+    let mobile = display_of(layer(&report, "heading"), "mobile_list");
+    assert_eq!(mobile["against"], "ground", "{family}: {mobile}");
+    assert!(
+        reasons(mobile).contains(&"low_contrast".to_string()),
+        "{family}: {mobile}"
+    );
+    let warning = report["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "TEXT_ILLEGIBLE_AT_DISPLAY" && w["data"]["display"] == "mobile_list")
+        .expect("mobile_list の警告が無い");
+    let hint = warning["hint"].as_str().unwrap();
+    assert!(
+        hint.contains("stroke") && hint.contains("width 9") && hint.contains("shape"),
+        "low_contrast の手に縁取りと帯が無い: {hint}"
+    );
+}
+
+/// 縁は見える画素なので、`placed` も `text_overflow` も縁を含む（§13.2.1）。
+///
+/// 縁のある層は縁の幅だけ内側へ寄せて組む（§13.7）。`placed` は縁の無い層の
+/// 矩形を縁の幅だけ動かしたものを含み、その 4 辺を縁の幅だけ広げた範囲に収まる。
+#[test]
+fn the_placed_rect_includes_the_stroke() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let out = dir.path().join("out.png");
+    let bare = stroked_heading_spec(dir.path(), &family, None);
+    // キャンバスの寸法は profile から来る（spec が書いていない）
+    let args = ["--profile", "note", "--dry-run"];
+    let bare = rect_of(&layer(&json_stdout(&compose(&bare, &out, &args)), "heading")["placed"]);
+    let spec = stroked_heading_spec(dir.path(), &family, Some(8));
+    let report = json_stdout(&compose(&spec, &out, &args));
+    let heading = layer(&report, "heading");
+    let placed = rect_of(&heading["placed"]);
+
+    // 縁の無い矩形を右と下へ 8 動かしたもの（字の送りの矩形）
+    let [bx, by, bw, bh] = [bare[0] + 8.0, bare[1] + 8.0, bare[2], bare[3]];
+    let eps = 1e-3;
+    assert!(
+        placed[0] <= bx + eps
+            && placed[1] <= by + eps
+            && placed[0] + placed[2] >= bx + bw - eps
+            && placed[1] + placed[3] >= by + bh - eps,
+        "縁を付けて矩形が縮んだ: {placed:?} / {bare:?}"
+    );
+    assert!(
+        placed[0] >= bx - 8.0 - eps
+            && placed[1] >= by - 8.0 - eps
+            && placed[0] + placed[2] <= bx + bw + 8.0 + eps
+            && placed[1] + placed[3] <= by + bh + 8.0 + eps,
+        "縁の幅より外まで広がった: {placed:?} / {bare:?}"
+    );
+    assert!(
+        placed[0] < bx - 5.0,
+        "左へ縁が出ていない: {placed:?} / {bare:?}"
+    );
+    let widths = heading["line_widths"].as_array().unwrap();
+    assert!(
+        (widths[0].as_f64().unwrap() - placed[2]).abs() < 0.01,
+        "1 行のときは行の幅と placed の幅が一致する"
+    );
+
+    // **本当に狭い枠では、縁の分だけはみ出す。** 縁の無い字がちょうど収まる枠に
+    // 縁を付けると、字は縁の幅だけ右と下へ寄るので、少なくとも縁の幅だけ出る
+    let tight = write_spec(
+        dir.path(),
+        &format!(
+            r##"{{"canvas":{{"width":1280,"height":670,"background":"#ffffff"}},
+                 "font":{{"family":"{family}"}},
+                 "layers":[{{"id":"t","type":"text","role":"heading","lines":["ABAB"],
+                            "rect":[{x},{y},{w},{h}],"size":100,"color":"#000000",
+                            "stroke":{{"color":"#ff0000","width":8}}}}]}}"##,
+            x = bare[0],
+            y = bare[1],
+            w = bare[2],
+            h = bare[3],
+        ),
+    );
+    let report = json_stdout(&compose(&tight, &out, &["--dry-run"]));
+    let t = layer(&report, "t");
+    let over = t["text_overflow"].as_f64().unwrap();
+    assert!(
+        over >= 8.0 - eps,
+        "縁が枠から出たのにはみ出しと言わない: {t}"
+    );
+    assert!(codes(&report).contains(&"TEXT_OVERFLOW".to_string()));
+}
+
+/// **縁のある見出しも、余裕のある枠なら はみ出さない**（§13.7）。縁を内側へ
+/// 寄せずに組むと、`start` 揃えの字頭と最初の行の天で縁が必ず枠の外へ出て、
+/// どう `rect` を書いても `--fail-on default` を通らなかった。
+#[test]
+fn a_stroked_heading_with_room_does_not_overflow() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let out = dir.path().join("out.png");
+    for align in ["start", "center", "end"] {
+        let spec = write_spec(
+            dir.path(),
+            &format!(
+                r##"{{"canvas":{{"background":"#767676"}},
+                     "font":{{"family":"{family}"}},
+                     "layers":[{{"id":"heading","type":"text","role":"heading",
+                                "lines":["ABAB"],"rect":[80,200,1100,240],"align":"{align}",
+                                "size":100,"color":"#ffffff",
+                                "stroke":{{"color":"#000000","width":8}}}}]}}"##
+            ),
+        );
+        let report = json_stdout(&compose(
+            &spec,
+            &out,
+            &["--profile", "note", "--dry-run", "--fail-on", "default"],
+        ));
+        let heading = layer(&report, "heading");
+        assert_eq!(heading["text_overflow"], 0.0, "{family} {align}: {heading}");
+        assert!(
+            rect_of(&heading["placed"])[0] >= 80.0,
+            "{family} {align}: {heading}"
+        );
+        // 縮小表示の読みやすさは字体の太さに依るので、門は text_overflow の行だけを見る
+        let check = check_of(&report, "text_overflow").expect("text_overflow の行");
+        assert_eq!(check["status"], "pass", "{family} {align}: {check}");
+        assert!(!codes(&report).contains(&"TEXT_OVERFLOW".to_string()));
+    }
+}
+
+/// **塗りと同じ色の縁は、字を地から分けていない。** 黒地に白の字と白の縁は
+/// 縁との比が 1 だが、地と比べれば読める（§13.7）。原寸も縮小も地と比べる。
+#[test]
+fn a_stroke_the_colour_of_the_fill_is_not_called_low_contrast() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let spec = write_spec(
+        dir.path(),
+        &format!(
+            r##"{{"canvas":{{"background":"#000000"}},
+                 "font":{{"family":"{family}"}},
+                 "layers":[{{"id":"heading","type":"text","role":"heading",
+                            "lines":["ABAB"],"rect":[80,200,1100,240],
+                            "size":100,"color":"#ffffff",
+                            "stroke":{{"color":"#ffffff","width":8}}}}]}}"##
+        ),
+    );
+    let out = dir.path().join("out.png");
+    let report = json_stdout(&compose(&spec, &out, &["--profile", "note", "--dry-run"]));
+    let heading = layer(&report, "heading");
+    assert!(
+        heading["text_contrast"].as_f64().unwrap() > 20.0,
+        "{heading}"
+    );
+    assert!(!codes(&report).contains(&"TEXT_CONTRAST_LOW".to_string()));
+    let pc = display_of(heading, "pc_list");
+    assert_eq!(pc["against"], "ground", "{pc}");
+    assert_eq!(pc["legible"], true, "{pc}");
+}
+
+/// 白地に白に近い文字の下へ黒い帯（不透明度 0.8）を敷くと、`TEXT_CONTRAST_LOW` が
+/// 消える（§13.4 の 4）。
+#[test]
+fn a_band_beneath_pale_text_clears_the_low_contrast() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let make = |band: bool| {
+        let band = if band {
+            r##"{"id":"band","type":"shape","rect":[0,40,400,120],
+                 "color":"#000000","opacity":0.8},"##
+        } else {
+            ""
+        };
+        write_spec(
+            dir.path(),
+            &format!(
+                r##"{{"canvas":{{"width":400,"height":200,"background":"#ffffff"}},
+                     "font":{{"family":"{family}"}},
+                     "layers":[{band}
+                       {{"id":"t","type":"text","role":"heading","lines":["AB"],
+                        "rect":[20,50,360,100],"size":60,"color":"#eeeeee"}}]}}"##
+            ),
+        )
+    };
+    let out = dir.path().join("out.png");
+    let report = json_stdout(&compose(&make(false), &out, &["--dry-run"]));
+    assert!(codes(&report).contains(&"TEXT_CONTRAST_LOW".to_string()));
+    let hint = report["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "TEXT_CONTRAST_LOW")
+        .unwrap()["hint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(hint.contains("stroke") && hint.contains("shape"), "{hint}");
+
+    let report = json_stdout(&compose(&make(true), &out, &["--dry-run"]));
+    assert!(
+        !codes(&report).contains(&"TEXT_CONTRAST_LOW".to_string()),
+        "帯を敷いたのにまだ低い: {}",
+        layer(&report, "t")
+    );
+    assert!(layer(&report, "t")["text_contrast"].as_f64().unwrap() >= 4.5);
+}
+
+/// 文字の上に不透明な図形を重ねると `TEXT_OBSCURED`（§13.4 の 5）。
+#[test]
+fn an_opaque_shape_over_text_obscures_it() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let spec = write_spec(
+        dir.path(),
+        &format!(
+            r##"{{"canvas":{{"width":400,"height":200,"background":"#ffffff"}},
+                 "font":{{"family":"{family}"}},
+                 "layers":[
+                   {{"id":"t","type":"text","role":"heading","lines":["AB"],
+                    "rect":[20,40,360,120],"size":60,"color":"#000000"}},
+                   {{"id":"plate","type":"shape","rect":[0,0,400,200],
+                    "color":"#202020","radius":12}}]}}"##
+        ),
+    );
+    let out = dir.path().join("out.png");
+    let result = compose(&spec, &out, &["--fail-on", "default"]);
+    let report = json_stdout(&result);
+    assert!(layer(&report, "t")["text_obscured"].as_f64().unwrap() > 0.99);
+    assert!(codes(&report).contains(&"TEXT_OBSCURED".to_string()));
+    assert_eq!(result.status.code(), Some(5));
+}
+
+/// 図形の層は `decoration`・`outside_safe_area: null`・`display` 無し
+/// （§13.4 の 6）。`subject` ではないので、文字が重なっても `layer_overlap` は数えない。
+#[test]
+fn a_shape_layer_reports_as_an_unmeasured_decoration() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let spec = write_spec(
+        dir.path(),
+        &format!(
+            r##"{{"font":{{"family":"{family}"}},
+                 "layers":[
+                   {{"id":"band","type":"shape","rect":[0,0,1280,670],"color":"#000000"}},
+                   {{"id":"heading","type":"text","role":"heading","lines":["AB"],
+                    "rect":[80,200,1100,240],"size":120,"color":"#ffffff"}}]}}"##
+        ),
+    );
+    let out = dir.path().join("out.png");
+    let report = json_stdout(&compose(&spec, &out, &["--profile", "note", "--dry-run"]));
+    let band = layer(&report, "band");
+    assert_eq!(band["kind"], "shape");
+    assert_eq!(band["role"], "decoration");
+    assert_eq!(
+        band["outside_safe_area"],
+        Value::Null,
+        "端まで敷いた帯を外と言った"
+    );
+    assert!(band.get("display").is_none(), "{band}");
+    assert_eq!(rect_of(&band["placed"]), [0.0, 0.0, 1280.0, 670.0]);
+    for key in [
+        "opaque_rect",
+        "line_widths",
+        "text_overflow",
+        "text_contrast",
+        "text_obscured",
+        "layer_overlap",
+        "align",
+        "font",
+    ] {
+        assert_eq!(band[key], Value::Null, "{key}: {band}");
+    }
+    assert!(!codes(&report).contains(&"OUTSIDE_SAFE_AREA".to_string()));
+    let heading = layer(&report, "heading");
+    assert_eq!(
+        heading["layer_overlap"],
+        Value::Null,
+        "図形は subject ではない"
+    );
+    assert!(
+        heading["text_contrast"].as_f64().unwrap() > 20.0,
+        "黒い帯の上の白"
+    );
+}
+
+/// PNG を読み、不透明の RGB を並べる。
+fn rgb_of(path: &Path) -> (u32, u32, Vec<u8>) {
+    let image = image::open(path).unwrap().to_rgba8();
+    let rgb = image.pixels().flat_map(|p| [p[0], p[1], p[2]]).collect();
+    (image.width(), image.height(), rgb)
+}
+
+/// `--preview` は 2 枚を書き、寸法は表示の CSS px で、**画素は測りの絵そのもの**
+/// である（§13.4 の 7）。
+///
+/// 書いた出力（PNG なので可逆）を、測りと同じ `shrink_canvas` で縮め直して
+/// 突き合わせる。輝度は RGB から出す（`display::Shrunk` の doc）ので、RGB が
+/// 一致すれば輝度も一致する。
+#[test]
+fn the_preview_is_the_picture_the_display_measure_saw() {
+    let dir = TempDir::new().unwrap();
+    // 字体の要らない絵で確かめる。中間色の地に半透明の帯と丸い札
+    let spec = write_spec(
+        dir.path(),
+        r##"{"canvas":{"background":"#767676"},
+             "layers":[
+               {"id":"band","type":"shape","rect":[0,300.5,1280,97.3],
+                "color":"#102030","opacity":0.6},
+               {"id":"tag","type":"shape","rect":[900,100,300,120],
+                "color":"#ffffff","radius":60}]}"##,
+    );
+    let out = dir.path().join("header.png");
+    let result = compose(&spec, &out, &["--profile", "note", "--preview"]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report = json_stdout(&result);
+
+    let previews = report["previews"].as_array().expect("previews[] が無い");
+    let listed: Vec<(String, u64, u64)> = previews
+        .iter()
+        .map(|p| {
+            (
+                p["display"].as_str().unwrap().to_string(),
+                p["width"].as_u64().unwrap(),
+                p["height"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            ("pc_list".to_string(), 192, 101),
+            ("mobile_list".to_string(), 144, 75)
+        ]
+    );
+
+    let canvas = image::open(&out).unwrap().to_rgba8();
+    for p in previews {
+        let path = PathBuf::from(p["path"].as_str().unwrap());
+        assert_eq!(
+            path,
+            dir.path()
+                .join(format!("header.{}.png", p["display"].as_str().unwrap()))
+        );
+        let (w, h, rgb) = rgb_of(&path);
+        assert_eq!(
+            (u64::from(w), u64::from(h)),
+            (p["width"].as_u64().unwrap(), p["height"].as_u64().unwrap())
+        );
+        let measured = kiri::compose::display::shrink_canvas(&canvas, [255, 255, 255], w, h);
+        assert_eq!(
+            rgb,
+            measured.rgb(),
+            "{}: 書いた絵と測った絵が違う",
+            path.display()
+        );
+    }
+}
+
+/// 文字の測りとプレビューの輝度が一致する（§13.4 の 7）。縮めた絵の画素から
+/// 前景と背景の中央値を取り直し、`display[].contrast` と同じ数になることを見る。
+#[test]
+fn the_preview_reproduces_the_measured_contrast() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let spec = stroked_heading_spec(dir.path(), &family, None);
+    let out = dir.path().join("h.png");
+    let report = json_stdout(&compose(&spec, &out, &["--profile", "note", "--preview"]));
+    let heading = layer(&report, "heading");
+
+    // 前景の画素を、文字だけを描いた絵から同じ縮小で取る
+    let glyphs_spec = write_spec(
+        dir.path(),
+        &format!(
+            r##"{{"canvas":{{"width":1280,"height":670}},
+                 "font":{{"family":"{family}"}},
+                 "layers":[{{"id":"heading","type":"text","role":"heading",
+                            "lines":["ABAB"],"rect":[80,200,1100,240],
+                            "size":100,"color":"#ffffff"}}]}}"##
+        ),
+    );
+    let glyphs_out = dir.path().join("glyphs.png");
+    assert!(compose(&glyphs_spec, &glyphs_out, &[]).status.success());
+    let glyphs = image::open(&glyphs_out).unwrap().to_rgba8();
+    let placed = rect_of(&heading["placed"]);
+
+    for p in report["previews"].as_array().unwrap() {
+        let name = p["display"].as_str().unwrap();
+        let (w, h, rgb) = rgb_of(Path::new(p["path"].as_str().unwrap()));
+        let coverage = kiri::compose::display::shrink_coverage(&glyphs, w, h);
+        let lum = |i: usize| {
+            let f = |v: u8| {
+                let c = f64::from(v) / 255.0;
+                if c <= 0.03928 {
+                    c / 12.92
+                } else {
+                    ((c + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * f(rgb[i * 3]) + 0.7152 * f(rgb[i * 3 + 1]) + 0.0722 * f(rgb[i * 3 + 2])
+        };
+        let (sx, sy) = (f64::from(w) / 1280.0, f64::from(h) / 670.0);
+        let x0 = (placed[0] * sx).floor() as usize;
+        let x1 = (((placed[0] + placed[2]) * sx).ceil() as usize).min(w as usize);
+        let y0 = (placed[1] * sy).floor() as usize;
+        let y1 = (((placed[1] + placed[3]) * sy).ceil() as usize).min(h as usize);
+        let mut front: Vec<f64> = (0..coverage.len())
+            .filter(|&i| coverage[i] == kiri::compose::display::FOREGROUND)
+            .map(lum)
+            .collect();
+        let mut back: Vec<f64> = (y0..y1)
+            .flat_map(|y| (x0..x1).map(move |x| y * w as usize + x))
+            .filter(|&i| coverage[i] == kiri::compose::display::BACKGROUND)
+            .map(lum)
+            .collect();
+        front.sort_by(f64::total_cmp);
+        back.sort_by(f64::total_cmp);
+        let (f, b) = (front[front.len() / 2], back[back.len() / 2]);
+        let (hi, lo) = if f > b { (f, b) } else { (b, f) };
+        let expected = (hi + 0.05) / (lo + 0.05);
+        let measured = display_of(heading, name)["contrast"].as_f64().unwrap();
+        assert_eq!(measured, expected, "{name}");
+    }
+}
+
+/// `--preview` は `--profile` が要り、`--dry-run` と併用できない（§13.4 の 8）。
+#[test]
+fn the_preview_needs_a_profile_and_refuses_a_dry_run() {
+    let dir = TempDir::new().unwrap();
+    let spec = write_spec(
+        dir.path(),
+        r##"{"canvas":{"width":1280,"height":670,"background":"#ffffff"},
+             "layers":[{"id":"s","type":"shape","rect":[0,0,10,10],"color":"#000000"}]}"##,
+    );
+    let out = dir.path().join("out.png");
+    assert_eq!(compose(&spec, &out, &["--preview"]).status.code(), Some(2));
+    assert_eq!(
+        compose(
+            &spec,
+            &out,
+            &["--profile", "note", "--preview", "--dry-run"]
+        )
+        .status
+        .code(),
+        Some(2)
+    );
+    assert!(!out.exists());
+    assert!(!dir.path().join("out.pc_list.png").exists());
+}
+
+/// プレビューの先に既存のファイルがあれば `--force` 無しで断り、**出力も書かない**
+/// （§13.4 の 8）。`--force` があれば全部書く。
+#[test]
+fn an_existing_preview_blocks_every_write_without_force() {
+    let dir = TempDir::new().unwrap();
+    let spec = write_spec(
+        dir.path(),
+        r##"{"canvas":{"background":"#ffffff"},
+             "layers":[{"id":"s","type":"shape","rect":[0,0,10,10],"color":"#000000"}]}"##,
+    );
+    let out = dir.path().join("out.png");
+    let existing = dir.path().join("out.mobile_list.png");
+    std::fs::write(&existing, b"keep").unwrap();
+
+    let result = compose(&spec, &out, &["--profile", "note", "--preview"]);
+    assert!(!result.status.success());
+    assert_eq!(json_stdout(&result)["error"]["code"], "OUTPUT_EXISTS");
+    assert!(!out.exists(), "プレビューで断ったのに出力を書いた");
+    assert!(!dir.path().join("out.pc_list.png").exists());
+    assert_eq!(std::fs::read(&existing).unwrap(), b"keep");
+
+    let result = compose(&spec, &out, &["--profile", "note", "--preview", "--force"]);
+    assert!(result.status.success());
+    assert!(out.exists());
+    assert_eq!(rgb_of(&existing).0, 144);
+}
+
+/// プレビューの先がディレクトリなら、`--force` があっても**描く前に**断り、出力も
+/// 書かない・変えない（§13.7）。
+#[test]
+fn a_directory_at_a_preview_path_blocks_every_write_even_with_force() {
+    let dir = TempDir::new().unwrap();
+    let spec = write_spec(
+        dir.path(),
+        r##"{"canvas":{"background":"#ffffff"},
+             "layers":[{"id":"s","type":"shape","rect":[0,0,10,10],"color":"#000000"}]}"##,
+    );
+    let out = dir.path().join("out.png");
+    std::fs::write(&out, b"old").unwrap();
+    std::fs::create_dir(dir.path().join("out.pc_list.png")).unwrap();
+
+    let result = compose(&spec, &out, &["--profile", "note", "--preview", "--force"]);
+    assert!(!result.status.success());
+    assert_eq!(json_stdout(&result)["error"]["code"], "OUTPUT_WRITE_FAILED");
+    assert_eq!(std::fs::read(&out).unwrap(), b"old", "出力を書き換えた");
+    assert!(!dir.path().join("out.mobile_list.png").exists());
+
+    // 出力の先がディレクトリでも同じく描く前に断る
+    let other = dir.path().join("other.png");
+    std::fs::create_dir(&other).unwrap();
+    let result = compose(
+        &spec,
+        &other,
+        &["--profile", "note", "--preview", "--force"],
+    );
+    assert_eq!(json_stdout(&result)["error"]["code"], "OUTPUT_WRITE_FAILED");
+    assert!(!dir.path().join("other.pc_list.png").exists());
+}
+
+/// `--preview` を渡さなければ `previews` はキーごと出ず、縁の無い層の
+/// `display[]` に `against` は出ない（§13.4 の 1）。
+#[test]
+fn without_the_new_options_no_new_keys_appear() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let spec = stroked_heading_spec(dir.path(), &family, None);
+    let out = dir.path().join("out.png");
+    let report = json_stdout(&compose(&spec, &out, &["--profile", "note"]));
+    assert!(report.get("previews").is_none(), "{report}");
+    for d in layer(&report, "heading")["display"].as_array().unwrap() {
+        assert!(d.get("against").is_none(), "{d}");
+    }
+    assert!(!dir.path().join("out.pc_list.png").exists());
+}
+
+/// 不正な `stroke` / `shape` の値とキーを断る（§13.4 の 9）。
+#[test]
+fn bad_stroke_and_shape_values_are_refused() {
+    let dir = TempDir::new().unwrap();
+    let out = dir.path().join("out.png");
+    for (layer, code) in [
+        (
+            r##"{"id":"t","type":"text","role":"heading","lines":["A"],"rect":[0,0,10,10],
+                "size":20,"color":"#000000","stroke":{"color":"#ffffff","width":21}}"##,
+            "SPEC_INVALID",
+        ),
+        (
+            r##"{"id":"t","type":"text","role":"heading","lines":["A"],"rect":[0,0,10,10],
+                "size":20,"color":"#000000","stroke":{"color":"#ffffff","width":0}}"##,
+            "SPEC_INVALID",
+        ),
+        (
+            r##"{"id":"t","type":"text","role":"heading","lines":["A"],"rect":[0,0,10,10],
+                "size":20,"color":"#000000","stroke":{"colour":"#ffffff","width":2}}"##,
+            "SPEC_UNKNOWN_FIELD",
+        ),
+        (
+            r##"{"id":"s","type":"shape","rect":[0,0,10,10],"color":"#000000","opacity":0}"##,
+            "SPEC_INVALID",
+        ),
+        (
+            r##"{"id":"s","type":"shape","rect":[0,0,10,10],"color":"#000000","opacity":1.5}"##,
+            "SPEC_INVALID",
+        ),
+        (
+            r##"{"id":"s","type":"shape","rect":[0,0,10,10],"color":"#000000","radius":-2}"##,
+            "SPEC_INVALID",
+        ),
+        (
+            r##"{"id":"s","type":"shape","role":"heading","rect":[0,0,10,10],"color":"#000000"}"##,
+            "SPEC_UNKNOWN_FIELD",
+        ),
+        (
+            r##"{"id":"s","type":"shape","rect":[0,0,10,10],"color":"#000"}"##,
+            "INVALID_COLOR",
+        ),
+    ] {
+        let spec = write_spec(
+            dir.path(),
+            &format!(
+                r##"{{"canvas":{{"width":100,"height":100}},"font":{{"family":"X"}},
+                     "layers":[{layer}]}}"##
+            ),
+        );
+        let result = compose(&spec, &out, &[]);
+        assert_eq!(json_stdout(&result)["error"]["code"], code, "{layer}");
+        assert!(!out.exists());
+    }
+}
+
+/// 縁取り・図形・プレビューを使っても、同じ入力から同じ結果（§13.4 の 10）。
+#[test]
+fn strokes_shapes_and_previews_are_deterministic() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let run = |name: &str| {
+        let dir = TempDir::new().unwrap();
+        let spec = write_spec(
+            dir.path(),
+            &format!(
+                r##"{{"canvas":{{"background":"#767676"}},
+                     "font":{{"family":"{family}"}},
+                     "layers":[
+                       {{"id":"band","type":"shape","rect":[40,180,1200,280],
+                        "color":"#000000","opacity":0.5,"radius":24}},
+                       {{"id":"heading","type":"text","role":"heading","lines":["ABAB"],
+                        "rect":[80,200,1100,240],"size":100,"color":"#ffffff",
+                        "stroke":{{"color":"#000000","width":8}}}}]}}"##
+            ),
+        );
+        let out = dir.path().join(name);
+        let mut report = json_stdout(&compose(&spec, &out, &["--profile", "note", "--preview"]));
+        let o = report.as_object_mut().unwrap();
+        o.remove("elapsed_ms");
+        o.remove("spec");
+        o.remove("output");
+        let mut bytes = vec![std::fs::read(&out).unwrap()];
+        for p in o.remove("previews").unwrap().as_array().unwrap() {
+            bytes.push(std::fs::read(p["path"].as_str().unwrap()).unwrap());
+        }
+        (report, bytes)
+    };
+    let (a, a_bytes) = run("a.png");
+    let (b, b_bytes) = run("a.png");
+    assert_eq!(a, b);
+    assert_eq!(a_bytes, b_bytes);
+}
+
+/// `kiri schema` が縁取り・図形・`against`・`previews[]`・`--preview` を配る
+/// （§13.4 の 12）。
+#[test]
+fn the_schema_publishes_strokes_shapes_and_previews() {
+    let out = kiri()
+        .args(["schema", "compose", "--json"])
+        .output()
+        .unwrap();
+    let schema = json_stdout(&out);
+    let at = |name: &str| -> Vec<String> {
+        schema["compose_spec"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["at"] == name)
+            .unwrap_or_else(|| panic!("compose_spec に '{name}' が無い"))["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| k.as_str().unwrap().to_string())
+            .collect()
+    };
+    assert!(at("layers[type=text]").contains(&"stroke".to_string()));
+    assert_eq!(at("layers[type=text].stroke"), ["color", "width"]);
+    assert_eq!(
+        at("layers[type=shape]"),
+        ["id", "type", "rect", "color", "opacity", "radius"]
+    );
+    let paths: Vec<&str> = schema["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert!(paths.contains(&"layers[].display[].against"), "{paths:?}");
+    for key in ["display", "path", "width", "height"] {
+        let path = format!("previews[].{key}");
+        assert!(paths.contains(&path.as_str()), "{path}: {paths:?}");
+    }
+    let options = schema["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "compose")
+        .unwrap()["options"]
+        .to_string();
+    assert!(options.contains("--preview"), "{options}");
+}

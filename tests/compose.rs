@@ -2480,9 +2480,11 @@ fn a_hairline_stroke_lost_in_the_shrink_is_compared_with_the_ground() {
         .expect("mobile_list の警告が無い");
     let hint = warning["hint"].as_str().unwrap();
     assert!(
-        hint.contains("stroke") && hint.contains("width 9") && hint.contains("shape"),
-        "low_contrast の手に縁取りと帯が無い: {hint}"
+        hint.contains("stroke の width を 9 以上") && hint.contains("shape"),
+        "low_contrast の手に縁を太らせる手と帯が無い: {hint}"
     );
+    // 既に縁を持つ層に「縁取る」とは言わない
+    assert!(!hint.contains("縁取る"), "{hint}");
 }
 
 /// 縁は見える画素なので、`placed` も `text_overflow` も縁を含む（§13.2.1）。

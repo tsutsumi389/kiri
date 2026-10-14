@@ -451,13 +451,26 @@ pub fn warning(layer: &str, report: &DisplayReport, canvas_w: u32) -> Option<War
                                     太い face を持つ字体を layers[].font で指す）"
                 .to_string(),
             // **縁取りと帯を足す。** 写真の上に置いた見出しでは、文字色も下地も
-            // 選べないことが多い（13-phase-32.md §13.2.5）
-            Reason::LowContrast => format!(
-                "文字色か、その文字が載っている下地を変える。変えられなければ stroke で\
-                 縁取る（width {} 以上——表示上 1px 以上残る太さ）か、文字の下に \
-                 shape の帯を敷く",
-                required_stroke(canvas_w, report.width)
-            ),
+            // 選べないことが多い（13-phase-32.md §13.2.5）。**既に縁を持つ層に
+            // 「縁取る」と言わない**——`against` が、縁が縮小で潰れたのか、
+            // 残ったのに足りないのかを言うので、それぞれの手を返す
+            Reason::LowContrast => match report.against {
+                None => format!(
+                    "文字色か、その文字が載っている下地を変える。変えられなければ stroke で\
+                     縁取る（width {} 以上——表示上 1px 以上残る太さ）か、文字の下に \
+                     shape の帯を敷く",
+                    required_stroke(canvas_w, report.width)
+                ),
+                Some(Against::Ground) => format!(
+                    "縁が縮小で地に溶けている。stroke の width を {} 以上にする\
+                     （表示上 1px 以上残る太さ）か、文字の下に shape の帯を敷く",
+                    required_stroke(canvas_w, report.width)
+                ),
+                Some(Against::Stroke) => "縁と比べても足りない。文字色と stroke の color を\
+                                          離すか、size か weight を上げて塗りが縁に埋もれない\
+                                          ようにするか、文字の下に shape の帯を敷く"
+                    .to_string(),
+            },
         });
     }
     Some(
@@ -765,6 +778,37 @@ mod tests {
         assert_eq!(shrunk.rgb().len(), 192 * 101 * 3);
         for (c, l) in shrunk.rgb().chunks_exact(3).zip(&shrunk.luminance) {
             assert_eq!(relative_luminance([c[0], c[1], c[2]]), *l);
+        }
+    }
+
+    /// **既に縁を持つ層に「縁取る」と言わない。** 縁が潰れたなら太らせる手を、
+    /// 残ったのに足りないなら色を離すか塗りを太らせる手を言う（実写の検証で、
+    /// 幅 4 の縁を持つキャプションに「stroke で縁取る」と返していた）。
+    #[test]
+    fn a_stroked_layer_is_not_told_to_add_a_stroke() {
+        let hint_for = |against| {
+            let report = DisplayReport {
+                name: "mobile_list",
+                width: 144,
+                size_px: 6.6,
+                contrast: Some(2.7),
+                legible: false,
+                reasons: vec![Reason::LowContrast],
+                against: Some(against),
+            };
+            let w = warning("caption", &report, 1280).unwrap();
+            serde_json::to_value(&w).unwrap()["hint"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let ground = hint_for(Against::Ground);
+        assert!(ground.contains("stroke の width を 9 以上"), "{ground}");
+        let stroke = hint_for(Against::Stroke);
+        assert!(stroke.contains("stroke の color"), "{stroke}");
+        for hint in [ground, stroke] {
+            assert!(!hint.contains("縁取る"), "{hint}");
+            assert!(hint.contains("shape"), "{hint}");
         }
     }
 

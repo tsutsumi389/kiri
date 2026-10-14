@@ -338,3 +338,32 @@ decoration・透過の下地・後から覆う層とキャンバスの外の文�
 13. `kiri schema` は `previews[]` を 1 行で配っていたのを、他の配列と同じく
     `previews[].display` / `.path` / `.width` / `.height` の 4 行にした。
     `layers[].opaque_rect` の `null_means` に図形の層を足した
+
+## 13.8 実写での検証（2026-10-15）
+
+白い不織布の上のリモコン（`IMG_0251`）を背景に `cover` で敷き、切り抜いた同じ
+リモコンを右に立てた note の見出しを 3 通り組んだ。字体はヒラギノ角ゴシック W8
+（見出し 104px）と W4（キャプション 44px）、文字は白。見出しの下は明るい
+不織布である。
+
+| 版 | 見出し 原寸 | 見出し `pc_list` | 見出し `mobile_list` | キャプション `mobile_list` |
+|---|---|---|---|---|
+| そのまま | 2.59 `TEXT_CONTRAST_LOW` | 2.46 low_contrast | 2.33 low_contrast | 2.13 too_small・low_contrast |
+| 縁 8px（キャプション 4px）、#111418 | 18.47 | 15.68 `stroke` | 10.31 `stroke` | 2.70 `stroke`・too_small・low_contrast |
+| 帯（#111418、不透明度 0.6、角 24） | 8.62 | 8.16 | 7.42 | 4.19 too_small・low_contrast |
+
+**`--preview` の絵を 4 倍に拡大して目で見た印象と、数の順位が一致した。**
+そのままの見出しは不織布に溶けて読みにくく、縁と帯の見出しははっきり読める。
+キャプションは 3 通りとも潰れており、縁 4px の版は縮めた塗りが縁に埋もれて
+黒い塊に見える——`against: "stroke"` で 2.70 という数はその見た目どおりである。
+
+**見つけた欠陥を 1 つ直した。** 縁 4px のキャプションの `low_contrast` に
+「stroke で縁取る（width 9 以上）」と返していた——既に縁を持つ層である。
+`against` で手を分けた: `ground` なら縁の width を太らせる手、`stroke` なら
+文字色と縁の color を離すか、size か weight を上げて塗りが縁に埋もれないように
+する手を返す（`display::tests::a_stroked_layer_is_not_told_to_add_a_stroke`）。
+
+`OUTSIDE_SAFE_AREA` は背景の写真（`bg`、`role: decoration` の画像）と商品の
+両方に出た。背景の写真が安全領域の外へ出るのは全面に敷く以上当然で、図形の層と
+同じ理由で測らなくてよいが、画像の層の振る舞いを変えるのはこの段の範囲の外
+なので、残件として記す。

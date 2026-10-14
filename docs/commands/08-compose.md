@@ -319,6 +319,12 @@ $ kiri compose header.json -o header.png --profile note --json | jq '.layers[1].
 `low_contrast` のまま）になる（Arial Unicode MS、`start` 揃え）。`against` は縁取りのある層に
 だけ出る。前景は縁の有無に依らず塗りの被覆で選ぶので、`strokes_lost` も変わらない。
 
+**縁のある層の `low_contrast` には「縁取る」と言わない。** `against` が `ground` なら
+縁を `canvas の幅 / 表示幅` px 以上へ太らせる手を、`stroke` なら文字色と縁の色を
+離すか、`size` か `weight` を上げて塗りが縁に埋もれないようにする手を返す。
+小さな字に太い縁を付けると、縮めた塗りが縁に埋もれて `stroke` と比べても足りなく
+なる（44px のキャプションに縁 4px で `mobile_list` が 2.7）。
+
 透過の画素は、出力が透過を保てるなら**白**（note の一覧の地）へ、保てないなら
 潰す色へ重ねてから縮める。縮小は box（面積平均）で、Lanczos のように輪郭を
 立たせて細い線を実際より読めるように見せることはしない。

@@ -206,7 +206,7 @@ warning_catalog! {
         remedy: Some("要素の rect を safe_area の中へ収める"),
     TextIllegibleAtDisplay = "TEXT_ILLEGIBLE_AT_DISPLAY"
         => "compose --profile の縮小表示で文字が読めない。data.layer の文字を data.display（幅 data.width px）へ縮めた絵で測った。data.reasons が too_small（data.size_px が 11 未満）/ strokes_lost（線が 1px 未満に潰れた）/ low_contrast（data.contrast が 4.5 未満）のどれかを言う",
-        remedy: Some("too_small なら size を上げる（要る size は 11 × canvas の幅 / data.width）。low_contrast なら文字色か、その文字が載っている下地を変える。変えられなければ layers[].stroke で縁取る（width は canvas の幅 / data.width 以上——縮小で 1px 以上残る太さ。細い縁は地に溶け、display[].against が ground になる）か、文字の下に type: shape の帯を敷く。strokes_lost なら weight を上げる（FONT_WEIGHT_UNAVAILABLE が同じ層に出ていれば weight は効かないので、太い face を持つ字体を layers[].font で指す）"),
+        remedy: Some("too_small なら size を上げる（要る size は 11 × canvas の幅 / data.width）。low_contrast なら文字色か、その文字が載っている下地を変える。変えられなければ layers[].stroke で縁取る（width は canvas の幅 / data.width 以上——縮小で 1px 以上残る太さ。細い縁は地に溶け、display[].against が ground になる）か、文字の下に type: shape の帯を敷く。既に縁があって display[].against が stroke なら、文字色と縁の color を離すか、size か weight を上げて塗りが縁に埋もれないようにする。strokes_lost なら weight を上げる（FONT_WEIGHT_UNAVAILABLE が同じ層に出ていれば weight は効かないので、太い face を持つ字体を layers[].font で指す）"),
     ProfileAspectMismatch = "PROFILE_ASPECT_MISMATCH"
         => "compose の canvas の縦横比が --profile の比から 0.5% 以上外れている。表示側でトリミングされる（data.expected と data.actual が [幅, 高さ]）",
         remedy: Some("canvas の width / height を消して profile の大きさにする（または同じ比の大きさにする）"),

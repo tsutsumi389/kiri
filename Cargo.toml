@@ -67,9 +67,19 @@ tract-onnx = { version = "0.23.7", optional = true }
 # 正規化している。そちらを迂回すると、**色と向きの契約が compose でだけ崩れる。**
 # 画像は kiri が読んで自分で合成し、resvg へ渡すのは文字だけにする（計画 §10.3.3）。
 # `svgz` も外す——外から SVG を受けない設計なので、読む相手が居ない
+#
+# **`memmap-fonts` は入れる。** 無いと fontdb は `with_face_data` のたびに字体の
+# ファイルを `std::fs::read` で丸ごと読む。usvg はグリフの輪郭を取るたびにそこを
+# 通るので、Hiragino Sans GB.ttc（23.5MB）では異なる字 1 つにつき数 ms が
+# sys 時間に消える。17 字・`--profile note` で 196 → 84ms、`path` を書かない
+# spec（システムの字体を全部積む）では 332 → 95ms（2026-10-16）。足すのは
+# `memmap2` だけで、`*-sys` は増えない。
+# 引き換えに、**組んでいる最中に字体のファイルが切り詰められると SIGBUS で
+# 落ちうる。** 字体は組む間に書き換える相手ではないので、それは受け入れる
 resvg = { version = "0.48.1", default-features = false, features = [
     "text",
     "system-fonts",
+    "memmap-fonts",
 ] }
 # 字体に、その文字のグリフが在るかを見るためだけに引く。
 #

@@ -87,6 +87,18 @@ fn render(
 
     let (bbox, line_widths) = measure_tree(&tree, layer);
 
+    Ok(Layout {
+        bbox,
+        line_widths,
+        pixels: rasterize(&tree, canvas)?,
+    })
+}
+
+/// 木をキャンバスと同じ大きさの画像（straight alpha）に描く。
+///
+/// 文字と図形が**同じ経路を通る**ための入口である——縁のアンチエイリアスを
+/// そろえる理由は `compose::shape` の doc にある。
+pub(super) fn rasterize(tree: &usvg::Tree, canvas: &Canvas) -> Result<RgbaImage> {
     let mut pixmap = tiny_skia::Pixmap::new(canvas.width, canvas.height).ok_or_else(|| {
         Error::new(
             ErrorCode::InvalidCanvas,
@@ -96,13 +108,8 @@ fn render(
             ),
         )
     })?;
-    resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
-
-    Ok(Layout {
-        bbox,
-        line_widths,
-        pixels: to_rgba(&pixmap),
-    })
+    resvg::render(tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
+    Ok(to_rgba(&pixmap))
 }
 
 /// 木から幾何を拾う。
@@ -334,7 +341,7 @@ pub(super) fn escape(text: &str) -> String {
 ///
 /// **ここで戻しておく。** kiri の合成（`transform::canvas::composite`）は straight
 /// alpha で書かれており、premultiplied のまま渡すと半透明の縁だけが暗くなる。
-pub(super) fn to_rgba(pixmap: &tiny_skia::Pixmap) -> RgbaImage {
+fn to_rgba(pixmap: &tiny_skia::Pixmap) -> RgbaImage {
     let mut out = RgbaImage::new(pixmap.width(), pixmap.height());
     for (dst, src) in out.pixels_mut().zip(pixmap.pixels()) {
         let c = src.demultiply();

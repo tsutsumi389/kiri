@@ -2238,3 +2238,45 @@ fn find_font(chars: &[char]) -> Option<String> {
         draws.then_some(family)
     })
 }
+
+// ---------------------------------------------------------------------------
+// `kiri compose` の統合テスト（`tests/compose.rs` / `tests/compose_font.rs`）が
+// 共に使う口
+// ---------------------------------------------------------------------------
+
+pub fn kiri() -> assert_cmd::Command {
+    assert_cmd::Command::new(env!("CARGO_BIN_EXE_kiri"))
+}
+
+pub fn json_stdout(output: &std::process::Output) -> serde_json::Value {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout が JSON として解釈できません: {e}\n---\n{stdout}"))
+}
+
+pub fn write_spec(dir: &Path, json: &str) -> PathBuf {
+    let path = dir.join("layout.json");
+    std::fs::write(&path, json).unwrap();
+    path
+}
+
+pub fn compose(spec: &Path, out: &Path, extra: &[&str]) -> std::process::Output {
+    let mut args = vec![
+        "compose",
+        spec.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--json",
+    ];
+    args.extend_from_slice(extra);
+    kiri().args(&args).output().unwrap()
+}
+
+pub fn layer<'a>(report: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
+    report["layers"]
+        .as_array()
+        .expect("layers が配列")
+        .iter()
+        .find(|l| l["id"] == id)
+        .unwrap_or_else(|| panic!("レイヤ '{id}' が結果に無い: {report}"))
+}

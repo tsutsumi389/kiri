@@ -228,17 +228,22 @@ fn compose_profile_long_help() -> String {
     let mut lines = vec![
         "見出し画像の規格を当て、縮小表示での読みやすさを測る。".to_string(),
         String::new(),
-        "spec に書いた値は profile より強い（明示 > profile）。canvas の width / height \
-         と safe_area を spec で省くと profile の値を使い、canvas を書いた場合は比が 0.5% \
-         以上外れると PROFILE_ASPECT_MISMATCH が出る。書いたバイト数が上限を超えると \
-         PROFILE_MAX_BYTES_EXCEEDED が出る。"
-            .to_string(),
+        format!(
+            "spec に書いた値は profile より強い（明示 > profile）。canvas の width / height \
+             と safe_area を spec で省くと profile の値を使い、canvas を書いた場合は比が {}% \
+             以上外れると PROFILE_ASPECT_MISMATCH が出る。書いたバイト数が上限を超えると \
+             PROFILE_MAX_BYTES_EXCEEDED が出る。",
+            crate::compose::profile::ASPECT_TOLERANCE * 100.0
+        ),
         String::new(),
-        "**原寸の測りに加えて、** 全層を重ねた絵を profile の表示幅へ面積平均で縮め、\
-         文字の層ごとに表示上の大きさ（11px 未満で too_small）・線の残り（strokes_lost）・\
-         コントラスト（4.5 未満で low_contrast）を layers[].display[] に返す。\
-         読めなければ TEXT_ILLEGIBLE_AT_DISPLAY が出る。"
-            .to_string(),
+        format!(
+            "**原寸の測りに加えて、** 全層を重ねた絵を profile の表示幅へ面積平均で縮め、\
+             文字の層ごとに表示上の大きさ（{}px 未満で too_small）・線の残り（strokes_lost）・\
+             コントラスト（{} 未満で low_contrast）を layers[].display[] に返す。\
+             読めなければ TEXT_ILLEGIBLE_AT_DISPLAY が出る。",
+            crate::compose::display::MIN_DISPLAY_SIZE,
+            crate::compose::measure::MIN_CONTRAST
+        ),
         String::new(),
         "規格:".to_string(),
     ];

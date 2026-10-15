@@ -296,11 +296,13 @@ impl FailOn {
     /// 実行の結果を動かさないという約束（12-phase-31.md §12.1 の 3）が破れる。
     /// 明示して書いた `display_*` は、測っていないので `unmeasurable` として
     /// 残す（`evaluate`）。
-    fn rule_for(&self, metric: Metric, profiled: bool) -> Option<Rule> {
+    ///
+    /// `unprofiled` は「`--profile` が要る指標なのに渡していない」か。
+    fn rule_for(&self, metric: Metric, unprofiled: bool) -> Option<Rule> {
         if let Some(rule) = self.rules.iter().find(|r| r.metric() == metric) {
             return Some(*rule);
         }
-        if !self.default || (metric.needs_profile() && !profiled) {
+        if !self.default || unprofiled {
             return None;
         }
         Some(match metric.calibrated() {
@@ -321,10 +323,11 @@ impl FailOn {
     pub fn evaluate(&self, layers: &[LayerReport], profiled: bool) -> GateReport {
         let mut checks = Vec::new();
         for metric in Metric::ALL {
-            let Some(rule) = self.rule_for(metric, profiled) else {
+            let unprofiled = metric.needs_profile() && !profiled;
+            let Some(rule) = self.rule_for(metric, unprofiled) else {
                 continue;
             };
-            let applicable = metric.applicable(layers) || (metric.needs_profile() && !profiled);
+            let applicable = metric.applicable(layers) || unprofiled;
             let actual = metric.worst(layers);
             let (operator, threshold) = match rule {
                 Rule::Number {
@@ -485,21 +488,18 @@ mod tests {
 
     fn text(display: Option<Vec<DisplayReport>>) -> LayerReport {
         LayerReport {
-            id: "t".to_string(),
-            kind: "text",
-            role: Role::Heading,
-            rect: [0.0, 0.0, 10.0, 10.0],
-            placed: [0.0, 0.0, 10.0, 10.0],
-            opaque_rect: None,
             line_widths: Some(vec![10.0]),
             text_overflow: Some(0.0),
             text_contrast: Some(21.0),
             text_obscured: Some(0.0),
-            layer_overlap: None,
-            outside_safe_area: None,
-            align: None,
-            font: None,
             display,
+            ..LayerReport::bare(
+                "t".to_string(),
+                "text",
+                Role::Heading,
+                [0.0, 0.0, 10.0, 10.0],
+                [0.0, 0.0, 10.0, 10.0],
+            )
         }
     }
 

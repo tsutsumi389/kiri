@@ -72,10 +72,9 @@ pub struct ResolvedFont {
 /// ファイルが違う——最上位の 1 つだけでは「何で組まれたか」が辿れない。
 #[derive(Debug, Clone, Serialize)]
 pub struct UsedFont {
-    pub family: String,
-    /// `ResolvedFont::path` と同じ約束
-    pub path: Option<String>,
-    pub sha256: Option<String>,
+    /// `family` / `path` / `sha256`。**`ResolvedFont` と同じ約束で、同じ並びに出る**
+    #[serde(flatten)]
+    pub font: ResolvedFont,
     /// **実際に描かれる太さ**を 100 刻みへ丸めたもの。spec の weight ではない。
     ///
     /// 静的な字体ではその face の太さ（OS/2 の usWeightClass）、可変フォントでは
@@ -88,7 +87,7 @@ pub struct UsedFont {
 pub struct LayerFont {
     /// この層の字体だけを積んだ db（`retain_family` の後）
     pub db: Arc<fontdb::Database>,
-    pub family: String,
+    /// family は `used.font.family` が持つ
     pub used: UsedFont,
 }
 
@@ -116,16 +115,8 @@ pub fn resolve(document: &ComposeSpec, base: &Path, warnings: &mut Vec<Warning>)
     let top = match &document.font {
         Some(spec) => {
             let db = open_once(spec, "font", base, &mut opened, &mut system)?;
-            let source = query(&db, &spec.family).and_then(|id| file_of(&db, id));
-            let sha256 = source
-                .as_deref()
-                .map(|p| cached_digest(p, &mut digests))
-                .transpose()?;
-            Some(ResolvedFont {
-                family: spec.family.clone(),
-                path: source.map(|p| p.display().to_string()),
-                sha256,
-            })
+            let face = query(&db, &spec.family);
+            Some(provenance(&spec.family, &db, face, &mut digests)?)
         }
         None => None,
     };
@@ -195,11 +186,7 @@ pub fn resolve(document: &ComposeSpec, base: &Path, warnings: &mut Vec<Warning>)
             layers.push(None);
             continue;
         };
-        let source = c.face.and_then(|id| file_of(&c.db, id));
-        let sha256 = source
-            .as_deref()
-            .map(|p| cached_digest(p, &mut digests))
-            .transpose()?;
+        let font = provenance(c.family, &c.db, c.face, &mut digests)?;
         let weight = c
             .face
             .map_or(text.weight, |id| drawn_weight(&c.db, id, text.weight));
@@ -209,17 +196,11 @@ pub fn resolve(document: &ComposeSpec, base: &Path, warnings: &mut Vec<Warning>)
                 c.family,
                 text.weight,
                 weight,
-                source.as_deref(),
+                font.path.as_deref(),
             ));
         }
         layers.push(Some(LayerFont {
-            family: c.family.to_string(),
-            used: UsedFont {
-                family: c.family.to_string(),
-                path: source.map(|p| p.display().to_string()),
-                sha256,
-                weight,
-            },
+            used: UsedFont { font, weight },
             db: c.db,
         }));
     }
@@ -234,6 +215,25 @@ struct Chosen<'a> {
     /// その層の weight で引いた face。family は `open` が確かめてあるので、
     /// `None` は字体がメモリ上にしか無いような届かない経路である
     face: Option<fontdb::ID>,
+}
+
+/// face の素性（実体のパスと SHA-256）を、結果 JSON に出す形に組む。
+fn provenance(
+    family: &str,
+    db: &fontdb::Database,
+    face: Option<fontdb::ID>,
+    digests: &mut Vec<(PathBuf, String)>,
+) -> Result<ResolvedFont> {
+    let source = face.and_then(|id| file_of(db, id));
+    let sha256 = source
+        .as_deref()
+        .map(|p| cached_digest(p, digests))
+        .transpose()?;
+    Ok(ResolvedFont {
+        family: family.to_string(),
+        path: source.map(|p| p.display().to_string()),
+        sha256,
+    })
 }
 
 /// 読んだことのあるファイルならそのダイジェストを返す。
@@ -343,7 +343,7 @@ fn weight_warning(
     family: &str,
     requested: u16,
     actual: u16,
-    source: Option<&Path>,
+    path: Option<&str>,
 ) -> Warning {
     let mut warning = Warning::new(
         WarningCode::FontWeightUnavailable,
@@ -360,8 +360,8 @@ fn weight_warning(
     .with_data("family", family)
     .with_data("requested", requested)
     .with_data("actual", actual);
-    if let Some(path) = source {
-        warning = warning.with_data("path", path.display().to_string());
+    if let Some(path) = path {
+        warning = warning.with_data("path", path);
     }
     warning
 }
@@ -474,12 +474,7 @@ pub fn ascent_ratio(db: &fontdb::Database, family: &str) -> f64 {
 /// ない。可変フォント 1 本で 100〜900 を賄う字体では、`Weight::BOLD` で引くと
 /// 在るのに無いと答えることがある。太さの当てはめは usvg が自分で行う。
 fn query(db: &fontdb::Database, family: &str) -> Option<fontdb::ID> {
-    db.query(&fontdb::Query {
-        families: &[fontdb::Family::Name(family)],
-        weight: fontdb::Weight::NORMAL,
-        stretch: fontdb::Stretch::Normal,
-        style: fontdb::Style::Normal,
-    })
+    query_weight(db, family, fontdb::Weight::NORMAL.0)
 }
 
 /// usvg が組むときと**同じ引き方**で、その weight の face を引く。

@@ -1247,7 +1247,7 @@ pub struct SchemaReport {
     /// `profiles[]` と分けて配る。あちらは cutout / lint の表で、混ぜると
     /// `cutout --profile note` が書けるように読める（`compose::profile` の doc）。
     /// `--summary` でも載せる——規格の表は入口で引くものである（`profiles` と同じ）
-    pub compose_profiles: Vec<ComposeProfileEntry>,
+    pub compose_profiles: &'static [crate::compose::profile::ComposeProfile],
     /// どのサブコマンドでも受けるオプション。**コマンド側には重複させない。**
     /// clap のグローバル引数はサブコマンドの引数一覧に現れないので、
     /// 素直に組むと schema から丸ごと落ちる
@@ -1272,34 +1272,6 @@ pub struct SchemaScope {
     pub brief: bool,
     /// 入口だけを返したか
     pub summary: bool,
-}
-
-/// `kiri compose --profile` の 1 行。**`compose::profile::ComposeProfile` の全項目**
-/// をそのまま機械可読にしたものである。
-#[derive(Debug, Serialize)]
-pub struct ComposeProfileEntry {
-    pub name: &'static str,
-    /// 規格の版。表示幅は実測なので、測った年月でもある
-    pub revision: &'static str,
-    pub summary: &'static str,
-    /// キャンバス・安全領域・容量の出典。**表示幅はここに無い**（kiri の実測）
-    pub source: &'static str,
-    /// spec が寸法を省いたときのキャンバス `[幅, 高さ]`
-    pub canvas: [u32; 2],
-    /// spec が省いたときの安全領域 `[x, y, 幅, 高さ]`（`canvas` 基準。
-    /// キャンバスが違えば比で合わせる）
-    pub safe_area: [f64; 4],
-    /// 書いたバイト数の上限（以下が合格）。null は規定なし
-    pub max_bytes: Option<u64>,
-    /// 縮めて読みやすさを測る表示。並びは `layers[].display[]` の並び
-    pub displays: Vec<ComposeDisplayEntry>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ComposeDisplayEntry {
-    pub name: &'static str,
-    /// 表示幅（CSS px）
-    pub width: u32,
 }
 
 /// compose の spec の 1 階層。

@@ -15,47 +15,10 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-use assert_cmd::Command;
+use common::{compose, json_stdout, kiri, layer, write_spec};
 use resvg::usvg::fontdb;
 use serde_json::Value;
 use tempfile::TempDir;
-
-fn kiri() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_kiri"))
-}
-
-fn json_stdout(output: &std::process::Output) -> Value {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("stdout が JSON として解釈できません: {e}\n---\n{stdout}"))
-}
-
-fn write_spec(dir: &Path, json: &str) -> PathBuf {
-    let path = dir.join("layout.json");
-    std::fs::write(&path, json).unwrap();
-    path
-}
-
-fn compose(spec: &Path, out: &Path, extra: &[&str]) -> std::process::Output {
-    let mut args = vec![
-        "compose",
-        spec.to_str().unwrap(),
-        "-o",
-        out.to_str().unwrap(),
-        "--json",
-    ];
-    args.extend_from_slice(extra);
-    kiri().args(&args).output().unwrap()
-}
-
-fn layer<'a>(report: &'a Value, id: &str) -> &'a Value {
-    report["layers"]
-        .as_array()
-        .expect("layers が配列")
-        .iter()
-        .find(|l| l["id"] == id)
-        .unwrap_or_else(|| panic!("レイヤ '{id}' が結果に無い: {report}"))
-}
 
 fn warnings_of<'a>(report: &'a Value, code: &str) -> Vec<&'a Value> {
     report["warnings"]

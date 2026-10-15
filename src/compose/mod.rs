@@ -111,7 +111,7 @@ pub struct ComposeSpec {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Canvas {
-    /// **`--profile` を渡したときだけ省ける**（`parse_with` が埋める）。
+    /// **`--profile` を渡したときだけ省ける**（`parse` が埋める）。
     /// 渡さずに省けば今までどおり `SPEC_INVALID` で断る
     pub width: u32,
     pub height: u32,
@@ -371,29 +371,21 @@ fn default_line_height() -> f64 {
     1.4
 }
 
-/// spec を読む。
-pub fn load(path: &Path) -> Result<ComposeSpec> {
-    load_with(path, None)
-}
-
 /// spec を読み、`--profile` の値で**書かれていない項目だけを**埋める。
-pub fn load_with(path: &Path, profile: Option<&ComposeProfile>) -> Result<ComposeSpec> {
+pub fn load(path: &Path, profile: Option<&ComposeProfile>) -> Result<ComposeSpec> {
     let text = std::fs::read_to_string(path).map_err(|e| {
         Error::new(
             ErrorCode::SpecUnreadable,
             format!("{} を読めません: {e}", path.display()),
         )
     })?;
-    parse_with(&text, &path.display().to_string(), profile)
+    parse(&text, &path.display().to_string(), profile)
 }
 
 /// 読んだ文字列を spec にする。**ファイルを読む経路とテストが同じ関門を通る。**
-pub fn parse(text: &str, origin: &str) -> Result<ComposeSpec> {
-    parse_with(text, origin, None)
-}
-
-/// `parse` に `--profile` を足したもの。**明示 > profile の順で勝つ**
-/// （cutout の `--profile` と同じ約束）。
+///
+/// `profile` があれば書かれていない項目だけを埋める。**明示 > profile の順で
+/// 勝つ**（cutout の `--profile` と同じ約束）。
 ///
 /// # 埋めるのは型へ落とす前である
 ///
@@ -407,11 +399,7 @@ pub fn parse(text: &str, origin: &str) -> Result<ComposeSpec> {
 /// `safe_area` は型へ落とした後に埋める。キャンバスの寸法が決まらないと
 /// 比で合わせられないからである。どちらも `validate` の前なので、profile が
 /// 埋めた値も spec に書いた値と同じ関門を通る。
-pub fn parse_with(
-    text: &str,
-    origin: &str,
-    profile: Option<&ComposeProfile>,
-) -> Result<ComposeSpec> {
+pub fn parse(text: &str, origin: &str, profile: Option<&ComposeProfile>) -> Result<ComposeSpec> {
     let mut raw: serde_json::Value = serde_json::from_str(text).map_err(|e| {
         Error::new(
             ErrorCode::SpecInvalidJson,
@@ -759,7 +747,7 @@ mod tests {
     /// `canvas` を省いた spec は profile の寸法と安全領域で組む（§12.5 の 2）。
     #[test]
     fn a_missing_canvas_takes_the_profile_values() {
-        let spec = parse_with(IMAGE_ONLY, "t", Some(note())).unwrap();
+        let spec = parse(IMAGE_ONLY, "t", Some(note())).unwrap();
         assert_eq!((spec.canvas.width, spec.canvas.height), (1280, 670));
         assert_eq!(spec.safe_area, Some([0.0, 108.0, 1280.0, 454.0]));
         assert_eq!(spec.canvas.background, None);
@@ -768,12 +756,13 @@ mod tests {
     /// **profile を渡さなければ、省いた寸法は今までどおり断る。**
     #[test]
     fn without_a_profile_a_missing_canvas_is_still_refused() {
-        let err = parse(IMAGE_ONLY, "t").unwrap_err();
+        let err = parse(IMAGE_ONLY, "t", None).unwrap_err();
         assert_eq!(err.code, ErrorCode::SpecInvalid);
         let err = parse(
             r#"{"canvas":{"width":10},"layers":[{"id":"a","type":"image",
                "role":"subject","source":"a.png","rect":[0,0,10,10]}]}"#,
             "t",
+            None,
         )
         .unwrap_err();
         assert_eq!(err.code, ErrorCode::SpecInvalid);
@@ -782,7 +771,7 @@ mod tests {
     /// 書いた値は profile より強い。安全領域は書いたキャンバスへ比で合わせる。
     #[test]
     fn written_values_win_over_the_profile() {
-        let spec = parse_with(
+        let spec = parse(
             r##"{"canvas":{"width":1920,"height":1006,"background":"#ffffff"},
                 "layers":[{"id":"a","type":"image","role":"subject",
                            "source":"a.png","rect":[0,0,10,10]}]}"##,
@@ -793,7 +782,7 @@ mod tests {
         assert_eq!((spec.canvas.width, spec.canvas.height), (1920, 1006));
         assert_eq!(spec.safe_area, Some(note().safe_area_for(1920, 1006)));
 
-        let spec = parse_with(
+        let spec = parse(
             r#"{"canvas":{"width":1280,"height":670},"safe_area":[10,10,100,100],
                 "layers":[{"id":"a","type":"image","role":"subject",
                            "source":"a.png","rect":[0,0,10,10]}]}"#,
@@ -825,21 +814,21 @@ mod tests {
 
     #[test]
     fn a_valid_stroke_and_shape_are_accepted() {
-        let spec = parse(&stroked(r##"{"color":"#000000","width":40}"##), "t").unwrap();
+        let spec = parse(&stroked(r##"{"color":"#000000","width":40}"##), "t", None).unwrap();
         let Layer::Text(t) = &spec.layers[0] else {
             panic!("文字の層");
         };
         let stroke = t.stroke.as_ref().unwrap();
         assert_eq!((stroke.color.as_str(), stroke.width), ("#000000", 40.0));
 
-        let spec = parse(&shaped(""), "t").unwrap();
+        let spec = parse(&shaped(""), "t", None).unwrap();
         let Layer::Shape(s) = &spec.layers[0] else {
             panic!("図形の層");
         };
         assert_eq!((s.opacity, s.radius), (1.0, 0.0), "既定は不透明・角なし");
         assert_eq!(spec.layers[0].role(), Role::Decoration);
         assert_eq!(spec.layers[0].kind(), "shape");
-        parse(&shaped(r#","opacity":0.6,"radius":1000"#), "t").unwrap();
+        parse(&shaped(r#","opacity":0.6,"radius":1000"#), "t", None).unwrap();
     }
 
     #[test]
@@ -848,13 +837,14 @@ mod tests {
             let err = parse(
                 &stroked(&format!(r##"{{"color":"#000000","width":{width}}}"##)),
                 "t",
+                None,
             )
             .unwrap_err();
             assert_eq!(err.code, ErrorCode::SpecInvalid, "width {width}");
         }
-        let err = parse(&stroked(r##"{"color":"#000","width":2}"##), "t").unwrap_err();
+        let err = parse(&stroked(r##"{"color":"#000","width":2}"##), "t", None).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidColor);
-        let err = parse(&stroked(r#"{"width":2}"#), "t").unwrap_err();
+        let err = parse(&stroked(r#"{"width":2}"#), "t", None).unwrap_err();
         assert_eq!(err.code, ErrorCode::SpecInvalid, "color は必須");
     }
 
@@ -863,6 +853,7 @@ mod tests {
         let err = parse(
             &stroked(r##"{"color":"#000000","width":2,"opacity":0.5}"##),
             "t",
+            None,
         )
         .unwrap_err();
         assert_eq!(err.code, ErrorCode::SpecUnknownField);
@@ -876,13 +867,14 @@ mod tests {
             r#","opacity":-0.5"#,
             r#","radius":-1"#,
         ] {
-            let err = parse(&shaped(extra), "t").unwrap_err();
+            let err = parse(&shaped(extra), "t", None).unwrap_err();
             assert_eq!(err.code, ErrorCode::SpecInvalid, "{extra}");
         }
         let err = parse(
             r#"{"canvas":{"width":100,"height":100},
                 "layers":[{"id":"s","type":"shape","rect":[0,0,50,50],"color":"black"}]}"#,
             "t",
+            None,
         )
         .unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidColor);
@@ -896,7 +888,7 @@ mod tests {
             r#","stroke":{}"#,
             r#","lines":["a"]"#,
         ] {
-            let err = parse(&shaped(extra), "t").unwrap_err();
+            let err = parse(&shaped(extra), "t", None).unwrap_err();
             assert_eq!(err.code, ErrorCode::SpecUnknownField, "{extra}");
         }
     }
@@ -904,7 +896,7 @@ mod tests {
     /// 1 辺だけ書けば、もう 1 辺を profile から受け取る。
     #[test]
     fn one_written_side_keeps_the_other_from_the_profile() {
-        let spec = parse_with(
+        let spec = parse(
             r#"{"canvas":{"height":720},"layers":[{"id":"a","type":"image",
                "role":"subject","source":"a.png","rect":[0,0,10,10]}]}"#,
             "t",

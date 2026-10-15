@@ -42,11 +42,12 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use image::RgbaImage;
+use image::buffer::ConvertBuffer;
 
 use crate::cli::ComposeArgs;
 use crate::compose::font::LayerFont;
 use crate::compose::measure::{self, COVERAGE, LayerReport};
-use crate::compose::profile::ComposeProfile;
+use crate::compose::profile::{ComposeProfile, Display};
 use crate::compose::{
     self, ComposeSpec, ImageLayer, Layer, Role, ShapeLayer, TextLayer, Trim, display,
 };
@@ -68,7 +69,7 @@ const UNPAINTED: u16 = u16::MAX;
 pub fn run(args: &ComposeArgs) -> Result<ComposeReport> {
     let started = Instant::now();
     let profile = args.profile;
-    let spec = compose::load_with(&args.spec, profile)?;
+    let spec = compose::load(&args.spec, profile)?;
     // 素材のパスは **spec からの相対**で解く。実行時の作業ディレクトリに
     // 依らせると、同じ spec が置き場所によって別のものを読む
     let base = args.spec.parent().unwrap_or(Path::new(".")).to_path_buf();
@@ -81,14 +82,19 @@ pub fn run(args: &ComposeArgs) -> Result<ComposeReport> {
         .with_hint("avif / png / jpg / webp のいずれかの拡張子を付けてください")
     })?;
     crate::commands::output::ensure_path_writable(&args.output, args.force)?;
-    // **プレビューの先も、描く前に確かめる。** 出力を書いてからプレビューで
-    // 断ると、半端な成果物が残る（モジュールの doc の「書く約束」）
-    if let Some(profile) = profile.filter(|_| args.preview) {
-        let previews = profile
-            .displays
+    // 縮小表示で測る表示（`display::measurable`）。**ここで 1 度だけ選ぶ**——
+    // プレビューの書く先、文字の被覆の縮小、測りが同じ一覧を見るので、確かめた
+    // 先と書く先と測った表示が食い違わない
+    let measured: Option<Vec<&Display>> = profile.map(|p| {
+        p.displays
             .iter()
             .filter(|d| display::measurable(spec.canvas.width, d))
-            .map(|d| preview_path(&args.output, d.name));
+            .collect()
+    });
+    // **プレビューの先も、描く前に確かめる。** 出力を書いてからプレビューで
+    // 断ると、半端な成果物が残る（モジュールの doc の「書く約束」）
+    if let Some(measured) = measured.as_deref().filter(|_| args.preview) {
+        let previews = measured.iter().map(|d| preview_path(&args.output, d.name));
         for path in previews {
             crate::commands::output::ensure_path_writable(&path, args.force)?;
             refuse_directory(&path)?;
@@ -113,19 +119,19 @@ pub fn run(args: &ComposeArgs) -> Result<ComposeReport> {
         &base,
         &fonts.layers,
         flatten_to,
-        profile,
+        measured.as_deref(),
         &mut warnings,
     )?;
     let canvas = built.canvas;
     let mut layers = built.layers;
     let mut shrunk: Vec<(&'static str, display::Shrunk)> = Vec::new();
 
-    if let Some(profile) = profile {
+    if let Some(measured) = measured.as_deref() {
         // **透過は白として縮める**——note の一覧の地は白で、透過の PNG を上げた
         // ときに見えるのはその白である（12-phase-31.md §12.6 の 2）。透過を
         // 保てない出力なら、実際に潰される色のほうが見える
         let base = flatten_to.unwrap_or([255, 255, 255]);
-        shrunk = measure_displays(profile, &canvas, base, &built.glyphs, &spec, &mut layers);
+        shrunk = measure_displays(measured, &canvas, base, &built.glyphs, &spec, &mut layers);
     }
 
     for layer in &layers {
@@ -304,11 +310,7 @@ fn encode_previews(
     };
     let mut out = Vec::with_capacity(shrunk.len());
     for (name, image) in shrunk {
-        let rgba = RgbaImage::from_fn(image.width, image.height, |x, y| {
-            let i = ((y * image.width + x) * 3) as usize;
-            let c = &image.rgb()[i..i + 3];
-            image::Rgba([c[0], c[1], c[2], 255])
-        });
+        let rgba: RgbaImage = image.rgb().convert();
         let (bytes, encode_warnings) = save::encode(&rgba, &options)?;
         warnings.extend(encode_warnings);
         let path = preview_path(output, name);
@@ -363,52 +365,47 @@ fn write_all(files: &[(&Path, &[u8])]) -> Result<()> {
     Ok(())
 }
 
-/// 全層を重ねたキャンバスを profile の表示ごとに縮め、文字の層ごとに測る。
+/// 全層を重ねたキャンバスを測る表示ごとに縮め、文字の層ごとに測る。
 ///
 /// **表示ごとに 1 回だけ縮める。** 縮めた絵は文字の層をまたいで同じなので、
 /// 層ごとに縮め直すと同じ計算を層の数だけ払う。縮めた絵は `--preview` の
 /// ために返す（表示 1 つで高々 192x101 の RGB である）。
+///
+/// `measured` は `display::measurable` で選んだ表示だけの一覧である。表示幅が
+/// キャンバスより広い表示は測らず、`display[]` に行ごと出さない。
 fn measure_displays(
-    profile: &ComposeProfile,
+    measured: &[&Display],
     canvas: &RgbaImage,
     base: [u8; 3],
     glyphs: &[Glyphs],
     spec: &ComposeSpec,
     layers: &mut [LayerReport],
 ) -> Vec<(&'static str, display::Shrunk)> {
-    let mut kept = Vec::new();
+    let mut kept = Vec::with_capacity(measured.len());
     let (w, h) = (spec.canvas.width, spec.canvas.height);
-    for entry in glyphs {
-        layers[entry.index].display = Some(Vec::with_capacity(profile.displays.len()));
-    }
-    for (d, target) in profile.displays.iter().enumerate() {
-        // 表示幅がキャンバスより広い表示は測らず、`display[]` に行ごと出さない
-        // （`display::measurable`）
-        if !display::measurable(w, target) {
-            continue;
-        }
+    let mut reports: Vec<Vec<display::DisplayReport>> = glyphs
+        .iter()
+        .map(|_| Vec::with_capacity(measured.len()))
+        .collect();
+    for (d, target) in measured.iter().enumerate() {
         let height = display::display_height(w, h, target.width);
         let shrunk = display::shrink_canvas(canvas, base, target.width, height);
-        for entry in glyphs {
-            let Some(coverage) = entry.coverage[d].as_deref() else {
-                continue;
-            };
-            let halo = entry.halo.as_ref().and_then(|halo| halo[d].as_deref());
-            let layer = &mut layers[entry.index];
-            let report = display::measure(
+        for (entry, list) in glyphs.iter().zip(&mut reports) {
+            let halo = entry.halo.as_ref().map(|halo| halo[d].as_slice());
+            list.push(display::measure(
                 &shrunk,
-                coverage,
+                &entry.coverage[d],
                 halo,
-                layer.placed,
+                layers[entry.index].placed,
                 entry.size,
                 (w, h),
                 target,
-            );
-            if let Some(list) = layer.display.as_mut() {
-                list.push(report);
-            }
+            ));
         }
         kept.push((target.name, shrunk));
+    }
+    for (entry, list) in glyphs.iter().zip(reports) {
+        layers[entry.index].display = Some(list);
     }
     kept
 }
@@ -428,11 +425,11 @@ struct Glyphs {
     /// spec の `size`。表示上の大きさはここから計算で出す
     size: f64,
     /// この文字の**塗りの**被覆を表示ごとに縮めて区分へ畳んだもの。並びは
-    /// `displays` の並びで、測らない表示（`display::measurable`）は `None`
-    coverage: Vec<Option<Vec<u8>>>,
+    /// 測る表示（`display::measurable` で選んだ一覧）の並び
+    coverage: Vec<Vec<u8>>,
     /// 縁取りのある層だけ、**塗り + 縁の**被覆を同じく縮めたもの。縮小での
     /// 背景を縁と地から選ぶのに使う（`display::measure` の doc）
-    halo: Option<Vec<Option<Vec<u8>>>>,
+    halo: Option<Vec<Vec<u8>>>,
 }
 
 /// 文字の層について、後から覆われた割合を数えるために取っておくもの。
@@ -444,12 +441,14 @@ struct Covered {
 }
 
 /// 下地を作り、層を順に重ね、各層を測る。
+///
+/// `measured` は縮小表示で測る表示の一覧で、`--profile` が無ければ `None`。
 fn build(
     spec: &ComposeSpec,
     base: &Path,
     fonts: &[Option<LayerFont>],
     flatten_to: Option<[u8; 3]>,
-    profile: Option<&ComposeProfile>,
+    measured: Option<&[&Display]>,
     warnings: &mut Vec<Warning>,
 ) -> Result<Built> {
     let (w, h) = (spec.canvas.width, spec.canvas.height);
@@ -488,17 +487,7 @@ fn build(
                     &mut painter,
                 )?;
                 LayerReport {
-                    id: image.id.clone(),
-                    kind: layer.kind(),
-                    role: image.role,
-                    rect: image.rect,
-                    placed,
                     opaque_rect,
-                    line_widths: None,
-                    text_overflow: None,
-                    text_contrast: None,
-                    text_obscured: None,
-                    layer_overlap: None,
                     // **不透明な画素で判定する。** 透過の余白が外へ出ても、表示で
                     // 切られるものは無い。描く画素が無ければ外へは出ようがない。
                     // **decoration は測らない**——全面に敷いた背景の写真は外へ出る
@@ -507,14 +496,26 @@ fn build(
                         .safe_area
                         .filter(|_| image.role != Role::Decoration)
                         .map(|a| opaque_rect.is_some_and(|r| measure::outside(a, r))),
-                    align: None,
-                    font: None,
-                    display: None,
+                    ..LayerReport::bare(
+                        image.id.clone(),
+                        layer.kind(),
+                        image.role,
+                        image.rect,
+                        placed,
+                    )
                 }
             }
             Layer::Shape(shape) => draw_shape(&mut canvas, shape, spec, index, &mut painter)?,
             Layer::Text(text) => {
-                let font = fonts.get(i).and_then(Option::as_ref);
+                // `compose::validate` が「文字があるのに font が無い」を既に断っているので、
+                // ここへ `None` で来ることは無い。**それでも unwrap しない**——届かない
+                // はずの経路が届いたときに、panic ではなく code で言えるほうがよい
+                let font = fonts.get(i).and_then(Option::as_ref).ok_or_else(|| {
+                    Error::new(
+                        ErrorCode::FontNotFound,
+                        format!("'{}' を組むための字体が決まっていません", text.id),
+                    )
+                })?;
                 let (report, pixels, drawn) = draw_text(
                     &mut canvas,
                     text,
@@ -535,18 +536,15 @@ fn build(
                 let drawn_at_full_size = !pixels.is_empty();
                 covered.push(Covered { index, pixels });
                 // **読めることを要求しない層は測らない**（`text_contrast` と同じ線引き）
-                if let Some(profile) =
-                    profile.filter(|_| text.role.wants_contrast() && drawn_at_full_size)
+                if let Some(measured) =
+                    measured.filter(|_| text.role.wants_contrast() && drawn_at_full_size)
                 {
-                    let shrink = |pixels: &RgbaImage| -> Vec<Option<Vec<u8>>> {
-                        profile
-                            .displays
+                    let shrink = |pixels: &RgbaImage| -> Vec<Vec<u8>> {
+                        measured
                             .iter()
                             .map(|d| {
-                                display::measurable(w, d).then(|| {
-                                    let height = display::display_height(w, h, d.width);
-                                    display::shrink_coverage(pixels, d.width, height)
-                                })
+                                let height = display::display_height(w, h, d.width);
+                                display::shrink_coverage(pixels, d.width, height)
                             })
                             .collect()
                     };
@@ -611,14 +609,9 @@ fn build(
 /// 縁取りのある文字の、**塗りだけ**を描いた画像。縁付きと同じ位置に組み
 /// （`text::layout_fill`）、縁の属性だけを落とす——塗りの形は縁の有無で
 /// 変わらないので、縁付きの絵の塗りと画素まで一致する。
-fn fill_only(layer: &TextLayer, spec: &ComposeSpec, font: Option<&LayerFont>) -> Result<RgbaImage> {
-    let Some(font) = font else {
-        return Err(Error::new(
-            ErrorCode::FontNotFound,
-            format!("'{}' を組むための字体が決まっていません", layer.id),
-        ));
-    };
-    Ok(compose::text::layout_fill(layer, &spec.canvas, &font.family, &font.db)?.pixels)
+fn fill_only(layer: &TextLayer, spec: &ComposeSpec, font: &LayerFont) -> Result<RgbaImage> {
+    let family = &font.used.font.family;
+    Ok(compose::text::layout_fill(layer, &spec.canvas, family, &font.db)?.pixels)
 }
 
 /// 図形を描いて重ね、層の測りを返す（13-phase-32.md §13.2.3）。
@@ -645,23 +638,13 @@ fn draw_shape(
         index,
     );
     canvas_mod::composite_clipped(canvas, &pixels, (0, 0));
-    Ok(LayerReport {
-        id: layer.id.clone(),
-        kind: "shape",
-        role: Role::Decoration,
-        rect: layer.rect,
-        placed: layer.rect,
-        opaque_rect: None,
-        line_widths: None,
-        text_overflow: None,
-        text_contrast: None,
-        text_obscured: None,
-        layer_overlap: None,
-        outside_safe_area: None,
-        align: None,
-        font: None,
-        display: None,
-    })
+    Ok(LayerReport::bare(
+        layer.id.clone(),
+        "shape",
+        Role::Decoration,
+        layer.rect,
+        layer.rect,
+    ))
 }
 
 /// 文字が覆う画素のうち、自分より後の層に塗られた割合。
@@ -788,7 +771,7 @@ fn draw_text(
     canvas: &mut RgbaImage,
     layer: &TextLayer,
     spec: &ComposeSpec,
-    font: Option<&LayerFont>,
+    font: &LayerFont,
     flatten_to: Option<[u8; 3]>,
     index: u16,
     subject: &[u8],
@@ -796,17 +779,7 @@ fn draw_text(
     painter: &mut [u16],
     warnings: &mut Vec<Warning>,
 ) -> Result<(LayerReport, Vec<u32>, RgbaImage)> {
-    // `compose::validate` が「文字があるのに font が無い」を既に断っているので、
-    // ここへ `None` で来ることは無い。**それでも unwrap しない**——届かない
-    // はずの経路が届いたときに、panic ではなく code で言えるほうがよい
-    let Some(font) = font else {
-        return Err(Error::new(
-            ErrorCode::FontNotFound,
-            format!("'{}' を組むための字体が決まっていません", layer.id),
-        ));
-    };
-
-    let layout = compose::text::layout(layer, &spec.canvas, &font.family, &font.db)?;
+    let layout = compose::text::layout(layer, &spec.canvas, &font.used.font.family, &font.db)?;
     let color = compose::parse_color(&layer.color)?;
     let stroke = layer
         .stroke
@@ -858,23 +831,22 @@ fn draw_text(
     }
     canvas_mod::composite_clipped(canvas, &layout.pixels, (0, 0));
 
+    // `text_obscured` は重ねた後でなければ決まらない。`build` が埋める
     let report = LayerReport {
-        id: layer.id.clone(),
-        kind: "text",
-        role: layer.role,
-        rect: layer.rect,
-        placed: layout.bbox,
-        opaque_rect: None,
         line_widths: Some(layout.line_widths),
         text_overflow: Some(measure::overflow(layer.rect, layout.bbox)),
         text_contrast: contrast,
-        // 重ねた後でなければ決まらない。`build` が埋める
-        text_obscured: None,
         layer_overlap,
         outside_safe_area: spec.safe_area.map(|a| measure::outside(a, layout.bbox)),
         align: Some(layer.align),
         font: Some(font.used.clone()),
-        display: None,
+        ..LayerReport::bare(
+            layer.id.clone(),
+            "text",
+            layer.role,
+            layer.rect,
+            layout.bbox,
+        )
     };
     Ok((report, pixels, layout.pixels))
 }

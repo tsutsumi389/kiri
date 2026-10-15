@@ -160,9 +160,14 @@ fn far_weight(weight: u16) -> u16 {
 }
 
 /// 字体のファイルを spec の隣へ写す（検証で踏んだ形そのもの）。
+///
+/// **`std::fs::copy` は使わない。** macOS のそれは `fcopyfile` で、システム字体の
+/// 透過圧縮（decmpfs）を**圧縮のまま**写す。並列に走る検査の下でその写しを
+/// 別プロセス（kiri）が読むと、ときどき `Attribute not found (os error 93)` で
+/// 読めず `FONT_UNREADABLE` になった。中身だけを書けば普通のファイルになる。
 fn copy_beside(dir: &Path, font: &Path) -> String {
     let name = font.file_name().unwrap().to_str().unwrap().to_string();
-    std::fs::copy(font, dir.join(&name)).unwrap();
+    std::fs::write(dir.join(&name), std::fs::read(font).unwrap()).unwrap();
     name
 }
 
@@ -204,8 +209,9 @@ fn a_weight_the_font_cannot_draw_is_named() {
     let result = compose(&spec, &out, &["--dry-run"]);
     assert!(
         result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
+        "{}{}",
+        String::from_utf8_lossy(&result.stderr),
+        String::from_utf8_lossy(&result.stdout)
     );
     let report = json_stdout(&result);
 
@@ -252,8 +258,9 @@ fn a_variable_font_within_its_axis_is_not_reported() {
         let result = compose(&spec, &out, &[]);
         assert!(
             result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stderr)
+            "{}{}",
+            String::from_utf8_lossy(&result.stderr),
+            String::from_utf8_lossy(&result.stdout)
         );
         (json_stdout(&result), std::fs::read(&out).unwrap())
     };
@@ -346,8 +353,9 @@ fn each_text_layer_can_name_its_own_font() {
     let result = compose(&spec, &out, &["--dry-run"]);
     assert!(
         result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
+        "{}{}",
+        String::from_utf8_lossy(&result.stderr),
+        String::from_utf8_lossy(&result.stdout)
     );
     let report = json_stdout(&result);
 
@@ -389,8 +397,9 @@ fn a_spec_with_only_layer_fonts_needs_no_top_level_font() {
     let result = compose(&spec, &out, &["--dry-run"]);
     assert!(
         result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
+        "{}{}",
+        String::from_utf8_lossy(&result.stderr),
+        String::from_utf8_lossy(&result.stdout)
     );
     let report = json_stdout(&result);
     assert_eq!(report["font"], Value::Null);

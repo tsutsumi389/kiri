@@ -367,3 +367,7 @@ decoration・透過の下地・後から覆う層とキャンバスの外の文�
 両方に出た。背景の写真が安全領域の外へ出るのは全面に敷く以上当然で、図形の層と
 同じ理由で測らなくてよいが、画像の層の振る舞いを変えるのはこの段の範囲の外
 なので、残件として記す。
+
+**追記（2026-10-15）**: 残件は後続の PR で片付けた。`role: decoration` の画像は
+`outside_safe_area` を null にし、`OUTSIDE_SAFE_AREA` を出さない
+（`a_full_bleed_decoration_image_is_not_judged_against_the_safe_area`）。

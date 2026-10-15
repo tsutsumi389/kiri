@@ -85,6 +85,12 @@ $ kiri compose layout.json -o thumb.png --dry-run --json | jq '.layers[] | {id, 
 見えない余白が外へ出ても表示で切られるものは無いので、`OUTSIDE_SAFE_AREA` は
 出さない。描く画素が 1 つも無い画像は `false` である。
 
+**`role: "decoration"` の画像は測らず、`outside_safe_area` は null である。**
+`fit: cover` で全面に敷いた背景の写真は safe_area の外へ出るのが当然で、表示で
+切られても欠ける情報は無い——図形の層と同じ理由である。測ると普通の構図が毎回
+`OUTSIDE_SAFE_AREA` を出し、`--fail-on default` を落とす。切られては困る画像は
+`role: "subject"` で置く。
+
 ## 縮めない、折り返さない
 
 収まらない文字は**縮めも折り返しもせず**、`TEXT_OVERFLOW` で言う。どちらも
@@ -209,7 +215,7 @@ spec に書いた指定が黙って消える向きの親切で、`--fill-ratio` 
 | `text_overflow` | `TEXT_OVERFLOW` | 文字が `rect` からはみ出した量(px) |
 | `text_contrast` | `TEXT_CONTRAST_LOW` | 文字と**その文字が実際に載っている背後**とのコントラスト比 |
 | `layer_overlap` | `LAYERS_OVERLAP` | 文字が覆う画素のうち `subject` と重なった比 |
-| `outside_safe_area` | `OUTSIDE_SAFE_AREA` | `safe_area` の外へ出たか（画像は `opaque_rect` で、文字は `placed` で判定） |
+| `outside_safe_area` | `OUTSIDE_SAFE_AREA` | `safe_area` の外へ出たか（画像は `opaque_rect` で、文字は `placed` で判定。decoration の画像と図形は測らない） |
 
 ```
 $ kiri compose layout.json -o thumb.png --fail-on default

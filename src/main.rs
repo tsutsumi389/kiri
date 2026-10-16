@@ -219,7 +219,7 @@ fn print_schema(report: &SchemaReport) {
         report.compose_profiles.len()
     );
     let w = column_width(report.compose_profiles.iter().map(|p| p.name));
-    for p in &report.compose_profiles {
+    for p in report.compose_profiles {
         println!("  {:<w$}  {}  {}", p.name, p.revision, p.summary, w = w);
         println!("  {:<w$}  出典 {}", "", p.source, w = w);
     }
@@ -669,13 +669,13 @@ fn print_compose(report: &ComposeReport) {
             report
                 .font
                 .as_ref()
-                .is_none_or(|top| top.family != f.family || top.path != f.path)
+                .is_none_or(|top| top.family != f.font.family || top.path != f.font.path)
         }) {
             println!(
                 "               字体 {} ({}){}",
-                font.family,
+                font.font.family,
                 font.weight,
-                match &font.path {
+                match &font.font.path {
                     Some(path) => format!("  {path}"),
                     None => String::new(),
                 }

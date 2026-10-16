@@ -26,9 +26,9 @@ use crate::cutout::{MAX_FOREGROUND_RATIO, MIN_FOREGROUND_RATIO, background, diag
 use crate::error::{ErrorCode, ErrorKind};
 use crate::profile;
 use crate::report::{
-    ArgEntry, CommandEntry, ComposeDisplayEntry, ComposeProfileEntry, ComposeSpecEntry,
-    ErrorCodeEntry, ExitCodeEntry, FieldEntry, FieldGate, FieldThreshold, LintCheckEntry,
-    ProfileEntry, ProfileRules, SCHEMA_VERSION, SchemaReport, SchemaScope, WarningCodeEntry,
+    ArgEntry, CommandEntry, ComposeSpecEntry, ErrorCodeEntry, ExitCodeEntry, FieldEntry, FieldGate,
+    FieldThreshold, LintCheckEntry, ProfileEntry, ProfileRules, SCHEMA_VERSION, SchemaReport,
+    SchemaScope, WarningCodeEntry,
 };
 use crate::warning::WarningCode;
 
@@ -114,7 +114,7 @@ pub fn run(args: &SchemaArgs) -> SchemaReport {
         fields: full.then_some(fields),
         lint_checks: (full && wants_lint_checks).then(lint_checks),
         profiles: profiles(),
-        compose_profiles: compose_profiles(),
+        compose_profiles: crate::compose::profile::ALL,
         global_options,
         commands,
         compose_spec: (full && wants_compose_spec).then(compose_spec_entries),
@@ -318,32 +318,6 @@ fn profiles() -> Vec<ProfileEntry> {
                 alpha_allowed: p.rules.alpha_allowed,
                 srgb_required: p.rules.srgb_required,
             },
-        })
-        .collect()
-}
-
-/// `kiri compose --profile` の規格の表を配る。
-///
-/// **`compose::profile::ALL` から組む。書き写さない**（`profiles` と同じ作法）。
-fn compose_profiles() -> Vec<ComposeProfileEntry> {
-    crate::compose::profile::ALL
-        .iter()
-        .map(|p| ComposeProfileEntry {
-            name: p.name,
-            revision: p.revision,
-            summary: p.summary,
-            source: p.source,
-            canvas: [p.canvas.0, p.canvas.1],
-            safe_area: p.safe_area,
-            max_bytes: p.max_bytes,
-            displays: p
-                .displays
-                .iter()
-                .map(|d| ComposeDisplayEntry {
-                    name: d.name,
-                    width: d.width,
-                })
-                .collect(),
         })
         .collect()
 }

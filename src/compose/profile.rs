@@ -15,9 +15,11 @@
 //! note.com を開いて描画サイズを測った値である（12-phase-31.md §12.3）。改修で
 //! 変わりうるので、`revision` に測った年月を持つ。
 
+use serde::Serialize;
+
 /// 縮小表示の 1 つ。**幅だけを持つ**——高さはキャンバスの比から決まる
 /// （note の一覧は `object-fit: cover` で、1280x670 なら切られない）。
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct Display {
     /// 結果 JSON の `layers[].display[].name` に出る綴り
     pub name: &'static str,
@@ -26,7 +28,7 @@ pub struct Display {
 }
 
 /// 1 つの規格。**`kiri schema` の `compose_profiles[]` はこれをそのまま配る。**
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct ComposeProfile {
     /// `--profile` に書く名前
     pub name: &'static str,

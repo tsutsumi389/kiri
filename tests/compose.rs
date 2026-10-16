@@ -20,20 +20,11 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-use assert_cmd::Command;
-use common::{ProductSpec, product_image, write_png};
+use common::{
+    ProductSpec, compose, json_stdout, kiri, layer, product_image, write_png, write_spec,
+};
 use serde_json::Value;
 use tempfile::TempDir;
-
-fn kiri() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_kiri"))
-}
-
-fn json_stdout(output: &std::process::Output) -> Value {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("stdout が JSON として解釈できません: {e}\n---\n{stdout}"))
-}
 
 /// このファイルの表明が使う文字を**実際に描ける**字体を 1 つ借りる。
 ///
@@ -60,33 +51,6 @@ fn portrait(dir: &Path) -> PathBuf {
         ..Default::default()
     });
     write_png(dir, "product.png", &image)
-}
-
-fn write_spec(dir: &Path, json: &str) -> PathBuf {
-    let path = dir.join("layout.json");
-    std::fs::write(&path, json).unwrap();
-    path
-}
-
-fn compose(spec: &Path, out: &Path, extra: &[&str]) -> std::process::Output {
-    let mut args = vec![
-        "compose",
-        spec.to_str().unwrap(),
-        "-o",
-        out.to_str().unwrap(),
-        "--json",
-    ];
-    args.extend_from_slice(extra);
-    kiri().args(&args).output().unwrap()
-}
-
-fn layer<'a>(report: &'a Value, id: &str) -> &'a Value {
-    report["layers"]
-        .as_array()
-        .expect("layers が配列")
-        .iter()
-        .find(|l| l["id"] == id)
-        .unwrap_or_else(|| panic!("レイヤ '{id}' が結果に無い: {report}"))
 }
 
 fn rect_of(value: &Value) -> [f64; 4] {
@@ -2897,7 +2861,7 @@ fn the_preview_is_the_picture_the_display_measure_saw() {
         let measured = kiri::compose::display::shrink_canvas(&canvas, [255, 255, 255], w, h);
         assert_eq!(
             rgb,
-            measured.rgb(),
+            measured.rgb().as_raw().as_slice(),
             "{}: 書いた絵と測った絵が違う",
             path.display()
         );

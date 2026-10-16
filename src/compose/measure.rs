@@ -115,6 +115,36 @@ pub struct LayerReport {
     pub display: Option<Vec<crate::compose::display::DisplayReport>>,
 }
 
+impl LayerReport {
+    /// 測りのキーを全部 null にした 1 層。**呼ぶ側は層の種類が埋めるキーだけを
+    /// 構造体の更新記法で上書きする**——同じ `None` の並びを種類ごとに書かない。
+    pub fn bare(
+        id: String,
+        kind: &'static str,
+        role: Role,
+        rect: [f64; 4],
+        placed: [f64; 4],
+    ) -> Self {
+        LayerReport {
+            id,
+            kind,
+            role,
+            rect,
+            placed,
+            opaque_rect: None,
+            line_widths: None,
+            text_overflow: None,
+            text_contrast: None,
+            text_obscured: None,
+            layer_overlap: None,
+            outside_safe_area: None,
+            align: None,
+            font: None,
+            display: None,
+        }
+    }
+}
+
 /// 文字が枠からはみ出した量。**どの向きであれ最も大きい 1 つ**を返す。
 ///
 /// 4 辺ぶんの配列にしないのは、**同じ事実が 2 つの形で配られる**のを避けるため
@@ -212,18 +242,25 @@ pub fn contrast(
         };
         behind.push(relative_luminance(rgb));
     }
-    if behind.is_empty() {
+    let median = median(&mut behind)?;
+    Some(contrast_ratio(relative_luminance(color), median))
+}
+
+/// 相対輝度 2 つのコントラスト比（WCAG 2.1）。**順序に依らない**——明るいほうを
+/// 分子に置く。
+pub(crate) fn contrast_ratio(a: f64, b: f64) -> f64 {
+    let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// 中央値。**外周の背景色を測るのと同じ理由で平均を採らない**——写真の上では
+/// 平均が一部の明るい画素に引かれる。偶数個なら上側を採る。
+pub(crate) fn median(values: &mut [f64]) -> Option<f64> {
+    if values.is_empty() {
         return None;
     }
-    behind.sort_by(f64::total_cmp);
-    let median = behind[behind.len() / 2];
-    let front = relative_luminance(color);
-    let (hi, lo) = if front > median {
-        (front, median)
-    } else {
-        (median, front)
-    };
-    Some((hi + 0.05) / (lo + 0.05))
+    values.sort_by(f64::total_cmp);
+    Some(values[values.len() / 2])
 }
 
 /// 縁取りのある文字の原寸のコントラスト。**塗りの色と縁の色の比である。**
@@ -237,9 +274,7 @@ pub fn contrast(
 /// そのとき字を分けているのは縁の下の地である。呼ぶ側が地との比とも比べて、
 /// 良いほうを採る（13-phase-32.md §13.7）。
 pub fn stroked_contrast(fill: [u8; 3], stroke: [u8; 3]) -> f64 {
-    let (a, b) = (relative_luminance(fill), relative_luminance(stroke));
-    let (hi, lo) = if a > b { (a, b) } else { (b, a) };
-    (hi + 0.05) / (lo + 0.05)
+    contrast_ratio(relative_luminance(fill), relative_luminance(stroke))
 }
 
 /// straight alpha の画素を下地の色へ重ねた結果。

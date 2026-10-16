@@ -18,10 +18,10 @@
 //! 定義が違う。片方へ寄せると、もう片方でしか起きない問題が消える——細い線の
 //! 背後だけが暗い、は原寸でしか見えず、線が地の色に溶ける、は縮小でしか見えない。
 
-use image::RgbaImage;
+use image::{RgbImage, RgbaImage};
 use serde::Serialize;
 
-use crate::compose::measure::{MIN_CONTRAST, flatten, relative_luminance};
+use crate::compose::measure::{MIN_CONTRAST, contrast_ratio, flatten, median, relative_luminance};
 use crate::compose::profile::Display;
 use crate::warning::{Warning, WarningCode};
 
@@ -46,8 +46,9 @@ pub const FOREGROUND_COVERAGE: f64 = 0.5;
 pub const BACKGROUND_COVERAGE: f64 = 0.05;
 
 /// 読めないと判断した理由。**1 つでも当たれば読めない。**
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+///
+/// 綴りは `as_str` の 1 箇所だけが持つ（`WarningCode` と同じ作法）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
     /// 表示上の大きさが `MIN_DISPLAY_SIZE` 未満
     TooSmall,
@@ -64,6 +65,12 @@ impl Reason {
             Reason::StrokesLost => "strokes_lost",
             Reason::LowContrast => "low_contrast",
         }
+    }
+}
+
+impl Serialize for Reason {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
     }
 }
 
@@ -109,13 +116,13 @@ pub struct DisplayReport {
 pub struct Shrunk {
     pub width: u32,
     pub height: u32,
-    rgb: Vec<u8>,
+    rgb: RgbImage,
     luminance: Vec<f64>,
 }
 
 impl Shrunk {
-    /// 測りが見た絵（不透明の RGB、行優先）。
-    pub fn rgb(&self) -> &[u8] {
+    /// 測りが見た絵（不透明の RGB）。
+    pub fn rgb(&self) -> &RgbImage {
         &self.rgb
     }
 }
@@ -151,14 +158,11 @@ pub fn shrink_canvas(canvas: &RgbaImage, base: [u8; 3], width: u32, height: u32)
             }
         }
     });
-    let rgb: Vec<u8> = shrunk
-        .iter()
-        .map(|v| v.round().clamp(0.0, 255.0) as u8)
-        .collect();
-    let luminance = rgb
-        .chunks_exact(3)
-        .map(|c| relative_luminance([c[0], c[1], c[2]]))
-        .collect();
+    let rgb = RgbImage::from_fn(width, height, |x, y| {
+        let i = (y as usize * width as usize + x as usize) * 3;
+        image::Rgb([0, 1, 2].map(|c| shrunk[i + c].round().clamp(0.0, 255.0) as u8))
+    });
+    let luminance = rgb.pixels().map(|p| relative_luminance(p.0)).collect();
     Shrunk {
         width,
         height,
@@ -356,10 +360,7 @@ pub fn measure(
     let front = median(&mut front);
     let ratio = |mut back: Vec<f64>| -> Option<f64> {
         match (front, median(&mut back)) {
-            (Some(f), Some(b)) => {
-                let (hi, lo) = if f > b { (f, b) } else { (b, f) };
-                Some((hi + 0.05) / (lo + 0.05))
-            }
+            (Some(f), Some(b)) => Some(contrast_ratio(f, b)),
             _ => None,
         }
     };
@@ -407,17 +408,6 @@ pub fn measure(
         reasons,
         against,
     }
-}
-
-/// 中央値。**外周の背景色を測るのと同じ理由で平均を採らない**——写真の上では
-/// 平均が一部の明るい画素に引かれる。偶数個なら上側を採る（`measure::contrast`
-/// と同じ選び方）。
-fn median(values: &mut [f64]) -> Option<f64> {
-    if values.is_empty() {
-        return None;
-    }
-    values.sort_by(f64::total_cmp);
-    Some(values[values.len() / 2])
 }
 
 /// その表示で `MIN_DISPLAY_SIZE` に届く spec の `size`。`11 × canvas_w / width`

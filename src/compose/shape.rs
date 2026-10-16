@@ -12,10 +12,9 @@
 //! 文字と同じ経路を通す。小数の枠を自前で塗ると、端の画素の扱いが文字の側と
 //! 食い違い、同じ位置に置いた帯と字の縁が半画素ずれて見える。
 
-use resvg::tiny_skia;
 use resvg::usvg;
 
-use crate::compose::text::{escape, to_rgba};
+use crate::compose::text::{escape, rasterize};
 use crate::compose::{Canvas, ShapeLayer};
 use crate::error::{Error, ErrorCode, Result};
 use image::RgbaImage;
@@ -30,17 +29,7 @@ pub fn render(layer: &ShapeLayer, canvas: &Canvas) -> Result<RgbaImage> {
             format!("図形 '{}' を描けませんでした: {e}", layer.id),
         )
     })?;
-    let mut pixmap = tiny_skia::Pixmap::new(canvas.width, canvas.height).ok_or_else(|| {
-        Error::new(
-            ErrorCode::InvalidCanvas,
-            format!(
-                "{}x{} の描画面を確保できません",
-                canvas.width, canvas.height
-            ),
-        )
-    })?;
-    resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
-    Ok(to_rgba(&pixmap))
+    rasterize(&tree, canvas)
 }
 
 /// spec の 1 層を SVG の `<rect>` にする。

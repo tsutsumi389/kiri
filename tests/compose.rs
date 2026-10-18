@@ -3180,3 +3180,441 @@ fn the_schema_publishes_strokes_shapes_and_previews() {
         .to_string();
     assert!(options.contains("--preview"), "{options}");
 }
+
+// ---------------------------------------------------------------------------
+// Phase 33: `--free-regions`（14-phase-33.md）
+// ---------------------------------------------------------------------------
+
+/// `free_regions` を取り出す。無ければ落とす。
+fn free_regions(report: &Value) -> &Value {
+    report
+        .get("free_regions")
+        .unwrap_or_else(|| panic!("free_regions が無い: {report}"))
+}
+
+/// 候補の矩形を整数で並べる。
+fn region_rects(free: &Value) -> Vec<[i64; 4]> {
+    free["regions"]
+        .as_array()
+        .expect("regions[] が無い")
+        .iter()
+        .map(|r| {
+            let a = r["rect"].as_array().expect("rect は配列");
+            [0, 1, 2, 3].map(|i| a[i].as_i64().expect("rect は整数"))
+        })
+        .collect()
+}
+
+/// 2 つの矩形 `[x, y, 幅, 高さ]` が、間に `gap` 画素以上を空けて離れているか。
+fn apart(a: [f64; 4], b: [f64; 4], gap: f64) -> bool {
+    a[0] + a[2] + gap <= b[0]
+        || b[0] + b[2] + gap <= a[0]
+        || a[1] + a[3] + gap <= b[1]
+        || b[1] + b[3] + gap <= a[1]
+}
+
+fn as_f64(rect: [i64; 4]) -> [f64; 4] {
+    rect.map(|v| v as f64)
+}
+
+/// 不透明な画素で `opaque(x, y)` を描いた `w`x`h` の画像。
+fn mask_image(w: u32, h: u32, opaque: impl Fn(u32, u32) -> bool) -> image::RgbaImage {
+    image::RgbaImage::from_fn(w, h, |x, y| {
+        if opaque(x, y) {
+            image::Rgba([40, 40, 40, 255])
+        } else {
+            image::Rgba([0, 0, 0, 0])
+        }
+    })
+}
+
+/// 外接矩形の右上が透明な L 字。縦棒は左の 60px、横棒は下の 60px。
+fn l_shape() -> image::RgbaImage {
+    mask_image(200, 200, |x, y| x < 60 || y >= 140)
+}
+
+/// 渡さなければ `free_regions` はキーごと出ない（§14.4 の 1）。
+#[test]
+fn free_regions_are_absent_without_the_flag() {
+    let dir = TempDir::new().unwrap();
+    write_png(dir.path(), "l.png", &l_shape());
+    let spec = write_spec(
+        dir.path(),
+        r##"{"canvas":{"width":400,"height":400,"background":"#ffffff"},
+             "layers":[{"id":"subject","type":"image","role":"subject",
+                        "source":"l.png","rect":[100,100,200,200]}]}"##,
+    );
+    let out = dir.path().join("out.png");
+    let report = json_stdout(&compose(&spec, &out, &["--dry-run"]));
+    assert!(report.get("free_regions").is_none(), "{report}");
+}
+
+/// 避ける相手が無ければ `within` そのものが 1 つだけ返る（§14.4 の 2）。
+/// **図形と `decoration` の画像は避けない**ので、その上に候補が出る（§14.4 の 5）。
+///
+/// 層が 1 つも無い spec は `SPEC_EMPTY` で断られるので、ここでは避けない層だけを
+/// 置く。`safe_area` の高さ 454 は 8 の倍数でないが、端は削らない。
+#[test]
+fn shapes_and_decoration_leave_the_whole_range_free() {
+    let dir = TempDir::new().unwrap();
+    write_png(dir.path(), "bg.png", &mask_image(1280, 670, |_, _| true));
+    let spec = write_spec(
+        dir.path(),
+        r##"{"canvas":{"width":1280,"height":670,"background":"#ffffff"},
+             "safe_area":[0,108,1280,454],
+             "layers":[{"id":"photo","type":"image","role":"decoration",
+                        "source":"bg.png","rect":[0,0,1280,670]},
+                       {"id":"band","type":"shape","rect":[0,300,1280,120],
+                        "color":"#000000","opacity":0.5}]}"##,
+    );
+    let out = dir.path().join("out.png");
+    let report = json_stdout(&compose(&spec, &out, &["--dry-run", "--free-regions"]));
+    let free = free_regions(&report);
+    assert_eq!(free["within"], serde_json::json!([0, 108, 1280, 454]));
+    assert_eq!(free["margin"], 24, "1280 幅の既定は 24px");
+    assert_eq!(free["cell"], 8);
+    assert_eq!(region_rects(free), [[0, 108, 1280, 454]]);
+    assert_eq!(free["regions"][0]["area_ratio"], 1.0);
+}
+
+/// 中央の正方形の `subject` の周りに、左右と上下の帯の 4 つが返り、どれも
+/// `opaque_rect` から `margin` 以上離れている（§14.4 の 3）。
+#[test]
+fn a_square_subject_leaves_four_bands_clear_of_it() {
+    let dir = TempDir::new().unwrap();
+    write_png(dir.path(), "square.png", &mask_image(80, 80, |_, _| true));
+    let spec = write_spec(
+        dir.path(),
+        r##"{"canvas":{"width":400,"height":400,"background":"#ffffff"},
+             "layers":[{"id":"subject","type":"image","role":"subject",
+                        "source":"square.png","rect":[160,160,80,80]}]}"##,
+    );
+    let out = dir.path().join("out.png");
+    let report = json_stdout(&compose(&spec, &out, &["--dry-run", "--free-regions"]));
+    let free = free_regions(&report);
+    let margin = free["margin"].as_f64().unwrap();
+    assert_eq!(margin, 8.0, "round(400 × 24 / 1280) = round(7.5) = 8");
+    let opaque = rect_of(&layer(&report, "subject")["opaque_rect"]);
+    assert_eq!(opaque, [160.0, 160.0, 80.0, 80.0]);
+
+    let rects = region_rects(free);
+    assert_eq!(rects.len(), 4, "{free}");
+    for r in &rects {
+        assert!(
+            apart(as_f64(*r), opaque, margin),
+            "{r:?} が opaque_rect から {margin}px 離れていない"
+        );
+    }
+    // 上・下・左・右の帯がそれぞれ 1 つずつある
+    let [ox, oy, ow, oh] = opaque;
+    let above = |r: &[i64; 4]| (r[1] + r[3]) as f64 <= oy;
+    let below = |r: &[i64; 4]| r[1] as f64 >= oy + oh;
+    let left = |r: &[i64; 4]| (r[0] + r[2]) as f64 <= ox;
+    let right = |r: &[i64; 4]| r[0] as f64 >= ox + ow;
+    for (name, side) in [
+        ("上", &above as &dyn Fn(&[i64; 4]) -> bool),
+        ("下", &below),
+        ("左", &left),
+        ("右", &right),
+    ] {
+        assert_eq!(
+            rects.iter().filter(|r| side(r)).count(),
+            1,
+            "{name}の帯がちょうど 1 つではない: {rects:?}"
+        );
+    }
+}
+
+/// L 字の `subject` では、**外接矩形の内側の空き**にかかる候補が返る
+/// （§14.4 の 4）。同じ外接矩形を塗り潰した `subject` では返らない——
+/// `opaque_rect` だけで計算したなら出ない候補である。
+///
+/// 併せて、どの候補の全画素も L 字の不透明な画素から `margin` を超えて離れて
+/// いることを、素材の画素から総当たりで確かめる（§14.4 の 6）。
+#[test]
+fn an_l_shaped_subject_leaves_room_inside_its_bounding_box() {
+    let dir = TempDir::new().unwrap();
+    let shape = l_shape();
+    write_png(dir.path(), "l.png", &shape);
+    write_png(dir.path(), "box.png", &mask_image(200, 200, |_, _| true));
+    let spec_for = |source: &str| {
+        format!(
+            r##"{{"canvas":{{"width":400,"height":400,"background":"#ffffff"}},
+                 "layers":[{{"id":"subject","type":"image","role":"subject",
+                            "source":"{source}","rect":[100,100,200,200]}}]}}"##
+        )
+    };
+    let out = dir.path().join("out.png");
+
+    let spec = write_spec(dir.path(), &spec_for("l.png"));
+    let report = json_stdout(&compose(&spec, &out, &["--dry-run", "--free-regions"]));
+    let opaque = rect_of(&layer(&report, "subject")["opaque_rect"]);
+    assert_eq!(opaque, [100.0, 100.0, 200.0, 200.0], "外接矩形は L 字全体");
+    let free = free_regions(&report);
+    let margin = free["margin"].as_i64().unwrap();
+    let shaped = region_rects(free);
+    let inside: Vec<_> = shaped
+        .iter()
+        .filter(|r| !apart(as_f64(**r), opaque, 0.0))
+        .collect();
+    assert!(
+        !inside.is_empty(),
+        "外接矩形の内側にかかる候補が無い: {shaped:?}"
+    );
+
+    // 全画素を、L 字の不透明な画素から総当たりで離す（チェビシェフ距離 > margin）
+    let opaque_at = |x: i64, y: i64| {
+        let (sx, sy) = (x - 100, y - 100);
+        (0..200).contains(&sx)
+            && (0..200).contains(&sy)
+            && shape.get_pixel(sx as u32, sy as u32)[3] > 0
+    };
+    for [x, y, w, h] in &shaped {
+        for py in *y..y + h {
+            for px in *x..x + w {
+                for oy in py - margin..=py + margin {
+                    for ox in px - margin..=px + margin {
+                        assert!(
+                            !opaque_at(ox, oy),
+                            "({px}, {py}) が不透明な ({ox}, {oy}) から {margin}px 以内"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // 外接矩形を塗り潰すと、内側にかかる候補は消える
+    let spec = write_spec(dir.path(), &spec_for("box.png"));
+    let report = json_stdout(&compose(&spec, &out, &["--dry-run", "--free-regions"]));
+    let boxed = region_rects(free_regions(&report));
+    assert!(
+        boxed.iter().all(|r| apart(as_f64(*r), opaque, 0.0)),
+        "{boxed:?}"
+    );
+    for r in inside {
+        assert!(!boxed.contains(r), "{r:?} は外接矩形でも出てしまう");
+    }
+}
+
+/// `subject` 以外の画像（ロゴの `heading` など）も避ける。`decoration` と書いた
+/// 画像だけは避けない（§14.2.2）。
+#[test]
+fn every_image_but_decoration_is_avoided() {
+    let dir = TempDir::new().unwrap();
+    write_png(dir.path(), "logo.png", &mask_image(100, 100, |_, _| true));
+    let spec_for = |role: &str| {
+        format!(
+            r##"{{"canvas":{{"width":400,"height":400,"background":"#ffffff"}},
+                 "layers":[{{"id":"logo","type":"image","role":"{role}",
+                            "source":"logo.png","rect":[150,150,100,100]}}]}}"##
+        )
+    };
+    let out = dir.path().join("out.png");
+    for role in ["heading", "subject", "body"] {
+        let spec = write_spec(dir.path(), &spec_for(role));
+        let report = json_stdout(&compose(&spec, &out, &["--dry-run", "--free-regions"]));
+        let rects = region_rects(free_regions(&report));
+        assert!(rects.len() > 1, "{role}: {rects:?}");
+        let logo = [150.0, 150.0, 100.0, 100.0];
+        assert!(
+            rects.iter().all(|r| apart(as_f64(*r), logo, 8.0)),
+            "{role}: {rects:?}"
+        );
+    }
+    let spec = write_spec(dir.path(), &spec_for("decoration"));
+    let report = json_stdout(&compose(&spec, &out, &["--dry-run", "--free-regions"]));
+    assert_eq!(region_rects(free_regions(&report)), [[0, 0, 400, 400]]);
+}
+
+/// 既存の文字の `placed` と交わる候補は無い（§14.4 の 5）。`margin` も空ける。
+#[test]
+fn free_regions_keep_clear_of_placed_text() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let spec = write_spec(
+        dir.path(),
+        &format!(
+            r##"{{"canvas":{{"width":640,"height":400,"background":"#ffffff"}},
+                 "font":{{"family":"{family}"}},
+                 "layers":[{{"id":"heading","type":"text","role":"heading",
+                            "lines":["AB","BA"],"rect":[200,120,300,160],
+                            "size":48,"color":"#000000"}},
+                           {{"id":"note","type":"text","role":"decoration",
+                            "lines":["A"],"rect":[20,320,100,60],
+                            "size":24,"color":"#999999"}}]}}"##
+        ),
+    );
+    let out = dir.path().join("out.png");
+    let report = json_stdout(&compose(&spec, &out, &["--dry-run", "--free-regions"]));
+    let free = free_regions(&report);
+    let margin = free["margin"].as_f64().unwrap();
+    let rects = region_rects(free);
+    assert!(!rects.is_empty(), "{free}");
+    for id in ["heading", "note"] {
+        let placed = rect_of(&layer(&report, id)["placed"]);
+        for r in &rects {
+            // `placed` は外向きに画素の格子へ丸めて避ける。1/64px までの端数は
+            // 見逃す（`measure::SUBPIXEL_TOLERANCE`。usvg の f32 の誤差である）
+            let tol = 1.0 / 64.0;
+            let (x0, y0) = ((placed[0] + tol).floor(), (placed[1] + tol).floor());
+            let x1 = (placed[0] + placed[2] - tol).ceil();
+            let y1 = (placed[1] + placed[3] - tol).ceil();
+            let grown = [x0, y0, x1 - x0, y1 - y0];
+            assert!(
+                apart(as_f64(*r), grown, margin),
+                "{r:?} が {id} の placed {placed:?} から {margin}px 離れていない"
+            );
+        }
+    }
+}
+
+/// `min_size` の高さは `--profile note` で 98、無ければ短辺の 8%（切り上げ）
+/// （§14.4 の 7）。幅は高さの 2 倍。
+#[test]
+fn the_minimum_size_follows_the_profile() {
+    let dir = TempDir::new().unwrap();
+    let spec = write_spec(
+        dir.path(),
+        r##"{"canvas":{"width":1280,"height":670,"background":"#ffffff"},
+             "layers":[{"id":"band","type":"shape","rect":[0,0,1280,40],"color":"#000000"}]}"##,
+    );
+    let out = dir.path().join("out.png");
+    let report = json_stdout(&compose(
+        &spec,
+        &out,
+        &["--dry-run", "--free-regions", "--profile", "note"],
+    ));
+    assert_eq!(
+        free_regions(&report)["min_size"],
+        serde_json::json!([196, 98])
+    );
+    // --profile note は safe_area を埋める
+    assert_eq!(
+        free_regions(&report)["within"],
+        serde_json::json!([0, 108, 1280, 454])
+    );
+
+    let report = json_stdout(&compose(&spec, &out, &["--dry-run", "--free-regions"]));
+    // 670 × 0.08 = 53.6 → 54
+    assert_eq!(
+        free_regions(&report)["min_size"],
+        serde_json::json!([108, 54])
+    );
+    assert_eq!(
+        free_regions(&report)["within"],
+        serde_json::json!([0, 0, 1280, 670])
+    );
+}
+
+/// `--free-margin` は `--free-regions` が要り、負・有限でない値は断る
+/// （§14.4 の 8）。渡した値は切り上げて効いた値を返す。
+#[test]
+fn the_free_margin_is_checked_and_reported() {
+    let dir = TempDir::new().unwrap();
+    let spec = write_spec(
+        dir.path(),
+        r##"{"canvas":{"width":400,"height":400,"background":"#ffffff"},
+             "layers":[{"id":"band","type":"shape","rect":[0,0,400,40],"color":"#000000"}]}"##,
+    );
+    let out = dir.path().join("out.png");
+    for extra in [
+        &["--free-margin", "10"][..],
+        &["--free-regions", "--free-margin=-1"],
+        &["--free-regions", "--free-margin", "nan"],
+        &["--free-regions", "--free-margin", "inf"],
+        // キャンバスの辺の上限 16384 を超える値は、効いた値を返せないので断る
+        &["--free-regions", "--free-margin", "16384.5"],
+    ] {
+        let mut args = vec!["--dry-run"];
+        args.extend_from_slice(extra);
+        assert_eq!(
+            compose(&spec, &out, &args).status.code(),
+            Some(2),
+            "{extra:?}"
+        );
+    }
+    let report = json_stdout(&compose(
+        &spec,
+        &out,
+        &["--dry-run", "--free-regions", "--free-margin", "12.5"],
+    ));
+    assert_eq!(free_regions(&report)["margin"], 13);
+
+    // キャンバスより広い距離は切り詰めずに空け、渡した値のまま返す。避ける相手が
+    // 無ければ within そのものが残る
+    let report = json_stdout(&compose(
+        &spec,
+        &out,
+        &["--dry-run", "--free-regions", "--free-margin", "5000"],
+    ));
+    assert_eq!(free_regions(&report)["margin"], 5000);
+    assert_eq!(region_rects(free_regions(&report)), [[0, 0, 400, 400]]);
+}
+
+/// 同じ入力から同じ候補が、同じ並びで返る（§14.4 の 9）。
+#[test]
+fn free_regions_are_deterministic() {
+    let dir = TempDir::new().unwrap();
+    write_png(dir.path(), "l.png", &l_shape());
+    let spec = write_spec(
+        dir.path(),
+        r##"{"canvas":{"width":1280,"height":670,"background":"#ffffff"},
+             "layers":[{"id":"a","type":"image","role":"subject",
+                        "source":"l.png","rect":[700,200,300,300]},
+                       {"id":"b","type":"image","role":"subject",
+                        "source":"l.png","rect":[100,380,200,200]}]}"##,
+    );
+    let out = dir.path().join("out.png");
+    let run = || {
+        let report = json_stdout(&compose(
+            &spec,
+            &out,
+            &["--dry-run", "--free-regions", "--profile", "note"],
+        ));
+        free_regions(&report).clone()
+    };
+    let first = run();
+    assert!(region_rects(&first).len() > 1, "{first}");
+    for _ in 0..3 {
+        assert_eq!(run(), first);
+    }
+}
+
+/// `kiri schema` が `--free-regions`・`--free-margin` と `free_regions` の形を
+/// 配る（§14.4 の 12）。
+#[test]
+fn the_schema_publishes_free_regions() {
+    let out = kiri()
+        .args(["schema", "compose", "--json"])
+        .output()
+        .unwrap();
+    let schema = json_stdout(&out);
+    let paths: Vec<&str> = schema["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    for key in [
+        "free_regions.within",
+        "free_regions.margin",
+        "free_regions.min_size",
+        "free_regions.cell",
+        "free_regions.regions[].rect",
+        "free_regions.regions[].area_ratio",
+    ] {
+        assert!(paths.contains(&key), "{key}: {paths:?}");
+    }
+    let options = schema["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "compose")
+        .unwrap()["options"]
+        .to_string();
+    assert!(options.contains("--free-regions"), "{options}");
+    assert!(options.contains("--free-margin"), "{options}");
+}

@@ -37,6 +37,13 @@
 //! があっても断る）、**全部をエンコードし終えてから**書き始める。書く途中で
 //! 失敗したら、この実行が新しく作ったファイルを消す。**`--force` で上書きした
 //! ファイルは戻せない**——前の中身を持っていないからである（13-phase-32.md §13.7）。
+//!
+//! # `--free-regions` は重ねながら障害物を集める
+//!
+//! 空きを求めるのに要るのは、`decoration` でない画像の不透明な画素と、文字の
+//! `placed` だけである（`compose::free` の doc）。画像は当てはめた絵を手放す前に
+//! 原寸のマスクへ押し、文字は重ね終えてから `placed` を塗る。**渡さない実行では
+//! マスクを確保しない**——費用も出力も変えない（14-phase-33.md §14.1 の 4）。
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -46,6 +53,7 @@ use image::buffer::ConvertBuffer;
 
 use crate::cli::ComposeArgs;
 use crate::compose::font::LayerFont;
+use crate::compose::free::{self, Obstacles};
 use crate::compose::measure::{self, COVERAGE, LayerReport};
 use crate::compose::profile::{ComposeProfile, Display};
 use crate::compose::{
@@ -120,10 +128,24 @@ pub fn run(args: &ComposeArgs) -> Result<ComposeReport> {
         &fonts.layers,
         flatten_to,
         measured.as_deref(),
+        args.free_regions,
         &mut warnings,
     )?;
     let canvas = built.canvas;
     let mut layers = built.layers;
+    // **文字は `placed` の矩形で避ける。** 行間ごと 1 つの塊として読まれるので、
+    // グリフの画素だけを避けると行間へ別の文字を差し込む候補が出る（§14.2.2）
+    let free_regions = built.obstacles.map(|mut obstacles| {
+        for layer in layers.iter().filter(|l| l.kind == "text") {
+            obstacles.fill_rect(layer.placed);
+        }
+        let (w, h) = (spec.canvas.width, spec.canvas.height);
+        let within = free::within((w, h), spec.safe_area);
+        let margin = args
+            .free_margin
+            .map_or_else(|| free::default_margin(w), free::margin_from);
+        free::report(&obstacles, within, margin, free::min_size((w, h), profile))
+    });
     let mut shrunk: Vec<(&'static str, display::Shrunk)> = Vec::new();
 
     if let Some(measured) = measured.as_deref() {
@@ -207,6 +229,7 @@ pub fn run(args: &ComposeArgs) -> Result<ComposeReport> {
         previews,
         dry_run: args.dry_run,
         layers,
+        free_regions,
         compliance,
         elapsed_ms: started.elapsed().as_millis(),
         warnings,
@@ -416,6 +439,9 @@ struct Built {
     layers: Vec<LayerReport>,
     /// 縮小表示で測る文字の層のグリフ。`--profile` が無ければ空
     glyphs: Vec<Glyphs>,
+    /// `--free-regions` の障害物のうち、画像の不透明な画素。文字の `placed` は
+    /// まだ塗っていない（`run` が塗る）。渡さなければ `None`
+    obstacles: Option<Obstacles>,
 }
 
 /// 縮小表示で測るために取っておく、1 つの文字の層。
@@ -443,12 +469,14 @@ struct Covered {
 /// 下地を作り、層を順に重ね、各層を測る。
 ///
 /// `measured` は縮小表示で測る表示の一覧で、`--profile` が無ければ `None`。
+/// `free` が真なら、`--free-regions` の障害物を集める。
 fn build(
     spec: &ComposeSpec,
     base: &Path,
     fonts: &[Option<LayerFont>],
     flatten_to: Option<[u8; 3]>,
     measured: Option<&[&Display]>,
+    free: bool,
     warnings: &mut Vec<Warning>,
 ) -> Result<Built> {
     let (w, h) = (spec.canvas.width, spec.canvas.height);
@@ -468,6 +496,7 @@ fn build(
     // 画素ごとに最後に塗った層。**`has_subject` と違い、実際に 1 画素でも
     // 書けたときにしか動かない**
     let mut painter: Vec<u16> = vec![UNPAINTED; area];
+    let mut obstacles = free.then(|| Obstacles::new(w, h));
 
     let mut reports = Vec::with_capacity(spec.layers.len());
     let mut covered: Vec<Covered> = Vec::new();
@@ -485,6 +514,7 @@ fn build(
                     &mut subject,
                     &mut has_subject,
                     &mut painter,
+                    obstacles.as_mut(),
                 )?;
                 LayerReport {
                     opaque_rect,
@@ -603,6 +633,7 @@ fn build(
         canvas,
         layers: reports,
         glyphs,
+        obstacles,
     })
 }
 
@@ -670,6 +701,10 @@ fn obscured(entry: &Covered, painter: &[u16]) -> Option<f64> {
 /// **原点を 0 で止めない。** 止めると「枠の外へ置いた」という事実が結果から
 /// 消え、`placed` が spec と違う位置を名乗る。はみ出した分は
 /// 切り落とし、返す矩形は要求どおりの位置を言う。
+///
+/// `obstacles` があれば、`decoration` でない画像の不透明な画素をそこへ押す
+/// （`--free-regions`。`subject` だけでなく、ロゴのような `heading` の画像も避ける）。
+#[allow(clippy::too_many_arguments)]
 fn draw_image(
     canvas: &mut RgbaImage,
     layer: &ImageLayer,
@@ -678,6 +713,7 @@ fn draw_image(
     subject: &mut [u8],
     has_subject: &mut bool,
     painter: &mut [u16],
+    obstacles: Option<&mut Obstacles>,
 ) -> Result<([f64; 4], Option<[f64; 4]>)> {
     let path = base.join(&layer.source);
     let loaded = load::load_with(&path, &Default::default())?;
@@ -727,6 +763,9 @@ fn draw_image(
         if stamp_alpha(subject, canvas.width(), canvas.height(), &fitted, at) {
             *has_subject = true;
         }
+    }
+    if let Some(obstacles) = obstacles.filter(|_| layer.role != Role::Decoration) {
+        obstacles.stamp(&fitted, at);
     }
     paint(painter, canvas.width(), canvas.height(), &fitted, at, index);
     canvas_mod::composite_clipped(canvas, &fitted, at);

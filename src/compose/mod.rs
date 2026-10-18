@@ -23,6 +23,7 @@
 
 pub mod display;
 pub mod font;
+pub mod free;
 pub mod gate;
 pub mod measure;
 pub mod profile;

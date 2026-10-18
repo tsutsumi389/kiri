@@ -209,6 +209,27 @@ pub struct ComposeArgs {
     /// --dry-run とは併用できない（dry-run は 1 バイトも書かない約束である）
     #[arg(long, requires = "profile", conflicts_with = "dry_run")]
     pub preview: bool,
+
+    /// 文字を置ける空き矩形の候補を free_regions に返す（商品の不透明な画素と既存の文字を避ける）
+    ///
+    /// **置くのは spec の仕事である。** kiri は候補を返すだけで、層を動かさない。rect を書く前に --dry-run --free-regions で引き、候補の 1 つを文字の rect に書けば、LAYERS_OVERLAP で書き直す往復が要らない
+    ///
+    /// 避けるのは decoration でない画像の不透明度が 0 でない画素（外接矩形ではない）と、全ての文字の placed の矩形。図形と decoration の画像は文字を載せる下地なので避けない。探す範囲は safe_area、無ければキャンバス全体。障害物を --free-margin だけ膨らませて 8px の格子へ保守的に畳み、極大な空き矩形を面積の大きい順に最大 8 個返す（既に返した 1 つに面積の 7 割以上が入るものは捨てる）
+    ///
+    /// 渡さなければ free_regions のキーごと出さない
+    #[arg(long)]
+    pub free_regions: bool,
+
+    /// --free-regions が障害物から空ける距離(px)。既定は round(canvas の幅 × 24 / 1280)（1280 幅で 24px）
+    ///
+    /// 端数は切り上げる。--free-regions が要る。負・有限でない値と、キャンバスの辺の上限（16384）を超える値は断る。キャンバスの辺より広い値は切り詰めず、そのまま空ける（障害物が 1 つでもあれば候補は無い）
+    #[arg(
+        long,
+        value_name = "PX",
+        value_parser = parse_free_margin,
+        requires = "free_regions"
+    )]
+    pub free_margin: Option<f64>,
 }
 
 /// `kiri compose --profile` の値を読む。**cutout / lint の `--profile` とは別の表**
@@ -1597,6 +1618,24 @@ pub fn unit_interval(s: &str) -> Result<f64, String> {
     let v = non_negative(s)?;
     if v > 1.0 {
         return Err(format!("'{s}' は 0.0 から 1.0 の範囲で指定してください"));
+    }
+    Ok(v)
+}
+
+/// `compose --free-margin` の値。0 以上の有限な実数で、**キャンバスの辺の上限
+/// （`compose::MAX_CANVAS_SIDE`）以下**に限る。
+///
+/// 上限を置くのは、結果の `margin` を渡した値と食い違わせないためである。どの
+/// キャンバスもこの辺を超えないので、上限より広い距離はどれも上限と同じ答えに
+/// なり、受け取れば「効いた値」を返すには切り詰めるしかない。上限の内側は
+/// キャンバスより広くても切り詰めずに空ける（`compose::free::margin_from`）。
+pub fn parse_free_margin(s: &str) -> Result<f64, String> {
+    let v = non_negative(s)?;
+    let limit = f64::from(crate::compose::MAX_CANVAS_SIDE);
+    if v > limit {
+        return Err(format!(
+            "'{s}' はキャンバスの辺の上限 {limit}px を超えています"
+        ));
     }
     Ok(v)
 }

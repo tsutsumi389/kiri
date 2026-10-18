@@ -284,6 +284,54 @@ static LINT_CHECKS_NOTE: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
+/// `free_regions.margin` の読み方。既定の距離を定数から差し込む。
+static FREE_MARGIN_NOTE: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "既定は round(canvas の幅 × {} / 1280)（1280 幅で {}px）で、--free-margin で\
+         上書きできる（端数は切り上げる。上限は {}px で、それを超える値は断る。\
+         キャンバスの辺より広い値も切り詰めずにそのまま空け、ここに返す）。障害物を一辺 2 × margin + 1 の正方形で膨らませた\
+         のと同じ距離で、チェビシェフ距離で margin 以下の画素を候補に含めない。\
+         **候補の rect をそのまま文字の rect に書けば、文字が rect に収まる限り、この距離より商品に近づく\
+         ことは無い**",
+        crate::compose::free::MARGIN_AT_1280,
+        crate::compose::free::default_margin(1280),
+        crate::compose::MAX_CANVAS_SIDE
+    )
+});
+
+/// `free_regions.min_size` の読み方。
+static FREE_MIN_SIZE_NOTE: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "高さは --profile があれば、最も狭い表示で {}px になる文字 1 行の高さ\
+         （ceil({} × canvas の幅 / 表示幅)。note なら 98）、無ければ canvas の短辺の {}% \
+         の切り上げ。幅は高さの 2 倍（2 文字を下回る幅に見出しは入らない）。\
+         読めない大きさの文字しか入らない候補は、出しても使い道が無い",
+        crate::compose::display::MIN_DISPLAY_SIZE,
+        crate::compose::display::MIN_DISPLAY_SIZE,
+        crate::compose::free::MIN_HEIGHT_PERCENT_OF_SHORT_SIDE
+    )
+});
+
+/// `free_regions.regions[]` の読み方。上限と捨てる割合を定数から差し込む。
+static FREE_REGIONS_NOTE: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "**避けるのは decoration でない画像の不透明度が 0 でない画素と、全ての文字の \
+         placed の矩形である。** 画像は外接矩形（opaque_rect）ではなく画素で避けるので、\
+         外接矩形の内側の空きにも候補が出る。不透明度 1〜3 の Lanczos の裾も避ける。\
+         **位置を決めたい文字の層は spec から抜いて引く**——残すとその文字自身が移動先を\
+         塞ぐ。subject 以外の画像（ロゴなど）も避ける\
+         （layer_overlap が subject だけを数えるのとは線引きが違う）。図形と decoration \
+         の画像は文字を載せる下地なので避けない——背景の写真の上で読めるかは見ていない。\
+         並びは面積の大きい順、同じなら (y, x) の小さい順、それも同じなら幅の小さい順\
+         （同じ左上の縦長と横長は縦長が先）で、最大 {} 個。既に返した\
+         候補のどれか 1 つに面積の {}% 以上が入るものは捨てる（角で重なる横長と縦長は\
+         両方残る）。**kiri は置かない**——候補の 1 つを文字の rect に書くのは spec の側で\
+         ある",
+        crate::compose::free::MAX_REGIONS,
+        crate::compose::free::MAX_CONTAINED * 100.0
+    )
+});
+
 /// `checks[].status` の語彙。4 語は `CHECK_STATUSES` が唯一の定義である。
 static LINT_STATUS_SUMMARY: LazyLock<String> =
     LazyLock::new(|| format!("{} のいずれか", CHECK_STATUSES.join(" / ")));
@@ -2298,6 +2346,81 @@ fn fields() -> Vec<FieldEntry> {
             warns: vec![],
             gates: None,
             summary: "プレビューの高さ。round(canvas の高さ × 表示幅 / canvas の幅)",
+            notes: None,
+        },
+        FieldEntry {
+            path: "free_regions.within",
+            appears_in: compose(),
+            unit: "list",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "--free-regions が空きを探した範囲 [x, y, 幅, 高さ]。safe_area があればそれ、無ければキャンバス全体",
+            notes: Some(
+                "**--free-regions を渡したときだけ free_regions のキーが出る。** \
+                 safe_area はキャンバスへ切り詰め、画素の格子へ内向きに丸めた整数で返す\
+                 （1/64px までの端数は見逃す）。--profile が safe_area を埋めた spec では\
+                 その値になる",
+            ),
+        },
+        FieldEntry {
+            path: "free_regions.margin",
+            appears_in: compose(),
+            unit: "px",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "障害物から空けた距離。候補と障害物の画素の間には少なくともこの数の画素が挟まる",
+            notes: Some(&FREE_MARGIN_NOTE),
+        },
+        FieldEntry {
+            path: "free_regions.min_size",
+            appears_in: compose(),
+            unit: "list",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "これより小さい候補は捨てた [幅, 高さ]",
+            notes: Some(&FREE_MIN_SIZE_NOTE),
+        },
+        FieldEntry {
+            path: "free_regions.cell",
+            appears_in: compose(),
+            unit: "px",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "探索に使った格子の大きさ。候補の座標は within の左上からこの倍数へ内向きに丸まる",
+            notes: Some(
+                "固定で、変えられない。within の右端と下端だけは端数のまま線にするので、\
+                 候補の右端・下端は within の端に一致することがある。極大な空き矩形の数は\
+                 輪郭のギザギザの数に比例して増えるので、原寸ではなく格子の上で並べる",
+            ),
+        },
+        FieldEntry {
+            path: "free_regions.regions[].rect",
+            appears_in: compose(),
+            unit: "list",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "文字を置ける空き矩形 [x, y, 幅, 高さ]（整数）。中のどの画素も障害物から margin を超えて離れている",
+            notes: Some(&FREE_REGIONS_NOTE),
+        },
+        FieldEntry {
+            path: "free_regions.regions[].area_ratio",
+            appears_in: compose(),
+            unit: "ratio",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "候補の面積の within に対する比",
             notes: None,
         },
     ]);

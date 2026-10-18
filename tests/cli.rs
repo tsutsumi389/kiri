@@ -9931,6 +9931,10 @@ const PLANNED_CODES: &[&str] = &[
     // 次に誰かが同じ名前を計画書へ書いたとき検討されないまま素通しになる
     //
     // Phase 29（§10）の 5 つは実装済みなのでここから消した
+    //
+    // Phase 33（§14.5）が「この段でやらない」として次の段へ送った、下地の
+    // ごちゃつきの警告
+    "TEXT_BACKGROUND_BUSY",
 ];
 
 /// ドキュメントが名指しする code は、実在する code か実在する定数のどちらかである。
@@ -11194,6 +11198,25 @@ fn every_published_field_exists_in_the_result() {
             "--json",
         ])
     };
+    // `free_regions` は `--free-regions` を渡した実行にしか出ない。`regions[]` が
+    // 空だと中身の path を辿れないので、商品を小さく置いて空きを残す
+    let freed = {
+        let spec = write_spec(
+            dir.path(),
+            r##"{"canvas":{"width":200,"height":200,"background":"#ffffff"},
+                 "layers":[{"id":"subject","type":"image","role":"subject",
+                            "source":"product.jpg","rect":[140,140,40,40]}]}"##,
+        );
+        run(&[
+            "compose",
+            spec.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+            "--dry-run",
+            "--free-regions",
+            "--json",
+        ])
+    };
     // **縮小表示の測り（`layers[].display[]`）は文字の層にしか出ない。** 上の
     // 実行は字体を避けているので、`--profile` を付けた文字の実行を別に持つ。
     // 字体が無い機械ではその path だけを飛ばす（`segment.*` と同じ扱い）
@@ -11284,6 +11307,7 @@ fn every_published_field_exists_in_the_result() {
                 "cutout" if path.starts_with("rotate.") => &rotated,
                 "lint" => &linted,
                 "compose" if wants_text => displayed.as_ref().unwrap(),
+                "compose" if path.starts_with("free_regions") => &freed,
                 "compose" => &composed,
                 "batch" => &batched,
                 "rotate" => &turned,

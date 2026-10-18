@@ -162,6 +162,16 @@ kiri compose layout.json -o thumb.png --fail-on default --json
 - **`lines` は行の配列である。** 長い見出しはどこで割るかを自分で決めて行に分ける。
   行ごとの実測幅は `layers[]` に返る
 - `rect` は枠で、画像は内接して縮む。実際に置かれた矩形は `layers[].placed` を見る
+- **文字の `rect` を書く前に `--free-regions` で空きを引く。** 商品と文字だけを置いた spec を
+  `kiri compose layout.json -o thumb.png --dry-run --free-regions --json` に通すと、
+  `free_regions.regions[].rect` に**商品の不透明な画素と既存の文字から `margin`（1280 幅で 24px）
+  を超えて離れた空き矩形**が面積の大きい順に返る。その 1 つを文字の `rect` にそのまま書けば、
+  `LAYERS_OVERLAP` や `OUTSIDE_SAFE_AREA` で書き直す往復が要らない。外接矩形（`opaque_rect`）の
+  内側の空き（瓶の肩の横など）も出る。候補が無ければ `--free-margin` を小さくするか、商品の `rect` を
+  寄せて空きを作る。図形と `decoration` の画像は避けないので、帯や背景の写真の上にも候補が出る
+- **位置を決めたい文字の層は spec から抜いてから引く。** 文字はどの role でも障害物になるので、
+  動かしたい見出しを残すと自分の移動先を塞ぐ。`jq 'del(.layers[] | select(.id == "heading"))' layout.json > probe.json`
+  のように外した spec（素材の相対パスが崩れないよう元の spec と同じ場所に置く）で引く。残した文字は避けられる
 - **画像は透過の余白を切り詰めてから枠へ当てはめる**（既定の `"trim": "alpha"`）。`cutout` の
   `--canvas` や `--rotate` で余白が付いた素材でも、商品そのものが `rect` いっぱいに置かれる。
   余白ごと置きたいときだけ `"trim": "none"` を書く
@@ -182,7 +192,7 @@ kiri compose layout.json -o thumb.png --fail-on default --json
 |---|---|
 | `TEXT_OVERFLOW` | `rect` を広げる、`size` を下げる、`lines` を短くする |
 | `TEXT_CONTRAST_LOW` | 文字の `color` か、その文字が載っている下地を変える（背後の実測で、しきい値は WCAG の 4.5）。写真の上で変えられなければ `stroke` で縁取るか、文字の下に `shape` の帯を敷く |
-| `LAYERS_OVERLAP` | 文字の `rect` を商品の外へ寄せる |
+| `LAYERS_OVERLAP` | 文字の `rect` を商品の外へ寄せる。`--free-regions` の候補の 1 つを `rect` に書く |
 | `TEXT_OBSCURED` | 文字の層を、覆っている層より後ろ（配列の末尾側）へ移す |
 | `OUTSIDE_SAFE_AREA` | 層を `safe_area` の内側へ入れる |
 | `FONT_WEIGHT_UNAVAILABLE` | その太さの face を持つファイル（または可変フォント）を `layers[].font` で指す。無ければ `weight` を `data.actual` に合わせる |

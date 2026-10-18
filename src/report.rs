@@ -389,6 +389,11 @@ pub struct ComposeReport {
     pub dry_run: bool,
     /// 層ごとの測り。**並びは spec の `layers` の並びそのもの**——重ねた順である
     pub layers: Vec<crate::compose::measure::LayerReport>,
+    /// `--free-regions` が返す、文字を置ける空き矩形の候補（`compose::free`）。
+    /// **渡さなければキーごと出さない**——`previews` と同じ扱いで、渡さない実行の
+    /// 結果を 1 バイトも動かさない
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub free_regions: Option<crate::compose::free::FreeRegionsReport>,
     /// `--fail-on` の合否。指定が無ければ null
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compliance: Option<crate::compose::gate::GateReport>,

@@ -113,6 +113,11 @@ pub struct LayerReport {
     /// （12-phase-31.md §12.1 の 3）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display: Option<Vec<crate::compose::display::DisplayReport>>,
+    /// この層の `size` を書き換えるなら、どの範囲に書けば収まって読めるか
+    /// （`compose::size`）。**`--size-range` を渡した実行の文字の層にだけ出る。**
+    /// 渡さなければキーごと出さない（15-phase-34.md §15.1 の 5）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_range: Option<crate::compose::size::SizeRange>,
 }
 
 impl LayerReport {
@@ -141,6 +146,7 @@ impl LayerReport {
             align: None,
             font: None,
             display: None,
+            size_range: None,
         }
     }
 }
@@ -157,18 +163,25 @@ impl LayerReport {
 ///
 /// `SUBPIXEL_TOLERANCE` 以下は描画の端数で、0 と数える。
 pub fn overflow(rect: [f64; 4], placed: [f64; 4]) -> f64 {
-    let right = (placed[0] + placed[2]) - (rect[0] + rect[2]);
-    let bottom = (placed[1] + placed[3]) - (rect[1] + rect[3]);
-    let left = rect[0] - placed[0];
-    let top = rect[1] - placed[1];
-    let worst = [right, bottom, left, top]
-        .into_iter()
-        .fold(0.0_f64, f64::max);
+    let worst = edges(rect, placed).into_iter().fold(0.0_f64, f64::max);
     if worst <= SUBPIXEL_TOLERANCE {
         0.0
     } else {
         worst
     }
+}
+
+/// 4 辺それぞれの はみ出し量 `[右, 下, 左, 上]`。収まっている辺は負になる。
+///
+/// `overflow` はこの最大を返す。`compose::size` は辺ごとの値を `size` の 1 次式と
+/// して解くので、**同じ引き算を 2 か所に書かない**——片方だけ直すと、上限が
+/// `text_overflow` と別の矩形を見ることになる。
+pub(crate) fn edges(rect: [f64; 4], placed: [f64; 4]) -> [f64; 4] {
+    let right = (placed[0] + placed[2]) - (rect[0] + rect[2]);
+    let bottom = (placed[1] + placed[3]) - (rect[1] + rect[3]);
+    let left = rect[0] - placed[0];
+    let top = rect[1] - placed[1];
+    [right, bottom, left, top]
 }
 
 /// その矩形が `safe_area` に収まっていないか。

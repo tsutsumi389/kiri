@@ -87,6 +87,7 @@ src/
 | 30 | 切り抜きを速く、軽くする（§11）。**品質の的は 1 つも動かさない**——受け入れ条件は「同じ入力から同じ品質指標が出ること」で、速さとピーク RSS だけが動く | 段ごとの計測（`KIRI_STAGE_MS`） / 24.5MP 5.74 秒・872MB の短縮 | M |
 | 29 | 切り抜いた素材と文字を spec から 1 枚へ組む（**済**。§10.10。**組版だけを `resvg` へ出し、契約と測りは kiri が持つ**。計画と違えた 6 点と費用の実測は §10.10） | `kiri compose` / spec の `layers[].role` / `TEXT_OVERFLOW` ほか指標 4 つ | L |
 | 33 | 文字を置ける空き矩形の候補を返す（§14）。**置くのは spec の仕事のまま**——商品の不透明な画素と文字の `placed` から `margin` を超えて離れた極大な空き矩形を、面積の大きい順に最大 8 個返すだけで、層は動かさない | `compose --free-regions` / `--free-margin` / `free_regions` | S |
+| 34 | 収まる文字サイズの範囲を返す（§15）。**`size` を書き換えるのは spec の仕事のまま**——文字の層ごとに、`rect` に収まる最大の整数 `size`（線形に見積もって組み直して確かめた値）と、`--profile` の最も狭い表示で 11px に届く最小の整数 `size` を返すだけ | `compose --size-range` / `layers[].size_range` | S |
 
 **Phase 17〜26 は EC 特化のロードマップ**で、狙いと順序の根拠は
 [7. EC 特化のロードマップ](phases/07-roadmap-ec.md)に置く。
@@ -303,4 +304,4 @@ test / MSRV を GitHub Actions へ移した。**新規のコードは無い**—
 | 12 | Phase 31: note の見出し画像を規格として組む | [12-phase-31.md](phases/12-phase-31.md) |
 | 13 | Phase 32: 縁取り・図形の層・縮小表示のプレビュー | [13-phase-32.md](phases/13-phase-32.md) |
 | 14 | Phase 33: 文字を置ける空き領域を返す（`--free-regions`） | [14-phase-33.md](phases/14-phase-33.md) |
-| 15 | Phase 34: 収まる文字サイズの範囲を返す（`--size-range`。計画） | [15-phase-34.md](phases/15-phase-34.md) |
+| 15 | Phase 34: 収まる文字サイズの範囲を返す（`--size-range`） | [15-phase-34.md](phases/15-phase-34.md) |

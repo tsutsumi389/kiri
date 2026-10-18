@@ -44,6 +44,12 @@
 //! `placed` だけである（`compose::free` の doc）。画像は当てはめた絵を手放す前に
 //! 原寸のマスクへ押し、文字は重ね終えてから `placed` を塗る。**渡さない実行では
 //! マスクを確保しない**——費用も出力も変えない（14-phase-33.md §14.1 の 4）。
+//!
+//! # `--size-range` は重ね終えてから組み直す
+//!
+//! 範囲の上限は `size` を差し替えた幾何だけで決まり、キャンバスに依らない
+//! （`compose::size` の doc）。重ねた `placed` を 1 点目に使い、幾何だけを数回
+//! 組み直す。**渡さない実行では 1 回も組み直さない**（15-phase-34.md §15.1 の 5）。
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -146,6 +152,30 @@ pub fn run(args: &ComposeArgs) -> Result<ComposeReport> {
             .map_or_else(|| free::default_margin(w), free::margin_from);
         free::report(&obstacles, within, margin, free::min_size((w, h), profile))
     });
+    // **範囲は組んだ `placed` を 1 点目にして求める**（`compose::size` の doc）。
+    // 渡さない実行では 1 回も組み直さない
+    if args.size_range {
+        let narrowest = measured
+            .as_deref()
+            .and_then(|m| m.iter().map(|d| d.width).min());
+        for (i, layer) in spec.layers.iter().enumerate() {
+            let Layer::Text(text) = layer else {
+                continue;
+            };
+            let Some(font) = fonts.layers.get(i).and_then(Option::as_ref) else {
+                continue;
+            };
+            let report = &mut layers[i];
+            report.size_range = Some(compose::size::range(
+                text,
+                &spec.canvas,
+                &font.used.font.family,
+                &font.db,
+                report.placed,
+                narrowest,
+            )?);
+        }
+    }
     let mut shrunk: Vec<(&'static str, display::Shrunk)> = Vec::new();
 
     if let Some(measured) = measured.as_deref() {

@@ -332,6 +332,40 @@ static FREE_REGIONS_NOTE: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
+/// `layers[].size_range.min` の読み方。表示上の大きさの線を定数から差し込む。
+static SIZE_RANGE_MIN_NOTE: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "**--size-range を渡した実行の文字の層にだけ size_range のキーが出る**（画像と\
+         図形の層には無い）。ceil({} × canvas の幅 / 最も狭い測る表示の幅)\
+         （1280 幅の note なら 98）で、TEXT_ILLEGIBLE_AT_DISPLAY の too_small の hint が\
+         「size を N 以上に」と言う N と同じ式・同じ丸めである。押さえるのは too_small \
+         だけで、strokes_lost と low_contrast を消す size は言わない。role は問わない\
+         （decoration の文字にも出す）。**stroke.width 未満の size は書けない**\
+         （SPEC_INVALID）——min がそれを下回るときは、stroke.width 以上を書く",
+        crate::compose::display::MIN_DISPLAY_SIZE
+    )
+});
+
+/// `layers[].size_range.max` の読み方。見積もりの定数を差し込む。
+static SIZE_RANGE_MAX_NOTE: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "**書いたら確実に収まる整数である。** spec の size と max({} × size, {}) の 2 点で\
+         4 辺のはみ出しを size の 1 次式として解いて見積もり、その値と + 1 を組み直して\
+         確かめる（外れていれば 1 ずつ {} 回まで歩き、それでも決まらなければ二分探索で\
+         詰める）。max で組めば text_overflow は 0、max + 1 で組めば 0 より大きい。\
+         縁取りの幅は size に依らない定数として効き、stroke.width を下回る値は返さない\
+         （spec に書けない）。**min > max でもそのまま返す**——size をいじっても解けない\
+         ので、lines を割るか rect を広げる。max も limited_by も null なら、どの整数も\
+         収まらない（rect が縁の幅の 2 倍に届かないなど）ので、rect を広げるか stroke を\
+         細くする。今の size が範囲の中かどうかは spec の size と比べる。**はみ出しは size \
+         について単調（大きくするほど減らない）という前提で探す**——placed の 4 辺は size \
+         の 1 次式か、縁の矩形との入れ替わりでできる区分的な 1 次式である",
+        crate::compose::size::S1_FACTOR,
+        crate::compose::size::S1_FLOOR,
+        crate::compose::size::STEPS
+    )
+});
+
 /// `checks[].status` の語彙。4 語は `CHECK_STATUSES` が唯一の定義である。
 static LINT_STATUS_SUMMARY: LazyLock<String> =
     LazyLock::new(|| format!("{} のいずれか", CHECK_STATUSES.join(" / ")));
@@ -2291,6 +2325,50 @@ fn fields() -> Vec<FieldEntry> {
                  字を地から分けていないので、地と比べる）。**縁が溶けての ground なら縁は\
                  効いていない**——縮小で 1px 以上残るには、width が canvas の幅 / 表示幅（px）\
                  以上要る",
+            ),
+        },
+        // `--size-range`（15-phase-34.md）。**範囲を返すだけで、size は書き換えない**
+        FieldEntry {
+            path: "layers[].size_range.min",
+            appears_in: compose(),
+            unit: "px",
+            nullable: true,
+            null_means: Some(
+                "--profile が無いか、測る表示（表示幅がキャンバスの幅より狭い表示）が 1 つも無い",
+            ),
+            warns: vec![],
+            gates: None,
+            summary: "--profile の最も狭い測る表示で、表示上 11px に届く最小の整数 size",
+            notes: Some(&SIZE_RANGE_MIN_NOTE),
+        },
+        FieldEntry {
+            path: "layers[].size_range.max",
+            appears_in: compose(),
+            unit: "px",
+            nullable: true,
+            null_means: Some(
+                "収まる整数が 1 つも無い（limited_by も null）か、どれだけ大きくしても\
+                 はみ出さない（limited_by が none）",
+            ),
+            warns: vec![],
+            gates: None,
+            summary: "この rect・lines・weight・line_height・align・font・stroke のまま、text_overflow が 0 になる最大の整数 size",
+            notes: Some(&SIZE_RANGE_MAX_NOTE),
+        },
+        FieldEntry {
+            path: "layers[].size_range.limited_by",
+            appears_in: compose(),
+            unit: "enum",
+            nullable: true,
+            null_means: Some("収まる整数が 1 つも無い（max も null）"),
+            warns: vec![],
+            gates: None,
+            summary: "上限を決めた向き。width（最も長い行の幅）/ height（行の積み上げ）/ none（上限が無い）",
+            notes: Some(
+                "max + 1 で組んだときに最も大きくはみ出した辺で言う（左右なら width、\
+                 上下なら height）。width なら lines を割るか rect を広げる、height なら\
+                 行を減らすか line_height を詰めるか rect を高くする。none は字が 1 つも\
+                 組めず placed が rect の左上に潰れた層などで、max は null になる",
             ),
         },
         FieldEntry {

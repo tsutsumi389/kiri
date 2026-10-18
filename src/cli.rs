@@ -230,6 +230,16 @@ pub struct ComposeArgs {
         requires = "free_regions"
     )]
     pub free_margin: Option<f64>,
+
+    /// 文字の層ごとに、収まって読める size の範囲を layers[].size_range に返す
+    ///
+    /// **size を書き換えるのは spec の仕事である。** kiri は範囲を返すだけで、縮めも広げもしない。TEXT_OVERFLOW や TEXT_ILLEGIBLE_AT_DISPLAY の too_small が出たら --dry-run --size-range で引き、min 以上 max 以下の整数を size に書けば、はみ出しと too_small を交互に踏む往復が要らない
+    ///
+    /// max は rect に lines が収まる（text_overflow が 0 になる）最大の整数で、見積もった値を組み直して確かめてある。min は --profile の最も狭い表示で 11px に届く最小の整数（too_small の hint の N と同じ）で、--profile が無ければ null。範囲が空（min > max）でもそのまま返す。stroke.width 未満の size は書けない（min がそれを下回るときは stroke.width 以上を書く）
+    ///
+    /// 渡さなければ size_range のキーごと出さない
+    #[arg(long)]
+    pub size_range: bool,
 }
 
 /// `kiri compose --profile` の値を読む。**cutout / lint の `--profile` とは別の表**

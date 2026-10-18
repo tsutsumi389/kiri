@@ -3618,3 +3618,455 @@ fn the_schema_publishes_free_regions() {
     assert!(options.contains("--free-regions"), "{options}");
     assert!(options.contains("--free-margin"), "{options}");
 }
+
+// ---------------------------------------------------------------------------
+// Phase 34: `--size-range`（15-phase-34.md）
+// ---------------------------------------------------------------------------
+
+/// `size_range` を取り出す。無ければ落とす。
+fn size_range<'a>(report: &'a Value, id: &str) -> &'a Value {
+    layer(report, id)
+        .get("size_range")
+        .unwrap_or_else(|| panic!("'{id}' に size_range が無い: {report}"))
+}
+
+/// 文字の層を 1 つ書く。`extra` は `"stroke":{…}` のような足しのキー。
+fn text_layer(
+    id: &str,
+    lines: &[&str],
+    rect: [u32; 4],
+    size: u32,
+    align: &str,
+    extra: &str,
+) -> String {
+    let lines: Vec<String> = lines.iter().map(|l| format!("\"{l}\"")).collect();
+    format!(
+        r##"{{"id":"{id}","type":"text","role":"heading","lines":[{}],
+             "rect":[{},{},{},{}],"size":{size},"color":"#000000",
+             "align":"{align}"{extra}}}"##,
+        lines.join(","),
+        rect[0],
+        rect[1],
+        rect[2],
+        rect[3],
+    )
+}
+
+/// 文字の層を並べた spec を書く。
+fn text_spec(dir: &Path, family: &str, canvas: [u32; 2], layers: &[String]) -> PathBuf {
+    write_spec(
+        dir,
+        &format!(
+            r##"{{"canvas":{{"width":{},"height":{},"background":"#ffffff"}},
+                 "font":{{"family":"{family}"}},
+                 "layers":[{}]}}"##,
+            canvas[0],
+            canvas[1],
+            layers.join(",")
+        ),
+    )
+}
+
+/// 渡さなければ `size_range` はキーごと出ない。渡しても**画像と図形の層には
+/// 出ない**（§15.4 の 1 と 7）。
+#[test]
+fn size_range_is_absent_without_the_flag_and_on_images_and_shapes() {
+    let dir = TempDir::new().unwrap();
+    portrait(dir.path());
+    let spec = write_spec(
+        dir.path(),
+        r##"{"canvas":{"width":400,"height":400,"background":"#ffffff"},
+             "layers":[{"id":"subject","type":"image","role":"subject",
+                        "source":"product.png","rect":[100,100,160,160]},
+                       {"id":"band","type":"shape","rect":[0,300,400,60],
+                        "color":"#000000"}]}"##,
+    );
+    let out = dir.path().join("out.png");
+    for extra in [&["--dry-run"][..], &["--dry-run", "--size-range"]] {
+        let report = json_stdout(&compose(&spec, &out, extra));
+        for id in ["subject", "band"] {
+            assert!(layer(&report, id).get("size_range").is_none(), "{report}");
+        }
+    }
+
+    let Some(family) = any_font() else {
+        return;
+    };
+    let spec = text_spec(
+        dir.path(),
+        &family,
+        [400, 200],
+        &[text_layer(
+            "t",
+            &["AB"],
+            [10, 10, 380, 180],
+            40,
+            "start",
+            "",
+        )],
+    );
+    let report = json_stdout(&compose(&spec, &out, &["--dry-run"]));
+    assert!(layer(&report, "t").get("size_range").is_none(), "{report}");
+}
+
+/// **返した `max` で組むと はみ出しが 0 で、`max + 1` で組むと 0 より大きい**
+/// （§15.4 の 2）。縁取りの有無 × `start` / `center` / `end` × 1 行 / 複数行の
+/// 12 通りを 1 枚の spec に並べ、`max` と `max + 1` に書き換えた spec で確かめる
+/// （層ごとの はみ出しは他の層に依らない）。
+#[test]
+fn the_returned_max_fits_and_one_more_overflows() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let mut cases = Vec::new();
+    for stroke in ["", r##","stroke":{"color":"#ffffff","width":5}"##] {
+        for align in ["start", "center", "end"] {
+            for lines in [&["ABBA"][..], &["AB", "BAAB", "A"]] {
+                cases.push((lines, align, stroke));
+            }
+        }
+    }
+    let write = |sizes: &[u32]| {
+        let layers: Vec<String> = cases
+            .iter()
+            .zip(sizes)
+            .enumerate()
+            .map(|(i, ((lines, align, stroke), size))| {
+                let y = 10 + 300 * i as u32;
+                text_layer(
+                    &format!("t{i}"),
+                    lines,
+                    [30, y, 470, 260],
+                    *size,
+                    align,
+                    stroke,
+                )
+            })
+            .collect();
+        text_spec(dir.path(), &family, [600, 3700], &layers)
+    };
+    let out = dir.path().join("out.png");
+    let report = json_stdout(&compose(
+        &write(&[40; 12]),
+        &out,
+        &["--dry-run", "--size-range"],
+    ));
+
+    let maxes: Vec<u32> = (0..cases.len())
+        .map(|i| {
+            let range = size_range(&report, &format!("t{i}"));
+            assert!(
+                range["min"].is_null(),
+                "--profile が無ければ min は null: {range}"
+            );
+            let max = range["max"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("t{i}: {range}"));
+            assert!(max >= 5, "stroke.width を下回る max を返した: {range}");
+            max as u32
+        })
+        .collect();
+    let at_max = json_stdout(&compose(&write(&maxes), &out, &["--dry-run"]));
+    let plus_one: Vec<u32> = maxes.iter().map(|m| m + 1).collect();
+    let above = json_stdout(&compose(&write(&plus_one), &out, &["--dry-run"]));
+    for i in 0..cases.len() {
+        let id = format!("t{i}");
+        assert_eq!(
+            layer(&at_max, &id)["text_overflow"].as_f64().unwrap(),
+            0.0,
+            "{id} {:?} は max {} で収まるはず",
+            cases[i],
+            maxes[i]
+        );
+        assert!(
+            layer(&above, &id)["text_overflow"].as_f64().unwrap() > 0.0,
+            "{id} {:?} は max + 1 = {} ではみ出すはず",
+            cases[i],
+            maxes[i] + 1
+        );
+    }
+}
+
+/// 長い 1 行を高い `rect` に置けば幅で、短い行を何行も低い `rect` に置けば高さで
+/// 決まる（§15.4 の 3）。
+#[test]
+fn the_limiting_direction_is_reported() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let spec = text_spec(
+        dir.path(),
+        &family,
+        [1280, 670],
+        &[
+            text_layer(
+                "wide",
+                &["ABABABABABAB"],
+                [20, 20, 600, 400],
+                40,
+                "start",
+                "",
+            ),
+            text_layer(
+                "tall",
+                &["A", "B", "A", "B"],
+                [700, 20, 500, 200],
+                40,
+                "start",
+                "",
+            ),
+        ],
+    );
+    let out = dir.path().join("out.png");
+    let report = json_stdout(&compose(&spec, &out, &["--dry-run", "--size-range"]));
+    assert_eq!(
+        size_range(&report, "wide")["limited_by"],
+        "width",
+        "{report}"
+    );
+    assert_eq!(
+        size_range(&report, "tall")["limited_by"],
+        "height",
+        "{report}"
+    );
+}
+
+/// `hint` の「size を N 以上に」から N を取る。
+fn hinted_size(hint: &str) -> u64 {
+    let rest = hint
+        .split("size を ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("{hint}"));
+    rest.split(' ').next().unwrap().parse().unwrap()
+}
+
+/// `--profile note` の `min` は `too_small` の hint の N と一致する。`--profile` が
+/// 無ければ、測る表示が無い（どの表示幅よりも狭い）キャンバスでも null（§15.4 の 4）。
+#[test]
+fn the_minimum_is_the_too_small_hint() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let out = dir.path().join("out.png");
+    let spec = text_spec(
+        dir.path(),
+        &family,
+        [1280, 670],
+        &[text_layer(
+            "t",
+            &["AB"],
+            [20, 20, 1200, 600],
+            40,
+            "start",
+            "",
+        )],
+    );
+    let report = json_stdout(&compose(
+        &spec,
+        &out,
+        &["--dry-run", "--size-range", "--profile", "note"],
+    ));
+    let hinted = report["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|w| w["code"] == "TEXT_ILLEGIBLE_AT_DISPLAY")
+        .map(|w| hinted_size(w["hint"].as_str().unwrap()))
+        .max()
+        .unwrap_or_else(|| panic!("too_small が出ていない: {}", report["warnings"]));
+    let range = size_range(&report, "t");
+    assert_eq!(range["min"].as_u64().unwrap(), hinted, "{range}");
+    assert_eq!(hinted, 98, "ceil(11 × 1280 / 144)");
+
+    let report = json_stdout(&compose(&spec, &out, &["--dry-run", "--size-range"]));
+    assert!(size_range(&report, "t")["min"].is_null(), "{report}");
+
+    // note の表示は 192 と 144 幅。それより狭いキャンバスは縮めないので測らない
+    let narrow = text_spec(
+        dir.path(),
+        &family,
+        [120, 63],
+        &[text_layer("t", &["AB"], [4, 4, 112, 55], 20, "start", "")],
+    );
+    let report = json_stdout(&compose(
+        &narrow,
+        &out,
+        &["--dry-run", "--size-range", "--profile", "note"],
+    ));
+    let range = size_range(&report, "t");
+    assert!(range["min"].is_null(), "{range}");
+    assert!(range["max"].is_u64(), "{range}");
+}
+
+/// 縁取りの幅は上限を下げ、`stroke.width` を下回る `max` は返さない
+/// （§15.4 の 5。下げた値が条件 2 を満たすことは
+/// `the_returned_max_fits_and_one_more_overflows` が縁付きの 6 通りで見ている）。
+#[test]
+fn a_stroke_lowers_the_maximum() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let stroke = |w: u32| format!(r##","stroke":{{"color":"#ffffff","width":{w}}}"##);
+    let spec = text_spec(
+        dir.path(),
+        &family,
+        [1280, 670],
+        &[
+            text_layer(
+                "plain",
+                &["ABAB", "BA"],
+                [20, 20, 600, 300],
+                40,
+                "center",
+                "",
+            ),
+            text_layer(
+                "stroked",
+                &["ABAB", "BA"],
+                [20, 340, 600, 300],
+                40,
+                "center",
+                &stroke(12),
+            ),
+            // 縁 30px を上下に足すと、30 以上の size が 1 行も入らない高さ
+            text_layer(
+                "thick",
+                &["A"],
+                [700, 20, 400, 80],
+                40,
+                "start",
+                &stroke(30),
+            ),
+        ],
+    );
+    let out = dir.path().join("out.png");
+    let report = json_stdout(&compose(&spec, &out, &["--dry-run", "--size-range"]));
+    let plain = size_range(&report, "plain")["max"].as_u64().unwrap();
+    let stroked = size_range(&report, "stroked")["max"].as_u64().unwrap();
+    assert!(
+        stroked < plain,
+        "縁 12px で max が下がらない: {plain} → {stroked}"
+    );
+    assert!(stroked >= 12);
+
+    let thick = size_range(&report, "thick");
+    assert!(thick["max"].is_null(), "{thick}");
+    assert!(
+        thick["limited_by"].is_null(),
+        "収まる整数が無ければ limited_by も null: {thick}"
+    );
+}
+
+/// 範囲が空になる spec（狭い `rect` に `--profile note`）でも、`min > max` を
+/// そのまま返す（§15.4 の 6）。同じ入力からは同じ結果が出る（§15.4 の 8）。
+#[test]
+fn an_empty_range_is_returned_as_it_is_and_deterministically() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let spec = text_spec(
+        dir.path(),
+        &family,
+        [1280, 670],
+        &[text_layer(
+            "t",
+            &["ABABABAB"],
+            [20, 20, 300, 60],
+            40,
+            "start",
+            "",
+        )],
+    );
+    let out = dir.path().join("out.png");
+    let run = || {
+        let report = json_stdout(&compose(
+            &spec,
+            &out,
+            &["--dry-run", "--size-range", "--profile", "note"],
+        ));
+        size_range(&report, "t").clone()
+    };
+    let range = run();
+    let (min, max) = (
+        range["min"].as_u64().unwrap(),
+        range["max"].as_u64().unwrap(),
+    );
+    assert!(
+        min > max,
+        "8 文字を 300px に入れて 98px 以上にはできない: {range}"
+    );
+    for _ in 0..3 {
+        assert_eq!(run(), range);
+    }
+}
+
+/// `kiri schema` が `--size-range` と `layers[].size_range` の形を配る（§15.4 の 12）。
+#[test]
+fn the_schema_publishes_size_range() {
+    let out = kiri()
+        .args(["schema", "compose", "--json"])
+        .output()
+        .unwrap();
+    let schema = json_stdout(&out);
+    let paths: Vec<&str> = schema["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    for key in [
+        "layers[].size_range.min",
+        "layers[].size_range.max",
+        "layers[].size_range.limited_by",
+    ] {
+        assert!(paths.contains(&key), "{key}: {paths:?}");
+    }
+    let options = schema["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "compose")
+        .unwrap()["options"]
+        .to_string();
+    assert!(options.contains("--size-range"), "{options}");
+}
+
+/// **縁が上へ探す天井（65536）より太い層でも落ちない。** `size` 100000・縁 70000 は
+/// spec として書けるが、天井の内側に書ける整数が無いので `max` も `limited_by` も
+/// null（レビューの指摘。以前は `clamp` が panic した）。
+#[test]
+fn a_stroke_wider_than_the_search_ceiling_fits_nothing() {
+    let Some(family) = any_font() else {
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let spec = text_spec(
+        dir.path(),
+        &family,
+        [400, 200],
+        &[text_layer(
+            "t",
+            &["A"],
+            [0, 0, 400, 200],
+            100_000,
+            "start",
+            r##","stroke":{"color":"#ffffff","width":70000}"##,
+        )],
+    );
+    let out = dir.path().join("out.png");
+    let result = compose(&spec, &out, &["--dry-run", "--size-range"]);
+    assert!(
+        result.status.success(),
+        "compose: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report = json_stdout(&result);
+    let range = size_range(&report, "t");
+    assert!(range["max"].is_null(), "{range}");
+    assert!(range["limited_by"].is_null(), "{range}");
+}

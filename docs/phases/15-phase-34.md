@@ -1,0 +1,192 @@
+# 15. Phase 34: 収まる文字サイズの範囲を返す（`--size-range`）
+
+節番号は分割前のまま変えていない。どの節がどのファイルにあるかは
+[実装計画](../implementation-plan.md) の索引で引く。
+
+compose は**縮めない、折り返さない**（08-compose.md）。収まらない文字は
+`TEXT_OVERFLOW` で「何 px はみ出した」と言い、縮小表示で読めない文字は
+`TEXT_ILLEGIBLE_AT_DISPLAY` の `too_small` で「`size` を N 以上に」と言う。
+**片方は上から、片方は下から `size` を押さえているのに、両方を同時に満たす値は
+誰も言わない。** エージェントは `size` を当て推量で書き換え、はみ出しが消えたら
+今度は `too_small` が出る、という往復をする。
+
+この段では、文字の層ごとに
+
+1. その `rect` に `lines` が収まる `size` の**上限**
+2. `--profile` の最も狭い表示で 11px を保つ `size` の**下限**
+
+を結果 JSON に返す。**どちらも数を返すだけで、kiri は `size` を書き換えない。**
+§14 の `--free-regions` が「どこへ置けるか」を返したのに対し、この段は
+「その `rect` にどの大きさで置けるか」を返す。
+
+## 15.1 なぜここか
+
+1. **§14.5 が送った宿題である。** 候補ごとの「入る文字の最大サイズ」は、
+   次の案で文字の層ごとに返すと書いてある
+2. **往復が一番減る。** 「`--dry-run --size-range` → 範囲の中の値を `size` に
+   書く → 組む」の 2 手で、`TEXT_OVERFLOW` と `too_small` を交互に踏む
+   ループがなくなる。範囲が空なら（下限 > 上限）、`size` をいじっても解けない
+   ことが 1 回で分かり、`lines` を割るか `rect` を広げる判断へ直行できる
+3. **「書いたら確実に収まる」数は kiri にしか出せない。** 上限の目安は既存の
+   出力（`line_widths` と `placed`）からエージェントでも線形に見積もれる。
+   しかし縁取りの幅（`size` に依らない定数）、ascent の差による上端のずれ、
+   usvg の f32 の端数、`SUBPIXEL_TOLERANCE` の見逃しを知らない見積もりは、
+   境目で 1px はみ出す値を返しうる。kiri は**見積もった値で組み直して確かめた
+   整数**を返せる。これが機能範囲の基準（「AI が他のツールの組み合わせで
+   できることは入れない」）に対する答えである（§15.6 の 1 で入れると決めた）
+4. **測りの材料はすでに揃っている。** `text::render` は木から幾何だけを拾う
+   `measure_tree` を持ち、下限は `display::required_size` そのものである。
+   足すのは「別の `size` で幾何だけ組み直す」入口だけである
+5. **既存の出力を 1 バイトも動かさない。** 旗を渡さなければキーごと出さない
+   （`free_regions` / `profile` / `previews` と同じ扱い）
+
+## 15.2 作るもの
+
+### 15.2.1 使い方
+
+```
+$ kiri compose layout.json -o thumb.png --dry-run --profile note --size-range --json \
+    | jq '.layers[] | select(.kind == "text") | {id, size_range}'
+```
+
+```json
+{
+  "id": "heading",
+  "size_range": { "min": 98, "max": 131, "limited_by": "width" }
+}
+```
+
+（数値は説明用。実装後に実際の出力へ差し替える）
+
+| キー | 意味 |
+|---|---|
+| `size_range.max` | この `rect`・`lines`・`weight`・`line_height`・`align`・`font`・`stroke` のまま、`text_overflow` が 0 になる最大の整数 `size`。収まる整数が 1 つも無ければ `null` |
+| `size_range.min` | `--profile` の測る表示（`display::measurable`）のうち最も狭い幅で、表示上 `MIN_DISPLAY_SIZE`（11px）に届く最小の整数 `size`。`--profile` が無いか、測る表示が 1 つも無ければ `null` |
+| `size_range.limited_by` | 上限を決めた向き。`"width"`（最も長い行の幅）か `"height"`（行の積み上げ）。上限が無ければ `"none"`、収まる整数が無ければ `null` |
+
+- **キーは文字の層にだけ出る。** 画像と図形の層には出さない（`line_widths` と同じ）
+- 範囲が空（`min > max`）でも、そのまま返す。「空である」ことが答えである
+- 今の `size` が範囲の中かどうかは出さない。spec の `size` と比べれば分かる
+  （同じ事実を 2 つの形で配らない。`measure::overflow` の doc と同じ考え方）
+
+### 15.2.2 上限の求め方：線形に見積もり、組んで確かめる
+
+`text.rs` の組み方では、**`size` 以外を固定したとき、`placed` の 4 辺は `size` の
+1 次式になる**。
+
+- 横：行の送り幅は字の advance の和で、`size` に比例する（usvg は輪郭を
+  ヒンティングしないので、整数への丸めが入らない）。`start` 揃えなら左端は
+  `rect.x + stroke.width` で動かず、右端が `size` に比例して伸びる。`center` は
+  左右へ半分ずつ、`end` は左へ伸びる
+- 縦：最初のベースラインは `rect.y + stroke.width + size × ascent`、行の天地は
+  usvg の ascent / descent × `size`、行送りは `size × line_height`。上端も下端も
+  `size` の 1 次式で、定数項は縁の幅である
+- 縁取りは `intersect(union(…), grow(rect, width))` で「送りの矩形 + 縁の幅」に
+  止めてあり、縁の幅は `size` に依らない定数として効く
+
+そこで次の手順で求める。
+
+1. **幾何だけを 2 回組む。** spec の `size` を `s0`、`s1 = 2 × s0` とし、それぞれで
+   `measure_tree` が返す `placed` を取る（ラスタライズはしない。§15.6 の 3）
+2. 4 辺それぞれの はみ出し量 `o(s) = a + b × s` の `a` と `b` を 2 点から解く。
+   `b ≤ 0` の辺は大きくしても はみ出しが増えないので上限に効かない
+3. 各辺で `o(s) ≤ SUBPIXEL_TOLERANCE` となる最大の `s` を出し、その最小を取って
+   **整数へ切り捨てる**。これが候補 `c`。効いた辺から `limited_by` を決める
+   （左右なら `width`、上下なら `height`）
+4. **`c` で幾何を組み直し、`measure::overflow` で 0 を確かめる。** 0 でなければ
+   1 ずつ下げて最大 3 回まで確かめる。それでも収まらなければ `[1, c]` の整数で
+   二分探索に落ちる（f32 の端数や字体の癖で直線から外れたときの保険）
+5. 結果が `MIN_FONT_SIZE`（1）未満か、縁取りのある層で `stroke.width` 未満なら
+   `max` は `null`——`stroke.width ≤ size` は `compose::validate` の検査で、
+   それを破る `size` は spec に書けない
+6. **`b` がどの辺でも 0 以下**（1 行も字が組めず `placed` が `rect` の左上に潰れた
+   ときなど）は、どれだけ大きくしても はみ出さない。上限は無いが、無限を返す
+   代わりに `max` は `null`、`limited_by` は `"none"` とする（§15.6 の 4）
+
+**二分探索を主にしない理由。** `[1, 16384]` を整数で詰めると 1 層あたり 14 回
+組み直す。線形の見積もりは 2 回 + 確かめ 1 回で、外れたときだけ二分探索へ落ちる
+ので、正しさは二分探索と同じ（最後に必ず組んで確かめる）まま、普通の層では
+組み直しが 3 回で済む。
+
+**整数で返す理由。** `display::required_size` が「spec に書く値なので、書いたら
+確実に届く数を返す」として整数へ切り上げているのと揃える。上限は切り捨て、
+下限は切り上げで、どちらも書いたら確実に条件を満たす。
+
+### 15.2.3 下限の求め方
+
+`display::required_size(canvas.width, 最も狭い測る表示の幅)` をそのまま使う。
+`TEXT_ILLEGIBLE_AT_DISPLAY` の `too_small` の hint が「size を N 以上に」と言う
+N と、**同じ式・同じ丸めで一致させる**（受け入れ条件 4）。
+
+下限が押さえるのは `too_small` だけである。`strokes_lost`（線が潰れる）と
+`low_contrast`（地と分かれない）は `size` を上げれば軽くなることが多いが、
+どこで消えるかは縮めた絵を測らないと分からないので、この段では返さない（§15.5）。
+
+## 15.3 契約への影響
+
+| 場所 | 変更 |
+|---|---|
+| CLI | `--size-range`（旗）。`--profile` は要らない（無ければ `min` が `null`） |
+| `LayerReport` | `size_range`（文字の層だけ）。**渡さなければキーごと出さない** |
+| `kiri schema` | `compose` のオプションに `--size-range`、出力の `layers[]` に `size_range` の形 |
+| `schema_version` | **2 のまま。** キーが増えるだけ |
+| error / warning | 新しい code は無い。既存の警告の hint も変えない（§15.6 の 5） |
+| `text.rs` | `render` から「木を組む」部分を切り出し、`size` を差し替えて幾何だけを返す入口を足す。`layout` / `layout_fill` の結果は 1 ビットも変えない |
+
+## 15.4 受け入れ条件
+
+1. `--size-range` を渡さない実行の結果 JSON（`elapsed_ms` を除く）と出力の
+   バイト列（プレビューを含む）が main と一致する（`tests/compose.rs` の釘を含む）
+2. **返した `max` で組むと `text_overflow` が 0 で、`max + 1` で組むと 0 より大きい**
+   （縁取りの有無 × `start` / `center` / `end` × 1 行 / 複数行の組み合わせで確かめる。
+   性質テスト）
+3. 幅で決まる層（長い 1 行を低くない `rect` に）では `limited_by` が `width`、
+   高さで決まる層（短い行を何行も低い `rect` に）では `height`
+4. `--profile note` で、`min` が `TEXT_ILLEGIBLE_AT_DISPLAY` の hint の N と一致する。
+   `--profile` が無ければ `min` は `null`。測る表示が無いキャンバス
+   （どの表示幅よりも狭いキャンバス）でも `null`
+5. 縁取りの幅が上限に効く：同じ層に `stroke.width` を足すと `max` が下がり、
+   なお条件 2 を満たす。`stroke.width` を下回る `max` は返さない
+6. 範囲が空になる spec（狭い `rect` に `--profile note`）で `min > max` がそのまま返る
+7. 画像と図形の層には `size_range` が出ない
+8. 同じ入力から同じ結果（決定性）
+9. 見積もりが外れて二分探索へ落ちる経路をテストで通す（見積もりの関数を
+   差し替えるか、直線から外れる入力を作る）
+10. 1280 × 670・文字 3 層の spec で、`--size-range` による増加が 15ms 以下
+    （`--release`。§15.6 の 3）
+11. `cargo test`（`ci-test` プロファイル、feature 有無を直列で）、clippy（両系統、
+    `-D warnings`）、fmt、MSRV 1.85 がすべて通る
+12. 08-compose.md（「縮めない、折り返さない」の節に「縮めないが、収まる範囲は
+    言う」を足す）・`kiri schema`・Skill（「`TEXT_OVERFLOW` や `too_small` が出たら
+    `--size-range` を引いて範囲の中の値を書く」手順）・implementation-plan.md の
+    索引を更新する
+
+## 15.5 この段でやらないこと
+
+- **`size` を自動で縮める・広げる。** 「縮めない、折り返さない」はそのまま。
+  返すのは範囲で、書くのは spec である
+- **折り返しの提案。** 範囲が空のときに「どこで割れば入るか」は言わない。
+  割る材料（`line_widths`）は今も返している
+- `strokes_lost` と `low_contrast` を消す `size`。縮めた絵を `size` ごとに測る
+  ことになり、上限の求め方とは費用の桁が違う
+- `rect` が `safe_area` の外へ出ていることや、`size` を変えたときの
+  `layer_overlap` の変化。上限は `rect` に対する はみ出しだけを見る
+- `--free-regions` の候補ごとの上限。候補の矩形を `rect` として書き直した spec で
+  `--size-range` を引けば得られる（2 つの旗の組み合わせで済む）
+- `stroke.width` の助言（`required_stroke` は既に hint が言っている）
+
+## 15.6 決めたこと（2026-10-18）
+
+1. **入れる。** 見積もりの式を Skill に書くだけでは閉じない。エージェントが
+   自分で確かめるには kiri を何度も回すことになり、それがこの段で減らしたい往復
+   そのものである。縁・ascent・端数が絡むと、見積もりは 1〜2px ずれる
+2. **旗は `--size-range`、出力は `layers[].size_range`。** 層ごとの測り
+   （`display` / `line_widths`）と同じく `layers[]` に置く
+3. **費用は実測して直す。** 受け入れ条件 10 の 15ms を超えるなら、`s1` を省き、
+   組み直しを確かめの 1 回だけにする案へ替える
+4. **上限が無い層には `max: null` と `limited_by: "none"` を返す。** 「収まる整数が
+   無い」と「上限が無い」を `limited_by` で分ける
+5. **既存の警告の hint は変えない。** hint に数を足すと、旗を渡さない実行の出力が
+   変わって条件 1 と両立しない。足すなら別の段でやる
+6. **整数で返す**（§15.2.2）
+7. **`s1` の下駄は実測で決める。** `s1 = max(2 × s0, 64)` を出発点にする

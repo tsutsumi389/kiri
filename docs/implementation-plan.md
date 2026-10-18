@@ -303,3 +303,4 @@ test / MSRV を GitHub Actions へ移した。**新規のコードは無い**—
 | 12 | Phase 31: note の見出し画像を規格として組む | [12-phase-31.md](phases/12-phase-31.md) |
 | 13 | Phase 32: 縁取り・図形の層・縮小表示のプレビュー | [13-phase-32.md](phases/13-phase-32.md) |
 | 14 | Phase 33: 文字を置ける空き領域を返す（`--free-regions`） | [14-phase-33.md](phases/14-phase-33.md) |
+| 15 | Phase 34: 収まる文字サイズの範囲を返す（`--size-range`。計画） | [15-phase-34.md](phases/15-phase-34.md) |

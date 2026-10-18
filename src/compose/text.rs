@@ -63,6 +63,28 @@ pub fn layout_fill(
     render(layer, canvas, family, db, false)
 }
 
+/// `size` だけを差し替えて組み、**外接矩形（`Layout::bbox`）だけ**を返す
+/// （15-phase-34.md §15.2.2）。
+///
+/// `--size-range` が上限を見積もって確かめるための入口である。ラスタライズは
+/// しない——要るのは幾何だけで、描くとキャンバスの面積ぶんの費用が組み直しの
+/// 回数だけ掛かる。**木は `layout` と同じ SVG から組む**ので、`size` が spec の値
+/// なら `layout` の `bbox` とビットまで一致する。
+pub fn placed_at(
+    layer: &TextLayer,
+    size: f64,
+    canvas: &Canvas,
+    family: &str,
+    db: &Arc<usvg::fontdb::Database>,
+) -> Result<[f64; 4]> {
+    let resized = TextLayer {
+        size,
+        ..layer.clone()
+    };
+    let tree = build_tree(&resized, canvas, family, db, true)?;
+    Ok(measure_tree(&tree, &resized).0)
+}
+
 fn render(
     layer: &TextLayer,
     canvas: &Canvas,
@@ -70,27 +92,37 @@ fn render(
     db: &Arc<usvg::fontdb::Database>,
     paint_stroke: bool,
 ) -> Result<Layout> {
-    let ascent = crate::compose::font::ascent_ratio(db, family);
-    let svg = to_svg(layer, canvas, family, ascent, paint_stroke);
-    let options = usvg::Options {
-        fontdb: Arc::clone(db),
-        ..Default::default()
-    };
-    let tree = usvg::Tree::from_str(&svg, &options).map_err(|e| {
-        // **ここへ来るのは kiri の組み立ての誤りである。** SVG は外から受け取って
-        // いないので、利用者の spec の形で説明できる失敗ではない
-        Error::new(
-            ErrorCode::SpecInvalid,
-            format!("文字 '{}' を組めませんでした: {e}", layer.id),
-        )
-    })?;
-
+    let tree = build_tree(layer, canvas, family, db, paint_stroke)?;
     let (bbox, line_widths) = measure_tree(&tree, layer);
 
     Ok(Layout {
         bbox,
         line_widths,
         pixels: rasterize(&tree, canvas)?,
+    })
+}
+
+/// spec の 1 レイヤを usvg の木にする。組版（字の送りと輪郭）はここで終わる。
+fn build_tree(
+    layer: &TextLayer,
+    canvas: &Canvas,
+    family: &str,
+    db: &Arc<usvg::fontdb::Database>,
+    paint_stroke: bool,
+) -> Result<usvg::Tree> {
+    let ascent = crate::compose::font::ascent_ratio(db, family);
+    let svg = to_svg(layer, canvas, family, ascent, paint_stroke);
+    let options = usvg::Options {
+        fontdb: Arc::clone(db),
+        ..Default::default()
+    };
+    usvg::Tree::from_str(&svg, &options).map_err(|e| {
+        // **ここへ来るのは kiri の組み立ての誤りである。** SVG は外から受け取って
+        // いないので、利用者の spec の形で説明できる失敗ではない
+        Error::new(
+            ErrorCode::SpecInvalid,
+            format!("文字 '{}' を組めませんでした: {e}", layer.id),
+        )
     })
 }
 

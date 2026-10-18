@@ -11233,8 +11233,9 @@ fn every_published_field_exists_in_the_result() {
             ),
         );
         // `display[].against` は縁取りのある層にだけ、`previews[]` は `--preview`
-        // を渡したときにだけ出る。`--preview` は `--dry-run` と併用できないので
-        // 書く（出力は他の実行と別の名前にする）
+        // を、`layers[].size_range` は `--size-range` を渡したときにだけ出る。
+        // `--preview` は `--dry-run` と併用できないので書く（出力は他の実行と
+        // 別の名前にする）
         let previewed = dir.path().join("displayed.png");
         run(&[
             "compose",
@@ -11245,6 +11246,7 @@ fn every_published_field_exists_in_the_result() {
             "--profile",
             "note",
             "--preview",
+            "--size-range",
         ])
     });
     let segmented = segment_ready().then(|| {
@@ -11285,6 +11287,7 @@ fn every_published_field_exists_in_the_result() {
         // `previews[]` は同じ実行が `--preview` で書く
         let wants_text = path.starts_with("layers[].display")
             || path.starts_with("layers[].font")
+            || path.starts_with("layers[].size_range")
             || path.starts_with("previews");
         if wants_text && displayed.is_none() {
             continue;

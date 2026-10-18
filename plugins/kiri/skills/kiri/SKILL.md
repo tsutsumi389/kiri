@@ -172,6 +172,15 @@ kiri compose layout.json -o thumb.png --fail-on default --json
 - **位置を決めたい文字の層は spec から抜いてから引く。** 文字はどの role でも障害物になるので、
   動かしたい見出しを残すと自分の移動先を塞ぐ。`jq 'del(.layers[] | select(.id == "heading"))' layout.json > probe.json`
   のように外した spec（素材の相対パスが崩れないよう元の spec と同じ場所に置く）で引く。残した文字は避けられる
+- **`TEXT_OVERFLOW` や `too_small` が出たら、`size` を当て推量で書き換えずに `--size-range` を引く。**
+  `kiri compose layout.json -o thumb.png --dry-run --profile note --size-range --json` の
+  `layers[].size_range` に、文字の層ごとの `{min, max, limited_by}` が返る。`min` 以上 `max` 以下の
+  整数を `size` に書けば、はみ出しも `too_small` も出ない（`max` は組み直して確かめた値。`min` は
+  `--profile` が無ければ null）。**`min > max` なら `size` では解けない**——`limited_by` が `width` なら
+  `lines` を割り直すか `rect` を広げ、`height` なら行を減らすか `line_height` を詰めるか `rect` を高くする。
+  **`max` も `limited_by` も null なら、どの整数も収まらない**（縁が太すぎて `rect` に 1 字も入らないなど）。
+  `rect` を広げるか、`stroke` の `width` を細くするか外す。`limited_by` が `none` なら上限は無い。
+  `stroke.width` 未満の `size` は書けない（`SPEC_INVALID`）ので、`min` がそれを下回るときは `stroke.width` 以上を書く
 - **画像は透過の余白を切り詰めてから枠へ当てはめる**（既定の `"trim": "alpha"`）。`cutout` の
   `--canvas` や `--rotate` で余白が付いた素材でも、商品そのものが `rect` いっぱいに置かれる。
   余白ごと置きたいときだけ `"trim": "none"` を書く
@@ -190,7 +199,7 @@ kiri compose layout.json -o thumb.png --fail-on default --json
 
 | 警告 | 直し方 |
 |---|---|
-| `TEXT_OVERFLOW` | `rect` を広げる、`size` を下げる、`lines` を短くする |
+| `TEXT_OVERFLOW` | `--size-range` の `max` 以下に `size` を下げる。範囲が空なら `rect` を広げるか `lines` を短くする |
 | `TEXT_CONTRAST_LOW` | 文字の `color` か、その文字が載っている下地を変える（背後の実測で、しきい値は WCAG の 4.5）。写真の上で変えられなければ `stroke` で縁取るか、文字の下に `shape` の帯を敷く |
 | `LAYERS_OVERLAP` | 文字の `rect` を商品の外へ寄せる。`--free-regions` の候補の 1 つを `rect` に書く |
 | `TEXT_OBSCURED` | 文字の層を、覆っている層より後ろ（配列の末尾側）へ移す |
@@ -214,7 +223,7 @@ kiri compose header.json -o header.png --profile note --fail-on default --json
 
 | 理由 | 直し方 |
 |---|---|
-| `too_small` | `size` を `11 × canvas の幅 / 表示幅` 以上にする（1280 幅ならスマホで 98） |
+| `too_small` | `size` を `11 × canvas の幅 / 表示幅` 以上にする（1280 幅ならスマホで 98）。`--size-range` の `min` がその値で、`max` を超えるなら `lines` か `rect` を直す |
 | `strokes_lost` | `weight` を上げる（`FONT_WEIGHT_UNAVAILABLE` が出ていれば効かないので、太いファイルを `layers[].font` で指す） |
 | `low_contrast` | 文字色か下地を変える。変えられなければ `stroke` で縁取る（`width` は `canvas の幅 / 表示幅` 以上。1280 幅ならスマホで 9）か、文字の下に `shape` の帯を敷く。原寸の `text_contrast` が通っていても、縮めると落ちることがある |
 

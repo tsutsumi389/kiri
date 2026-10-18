@@ -101,6 +101,11 @@ spec に書いた指定が黙って消える向きの親切で、`--fill-ratio` 
 それを持つと kiri は合成器ではなくなる。どこで割るかは文意の問題でもあるので、
 **`lines` は行の配列で受け取る。割る材料（行ごとの実測幅）は返すが、割らない。**
 
+**縮めないが、収まる範囲は言う。** `TEXT_OVERFLOW` は上から、縮小表示の `too_small`
+は下から `size` を押さえる。両方を同時に満たす値は `--size-range` が層ごとに返す
+（[収まる文字サイズの範囲を引く](#収まる文字サイズの範囲を引く--size-range)）。
+`size` を書き換えるのは spec のままである。
+
 ## 無い字体は黙って代替しない
 
 指定の family が見つからなければ `FONT_NOT_FOUND` で断り、**1 枚も書かない。**
@@ -499,6 +504,58 @@ $ kiri compose probe.json -o thumb.png --dry-run --free-regions --json | jq .fre
   作らないので、渡さない実行の費用も出力も変わらない
 - 層が避ける相手を 1 つも持たなければ（図形と `decoration` だけ）、`within` そのものが
   1 つだけ返る
+
+## 収まる文字サイズの範囲を引く（`--size-range`）
+
+```
+$ kiri compose layout.json -o thumb.png --dry-run --profile note --size-range --json \
+    | jq -c '.layers[] | select(.kind == "text") | {id, size_range}'
+```
+
+```json
+{"id":"heading","size_range":{"min":98,"max":62,"limited_by":"width"}}
+{"id":"wide","size_range":{"min":98,"max":124,"limited_by":"width"}}
+```
+
+**`size` をどの範囲に書けば収まって読めるかを、組む前に言う。** はみ出しを
+`TEXT_OVERFLOW` で知って `size` を下げると、今度は `too_small` が出る——当て推量で
+`size` を書き換えると、この往復が続く。「`--dry-run --size-range` → 範囲の中の値を
+`size` に書く → 組む」の 2 手で済む。**kiri は `size` を書き換えない。**
+
+| キー | 意味 |
+|---|---|
+| `size_range.max` | この `rect`・`lines`・`weight`・`line_height`・`align`・`font`・`stroke` のまま、`text_overflow` が 0 になる最大の整数 `size`。収まる整数が無いか、上限が無ければ `null` |
+| `size_range.min` | `--profile` の測る表示のうち最も狭い幅で、表示上 11px に届く最小の整数 `size`。`too_small` の hint が「size を N 以上に」と言う N と同じ式・同じ丸め。`--profile` が無いか、測る表示が 1 つも無ければ `null` |
+| `size_range.limited_by` | 上限を決めた向き。`width`（最も長い行の幅）/ `height`（行の積み上げ）/ `none`（どれだけ大きくしても はみ出さない。`max` は `null`）。収まる整数が無ければ `null` |
+
+上の例は冒頭の spec の `heading` に、1 行の `wide`（`rect` が `[80, 400, 1120, 200]`）を
+足し、ヒラギノ角ゴシックで組んだ実際の出力である。**`heading` は範囲が空**（`min > max`）
+で、64px のままでも幅で 16px はみ出す（最も長い行が 576px）。`size` をどう書いても はみ出しと `too_small` の
+両方は消えないので、`lines` を割り直すか `rect` を広げる。`width` なら行を短く、
+`height` なら行を減らすか `line_height` を詰める。
+
+- **書いたら確実に収まる整数である。** `max` で組めば `text_overflow` は 0、`max + 1` で
+  組めば 0 より大きい。`placed` の 4 辺は `size` の 1 次式なので、spec の `size` と
+  `max(2 × size, 64)` の 2 点から見積もり、その値と + 1 を組み直して確かめる。
+  外れていれば 1 ずつ 3 回まで歩き、それでも決まらなければ二分探索で詰める
+  （縁取りの層では、縁の矩形と字の送りの矩形のどちらが外側かが `size` で入れ替わり、
+  直線から外れることがある）
+- **縁取りの幅は上限を下げる。** 縁は `size` に依らない幅で外へ出る。`stroke.width` を
+  下回る値は spec に書けない（`SPEC_INVALID`）ので `max` には返さない。`min` は
+  `too_small` の hint と揃えるため `stroke.width` を下回ることがあり、そのときは
+  `stroke.width` 以上を書く。`max` も `limited_by` も null なら、どの整数も収まらない
+  （縁が太すぎて 1 字も入らないなど）ので、`rect` を広げるか縁を細くする
+- **下限が押さえるのは `too_small` だけである。** `strokes_lost` と `low_contrast` は
+  縮めた絵を測らないと分からないので、範囲には入れない。`role` は問わない
+- 今の `size` が範囲の中かどうかは出さない。spec の `size` と比べれば分かる
+- 画像と図形の層には出ない。**`--size-range` を渡さなければ `size_range` のキーごと
+  出ない**し、組み直しもしない。1280 x 670・文字 3 層で増える時間は 5ms 前後
+  （`--release`。1 層あたり幾何だけの組み直しが普通 3 回）。見積もりが最も低く
+  外れた層の最悪は 35 回（`s1`・候補・上へ 4 回・倍々 14 回・二分探索 15 回）。
+  実の字体でそこまで外れる層は測った範囲では無く、二分探索に落ちた層でも 14 回だった
+- はみ出しは `size` について単調（大きくするほど減らない）という前提で探す
+- `--free-regions` の候補ごとの上限は返さない。候補の矩形を文字の `rect` に書いた spec で
+  `--size-range` を引けばよい
 
 ## 持っていないもの
 

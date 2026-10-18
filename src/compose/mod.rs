@@ -28,6 +28,7 @@ pub mod gate;
 pub mod measure;
 pub mod profile;
 pub mod shape;
+pub mod size;
 pub mod text;
 
 use std::path::{Path, PathBuf};

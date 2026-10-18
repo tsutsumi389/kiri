@@ -131,25 +131,11 @@ pub fn lower(canvas_w: u32, narrowest: u32) -> u32 {
     display::required_size(canvas_w, narrowest) as u32
 }
 
-/// 上限を求めた結果。`route` はテストが経路を確かめるためにだけ持つ。
+/// 上限を求めた結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Upper {
     max: Option<u32>,
     limited_by: Option<LimitedBy>,
-    route: Route,
-}
-
-/// どの経路で決まったか。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Route {
-    /// 見積もり `c` が収まり、`c + 1` がはみ出した
-    Estimate,
-    /// 1 ずつ歩いて決まった
-    Stepped,
-    /// 二分探索に落ちた
-    Searched,
-    /// 組み直すまでもなく決まった（上限が無い）
-    Unbounded,
 }
 
 /// 見積もりの関数の形。`(rect, s0, placed(s0), s1, placed(s1))` から、
@@ -196,14 +182,10 @@ fn upper(
         place,
         seen: Vec::new(),
     };
-    let p1 = (probe.place)(s1)?;
-    // 組んだ 2 点は、整数なら覚えておく——確かめで同じ `size` を組み直さない
-    for (s, p) in [(s0, p0), (s1, p1)] {
-        if s.fract() == 0.0 && s <= f64::from(SEARCH_CEILING) {
-            probe.seen.push((s as u32, p));
-        }
-    }
-    let fits = |p: [f64; 4]| measure::overflow(rect, p) == 0.0;
+    // 組んだ 2 点を覚えておく——確かめで同じ `size` を組み直さない。整数でない
+    // 点は整数の確かめと一致しないだけである
+    probe.seen.push((s0, p0));
+    let p1 = probe.at(s1)?;
     let candidate = match estimator(rect, s0, p0, s1, p1) {
         // **NaN は候補にしない。** `as u32` が 0 に落ち、`max: 0` を返しうる。
         // spec の `size` から探して確かめる
@@ -212,44 +194,42 @@ fn upper(
         // **どの辺も伸びない。** 2 点とも収まっていれば、どれだけ大きくしても
         // はみ出さない（§15.6 の 4）。収まっていなければ定数項がはみ出しており、
         // 探して確かめる
-        None if fits(p0) && fits(p1) => {
-            return Ok(Upper {
-                max: None,
-                limited_by: Some(LimitedBy::None),
-                route: Route::Unbounded,
-            });
-        }
+        None if fits(rect, p0) && fits(rect, p1) => return Ok(Upper::unbounded()),
         None => s0,
     };
-    // `lowest ≤ SEARCH_CEILING` は上で確かめてある。cast の後にも `lowest` で
-    // 押さえ、候補が何であれ書けない整数から歩き始めない
-    let c = (candidate
+    // `lowest ≤ SEARCH_CEILING` は上で確かめてあり、NaN も上で除いてある。候補が
+    // 何であれ書けない整数から歩き始めない
+    let c = candidate
         .floor()
-        .clamp(f64::from(lowest), f64::from(SEARCH_CEILING)) as u32)
-        .max(lowest);
+        .clamp(f64::from(lowest), f64::from(SEARCH_CEILING)) as u32;
     probe.settle(c, lowest)
 }
 
-/// 整数の `size` ごとに組んで確かめる器。同じ `size` を 2 度組まない。
+/// 外接矩形 `p` が `rect` からはみ出していないか。
+fn fits(rect: [f64; 4], p: [f64; 4]) -> bool {
+    measure::overflow(rect, p) == 0.0
+}
+
+/// `size` ごとに組んで確かめる器。同じ `size` を 2 度組まない。
 struct Probe<F> {
     rect: [f64; 4],
     place: F,
-    seen: Vec<(u32, [f64; 4])>,
+    seen: Vec<(f64, [f64; 4])>,
 }
 
 impl<F: FnMut(f64) -> Result<[f64; 4]>> Probe<F> {
-    fn at(&mut self, size: u32) -> Result<[f64; 4]> {
+    fn at(&mut self, size: f64) -> Result<[f64; 4]> {
         if let Some((_, p)) = self.seen.iter().find(|(s, _)| *s == size) {
             return Ok(*p);
         }
-        let p = (self.place)(f64::from(size))?;
+        let p = (self.place)(size)?;
         self.seen.push((size, p));
         Ok(p)
     }
 
     fn fits(&mut self, size: u32) -> Result<bool> {
-        let p = self.at(size)?;
-        Ok(measure::overflow(self.rect, p) == 0.0)
+        let p = self.at(f64::from(size))?;
+        Ok(fits(self.rect, p))
     }
 
     /// 候補 `c` の近くで、収まる最大の整数を決める。**大きくするほど はみ出しは
@@ -258,21 +238,12 @@ impl<F: FnMut(f64) -> Result<[f64; 4]>> Probe<F> {
     fn settle(&mut self, mut c: u32, lowest: u32) -> Result<Upper> {
         if self.fits(c)? {
             // 上へ歩く。`c + 1` が はみ出せば見積もりどおり
-            for step in 0..=STEPS {
+            for _ in 0..=STEPS {
                 if c >= SEARCH_CEILING {
-                    return Ok(Upper {
-                        max: None,
-                        limited_by: Some(LimitedBy::None),
-                        route: Route::Searched,
-                    });
+                    return Ok(Upper::unbounded());
                 }
                 if !self.fits(c + 1)? {
-                    let route = if step == 0 {
-                        Route::Estimate
-                    } else {
-                        Route::Stepped
-                    };
-                    return self.done(c, route);
+                    return self.done(c);
                 }
                 c += 1;
             }
@@ -285,11 +256,7 @@ impl<F: FnMut(f64) -> Result<[f64; 4]>> Probe<F> {
                     break;
                 }
                 if hi == SEARCH_CEILING {
-                    return Ok(Upper {
-                        max: None,
-                        limited_by: Some(LimitedBy::None),
-                        route: Route::Searched,
-                    });
+                    return Ok(Upper::unbounded());
                 }
                 lo = hi;
             }
@@ -302,7 +269,7 @@ impl<F: FnMut(f64) -> Result<[f64; 4]>> Probe<F> {
                 }
                 c -= 1;
                 if self.fits(c)? {
-                    return self.done(c, Route::Stepped);
+                    return self.done(c);
                 }
             }
             if c <= lowest || !self.fits(lowest)? {
@@ -322,13 +289,13 @@ impl<F: FnMut(f64) -> Result<[f64; 4]>> Probe<F> {
                 hi = mid;
             }
         }
-        self.done(lo, Route::Searched)
+        self.done(lo)
     }
 
     /// `max` で決まった。**向きは `max + 1` で最も大きく はみ出した辺から言う**
     /// ——見積もりで効いた辺ではなく、組んで確かめた辺である。
-    fn done(&mut self, max: u32, route: Route) -> Result<Upper> {
-        let over = self.at(max + 1)?;
+    fn done(&mut self, max: u32) -> Result<Upper> {
+        let over = self.at(f64::from(max + 1))?;
         let e = measure::edges(self.rect, over);
         // [右, 下, 左, 上]。同じなら先の辺（幅）を採る
         let worst = (0..4).fold(0, |best, k| if e[k] > e[best] { k } else { best });
@@ -340,7 +307,6 @@ impl<F: FnMut(f64) -> Result<[f64; 4]>> Probe<F> {
         Ok(Upper {
             max: Some(max),
             limited_by: Some(limited_by),
-            route,
         })
     }
 }
@@ -351,7 +317,14 @@ impl Upper {
         Upper {
             max: None,
             limited_by: None,
-            route: Route::Searched,
+        }
+    }
+
+    /// どれだけ大きくしても はみ出さない。`max` は null、`limited_by` は `"none"`
+    fn unbounded() -> Upper {
+        Upper {
+            max: None,
+            limited_by: Some(LimitedBy::None),
         }
     }
 }
@@ -390,7 +363,6 @@ mod tests {
         let up = run(linear(2.5, 1.2, 0.0), 40.0, 1.0, estimate, &mut calls);
         assert_eq!(up.max, Some(83));
         assert_eq!(up.limited_by, Some(LimitedBy::Height));
-        assert_eq!(up.route, Route::Estimate);
         assert_eq!(calls, 3);
     }
 
@@ -408,17 +380,14 @@ mod tests {
     /// 遠くへ外す関数へ差し替え、上下どちらへ外れても二分探索で正しい値に着く。
     #[test]
     fn a_wrong_estimate_falls_back_to_the_binary_search() {
-        fn too_high(_: [f64; 4], _: f64, _: [f64; 4], _: f64, _: [f64; 4]) -> Option<f64> {
-            Some(5000.0)
-        }
-        fn too_low(_: [f64; 4], _: f64, _: [f64; 4], _: f64, _: [f64; 4]) -> Option<f64> {
-            Some(2.0)
-        }
-        for estimator in [too_high as Estimator, too_low] {
+        let too_high = (|_, _, _, _, _| Some(5000.0)) as Estimator;
+        let too_low = (|_, _, _, _, _| Some(2.0)) as Estimator;
+        for estimator in [too_high, too_low] {
             let mut calls = 0;
             let up = run(linear(2.5, 1.2, 0.0), 40.0, 1.0, estimator, &mut calls);
             assert_eq!(up.max, Some(83));
-            assert_eq!(up.route, Route::Searched);
+            // 見積もりの 3 回と、歩く `STEPS` 回では足りず二分探索に落ちた
+            assert!(calls > 3 + STEPS, "{calls} 回");
             assert_eq!(up.limited_by, Some(LimitedBy::Height));
         }
     }
@@ -436,7 +405,7 @@ mod tests {
             &mut calls,
         );
         assert_eq!(up.max, Some(70));
-        assert_ne!(up.route, Route::Estimate);
+        assert!(calls > 3, "見積もりだけでは決まらない: {calls} 回");
     }
 
     /// 字が 1 つも組めず `placed` が潰れた層は、上限が無い。
@@ -483,9 +452,7 @@ mod tests {
     /// **NaN の見積もりは `max: 0` にならない。** spec の `size` から探す。
     #[test]
     fn a_nan_estimate_is_not_taken_as_zero() {
-        fn nan(_: [f64; 4], _: f64, _: [f64; 4], _: f64, _: [f64; 4]) -> Option<f64> {
-            Some(f64::NAN)
-        }
+        let nan = (|_, _, _, _, _| Some(f64::NAN)) as Estimator;
         let mut calls = 0;
         let up = run(linear(2.5, 1.2, 0.0), 40.0, 1.0, nan, &mut calls);
         assert_eq!(up.max, Some(83));
@@ -495,11 +462,9 @@ mod tests {
     /// 真の上限を倍々の最後の区間（40960〜65536）に置き、二分探索を最も長くする。
     #[test]
     fn the_worst_case_stays_within_the_published_count() {
-        fn lowest(_: [f64; 4], _: f64, _: [f64; 4], _: f64, _: [f64; 4]) -> Option<f64> {
-            Some(1.0)
-        }
+        let lowest = (|_, _, _, _, _| Some(1.0)) as Estimator;
         let mut calls = 0;
-        // 高さ 0.002 × s ≤ 100 + 1/64 → 50007.8。spec の size は整数でない（覚えない）
+        // 高さ 0.002 × s ≤ 100 + 1/64 → 50007.8。spec の size は整数でない（整数の確かめと一致しない）
         let up = run(linear(0.0, 0.002, 0.0), 40.5, 1.0, lowest, &mut calls);
         assert_eq!(up.max, Some(50_007));
         assert!(calls <= WORST_LAYOUTS, "{calls} 回");

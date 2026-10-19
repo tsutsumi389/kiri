@@ -162,6 +162,29 @@ async function loadOrReport($: EngineInterface, path: string): Promise<string> {
   }
 }
 
+/** クリップボードに画像そのものを入れる osascript の引数。PNG は透過を残すため PNGf で、それ以外は JPEG で渡す */
+export function copyImageArgv(path: string, png?: string): string[] {
+  const as = png === undefined && /\.jpe?g$/i.test(path) ? 'JPEG picture' : '«class PNGf»'
+  return [
+    'osascript',
+    '-e', 'on run argv',
+    '-e', `set the clipboard to (read (POSIX file (item 1 of argv)) as ${as})`,
+    '-e', 'end run',
+    png ?? path,
+  ]
+}
+
+/** 元画像を（縮小せず）クリップボードへ。JPEG と PNG 以外は PNG に変えてから入れる */
+async function copyImage($: EngineInterface, path: string): Promise<void> {
+  if (/\.(jpe?g|png)$/i.test(path)) {
+    await run($, copyImageArgv(path))
+    return
+  }
+  const png = `${$.plugin.root}/.cache/clipboard.png`
+  await run($, ['sips', '-s', 'format', 'png', path, '--out', png])
+  await run($, copyImageArgv(path, png))
+}
+
 export function svgFor(img: ReviewImage, list: readonly ReviewComment[], selected: string): string {
   const W = img.previewWidth
   const H = img.previewHeight
@@ -302,6 +325,18 @@ export const register: Register = on => {
       $.ui.toast(`kiri-review: ${current.length} 件を Claude に送りました`)
     }
 
+    // 仕上がった画像を別のアプリへ貼り付けるとき用
+    const copy = async () => {
+      const now = await read($, image)
+      if (now === null) return
+      try {
+        await copyImage($, now.path)
+        $.ui.toast(`kiri-review: ${now.path.split('/').at(-1) ?? ''} をクリップボードにコピーしました`)
+      } catch (err) {
+        $.ui.toast(`kiri-review: コピーできませんでした: ${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+
     const svg = svgFor(img, list, selected)
     const picture =
       svg.length >= 131072
@@ -342,6 +377,7 @@ export const register: Register = on => {
           )}
         <Box flexDirection="row" gap={1}>
           <Button key="send" variant="primary" label={`Claude に送る（${list.length}）`} onPress={() => void send()} />
+          <Button key="copy" label="画像をコピー" onPress={() => void copy()} />
           <Button key="reload" label="読み直す" onPress={() => void loadOrReport($, img.path)} />
           <Button key="clear" label="全部消す" onPress={() => void update($, comments, () => [])} />
         </Box>

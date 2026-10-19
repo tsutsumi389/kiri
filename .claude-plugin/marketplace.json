@@ -9,6 +9,11 @@
       "name": "kiri",
       "source": "./plugins/kiri",
       "description": "EC 商品画像の切り抜き・規格対応を kiri CLI で行うための Skill"
+    },
+    {
+      "name": "kiri-review",
+      "source": "./plugins/kiri-review",
+      "description": "kiri が書き出した画像をペインに格子つきで出し、場所ごとの修正コメントを Claude に送る mod"
     }
   ]
 }

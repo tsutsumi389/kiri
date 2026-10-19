@@ -1,0 +1,12 @@
+{
+  "name": "kiri-review",
+  "version": "0.1.0",
+  "description": "kiri が書き出した画像をペインに格子つきで出し、場所ごとの修正コメントを Claude に送る",
+  "author": {
+    "name": "tsutsumi389"
+  },
+  "homepage": "https://github.com/tsutsumi389/kiri",
+  "repository": "https://github.com/tsutsumi389/kiri",
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}

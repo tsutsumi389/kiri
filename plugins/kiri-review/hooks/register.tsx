@@ -141,9 +141,19 @@ async function load($: EngineInterface, path: string): Promise<ReviewImage> {
   return img
 }
 
+// load() は .cache の同じファイルに書くので、重なると縮小画像と寸法が別の画像のものと混ざる。
+// 1 本ずつ流し、あとから頼んだ画像が最後に state に残るようにする
+let queue: Promise<unknown> = Promise.resolve()
+
+function loadSerial($: EngineInterface, path: string): Promise<ReviewImage> {
+  const loaded = queue.then(() => load($, path))
+  queue = loaded.catch(() => undefined)
+  return loaded
+}
+
 async function loadOrReport($: EngineInterface, path: string): Promise<string> {
   try {
-    const img = await load($, path)
+    const img = await loadSerial($, path)
     return `${img.path}（${img.width}×${img.height}）をペインに出しました。`
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)

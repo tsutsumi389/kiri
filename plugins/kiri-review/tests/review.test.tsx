@@ -49,7 +49,7 @@ test('画像を開き、コメントして Claude に送る', async ($, on) => {
   expect(await ui.find({ type: 'Text', text: /\[B2\] 髪の輪郭/ })).toBeDefined()
   await ui.press({ key: 'send' })
   expect(sent.length).toBe(1)
-  expect(sent[0]).toContain('/w/out.png（表示の向きで 800×600 px）')
+  expect(sent[0]).toContain('画像 /w/out.png（表示の向きで 800×600 px、格子 8×6')
   expect(sent[0]).toContain('1. [B2] x 100–200, y 100–200 px: 髪の輪郭がギザギザ')
   expect(sent[0]).toContain('2. [A1] x 0–100, y 0–100 px: 影が濃い')
   expect(await ui.find({ type: 'Text', text: /コメントはまだありません/ })).toBeDefined()
@@ -70,7 +70,7 @@ test('回して表示する画像は向きを合わせる', async ($, on) => {
 
 test('いちばん重い画像でも SVG の上限に収まる', async () => {
   const img = { path: '/w/a.png', width: 3024, height: 4032, preview: 'A'.repeat(MAX_B64),
-    previewWidth: 480, previewHeight: 640, cols: 8, rows: 12, mtimeMs: 0 }
-  const list = Array.from({ length: 30 }, (_, i) => ({ id: i, cells: 'H12', x0: 2600, y0: 3700, x1: 3024, y1: 4032, text: 'x' }))
+    previewWidth: 480, previewHeight: 640, thumb: '', thumbWidth: 120, thumbHeight: 160, cols: 8, rows: 12, mtimeMs: 0 }
+  const list = Array.from({ length: 30 }, (_, i) => ({ id: i, path: '/w/a.png', cells: 'H12', x0: 2600, y0: 3700, x1: 3024, y1: 4032, text: 'x' }))
   expect(svgFor(img, list, 'H12').length).toBeLessThan(131072)
 })

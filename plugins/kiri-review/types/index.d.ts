@@ -8,6 +8,10 @@ export type ReviewImage = {
   preview: string
   previewWidth: number
   previewHeight: number
+  /** 一覧に並べる小さな JPEG（base64）とその寸法 */
+  thumb: string
+  thumbWidth: number
+  thumbHeight: number
   /** 格子の列数・行数 */
   cols: number
   rows: number
@@ -16,6 +20,8 @@ export type ReviewImage = {
 
 export type ReviewComment = {
   id: number
+  /** どの画像へのコメントか（ReviewImage.path） */
+  path: string
   /** 'C3' や 'B2:D4' */
   cells: string
   /** 元画像の画素での範囲 */
@@ -29,10 +35,15 @@ export type ReviewComment = {
 declare module 'claude-code' {
   interface PluginState {
     'kiri-review': {
-      image: ReviewImage | null
+      /** ペインに並べている画像。順序は一覧の順 */
+      images: ReviewImage[]
+      /** 大きく出している画像のパス */
+      current: string
       comments: ReviewComment[]
       cell: string
       error: string
+      /** これまでに付けたコメントの番号の最大。番号を使い回さないため */
+      lastId: number
     }
   }
 }

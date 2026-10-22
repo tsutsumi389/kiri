@@ -1,12 +1,13 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { ReviewComment, ReviewImage } from '../types'
+import type { ReviewComment, ReviewImage, ReviewSelection } from '../types'
 
 const PANE = 'kiri-review'
+// 画像に重ねるドラッグ用の Client の key
+const DRAG = 'drag'
 const TOOL = 'mcp__kiri-review__open'
-const COLS = 8
-// Svg の source は 131072 文字まで。枠と格子の分を残す
+// Svg の source は 131072 文字まで。枠とコメントの印の分を残す
 export const MAX_B64 = 95000
 // 一覧の Svg に入れるサムネイルの base64 の合計。枠と番号の分を残す
 export const MAX_STRIP_B64 = 120000
@@ -17,7 +18,7 @@ const THUMB = 160
 const images = atom({ plugin: 'kiri-review', key: 'images' } as const, [])
 const current = atom({ plugin: 'kiri-review', key: 'current' } as const, '')
 const comments = atom({ plugin: 'kiri-review', key: 'comments' } as const, [])
-const cell = atom({ plugin: 'kiri-review', key: 'cell' } as const, 'A1')
+const selection = atom({ plugin: 'kiri-review', key: 'selection' } as const, null as ReviewSelection | null)
 const error = atom({ plugin: 'kiri-review', key: 'error' } as const, '')
 // コメントの番号は使い回さない。送っている間に消して足したコメントを、送った分と取り違えないため
 const lastId = atom({ plugin: 'kiri-review', key: 'lastId' } as const, 0)
@@ -126,49 +127,54 @@ export function splitArgs(args: string): string[] {
   return [...args.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map(m => m[1] ?? m[2] ?? m[3] ?? '').filter(s => s !== '')
 }
 
-export function colName(i: number): string {
-  return String.fromCharCode(65 + i)
-}
-
 export function baseName(path: string): string {
   return path.split('/').at(-1) ?? path
 }
 
-/** 'C3' → { c: 2, r: 2 } */
-export function parseCell(s: string): { c: number; r: number } | undefined {
-  const m = s.trim().toUpperCase().match(/^([A-Z])(\d{1,2})$/)
-  if (m === null) return undefined
-  return { c: (m[1] ?? 'A').charCodeAt(0) - 65, r: Number(m[2]) - 1 }
-}
+/** 細すぎる範囲（クリックだけ、1 列や 1 行のドラッグ）は、その辺を画像の短辺の 1/10 まで広げる */
+const MIN_SIDE = 0.1
 
-/** 'B2' か 'B2:D4' を元画像の画素範囲へ。格子の外なら undefined */
-export function cellsToRect(
-  cells: string,
-  img: Pick<ReviewImage, 'width' | 'height' | 'cols' | 'rows'>,
+/**
+ * ドラッグの範囲（画像に対する 0–1）を元画像の画素へ。数でないものは undefined。
+ * Client から届いた値なので、範囲の外は画像の中へ収める
+ */
+export function fractionToRect(
+  f: { x0: unknown; y0: unknown; x1: unknown; y1: unknown },
+  img: Pick<ReviewImage, 'width' | 'height'>,
 ): { x0: number; y0: number; x1: number; y1: number } | undefined {
-  const [a, b = a] = cells.split(':').map(parseCell)
-  if (a === undefined || b === undefined) return undefined
-  const c0 = Math.min(a.c, b.c)
-  const c1 = Math.max(a.c, b.c)
-  const r0 = Math.min(a.r, b.r)
-  const r1 = Math.max(a.r, b.r)
-  if (c0 < 0 || r0 < 0 || c1 >= img.cols || r1 >= img.rows) return undefined
+  const v = [f.x0, f.y0, f.x1, f.y1]
+  if (!v.every((n): n is number => typeof n === 'number' && Number.isFinite(n))) return undefined
+  const [a, b, c, d] = v.map(n => Math.min(1, Math.max(0, n))) as [number, number, number, number]
+  const side = MIN_SIDE * Math.min(img.width, img.height)
+  // 1 辺ずつ、足りなければ中心を保って広げ、画像の中に収める
+  const widen = (lo: number, hi: number, size: number): [number, number] => {
+    if (hi - lo >= side / 4) return [lo, hi]
+    const s = Math.min(side, size)
+    const start = Math.max(0, Math.min(size - s, (lo + hi) / 2 - s / 2))
+    return [start, start + s]
+  }
+  const [x0, x1] = widen(Math.min(a, c) * img.width, Math.max(a, c) * img.width, img.width)
+  const [y0, y1] = widen(Math.min(b, d) * img.height, Math.max(b, d) * img.height, img.height)
+  // 15.5 / 30 * 600 が 310.00000000000006 になる類いを、丸めの前に落とす
+  const tidy = (v: number) => Math.round(v * 1e6) / 1e6
   return {
-    x0: Math.floor((c0 * img.width) / img.cols),
-    y0: Math.floor((r0 * img.height) / img.rows),
-    x1: Math.floor(((c1 + 1) * img.width) / img.cols),
-    y1: Math.floor(((r1 + 1) * img.height) / img.rows),
+    x0: Math.floor(tidy(x0)),
+    y0: Math.floor(tidy(y0)),
+    x1: Math.min(img.width, Math.ceil(tidy(x1))),
+    y1: Math.min(img.height, Math.ceil(tidy(y1))),
   }
 }
 
-/** 先頭が 'B2 ' や 'B2:D4 ' ならそのセル指定を取り出す */
-export function splitCellPrefix(text: string): { cells?: string; text: string } {
-  const m = text.match(/^\s*([A-Za-z]\d{1,2}(?::[A-Za-z]\d{1,2})?)\s+([\s\S]+)$/)
-  return m === null ? { text: text.trim() } : { cells: (m[1] ?? '').toUpperCase(), text: (m[2] ?? '').trim() }
+export function isWhole(c: { x0: number; y0: number; x1: number; y1: number }, img: Pick<ReviewImage, 'width' | 'height'>): boolean {
+  return c.x0 <= 0 && c.y0 <= 0 && c.x1 >= img.width && c.y1 >= img.height
 }
 
-export function gridRows(width: number, height: number): number {
-  return Math.min(12, Math.max(2, Math.round((COLS * height) / width)))
+const pct = (v: number, of: number) => Math.round((100 * v) / of)
+
+/** 'x 100–200, y 50–80 px（横 13–25%、縦 8–13%）'。画像全体なら '画像全体' */
+export function describeRect(c: { x0: number; y0: number; x1: number; y1: number }, img: Pick<ReviewImage, 'width' | 'height'>): string {
+  if (isWhole(c, img)) return '画像全体'
+  return `x ${c.x0}–${c.x1}, y ${c.y0}–${c.y1} px（横 ${pct(c.x0, img.width)}–${pct(c.x1, img.width)}%、縦 ${pct(c.y0, img.height)}–${pct(c.y1, img.height)}%）`
 }
 
 /** コメントを画像ごとにまとめ、一覧の順で並べる */
@@ -177,14 +183,14 @@ export function promptFor(list: readonly ReviewImage[], all: readonly ReviewComm
     .map(img => ({ img, items: all.filter(c => c.path === img.path) }))
     .filter(g => g.items.length > 0)
   const body = groups.flatMap(({ img, items }, gi) => [
-    `${groups.length > 1 ? `## ${gi + 1}. ` : ''}画像 ${img.path}（表示の向きで ${img.width}×${img.height} px、格子 ${img.cols}×${img.rows}: 列 A–${colName(img.cols - 1)}、行 1–${img.rows}）`,
-    ...items.map((c, i) => `${i + 1}. [${c.cells}] x ${c.x0}–${c.x1}, y ${c.y0}–${c.y1} px: ${c.text}`),
+    `${groups.length > 1 ? `## ${gi + 1}. ` : ''}画像 ${img.path}（表示の向きで ${img.width}×${img.height} px）`,
+    ...items.map((c, i) => `${i + 1}. ${describeRect(c, img)}: ${c.text}`),
     '',
   ])
   return [
     groups.length > 1
-      ? `${groups.length} 枚の画像に修正コメントが付きました。位置は格子（左上が A1）と元画像の画素範囲です。`
-      : '画像に修正コメントが付きました。位置は格子（左上が A1）と元画像の画素範囲です。',
+      ? `${groups.length} 枚の画像に修正コメントが付きました。位置は元画像の画素範囲（左上が原点）です。`
+      : '画像に修正コメントが付きました。位置は元画像の画素範囲（左上が原点）です。',
     '',
     ...body,
     '画像の該当範囲を見て、各コメントに対応してください。kiri の出力なら、原因を kiri の設定か実装から探して出し直してください。',
@@ -244,8 +250,6 @@ async function load($: EngineInterface, path: string): Promise<ReviewImage> {
     thumb,
     thumbWidth: Math.max(1, Math.round(p.w * ts)),
     thumbHeight: Math.max(1, Math.round(p.h * ts)),
-    cols: COLS,
-    rows: gridRows(w, h),
     mtimeMs: st.mtimeMs ?? 0,
   }
 }
@@ -323,7 +327,11 @@ async function addImages($: EngineInterface, paths: readonly string[], replace: 
   await update($, comments, l => l.filter(c => next.some(x => x.path === c.path)))
   await update($, current, () => first?.path ?? '')
   await update($, error, () => failed.join('\n'))
-  if (first !== undefined && first.path !== shown) await update($, cell, c => (cellsToRect(c, first) === undefined ? 'A1' : c))
+  // 一覧から外れた画像や、寸法の変わった画像の選択は、別の場所を指すので外す
+  await update($, selection, sel => {
+    const now = sel === null ? undefined : next.find(x => x.path === sel.path)
+    return now === undefined || sel === null || now.width !== sel.width || now.height !== sel.height ? null : sel
+  })
   return { loaded: loaded.filter(x => next.some(y => y.path === x.path)), failed, kept }
 }
 
@@ -379,39 +387,28 @@ async function copyImage($: EngineInterface, path: string): Promise<void> {
   await run($, copyImageArgv(path, png))
 }
 
-export function svgFor(img: ReviewImage, list: readonly ReviewComment[], selected: string): string {
+export function svgFor(img: ReviewImage, list: readonly ReviewComment[], sel: ReviewSelection | null): string {
   const W = img.previewWidth
   const H = img.previewHeight
   const sx = W / img.width
   const sy = H / img.height
-  const cw = W / img.cols
-  const ch = H / img.rows
   const parts: string[] = [
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">`,
     `<image href="data:image/jpeg;base64,${img.preview}" x="0" y="0" width="${W}" height="${H}"/>`,
   ]
-  const grid: string[] = []
-  for (let c = 1; c < img.cols; c++) grid.push(`M${(c * cw).toFixed(1)} 0V${H}`)
-  for (let r = 1; r < img.rows; r++) grid.push(`M0 ${(r * ch).toFixed(1)}H${W}`)
-  parts.push(`<path d="${grid.join('')}" stroke="#fff" stroke-opacity=".55" stroke-dasharray="3 3"/>`)
-  parts.push('<g font-size="10" font-family="sans-serif" fill="#fff" stroke="#000" stroke-width="2" paint-order="stroke">')
-  for (let r = 0; r < img.rows; r++) {
-    for (let c = 0; c < img.cols; c++) {
-      parts.push(`<text x="${(c * cw + 3).toFixed(0)}" y="${(r * ch + 11).toFixed(0)}">${colName(c)}${r + 1}</text>`)
-    }
-  }
-  parts.push('</g>')
-  const sel = cellsToRect(selected, img)
-  if (sel !== undefined) {
-    parts.push(`<rect x="${sel.x0 * sx}" y="${sel.y0 * sy}" width="${(sel.x1 - sel.x0) * sx}" height="${(sel.y1 - sel.y0) * sy}" fill="#3b82f6" fill-opacity=".25" stroke="#3b82f6" stroke-width="2"/>`)
-  }
   list.forEach((m, i) => {
     const x = m.x0 * sx
     const y = m.y0 * sy
-    parts.push(`<rect x="${x}" y="${y}" width="${(m.x1 - m.x0) * sx}" height="${(m.y1 - m.y0) * sy}" fill="none" stroke="#ef4444" stroke-width="2"/>`)
+    // 画像全体へのコメントは枠を描かず、左上の番号だけ
+    if (!isWhole(m, img)) {
+      parts.push(`<rect x="${x}" y="${y}" width="${(m.x1 - m.x0) * sx}" height="${(m.y1 - m.y0) * sy}" fill="none" stroke="#ef4444" stroke-width="2"/>`)
+    }
     parts.push(`<circle cx="${x + 10}" cy="${y + 10}" r="9" fill="#ef4444"/>`)
     parts.push(`<text x="${x + 10}" y="${y + 14}" font-size="11" font-family="sans-serif" font-weight="bold" fill="#fff" text-anchor="middle">${i + 1}</text>`)
   })
+  if (sel !== null && sel.path === img.path) {
+    parts.push(`<rect x="${sel.x0 * sx}" y="${sel.y0 * sy}" width="${(sel.x1 - sel.x0) * sx}" height="${(sel.y1 - sel.y0) * sy}" fill="#3b82f6" fill-opacity=".25" stroke="#3b82f6" stroke-width="2"/>`)
+  }
   parts.push('</svg>')
   return parts.join('')
 }
@@ -469,7 +466,7 @@ export const register: Register = on => {
     await $.tool.register({
       name: 'open',
       description:
-        'kiri が書き出した画像を kiri-review ペインに格子つきで表示する。複数の画像（--derive や batch の出力、ディレクトリ）をまとめて渡せ、人はペインで切り替えながら画像ごと・場所ごとに修正コメントを付け、まとめて送ってくる。画像を人に見てもらいたいときに呼ぶ。',
+        'kiri が書き出した画像を kiri-review ペインに表示する。複数の画像（--derive や batch の出力、ディレクトリ）をまとめて渡せ、人はペインで切り替えながら画像ごとに、ドラッグで選んだ場所ごとの修正コメントを付け、まとめて送ってくる。画像を人に見てもらいたいときに呼ぶ。',
       inputSchema: {
         type: 'object',
         properties: {
@@ -522,6 +519,22 @@ export const register: Register = on => {
     return ran
   })
 
+  // 画像の上でドラッグした範囲。Client から届いた値なので確かめてから使う
+  on('ui.message', async ($, e, next) => {
+    if (e.requestId !== PANE || e.element !== DRAG) return next(e)
+    const d = e.data as { path?: unknown; x0?: unknown; y0?: unknown; x1?: unknown; y1?: unknown } | null
+    if (d === null || typeof d !== 'object' || typeof d.path !== 'string') return {}
+    // 切り替えたあとに届いた、前の画像の選択は捨てる
+    const list = await read($, images)
+    const shown = await read($, current)
+    const img = list.find(x => x.path === shown) ?? list[0]
+    if (img === undefined || img.path !== d.path) return {}
+    const rect = fractionToRect({ x0: d.x0, y0: d.y0, x1: d.x1, y1: d.y1 }, img)
+    if (rect === undefined) return {}
+    await update($, selection, () => ({ path: img.path, width: img.width, height: img.height, ...rect }))
+    return {}
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const ui = $.ui.resolve(e)
     const { Box, Text, Button, Markdown } = ui
@@ -529,7 +542,7 @@ export const register: Register = on => {
     const shownPath = await read($, current)
     // 複数画像にする前のコメントは path を持たない。どの画像のものか分からないので数えない
     const all = (await read($, comments)).filter(c => typeof c.path === 'string')
-    const selected = await read($, cell)
+    const sel = await read($, selection)
     const err = await read($, error)
     // current が一覧に無いときは先頭を出す。ハンドラも描いた画像（img.path）を使う
     const index = Math.max(0, list.findIndex(x => x.path === shownPath))
@@ -554,7 +567,6 @@ export const register: Register = on => {
         const to = (await read($, images)).find(x => x.path === path)
         if (to === undefined) return
         await update($, current, () => to.path)
-        await update($, cell, c => (cellsToRect(c, to) === undefined ? 'A1' : c))
       })()
     const step = (d: number) => {
       const to = list[(index + d + list.length) % list.length]
@@ -567,38 +579,32 @@ export const register: Register = on => {
       const after = before.filter(x => x.path !== now)
       await update($, images, () => after)
       await update($, comments, l => l.filter(c => c.path !== now))
+      await update($, selection, s => (s !== null && s.path === now ? null : s))
       await update($, current, () => after[Math.min(at, after.length - 1)]?.path ?? '')
     }
 
-    // Select は 64 個まで。マスは列と行に分けて選ぶ
-    const at = parseCell(selected) ?? { c: 0, r: 0 }
-    const colOptions = Array.from({ length: img.cols }, (_, c) => ({ value: colName(c), label: colName(c) }))
-    const rowOptions = Array.from({ length: img.rows }, (_, r) => ({ value: String(r + 1), label: String(r + 1) }))
     const imageOptions = list.map((x, i) => {
       const n = counts.get(x.path) ?? 0
       return { value: x.path, label: `${i + 1}. ${baseName(x.path)}${n > 0 ? `（${n}）` : ''}` }
     })
-    const pick = (part: 'c' | 'r', v: string) =>
-      void update($, cell, now => {
-        const p = parseCell(now) ?? { c: 0, r: 0 }
-        return part === 'c' ? `${v}${p.r + 1}` : `${colName(p.c)}${v}`
-      })
+    const mySel = sel !== null && sel.path === img.path ? sel : null
 
     const addComment = async (raw: string) => {
       const now = (await read($, images)).find(x => x.path === img.path)
       if (now === undefined) return
-      const { cells = await read($, cell), text } = splitCellPrefix(raw)
+      const text = raw.trim()
       if (text === '') return
-      const rect = cellsToRect(cells, now)
-      if (rect === undefined) {
-        await update($, error, () => `格子の外です: ${cells}`)
-        return
-      }
+      // 選んでいなければ画像全体へのコメント
+      const picked = await read($, selection)
+      const isMine = picked !== null && picked.path === now.path && picked.width === now.width && picked.height === now.height
+      const { x0, y0, x1, y1 } = isMine ? picked : { x0: 0, y0: 0, x1: now.width, y1: now.height }
       await update($, error, () => '')
       const before = await read($, comments)
       const id = Math.max(await read($, lastId), ...before.map(x => x.id)) + 1
       await update($, lastId, () => id)
-      await update($, comments, l => [...l, { id, path: now.path, cells, ...rect, text }])
+      await update($, comments, l => [...l, { id, path: now.path, x0, y0, x1, y1, text }])
+      // 次のコメントは選び直す
+      await update($, selection, s => (s !== null && s.path === now.path ? null : s))
     }
 
     const send = async () => {
@@ -622,12 +628,23 @@ export const register: Register = on => {
       }
     }
 
-    const svg = svgFor(img, mine, selected)
+    const svg = svgFor(img, mine, sel)
+    // 画像の上に透明な Client を重ね、ドラッグした範囲を受け取る（ui.message）。
+    // 外側の Box は画像の大きさに縮め、Client の領域と画像を揃える
     const picture =
       svg.length >= 131072
         ? <Text color="red">画像が大きすぎて描けません（{svg.length} 文字）。コメントを減らすか「読み直す」を押してください。</Text>
         : 'Svg' in ui
-          ? <ui.Svg key="picture" source={svg} alt={`${img.path} に格子とコメント位置を重ねたもの`} />
+          ? (
+            <Box position="relative" alignSelf="flex-start" flexDirection="column">
+              <ui.Svg key="picture" source={svg} alt={`${img.path} にコメント位置を重ねたもの`} />
+              {'Client' in ui && (
+                <Box position="absolute" top={0} left={0} right={0} bottom={0}>
+                  <ui.Client key={DRAG} module="./drag.tsx" props={{ path: img.path, aspect: img.previewHeight / img.previewWidth }} width="100%" />
+                </Box>
+              )}
+            </Box>
+          )
           : <Text dimColor>この画面では画像を描けません（デスクトップアプリで開いてください）</Text>
 
     const strip = list.length > 1 ? stripFor(list, img.path, counts) : undefined
@@ -649,17 +666,20 @@ export const register: Register = on => {
             <Button key="next" label="→" onPress={() => step(1)} />
           </Box>
         )}
-        <Text dimColor>{list.length > 1 ? `${index + 1}/${list.length} · ` : ''}{img.path} · {img.width}×{img.height} · 格子 {img.cols}×{img.rows}</Text>
+        <Text dimColor>{list.length > 1 ? `${index + 1}/${list.length} · ` : ''}{img.path} · {img.width}×{img.height}</Text>
         {picture}
         <Box flexDirection="column">
-          {'Select' in ui && (
-            <Box flexDirection="row" gap={2}>
-              <ui.Select key="col" label="列" options={colOptions} value={colName(at.c)} onSelect={v => pick('c', v)} />
-              <ui.Select key="row" label="行" options={rowOptions} value={String(at.r + 1)} onSelect={v => pick('r', v)} />
-            </Box>
-          )}
+          <Box flexDirection="row" gap={1}>
+            <Text dimColor={mySel === null}>
+              {mySel === null ? '範囲: 画像全体（画像の上をドラッグすると範囲を選べます）' : `範囲: ${describeRect(mySel, img)}`}
+            </Text>
+            {mySel !== null && (
+              <Button key="unselect" plain label="選択を外す"
+                onPress={() => void update($, selection, s => (s !== null && s.path === img.path ? null : s))} />
+            )}
+          </Box>
           {'Input' in ui && (
-            <ui.Input key="comment" label="コメント" placeholder="例: 髪の輪郭がギザギザ（先頭に B2:D4 で範囲指定も可）"
+            <ui.Input key="comment" label="コメント" placeholder="例: 髪の輪郭がギザギザ"
               submitLabel="追加" value="" onSubmit={v => void addComment(v)} />
           )}
           {err !== '' && <Text color="red">{err}</Text>}
@@ -672,7 +692,7 @@ export const register: Register = on => {
                 <Box key={`c${c.id}`} flexDirection="row" gap={1}>
                   <Button key={`del${c.id}`} plain label="×"
                     onPress={() => void update($, comments, l => l.filter(x => x.id !== c.id))} />
-                  <Text>{i + 1}. [{c.cells}] {c.text}</Text>
+                  <Text>{i + 1}. [{describeRect(c, img)}] {c.text}</Text>
                 </Box>
               ))}
             </Box>
@@ -686,8 +706,8 @@ export const register: Register = on => {
           {list.length > 1 && <Button key="remove" label="一覧から外す" onPress={() => void remove()} />}
         </Box>
         <Markdown text={list.length > 1
-          ? '画像を ← → か「画像」で切り替え、場所を選んでコメントを Enter で追加 → 全部の画像の分をまとめて **Claude に送る**。'
-          : '場所を選んでコメントを Enter で追加 → まとめて **Claude に送る**。'} />
+          ? '画像を ← → か「画像」で切り替え、直したい場所を画像の上でドラッグして選び、コメントを Enter で追加 → 全部の画像の分をまとめて **Claude に送る**。'
+          : '直したい場所を画像の上でドラッグして選び、コメントを Enter で追加 → まとめて **Claude に送る**。'} />
       </Box>
     )
   })

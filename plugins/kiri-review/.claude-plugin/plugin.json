@@ -1,7 +1,7 @@
 {
   "name": "kiri-review",
   "version": "0.1.0",
-  "description": "kiri が書き出した画像をペインに格子つきで出し、場所ごとの修正コメントを Claude に送る",
+  "description": "kiri が書き出した画像をペインに出し、ドラッグで選んだ場所ごとの修正コメントを Claude に送る",
   "author": {
     "name": "tsutsumi389"
   },

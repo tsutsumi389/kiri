@@ -6,6 +6,8 @@ import type { ReviewComment, ReviewImage, ReviewSelection } from '../types'
 const PANE = 'kiri-review'
 // 画像に重ねるドラッグ用の Client の key
 const DRAG = 'drag'
+// 一覧に重ねるクリックとドラッグ用の Client の key
+const STRIP = 'strip'
 const TOOL = 'mcp__kiri-review__open'
 // Svg の source は 131072 文字まで。枠とコメントの印の分を残す
 export const MAX_B64 = 95000
@@ -14,6 +16,11 @@ export const MAX_STRIP_B64 = 120000
 // 画像の切り替えは Select で選ぶ。Select の選択肢は 64 個まで
 export const MAX_IMAGES = 64
 const THUMB = 160
+// 一覧に一度に並べるサムネイルの数と、1 枚分の幅（px）。それより多ければ横に流す
+export const STRIP_SLOTS = 6
+const SLOT = 108
+// 一覧の端の ‹ › の幅（px）。隠れた画像があれば、ここのクリックで一覧を流す
+const EDGE = 26
 
 const images = atom({ plugin: 'kiri-review', key: 'images' } as const, [])
 const current = atom({ plugin: 'kiri-review', key: 'current' } as const, '')
@@ -22,6 +29,8 @@ const selection = atom({ plugin: 'kiri-review', key: 'selection' } as const, nul
 const error = atom({ plugin: 'kiri-review', key: 'error' } as const, '')
 // コメントの番号は使い回さない。送っている間に消して足したコメントを、送った分と取り違えないため
 const lastId = atom({ plugin: 'kiri-review', key: 'lastId' } as const, 0)
+// 一覧の左端に出しているサムネイルの番号（0 から）
+const stripOffset = atom({ plugin: 'kiri-review', key: 'stripOffset' } as const, 0)
 
 const IMAGE_EXT = /\.(png|jpe?g|webp|avif|heic|tiff?|gif|bmp)$/i
 
@@ -326,6 +335,7 @@ async function addImages($: EngineInterface, paths: readonly string[], replace: 
   // 一覧から外れた画像のコメントは送れないので持ち越さない
   await update($, comments, l => l.filter(c => next.some(x => x.path === c.path)))
   await update($, current, () => first?.path ?? '')
+  await revealCurrent($)
   await update($, error, () => failed.join('\n'))
   // 一覧から外れた画像や、寸法の変わった画像の選択は、別の場所を指すので外す
   await update($, selection, sel => {
@@ -413,47 +423,72 @@ export function svgFor(img: ReviewImage, list: readonly ReviewComment[], sel: Re
   return parts.join('')
 }
 
+/** 一覧の左端の番号を、並べられる範囲に収める。index を渡せば、その画像が見える位置まで動かす */
+export function clampOffset(offset: number, total: number, index?: number): number {
+  const slots = Math.min(total, STRIP_SLOTS)
+  let o = Math.round(Number.isFinite(offset) ? offset : 0)
+  if (index !== undefined) o = Math.min(index, Math.max(o, index - slots + 1))
+  return Math.max(0, Math.min(total - slots, o))
+}
+
 /**
- * 画像の一覧を 1 枚の SVG に並べる。番号は Select の番号と同じで、大きく出している
- * 画像は青枠、コメントのある画像は件数の赤丸。Svg の上限に入りきらない分は描かない
+ * 画像の一覧を横一列の SVG に並べる。offset から STRIP_SLOTS 枚まで描き、ほかは左右へ流して見る。
+ * 番号は一覧の番号、大きく出している画像は青枠、コメントのある画像は件数の赤丸。
+ * 隠れている側の端には ‹ › を出す。Svg の上限に入りきらない分は描かない
  */
 export function stripFor(
   list: readonly ReviewImage[],
   shown: string,
   counts: ReadonlyMap<string, number>,
-): { svg: string; drawn: number } {
+  offset = 0,
+): { svg: string; drawn: number; slots: number } {
+  const slots = Math.min(list.length, STRIP_SLOTS)
+  const start = clampOffset(offset, list.length)
   // サムネイル 1 枚ごとに、枠・番号・件数の記述が 500 文字ほど付く
   let budget = MAX_STRIP_B64
   const fit: ReviewImage[] = []
-  for (const img of list) {
+  for (const img of list.slice(start, start + slots)) {
     const cost = img.thumb.length + 500
     if (cost > budget) break
     budget -= cost
     fit.push(img)
   }
-  const per = Math.min(fit.length, 6)
-  const S = THUMB + 8
-  const W = Math.max(1, per) * S
-  const H = Math.ceil(fit.length / Math.max(1, per)) * S
+  const T = SLOT - 8
+  const W = Math.max(1, slots) * SLOT
+  const H = SLOT
   const parts: string[] = [`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">`]
   fit.forEach((img, i) => {
-    const x0 = (i % per) * S
-    const y0 = Math.floor(i / per) * S
-    const x = x0 + 4 + (THUMB - img.thumbWidth) / 2
-    const y = y0 + 4 + (THUMB - img.thumbHeight) / 2
+    const x0 = i * SLOT
+    const k = Math.min(1, T / Math.max(img.thumbWidth, img.thumbHeight))
+    const w = img.thumbWidth * k
+    const h = img.thumbHeight * k
     const n = counts.get(img.path) ?? 0
-    parts.push(`<image href="data:image/jpeg;base64,${img.thumb}" x="${x}" y="${y}" width="${img.thumbWidth}" height="${img.thumbHeight}"/>`)
+    parts.push(`<image href="data:image/jpeg;base64,${img.thumb}" x="${x0 + 4 + (T - w) / 2}" y="${4 + (T - h) / 2}" width="${w}" height="${h}"/>`)
     if (img.path === shown) {
-      parts.push(`<rect x="${x0 + 1.5}" y="${y0 + 1.5}" width="${S - 3}" height="${S - 3}" fill="none" stroke="#3b82f6" stroke-width="3"/>`)
+      parts.push(`<rect x="${x0 + 1.5}" y="1.5" width="${SLOT - 3}" height="${SLOT - 3}" fill="none" stroke="#3b82f6" stroke-width="3"/>`)
     }
-    parts.push(`<text x="${x0 + 8}" y="${y0 + 20}" font-size="14" font-family="sans-serif" font-weight="bold" fill="#fff" stroke="#000" stroke-width="3" paint-order="stroke">${i + 1}</text>`)
+    parts.push(`<text x="${x0 + 8}" y="20" font-size="13" font-family="sans-serif" font-weight="bold" fill="#fff" stroke="#000" stroke-width="3" paint-order="stroke">${start + i + 1}</text>`)
     if (n > 0) {
-      parts.push(`<circle cx="${x0 + S - 16}" cy="${y0 + 16}" r="10" fill="#ef4444"/>`)
-      parts.push(`<text x="${x0 + S - 16}" y="${y0 + 20}" font-size="11" font-family="sans-serif" font-weight="bold" fill="#fff" text-anchor="middle">${n}</text>`)
+      parts.push(`<circle cx="${x0 + SLOT - 15}" cy="15" r="9" fill="#ef4444"/>`)
+      parts.push(`<text x="${x0 + SLOT - 15}" y="19" font-size="11" font-family="sans-serif" font-weight="bold" fill="#fff" text-anchor="middle">${n}</text>`)
     }
   })
+  const edge = (x: number, glyph: string) => {
+    parts.push(`<rect x="${x}" y="0" width="${EDGE}" height="${H}" fill="#000" fill-opacity=".55"/>`)
+    parts.push(`<text x="${x + EDGE / 2}" y="${H / 2 + 9}" font-size="26" font-family="sans-serif" font-weight="bold" fill="#fff" text-anchor="middle">${glyph}</text>`)
+  }
+  if (start > 0) edge(0, '‹')
+  if (start + slots < list.length) edge(W - EDGE, '›')
   parts.push('</svg>')
-  return { svg: parts.join(''), drawn: fit.length }
+  return { svg: parts.join(''), drawn: fit.length, slots }
+}
+
+/** 大きく出している画像が一覧の見える範囲に入るよう、一覧を流す */
+async function revealCurrent($: EngineInterface): Promise<void> {
+  const list = await read($, images)
+  const shown = await read($, current)
+  const index = list.findIndex(x => x.path === shown)
+  await update($, stripOffset, o => clampOffset(o, list.length, index < 0 ? undefined : index))
 }
 
 export const register: Register = on => {
@@ -520,8 +555,7 @@ export const register: Register = on => {
   })
 
   // 画像の上でドラッグした範囲。Client から届いた値なので確かめてから使う
-  on('ui.message', async ($, e, next) => {
-    if (e.requestId !== PANE || e.element !== DRAG) return next(e)
+  on('ui.message', { requestId: PANE, element: DRAG }, async ($, e) => {
     const d = e.data as { path?: unknown; x0?: unknown; y0?: unknown; x1?: unknown; y1?: unknown } | null
     if (d === null || typeof d !== 'object' || typeof d.path !== 'string') return {}
     // 切り替えたあとに届いた、前の画像の選択は捨てる
@@ -535,6 +569,34 @@ export const register: Register = on => {
     return {}
   })
 
+  // 一覧の上のクリック（その画像を出す。端の ‹ › なら流す）と横のドラッグ（流す）
+  on('ui.message', { requestId: PANE, element: STRIP }, async ($, e) => {
+    const d = e.data as { pick?: unknown; drag?: unknown } | null
+    if (d === null || typeof d !== 'object') return {}
+    const list = await read($, images)
+    const slots = Math.min(list.length, STRIP_SLOTS)
+    const offset = clampOffset(await read($, stripOffset), list.length)
+    if (typeof d.pick === 'number' && d.pick >= 0 && d.pick < 1) {
+      // 端の ‹ › のクリックは、ほぼ 1 画面分（1 枚は残す）流す
+      const px = d.pick * slots * SLOT
+      const page = Math.max(1, slots - 1)
+      if (offset > 0 && px < EDGE) {
+        await update($, stripOffset, () => clampOffset(offset - page, list.length))
+        return {}
+      }
+      if (offset + slots < list.length && px > slots * SLOT - EDGE) {
+        await update($, stripOffset, () => clampOffset(offset + page, list.length))
+        return {}
+      }
+      const to = list[offset + Math.floor(d.pick * slots)]
+      if (to !== undefined) await update($, current, () => to.path)
+    } else if (typeof d.drag === 'number' && Number.isFinite(d.drag)) {
+      // 指でめくるのと同じ向き: 左へドラッグすると右の画像が出てくる
+      await update($, stripOffset, () => clampOffset(offset - Math.round(d.drag as number * slots), list.length))
+    }
+    return {}
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const ui = $.ui.resolve(e)
     const { Box, Text, Button, Markdown } = ui
@@ -544,6 +606,7 @@ export const register: Register = on => {
     const all = (await read($, comments)).filter(c => typeof c.path === 'string')
     const sel = await read($, selection)
     const err = await read($, error)
+    const offset = await read($, stripOffset)
     // current が一覧に無いときは先頭を出す。ハンドラも描いた画像（img.path）を使う
     const index = Math.max(0, list.findIndex(x => x.path === shownPath))
     const img = list[index]
@@ -567,11 +630,8 @@ export const register: Register = on => {
         const to = (await read($, images)).find(x => x.path === path)
         if (to === undefined) return
         await update($, current, () => to.path)
+        await revealCurrent($)
       })()
-    const step = (d: number) => {
-      const to = list[(index + d + list.length) % list.length]
-      if (to !== undefined) show(to.path)
-    }
     const remove = async () => {
       const now = img.path
       const before = await read($, images)
@@ -581,6 +641,7 @@ export const register: Register = on => {
       await update($, comments, l => l.filter(c => c.path !== now))
       await update($, selection, s => (s !== null && s.path === now ? null : s))
       await update($, current, () => after[Math.min(at, after.length - 1)]?.path ?? '')
+      await revealCurrent($)
     }
 
     const imageOptions = list.map((x, i) => {
@@ -647,24 +708,26 @@ export const register: Register = on => {
           )
           : <Text dimColor>この画面では画像を描けません（デスクトップアプリで開いてください）</Text>
 
-    const strip = list.length > 1 ? stripFor(list, img.path, counts) : undefined
+    const strip = list.length > 1 ? stripFor(list, img.path, counts, offset) : undefined
 
     return (
       <Box flexDirection="column" gap={1}>
         {strip !== undefined && strip.drawn > 0 && strip.svg.length < 131072 && 'Svg' in ui && (
           <Box flexDirection="column">
-            <ui.Svg key="strip" source={strip.svg} alt={`画像 ${list.length} 枚の一覧。${index + 1} 番を表示中`} />
-            {strip.drawn < list.length && <Text dimColor>ほか {list.length - strip.drawn} 枚は一覧に入りきりません。「画像」で選んでください。</Text>}
+            {/* 一覧の上に透明な Client を重ね、クリックで選び、端の ‹ › か横のドラッグで流す */}
+            <Box position="relative" alignSelf="flex-start" flexDirection="column">
+              <ui.Svg key="strip" source={strip.svg} alt={`画像 ${list.length} 枚の一覧。${index + 1} 番を表示中`} />
+              {'Client' in ui && (
+                <Box position="absolute" top={0} left={0} right={0} bottom={0}>
+                  <ui.Client key={STRIP} module="./strip.tsx" props={{ aspect: 1 / strip.slots }} width="100%" />
+                </Box>
+              )}
+            </Box>
+            {strip.drawn < strip.slots && <Text dimColor>一覧に入りきらない画像があります。「画像」で選んでください。</Text>}
           </Box>
         )}
-        {list.length > 1 && (
-          <Box flexDirection="row" gap={1}>
-            <Button key="prev" label="←" onPress={() => step(-1)} />
-            {'Select' in ui && (
-              <ui.Select key="img" label="画像" options={imageOptions} value={img.path} onSelect={v => show(v)} />
-            )}
-            <Button key="next" label="→" onPress={() => step(1)} />
-          </Box>
+        {list.length > 1 && 'Select' in ui && (
+          <ui.Select key="img" label="画像" options={imageOptions} value={img.path} onSelect={v => show(v)} />
         )}
         <Text dimColor>{list.length > 1 ? `${index + 1}/${list.length} · ` : ''}{img.path} · {img.width}×{img.height}</Text>
         {picture}
@@ -706,7 +769,7 @@ export const register: Register = on => {
           {list.length > 1 && <Button key="remove" label="一覧から外す" onPress={() => void remove()} />}
         </Box>
         <Markdown text={list.length > 1
-          ? '画像を ← → か「画像」で切り替え、直したい場所を画像の上でドラッグして選び、コメントを Enter で追加 → 全部の画像の分をまとめて **Claude に送る**。'
+          ? '上の一覧をクリックして画像を切り替え（端の ‹ › で一覧を流す）、直したい場所を画像の上でドラッグして選び、コメントを Enter で追加 → 全部の画像の分をまとめて **Claude に送る**。'
           : '直したい場所を画像の上でドラッグして選び、コメントを Enter で追加 → まとめて **Claude に送る**。'} />
       </Box>
     )

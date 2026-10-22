@@ -52,6 +52,8 @@ declare module 'claude-code' {
       error: string
       /** これまでに付けたコメントの番号の最大。番号を使い回さないため */
       lastId: number
+      /** 一覧の左端に出しているサムネイルの番号（0 から）。多い画像は横に流して見る */
+      stripOffset: number
     }
   }
 }

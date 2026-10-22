@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { MAX_IMAGES, MAX_STRIP_B64, mergeImages, outputPaths, promptFor, reportPaths, splitArgs, stripFor } from '../hooks/register'
+import { MAX_IMAGES, MAX_STRIP_B64, STRIP_SLOTS, clampOffset, mergeImages, outputPaths, promptFor, reportPaths, splitArgs, stripFor } from '../hooks/register'
 
 const PANE = { component: 'Pane', requestId: 'kiri-review' } as const
 const PROPS = { title: 'kiri review', isFocused: false, bodyColumns: 80 }
@@ -47,8 +47,25 @@ describe('一覧と送る文面', () => {
     const list = Array.from({ length: MAX_IMAGES }, (_, i) => img(`/w/${i}.png`, 'A'.repeat(4000)))
     const counts = new Map(list.map(x => [x.path, 12]))
     const { svg, drawn } = stripFor(list, '/w/0.png', counts)
-    expect(drawn).toBeGreaterThan(20)
+    expect(drawn).toBe(STRIP_SLOTS)
     expect(svg.length).toBeLessThan(131072)
+  })
+  test('一覧は STRIP_SLOTS 枚ずつ横に流し、出している画像が見える位置へ動かせる', async () => {
+    expect(clampOffset(-3, 10)).toBe(0)
+    expect(clampOffset(9, 10)).toBe(10 - STRIP_SLOTS)
+    expect(clampOffset(0, 3)).toBe(0)
+    // 右に隠れている画像は右端に、左に隠れている画像は左端に来る
+    expect(clampOffset(0, 10, 8)).toBe(8 - STRIP_SLOTS + 1)
+    expect(clampOffset(4, 10, 1)).toBe(1)
+    expect(clampOffset(2, 10, 4)).toBe(2)
+    const list = Array.from({ length: 10 }, (_, i) => img(`/w/${i}.png`, 'QUJD'))
+    const { svg, drawn } = stripFor(list, '/w/3.png', new Map(), 2)
+    expect(drawn).toBe(STRIP_SLOTS)
+    // 番号は一覧の番号。両端に隠れた画像があれば ‹ › を出す
+    expect(svg).toContain('>3</text>')
+    expect(svg).not.toContain('>2</text>')
+    expect(svg).toContain('‹')
+    expect(svg).toContain('›')
   })
   test('置き換えても、送っていないコメントのある画像は残す', async () => {
     const p = (path: string) => ({ path })
@@ -104,17 +121,22 @@ test('複数の画像を開き、切り替えて画像ごとにコメントし�
   expect(await ui.find({ type: 'Text', text: /^1\/3 · \/w\/out\/a\.png/ })).toBeDefined()
   // 一覧と、大きく出している画像
   expect(await ui.findAll({ type: 'Svg' })).toHaveLength(2)
-  await ui.resize({ columns: 80, rows: 30 })
-  await ui.pointer({ type: 'down', x: 10, y: 5, button: 'left' })
-  await ui.pointer({ type: 'up', x: 20, y: 10, button: 'left' })
+  await ui.resize({ in: 'drag', columns: 80, rows: 30 })
+  await ui.pointer({ in: 'drag', type: 'down', x: 10, y: 5, button: 'left' })
+  await ui.pointer({ in: 'drag', type: 'up', x: 20, y: 10, button: 'left' })
   await ui.input({ key: 'comment', text: '輪郭' })
-  await ui.press({ key: 'next' })
+  // 一覧の 2 枚目をクリック（3 枚なら 80 列を 3 つに分ける）
+  await ui.resize({ in: 'strip', columns: 80, rows: 10 })
+  const pick = async (x: number) => {
+    await ui.pointer({ in: 'strip', type: 'down', x, y: 1, button: 'left' })
+    await ui.pointer({ in: 'strip', type: 'up', x, y: 1, button: 'left' })
+  }
+  await pick(40)
   expect(await ui.find({ type: 'Text', text: /^2\/3 · \/w\/out\/b\.png/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /ほかの画像に 1 件/ })).toBeDefined()
   await ui.select({ key: 'img', value: '/w/x.png' })
   await ui.input({ key: 'comment', text: '影が濃い' })
-  await ui.press({ key: 'prev' })
-  await ui.press({ key: 'prev' })
+  await pick(5)
   expect(await ui.find({ type: 'Text', text: /\[x 100–210, y 100–220 px.*\] 輪郭/ })).toBeDefined()
   await ui.press({ key: 'send' })
   expect(sent.length).toBe(1)
@@ -174,5 +196,37 @@ test('送っている間に消して足したコメントは、番号が同じ�
   await ui.input({ key: 'comment', text: '二つ目' })
   await ui.press({ key: 'send' })
   expect(await ui.find({ type: 'Text', text: /あとから/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('一覧は端の ‹ › や横のドラッグで流れ、出している画像を選び直すと見える位置へ動く', async ($, on) => {
+  on('fs.stat', (_$, e) => ({ value: { kind: 'file', size: 1, mtimeMs: 1, isLink: false, realPath: `/w/${(e as { path: string }).path.split('/').at(-1)}` } }) as never)
+  on('fs.read', () => ({ value: { base64: 'QUJD' } }) as never)
+  on('process.run', () => ok('pixelWidth: 640\n  pixelHeight: 480'))
+  on('ui.open', () => ({ value: { isPlaced: true } }) as never)
+  const names = Array.from({ length: 9 }, (_, i) => `${i + 1}.png`)
+  await $.command.run({ command: 'kiri-review', args: names.join(' ') } as never)
+  const ui = await $.ui.mount({ plugin: 'kiri-review', surface: 'desktop', ...PANE, props: PROPS as never })
+  await ui.resize({ in: 'strip', columns: 60, rows: 6 })
+  const press = async (from: number, to: number) => {
+    await ui.pointer({ in: 'strip', type: 'down', x: from, y: 1, button: 'left' })
+    await ui.pointer({ in: 'strip', type: 'up', x: to, y: 1, button: 'left' })
+  }
+  // 左へ 2 枚分（60 列を 6 枚で 1 枚 10 列）ドラッグすると、3 番から並ぶ。左から 2 枚目をクリックすると 4 番
+  await press(40, 20)
+  await press(15, 15)
+  expect(await ui.find({ type: 'Text', text: /^4\/9 · \/w\/4\.png/ })).toBeDefined()
+  // 右端の › で流すと行き過ぎず、4 番から並ぶ（右端の画像は 9 番）
+  await press(59, 59)
+  await press(55, 55)
+  expect(await ui.find({ type: 'Text', text: /^9\/9 · \/w\/9\.png/ })).toBeDefined()
+  // 左端の ‹ で戻すと、1 番から並ぶ
+  await press(0, 0)
+  await press(5, 5)
+  expect(await ui.find({ type: 'Text', text: /^1\/9 · \/w\/1\.png/ })).toBeDefined()
+  // 「画像」で隠れている 8 番を選ぶと、一覧も 8 番が見える位置（3 番から）へ流れる
+  await ui.select({ key: 'img', value: '/w/8.png' })
+  await press(5, 5)
+  expect(await ui.find({ type: 'Text', text: /^3\/9 · \/w\/3\.png/ })).toBeDefined()
   await ui.unmount()
 })

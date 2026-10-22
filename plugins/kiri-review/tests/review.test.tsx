@@ -53,12 +53,12 @@ test('画像を開き、コメントして Claude に送る', async ($, on) => {
   const ui = await $.ui.mount({ plugin: 'kiri-review', surface: 'desktop', ...PANE, props: PROPS as never })
   expect(await ui.find({ type: 'Svg' })).toBeDefined()
   // 画像の上の Client を 80×30 マスとして、左上 1/4 をドラッグ
-  await ui.resize({ columns: 80, rows: 30 })
-  await ui.pointer({ type: 'down', x: 0, y: 0, button: 'left' })
-  await ui.pointer({ type: 'move', x: 20, y: 10, button: 'left' })
+  await ui.resize({ in: 'drag', columns: 80, rows: 30 })
+  await ui.pointer({ in: 'drag', type: 'down', x: 0, y: 0, button: 'left' })
+  await ui.pointer({ in: 'drag', type: 'move', x: 20, y: 10, button: 'left' })
   // ドラッグの間は Client が枠を描く
   expect(await ui.findAll({ type: 'Box', in: 'drag' })).toHaveLength(2)
-  await ui.pointer({ type: 'up', x: 40, y: 15, button: 'left' })
+  await ui.pointer({ in: 'drag', type: 'up', x: 40, y: 15, button: 'left' })
   expect(await ui.find({ type: 'Text', text: /^範囲: x 0–410, y 0–320 px/ })).toBeDefined()
   expect(await ui.findAll({ type: 'Box', in: 'drag' })).toHaveLength(1)
   // 別の画像のつもりで届いた範囲や、数でない値は捨てる

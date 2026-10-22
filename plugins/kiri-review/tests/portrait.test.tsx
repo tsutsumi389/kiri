@@ -17,9 +17,9 @@ test('縦長の画像でも描けて、右下をドラッグで選べる', async
   const svg = await ui.find({ type: 'Svg' })
   expect(svg).toBeDefined()
   await ui.resize({ columns: 40, rows: 40 })
-  await ui.pointer({ type: 'down', x: 30, y: 30, button: 'left' })
+  await ui.pointer({ in: 'drag', type: 'down', x: 30, y: 30, button: 'left' })
   // 領域の外まで引いても画像の端で止まる
-  await ui.pointer({ type: 'up', x: 50, y: 45, button: 'left' })
+  await ui.pointer({ in: 'drag', type: 'up', x: 50, y: 45, button: 'left' })
   await ui.input({ key: 'comment', text: '右下' })
   expect(await ui.find({ type: 'Text', text: /\[x 2268–3024, y 3024–4032 px.*\] 右下/ })).toBeDefined()
 })

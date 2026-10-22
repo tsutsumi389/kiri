@@ -10,7 +10,7 @@ const ok = (stdout = '') =>
 
 const img = (path: string, thumb = 'QUJD') => ({
   path, width: 800, height: 600, preview: 'QUJD', previewWidth: 640, previewHeight: 480,
-  thumb, thumbWidth: 160, thumbHeight: 120, cols: 8, rows: 6, mtimeMs: 0,
+  thumb, thumbWidth: 160, thumbHeight: 120, mtimeMs: 0,
 })
 
 describe('kiri が書いた画像を全部拾う', () => {
@@ -66,8 +66,8 @@ describe('一覧と送る文面', () => {
   })
   test('コメントを画像ごとにまとめる', async () => {
     const text = promptFor([img('/w/a.png'), img('/w/b.png'), img('/w/c.png')], [
-      { id: 1, path: '/w/b.png', cells: 'A1', x0: 0, y0: 0, x1: 100, y1: 100, text: '影' },
-      { id: 2, path: '/w/a.png', cells: 'B2', x0: 100, y0: 100, x1: 200, y1: 200, text: '輪郭' },
+      { id: 1, path: '/w/b.png', x0: 0, y0: 0, x1: 100, y1: 100, text: '影' },
+      { id: 2, path: '/w/a.png', x0: 100, y0: 100, x1: 200, y1: 200, text: '輪郭' },
     ])
     expect(text).toContain('2 枚の画像')
     expect(text.indexOf('## 1. 画像 /w/a.png')).toBeLessThan(text.indexOf('## 2. 画像 /w/b.png'))
@@ -104,7 +104,10 @@ test('複数の画像を開き、切り替えて画像ごとにコメントし�
   expect(await ui.find({ type: 'Text', text: /^1\/3 · \/w\/out\/a\.png/ })).toBeDefined()
   // 一覧と、大きく出している画像
   expect(await ui.findAll({ type: 'Svg' })).toHaveLength(2)
-  await ui.input({ key: 'comment', text: 'B2 輪郭' })
+  await ui.resize({ columns: 80, rows: 30 })
+  await ui.pointer({ type: 'down', x: 10, y: 5, button: 'left' })
+  await ui.pointer({ type: 'up', x: 20, y: 10, button: 'left' })
+  await ui.input({ key: 'comment', text: '輪郭' })
   await ui.press({ key: 'next' })
   expect(await ui.find({ type: 'Text', text: /^2\/3 · \/w\/out\/b\.png/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /ほかの画像に 1 件/ })).toBeDefined()
@@ -112,12 +115,13 @@ test('複数の画像を開き、切り替えて画像ごとにコメントし�
   await ui.input({ key: 'comment', text: '影が濃い' })
   await ui.press({ key: 'prev' })
   await ui.press({ key: 'prev' })
-  expect(await ui.find({ type: 'Text', text: /\[B2\] 輪郭/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /\[x 100–210, y 100–220 px.*\] 輪郭/ })).toBeDefined()
   await ui.press({ key: 'send' })
   expect(sent.length).toBe(1)
   expect(sent[0]).toContain('## 1. 画像 /w/out/a.png')
   expect(sent[0]).toContain('## 2. 画像 /w/x.png')
-  expect(sent[0]).toContain('1. [A1] x 0–100, y 0–100 px: 影が濃い')
+  expect(sent[0]).toContain('1. x 100–210, y 100–220 px')
+  expect(sent[0]).toContain('1. 画像全体: 影が濃い')
 
   await ui.press({ key: 'remove' })
   expect(await ui.find({ type: 'Text', text: /^1\/2 · \/w\/out\/b\.png/ })).toBeDefined()

@@ -3,7 +3,7 @@ import { MAX_B64 } from '../hooks/register'
 
 const B64 = 'A'.repeat(MAX_B64)
 
-test('縦長で 12 行の格子でも描けて、列と行でマスを選べる', async ($, on) => {
+test('縦長の画像でも描けて、右下をドラッグで選べる', async ($, on) => {
   on('fs.stat', () => ({ value: { kind: 'file', size: 1, mtimeMs: 1, isLink: false, realPath: '/w/v.heic' } }) as never)
   on('fs.read', () => ({ value: { base64: B64 } }) as never)
   on('process.run', (_$, e) => {
@@ -16,8 +16,10 @@ test('縦長で 12 行の格子でも描けて、列と行でマスを選べる'
     props: { title: 'kiri review', isFocused: false, bodyColumns: 60 } as never })
   const svg = await ui.find({ type: 'Svg' })
   expect(svg).toBeDefined()
-  await ui.select({ key: 'col', value: 'H' })
-  await ui.select({ key: 'row', value: '11' })
+  await ui.resize({ columns: 40, rows: 40 })
+  await ui.pointer({ type: 'down', x: 30, y: 30, button: 'left' })
+  // 領域の外まで引いても画像の端で止まる
+  await ui.pointer({ type: 'up', x: 50, y: 45, button: 'left' })
   await ui.input({ key: 'comment', text: '右下' })
-  expect(await ui.find({ type: 'Text', text: /\[H11\] 右下/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /\[x 2268–3024, y 3024–4032 px.*\] 右下/ })).toBeDefined()
 })

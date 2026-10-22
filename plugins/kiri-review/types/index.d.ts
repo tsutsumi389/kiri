@@ -12,19 +12,26 @@ export type ReviewImage = {
   thumb: string
   thumbWidth: number
   thumbHeight: number
-  /** 格子の列数・行数 */
-  cols: number
-  rows: number
   mtimeMs: number
+}
+
+/** 画像の上をドラッグして選んだ、まだコメントを付けていない範囲（元画像の画素） */
+export type ReviewSelection = {
+  path: string
+  /** 選んだときの画像の寸法。読み直して変わっていたら選択を外す */
+  width: number
+  height: number
+  x0: number
+  y0: number
+  x1: number
+  y1: number
 }
 
 export type ReviewComment = {
   id: number
   /** どの画像へのコメントか（ReviewImage.path） */
   path: string
-  /** 'C3' や 'B2:D4' */
-  cells: string
-  /** 元画像の画素での範囲 */
+  /** 元画像の画素での範囲。画像全体なら 0, 0, width, height */
   x0: number
   y0: number
   x1: number
@@ -40,7 +47,8 @@ declare module 'claude-code' {
       /** 大きく出している画像のパス */
       current: string
       comments: ReviewComment[]
-      cell: string
+      /** ドラッグで選んだ範囲。無ければ次のコメントは画像全体へ */
+      selection: ReviewSelection | null
       error: string
       /** これまでに付けたコメントの番号の最大。番号を使い回さないため */
       lastId: number

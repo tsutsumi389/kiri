@@ -188,20 +188,165 @@ export function describeRect(c: { x0: number; y0: number; x1: number; y1: number
   return `x ${c.x0}–${c.x1}, y ${c.y0}–${c.y1} px（横 ${pct(c.x0, img.width)}–${pct(c.x1, img.width)}%、縦 ${pct(c.y0, img.height)}–${pct(c.y1, img.height)}%）`
 }
 
-/** コメントを画像ごとにまとめ、一覧の順で並べる */
-export function promptFor(list: readonly ReviewImage[], all: readonly ReviewComment[]): string {
+/** 切り抜きの余白（範囲の辺の長さに対する割合）と、その最小（px） */
+export const CROP_MARGIN = 0.15
+const CROP_MARGIN_MIN = 16
+/** 透過画像の切り抜きを重ねる背景。縁の残りが見えるよう、商品写真に無さそうな色にする */
+export const CROP_BG = 'ff00c8'
+/** 切り抜きの長辺。小さい範囲は拡大し、大きい範囲は縮める */
+const CROP_MIN_SIDE = 512
+const CROP_MAX_SIDE = 1568
+
+/** コメントの範囲に余白を付けた、切り抜く範囲（元画像の画素、画像の中に収める） */
+export function cropRect(
+  c: { x0: number; y0: number; x1: number; y1: number },
+  img: Pick<ReviewImage, 'width' | 'height'>,
+): { x: number; y: number; w: number; h: number } {
+  const mx = Math.max(CROP_MARGIN_MIN, Math.round(CROP_MARGIN * (c.x1 - c.x0)))
+  const my = Math.max(CROP_MARGIN_MIN, Math.round(CROP_MARGIN * (c.y1 - c.y0)))
+  const x = Math.max(0, c.x0 - mx)
+  const y = Math.max(0, c.y0 - my)
+  return { x, y, w: Math.min(img.width, c.x1 + mx) - x, h: Math.min(img.height, c.y1 + my) - y }
+}
+
+/** 切り抜きを書き出す寸法。長辺を CROP_MIN_SIDE–CROP_MAX_SIDE に収める */
+export function cropSize(w: number, h: number): { w: number; h: number } {
+  const long = Math.max(w, h)
+  const k = Math.min(CROP_MAX_SIDE, Math.max(CROP_MIN_SIDE, long)) / long
+  return { w: Math.max(1, Math.round(w * k)), h: Math.max(1, Math.round(h * k)) }
+}
+
+/**
+ * 切り抜いて背景に重ね、PNG に書く JXA（osascript -l JavaScript -e で渡す）。
+ * NSImage は表示の向きで読む（HEIC の回転も反映済み）ので、表示の向きの座標のまま切り抜ける。
+ * 引数: 元画像 書き出し先 表示の幅 高さ 切り抜く x y w h 書き出す幅 高さ 背景色（16 進、空なら塗らない）
+ */
+export const CROP_JXA = `function run(argv) {
+  ObjC.import('AppKit')
+  const [src, out, W, H, x, y, w, h, outW, outH, bg] = argv
+  const n = Number
+  const im = $.NSImage.alloc.initWithContentsOfFile(src)
+  if (im.isNil()) throw new Error('読めません: ' + src)
+  // NSImage の座標は点で、左下が原点
+  const sx = im.size.width / n(W)
+  const sy = im.size.height / n(H)
+  const rep = $.NSBitmapImageRep.alloc.initWithBitmapDataPlanesPixelsWidePixelsHighBitsPerSampleSamplesPerPixelHasAlphaIsPlanarColorSpaceNameBytesPerRowBitsPerPixel(null, n(outW), n(outH), 8, 4, true, false, $.NSDeviceRGBColorSpace, 0, 0)
+  const ctx = $.NSGraphicsContext.graphicsContextWithBitmapImageRep(rep)
+  $.NSGraphicsContext.saveGraphicsState
+  $.NSGraphicsContext.setCurrentContext(ctx)
+  ctx.setImageInterpolation($.NSImageInterpolationHigh)
+  const dst = $.NSMakeRect(0, 0, n(outW), n(outH))
+  if (bg) {
+    const c = parseInt(bg, 16)
+    $.NSColor.colorWithSRGBRedGreenBlueAlpha(((c >> 16) & 255) / 255, ((c >> 8) & 255) / 255, (c & 255) / 255, 1).setFill
+    $.NSRectFill(dst)
+  }
+  im.drawInRectFromRectOperationFraction(dst, $.NSMakeRect(n(x) * sx, (n(H) - n(y) - n(h)) * sy, n(w) * sx, n(h) * sy), $.NSCompositingOperationSourceOver, 1)
+  ctx.flushGraphics
+  $.NSGraphicsContext.restoreGraphicsState
+  const png = rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $())
+  if (!png.writeToFileAtomically(out, true)) throw new Error('書けません: ' + out)
+  return out
+}`
+
+/**
+ * 切り抜きを書く手順（コマンドの列）。info は元画像の `sips -g pixelWidth -g pixelHeight -g hasAlpha -g orientation`。
+ * sips の切り抜きは回転前の画素に効くので、そのまま使えるのは透過も回転指定も無い画像だけ。
+ * ほかは（背景に重ねる処理も含めて）JXA で切り抜く
+ */
+export function cropCommands(
+  img: Pick<ReviewImage, 'path' | 'width' | 'height'>,
+  c: { x0: number; y0: number; x1: number; y1: number },
+  info: string,
+  out: string,
+): string[][] {
+  const r = cropRect(c, img)
+  const size = cropSize(r.w, r.h)
+  const rawW = Number(info.match(/pixelWidth:\s*(\d+)/)?.[1])
+  const rawH = Number(info.match(/pixelHeight:\s*(\d+)/)?.[1])
+  const orientation = info.match(/orientation:\s*(\d+)/)?.[1]
+  const isPlain =
+    rawW === img.width && rawH === img.height &&
+    !/hasAlpha:\s*yes/.test(info) &&
+    (orientation === undefined || orientation === '1') &&
+    // HEIC の回転は sips の orientation に出ず、180 度は寸法でも分からない
+    !/\.(heic|heif|avif)$/i.test(img.path)
+  if (!isPlain) {
+    return [['osascript', '-l', 'JavaScript', '-e', CROP_JXA, img.path, out,
+      ...[img.width, img.height, r.x, r.y, r.w, r.h, size.w, size.h].map(String), CROP_BG]]
+  }
+  return [
+    ['sips', '-c', String(r.h), String(r.w), '--cropOffset', String(r.y), String(r.x), '-s', 'format', 'png', img.path, '--out', out],
+    ...(size.w === r.w && size.h === r.h ? [] : [['sips', '-Z', String(Math.max(size.w, size.h)), out]]),
+  ]
+}
+
+/**
+ * コメントごとに範囲を切り抜き、.cache/crops に PNG で書く。画像全体へのコメントは切り抜かない。
+ * 切り抜けなかったコメントは結果に入れない（送るのは止めない）
+ */
+async function writeCrops($: EngineInterface, list: readonly ReviewImage[], all: readonly ReviewComment[]): Promise<Map<number, string>> {
+  const crops = new Map<number, string>()
+  const targets = all.flatMap(c => {
+    const img = list.find(x => x.path === c.path)
+    return img === undefined || isWhole(c, img) ? [] : [{ c, img }]
+  })
+  if (targets.length === 0) return crops
+  const dir = `${$.plugin.root}/.cache/crops`
+  try {
+    await run($, ['mkdir', '-p', dir])
+    // Claude が読み終えたころの古い切り抜きを片付ける
+    await run($, ['find', dir, '-name', '*.png', '-mmin', '+1440', '-delete']).catch(() => undefined)
+  } catch {
+    return crops
+  }
+  const stamp = Date.now()
+  const infos = new Map<string, Promise<string>>()
+  for (const { c, img } of targets) {
+    try {
+      let info = infos.get(img.path)
+      if (info === undefined) {
+        info = run($, ['sips', '-g', 'pixelWidth', '-g', 'pixelHeight', '-g', 'hasAlpha', '-g', 'orientation', img.path])
+        infos.set(img.path, info)
+      }
+      const out = `${dir}/${stamp}-${c.id}-${baseName(img.path).replace(/\.[^.]+$/, '')}.png`
+      for (const argv of cropCommands(img, c, await info, out)) await run($, argv)
+      crops.set(c.id, out)
+    } catch {
+      // この行は座標だけで送る
+    }
+  }
+  return crops
+}
+
+/** コメントを画像ごとにまとめ、一覧の順で並べる。crops があれば、コメントの id ごとの切り抜きのパスも添える */
+export function promptFor(
+  list: readonly ReviewImage[],
+  all: readonly ReviewComment[],
+  crops: ReadonlyMap<number, string> = new Map(),
+): string {
   const groups = list
     .map(img => ({ img, items: all.filter(c => c.path === img.path) }))
     .filter(g => g.items.length > 0)
   const body = groups.flatMap(({ img, items }, gi) => [
     `${groups.length > 1 ? `## ${gi + 1}. ` : ''}画像 ${img.path}（表示の向きで ${img.width}×${img.height} px）`,
-    ...items.map((c, i) => `${i + 1}. ${describeRect(c, img)}: ${c.text}`),
+    ...items.flatMap((c, i) => {
+      const crop = crops.get(c.id)
+      return [
+        `${i + 1}. ${describeRect(c, img)}: ${c.text}`,
+        ...(crop === undefined ? [] : [`   切り抜き: ${crop}（Read で開いて確認できます）`]),
+      ]
+    }),
     '',
   ])
+  const hasCrop = all.some(c => crops.has(c.id))
   return [
     groups.length > 1
       ? `${groups.length} 枚の画像に修正コメントが付きました。位置は元画像の画素範囲（左上が原点）です。`
       : '画像に修正コメントが付きました。位置は元画像の画素範囲（左上が原点）です。',
+    ...(hasCrop
+      ? [`切り抜きは確認用で、範囲の周りに各辺 ${Math.round(CROP_MARGIN * 100)}% の余白を付け、透過部分はマゼンタ（#${CROP_BG}）の上に重ねています。位置の基準は画素範囲です。`]
+      : []),
     '',
     ...body,
     '画像の該当範囲を見て、各コメントに対応してください。kiri の出力なら、原因を kiri の設定か実装から探して出し直してください。',
@@ -686,7 +831,9 @@ export const register: Register = on => {
       const sending = (await read($, comments)).filter(c => typeof c.path === 'string')
       const now = await read($, images)
       if (sending.length === 0) return
-      await $.prompt.submit({ text: promptFor(now, sending), asUser: true })
+      // 切り抜きに失敗しても送る（その行は座標だけ）
+      const crops = await writeCrops($, now, sending).catch(() => new Map<number, string>())
+      await $.prompt.submit({ text: promptFor(now, sending, crops), asUser: true })
       // 送っている間に足されたコメントは残す
       await update($, comments, l => l.filter(x => !sending.some(c => c.id === x.id)))
       $.ui.toast(`kiri-review: ${sending.length} 件を Claude に送りました`)

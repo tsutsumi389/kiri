@@ -19,7 +19,7 @@ test('離したのが窓の外でも、ボタン無しの move で枠を消す',
   await ui.pointer({ in: 'drag', type: 'move', x: 9, y: 9 })
   expect(await ui.findAll({ type: 'Box', in: 'drag' })).toHaveLength(1)
   await ui.pointer({ in: 'drag', type: 'up', x: 9, y: 9, button: 'left' })
-  expect(await ui.find({ type: 'Text', text: /^範囲: 画像全体/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^画像の上をドラッグ/ })).toBeDefined()
   await ui.unmount()
 })
 
@@ -38,17 +38,17 @@ test('読み直して寸法が変わった画像や、一覧から外した画�
     await ui.pointer({ in: 'drag', type: 'up', x: 39, y: 14, button: 'left' })
   }
   await drag()
-  expect(await ui.find({ type: 'Text', text: /^範囲: x 0–400/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^青い枠/ })).toBeDefined()
   // 同じ寸法で読み直したなら残す
   await ui.press({ key: 'reload' })
-  expect(await ui.find({ type: 'Text', text: /^範囲: x 0–400/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^青い枠/ })).toBeDefined()
   size = 'pixelWidth: 1600\n  pixelHeight: 1200'
   await ui.press({ key: 'reload' })
-  expect(await ui.find({ type: 'Text', text: /^範囲: 画像全体/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^画像の上をドラッグ/ })).toBeDefined()
   // 外して kiri がまた書いても、前の選択は戻らない
   await drag()
   await ui.press({ key: 'remove' })
   await $.command.run({ command: 'kiri-review', args: 'a.png b.png' } as never)
-  expect(await ui.find({ type: 'Text', text: /^範囲: 画像全体/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^画像の上をドラッグ/ })).toBeDefined()
   await ui.unmount()
 })

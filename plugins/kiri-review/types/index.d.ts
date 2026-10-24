@@ -54,6 +54,8 @@ declare module 'claude-code' {
       lastId: number
       /** 一覧の左端に出しているサムネイルの番号（0 から）。多い画像は横に流して見る */
       stripOffset: number
+      /** 「一覧から外す」を一度押した画像のパス。コメントのある画像は二度押しで外す */
+      confirmRemove: string
     }
   }
 }

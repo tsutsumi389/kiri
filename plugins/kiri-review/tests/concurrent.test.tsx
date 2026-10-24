@@ -73,7 +73,7 @@ test('読み込みが重なっても、縮小画像と寸法が別の画像と�
   // あとから頼んだ b.png が、b.png 自身の縮小画像と寸法で残る
   const ui = await $.ui.mount({ plugin: 'kiri-review', surface: 'desktop', component: 'Pane', requestId: 'kiri-review',
     props: { title: 'kiri review', isFocused: false, bodyColumns: 80 } as never })
-  expect(await ui.find({ type: 'Text', text: /\/w\/b\.png · 600×800/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^b\.png · 600×800/ })).toBeDefined()
   const svg = await ui.find({ type: 'Svg' })
   const source = String((svg as { props?: { source?: unknown } } | undefined)?.props?.source ?? '')
   expect(source).toContain('viewBox="0 0 480 640"')

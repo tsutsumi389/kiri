@@ -11,6 +11,12 @@ test('縦長の画像でも描けて、右下をドラッグで選べる', async
     return { value: { exitCode: 0, stdout: out, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('ui.open', () => ({ value: { isPlaced: true } }) as never)
+  on('ui.toast', () => ({ value: undefined }) as never)
+  const sent: string[] = []
+  on('prompt.submit', (_$, e) => {
+    sent.push(e.text)
+    return { text: e.text } as never
+  })
   await $.command.run({ command: 'kiri-review', args: 'v.heic' } as never)
   const ui = await $.ui.mount({ plugin: 'kiri-review', surface: 'desktop', component: 'Pane', requestId: 'kiri-review',
     props: { title: 'kiri review', isFocused: false, bodyColumns: 60 } as never })
@@ -21,5 +27,6 @@ test('縦長の画像でも描けて、右下をドラッグで選べる', async
   // 領域の外まで引いても画像の端で止まる
   await ui.pointer({ in: 'drag', type: 'up', x: 50, y: 45, button: 'left' })
   await ui.input({ key: 'comment', text: '右下' })
-  expect(await ui.find({ type: 'Text', text: /\[x 2268–3024, y 3024–4032 px.*\] 右下/ })).toBeDefined()
+  await ui.press({ key: 'send' })
+  expect(sent[0]).toContain('1. x 2268–3024, y 3024–4032 px')
 })

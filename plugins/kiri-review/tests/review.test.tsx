@@ -59,23 +59,25 @@ test('画像を開き、コメントして Claude に送る', async ($, on) => {
   // ドラッグの間は Client が枠を描く
   expect(await ui.findAll({ type: 'Box', in: 'drag' })).toHaveLength(2)
   await ui.pointer({ in: 'drag', type: 'up', x: 40, y: 15, button: 'left' })
-  expect(await ui.find({ type: 'Text', text: /^範囲: x 0–410, y 0–320 px/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^青い枠/ })).toBeDefined()
   expect(await ui.findAll({ type: 'Box', in: 'drag' })).toHaveLength(1)
   // 別の画像のつもりで届いた範囲や、数でない値は捨てる
   await ui.post({ path: '/w/other.png', x0: 0, y0: 0, x1: 1, y1: 1 })
   await ui.post({ path: '/w/out.png', x0: 'x', y0: 0, x1: 1, y1: 1 })
-  expect(await ui.find({ type: 'Text', text: /^範囲: x 0–410, y 0–320 px/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^青い枠/ })).toBeDefined()
   await ui.input({ key: 'comment', text: '髪の輪郭がギザギザ' })
   // 付けたら選択は外れ、次は画像全体
-  expect(await ui.find({ type: 'Text', text: /^範囲: 画像全体/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^画像の上をドラッグ/ })).toBeDefined()
   await ui.input({ key: 'comment', text: '影が濃い' })
-  expect(await ui.find({ type: 'Text', text: /\[x 0–410, y 0–320 px.*\] 髪の輪郭/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^1\. 髪の輪郭/ })).toBeDefined()
   await ui.press({ key: 'send' })
   expect(sent.length).toBe(1)
   expect(sent[0]).toContain('画像 /w/out.png（表示の向きで 800×600 px）')
   expect(sent[0]).toContain('1. x 0–410, y 0–320 px（横 0–51%、縦 0–53%）: 髪の輪郭がギザギザ')
   expect(sent[0]).toContain('2. 画像全体: 影が濃い')
-  expect(await ui.find({ type: 'Text', text: /コメントはまだありません/ })).toBeDefined()
+  // 送ったコメントは一覧から消え、送るものが無ければ送るボタンも出さない
+  expect(await ui.find({ type: 'Text', text: /髪の輪郭/ })).toBeUndefined()
+  await expect(ui.press({ key: 'send' })).rejects.toThrow(/send/)
   await ui.unmount()
 })
 

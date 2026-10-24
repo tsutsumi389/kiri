@@ -31,6 +31,8 @@ const error = atom({ plugin: 'kiri-review', key: 'error' } as const, '')
 const lastId = atom({ plugin: 'kiri-review', key: 'lastId' } as const, 0)
 // 一覧の左端に出しているサムネイルの番号（0 から）
 const stripOffset = atom({ plugin: 'kiri-review', key: 'stripOffset' } as const, 0)
+// 「一覧から外す」を一度押した画像。コメントごと消えるので、もう一度押して確かめる
+const confirmRemove = atom({ plugin: 'kiri-review', key: 'confirmRemove' } as const, '')
 
 const IMAGE_EXT = /\.(png|jpe?g|webp|avif|heic|tiff?|gif|bmp)$/i
 
@@ -335,6 +337,8 @@ async function addImages($: EngineInterface, paths: readonly string[], replace: 
   // 一覧から外れた画像のコメントは送れないので持ち越さない
   await update($, comments, l => l.filter(c => next.some(x => x.path === c.path)))
   await update($, current, () => first?.path ?? '')
+  // 別の画像へ移ったら、「一覧から外す」の確かめはやり直す
+  if (first?.path !== shown) await update($, confirmRemove, () => '')
   await revealCurrent($)
   await update($, error, () => failed.join('\n'))
   // 一覧から外れた画像や、寸法の変わった画像の選択は、別の場所を指すので外す
@@ -589,7 +593,10 @@ export const register: Register = on => {
         return {}
       }
       const to = list[offset + Math.floor(d.pick * slots)]
-      if (to !== undefined) await update($, current, () => to.path)
+      if (to !== undefined) {
+        await update($, current, () => to.path)
+        await update($, confirmRemove, () => '')
+      }
     } else if (typeof d.drag === 'number' && Number.isFinite(d.drag)) {
       // 指でめくるのと同じ向き: 左へドラッグすると右の画像が出てくる
       await update($, stripOffset, () => clampOffset(offset - Math.round(d.drag as number * slots), list.length))
@@ -599,7 +606,7 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const ui = $.ui.resolve(e)
-    const { Box, Text, Button, Markdown } = ui
+    const { Box, Text, Button } = ui
     const list = await read($, images)
     const shownPath = await read($, current)
     // 複数画像にする前のコメントは path を持たない。どの画像のものか分からないので数えない
@@ -630,10 +637,17 @@ export const register: Register = on => {
         const to = (await read($, images)).find(x => x.path === path)
         if (to === undefined) return
         await update($, current, () => to.path)
+        await update($, confirmRemove, () => '')
         await revealCurrent($)
       })()
     const remove = async () => {
       const now = img.path
+      // コメントのある画像は、一度目は確かめるだけ
+      if ((await read($, comments)).some(c => c.path === now) && (await read($, confirmRemove)) !== now) {
+        await update($, confirmRemove, () => now)
+        return
+      }
+      await update($, confirmRemove, () => '')
       const before = await read($, images)
       const at = before.findIndex(x => x.path === now)
       const after = before.filter(x => x.path !== now)
@@ -690,6 +704,10 @@ export const register: Register = on => {
     }
 
     const svg = svgFor(img, mine, sel)
+    // 画像の上でドラッグして選べるのは、Client を描ける面（デスクトップ）だけ。
+    // 面に無い要素も ui には空の要素として入っているので、'Client' in ui では分からない
+    const hasClient = e.surface === 'desktop'
+    const canDrag = hasClient && svg.length < 131072
     // 画像の上に透明な Client を重ね、ドラッグした範囲を受け取る（ui.message）。
     // 外側の Box は画像の大きさに縮め、Client の領域と画像を揃える
     const picture =
@@ -709,68 +727,71 @@ export const register: Register = on => {
           : <Text dimColor>この画面では画像を描けません（デスクトップアプリで開いてください）</Text>
 
     const strip = list.length > 1 ? stripFor(list, img.path, counts, offset) : undefined
+    const isStripShown = strip !== undefined && strip.drawn > 0 && strip.svg.length < 131072 && 'Svg' in ui
+    // 一覧で全部を選べないとき（Client の無い面では一覧を押せない）だけ、選択肢からも選べるようにする
+    const needsSelect = list.length > 1 && (!isStripShown || !hasClient || strip.drawn < strip.slots)
+    const confirming = mine.length > 0 && (await read($, confirmRemove)) === img.path
+
+    // いまの状態で次にすること
+    const hint = mySel !== null
+      ? '青い枠の場所へのコメントを書いて Enter'
+      : canDrag
+        ? '画像の上をドラッグして、直したい場所を選びます（選ばずに書けば画像全体へのコメント）'
+        : 'コメントを書いて Enter（画像全体へのコメント）'
 
     return (
       <Box flexDirection="column" gap={1}>
-        {strip !== undefined && strip.drawn > 0 && strip.svg.length < 131072 && 'Svg' in ui && (
-          <Box flexDirection="column">
-            {/* 一覧の上に透明な Client を重ね、クリックで選び、端の ‹ › か横のドラッグで流す */}
-            <Box position="relative" alignSelf="flex-start" flexDirection="column">
-              <ui.Svg key="strip" source={strip.svg} alt={`画像 ${list.length} 枚の一覧。${index + 1} 番を表示中`} />
-              {'Client' in ui && (
-                <Box position="absolute" top={0} left={0} right={0} bottom={0}>
-                  <ui.Client key={STRIP} module="./strip.tsx" props={{ aspect: 1 / strip.slots }} width="100%" />
-                </Box>
-              )}
-            </Box>
-            {strip.drawn < strip.slots && <Text dimColor>一覧に入りきらない画像があります。「画像」で選んでください。</Text>}
-          </Box>
-        )}
-        {list.length > 1 && 'Select' in ui && (
-          <ui.Select key="img" label="画像" options={imageOptions} value={img.path} onSelect={v => show(v)} />
-        )}
-        <Text dimColor>{list.length > 1 ? `${index + 1}/${list.length} · ` : ''}{img.path} · {img.width}×{img.height}</Text>
-        {picture}
-        <Box flexDirection="column">
-          <Box flexDirection="row" gap={1}>
-            <Text dimColor={mySel === null}>
-              {mySel === null ? '範囲: 画像全体（画像の上をドラッグすると範囲を選べます）' : `範囲: ${describeRect(mySel, img)}`}
-            </Text>
-            {mySel !== null && (
-              <Button key="unselect" plain label="選択を外す"
-                onPress={() => void update($, selection, s => (s !== null && s.path === img.path ? null : s))} />
+        {isStripShown && (
+          /* 一覧の上に透明な Client を重ね、クリックで選び、端の ‹ › か横のドラッグで流す */
+          <Box position="relative" alignSelf="flex-start" flexDirection="column">
+            <ui.Svg key="strip" source={strip.svg} alt={`画像 ${list.length} 枚の一覧。${index + 1} 番を表示中`} />
+            {'Client' in ui && (
+              <Box position="absolute" top={0} left={0} right={0} bottom={0}>
+                <ui.Client key={STRIP} module="./strip.tsx" props={{ aspect: 1 / strip.slots }} width="100%" />
+              </Box>
             )}
           </Box>
-          {'Input' in ui && (
-            <ui.Input key="comment" label="コメント" placeholder="例: 髪の輪郭がギザギザ"
-              submitLabel="追加" value="" onSubmit={v => void addComment(v)} />
+        )}
+        {needsSelect && 'Select' in ui && (
+          <ui.Select key="img" label="画像" options={imageOptions} value={img.path} onSelect={v => show(v)} />
+        )}
+        <Text dimColor>{list.length > 1 ? `${index + 1}/${list.length} · ` : ''}{baseName(img.path)} · {img.width}×{img.height}</Text>
+        <Box flexDirection="row" gap={1}>
+          <Text bold={mySel !== null}>{hint}</Text>
+          {mySel !== null && (
+            <Button key="unselect" plain dimColor label="選択を外す"
+              onPress={() => void update($, selection, s => (s !== null && s.path === img.path ? null : s))} />
           )}
-          {err !== '' && <Text color="red">{err}</Text>}
         </Box>
-        {mine.length === 0
-          ? <Text dimColor>この画像にコメントはまだありません。</Text>
-          : (
-            <Box flexDirection="column">
-              {mine.map((c, i) => (
-                <Box key={`c${c.id}`} flexDirection="row" gap={1}>
-                  <Button key={`del${c.id}`} plain label="×"
-                    onPress={() => void update($, comments, l => l.filter(x => x.id !== c.id))} />
-                  <Text>{i + 1}. [{describeRect(c, img)}] {c.text}</Text>
-                </Box>
-              ))}
-            </Box>
-          )}
+        {picture}
+        {'Input' in ui && (
+          <ui.Input key="comment" label="コメント"
+            placeholder={mySel !== null ? '例: 髪の輪郭がギザギザ' : '例: 全体に暗い'}
+            submitLabel="追加" value="" onSubmit={v => void addComment(v)} />
+        )}
+        {err !== '' && <Text color="red">{err}</Text>}
+        {mine.length > 0 && (
+          <Box flexDirection="column">
+            {mine.map((c, i) => (
+              <Box key={`c${c.id}`} flexDirection="row" gap={1}>
+                <Button key={`del${c.id}`} plain dimColor label="×"
+                  onPress={() => void update($, comments, l => l.filter(x => x.id !== c.id))} />
+                <Text>{i + 1}. {c.text}{isWhole(c, img) ? <Text dimColor>（画像全体）</Text> : ''}</Text>
+              </Box>
+            ))}
+          </Box>
+        )}
         {others > 0 && <Text dimColor>ほかの画像に {others} 件あります（一緒に送ります）。</Text>}
         <Box flexDirection="row" gap={1}>
-          <Button key="send" variant="primary" label={`Claude に送る（${all.length}）`} onPress={() => void send()} />
-          <Button key="copy" label="画像をコピー" onPress={() => void copy()} />
-          <Button key="reload" label="読み直す" onPress={() => void openAndReport($, [img.path], false)} />
-          <Button key="clear" label="この画像のコメントを消す" onPress={() => void update($, comments, l => l.filter(c => c.path !== img.path))} />
-          {list.length > 1 && <Button key="remove" label="一覧から外す" onPress={() => void remove()} />}
+          {all.length > 0 && <Button key="send" variant="primary" label={`Claude に送る（${all.length} 件）`} onPress={() => void send()} />}
+          <Button key="copy" dimColor label="画像をコピー" onPress={() => void copy()} />
+          <Button key="reload" dimColor label="読み直す" onPress={() => void openAndReport($, [img.path], false)} />
+          {list.length > 1 && (
+            <Button key="remove" dimColor={!confirming}
+              label={confirming ? `もう一度押すと外します（コメント ${mine.length} 件も消えます）` : '一覧から外す'}
+              onPress={() => void remove()} />
+          )}
         </Box>
-        <Markdown text={list.length > 1
-          ? '上の一覧をクリックして画像を切り替え（端の ‹ › で一覧を流す）、直したい場所を画像の上でドラッグして選び、コメントを Enter で追加 → 全部の画像の分をまとめて **Claude に送る**。'
-          : '直したい場所を画像の上でドラッグして選び、コメントを Enter で追加 → まとめて **Claude に送る**。'} />
       </Box>
     )
   })

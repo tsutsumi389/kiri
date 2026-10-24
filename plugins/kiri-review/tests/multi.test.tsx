@@ -118,7 +118,7 @@ test('複数の画像を開き、切り替えて画像ごとにコメントし�
   expect(r.text).toContain('3 枚をペインに出しました')
 
   const ui = await $.ui.mount({ plugin: 'kiri-review', surface: 'desktop', ...PANE, props: PROPS as never })
-  expect(await ui.find({ type: 'Text', text: /^1\/3 · \/w\/out\/a\.png/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^1\/3 · a\.png/ })).toBeDefined()
   // 一覧と、大きく出している画像
   expect(await ui.findAll({ type: 'Svg' })).toHaveLength(2)
   await ui.resize({ in: 'drag', columns: 80, rows: 30 })
@@ -132,12 +132,14 @@ test('複数の画像を開き、切り替えて画像ごとにコメントし�
     await ui.pointer({ in: 'strip', type: 'up', x, y: 1, button: 'left' })
   }
   await pick(40)
-  expect(await ui.find({ type: 'Text', text: /^2\/3 · \/w\/out\/b\.png/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^2\/3 · b\.png/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /ほかの画像に 1 件/ })).toBeDefined()
-  await ui.select({ key: 'img', value: '/w/x.png' })
+  // 一覧で全部選べるときは、「画像」の選択は出さない
+  expect(await ui.find({ type: 'Select' })).toBeUndefined()
+  await pick(75)
   await ui.input({ key: 'comment', text: '影が濃い' })
   await pick(5)
-  expect(await ui.find({ type: 'Text', text: /\[x 100–210, y 100–220 px.*\] 輪郭/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^1\. 輪郭/ })).toBeDefined()
   await ui.press({ key: 'send' })
   expect(sent.length).toBe(1)
   expect(sent[0]).toContain('## 1. 画像 /w/out/a.png')
@@ -146,7 +148,7 @@ test('複数の画像を開き、切り替えて画像ごとにコメントし�
   expect(sent[0]).toContain('1. 画像全体: 影が濃い')
 
   await ui.press({ key: 'remove' })
-  expect(await ui.find({ type: 'Text', text: /^1\/2 · \/w\/out\/b\.png/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^1\/2 · b\.png/ })).toBeDefined()
   await ui.unmount()
 })
 
@@ -167,7 +169,7 @@ test('開いたあと kiri が何枚も書いたら、一覧に足す', async ($
   await $.tool.call({ tool: 'Bash', command: 'kiri resize a.png -o a.jpg --sizes 400,800 --json' } as never)
   const ui = await $.ui.mount({ plugin: 'kiri-review', surface: 'desktop', ...PANE, props: PROPS as never })
   // 見ている画像のまま、一覧に足す
-  expect(await ui.find({ type: 'Text', text: /^1\/3 · \/w\/a\.png/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^1\/3 · a\.png/ })).toBeDefined()
   expect(await ui.findAll({ type: 'Svg' })).toHaveLength(2)
   await ui.unmount()
 })
@@ -215,18 +217,67 @@ test('一覧は端の ‹ › や横のドラッグで流れ、出している�
   // 左へ 2 枚分（60 列を 6 枚で 1 枚 10 列）ドラッグすると、3 番から並ぶ。左から 2 枚目をクリックすると 4 番
   await press(40, 20)
   await press(15, 15)
-  expect(await ui.find({ type: 'Text', text: /^4\/9 · \/w\/4\.png/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^4\/9 · 4\.png/ })).toBeDefined()
   // 右端の › で流すと行き過ぎず、4 番から並ぶ（右端の画像は 9 番）
   await press(59, 59)
   await press(55, 55)
-  expect(await ui.find({ type: 'Text', text: /^9\/9 · \/w\/9\.png/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^9\/9 · 9\.png/ })).toBeDefined()
   // 左端の ‹ で戻すと、1 番から並ぶ
   await press(0, 0)
   await press(5, 5)
-  expect(await ui.find({ type: 'Text', text: /^1\/9 · \/w\/1\.png/ })).toBeDefined()
-  // 「画像」で隠れている 8 番を選ぶと、一覧も 8 番が見える位置（3 番から）へ流れる
-  await ui.select({ key: 'img', value: '/w/8.png' })
+  expect(await ui.find({ type: 'Text', text: /^1\/9 · 1\.png/ })).toBeDefined()
+  // 隠れている 9 番を外すと 8 番が出て、一覧も 8 番が見える位置（3 番から）へ流れる
+  await press(59, 59)
+  await press(55, 55)
+  await press(0, 0)
+  await ui.press({ key: 'remove' })
   await press(5, 5)
-  expect(await ui.find({ type: 'Text', text: /^3\/9 · \/w\/3\.png/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^3\/8 · 3\.png/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('コメントのある画像を一覧から外すときは、もう一度押して確かめる', async ($, on) => {
+  on('fs.stat', (_$, e) => ({ value: { kind: 'file', size: 1, mtimeMs: 1, isLink: false, realPath: `/w/${(e as { path: string }).path.split('/').at(-1)}` } }) as never)
+  on('fs.read', () => ({ value: { base64: 'QUJD' } }) as never)
+  on('process.run', () => ok('pixelWidth: 640\n  pixelHeight: 480'))
+  on('ui.open', () => ({ value: { isPlaced: true } }) as never)
+  await $.command.run({ command: 'kiri-review', args: 'a.png b.png' } as never)
+  const ui = await $.ui.mount({ plugin: 'kiri-review', surface: 'desktop', ...PANE, props: PROPS as never })
+  await ui.input({ key: 'comment', text: '暗い' })
+  await ui.press({ key: 'remove' })
+  expect(await ui.find({ type: 'Text', text: /^1\/2 · a\.png/ })).toBeDefined()
+  await ui.press({ key: 'remove' })
+  expect(await ui.find({ type: 'Text', text: /^b\.png/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /暗い/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('別の画像を開いて戻ったら、外すときにまた確かめる', async ($, on) => {
+  on('fs.stat', (_$, e) => ({ value: { kind: 'file', size: 1, mtimeMs: 1, isLink: false, realPath: `/w/${(e as { path: string }).path.split('/').at(-1)}` } }) as never)
+  on('fs.read', () => ({ value: { base64: 'QUJD' } }) as never)
+  on('process.run', () => ok('pixelWidth: 640\n  pixelHeight: 480'))
+  on('ui.open', () => ({ value: { isPlaced: true } }) as never)
+  await $.command.run({ command: 'kiri-review', args: 'a.png b.png' } as never)
+  const ui = await $.ui.mount({ plugin: 'kiri-review', surface: 'desktop', ...PANE, props: PROPS as never })
+  await ui.input({ key: 'comment', text: '暗い' })
+  await ui.press({ key: 'remove' })
+  await $.command.run({ command: 'kiri-review', args: 'b.png' } as never)
+  expect(await ui.find({ type: 'Text', text: /· b\.png/ })).toBeDefined()
+  await $.command.run({ command: 'kiri-review', args: 'a.png b.png' } as never)
+  expect(await ui.find({ type: 'Text', text: /^1\/2 · a\.png/ })).toBeDefined()
+  await ui.press({ key: 'remove' })
+  expect(await ui.find({ type: 'Text', text: /暗い/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('一覧を押せない面（Client が無い）では、「画像」の選択で切り替える', async ($, on) => {
+  on('fs.stat', (_$, e) => ({ value: { kind: 'file', size: 1, mtimeMs: 1, isLink: false, realPath: `/w/${(e as { path: string }).path.split('/').at(-1)}` } }) as never)
+  on('fs.read', () => ({ value: { base64: 'QUJD' } }) as never)
+  on('process.run', () => ok('pixelWidth: 640\n  pixelHeight: 480'))
+  on('ui.open', () => ({ value: { isPlaced: true } }) as never)
+  await $.command.run({ command: 'kiri-review', args: 'a.png b.png' } as never)
+  const ui = await $.ui.mount({ plugin: 'kiri-review', surface: 'vscode', ...PANE, props: PROPS as never })
+  await ui.select({ key: 'img', value: '/w/b.png' })
+  expect(await ui.find({ type: 'Text', text: /^2\/2 · b\.png/ })).toBeDefined()
   await ui.unmount()
 })

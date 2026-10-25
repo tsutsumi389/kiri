@@ -243,6 +243,9 @@ export function kiriInfos(command: string, stdout: string, cwd = ''): Map<string
       const c = rect4(out.content_rect)
       const mapping: KiriMapping | undefined =
         s !== undefined && c !== undefined && typeof source?.width === 'number' && typeof source.height === 'number' && abs !== ''
+          // パスはそのまま Claude への文に入る。改行や制御文字を含むパスは、文の外へ
+          // 指示を書き足せてしまうので、対応ごと使わない
+          && !/[\u0000-\u001f\u007f]/.test(abs)
           ? { input: abs, inputWidth: source.width, inputHeight: source.height, source: s, content: c }
           : undefined
       const size = { width: typeof out.width === 'number' ? out.width : Infinity, height: typeof out.height === 'number' ? out.height : Infinity }

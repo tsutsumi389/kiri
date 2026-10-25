@@ -25,6 +25,8 @@ export type KiriRegion = {
   y0: number
   x1: number
   y1: number
+  /** kiri が出した入力画像での範囲（両端を含む）。写す前のもの */
+  bbox?: [number, number, number, number]
 }
 
 /** 出力画像と入力画像の対応（kiri の outputs[].source_rect / content_rect。両端を含む） */
@@ -48,7 +50,13 @@ export type KiriRepair = {
 
 /** kiri の --json の結果から拾った、出力画像 1 枚ぶんの情報 */
 export type KiriInfo = {
+  /** この画像を書いた kiri のコマンド（&& などでつないだ前後と、頭の VAR=... は落とす）。ラベルの書き出しに残す */
+  command?: string
+  /** kiri を走らせた作業ディレクトリ。分からなければ無い */
+  cwd?: string
   regions: KiriRegion[]
+  /** 警告ごとの上限で、範囲を落としたか */
+  truncated?: boolean
   mapping?: KiriMapping
   repair?: KiriRepair
 }
@@ -94,6 +102,12 @@ export type ReviewSelection = {
  */
 export type ReviewStatus = 'draft' | 'sent' | 'check' | 'fixed' | 'again'
 
+/**
+ * 指摘の種類。halo: 縁残り（背景が縁に残った）、missing: 欠け（商品が削れた）、extra: 残り（背景が塊で残った）、
+ * rough: ギザギザ（輪郭が粗い）、tint: 混色（縁に背景の色が混ざった）、other: その他
+ */
+export type ReviewKind = 'halo' | 'missing' | 'extra' | 'rough' | 'tint' | 'other'
+
 export type ReviewComment = {
   id: number
   /** どの画像へのコメントか（ReviewImage.path） */
@@ -109,6 +123,25 @@ export type ReviewComment = {
   /** 付けたときの画像の寸法。差し替えで寸法が変わったら、範囲を同じ割合の位置へ移す */
   width?: number
   height?: number
+  /** 指摘の種類。無ければ未分類 */
+  kind?: ReviewKind
+  /** kiri の指摘から作ったコメントなら、その警告のコード */
+  code?: string
+  /** 付けたときの画像の版と、その版での範囲。差し替わって範囲が動いても、ラベルはこの版のものとして書き出す */
+  seen?: ReviewSeen
+}
+
+/** コメントを付けたときの画像の版と、その版での範囲・kiri の結果 */
+export type ReviewSeen = {
+  mtimeMs: number
+  version: number
+  width: number
+  height: number
+  x0: number
+  y0: number
+  x1: number
+  y1: number
+  kiri?: KiriInfo
 }
 
 /** 元画像から原寸で切り出して大きく出している範囲 */
@@ -151,6 +184,8 @@ declare module 'claude-code' {
       compare: boolean
       /** 拡大を作っている間の案内 */
       busy: string
+      /** 次に付けるコメントの種類。無ければ未分類 */
+      kind: ReviewKind | null
     }
   }
 }

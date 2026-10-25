@@ -31,6 +31,7 @@ use crate::cutout::background::BackgroundField;
 use crate::cutout::local_colour::{self, Lean, Role};
 use crate::cutout::mask::{FOREGROUND_THRESHOLD, Mask};
 use crate::cutout::morphology::BitPlane;
+use crate::cutout::regions::{self, Grid, Measure, Region, Tally};
 
 /// 局所背景の参照に採る色の窓を、背景の残差 p90 の何倍に取るか。
 ///
@@ -194,6 +195,53 @@ pub struct Diagnostics {
     /// 判定不能が大半を占めたまま割合を返すと、残りについて「汚染されて
     /// いない」と言ったことになってしまう
     pub rim_contamination: Option<f64>,
+    /// 上の 3 つの指標を格子セルごとに数え直したもの。警告が「どこ」を
+    /// 言うために持つ（`regions.rs`）。**JSON へはそのまま出さない**——
+    /// 警告が出たときだけ、束ねた区間として `data.regions` に現れる
+    pub local: Local,
+}
+
+/// 指標の局所の集計。`regions.rs` の冒頭を参照。
+///
+/// 測れなかった指標の集計は空である（`regions` は何も返さない）。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Local {
+    pub grid: Grid,
+    pub halo: Vec<Tally>,
+    pub roughness: Vec<Tally>,
+    pub rim: Vec<Tally>,
+}
+
+impl Diagnostics {
+    /// `halo_ratio` がしきい値を越えた区間。悪い順に最大 5 個。
+    pub fn halo_regions(&self) -> Vec<Region> {
+        self.regions_of(&self.local.halo, Measure::Halo, HALO_WARN)
+    }
+
+    /// `contour_roughness` がしきい値を越えた区間。悪い順に最大 5 個。
+    pub fn roughness_regions(&self) -> Vec<Region> {
+        let measure = Measure::Roughness {
+            step: f64::from(CHAMFER_STEP),
+            scale: self.scale(),
+        };
+        self.regions_of(&self.local.roughness, measure, CONTOUR_ROUGH_WARN)
+    }
+
+    /// `rim_contamination` がしきい値を越えた区間。悪い順に最大 5 個。
+    pub fn rim_regions(&self) -> Vec<Region> {
+        self.regions_of(&self.local.rim, Measure::Rim, RIM_CONTAMINATION_WARN)
+    }
+
+    fn scale(&self) -> f64 {
+        scale_at_1000(self.local.grid.width, self.local.grid.height)
+    }
+
+    /// 区間の矩形は縁の帯（換算 3px）ぶん外へ広げる。集計した画素は輪郭の
+    /// 片側にしか無いことがあり、そのままでは遷移の帯が矩形からはみ出す
+    fn regions_of(&self, tallies: &[Tally], measure: Measure, threshold: f64) -> Vec<Region> {
+        let pad = rim_band(self.scale());
+        regions::regions(&self.local.grid, tallies, measure, threshold, pad)
+    }
 }
 
 /// 元画像とマスクから診断値を求める。
@@ -216,31 +264,47 @@ pub fn diagnose(
 ) -> Diagnostics {
     // 輪郭画素の抽出は全画素の走査なので、2 つの指標で使い回す
     let contour = contour_pixels(mask, bbox);
+    // 局所の集計の格子。3 つの指標が同じ格子へ足すので、セルの添字が揃う
+    let grid = Grid::new(
+        mask.width(),
+        mask.height(),
+        scale_at_1000(mask.width(), mask.height()),
+    );
     // **4 つは互いに独立である。** どれも画像・マスク・場を読むだけで、
     // 互いの結果を見ない。入れ子の `join` で 4 本同時に回すと、合計ではなく
     // いちばん長い 1 本の時間になる。
     //
     // 浮動小数を畳むのは各指標の中だけで、指標をまたいで足す箇所は無い
     // ——だから分け方で答えが動かない
-    let ((halo_ratio_v, edge_width_v), (roughness, rim)) = rayon::join(
-        || {
-            rayon::join(
-                || halo_ratio(image, mask, field, reference_gate),
-                || edge_width(mask),
-            )
-        },
-        || {
-            rayon::join(
-                || roughness_of(mask, &contour, bbox),
-                || contamination_of(image, mask, &contour),
-            )
-        },
-    );
+    //
+    // 局所の集計も同じで、各指標が自分の `Vec<Tally>` を持って帰る。共有の
+    // 表へ並列に足すことはしないので、足す順が揺れる余地が無い
+    let (((halo_ratio_v, halo_cells), edge_width_v), ((roughness, rough_cells), (rim, rim_cells))) =
+        rayon::join(
+            || {
+                rayon::join(
+                    || halo_of(image, mask, field, reference_gate, &grid),
+                    || edge_width(mask),
+                )
+            },
+            || {
+                rayon::join(
+                    || roughness_of(mask, &contour, bbox, &grid),
+                    || contamination_of(image, mask, &contour, &grid),
+                )
+            },
+        );
     Diagnostics {
         halo_ratio: halo_ratio_v,
         edge_width: edge_width_v,
         contour_roughness: roughness,
         rim_contamination: rim,
+        local: Local {
+            grid,
+            halo: halo_cells,
+            roughness: rough_cells,
+            rim: rim_cells,
+        },
     }
 }
 
@@ -362,7 +426,12 @@ pub fn farther_than(width: u32, height: u32, seeds: &[(u32, u32)], limit: u32) -
 /// 二値輪郭が、平滑化した参照輪郭からどれだけ離れているかの平均
 /// (px, 長辺 1000px 換算)。測れる輪郭が無ければ None。
 pub fn contour_roughness(mask: &Mask, bbox: Option<(u32, u32, u32, u32)>) -> Option<f64> {
-    roughness_of(mask, &contour_pixels(mask, bbox), bbox)
+    let grid = Grid::new(
+        mask.width(),
+        mask.height(),
+        scale_at_1000(mask.width(), mask.height()),
+    );
+    roughness_of(mask, &contour_pixels(mask, bbox), bbox, &grid).0
 }
 
 /// 帯の中で「局所前景より局所背景に近い」画素の割合。判定できなければ None。
@@ -371,7 +440,12 @@ pub fn rim_contamination(
     mask: &Mask,
     bbox: Option<(u32, u32, u32, u32)>,
 ) -> Option<f64> {
-    contamination_of(image, mask, &contour_pixels(mask, bbox))
+    let grid = Grid::new(
+        mask.width(),
+        mask.height(),
+        scale_at_1000(mask.width(), mask.height()),
+    );
+    contamination_of(image, mask, &contour_pixels(mask, bbox), &grid).0
 }
 
 /// 輪郭を σ = 2.0 × scale px 相当で滑らかにしたものを参照に、そこからの距離の
@@ -381,13 +455,17 @@ pub fn rim_contamination(
 /// 無いが、「自分自身を滑らかにしたもの」なら必ず作れる。滑らかな輪郭は
 /// ぼかしても 0.5 の等高線が動かないので値は 0 に近く、1〜3px で蛇行していれば
 /// 蛇行ぶんがそのまま距離として出る。
+///
+/// 2 つ目の戻り値は格子セルごとの集計（分子は頭打ちにした距離の和、分母は
+/// 輪郭画素の数）。測れなければ空である。
 fn roughness_of(
     mask: &Mask,
     contour: &[(u32, u32)],
     bbox: Option<(u32, u32, u32, u32)>,
-) -> Option<f64> {
+    grid: &Grid,
+) -> (Option<f64>, Vec<Tally>) {
     if contour.is_empty() {
-        return None;
+        return (None, Vec::new());
     }
     let (w, h) = (mask.width(), mask.height());
     let scale = scale_at_1000(w, h);
@@ -404,7 +482,7 @@ fn roughness_of(
     // 平滑化で輪郭が消えるなら、比べる相手が無い。0 と報告すると
     // 「完全に滑らか」という最良の結果に見えてしまう
     if smooth_contour.is_empty() {
-        return None;
+        return (None, Vec::new());
     }
 
     let distance = chamfer_distance(&smooth_contour, roi);
@@ -422,12 +500,20 @@ fn roughness_of(
     // 箱ぼかし 3 回ぶんの `3r` しかないのだから、それより遠い距離に情報は無い。
     // **画素ごとに 3r で clamp してから平均する**
     let cap = (3 * radius * u32::from(CHAMFER_STEP)).min(u32::from(u8::MAX));
-    let total: u64 = contour
-        .iter()
-        .map(|&(x, y)| u64::from(u32::from(distance.at(x, y)).min(cap)))
-        .sum();
+    // 全体の和と同じ値をセルへも足す。整数なので、セルの和を足し直すと
+    // 全体の和と 1 ビットも違わない
+    let mut cells = grid.tallies();
+    let mut total: u64 = 0;
+    for &(x, y) in contour {
+        let d = u64::from(u32::from(distance.at(x, y)).min(cap));
+        total += d;
+        let cell = &mut cells[grid.index(x, y)];
+        cell.see(x, y);
+        cell.num += d;
+        cell.den += 1;
+    }
     let mean = total as f64 / contour.len() as f64 / f64::from(CHAMFER_STEP);
-    Some(mean / scale)
+    (Some(mean / scale), cells)
 }
 
 /// 帯の各画素を「局所前景 F」と「局所背景 B」の 2 択で分類し、B 寄りの割合を返す。
@@ -477,11 +563,19 @@ fn roughness_of(
 /// `scale` で縮めた格子の上で箱平均を取り、帯画素からは最近傍で引けばよい。
 /// 全面の積分画像（8 面 × 12MP × f64 = 768MB）は持たない——`refine.rs` が
 /// タイルへ切ったのと同じ制約である。
-fn contamination_of(image: &RgbaImage, mask: &Mask, contour: &[(u32, u32)]) -> Option<f64> {
+///
+/// 2 つ目の戻り値は格子セルごとの集計（分子は背景寄りの画素、分母は判定
+/// できた画素、`seen` は帯の画素）。測れなければ空である。
+fn contamination_of(
+    image: &RgbaImage,
+    mask: &Mask,
+    contour: &[(u32, u32)],
+    lattice: &Grid,
+) -> (Option<f64>, Vec<Tally>) {
     let (w, h) = (mask.width(), mask.height());
     // 公開 API なので、対応しない組み合わせで panic させない
     if image.width() != w || image.height() != h || contour.is_empty() {
-        return None;
+        return (None, Vec::new());
     }
     let scale = scale_at_1000(w, h);
     let rim = rim_band(scale);
@@ -510,6 +604,7 @@ fn contamination_of(image: &RgbaImage, mask: &Mask, contour: &[(u32, u32)]) -> O
     let pixels = image.as_raw();
     let (x0, y0, x1, y1) = around(contour, w, h, rim);
     let (mut contaminated, mut decided, mut in_band) = (0u64, 0u64, 0u64);
+    let mut cells = lattice.tallies();
     for y in y0..=y1 {
         let row = (y as usize) * (w as usize);
         for x in x0..=x1 {
@@ -518,6 +613,8 @@ fn contamination_of(image: &RgbaImage, mask: &Mask, contour: &[(u32, u32)]) -> O
                 continue;
             }
             in_band += 1;
+            let cell = &mut cells[lattice.index(x, y)];
+            cell.see(x, y);
             // 窓に確定背景が無い、確定前景を借りられる範囲に見つからない、
             // あるいは 2 つの分布が散らばりの中で重なっていれば、どちらに
             // 近いかを問う相手がいない
@@ -525,15 +622,18 @@ fn contamination_of(image: &RgbaImage, mask: &Mask, contour: &[(u32, u32)]) -> O
                 continue;
             };
             decided += 1;
+            cell.den += 1;
             if lean == Lean::Background {
                 contaminated += 1;
+                cell.num += 1;
             }
         }
     }
     // **判定できた画素が帯の半分に満たなければ、何も言わない。** 残りの
     // 画素について「汚染されていない」と言った覚えは無いのに、割合を返すと
     // そう読まれる。0 と null を混同させないという約束はここにも掛かる
-    (decided * 2 >= in_band && decided > 0).then(|| contaminated as f64 / decided as f64)
+    let rim = (decided * 2 >= in_band && decided > 0).then(|| contaminated as f64 / decided as f64);
+    (rim, cells)
 }
 
 /// 輪郭画素の外接矩形を `margin` px だけ広げ、画像の中へ収めたもの。
@@ -807,11 +907,29 @@ pub fn halo_ratio(
     field: &BackgroundField,
     reference_gate: f64,
 ) -> Option<f64> {
+    let grid = Grid::new(
+        mask.width(),
+        mask.height(),
+        scale_at_1000(mask.width(), mask.height()),
+    );
+    halo_of(image, mask, field, reference_gate, &grid).0
+}
+
+/// `halo_ratio` と、その格子セルごとの集計（分子は背景色のままの画素、
+/// 分母は境界近傍の前景画素）。測れなければ集計は空である。
+fn halo_of(
+    image: &RgbaImage,
+    mask: &Mask,
+    field: &BackgroundField,
+    reference_gate: f64,
+    grid: &Grid,
+) -> (Option<f64>, Vec<Tally>) {
     let (w, h) = (mask.width(), mask.height());
     if image.width() != w || image.height() != h {
-        return None;
+        return (None, Vec::new());
     }
     let (mut halo, mut total) = (0u64, 0u64);
+    let mut cells = grid.tallies();
     // 「境界近傍か」は前景でない画素からのチェビシェフ距離で引く。画素ごとに
     // 7x7 を数えると前景の内側ほど全部を舐めることになり、12MP で 125ms を
     // ここだけで食う。距離を 1 度作れば同じ答えが O(N) で出る（7x7 の窓は
@@ -829,6 +947,9 @@ pub fn halo_ratio(
                 continue;
             }
             total += 1;
+            let cell = &mut cells[grid.index(x, y)];
+            cell.see(x, y);
+            cell.den += 1;
             // 参照が 1 つも採れなければ、その場所の背景モデルそのものを使う。
             // 大域の 1 色へ落とすと、照明場を持っている素材で「その場所の
             // 背景」ではない色と比べることになる
@@ -837,10 +958,11 @@ pub fn halo_ratio(
             let p = image.get_pixel(x, y).0;
             if delta_e76(srgb_to_lab([p[0], p[1], p[2]]), reference) <= SAME_AS_BACKGROUND {
                 halo += 1;
+                cell.num += 1;
             }
         }
     }
-    (total > 0).then(|| halo as f64 / total as f64)
+    ((total > 0).then(|| halo as f64 / total as f64), cells)
 }
 
 /// 前景でない画素からのチェビシェフ距離(px)。255 で飽和する。
@@ -1528,5 +1650,163 @@ mod tests {
         assert!(!contour_pixels(&mask, None).is_empty());
         assert!(contour_pixels(&mask, Some((10, 10, 30, 30))).is_empty());
         assert_eq!(contour_roughness(&mask, Some((10, 10, 30, 30))), None);
+    }
+
+    /// 円盤の商品。輪郭のうち 2 か所だけに既知の欠陥を作る。
+    ///
+    /// - 右（角度 -20°〜20°）: 商品ごと輪郭を ±3px・周期 4px で蛇行させる
+    ///   （`CONTOUR_ROUGH`。色は輪郭に従うので縁は汚れない）
+    /// - 下（角度 60°〜120°）: マスクだけを 6px 外へ広げ、背景色のまま不透明な
+    ///   縁を作る（`HALO_REMAINS` / `RIM_CONTAMINATED`）
+    ///
+    /// 残りの輪郭は滑らかで縁も無いので、**場所を言う値はこの 2 か所だけを
+    /// 指さなければならない。**
+    fn two_known_defects() -> (RgbaImage, Mask) {
+        let size = 600u32;
+        let (c, radius) = (300.0f32, 180.0f32);
+        let bg = [250u8, 250, 249];
+        let mut image = RgbaImage::from_pixel(size, size, Rgba([bg[0], bg[1], bg[2], 255]));
+        let mut mask = Mask::new(size, size, 0);
+        for y in 0..size {
+            for x in 0..size {
+                let (fx, fy) = (x as f32 + 0.5 - c, y as f32 + 0.5 - c);
+                let r = fx.hypot(fy);
+                let deg = fy.atan2(fx).to_degrees();
+                // 蛇行は商品の色の側にも付ける。マスクだけを蛇行させると、外へ
+                // 出た歯が背景色のまま不透明になり、縁の汚染まで同じ場所に出る
+                let teeth = ((deg.to_radians() * radius) / 4.0).floor() as i32;
+                let wobble = radius + if teeth % 2 == 0 { 3.0 } else { -3.0 };
+                let product = if deg.abs() < 20.0 { wobble } else { radius };
+                if r <= product {
+                    image.put_pixel(x, y, Rgba([40, 40, 45, 255]));
+                }
+                let edge = if deg.abs() < 20.0 {
+                    wobble
+                } else if (60.0..120.0).contains(&deg) {
+                    // 端は 10° かけて広げる。段差のまま広げると、その段差が
+                    // 本物の蛇行として `contour_roughness` に数えられる
+                    let taper = ((deg - 60.0) / 10.0).min((120.0 - deg) / 10.0).min(1.0);
+                    radius + 6.0 * taper
+                } else {
+                    radius
+                };
+                if r <= edge {
+                    mask.set(x, y, 255);
+                }
+            }
+        }
+        (image, mask)
+    }
+
+    fn overlaps(a: (u32, u32, u32, u32), b: (u32, u32, u32, u32)) -> bool {
+        a.0 <= b.2 && b.0 <= a.2 && a.1 <= b.3 && b.1 <= a.3
+    }
+
+    /// 欠陥の場所。円盤の中心 300、半径 180 から読む
+    const RIGHT_EDGE: (u32, u32, u32, u32) = (465, 240, 490, 360);
+    const BOTTOM_EDGE: (u32, u32, u32, u32) = (210, 450, 390, 490);
+
+    #[test]
+    fn the_regions_point_at_the_known_defects() {
+        let (image, mask) = two_known_defects();
+        let field = BackgroundField::flat([250, 250, 249]);
+        let d = diagnose(&image, &mask, &field, 3.0, None);
+        // 前提: 全体の値が警告に届いている（届かなければ区間を出す場面が無い）
+        assert!(d.contour_roughness.unwrap() > CONTOUR_ROUGH_WARN, "{d:?}");
+        assert!(
+            d.rim_contamination.unwrap() > RIM_CONTAMINATION_WARN,
+            "{d:?}"
+        );
+
+        let rough = d.roughness_regions();
+        assert!(!rough.is_empty(), "{d:?}");
+        for r in &rough {
+            assert!(r.score > CONTOUR_ROUGH_WARN, "{rough:?}");
+            assert!(
+                overlaps(r.bbox, RIGHT_EDGE),
+                "蛇行していない場所を指した: {rough:?}"
+            );
+        }
+        let rim = d.rim_regions();
+        assert!(!rim.is_empty(), "{d:?}");
+        for r in &rim {
+            assert!(
+                overlaps(r.bbox, BOTTOM_EDGE),
+                "縁の無い場所を指した: {rim:?}"
+            );
+        }
+        let halo = d.halo_regions();
+        assert!(!halo.is_empty(), "{d:?}");
+        for r in &halo {
+            assert!(
+                overlaps(r.bbox, BOTTOM_EDGE),
+                "縁の無い場所を指した: {halo:?}"
+            );
+        }
+    }
+
+    /// **局所の集計は全体の値と同じ定義である。** セルの分子と分母を足し直すと、
+    /// 全体の値と 1 ビットも違わない。
+    #[test]
+    fn the_cells_add_up_to_the_whole_value() {
+        let (image, mask) = two_known_defects();
+        let field = BackgroundField::flat([250, 250, 249]);
+        let d = diagnose(&image, &mask, &field, 3.0, None);
+        let total = |cells: &[Tally]| {
+            cells
+                .iter()
+                .fold((0u64, 0u64), |(n, m), t| (n + t.num, m + t.den))
+        };
+        let (n, m) = total(&d.local.halo);
+        assert_eq!(Some(n as f64 / m as f64), d.halo_ratio);
+        let (n, m) = total(&d.local.rim);
+        assert_eq!(Some(n as f64 / m as f64), d.rim_contamination);
+        let (n, m) = total(&d.local.roughness);
+        let scale = scale_at_1000(600, 600);
+        assert_eq!(
+            Some(n as f64 / m as f64 / f64::from(CHAMFER_STEP) / scale),
+            d.contour_roughness
+        );
+    }
+
+    /// 並列に測っても区間の並びが揺れない。
+    #[test]
+    fn the_regions_are_deterministic() {
+        let (image, mask) = two_known_defects();
+        let field = BackgroundField::flat([250, 250, 249]);
+        let first = diagnose(&image, &mask, &field, 3.0, None);
+        for _ in 0..4 {
+            let again = diagnose(&image, &mask, &field, 3.0, None);
+            assert_eq!(again.roughness_regions(), first.roughness_regions());
+            assert_eq!(again.rim_regions(), first.rim_regions());
+            assert_eq!(again.halo_regions(), first.halo_regions());
+        }
+    }
+
+    /// きれいな輪郭は区間を 1 つも持たない。
+    #[test]
+    fn a_clean_cut_names_no_region() {
+        let mask = jagged_disc(400, 0.0, 4.0);
+        let image = RgbaImage::from_fn(400, 400, |x, y| {
+            if mask.get(x, y) == 255 {
+                Rgba([40, 40, 45, 255])
+            } else {
+                Rgba([250, 250, 249, 255])
+            }
+        });
+        let d = diagnose(
+            &image,
+            &mask,
+            &BackgroundField::flat([250, 250, 249]),
+            3.0,
+            None,
+        );
+        assert!(
+            d.roughness_regions().is_empty(),
+            "{:?}",
+            d.roughness_regions()
+        );
+        assert!(d.rim_regions().is_empty(), "{:?}", d.rim_regions());
+        assert!(d.halo_regions().is_empty(), "{:?}", d.halo_regions());
     }
 }

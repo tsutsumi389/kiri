@@ -355,6 +355,26 @@ pub struct OutputReport {
     /// **キーは常に出す**（`icc` / `quality_used` と同じ規約）。省くと
     /// 「古い版で走った」と「役目を付けなかった」が同じ形になる
     pub role: Option<String>,
+    /// 入力のどの矩形がこの出力に写ったか（`[x1, y1, x2, y2]`、両端を含む）。
+    /// 座標系は `applied_bbox` と同じ——EXIF の向きを適用した後、`--rotate` の
+    /// 前の入力画素である。`content_rect` と組で読む
+    ///
+    /// **cutout だけが出す。** 警告の `data.regions` は入力の座標で場所を言うので、
+    /// 出力の上に枠を描くには写像が要る。convert / resize / rotate は場所を
+    /// 言う値を持たないので、写像を足す理由が無い（その JSON は 1 バイトも
+    /// 動かない）。**`--rotate` で回した実行でも出さない**——0 度以外の回転は
+    /// 矩形を矩形へ写さない（90 度刻みでも向きが入れ替わる）ので、2 つの
+    /// 矩形の組では言えない。回したかどうかは `rotate` ブロックの有無が言う
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_rect: Option<[u32; 4]>,
+    /// `source_rect` が写った出力の矩形（`[x1, y1, x2, y2]`、両端を含む、出力の画素）。
+    ///
+    /// 写像は軸ごとの一様な拡縮で、入力の画素 `x` は出力の
+    /// `c.x1 + (x - s.x1) × (c.x2 - c.x1 + 1) / (s.x2 - s.x1 + 1)` に来る
+    /// （`s` が `source_rect`、`c` がこれ。y も同じ）。端は外側へ丸めるので、
+    /// 1px 未満の食い違いはありうる
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_rect: Option<[u32; 4]>,
 }
 
 /// `kiri compose` の結果。

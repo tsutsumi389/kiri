@@ -1252,6 +1252,43 @@ fn fields() -> Vec<FieldEntry> {
                  エンコードするのは決まった 1 枚だけなので、この回数は探索の後ろに 1 度だけ積む",
             ),
         },
+        FieldEntry {
+            path: "outputs[].source_rect",
+            appears_in: vec!["cutout"],
+            unit: "px",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "入力のどの矩形がこの出力に写ったか（[x1, y1, x2, y2]、両端を含む入力の画素）",
+            notes: Some(
+                "content_rect と組で読む。座標系は applied_bbox と警告の data.regions と同じ\
+                 （EXIF の向きを適用した後、--rotate の前の入力画素）なので、regions の\
+                 矩形を出力の上に描くのに使う。キャンバスが無ければ入力の全面、あれば\
+                 キャンバスへ載せるために切り詰めた範囲で、派生のリサイズが cover で\
+                 切り取った分はここも詰める。**--rotate で回した実行ではキーごと出ない**\
+                 ——0 度以外の回転は矩形を矩形へ写さないので、2 つの矩形の組では言えない\
+                 （回したことは rotate ブロックが言う）。--manifest の目録の outputs[] にも\
+                 同じ値が載る（目録の要素は結果 JSON とまったく同じ）",
+            ),
+        },
+        FieldEntry {
+            path: "outputs[].content_rect",
+            appears_in: vec!["cutout"],
+            unit: "px",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "source_rect が写った出力の矩形（[x1, y1, x2, y2]、両端を含む出力の画素）",
+            notes: Some(
+                "写像は軸ごとの一様な拡縮で、入力の画素 x は出力の \
+                 c.x1 + (x - s.x1) × (c.x2 - c.x1 + 1) / (s.x2 - s.x1 + 1) に来る\
+                 （s が source_rect、c がこれ。y も同じ）。キャンバスでは canvas.offset から\
+                 canvas.content の寸法の矩形で、派生のリサイズはその上に掛かる。端は外側へ\
+                 丸めるので 1px 未満の食い違いはありうる。出ない条件は source_rect と同じ",
+            ),
+        },
         // `color` ブロックは `--white-balance` / `--exposure` のどちらかに
         // `auto` を渡した実行にしか現れない（`optimize` / `shadow` と同じ規約）。
         // **要求したモードもここが持つ**——`settings` へ足すと、正規化を
@@ -1646,7 +1683,12 @@ fn fields() -> Vec<FieldEntry> {
                 "白い下地では見えず、黒や色付きの下地に載せて初めて輪郭の光として現れる。\
                  参照にする局所背景は背景モデルと矛盾しないものだけから採る——\
                  輪郭の色差が tolerance を下回る素材ではフィルが商品の外縁を食い、\
-                 その跡を参照にすると残った商品が「背景色のまま」と数えられる",
+                 その跡を参照にすると残った商品が「背景色のまま」と数えられる。\
+                 **警告が出たときは data.regions が場所を言う。** 同じ指標を格子セル\
+                 （長辺 1000px 換算で 64px）ごとに測り直し、しきい値を越えたセルを束ねた\
+                 区間を悪い順に最大 5 個、bbox（applied_bbox と同じ入力の画素）・\
+                 normalized_bbox（--bbox <値> --normalized へそのまま渡せる）・score\
+                 （その区間での同じ指標の値）で返す。警告が出なければ regions も出ない",
             ),
         },
         FieldEntry {
@@ -1686,7 +1728,12 @@ fn fields() -> Vec<FieldEntry> {
                  **この値は蛇行だけを見る。** 輪郭が滑らかなまま違う場所にある切り抜き\
                  （実写の照明勾配 + 既定値で、輪郭が真の位置から 59.7px ずれているのに \
                  0.19）はここには出ない。それを捕まえるのは BBOX_RECOMMENDED / \
-                 RIM_CONTAMINATED / HALO_REMAINS で、両方を見ること",
+                 RIM_CONTAMINATED / HALO_REMAINS で、両方を見ること。\
+                 **警告が出たときは data.regions が場所を言う。** 同じ指標を格子セル\
+                 （長辺 1000px 換算で 64px）ごとに測り直し、しきい値を越えたセルを束ねた\
+                 区間を悪い順に最大 5 個、bbox（applied_bbox と同じ入力の画素）・\
+                 normalized_bbox（--bbox <値> --normalized へそのまま渡せる）・score\
+                 （その区間での同じ指標の値）で返す。警告が出なければ regions も出ない",
             ),
         },
         FieldEntry {
@@ -1713,7 +1760,12 @@ fn fields() -> Vec<FieldEntry> {
                  散らばりの中で重なる画素（淡色商品 × 白背景）は判定しないので、帯の\
                  半分以上が判定できなければ値ではなく null を返す。マスクが背景を大きく\
                  飲み込んでいるときは局所前景そのものが背景になるので、値は正解より小さく\
-                 出る（BBOX_RECOMMENDED や HALO_REMAINS が同時に出ていたらそちらを先に読む）",
+                 出る（BBOX_RECOMMENDED や HALO_REMAINS が同時に出ていたらそちらを先に読む）。\
+                 **警告が出たときは data.regions が場所を言う。** 同じ指標を格子セル\
+                 （長辺 1000px 換算で 64px）ごとに測り直し、しきい値を越えたセルを束ねた\
+                 区間を悪い順に最大 5 個、bbox（applied_bbox と同じ入力の画素）・\
+                 normalized_bbox（--bbox <値> --normalized へそのまま渡せる）・score\
+                 （その区間での同じ指標の値）で返す。警告が出なければ regions も出ない",
             ),
         },
         FieldEntry {

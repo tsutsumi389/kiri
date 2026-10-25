@@ -532,6 +532,11 @@ fn to_cutout_args(
             "smooth_contour",
         )?,
         no_reclassify: !settings.reclassify.unwrap_or(true),
+        edge_repair: value_enum(
+            settings.edge_repair.as_deref(),
+            crate::cutout::edge_repair::EdgeRepairMode::Off,
+            "edge_repair",
+        )?,
         background_model: value_enum(
             settings.background_model.as_deref(),
             BackgroundModel::Auto,

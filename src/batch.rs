@@ -195,6 +195,8 @@ pub struct ItemSettings {
     /// 帯の中の二値輪郭に掛けるメディアンの半径(px, 長辺 1000px 換算)
     pub smooth_contour: Option<f64>,
     pub reclassify: Option<bool>,
+    /// 警告の区間だけ境界を解き直すか（"off" / "auto"、既定 "off"）
+    pub edge_repair: Option<String>,
     /// 背景のモデル（"auto" / "flat" / "field"）
     pub background_model: Option<String>,
     /// 背景を無彩色とみなして白点を正すか（"off" / "auto"、既定 "off"）。
@@ -326,6 +328,7 @@ impl ItemSettings {
             matting,
             smooth_contour,
             reclassify,
+            edge_repair,
             background_model,
             white_balance,
             exposure,
@@ -385,6 +388,7 @@ const SETTING_KEYS: &[&str] = &[
     "matting",
     "smooth_contour",
     "reclassify",
+    "edge_repair",
     "background_model",
     "white_balance",
     "exposure",

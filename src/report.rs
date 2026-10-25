@@ -685,6 +685,29 @@ pub struct ReflectReport {
     pub clipped: bool,
 }
 
+/// `--edge-repair auto` が何をしたか。**指定したときだけ出る**（`optimize` と同じ規約）。
+#[derive(Debug, Serialize)]
+pub struct EdgeRepairReport {
+    /// 解き直した窓の数。0 なら何もしていない（成果物は off と同じ）
+    pub repaired: usize,
+    /// 解き直した窓（`[x1, y1, x2, y2]`、両端を含む入力の画素。`applied_bbox` と同じ座標系）
+    pub windows: Vec<[u32; 4]>,
+    /// 見送った理由の警告 code。見送っていなければ null
+    pub gated_by: Option<WarningCode>,
+    /// 1 回目の指標
+    pub before: EdgeRepairMetrics,
+    /// 差し替えた後の指標（`mask.*` と同じ値）
+    pub after: EdgeRepairMetrics,
+}
+
+/// 解き直しの前後で比べる指標。丸めは `mask.*` と同じ小数第 4 位。
+#[derive(Debug, Serialize)]
+pub struct EdgeRepairMetrics {
+    pub halo_ratio: Option<f64>,
+    pub contour_roughness: Option<f64>,
+    pub rim_contamination: Option<f64>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CanvasReport {
     pub width: u32,
@@ -944,6 +967,9 @@ pub struct CutoutReport {
     /// 探索が走ったときだけ出る。`--optimize` 無しではキーごと無い
     #[serde(skip_serializing_if = "Option::is_none")]
     pub optimize: Option<OptimizeReport>,
+    /// `--edge-repair auto` を渡したときだけ出る。off の実行の JSON は 1 バイトも動かない
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edge_repair: Option<EdgeRepairReport>,
     /// `--white-balance` / `--exposure` のどちらかに `auto` を渡したときだけ出る。
     /// 既定（どちらも off）ではキーごと無い——`optimize` / `shadow` /
     /// `compliance` と同じ規約で、**渡さない実行の結果 JSON は 1 バイトも

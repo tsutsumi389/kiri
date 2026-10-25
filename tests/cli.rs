@@ -11121,6 +11121,18 @@ fn every_published_field_exists_in_the_result() {
         "--shadow",
         "synth",
     ]);
+    // **`edge_repair` も `--edge-repair auto` を渡したときだけ現れる。**
+    // 直す区間が無くてもブロックは出る（`repaired` が 0）ので、素材は同じでよい
+    let repaired = run(&[
+        "cutout",
+        input.to_str().unwrap(),
+        "-o",
+        output.to_str().unwrap(),
+        "--dry-run",
+        "--json",
+        "--edge-repair",
+        "auto",
+    ]);
     // **`reflect` も敷いたときだけ現れる。** `shadow` とまったく同じ扱いで、
     // 既定の実行で探すと「配った path が存在しない」になる
     let reflected = run(&[
@@ -11303,6 +11315,7 @@ fn every_published_field_exists_in_the_result() {
                 "cutout" if path.starts_with("constraints.") => &constrained,
                 "cutout" if path.starts_with("optimize.") => &optimized,
                 "cutout" if path.starts_with("shadow.") => &shadowed,
+                "cutout" if path.starts_with("edge_repair.") => &repaired,
                 "cutout" if path.starts_with("reflect.") => &reflected,
                 "cutout" if path.starts_with("color.") => &normalised,
                 "cutout" if path.starts_with("compliance.") => &gated,

@@ -168,6 +168,47 @@ Apple M4 Pro、release、`/usr/bin/time -l` の maximum resident set size。実�
 同時に開く枚数のほうなので、`--jobs 1` は「1 枚ずつ・全コアで」という意味になり、
 いちばん軽くていちばん速い構成である。
 
+## 悪い区間だけ解き直す（`--edge-repair`）
+
+`CONTOUR_ROUGH` / `RIM_CONTAMINATED` が出たまま数値のノブでは動かない素材（布の上の
+濃色の商品）では、輪郭そのものが真の縁より数 px 外を通り、その内側に背景の織り目が
+残っている。直す手は「1 回目の輪郭の少し内側を確定背景、もっと内側を確定前景にした
+トライマップで切り直す」ことで、`--edge-repair auto` はそれを**警告の `data.regions`
+が名指した区間の周りだけ**に掛ける。
+
+```
+kiri cutout in.jpg -o out.png --optimize --edge-repair auto --json
+```
+
+```json
+"edge_repair": {
+  "repaired": 9,
+  "windows": [[39, 2016, 1161, 2625], "..."],
+  "gated_by": null,
+  "before": { "halo_ratio": 0.0239, "contour_roughness": 0.2541, "rim_contamination": 0.0613 },
+  "after":  { "halo_ratio": 0.0068, "contour_roughness": 0.0939, "rim_contamination": 0.0111 }
+}
+```
+
+（実写のリモコン 24.5MP。2 つの警告が消える。`windows` は 9 つのうち 1 つだけを載せた）
+
+- **区間の外は 1 回目の画素のまま**で、継ぎ目は窓の縁から長辺 1000px 換算で 4px
+  かけて混ぜるので段差が出ない。`after` は `mask.*` と同じ値である
+- **切り抜きそのものが外れているときは解き直さない。** `HALO_REMAINS` /
+  `BBOX_RECOMMENDED` / `NOT_SEPARABLE` / `FOREGROUND_TOO_SMALL` /
+  `FOREGROUND_TOO_LARGE` / `SUBJECT_TOUCHES_EDGE` のどれかが出ていれば、
+  `gated_by` にその code を入れて 1 回目をそのまま返す。帯を解き直しても直らず、
+  ベンチでは悪化した。先にその警告の remedy を当てること
+- **時間は 2 回目の切り抜きの分かかる**（24.5MP で探索なし 2.6 → 4.8 秒、
+  `--optimize` 込み 7.8 → 9.8 秒）。直す区間が無ければ 2 回目は走らない
+- 指定しなければ（`off`）成果物も結果 JSON も、この機能を足す前と 1 バイトも変わらない。
+  `auto` を渡して直す区間が無かった実行では、増えるのは `edge_repair` ブロック
+  （`repaired` が 0）だけである
+- **商品の縁が背景と同じ色の画素は、2 回目でも半透明のまま残る**（黒いリモコンの
+  灰色の面取り）。色で解く以上そこのアルファは決められない
+
+帯の幅と門の決め方、27 点のベンチは [設計ドキュメント](../design.md) の 4.18 にある。
+
 ## 孤立ノイズは太さではなく面積で消す
 
 `--cleanup` はオープニング（収縮 → 膨張）ではなく**連結成分の面積フィルタ**で効く。

@@ -15,6 +15,7 @@ use crate::cutout::background::DEFAULT_BORDER;
 use crate::cutout::constraints::{
     ALPHA_BACKGROUND, ALPHA_FOREGROUND, MASK_THRESHOLD, TRIMAP_BACKGROUND, TRIMAP_FOREGROUND,
 };
+use crate::cutout::edge_repair::EdgeRepairMode;
 use crate::cutout::{BackgroundModel, DEFAULT_EDGE_THRESHOLD, Matting, OptimizeFixed};
 use crate::image_io::derive::{DERIVE_KEYS, DeriveSpec};
 use crate::image_io::naming::DEFAULT_TEMPLATE;
@@ -585,6 +586,22 @@ fn shadow_long_help() -> String {
      併せるなら「下地 → 影 → 反射 → 商品」で、影は最下層のままである）。\
      透過を保てる形式（PNG / WebP / AVIF）では影も半透明のアルファとして残る。\n\
      mask ブロックの統計と診断値は影を足す前の商品だけで測る"
+        .to_string()
+}
+
+/// `--edge-repair` の長いヘルプ。
+fn edge_repair_long_help() -> String {
+    "輪郭の警告が名指した区間だけ、境界を解き直す（既定 off）。\n\n\
+     off … 何もしない。成果物も結果 JSON も、この指定を足す前と 1 バイトも変わらない。\n\
+     auto … 1 回目の切り抜きで CONTOUR_ROUGH か RIM_CONTAMINATED が出たら、その \
+     data.regions の周りだけ、1 回目の輪郭の内側に不明の帯（長辺 1000px 換算で 6px）を\
+     置いたトライマップで 2 回目を切り、区間の中だけ 2 回目の画素に差し替える。\
+     区間の外は 1 回目の画素のまま、継ぎ目は重みを滑らかに変えて混ぜる。\
+     2 回目の分だけ時間がかかる（直す区間があれば切り抜きがおよそ 2 倍）。\n\
+     切り抜きそのものが外れているときは解き直さない——HALO_REMAINS / \
+     BBOX_RECOMMENDED / NOT_SEPARABLE / FOREGROUND_TOO_SMALL / FOREGROUND_TOO_LARGE / \
+     SUBJECT_TOUCHES_EDGE のどれかが出ていれば、帯を解き直しても直らない。\
+     結果の edge_repair ブロックが、直した窓と前後の指標、見送った理由を言う"
         .to_string()
 }
 
@@ -1875,6 +1892,18 @@ pub struct CutoutArgs {
     /// 塗り直しは mask.rim_contamination とまったく同じ 2 択で、前景なのに背景寄りの画素を背景へ、背景なのに前景寄りの画素を前景へ移す。切り分けのために切れるようにしてある。
     #[arg(long)]
     pub no_reclassify: bool,
+
+    /// 輪郭の警告が名指した区間だけ、境界を解き直す（既定 off）
+    ///
+    /// ヘルプの本文は `edge_repair_long_help` に置く。何をどこまで変えるかは、
+    /// 指定の前に知っていないと結果を読めない
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = EdgeRepairMode::Off,
+        long_help = edge_repair_long_help()
+    )]
+    pub edge_repair: EdgeRepairMode,
 
     /// 背景を 1 色で持つか、照明場 B(x, y) として持つか
     ///

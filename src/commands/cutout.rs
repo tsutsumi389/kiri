@@ -19,6 +19,7 @@ use crate::cutout::background::UNIFORM_DELTA_E;
 use crate::cutout::constraints::{
     ALPHA_BACKGROUND, ALPHA_FOREGROUND, MASK_THRESHOLD, TRIMAP_BACKGROUND, TRIMAP_FOREGROUND,
 };
+use crate::cutout::edge_repair::{self, Bands, EdgeRepairMode};
 use crate::cutout::mask::FOREGROUND_THRESHOLD;
 use crate::cutout::optimize;
 use crate::cutout::subject::TILT_SHAPE_MIN_FILL;
@@ -31,9 +32,9 @@ use crate::image_io::{IccPolicy, LoadOptions, OutputFormat, SaveOptions, load, s
 use crate::preview::{PreviewSpec, contact_sheet};
 use crate::profile;
 use crate::report::{
-    CanvasReport, ColorReport, ConstraintsReport, CutoutReport, Dimensions, MaskReport,
-    OptimizeCandidate, OptimizeReport, OptimizeScore, ProfileRef, ReflectReport, RotateReport,
-    SCHEMA_VERSION, SettingsReport, ShadowReport,
+    CanvasReport, ColorReport, ConstraintsReport, CutoutReport, Dimensions, EdgeRepairMetrics,
+    EdgeRepairReport, MaskReport, OptimizeCandidate, OptimizeReport, OptimizeScore, ProfileRef,
+    ReflectReport, RotateReport, SCHEMA_VERSION, SettingsReport, ShadowReport,
 };
 use crate::transform::canvas::{CanvasSpec, apply as canvas_apply, composite, plan as canvas_plan};
 use crate::transform::reflect::{self, ReflectMode, ReflectSpec};
@@ -175,6 +176,19 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         (cutout_seen(&loaded.image, &opts, seen), None, None)
     };
     let bbox = opts.bbox;
+
+    // **解き直しは探索の後ろに 1 度だけ掛ける。** 探索の候補ごとに掛けると、
+    // 候補の順位が解き直した後の指標で決まり、`--edge-repair` の有無で
+    // `--optimize` の選ぶ設定まで変わる。選ばれた 1 つの結果だけを直す
+    let edge_repair = match args.edge_repair {
+        EdgeRepairMode::Off => None,
+        EdgeRepairMode::Auto => {
+            let (repaired, outcome) =
+                edge_repair::repair(&loaded.image, &opts, result, seen, &Bands::default());
+            result = repaired;
+            Some(edge_repair_report(&outcome))
+        }
+    };
 
     // **`--rotate auto` はここで畳む。** 新しい幾何は 1 行も書かない——
     // `subject.level_rotation` は「`--rotate` にそのまま渡せる値」として
@@ -450,6 +464,7 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         constraints: opts.constraints.as_ref().map(constraints_report),
         segment: segment_report,
         optimize,
+        edge_repair,
         // 回した実行だけがこのブロックを持つ。`canvas` / `shadow` と同じ規約で、
         // 「回さなかった」と「回せない（古い版）」を `null` で混ぜない
         rotate: rotation,
@@ -462,6 +477,26 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         elapsed_ms: started.elapsed().as_millis(),
         warnings,
     })
+}
+
+/// 解き直しの結果を JSON のブロックへ落とす。丸めは `mask.*` と同じ。
+fn edge_repair_report(outcome: &edge_repair::Outcome) -> EdgeRepairReport {
+    let metrics = |d: &crate::cutout::Diagnostics| EdgeRepairMetrics {
+        halo_ratio: d.halo_ratio.map(round4),
+        contour_roughness: d.contour_roughness.map(round4),
+        rim_contamination: d.rim_contamination.map(round4),
+    };
+    EdgeRepairReport {
+        repaired: outcome.windows.len(),
+        windows: outcome
+            .windows
+            .iter()
+            .map(|&(x1, y1, x2, y2)| [x1, y1, x2, y2])
+            .collect(),
+        gated_by: outcome.gated_by,
+        before: metrics(&outcome.before),
+        after: metrics(&outcome.after),
+    }
 }
 
 /// 入力の矩形が最終画像（派生のリサイズ前）のどこへ写ったか。

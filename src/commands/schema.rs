@@ -1059,6 +1059,82 @@ fn fields() -> Vec<FieldEntry> {
                  stage が final の候補の指標は原寸のものである",
             ),
         },
+        // `edge_repair` ブロックは `--edge-repair auto` を渡した実行にしか現れない
+        // （`optimize` と同じ規約）。off の実行の JSON は 1 バイトも動かない
+        FieldEntry {
+            path: "edge_repair.repaired",
+            appears_in: vec!["cutout"],
+            unit: "count",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "--edge-repair auto が解き直した窓の数（0 なら何もしていない）",
+            notes: Some(
+                "1 回目の切り抜きで CONTOUR_ROUGH か RIM_CONTAMINATED が出たときだけ、その\
+                 data.regions を広げた窓で 2 回目を切って差し替える。0 のときの成果物は\
+                 --edge-repair off と 1 バイトも違わない——警告が出なかったか、gated_by の\
+                 警告が出ていて見送ったかのどちらかである",
+            ),
+        },
+        FieldEntry {
+            path: "edge_repair.windows",
+            appears_in: vec!["cutout"],
+            unit: "list",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "解き直した窓（[x1, y1, x2, y2]、両端を含む入力の画素）の並び",
+            notes: Some(
+                "座標系は applied_bbox と data.regions と同じ（EXIF の向きを適用した後、\
+                 --rotate の前の入力画素）。窓は regions の矩形を長辺 1000px 換算で 8px\
+                 広げたもので、重なりうる。窓の外の画素は 1 回目のまま、窓の縁から内へ\
+                 換算 4px かけて 2 回目へ移る",
+            ),
+        },
+        FieldEntry {
+            path: "edge_repair.gated_by",
+            appears_in: vec!["cutout"],
+            unit: "enum",
+            nullable: true,
+            null_means: Some("見送っていない（解き直したか、直す区間が無かった）"),
+            warns: vec![],
+            gates: None,
+            summary: "解き直しを見送らせた警告の code",
+            notes: Some(
+                "HALO_REMAINS / BBOX_RECOMMENDED / NOT_SEPARABLE / FOREGROUND_TOO_SMALL / \
+                 FOREGROUND_TOO_LARGE / SUBJECT_TOUCHES_EDGE のどれか。どれも縁の位置では\
+                 なく切り抜きそのものが外れていることを言い、帯を解き直しても直らない\
+                 （ベンチでは解き直すと悪化した）。先にその警告の remedy を当てること",
+            ),
+        },
+        FieldEntry {
+            path: "edge_repair.before.contour_roughness",
+            appears_in: vec!["cutout"],
+            unit: "px_at_1000",
+            nullable: true,
+            null_means: Some("測れる輪郭が無かった（mask.contour_roughness と同じ）"),
+            warns: vec![],
+            gates: None,
+            summary: "1 回目の切り抜きの contour_roughness",
+            notes: Some(
+                "before と after はどちらも halo_ratio / contour_roughness / rim_contamination\
+                 の 3 つを mask.* と同じ定義・同じ丸めで持つ。after は mask.* そのもので、\
+                 before は解き直す前の 1 回目の値である",
+            ),
+        },
+        FieldEntry {
+            path: "edge_repair.after.contour_roughness",
+            appears_in: vec!["cutout"],
+            unit: "px_at_1000",
+            nullable: true,
+            null_means: Some("測れる輪郭が無かった（mask.contour_roughness と同じ）"),
+            warns: vec![],
+            gates: None,
+            summary: "差し替えた後の contour_roughness（mask.contour_roughness と同じ値）",
+            notes: None,
+        },
         FieldEntry {
             path: "settings.shadow",
             appears_in: vec!["cutout"],

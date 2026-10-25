@@ -28,6 +28,7 @@ pub mod mask;
 pub mod morphology;
 pub mod optimize;
 pub mod refine;
+pub mod regions;
 pub mod reshape;
 pub mod stage;
 pub mod subject;
@@ -1165,7 +1166,11 @@ fn collect_warnings(
                 // 上げすぎれば商品を食うため、値そのものは示さない。倍率を
                 // 一つ書くと、素材によらずそれが正解であるかのように読まれる
                 .with_hint("--tolerance を上げると背景の残りが減ります")
-                .with_data("halo_ratio", round4(halo)),
+                .with_data("halo_ratio", round4(halo))
+                .with_data(
+                    "regions",
+                    regions_data(&diagnostics.halo_regions(), &diagnostics.local.grid),
+                ),
             );
         }
     }
@@ -1187,7 +1192,11 @@ fn collect_warnings(
                 // **hint は付けない。** 今の kiri に粗さを直すノブは無く、
                 // 実行できない助言は助言が無いより悪い（`--tolerance` を上げても
                 // 蛇行そのものは動かない。動くのは次の指標のほうである）
-                .with_data("contour_roughness", round4(roughness)),
+                .with_data("contour_roughness", round4(roughness))
+                .with_data(
+                    "regions",
+                    regions_data(&diagnostics.roughness_regions(), &diagnostics.local.grid),
+                ),
             );
         }
     }
@@ -1202,7 +1211,11 @@ fn collect_warnings(
                     rim * 100.0,
                 ),
             )
-            .with_data("rim_contamination", round4(rim));
+            .with_data("rim_contamination", round4(rim))
+            .with_data(
+                "regions",
+                regions_data(&diagnostics.rim_regions(), &diagnostics.local.grid),
+            );
             // **`HALO_REMAINS` が一緒に出ているときだけ tolerance を勧める。**
             // 縁が「背景色のまま」残っているなら、tolerance を上げれば減る
             // （実写で確認されている唯一のノブ）。だが汚染だけが出ている状態は
@@ -1259,6 +1272,30 @@ fn collect_warnings(
     }
 
     warnings
+}
+
+/// 警告の `data.regions`。区間ごとに矩形・正規化した矩形・その区間での値を持つ。
+///
+/// **矩形の座標系は `applied_bbox` と同じ**——EXIF の向きを適用した後、
+/// `--rotate` の前の入力画素で、`[x1, y1, x2, y2]` は両端を含む。切り抜きは
+/// その画素の上で走るので、マスクの画素の座標がそのまま入力の座標である。
+/// `normalized_bbox` は `--bbox <値> --normalized` へそのまま渡せる。
+///
+/// 値の丸めは指標と同じ小数第 4 位。並びは悪い順（`regions::regions`）。
+fn regions_data(found: &[regions::Region], grid: &regions::Grid) -> serde_json::Value {
+    serde_json::Value::Array(
+        found
+            .iter()
+            .map(|r| {
+                let (x1, y1, x2, y2) = r.bbox;
+                serde_json::json!({
+                    "bbox": [x1, y1, x2, y2],
+                    "normalized_bbox": regions::normalized(r.bbox, grid.width, grid.height),
+                    "score": round4(r.score),
+                })
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -1350,6 +1387,7 @@ mod tests {
             edge_width: Some(1.5),
             contour_roughness: Some(0.2),
             rim_contamination: Some(0.0),
+            local: Default::default(),
         }
     }
 
@@ -1645,6 +1683,7 @@ mod tests {
                 edge_width: Some(3.0),
                 contour_roughness: Some(0.2),
                 rim_contamination: Some(0.0),
+                local: Default::default(),
             },
             None,
             true,

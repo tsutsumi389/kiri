@@ -992,6 +992,7 @@ mod tests {
             edge_width: None,
             contour_roughness: None,
             rim_contamination: None,
+            local: Default::default(),
         }
     }
 
@@ -1002,6 +1003,7 @@ mod tests {
             edge_width: Some(1.5),
             contour_roughness: Some(0.0),
             rim_contamination: Some(0.0),
+            local: Default::default(),
         }
     }
 

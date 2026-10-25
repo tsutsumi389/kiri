@@ -83,13 +83,13 @@ warning_catalog! {
         remedy: Some("--tolerance を上げるか、残った背景を --bg-polygon で指す"),
     HaloRemains = "HALO_REMAINS"
         => "境界に背景色のままの縁が残っている。--tolerance を上げると減る",
-        remedy: Some("--tolerance を上げる（効く範囲は狭いので --dry-run で確かめる）。直らなければ CONTOUR_ROUGH と同じく --trimap を渡す"),
+        remedy: Some("--tolerance を上げる（効く範囲は狭いので --dry-run で確かめる）。直らなければ CONTOUR_ROUGH と同じく --trimap を渡す。どこに残っているかは data.regions が悪い順に言う"),
     ContourRough = "CONTOUR_ROUGH"
         => "輪郭がギザギザに蛇行している。背景のテクスチャが輪郭に乗っている",
-        remedy: Some("数値の調整では直らない。--debug-mask のマスクを外部の道具で縮めて --trimap を作る。確定背景を輪郭の数 px 内側から、確定前景を 20px ほど内側から取り、そのあいだを不明の帯にする"),
+        remedy: Some("数値の調整では直らない。--debug-mask のマスクを外部の道具で縮めて --trimap を作る。確定背景を輪郭の数 px 内側から、確定前景を 20px ほど内側から取り、そのあいだを不明の帯にする。どこが粗いかは data.regions が悪い順に言う"),
     RimContaminated = "RIM_CONTAMINATED"
         => "縁の色が商品より背景に近い（HALO_REMAINS も出ていれば --tolerance で減る）",
-        remedy: Some("HALO_REMAINS も出ていれば --tolerance を上げる。単独で出ているなら CONTOUR_ROUGH と同じく --trimap を渡す"),
+        remedy: Some("HALO_REMAINS も出ていれば --tolerance を上げる。単独で出ているなら CONTOUR_ROUGH と同じく --trimap を渡す。どこが汚れているかは data.regions が悪い順に言う"),
     MattingNotConverged = "MATTING_NOT_CONVERGED"
         => "closed-form matting が反復の上限で止まった。帯のアルファは解き切れていない",
         remedy: Some("--matting guided に戻す"),

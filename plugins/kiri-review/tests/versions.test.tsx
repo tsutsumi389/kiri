@@ -19,6 +19,8 @@ describe('写しの片付け', () => {
     const keep = new Set(['/v/a-1.png', '/v/a-2.png', '/v/b-1.png'])
     expect(prunePlan(files, keep, 100)).toEqual(['/v/orphan.png'])
     expect(prunePlan(files, keep, 10)).toEqual(['/v/orphan.png', '/v/a-2.png'])
+    // 起動時は、指されていなくても新しい写しは残す（state が戻る前かもしれない）
+    expect(prunePlan(files, keep, 100, -Infinity)).toEqual([])
   })
 })
 

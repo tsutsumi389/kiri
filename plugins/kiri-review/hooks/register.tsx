@@ -616,14 +616,16 @@ async function snapshot($: EngineInterface, abs: string, mtimeMs: number): Promi
 
 /**
  * 片付ける写し: state の画像が指していない写しは全部（state が戻ったあとの残りも含む）。
- * 指している写しも、合計が cap を超えたら古いほうから
+ * 指している写しも、合計が cap を超えたら古いほうから。
+ * `orphanBefore` を渡すと、指されていない写しはそれより前に写したものだけを消す
  */
 export function prunePlan(
   files: readonly { path: string; size: number; mtimeMs: number }[],
   keep: ReadonlySet<string>,
   cap: number = VERSIONS_CAP,
+  orphanBefore: number = Infinity,
 ): string[] {
-  const orphans = files.filter(f => !keep.has(f.path)).map(f => f.path)
+  const orphans = files.filter(f => !keep.has(f.path) && f.mtimeMs < orphanBefore).map(f => f.path)
   const used = files.filter(f => keep.has(f.path)).sort((a, b) => a.mtimeMs - b.mtimeMs)
   let total = used.reduce((n, f) => n + f.size, 0)
   const over: string[] = []
@@ -636,7 +638,10 @@ export function prunePlan(
 }
 
 /** 写しを片付ける。消した写しを指していた画像は、写し無し（前の版の拡大は比べられない）にする */
-async function pruneVersions($: EngineInterface): Promise<void> {
+/** 起動時の片付けで、孤立した写しを残しておく期間 */
+const ORPHAN_GRACE_MS = 7 * 24 * 60 * 60 * 1000
+
+async function pruneVersions($: EngineInterface, orphanBefore: number = Infinity): Promise<void> {
   const dir = versionsDir($)
   try {
     const entries = await $.fs.list(dir)
@@ -645,7 +650,7 @@ async function pruneVersions($: EngineInterface): Promise<void> {
     const files = entries
       .filter(e => e.kind === 'file')
       .map(e => ({ path: `${dir}/${e.name}`, size: e.size ?? 0, mtimeMs: (e as { mtimeMs?: number }).mtimeMs ?? 0 }))
-    const remove = prunePlan(files, keep)
+    const remove = prunePlan(files, keep, VERSIONS_CAP, orphanBefore)
     if (remove.length === 0) return
     await removeFiles($, remove)
     const gone = new Set(remove)
@@ -1105,8 +1110,10 @@ async function revealCurrent($: EngineInterface): Promise<void> {
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    // state が戻ったときに、どの画像も指していない写しを片付ける（読み込みと同じ列で、待たない）
-    queue = queue.then(() => pruneVersions($)).catch(() => undefined)
+    // 前のセッションで孤立した写しを片付ける（読み込みと同じ列で、待たない）。
+    // **state が戻る前に走りうるので、孤立した写しは 7 日より前のものだけ消す。**
+    // 戻る前の空の state で「指されていない」と読むと、使っている写しまで消える
+    queue = queue.then(() => pruneVersions($, Date.now() - ORPHAN_GRACE_MS)).catch(() => undefined)
     await $.command.register({
       name: 'kiri-review',
       description: 'kiri の画像をペインに出し、場所ごとの修正コメントを付ける（複数可）',

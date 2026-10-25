@@ -67,8 +67,9 @@ export type ReviewComment = {
   text: string
   /** 無ければ draft（追跡を足す前のコメント） */
   status?: ReviewStatus
-  /** 送ったときの画像の版 */
-  sentVersion?: number
+  /** 付けたときの画像の寸法。差し替えで寸法が変わったら、範囲を同じ割合の位置へ移す */
+  width?: number
+  height?: number
 }
 
 /** 元画像から原寸で切り出して大きく出している範囲 */

@@ -214,13 +214,50 @@ export function openCounts(all: readonly ReviewComment[]): Map<string, number> {
   return counts
 }
 
-/** 送ったコメントを「送信済み」にし、送ったときの版を覚える。送っている間に消されたものは戻さない */
-export function markSent(
+/** 送ったコメントを「送信済み」にする。送っている間に消されたものは戻さない */
+export function markSent(all: readonly ReviewComment[], ids: ReadonlySet<number>): ReviewComment[] {
+  return all.map(c => (ids.has(c.id) && isSendable(c) ? { ...c, status: 'sent' } : c))
+}
+
+/**
+ * 一覧に残しておく理由になるコメント（未送信、「まだ」、確認待ち）。送信済みのまま差し替わっていない
+ * コメントや直ったものだけの画像は、開き直したら外してよい
+ */
+export function needsAttention(c: Pick<ReviewComment, 'status'>): boolean {
+  const s = statusOf(c)
+  return s === 'draft' || s === 'again' || s === 'check'
+}
+
+/**
+ * 画像の寸法が変わったら、コメントの範囲を同じ割合の位置へ移す。画像全体へのコメントは全体のまま。
+ * 寸法を持たない（寸法を覚える前の）コメントは、一覧にあった前の画像の寸法で付けたものとみなす
+ */
+export function fitComments(
   all: readonly ReviewComment[],
-  ids: ReadonlySet<number>,
-  versions: ReadonlyMap<string, number>,
+  prev: readonly Pick<ReviewImage, 'path' | 'width' | 'height'>[],
+  next: readonly Pick<ReviewImage, 'path' | 'width' | 'height'>[],
 ): ReviewComment[] {
-  return all.map(c => (ids.has(c.id) && isSendable(c) ? { ...c, status: 'sent', sentVersion: versions.get(c.path) ?? 1 } : c))
+  return all.map(c => {
+    const img = next.find(x => x.path === c.path)
+    if (img === undefined) return c
+    const old = prev.find(x => x.path === c.path) ?? img
+    const from = { width: c.width ?? old.width, height: c.height ?? old.height }
+    const size = { width: img.width, height: img.height }
+    if (from.width === img.width && from.height === img.height) return c.width === undefined ? { ...c, ...size } : c
+    if (isWhole(c, from)) return { ...c, ...size, x0: 0, y0: 0, x1: img.width, y1: img.height }
+    const sx = img.width / Math.max(1, from.width)
+    const sy = img.height / Math.max(1, from.height)
+    const x0 = Math.max(0, Math.min(img.width - 1, Math.floor(c.x0 * sx)))
+    const y0 = Math.max(0, Math.min(img.height - 1, Math.floor(c.y0 * sy)))
+    return {
+      ...c,
+      ...size,
+      x0,
+      y0,
+      x1: Math.max(x0 + 1, Math.min(img.width, Math.ceil(c.x1 * sx))),
+      y1: Math.max(y0 + 1, Math.min(img.height, Math.ceil(c.y1 * sy))),
+    }
+  })
 }
 
 /** 差し替わった画像への送信済みのコメントを「確認待ち」にする */
@@ -544,35 +581,96 @@ export function snapshotPath(dir: string, path: string, mtimeMs: number): string
   return `${dir}/${pathKey(path)}-${Math.round(mtimeMs)}${ext}`
 }
 
+/** 版の写しの合計の上限（バイト）。超えたら古い写しから消す */
+export const VERSIONS_CAP = 2 * 1024 ** 3
+
+function versionsDir($: EngineInterface): string {
+  return `${$.plugin.root}/.cache/versions`
+}
+
 /**
  * 元画像を .cache/versions へ写す。kiri が同じパスに書き直したあとも、前の版を原寸で切り出せるように。
- * APFS なら複製（cp -c）で場所を取らない。写せなくても読み込みは止めない
+ * APFS なら複製（cp -c）で場所を取らない。写したあとに元画像の mtime を読み直し、写している間に
+ * 書き換わっていたら写し直す（写しの名前と版の mtime を合わせる）。写せなくても読み込みは止めない
  */
-async function snapshot($: EngineInterface, abs: string, mtimeMs: number): Promise<string> {
-  const dir = `${$.plugin.root}/.cache/versions`
+async function snapshot($: EngineInterface, abs: string, mtimeMs: number): Promise<{ path: string; mtimeMs: number }> {
+  const dir = versionsDir($)
+  let m = mtimeMs
   try {
     await run($, ['mkdir', '-p', dir])
-    // 長く使わなかった写しを片付ける（cp は写した時刻を mtime にする）
-    await run($, ['find', dir, '-type', 'f', '-mtime', '+7', '-delete']).catch(() => undefined)
-    const out = snapshotPath(dir, abs, mtimeMs)
-    await run($, ['cp', '-c', abs, out]).catch(() => run($, ['cp', abs, out]))
-    return out
+    for (let i = 0; i < 2; i++) {
+      const out = snapshotPath(dir, abs, m)
+      await run($, ['cp', '-c', abs, out]).catch(() => run($, ['cp', abs, out]))
+      // cp -c は元の mtime を引き継ぐ。写しの古さ（片付けの順）は写した時刻で数えるので付け直す
+      await run($, ['touch', '-m', out])
+      const after = (await $.fs.stat(abs, { resolve: true })).mtimeMs ?? m
+      if (after === m) return { path: out, mtimeMs: m }
+      await removeFiles($, [out])
+      m = after
+    }
   } catch {
-    return ''
+    // 写しなしで読む
+  }
+  return { path: '', mtimeMs: m }
+}
+
+/**
+ * 片付ける写し: state の画像が指していない写しは全部（state が戻ったあとの残りも含む）。
+ * 指している写しも、合計が cap を超えたら古いほうから
+ */
+export function prunePlan(
+  files: readonly { path: string; size: number; mtimeMs: number }[],
+  keep: ReadonlySet<string>,
+  cap: number = VERSIONS_CAP,
+): string[] {
+  const orphans = files.filter(f => !keep.has(f.path)).map(f => f.path)
+  const used = files.filter(f => keep.has(f.path)).sort((a, b) => a.mtimeMs - b.mtimeMs)
+  let total = used.reduce((n, f) => n + f.size, 0)
+  const over: string[] = []
+  for (const f of used) {
+    if (total <= cap) break
+    over.push(f.path)
+    total -= f.size
+  }
+  return [...orphans, ...over]
+}
+
+/** 写しを片付ける。消した写しを指していた画像は、写し無し（前の版の拡大は比べられない）にする */
+async function pruneVersions($: EngineInterface): Promise<void> {
+  const dir = versionsDir($)
+  try {
+    const entries = await $.fs.list(dir)
+    const list = await read($, images)
+    const keep = new Set(list.flatMap(x => [x.snapshot ?? '', x.before?.snapshot ?? '']).filter(p => p !== ''))
+    const files = entries
+      .filter(e => e.kind === 'file')
+      .map(e => ({ path: `${dir}/${e.name}`, size: e.size ?? 0, mtimeMs: (e as { mtimeMs?: number }).mtimeMs ?? 0 }))
+    const remove = prunePlan(files, keep)
+    if (remove.length === 0) return
+    await removeFiles($, remove)
+    const gone = new Set(remove)
+    await update($, images, l => l.map(x => ({
+      ...x,
+      snapshot: gone.has(x.snapshot ?? '') ? '' : x.snapshot,
+      before: x.before !== undefined && gone.has(x.before.snapshot) ? { ...x.before, snapshot: '' } : x.before,
+    })))
+  } catch {
+    // 片付けられなくても困らない
   }
 }
 
 /** 画像を読み、ペイン用の縮小 JPEG と一覧用のサムネイルを作る（state には触らない） */
 async function load($: EngineInterface, path: string): Promise<ReviewImage> {
   const st = await $.fs.stat(path, { resolve: true })
-  const abs = st.realPath ?? path
-  const mtimeMs = st.mtimeMs ?? 0
+  // 相対パスのままだと、`-` で始まる名前が sips や cp のオプションに読まれる
+  const abs = st.realPath ?? (path.startsWith('/') ? path : `${await $.session.cwd().catch(() => '.')}/${path}`)
   // sips の寸法は回転前の画素。iPhone の HEIC は「回して表示」の指定を持つので、
   // 向きは Quick Look の縮小画像（正立）から取り、縦横が入れ替わっていれば合わせる
   const info = await run($, ['sips', '-g', 'pixelWidth', '-g', 'pixelHeight', '-g', 'hasAlpha', abs])
   const raw = dims(info)
   const hasAlpha = /hasAlpha:\s*yes/.test(info)
-  const snap = await snapshot($, abs, mtimeMs)
+  // 版の mtime は写したあとに読んだもの
+  const { path: snap, mtimeMs } = await snapshot($, abs, st.mtimeMs ?? 0)
   const dir = `${$.plugin.root}/.cache`
   await run($, ['mkdir', '-p', dir])
   const thumbPng = `${dir}/${baseName(abs)}.png`
@@ -668,7 +766,14 @@ async function expand($: EngineInterface, path: string): Promise<string[]> {
 }
 
 /** checking: 差し替わって「確認待ち」になったコメントの数 */
-type Loaded = { loaded: ReviewImage[]; failed: string[]; kept: number; checking: number }
+/** dropped: 一覧の上限を超えて外した画像、lost: それといっしょに消えたコメントの数 */
+type Loaded = { loaded: ReviewImage[]; failed: string[]; kept: number; checking: number; dropped: string[]; lost: number }
+
+/** 上限を超えて外した画像を知らせる文。外していなければ undefined */
+export function droppedNotice(dropped: readonly string[], lost: number): string | undefined {
+  if (dropped.length === 0) return undefined
+  return `一覧は ${MAX_IMAGES} 枚までなので ${dropped.length} 枚を外しました（${dropped.slice(0, 3).map(baseName).join('、')}${dropped.length > 3 ? ' ほか' : ''}${lost > 0 ? `。コメント ${lost} 件も消えました` : ''}）。`
+}
 
 /**
  * 一覧の次の姿。replace なら読んだ画像だけにするが、未解決のコメントのある画像は
@@ -680,7 +785,7 @@ export function mergeImages<T extends { path: string }>(
   loaded: readonly T[],
   replace: boolean,
   commented: ReadonlySet<string>,
-): { next: T[]; kept: number } {
+): { next: T[]; kept: number; dropped: string[] } {
   const isNew = (x: T) => loaded.some(y => y.path === x.path)
   const kept = replace ? prev.filter(x => commented.has(x.path) && !isNew(x)) : []
   const merged = replace
@@ -692,7 +797,10 @@ export function mergeImages<T extends { path: string }>(
     over -= 1
     return false
   })
-  return { next: next.slice(0, MAX_IMAGES), kept: kept.length }
+  const capped = next.slice(0, MAX_IMAGES)
+  // 上限で外したもの（replace で入れ替えた画像は外したことにしない）。黙って消さず、呼び手が知らせる
+  const dropped = merged.filter(x => !capped.includes(x)).map(x => x.path)
+  return { next: capped, kept: kept.length, dropped }
 }
 
 /**
@@ -714,38 +822,45 @@ async function addImages($: EngineInterface, paths: readonly string[], replace: 
   }
   if (loaded.length === 0) {
     if (failed.length > 0) await update($, error, () => failed.join('\n'))
-    return { loaded, failed, kept: 0, checking: 0 }
+    return { loaded, failed, kept: 0, checking: 0, dropped: [], lost: 0 }
   }
   const prev = await read($, images)
   // 同じパスがあれば版を引き継ぎ、中身が変わっていれば前の版を残す
   const carried = loaded.map(x => carryHistory(prev.find(y => y.path === x.path), x))
   const fresh = carried.map(c => c.img)
   const replaced = new Set(carried.filter(c => c.replaced).map(c => c.img.path))
-  const commented = new Set((await read($, comments)).filter(isOpen).map(c => c.path))
-  const { next, kept } = mergeImages(prev, fresh, replace, commented)
+  // 未送信・「まだ」・確認待ちのある画像は、開き直しても一覧に残す
+  const commented = new Set((await read($, comments)).filter(needsAttention).map(c => c.path))
+  const { next, kept, dropped } = mergeImages(prev, fresh, replace, commented)
   const shown = await read($, current)
   // 開くと頼まれたときは読んだ画像へ移る。kiri の書き出しで差し替えるときは、見ている画像のまま
   const stay = replace ? undefined : next.find(x => x.path === shown)
   const first = stay ?? fresh.find(x => next.some(y => y.path === x.path)) ?? next[0]
   await update($, images, () => next)
   // 一覧から外れた画像のコメントは送れないので持ち越さない。差し替わった画像への送信済みは確認待ちへ
-  const checking = (await read($, comments)).filter(c => replaced.has(c.path) && statusOf(c) === 'sent').length
-  await update($, comments, l => markReplaced(l.filter(c => next.some(x => x.path === c.path)), replaced))
+  // 寸法の変わった画像のコメントは、同じ割合の位置へ移す
+  const was = await read($, comments)
+  const checking = was.filter(c => replaced.has(c.path) && statusOf(c) === 'sent').length
+  const lost = was.filter(c => dropped.includes(c.path)).length
+  await update($, comments, l => markReplaced(fitComments(l.filter(c => next.some(x => x.path === c.path)), prev, next), replaced))
   await update($, current, () => first?.path ?? '')
   // 別の画像へ移ったら、「一覧から外す」の確かめと、拡大と前の版の表示はやり直す
   if (first?.path !== shown) await leaveImage($)
   // 見ている画像が差し替わったら、新しい版を出す
   else if (first !== undefined && replaced.has(first.path)) await update($, compare, () => false)
   await revealCurrent($)
-  await update($, error, () => failed.join('\n'))
+  const notice = droppedNotice(dropped, lost)
+  await update($, error, () => [...failed, ...(notice === undefined ? [] : [notice])].join('\n'))
   await rezoom($, prev, next, first?.path ?? '')
   await removeFiles($, staleSnapshots(prev, next))
+  // 片付けは読み込みごとに一度（画像ごとではなく）。state が指していない写しと、上限を超えた分
+  await pruneVersions($)
   // 一覧から外れた画像や、寸法の変わった画像の選択は、別の場所を指すので外す
   await update($, selection, sel => {
     const now = sel === null ? undefined : next.find(x => x.path === sel.path)
     return now === undefined || sel === null || now.width !== sel.width || now.height !== sel.height ? null : sel
   })
-  return { loaded: fresh.filter(x => next.some(y => y.path === x.path)), failed, kept, checking }
+  return { loaded: fresh.filter(x => next.some(y => y.path === x.path)), failed, kept, checking, dropped, lost }
 }
 
 /** 別の画像へ移るときに、その画像だけの表示（外す確かめ、拡大、前の版）を戻す */
@@ -814,12 +929,14 @@ function zoomSerial($: EngineInterface, path: string, c: { x0: number; y0: numbe
 async function openAndReport($: EngineInterface, paths: readonly string[], replace: boolean): Promise<string> {
   if (paths.length === 0) return '画像のパスがありません。'
   try {
-    const { loaded, failed, kept } = await addSerial($, paths, replace)
+    const { loaded, failed, kept, dropped, lost } = await addSerial($, paths, replace)
+    const notice = droppedNotice(dropped, lost)
     const lines = [
       ...(loaded.length === 0
         ? []
         : [`${loaded.length} 枚をペインに出しました。`, ...loaded.map(i => `- ${i.path}（${i.width}×${i.height}）`)]),
       ...(kept > 0 ? [`未解決のコメントのある画像 ${kept} 枚は一覧に残しました。`] : []),
+      ...(notice === undefined ? [] : [notice]),
       ...failed.map(f => `読めませんでした: ${f}`),
     ]
     return lines.length === 0 ? '画像が見つかりませんでした。' : lines.join('\n')
@@ -988,6 +1105,8 @@ async function revealCurrent($: EngineInterface): Promise<void> {
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
+    // state が戻ったときに、どの画像も指していない写しを片付ける（読み込みと同じ列で、待たない）
+    queue = queue.then(() => pruneVersions($)).catch(() => undefined)
     await $.command.register({
       name: 'kiri-review',
       description: 'kiri の画像をペインに出し、場所ごとの修正コメントを付ける（複数可）',
@@ -1038,7 +1157,9 @@ export const register: Register = on => {
     // ペインの都合で Bash の結果を壊さない
     try {
       if ((await read($, images)).length > 0) {
-        const { loaded, checking } = await addSerial($, paths, false)
+        const { loaded, checking, dropped, lost } = await addSerial($, paths, false)
+        const notice = droppedNotice(dropped, lost)
+        if (notice !== undefined) $.ui.toast(`kiri-review: ${notice}`)
         if (loaded.length > 0) {
           $.ui.toast(`kiri-review: ${loaded.length === 1 ? baseName(loaded[0]?.path ?? '') : `${loaded.length} 枚`} を読み直しました${checking > 0 ? `（確認待ち ${checking} 件）` : ''}`)
         }
@@ -1196,7 +1317,7 @@ export const register: Register = on => {
       const prev = await read($, comments)
       const id = Math.max(await read($, lastId), ...prev.map(x => x.id)) + 1
       await update($, lastId, () => id)
-      await update($, comments, l => [...l, { id, path: now.path, x0, y0, x1, y1, text, status: 'draft' as const }])
+      await update($, comments, l => [...l, { id, path: now.path, x0, y0, x1, y1, text, status: 'draft' as const, width: now.width, height: now.height }])
       // 次のコメントは選び直す
       await update($, selection, s => (s !== null && s.path === now.path ? null : s))
     }
@@ -1213,8 +1334,7 @@ export const register: Register = on => {
       const crops = await writeCrops($, now, sending).catch(() => new Map<number, string>())
       await $.prompt.submit({ text: promptFor(now, sending, crops), asUser: true })
       // 送っている間に足したコメントは未送信のまま、消したコメントは消したまま
-      const versions = new Map(now.map(x => [x.path, x.version ?? 1]))
-      await update($, comments, l => markSent(l, new Set(sending.map(c => c.id)), versions))
+      await update($, comments, l => markSent(l, new Set(sending.map(c => c.id))))
       $.ui.toast(`kiri-review: ${sending.length} 件を Claude に送りました`)
     }
 

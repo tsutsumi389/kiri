@@ -18,8 +18,8 @@ describe('指摘の状態', () => {
     expect([...counts]).toEqual([['a', 1], ['b', 2]])
   })
   test('送ったら送信済みと版を付け、差し替わったら送信済みだけ確認待ちにする', async () => {
-    const sent = markSent([c(1, 'a'), c(2, 'a', 'again'), c(3, 'b'), c(4, 'a', 'fixed')], new Set([1, 2, 4]), new Map([['a', 3]]))
-    expect(sent.map(x => [x.status, x.sentVersion])).toEqual([['sent', 3], ['sent', 3], [undefined, undefined], ['fixed', undefined]])
+    const sent = markSent([c(1, 'a'), c(2, 'a', 'again'), c(3, 'b'), c(4, 'a', 'fixed')], new Set([1, 2, 4]))
+    expect(sent.map(x => x.status)).toEqual(['sent', 'sent', undefined, 'fixed'])
     const replaced = markReplaced([...sent, c(5, 'b', 'sent')], new Set(['a']))
     expect(replaced.map(x => x.status)).toEqual(['check', 'check', undefined, 'fixed', 'sent'])
   })

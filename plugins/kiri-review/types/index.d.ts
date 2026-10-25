@@ -16,6 +16,43 @@ export type ReviewVersion = ReviewShot & {
   version: number
 }
 
+/** kiri の警告が指した範囲を、出力画像の画素へ写したもの（左上が原点、右と下の端は含まない） */
+export type KiriRegion = {
+  /** 警告のコード（HALO_REMAINS / CONTOUR_ROUGH / RIM_CONTAMINATED） */
+  code: string
+  score: number
+  x0: number
+  y0: number
+  x1: number
+  y1: number
+}
+
+/** 出力画像と入力画像の対応（kiri の outputs[].source_rect / content_rect。両端を含む） */
+export type KiriMapping = {
+  /** 入力画像のパス（絶対にできなければ kiri に渡したまま） */
+  input: string
+  /** 入力画像の寸法（EXIF を当てたあと） */
+  inputWidth: number
+  inputHeight: number
+  source: [number, number, number, number]
+  content: [number, number, number, number]
+}
+
+/** --edge-repair auto の結果 */
+export type KiriRepair = {
+  repaired: number
+  gatedBy: string | null
+  before: Record<string, number | null>
+  after: Record<string, number | null>
+}
+
+/** kiri の --json の結果から拾った、出力画像 1 枚ぶんの情報 */
+export type KiriInfo = {
+  regions: KiriRegion[]
+  mapping?: KiriMapping
+  repair?: KiriRepair
+}
+
 export type ReviewImage = ReviewShot & {
   /** 元画像の絶対パス */
   path: string
@@ -35,6 +72,8 @@ export type ReviewImage = ReviewShot & {
   version?: number
   /** 一つ前の版。差し替わったことが無ければ無い */
   before?: ReviewVersion
+  /** この版を書いた kiri の結果から拾ったもの。--json の結果が無ければ無い */
+  kiri?: KiriInfo
 }
 
 /** 画像の上をドラッグして選んだ、まだコメントを付けていない範囲（元画像の画素） */

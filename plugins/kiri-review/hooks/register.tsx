@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { ReviewComment, ReviewImage, ReviewSelection, ReviewShot, ReviewStatus, ReviewVersion, ReviewZoom } from '../types'
+import type { KiriInfo, KiriMapping, KiriRegion, KiriRepair, ReviewComment, ReviewImage, ReviewSelection, ReviewShot, ReviewStatus, ReviewVersion, ReviewZoom } from '../types'
 
 const PANE = 'kiri-review'
 // 画像に重ねるドラッグ用の Client の key
@@ -135,6 +135,160 @@ export function outputPaths(command: string, stdout: string): string[] {
   }
   const one = outputPath(command)
   return one === undefined ? [] : [one]
+}
+
+/** 範囲を出力画像に重ねて見せる kiri の警告 */
+export const REGION_CODES: Readonly<Record<string, string>> = {
+  HALO_REMAINS: '縁に背景が残っている',
+  CONTOUR_ROUGH: '輪郭がギザギザ',
+  RIM_CONTAMINATED: '縁に背景の色が混じっている',
+}
+
+type Rect4 = [number, number, number, number]
+
+function rect4(v: unknown): Rect4 | undefined {
+  if (!Array.isArray(v) || v.length !== 4) return undefined
+  if (!v.every((n): n is number => typeof n === 'number' && Number.isFinite(n))) return undefined
+  const [a, b, c, d] = v as Rect4
+  return a <= c && b <= d ? [a, b, c, d] : undefined
+}
+
+/**
+ * 入力画像の画素範囲（両端を含む）を、source_rect の中に切り詰めてから出力画像の画素へ写す。
+ * 写し方は kiri の契約どおり c.x1 + (x - s.x1) × (c.x2-c.x1+1)/(s.x2-s.x1+1)。返す範囲は右と下の端を含まない
+ */
+export function inputToOutput(
+  b: Rect4,
+  m: Pick<KiriMapping, 'source' | 'content'>,
+  out: { width: number; height: number },
+): { x0: number; y0: number; x1: number; y1: number } | undefined {
+  const [s0, s1, s2, s3] = m.source
+  const [c0, c1, c2, c3] = m.content
+  const ix0 = Math.max(b[0], s0)
+  const iy0 = Math.max(b[1], s1)
+  const ix1 = Math.min(b[2], s2)
+  const iy1 = Math.min(b[3], s3)
+  if (ix0 > ix1 || iy0 > iy1) return undefined
+  const kx = (c2 - c0 + 1) / (s2 - s0 + 1)
+  const ky = (c3 - c1 + 1) / (s3 - s1 + 1)
+  const tidy = (v: number) => Math.round(v * 1e6) / 1e6
+  const x0 = Math.max(0, Math.floor(tidy(c0 + (ix0 - s0) * kx)))
+  const y0 = Math.max(0, Math.floor(tidy(c1 + (iy0 - s1) * ky)))
+  const x1 = Math.min(out.width, Math.max(x0 + 1, Math.ceil(tidy(c0 + (ix1 + 1 - s0) * kx))))
+  const y1 = Math.min(out.height, Math.max(y0 + 1, Math.ceil(tidy(c1 + (iy1 + 1 - s1) * ky))))
+  return { x0, y0, x1, y1 }
+}
+
+/**
+ * 出力画像の画素範囲（右と下の端を含まない）を、content_rect の中に切り詰めてから入力画像の画素へ戻す。
+ * 返す範囲は両端を含む（kiri の bbox と同じ）。content_rect に掛からなければ undefined
+ */
+export function outputToInput(
+  r: { x0: number; y0: number; x1: number; y1: number },
+  m: Pick<KiriMapping, 'source' | 'content'>,
+): Rect4 | undefined {
+  const [s0, s1, s2, s3] = m.source
+  const [c0, c1, c2, c3] = m.content
+  const ox0 = Math.max(r.x0, c0)
+  const oy0 = Math.max(r.y0, c1)
+  const ox1 = Math.min(r.x1, c2 + 1)
+  const oy1 = Math.min(r.y1, c3 + 1)
+  if (ox0 >= ox1 || oy0 >= oy1) return undefined
+  const kx = (s2 - s0 + 1) / (c2 - c0 + 1)
+  const ky = (s3 - s1 + 1) / (c3 - c1 + 1)
+  const tidy = (v: number) => Math.round(v * 1e6) / 1e6
+  const x0 = Math.max(s0, Math.floor(tidy(s0 + (ox0 - c0) * kx)))
+  const y0 = Math.max(s1, Math.floor(tidy(s1 + (oy0 - c1) * ky)))
+  return [x0, y0, Math.min(s2, Math.max(x0, Math.ceil(tidy(s0 + (ox1 - c0) * kx)) - 1)), Math.min(s3, Math.max(y0, Math.ceil(tidy(s1 + (oy1 - c1) * ky)) - 1))]
+}
+
+function numbers(v: unknown): Record<string, number | null> {
+  if (v === null || typeof v !== 'object' || Array.isArray(v)) return {}
+  return Object.fromEntries(
+    Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, typeof x === 'number' && Number.isFinite(x) ? x : null]),
+  )
+}
+
+/** edge_repair の塊を読む。無いか形が違えば undefined */
+function repairOf(v: unknown): KiriRepair | undefined {
+  if (v === null || typeof v !== 'object') return undefined
+  const o = v as Record<string, unknown>
+  return {
+    repaired: typeof o.repaired === 'number' ? o.repaired : 0,
+    gatedBy: typeof o.gated_by === 'string' ? o.gated_by : null,
+    before: numbers(o.before),
+    after: numbers(o.after),
+  }
+}
+
+/**
+ * kiri の --json の結果から、出力画像ごとの情報（警告の範囲、入力画像との対応、edge_repair）を拾う。
+ * 鍵は outputs[].path のまま（outputPaths が返すパスと同じ）。input の相対パスは cwd からの絶対パスにする。
+ * source_rect / content_rect の無い出力（--rotate）は範囲を写せないので、範囲も対応も持たない
+ */
+export function kiriInfos(command: string, stdout: string, cwd = ''): Map<string, KiriInfo> {
+  const found = new Map<string, KiriInfo>()
+  if (!isKiri(command)) return found
+  const visit = (report: Record<string, unknown>) => {
+    if (report.dry_run === true || !Array.isArray(report.outputs)) return
+    const source = report.source as { width?: unknown; height?: unknown } | undefined
+    const input = typeof report.input === 'string' ? report.input : ''
+    const abs = input === '' || input.startsWith('/') || !isReachable(command, input) || cwd === '' ? input : `${cwd.replace(/\/$/, '')}/${input}`
+    const warnings = Array.isArray(report.warnings) ? report.warnings : []
+    const repair = repairOf(report.edge_repair)
+    for (const o of report.outputs as unknown[]) {
+      const out = o as { path?: unknown; width?: unknown; height?: unknown; source_rect?: unknown; content_rect?: unknown } | null
+      if (typeof out?.path !== 'string' || !IMAGE_EXT.test(out.path)) continue
+      const s = rect4(out.source_rect)
+      const c = rect4(out.content_rect)
+      const mapping: KiriMapping | undefined =
+        s !== undefined && c !== undefined && typeof source?.width === 'number' && typeof source.height === 'number' && abs !== ''
+          ? { input: abs, inputWidth: source.width, inputHeight: source.height, source: s, content: c }
+          : undefined
+      const size = { width: typeof out.width === 'number' ? out.width : Infinity, height: typeof out.height === 'number' ? out.height : Infinity }
+      const regions: KiriRegion[] = []
+      for (const w of warnings) {
+        const code = (w as { code?: unknown } | null)?.code
+        if (typeof code !== 'string' || !(code in REGION_CODES) || mapping === undefined) continue
+        const list = (w as { data?: { regions?: unknown } }).data?.regions
+        for (const r of Array.isArray(list) ? list.slice(0, 5) : []) {
+          const b = rect4((r as { bbox?: unknown } | null)?.bbox)
+          const score = (r as { score?: unknown }).score
+          const at = b === undefined ? undefined : inputToOutput(b, mapping, size)
+          if (at !== undefined) regions.push({ code, score: typeof score === 'number' ? score : 0, ...at })
+        }
+      }
+      found.set(out.path, { regions, ...(mapping === undefined ? {} : { mapping }), ...(repair === undefined ? {} : { repair }) })
+    }
+  }
+  const walk = (v: unknown): void => {
+    if (Array.isArray(v)) {
+      v.forEach(walk)
+      return
+    }
+    if (v === null || typeof v !== 'object') return
+    const o = v as Record<string, unknown>
+    if (Array.isArray(o.outputs)) visit(o)
+    Object.entries(o).forEach(([k, x]) => {
+      if (k !== 'outputs') walk(x)
+    })
+  }
+  jsonObjects(stdout).forEach(walk)
+  return found
+}
+
+const METRIC_LABEL: Readonly<Record<string, string>> = {
+  halo_ratio: '縁残り',
+  contour_roughness: 'ギザギザ',
+  rim_contamination: '縁の混色',
+}
+
+/** edge_repair を一行に（「境界の解き直し 9 か所: 縁残り 0.0239→0.0068 · …」） */
+export function repairLine(r: KiriRepair): string {
+  const keys = [...new Set([...Object.keys(r.before), ...Object.keys(r.after)])]
+  const show = (v: number | null | undefined) => (typeof v === 'number' ? String(v) : '—')
+  const metrics = keys.map(k => `${METRIC_LABEL[k] ?? k} ${show(r.before[k])}→${show(r.after[k])}`).join(' · ')
+  return `kiri の境界の解き直し ${r.repaired} か所${r.gatedBy === null ? '' : `（見送り: ${r.gatedBy}）`}${metrics === '' ? '' : `: ${metrics}`}`
 }
 
 /** `a.png "b c.png" 'd.jpg'` を引用符を外して分ける */
@@ -537,11 +691,13 @@ export function promptFor(
       return [
         `${i + 1}. ${describeRect(c, img)}: ${c.text}${statusOf(c) === 'again' ? '（再指摘: 前回の修正のあとも直っていません）' : ''}`,
         ...(crop === undefined ? [] : [`   切り抜き: ${crop}（Read で開いて確認できます）`]),
+        ...inputLines(c, img),
       ]
     }),
     '',
   ])
   const hasCrop = all.some(c => crops.has(c.id))
+  const hasInput = groups.some(({ img, items }) => items.some(c => inputLines(c, img).length > 0))
   return [
     groups.length > 1
       ? `${groups.length} 枚の画像に修正コメントが付きました。位置は元画像の画素範囲（左上が原点）です。`
@@ -549,10 +705,32 @@ export function promptFor(
     ...(hasCrop
       ? [`切り抜きは確認用で、範囲の周りに各辺 ${Math.round(CROP_MARGIN * 100)}% の余白を付け、透過部分はマゼンタ（#${CROP_BG}）の上に重ねています。位置の基準は画素範囲です。`]
       : []),
+    ...(hasInput
+      ? ['入力画像の範囲は、kiri の結果の source_rect / content_rect から逆算したものです（両端を含む）。多角形は範囲の四隅で、そのまま --fg-polygon / --bg-polygon に渡せます（normalized は --normalized と併せて）。']
+      : []),
     '',
     ...body,
     '画像の該当範囲を見て、各コメントに対応してください。kiri の出力なら、原因を kiri の設定か実装から探して出し直してください。',
   ].join('\n')
+}
+
+/**
+ * kiri の出力画像へのコメントなら、入力画像での範囲を添える（kiri の --fg-polygon / --bg-polygon にそのまま渡せる形）。
+ * 対応の分からない画像、画像全体へのコメント、余白（content_rect の外）だけのコメントには添えない
+ */
+export function inputLines(c: { x0: number; y0: number; x1: number; y1: number }, img: Pick<ReviewImage, 'width' | 'height' | 'kiri'>): string[] {
+  const m = img.kiri?.mapping
+  if (m === undefined || isWhole(c, img)) return []
+  const r = outputToInput(c, m)
+  if (r === undefined) return []
+  const [x0, y0, x1, y1] = r
+  // 多角形は画素の外周（右と下は端の画素の外側）
+  const corners = [x0, y0, x1 + 1, y0, x1 + 1, y1 + 1, x0, y1 + 1]
+  const norm = corners.map((v, i) => (Math.round((v / (i % 2 === 0 ? m.inputWidth : m.inputHeight)) * 1e4) / 1e4).toString())
+  return [
+    `   入力画像 ${m.input}（${m.inputWidth}×${m.inputHeight} px）では x ${x0}–${x1}, y ${y0}–${y1}`,
+    `   多角形: ${corners.join(',')}（normalized: ${norm.join(',')}）`,
+  ]
 }
 
 async function run($: EngineInterface, argv: string[]): Promise<string> {
@@ -812,14 +990,23 @@ export function mergeImages<T extends { path: string }>(
  * 画像を読み、一覧へ入れる。replace なら一覧をこの画像たちで置き換え、そうでなければ
  * 同じパスは差し替え、新しいものは末尾に足す。大きく出すのは最初に読めた画像
  */
-async function addImages($: EngineInterface, paths: readonly string[], replace: boolean): Promise<Loaded> {
+async function addImages(
+  $: EngineInterface,
+  paths: readonly string[],
+  replace: boolean,
+  infos: ReadonlyMap<string, KiriInfo> = new Map(),
+): Promise<Loaded> {
   // 一覧に入りきらない分は読まない
   const expanded = (await Promise.all(paths.map(p => expand($, p)))).flat().slice(0, MAX_IMAGES)
   const loaded: ReviewImage[] = []
   const failed: string[] = []
+  // 読んだ画像（絶対パス）ごとの kiri の結果
+  const infoOf = new Map<string, KiriInfo>()
   for (const p of expanded) {
     try {
       const img = await load($, p)
+      const info = infos.get(p)
+      if (info !== undefined) infoOf.set(img.path, info)
       if (!loaded.some(x => x.path === img.path)) loaded.push(img)
     } catch (err) {
       failed.push(`${p}: ${err instanceof Error ? err.message : String(err)}`)
@@ -832,7 +1019,11 @@ async function addImages($: EngineInterface, paths: readonly string[], replace: 
   const prev = await read($, images)
   // 同じパスがあれば版を引き継ぎ、中身が変わっていれば前の版を残す
   const carried = loaded.map(x => carryHistory(prev.find(y => y.path === x.path), x))
-  const fresh = carried.map(c => c.img)
+  // kiri の指摘は書いた版のもの。新しい結果があればそれに替え、結果なしに差し替わったら消す
+  const fresh = carried.map(({ img, replaced: isReplaced }) => {
+    const kiri = infoOf.get(img.path) ?? (isReplaced ? undefined : prev.find(y => y.path === img.path)?.kiri)
+    return kiri === undefined ? img : { ...img, kiri }
+  })
   const replaced = new Set(carried.filter(c => c.replaced).map(c => c.img.path))
   // 未送信・「まだ」・確認待ちのある画像は、開き直しても一覧に残す
   const commented = new Set((await read($, comments)).filter(needsAttention).map(c => c.path))
@@ -902,8 +1093,13 @@ async function rezoom($: EngineInterface, prev: readonly ReviewImage[], next: re
 // 1 本ずつ流し、あとから頼んだ画像が最後に state に残るようにする
 let queue: Promise<unknown> = Promise.resolve()
 
-function addSerial($: EngineInterface, paths: readonly string[], replace: boolean): Promise<Loaded> {
-  const done = queue.then(() => addImages($, paths, replace))
+function addSerial(
+  $: EngineInterface,
+  paths: readonly string[],
+  replace: boolean,
+  infos?: ReadonlyMap<string, KiriInfo>,
+): Promise<Loaded> {
+  const done = queue.then(() => addImages($, paths, replace, infos))
   queue = done.catch(() => undefined)
   return done
 }
@@ -1004,7 +1200,17 @@ export function fullView(img: ReviewImage, shot: ReviewShot = img): SvgView {
  * 画像（view が拡大なら、その範囲）にコメントの枠と番号、選んでいる範囲を重ねた SVG。
  * 位置は元画像の画素で持っているので、view の範囲に合わせて写す。拡大では範囲に入るコメントだけ描く
  */
-export function svgFor(img: ReviewImage, list: readonly ReviewComment[], sel: ReviewSelection | null, view: SvgView = fullView(img)): string {
+/** kiri の指摘の枠の色（橙の点線）。コメントの枠と見分ける */
+export const KIRI_COLOR = '#f97316'
+
+export function svgFor(
+  img: ReviewImage,
+  list: readonly ReviewComment[],
+  sel: ReviewSelection | null,
+  view: SvgView = fullView(img),
+  /** kiri の指摘を重ねるか。前の版を出すときは、今の版の指摘なので重ねない */
+  withKiri = true,
+): string {
   const W = view.previewWidth
   const H = view.previewHeight
   const sx = W / Math.max(1, view.w)
@@ -1016,6 +1222,16 @@ export function svgFor(img: ReviewImage, list: readonly ReviewComment[], sel: Re
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">`,
     `<image href="data:image/jpeg;base64,${view.preview}" x="0" y="0" width="${W}" height="${H}"/>`,
   ]
+  // kiri の指摘はコメントの下に敷く（K1 から番号を振り、ペインの一覧と合わせる）
+  ;(withKiri ? img.kiri?.regions ?? [] : []).forEach((r, i) => {
+    if (r.x1 <= view.x || r.x0 >= view.x + view.w || r.y1 <= view.y || r.y0 >= view.y + view.h) return
+    const x = px(r.x0)
+    const y = py(r.y0)
+    parts.push(`<rect x="${x}" y="${y}" width="${Math.max(1, px(r.x1) - x)}" height="${Math.max(1, py(r.y1) - y)}" fill="none" stroke="${KIRI_COLOR}" stroke-width="2" stroke-dasharray="4 3"/>`)
+    const tx = Math.min(W - 18, Math.max(0, x) + 2)
+    const ty = Math.max(11, Math.min(H - 2, y - 3))
+    parts.push(`<text x="${tx}" y="${ty}" font-size="10" font-family="sans-serif" font-weight="bold" fill="${KIRI_COLOR}" stroke="#000" stroke-width="2" paint-order="stroke">K${i + 1}</text>`)
+  })
   list.forEach((m, i) => {
     const whole = isWhole(m, img)
     // 拡大では、場所の無い画像全体へのコメントと、範囲の外のコメントは描かない
@@ -1164,7 +1380,9 @@ export const register: Register = on => {
     // ペインの都合で Bash の結果を壊さない
     try {
       if ((await read($, images)).length > 0) {
-        const { loaded, checking, dropped, lost } = await addSerial($, paths, false)
+        const cwd = await $.session.cwd().catch(() => '')
+        const infos = kiriInfos(e.command, typeof stdout === 'string' ? stdout : '', cwd)
+        const { loaded, checking, dropped, lost } = await addSerial($, paths, false, infos)
         const notice = droppedNotice(dropped, lost)
         if (notice !== undefined) $.ui.toast(`kiri-review: ${notice}`)
         if (loaded.length > 0) {
@@ -1329,6 +1547,23 @@ export const register: Register = on => {
       await update($, selection, s => (s !== null && s.path === now.path ? null : s))
     }
 
+    // kiri の指摘を、その範囲への未送信のコメントにする（同じ指摘を二度足さない）
+    const regions = img.kiri?.regions ?? []
+    const regionText = (r: KiriRegion, k: number) => `[${r.code}] ${REGION_CODES[r.code] ?? ''}（kiri の指摘 K${k + 1}、score ${r.score}）`
+    const isTaken = (r: KiriRegion, k: number) =>
+      mine.some(c => c.x0 === r.x0 && c.y0 === r.y0 && c.x1 === r.x1 && c.y1 === r.y1 && c.text === regionText(r, k))
+    const fromRegion = async (k: number) => {
+      const now = (await read($, images)).find(x => x.path === img.path)
+      const r = now?.kiri?.regions[k]
+      if (now === undefined || r === undefined) return
+      const text = regionText(r, k)
+      const prev = await read($, comments)
+      if (prev.some(c => c.path === now.path && c.x0 === r.x0 && c.y0 === r.y0 && c.x1 === r.x1 && c.y1 === r.y1 && c.text === text)) return
+      const id = Math.max(await read($, lastId), ...prev.map(x => x.id)) + 1
+      await update($, lastId, () => id)
+      await update($, comments, l => [...l, { id, path: now.path, x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y1, text, status: 'draft' as const, width: now.width, height: now.height }])
+    }
+
     const setStatus = (id: number, status: ReviewStatus) =>
       void update($, comments, l => l.map(x => (x.id === id ? { ...x, status } : x)))
 
@@ -1356,7 +1591,7 @@ export const register: Register = on => {
       }
     }
 
-    const svg = svgFor(img, mine, showBefore ? null : sel, view)
+    const svg = svgFor(img, mine, showBefore ? null : sel, view, !showBefore)
     // 画像を描けるのは Svg のある面（ターミナルには無い）
     const canSvg = e.surface !== 'terminal'
     // 画像の上でドラッグして選べるのは、Client を描ける面（デスクトップ）だけ。
@@ -1430,6 +1665,7 @@ export const register: Register = on => {
           {list.length > 1 ? `${index + 1}/${list.length} · ` : ''}{baseName(img.path)} · {img.width}×{img.height}
           {(img.version ?? 1) > 1 ? ` · 第 ${img.version} 版` : ''}
         </Text>
+        {img.kiri?.repair !== undefined && <Text dimColor>{repairLine(img.kiri.repair)}</Text>}
         <Box flexDirection="row" gap={1}>
           <Text bold={mySel !== null || showBefore}>{hint}</Text>
           {mySel !== null && !showBefore && canSvg && (
@@ -1484,6 +1720,20 @@ export const register: Register = on => {
                 </Box>
               )
             })}
+          </Box>
+        )}
+        {regions.length > 0 && !showBefore && (
+          <Box flexDirection="column">
+            <Text color="yellow">kiri の指摘（橙の点線） {regions.length} 件</Text>
+            {regions.map((r, k) => (
+              <Box key={`k${k}`} flexDirection="row" gap={1}>
+                <Text>K{k + 1}. {r.code} {REGION_CODES[r.code] ?? ''}<Text dimColor>（score {r.score}）</Text></Text>
+                {canSvg && <Button key={`kzoom${k}`} plain dimColor label="拡大" onPress={() => void zoomSerial($, img.path, r)} />}
+                {isTaken(r, k)
+                  ? <Text dimColor>コメント済み</Text>
+                  : <Button key={`kcomment${k}`} plain label="コメントにする" onPress={() => void fromRegion(k)} />}
+              </Box>
+            ))}
           </Box>
         )}
         {others > 0 && <Text dimColor>ほかの画像に {others} 件あります（一緒に送ります）。</Text>}

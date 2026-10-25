@@ -257,19 +257,48 @@ pub fn trimap(
     out
 }
 
-/// 窓の中で 2 回目をどれだけ使うか（0〜1）。窓の縁から `blend` px かけて 0 → 1。
+/// 窓の和の中で、和の縁までのチェビシェフ距離（px）。和の外は 0、縁の画素は 1。
 ///
-/// 窓が重なれば大きいほうを採る（和の中は和の縁から測るのと同じ）。
-fn weight(windows: &[Window], x: u32, y: u32, blend: f64) -> f64 {
-    let mut best = 0.0f64;
+/// **窓ごとの縁からの距離の最大では足りない。** 2 つの窓が混ぜる幅の 2 倍より
+/// 浅く重なると、重なりの画素はどちらの窓の縁にも近く、和の奥にあるのに重みが
+/// 下がる——継ぎ目に 1 回目へ戻る筋が残る（CONTOUR_ROUGH と RIM_CONTAMINATED の
+/// 窓は同じ辺で範囲が少しずつ違うので、普通に起きる）。和そのものの距離を測る。
+///
+/// 外接矩形の外は和の外なので、1 画素ぶん外側に 0 の縁を付けて測る。
+fn union_depth(windows: &[Window], hull: Window) -> (Vec<u16>, usize) {
+    let (x0, y0) = (hull.0 as usize, hull.1 as usize);
+    let w = (hull.2 - hull.0) as usize + 3;
+    let h = (hull.3 - hull.1) as usize + 3;
+    let mut d = vec![0u16; w * h];
     for &(x1, y1, x2, y2) in windows {
-        if x < x1 || x > x2 || y < y1 || y > y2 {
-            continue;
+        for y in y1 as usize..=y2 as usize {
+            let row = (y - y0 + 1) * w;
+            for x in x1 as usize..=x2 as usize {
+                d[row + x - x0 + 1] = u16::MAX;
+            }
         }
-        let inside = (x - x1).min(x2 - x).min(y - y1).min(y2 - y) as f64;
-        best = best.max(((inside + 0.5) / blend).min(1.0));
     }
-    best
+    for y in 1..h - 1 {
+        for x in 1..w - 1 {
+            let i = y * w + x;
+            if d[i] == 0 {
+                continue;
+            }
+            let near = d[i - 1].min(d[i - w - 1]).min(d[i - w]).min(d[i - w + 1]);
+            d[i] = d[i].min(near.saturating_add(1));
+        }
+    }
+    for y in (1..h - 1).rev() {
+        for x in (1..w - 1).rev() {
+            let i = y * w + x;
+            if d[i] == 0 {
+                continue;
+            }
+            let near = d[i + 1].min(d[i + w + 1]).min(d[i + w]).min(d[i + w - 1]);
+            d[i] = d[i].min(near.saturating_add(1));
+        }
+    }
+    (d, w)
 }
 
 /// 2 回目を 1 回目の上へ混ぜる（1 回目をその場で書き換える）。窓の外は
@@ -296,12 +325,15 @@ pub fn composite(
     let Some((hx1, hy1, hx2, hy2)) = hull(windows) else {
         return;
     };
+    let (depth, dw) = union_depth(windows, (hx1, hy1, hx2, hy2));
     for y in hy1..=hy2 {
         for x in hx1..=hx2 {
-            let t = weight(windows, x, y, blend);
-            if t == 0.0 {
+            // 窓の縁から `blend` px かけて 0 → 1。縁の画素（距離 1）は 0.5 / blend
+            let d = depth[((y - hy1) as usize + 1) * dw + (x - hx1) as usize + 1];
+            if d == 0 {
                 continue;
             }
+            let t = ((f64::from(d) - 0.5) / blend).min(1.0);
             let i = (y as usize) * (w as usize) + (x as usize);
             let mix = |a: u8, b: u8| (f64::from(a) * (1.0 - t) + f64::from(b) * t).round() as u8;
             let a = mix(mask.as_slice()[i], second.1.as_slice()[i]);
@@ -339,6 +371,10 @@ pub struct Outcome {
 
 /// 1 回目の結果から、警告の区間だけを解き直した結果を作る。
 ///
+/// **`subject` と設定の値（堤防・帯幅）は 1 回目のまま**である。どちらも
+/// 「どう切ったか」の側の値で、差し替えるのは窓の中の輪郭の数 px だけなので、
+/// 主体の矩形は動かない。
+///
 /// 解き直す区間が無ければ（警告が無い、`GATES` に当たった）、`first` を
 /// **そのまま**返す——画素も警告も 1 バイトも動かない。
 ///
@@ -352,11 +388,21 @@ pub fn repair(
     seen: Option<&BackgroundSeen>,
     bands: &Bands,
 ) -> (CutoutResult, Outcome) {
+    // **直すものがあったときだけ「見送った」と言う。** 縁の警告が出ていない
+    // 切り抜きで門の code を返すと、直す必要があったのに止めたと読まれる
+    let wanted = first
+        .diagnostics
+        .contour_roughness
+        .is_some_and(|v| v > CONTOUR_ROUGH_WARN)
+        || first
+            .diagnostics
+            .rim_contamination
+            .is_some_and(|v| v > RIM_CONTAMINATION_WARN);
     let gated_by = first
         .warnings
         .iter()
         .map(|w| w.code)
-        .find(|c| GATES.contains(c));
+        .find(|c| wanted && GATES.contains(c));
     let windows = windows(&first.diagnostics, &first.warnings, bands);
     if windows.is_empty() {
         let outcome = Outcome {
@@ -367,19 +413,17 @@ pub fn repair(
         };
         return (first, outcome);
     }
-    let second = cutout_seen(
-        image,
-        &CutoutOptions {
-            constraints: Some(trimap(
-                &first.mask,
-                &windows,
-                bands,
-                opts.constraints.as_ref(),
-            )),
-            ..opts.clone()
-        },
-        seen,
-    );
+    // 指示の表（24.5MP で 24.5MB）を複製してから捨てないよう、表を抜いた
+    // 設定を複製してからトライマップを差す
+    let mut again = opts.clone_without_constraints();
+    again.constraints = Some(trimap(
+        &first.mask,
+        &windows,
+        bands,
+        opts.constraints.as_ref(),
+    ));
+    let second = cutout_seen(image, &again, seen);
+    drop(again);
     let CutoutResult {
         image: mut out,
         mut mask,
@@ -405,6 +449,14 @@ pub fn repair(
         &windows,
         bands,
     );
+    // **2 回目の設定の警告も持ち越す。** 窓の中は 2 回目の画素なので、
+    // 2 回目の matting が解き切れなかった（`MATTING_NOT_CONVERGED`）なら、
+    // そう言わないと黙って使ったことになる。1 回目と同じ code は重ねない
+    let carried: Vec<Warning> = second.warnings[..second.judged_from]
+        .iter()
+        .filter(|w| !warnings[..judged_from].iter().any(|x| x.code == w.code))
+        .cloned()
+        .collect();
     // 2 回目はここで手放す。24.5MP では画像だけで 98MB ある
     drop(second);
     let stats = mask.stats();
@@ -412,6 +464,8 @@ pub fn repair(
     // 設定の警告（堤防・場・matting）は 1 回目のまま正しい。結果の警告だけを
     // 混ぜたマスクで判定し直して入れ替える
     warnings.truncate(judged_from);
+    warnings.extend(carried);
+    let judged_from = warnings.len();
     warnings.extend(collect_warnings(
         &background,
         &residual,
@@ -577,6 +631,29 @@ mod tests {
                 (pair[0] - pair[1]).abs() <= 255 / 4 + 1,
                 "段差がある: {column:?}"
             );
+        }
+    }
+
+    /// 浅く重なった 2 つの窓の重なりは、和の奥なので 2 回目そのものになる。
+    /// 窓ごとの縁からの距離で重みを決めると、ここに 1 回目へ戻る筋が残る。
+    #[test]
+    fn a_shallow_overlap_of_two_windows_leaves_no_seam() {
+        let source = RgbaImage::from_pixel(200, 200, image::Rgba([0, 0, 0, 255]));
+        let mut image = RgbaImage::from_pixel(200, 200, image::Rgba([0, 0, 0, 255]));
+        let mut mask = Mask::new(200, 200, 255);
+        let second = (
+            RgbaImage::from_pixel(200, 200, image::Rgba([0, 0, 0, 0])),
+            Mask::new(200, 200, 0),
+        );
+        composite(
+            &source,
+            (&mut image, &mut mask),
+            (&second.0, &second.1),
+            &[(10, 20, 100, 180), (98, 20, 150, 180)],
+            &Bands::default(),
+        );
+        for x in 20..140 {
+            assert_eq!(mask.get(x, 100), 0, "x = {x} に筋が残った");
         }
     }
 

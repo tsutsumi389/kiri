@@ -152,6 +152,35 @@ pub struct CutoutOptions {
     pub background_model: BackgroundModel,
 }
 
+impl CutoutOptions {
+    /// 指示の表だけを持たない複製。**表は 24.5MP で 24.5MB ある**ので、差し替える
+    /// 側（`edge_repair::repair`）が複製してから捨てずに済むようにする。
+    ///
+    /// `..self.clone()` で書かないのは、それだと表まで複製されるからである。
+    /// 項目を全部並べるので、足した項目を書き忘れればコンパイルが通らない
+    pub(crate) fn clone_without_constraints(&self) -> Self {
+        Self {
+            tolerance: self.tolerance,
+            border: self.border,
+            bbox: self.bbox,
+            fg_seeds: self.fg_seeds.clone(),
+            constraints: None,
+            cleanup: self.cleanup,
+            feather: self.feather,
+            despill: self.despill,
+            edge_threshold: self.edge_threshold,
+            step_tolerance: self.step_tolerance,
+            shadow_tolerance: self.shadow_tolerance,
+            seal: self.seal,
+            refine: self.refine,
+            matting: self.matting,
+            smooth_contour: self.smooth_contour,
+            reclassify: self.reclassify,
+            background_model: self.background_model,
+        }
+    }
+}
+
 impl Default for CutoutOptions {
     fn default() -> Self {
         Self {

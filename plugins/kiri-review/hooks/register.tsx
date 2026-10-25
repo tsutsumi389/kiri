@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { ReviewComment, ReviewImage, ReviewSelection } from '../types'
+import type { ReviewComment, ReviewImage, ReviewSelection, ReviewShot, ReviewStatus, ReviewVersion, ReviewZoom } from '../types'
 
 const PANE = 'kiri-review'
 // 画像に重ねるドラッグ用の Client の key
@@ -33,6 +33,10 @@ const lastId = atom({ plugin: 'kiri-review', key: 'lastId' } as const, 0)
 const stripOffset = atom({ plugin: 'kiri-review', key: 'stripOffset' } as const, 0)
 // 「一覧から外す」を一度押した画像。コメントごと消えるので、もう一度押して確かめる
 const confirmRemove = atom({ plugin: 'kiri-review', key: 'confirmRemove' } as const, '')
+// 拡大して出している範囲と、前の版を出しているか
+const zoom = atom({ plugin: 'kiri-review', key: 'zoom' } as const, null as ReviewZoom | null)
+const compare = atom({ plugin: 'kiri-review', key: 'compare' } as const, false)
+const busy = atom({ plugin: 'kiri-review', key: 'busy' } as const, '')
 
 const IMAGE_EXT = /\.(png|jpe?g|webp|avif|heic|tiff?|gif|bmp)$/i
 
@@ -188,6 +192,42 @@ export function describeRect(c: { x0: number; y0: number; x1: number; y1: number
   return `x ${c.x0}–${c.x1}, y ${c.y0}–${c.y1} px（横 ${pct(c.x0, img.width)}–${pct(c.x1, img.width)}%、縦 ${pct(c.y0, img.height)}–${pct(c.y1, img.height)}%）`
 }
 
+export function statusOf(c: Pick<ReviewComment, 'status'>): ReviewStatus {
+  return c.status ?? 'draft'
+}
+
+/** 次の「Claude に送る」に入るコメント（まだ送っていないものと、「まだ」を付けたもの） */
+export function isSendable(c: Pick<ReviewComment, 'status'>): boolean {
+  const s = statusOf(c)
+  return s === 'draft' || s === 'again'
+}
+
+/** 直ったと確かめていないコメント。一覧の件数はこれを数える */
+export function isOpen(c: Pick<ReviewComment, 'status'>): boolean {
+  return statusOf(c) !== 'fixed'
+}
+
+/** 画像ごとの未解決（直ったを付けていない）コメントの数 */
+export function openCounts(all: readonly ReviewComment[]): Map<string, number> {
+  const counts = new Map<string, number>()
+  for (const c of all) if (isOpen(c)) counts.set(c.path, (counts.get(c.path) ?? 0) + 1)
+  return counts
+}
+
+/** 送ったコメントを「送信済み」にし、送ったときの版を覚える。送っている間に消されたものは戻さない */
+export function markSent(
+  all: readonly ReviewComment[],
+  ids: ReadonlySet<number>,
+  versions: ReadonlyMap<string, number>,
+): ReviewComment[] {
+  return all.map(c => (ids.has(c.id) && isSendable(c) ? { ...c, status: 'sent', sentVersion: versions.get(c.path) ?? 1 } : c))
+}
+
+/** 差し替わった画像への送信済みのコメントを「確認待ち」にする */
+export function markReplaced(all: readonly ReviewComment[], replaced: ReadonlySet<string>): ReviewComment[] {
+  return all.map(c => (replaced.has(c.path) && statusOf(c) === 'sent' ? { ...c, status: 'check' } : c))
+}
+
 /** 切り抜きの余白（範囲の辺の長さに対する割合）と、その最小（px） */
 export const CROP_MARGIN = 0.15
 const CROP_MARGIN_MIN = 16
@@ -219,7 +259,7 @@ export function cropSize(w: number, h: number): { w: number; h: number } {
 /**
  * 切り抜いて背景に重ね、PNG に書く JXA（osascript -l JavaScript -e で渡す）。
  * NSImage は表示の向きで読む（HEIC の回転も反映済み）ので、表示の向きの座標のまま切り抜ける。
- * 引数: 元画像 書き出し先 表示の幅 高さ 切り抜く x y w h 書き出す幅 高さ 背景色（16 進、空なら塗らない）
+ * 引数: 元画像 書き出し先 表示の幅 高さ 切り抜く x y w h 書き出す幅 高さ 背景色（16 進か CHECKER、空なら塗らない）
  */
 export const CROP_JXA = `function run(argv) {
   ObjC.import('AppKit')
@@ -230,15 +270,31 @@ export const CROP_JXA = `function run(argv) {
   // NSImage の座標は点で、左下が原点
   const sx = im.size.width / n(W)
   const sy = im.size.height / n(H)
+  // 市松模様は、ビットマップの文脈を立てる前に模様の画像を作っておく
+  let fill = null
+  if (bg === 'checker') {
+    const t = 8
+    const pat = $.NSImage.alloc.initWithSize($.NSMakeSize(2 * t, 2 * t))
+    pat.lockFocus
+    $.NSColor.colorWithSRGBRedGreenBlueAlpha(1, 1, 1, 1).setFill
+    $.NSRectFill($.NSMakeRect(0, 0, 2 * t, 2 * t))
+    $.NSColor.colorWithSRGBRedGreenBlueAlpha(0.78, 0.78, 0.78, 1).setFill
+    $.NSRectFill($.NSMakeRect(0, 0, t, t))
+    $.NSRectFill($.NSMakeRect(t, t, t, t))
+    pat.unlockFocus
+    fill = $.NSColor.colorWithPatternImage(pat)
+  } else if (bg) {
+    const c = parseInt(bg, 16)
+    fill = $.NSColor.colorWithSRGBRedGreenBlueAlpha(((c >> 16) & 255) / 255, ((c >> 8) & 255) / 255, (c & 255) / 255, 1)
+  }
   const rep = $.NSBitmapImageRep.alloc.initWithBitmapDataPlanesPixelsWidePixelsHighBitsPerSampleSamplesPerPixelHasAlphaIsPlanarColorSpaceNameBytesPerRowBitsPerPixel(null, n(outW), n(outH), 8, 4, true, false, $.NSDeviceRGBColorSpace, 0, 0)
   const ctx = $.NSGraphicsContext.graphicsContextWithBitmapImageRep(rep)
   $.NSGraphicsContext.saveGraphicsState
   $.NSGraphicsContext.setCurrentContext(ctx)
   ctx.setImageInterpolation($.NSImageInterpolationHigh)
   const dst = $.NSMakeRect(0, 0, n(outW), n(outH))
-  if (bg) {
-    const c = parseInt(bg, 16)
-    $.NSColor.colorWithSRGBRedGreenBlueAlpha(((c >> 16) & 255) / 255, ((c >> 8) & 255) / 255, (c & 255) / 255, 1).setFill
+  if (fill !== null) {
+    fill.setFill
     $.NSRectFill(dst)
   }
   im.drawInRectFromRectOperationFraction(dst, $.NSMakeRect(n(x) * sx, (n(H) - n(y) - n(h)) * sy, n(w) * sx, n(h) * sy), $.NSCompositingOperationSourceOver, 1)
@@ -248,6 +304,9 @@ export const CROP_JXA = `function run(argv) {
   if (!png.writeToFileAtomically(out, true)) throw new Error('書けません: ' + out)
   return out
 }`
+
+/** 透過部分に敷く市松模様（拡大とペインの縮小用）。CROP_JXA の背景色の代わりに渡す */
+export const CHECKER = 'checker'
 
 /**
  * 切り抜きを書く手順（コマンドの列）。info は元画像の `sips -g pixelWidth -g pixelHeight -g hasAlpha -g orientation`。
@@ -261,7 +320,18 @@ export function cropCommands(
   out: string,
 ): string[][] {
   const r = cropRect(c, img)
-  const size = cropSize(r.w, r.h)
+  return cropCommandsFor(img, r, cropSize(r.w, r.h), info, out, CROP_BG)
+}
+
+/** r（表示の向きの画素）を切り抜き、size の PNG にして out へ書く手順。透過は bg の上に重ねる */
+export function cropCommandsFor(
+  img: Pick<ReviewImage, 'path' | 'width' | 'height'>,
+  r: { x: number; y: number; w: number; h: number },
+  size: { w: number; h: number },
+  info: string,
+  out: string,
+  bg: string,
+): string[][] {
   const rawW = Number(info.match(/pixelWidth:\s*(\d+)/)?.[1])
   const rawH = Number(info.match(/pixelHeight:\s*(\d+)/)?.[1])
   const orientation = info.match(/orientation:\s*(\d+)/)?.[1]
@@ -273,7 +343,7 @@ export function cropCommands(
     !/\.(heic|heif|avif)$/i.test(img.path)
   if (!isPlain) {
     return [['osascript', '-l', 'JavaScript', '-e', CROP_JXA, img.path, out,
-      ...[img.width, img.height, r.x, r.y, r.w, r.h, size.w, size.h].map(String), CROP_BG]]
+      ...[img.width, img.height, r.x, r.y, r.w, r.h, size.w, size.h].map(String), bg]]
   }
   return [
     ['sips', '-c', String(r.h), String(r.w), '--cropOffset', String(r.y), String(r.x), '-s', 'format', 'png', img.path, '--out', out],
@@ -319,6 +389,101 @@ async function writeCrops($: EngineInterface, list: readonly ReviewImage[], all:
   return crops
 }
 
+/** 拡大の長辺（px）。小さい範囲は引き伸ばし、ペインの画像と同じくらいの大きさで出す */
+export const ZOOM_SIDE = 640
+/** 拡大の JPEG を Svg の上限に収めるまで、長辺と品質を下げていく */
+const ZOOM_STEPS = [[640, 75], [560, 60], [480, 50], [400, 45], [320, 40]] as const
+
+type PxRect = { x: number; y: number; w: number; h: number }
+
+/**
+ * 拡大して出す範囲（元画像の画素）。切り抜きと同じ余白を付け、細長すぎる範囲は
+ * 短い辺を長い辺の半分まで広げる（ペインで細い帯にならないように）
+ */
+export function zoomRect(c: { x0: number; y0: number; x1: number; y1: number }, img: Pick<ReviewImage, 'width' | 'height'>): PxRect {
+  const r = cropRect(c, img)
+  const widen = (lo: number, len: number, want: number, size: number): [number, number] => {
+    if (len >= want) return [lo, len]
+    const s = Math.min(size, Math.ceil(want))
+    const start = Math.floor(Math.max(0, Math.min(size - s, lo + len / 2 - s / 2)))
+    return [start, Math.min(size - start, s)]
+  }
+  const [x, w] = widen(r.x, r.w, r.h / 2, img.width)
+  const [y, h] = widen(r.y, r.h, r.w / 2, img.height)
+  return { x, y, w, h }
+}
+
+/** 拡大を書き出す寸法。長辺を ZOOM_SIDE にそろえる */
+export function zoomSize(w: number, h: number): { w: number; h: number } {
+  const k = ZOOM_SIDE / Math.max(1, w, h)
+  return { w: Math.max(1, Math.round(w * k)), h: Math.max(1, Math.round(h * k)) }
+}
+
+/** 寸法の違う版へ、範囲を同じ割合の位置に移す */
+export function mapRect(r: PxRect, from: Pick<ReviewImage, 'width' | 'height'>, to: Pick<ReviewImage, 'width' | 'height'>): PxRect {
+  if (from.width === to.width && from.height === to.height) return r
+  const sx = to.width / Math.max(1, from.width)
+  const sy = to.height / Math.max(1, from.height)
+  const x = Math.max(0, Math.min(to.width - 1, Math.floor(r.x * sx)))
+  const y = Math.max(0, Math.min(to.height - 1, Math.floor(r.y * sy)))
+  return { x, y, w: Math.max(1, Math.min(to.width - x, Math.round(r.w * sx))), h: Math.max(1, Math.min(to.height - y, Math.round(r.h * sy))) }
+}
+
+/**
+ * 拡大の上でドラッグした範囲（拡大に対する 0–1）を元画像の画素へ。
+ * 細すぎる範囲の広げ方は全体のときと同じで、基準は拡大の範囲
+ */
+export function zoomFractionToRect(
+  f: { x0: unknown; y0: unknown; x1: unknown; y1: unknown },
+  z: PxRect,
+): { x0: number; y0: number; x1: number; y1: number } | undefined {
+  const r = fractionToRect(f, { width: z.w, height: z.h })
+  if (r === undefined) return undefined
+  return { x0: z.x + r.x0, y0: z.y + r.y0, x1: z.x + r.x1, y1: z.y + r.y1 }
+}
+
+/** ドラッグの Client に渡す、いま出しているものの名前。拡大を出し入れしたあとに届いた選択を捨てるため */
+export function viewKey(z: ReviewZoom | null): string {
+  return z === null ? 'full' : `zoom:${z.x},${z.y},${z.w},${z.h}:${z.version}`
+}
+
+/** src の r（表示の向きの画素）を原寸で切り出し、ペインに出せる大きさの JPEG にする。透過は市松模様の上に重ねる */
+async function writeZoomShot($: EngineInterface, src: Pick<ReviewImage, 'path' | 'width' | 'height'>, r: PxRect, tag: string): Promise<ReviewShot> {
+  const dir = `${$.plugin.root}/.cache`
+  await run($, ['mkdir', '-p', dir])
+  const info = await run($, ['sips', '-g', 'pixelWidth', '-g', 'pixelHeight', '-g', 'hasAlpha', '-g', 'orientation', src.path])
+  const png = `${dir}/zoom-${tag}.png`
+  const jpg = `${dir}/zoom-${tag}.jpg`
+  for (const argv of cropCommandsFor(src, r, zoomSize(r.w, r.h), info, png, CHECKER)) await run($, argv)
+  let preview = ''
+  for (const [side, q] of ZOOM_STEPS) {
+    await run($, ['sips', '-s', 'format', 'jpeg', '-s', 'formatOptions', String(q), '-Z', String(side), png, '--out', jpg])
+    preview = (await $.fs.read(jpg, { as: 'bytes' })).base64
+    if (preview.length <= MAX_B64) break
+  }
+  const d = dims(await run($, ['sips', '-g', 'pixelWidth', '-g', 'pixelHeight', jpg]))
+  return { preview, previewWidth: d.w, previewHeight: d.h }
+}
+
+/** 拡大を作る。今の版は読んだときの写しから（無ければ元画像から）、前の版があれば同じ範囲をその写しから切り出す */
+async function buildZoom($: EngineInterface, img: ReviewImage, r: PxRect): Promise<ReviewZoom> {
+  const cur = { path: img.snapshot || img.path, width: img.width, height: img.height }
+  const after = await writeZoomShot($, cur, r, 'after').catch(err => {
+    if (cur.path === img.path) throw err
+    // 写しが片付けられていたら、元画像から
+    return writeZoomShot($, { ...cur, path: img.path }, r, 'after')
+  })
+  const zoomed: ReviewZoom = { path: img.path, version: img.version ?? 1, x: r.x, y: r.y, w: r.w, h: r.h, after }
+  const b = img.before
+  if (b === undefined) return zoomed
+  if (b.snapshot === '') return { ...zoomed, beforeError: '前の版の元画像を残せていないので、拡大して比べられません' }
+  try {
+    return { ...zoomed, before: await writeZoomShot($, { path: b.snapshot, width: b.width, height: b.height }, mapRect(r, img, b), 'before') }
+  } catch (err) {
+    return { ...zoomed, beforeError: `前の版を切り出せませんでした: ${err instanceof Error ? err.message : String(err)}` }
+  }
+}
+
 /** コメントを画像ごとにまとめ、一覧の順で並べる。crops があれば、コメントの id ごとの切り抜きのパスも添える */
 export function promptFor(
   list: readonly ReviewImage[],
@@ -333,7 +498,7 @@ export function promptFor(
     ...items.flatMap((c, i) => {
       const crop = crops.get(c.id)
       return [
-        `${i + 1}. ${describeRect(c, img)}: ${c.text}`,
+        `${i + 1}. ${describeRect(c, img)}: ${c.text}${statusOf(c) === 'again' ? '（再指摘: 前回の修正のあとも直っていません）' : ''}`,
         ...(crop === undefined ? [] : [`   切り抜き: ${crop}（Read で開いて確認できます）`]),
       ]
     }),
@@ -366,13 +531,48 @@ function dims(out: string): { w: number; h: number } {
   return { w, h }
 }
 
+/** パスごとに決まる短い名前（FNV-1a）。版の写しのファイル名に使う */
+export function pathKey(path: string): string {
+  let h = 0x811c9dc5
+  for (let i = 0; i < path.length; i++) h = Math.imul(h ^ path.charCodeAt(i), 0x01000193) >>> 0
+  return h.toString(16).padStart(8, '0')
+}
+
+/** 版の写しのパス。同じパスの同じ版（mtime）なら同じ名前になる */
+export function snapshotPath(dir: string, path: string, mtimeMs: number): string {
+  const ext = path.match(/\.[^./]+$/)?.[0] ?? ''
+  return `${dir}/${pathKey(path)}-${Math.round(mtimeMs)}${ext}`
+}
+
+/**
+ * 元画像を .cache/versions へ写す。kiri が同じパスに書き直したあとも、前の版を原寸で切り出せるように。
+ * APFS なら複製（cp -c）で場所を取らない。写せなくても読み込みは止めない
+ */
+async function snapshot($: EngineInterface, abs: string, mtimeMs: number): Promise<string> {
+  const dir = `${$.plugin.root}/.cache/versions`
+  try {
+    await run($, ['mkdir', '-p', dir])
+    // 長く使わなかった写しを片付ける（cp は写した時刻を mtime にする）
+    await run($, ['find', dir, '-type', 'f', '-mtime', '+7', '-delete']).catch(() => undefined)
+    const out = snapshotPath(dir, abs, mtimeMs)
+    await run($, ['cp', '-c', abs, out]).catch(() => run($, ['cp', abs, out]))
+    return out
+  } catch {
+    return ''
+  }
+}
+
 /** 画像を読み、ペイン用の縮小 JPEG と一覧用のサムネイルを作る（state には触らない） */
 async function load($: EngineInterface, path: string): Promise<ReviewImage> {
   const st = await $.fs.stat(path, { resolve: true })
   const abs = st.realPath ?? path
+  const mtimeMs = st.mtimeMs ?? 0
   // sips の寸法は回転前の画素。iPhone の HEIC は「回して表示」の指定を持つので、
   // 向きは Quick Look の縮小画像（正立）から取り、縦横が入れ替わっていれば合わせる
-  const raw = dims(await run($, ['sips', '-g', 'pixelWidth', '-g', 'pixelHeight', abs]))
+  const info = await run($, ['sips', '-g', 'pixelWidth', '-g', 'pixelHeight', '-g', 'hasAlpha', abs])
+  const raw = dims(info)
+  const hasAlpha = /hasAlpha:\s*yes/.test(info)
+  const snap = await snapshot($, abs, mtimeMs)
   const dir = `${$.plugin.root}/.cache`
   await run($, ['mkdir', '-p', dir])
   const thumbPng = `${dir}/${baseName(abs)}.png`
@@ -380,7 +580,14 @@ async function load($: EngineInterface, path: string): Promise<ReviewImage> {
   let preview = ''
   for (const [size, q] of [[640, 70], [480, 55], [360, 45], [260, 40]] as const) {
     await run($, ['rm', '-f', thumbPng])
-    await run($, ['qlmanage', '-t', '-s', String(size), '-o', dir, abs])
+    if (hasAlpha) {
+      // JPEG にすると透過が消えるので、市松模様の上に重ねてから縮める（背景の残りが見える）
+      const k = Math.min(1, size / Math.max(raw.w, raw.h))
+      await run($, ['osascript', '-l', 'JavaScript', '-e', CROP_JXA, abs, thumbPng,
+        ...[raw.w, raw.h, 0, 0, raw.w, raw.h, Math.max(1, Math.round(raw.w * k)), Math.max(1, Math.round(raw.h * k))].map(String), CHECKER])
+    } else {
+      await run($, ['qlmanage', '-t', '-s', String(size), '-o', dir, abs])
+    }
     await run($, ['sips', '-s', 'format', 'jpeg', '-s', 'formatOptions', String(q), thumbPng, '--out', out])
     const { base64 } = await $.fs.read(out, { as: 'bytes' })
     preview = base64
@@ -406,8 +613,45 @@ async function load($: EngineInterface, path: string): Promise<ReviewImage> {
     thumb,
     thumbWidth: Math.max(1, Math.round(p.w * ts)),
     thumbHeight: Math.max(1, Math.round(p.h * ts)),
-    mtimeMs: st.mtimeMs ?? 0,
+    mtimeMs,
+    hasAlpha,
+    snapshot: snap,
+    version: 1,
   }
+}
+
+/**
+ * 読み直した画像に、一覧にあった同じパスの画像の版を引き継ぐ。中身が変わっていれば（mtime か寸法）
+ * 版を一つ進め、前の版として前の縮小と写しを残す。変わっていなければ版も前の版もそのまま
+ */
+export function carryHistory(old: ReviewImage | undefined, x: ReviewImage): { img: ReviewImage; replaced: boolean } {
+  if (old === undefined) return { img: x, replaced: false }
+  const v = old.version ?? 1
+  const changed = old.mtimeMs !== x.mtimeMs || old.width !== x.width || old.height !== x.height
+  if (!changed) return { img: { ...x, version: v, before: old.before }, replaced: false }
+  const before: ReviewVersion = {
+    snapshot: old.snapshot ?? '',
+    width: old.width,
+    height: old.height,
+    preview: old.preview,
+    previewWidth: old.previewWidth,
+    previewHeight: old.previewHeight,
+    mtimeMs: old.mtimeMs,
+    version: v,
+  }
+  return { img: { ...x, version: v + 1, before }, replaced: true }
+}
+
+/** prev にあって next に無い写し（片付けてよいもの） */
+export function staleSnapshots(prev: readonly ReviewImage[], next: readonly ReviewImage[]): string[] {
+  const used = new Set(next.flatMap(x => [x.snapshot ?? '', x.before?.snapshot ?? '']))
+  const old = prev.flatMap(x => [x.snapshot ?? '', x.before?.snapshot ?? ''])
+  return [...new Set(old)].filter(p => p !== '' && !used.has(p))
+}
+
+async function removeFiles($: EngineInterface, paths: readonly string[]): Promise<void> {
+  if (paths.length === 0) return
+  await run($, ['rm', '-f', ...paths]).catch(() => undefined)
 }
 
 /** ディレクトリならその中の画像（名前順）、そうでなければそのまま */
@@ -423,10 +667,11 @@ async function expand($: EngineInterface, path: string): Promise<string[]> {
     .map(name => `${dir}/${name}`)
 }
 
-type Loaded = { loaded: ReviewImage[]; failed: string[]; kept: number }
+/** checking: 差し替わって「確認待ち」になったコメントの数 */
+type Loaded = { loaded: ReviewImage[]; failed: string[]; kept: number; checking: number }
 
 /**
- * 一覧の次の姿。replace なら読んだ画像だけにするが、送っていないコメントのある画像は
+ * 一覧の次の姿。replace なら読んだ画像だけにするが、未解決のコメントのある画像は
  * 残す（黙って消さない）。そうでなければ同じパスは差し替え、新しいものは末尾へ。
  * MAX_IMAGES を超えたら、今回読んだ画像とコメントのある画像を除いて古いほうから外す
  */
@@ -469,29 +714,68 @@ async function addImages($: EngineInterface, paths: readonly string[], replace: 
   }
   if (loaded.length === 0) {
     if (failed.length > 0) await update($, error, () => failed.join('\n'))
-    return { loaded, failed, kept: 0 }
+    return { loaded, failed, kept: 0, checking: 0 }
   }
   const prev = await read($, images)
-  const commented = new Set((await read($, comments)).map(c => c.path))
-  const { next, kept } = mergeImages(prev, loaded, replace, commented)
+  // 同じパスがあれば版を引き継ぎ、中身が変わっていれば前の版を残す
+  const carried = loaded.map(x => carryHistory(prev.find(y => y.path === x.path), x))
+  const fresh = carried.map(c => c.img)
+  const replaced = new Set(carried.filter(c => c.replaced).map(c => c.img.path))
+  const commented = new Set((await read($, comments)).filter(isOpen).map(c => c.path))
+  const { next, kept } = mergeImages(prev, fresh, replace, commented)
   const shown = await read($, current)
   // 開くと頼まれたときは読んだ画像へ移る。kiri の書き出しで差し替えるときは、見ている画像のまま
   const stay = replace ? undefined : next.find(x => x.path === shown)
-  const first = stay ?? loaded.find(x => next.some(y => y.path === x.path)) ?? next[0]
+  const first = stay ?? fresh.find(x => next.some(y => y.path === x.path)) ?? next[0]
   await update($, images, () => next)
-  // 一覧から外れた画像のコメントは送れないので持ち越さない
-  await update($, comments, l => l.filter(c => next.some(x => x.path === c.path)))
+  // 一覧から外れた画像のコメントは送れないので持ち越さない。差し替わった画像への送信済みは確認待ちへ
+  const checking = (await read($, comments)).filter(c => replaced.has(c.path) && statusOf(c) === 'sent').length
+  await update($, comments, l => markReplaced(l.filter(c => next.some(x => x.path === c.path)), replaced))
   await update($, current, () => first?.path ?? '')
-  // 別の画像へ移ったら、「一覧から外す」の確かめはやり直す
-  if (first?.path !== shown) await update($, confirmRemove, () => '')
+  // 別の画像へ移ったら、「一覧から外す」の確かめと、拡大と前の版の表示はやり直す
+  if (first?.path !== shown) await leaveImage($)
+  // 見ている画像が差し替わったら、新しい版を出す
+  else if (first !== undefined && replaced.has(first.path)) await update($, compare, () => false)
   await revealCurrent($)
   await update($, error, () => failed.join('\n'))
+  await rezoom($, prev, next, first?.path ?? '')
+  await removeFiles($, staleSnapshots(prev, next))
   // 一覧から外れた画像や、寸法の変わった画像の選択は、別の場所を指すので外す
   await update($, selection, sel => {
     const now = sel === null ? undefined : next.find(x => x.path === sel.path)
     return now === undefined || sel === null || now.width !== sel.width || now.height !== sel.height ? null : sel
   })
-  return { loaded: loaded.filter(x => next.some(y => y.path === x.path)), failed, kept }
+  return { loaded: fresh.filter(x => next.some(y => y.path === x.path)), failed, kept, checking }
+}
+
+/** 別の画像へ移るときに、その画像だけの表示（外す確かめ、拡大、前の版）を戻す */
+async function leaveImage($: EngineInterface): Promise<void> {
+  await update($, confirmRemove, () => '')
+  await update($, zoom, () => null)
+  await update($, compare, () => false)
+}
+
+/**
+ * 拡大している画像が差し替わったら、同じ範囲（寸法が変わっていれば同じ割合の位置）で作り直す。
+ * 画像が一覧から外れたか、別の画像を出しているなら拡大をやめる
+ */
+async function rezoom($: EngineInterface, prev: readonly ReviewImage[], next: readonly ReviewImage[], shown: string): Promise<void> {
+  const z = await read($, zoom)
+  if (z === null) return
+  const now = next.find(x => x.path === z.path)
+  if (now === undefined || now.path !== shown) {
+    await update($, zoom, () => null)
+    return
+  }
+  if ((now.version ?? 1) === z.version) return
+  const old = prev.find(x => x.path === z.path) ?? now
+  try {
+    const rebuilt = await buildZoom($, now, mapRect({ x: z.x, y: z.y, w: z.w, h: z.h }, old, now))
+    await update($, zoom, () => rebuilt)
+  } catch (err) {
+    await update($, zoom, () => null)
+    await update($, error, () => `拡大を作り直せませんでした: ${err instanceof Error ? err.message : String(err)}`)
+  }
 }
 
 // load() は .cache の同じファイルに書くので、重なると縮小画像と寸法が別の画像のものと混ざる。
@@ -504,6 +788,29 @@ function addSerial($: EngineInterface, paths: readonly string[], replace: boolea
   return done
 }
 
+/**
+ * 画像の範囲 c を拡大して出す。.cache の同じファイルに書くので、読み込みと同じ列に並べる。
+ * 作っている間に別の画像へ移ったか差し替わったら、作ったものは捨てる
+ */
+function zoomSerial($: EngineInterface, path: string, c: { x0: number; y0: number; x1: number; y1: number }): Promise<void> {
+  const done = queue.then(async () => {
+    const img = (await read($, images)).find(x => x.path === path)
+    if (img === undefined) return
+    await update($, busy, () => '拡大を作っています…')
+    try {
+      const z = await buildZoom($, img, zoomRect(c, img))
+      const now = (await read($, images)).find(x => x.path === path)
+      if ((await read($, current)) === path && (now?.version ?? 1) === z.version) await update($, zoom, () => z)
+    } catch (err) {
+      await update($, error, () => `拡大できませんでした: ${err instanceof Error ? err.message : String(err)}`)
+    } finally {
+      await update($, busy, () => '')
+    }
+  })
+  queue = done.catch(() => undefined)
+  return done
+}
+
 async function openAndReport($: EngineInterface, paths: readonly string[], replace: boolean): Promise<string> {
   if (paths.length === 0) return '画像のパスがありません。'
   try {
@@ -512,7 +819,7 @@ async function openAndReport($: EngineInterface, paths: readonly string[], repla
       ...(loaded.length === 0
         ? []
         : [`${loaded.length} 枚をペインに出しました。`, ...loaded.map(i => `- ${i.path}（${i.width}×${i.height}）`)]),
-      ...(kept > 0 ? [`送っていないコメントのある画像 ${kept} 枚は一覧に残しました。`] : []),
+      ...(kept > 0 ? [`未解決のコメントのある画像 ${kept} 枚は一覧に残しました。`] : []),
       ...failed.map(f => `読めませんでした: ${f}`),
     ]
     return lines.length === 0 ? '画像が見つかりませんでした。' : lines.join('\n')
@@ -546,27 +853,66 @@ async function copyImage($: EngineInterface, path: string): Promise<void> {
   await run($, copyImageArgv(path, png))
 }
 
-export function svgFor(img: ReviewImage, list: readonly ReviewComment[], sel: ReviewSelection | null): string {
-  const W = img.previewWidth
-  const H = img.previewHeight
-  const sx = W / img.width
-  const sy = H / img.height
+/** 状態ごとの枠と番号の色。未送信と「まだ」は赤、送信済みは灰、確認待ちは橙、直ったは緑 */
+export const STATUS_COLOR: Record<ReviewStatus, string> = {
+  draft: '#ef4444',
+  again: '#ef4444',
+  sent: '#64748b',
+  check: '#f59e0b',
+  fixed: '#22c55e',
+}
+
+export const STATUS_LABEL: Record<ReviewStatus, string> = {
+  draft: '',
+  again: '（まだ・次に送ります）',
+  sent: '（送信済み）',
+  check: '（確認待ち）',
+  fixed: '（直った）',
+}
+
+/** ペインに出すもの: 縮小画像と、それが元画像のどの範囲（画素）か */
+export type SvgView = ReviewShot & { x: number; y: number; w: number; h: number }
+
+/** 画像全体を出すときの SvgView */
+export function fullView(img: ReviewImage, shot: ReviewShot = img): SvgView {
+  return { preview: shot.preview, previewWidth: shot.previewWidth, previewHeight: shot.previewHeight, x: 0, y: 0, w: img.width, h: img.height }
+}
+
+/**
+ * 画像（view が拡大なら、その範囲）にコメントの枠と番号、選んでいる範囲を重ねた SVG。
+ * 位置は元画像の画素で持っているので、view の範囲に合わせて写す。拡大では範囲に入るコメントだけ描く
+ */
+export function svgFor(img: ReviewImage, list: readonly ReviewComment[], sel: ReviewSelection | null, view: SvgView = fullView(img)): string {
+  const W = view.previewWidth
+  const H = view.previewHeight
+  const sx = W / Math.max(1, view.w)
+  const sy = H / Math.max(1, view.h)
+  const isFull = view.x === 0 && view.y === 0 && view.w === img.width && view.h === img.height
+  const px = (v: number) => Math.round((v - view.x) * sx * 10) / 10
+  const py = (v: number) => Math.round((v - view.y) * sy * 10) / 10
   const parts: string[] = [
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">`,
-    `<image href="data:image/jpeg;base64,${img.preview}" x="0" y="0" width="${W}" height="${H}"/>`,
+    `<image href="data:image/jpeg;base64,${view.preview}" x="0" y="0" width="${W}" height="${H}"/>`,
   ]
   list.forEach((m, i) => {
-    const x = m.x0 * sx
-    const y = m.y0 * sy
+    const whole = isWhole(m, img)
+    // 拡大では、場所の無い画像全体へのコメントと、範囲の外のコメントは描かない
+    if (!isFull && (whole || m.x1 <= view.x || m.x0 >= view.x + view.w || m.y1 <= view.y || m.y0 >= view.y + view.h)) return
+    const color = STATUS_COLOR[statusOf(m)]
+    const x = px(m.x0)
+    const y = py(m.y0)
     // 画像全体へのコメントは枠を描かず、左上の番号だけ
-    if (!isWhole(m, img)) {
-      parts.push(`<rect x="${x}" y="${y}" width="${(m.x1 - m.x0) * sx}" height="${(m.y1 - m.y0) * sy}" fill="none" stroke="#ef4444" stroke-width="2"/>`)
+    if (!whole) {
+      parts.push(`<rect x="${x}" y="${y}" width="${px(m.x1) - x}" height="${py(m.y1) - y}" fill="none" stroke="${color}" stroke-width="2"${statusOf(m) === 'fixed' ? ' stroke-dasharray="6 4"' : ''}/>`)
     }
-    parts.push(`<circle cx="${x + 10}" cy="${y + 10}" r="9" fill="#ef4444"/>`)
-    parts.push(`<text x="${x + 10}" y="${y + 14}" font-size="11" font-family="sans-serif" font-weight="bold" fill="#fff" text-anchor="middle">${i + 1}</text>`)
+    // 番号は拡大の外にはみ出さないよう、見えている範囲の左上に寄せる
+    const cx = Math.min(W - 10, Math.max(0, x) + 10)
+    const cy = Math.min(H - 10, Math.max(0, y) + 10)
+    parts.push(`<circle cx="${cx}" cy="${cy}" r="9" fill="${color}"/>`)
+    parts.push(`<text x="${cx}" y="${cy + 4}" font-size="11" font-family="sans-serif" font-weight="bold" fill="#fff" text-anchor="middle">${i + 1}</text>`)
   })
   if (sel !== null && sel.path === img.path) {
-    parts.push(`<rect x="${sel.x0 * sx}" y="${sel.y0 * sy}" width="${(sel.x1 - sel.x0) * sx}" height="${(sel.y1 - sel.y0) * sy}" fill="#3b82f6" fill-opacity=".25" stroke="#3b82f6" stroke-width="2"/>`)
+    parts.push(`<rect x="${px(sel.x0)}" y="${py(sel.y0)}" width="${px(sel.x1) - px(sel.x0)}" height="${py(sel.y1) - py(sel.y0)}" fill="#3b82f6" fill-opacity=".25" stroke="#3b82f6" stroke-width="2"/>`)
   }
   parts.push('</svg>')
   return parts.join('')
@@ -692,9 +1038,9 @@ export const register: Register = on => {
     // ペインの都合で Bash の結果を壊さない
     try {
       if ((await read($, images)).length > 0) {
-        const { loaded } = await addSerial($, paths, false)
+        const { loaded, checking } = await addSerial($, paths, false)
         if (loaded.length > 0) {
-          $.ui.toast(`kiri-review: ${loaded.length === 1 ? baseName(loaded[0]?.path ?? '') : `${loaded.length} 枚`} を読み直しました`)
+          $.ui.toast(`kiri-review: ${loaded.length === 1 ? baseName(loaded[0]?.path ?? '') : `${loaded.length} 枚`} を読み直しました${checking > 0 ? `（確認待ち ${checking} 件）` : ''}`)
         }
       }
     } catch (err) {
@@ -705,14 +1051,22 @@ export const register: Register = on => {
 
   // 画像の上でドラッグした範囲。Client から届いた値なので確かめてから使う
   on('ui.message', { requestId: PANE, element: DRAG }, async ($, e) => {
-    const d = e.data as { path?: unknown; x0?: unknown; y0?: unknown; x1?: unknown; y1?: unknown } | null
+    const d = e.data as { path?: unknown; view?: unknown; x0?: unknown; y0?: unknown; x1?: unknown; y1?: unknown } | null
     if (d === null || typeof d !== 'object' || typeof d.path !== 'string') return {}
     // 切り替えたあとに届いた、前の画像の選択は捨てる
     const list = await read($, images)
     const shown = await read($, current)
     const img = list.find(x => x.path === shown) ?? list[0]
     if (img === undefined || img.path !== d.path) return {}
-    const rect = fractionToRect({ x0: d.x0, y0: d.y0, x1: d.x1, y1: d.y1 }, img)
+    // 前の版を出している間は選ばない。拡大を出し入れしたあとに届いた、前の表示の上の選択も捨てる
+    const z0 = await read($, zoom)
+    const z = z0 !== null && z0.path === img.path && z0.version === (img.version ?? 1) ? z0 : null
+    // 描くときと同じく、拡大中に前の版を切り出せていなければ今の版を出している
+    if ((await read($, compare)) && img.before !== undefined && (z === null || z.before !== undefined)) return {}
+    if ((d.view ?? 'full') !== viewKey(z)) return {}
+    const f = { x0: d.x0, y0: d.y0, x1: d.x1, y1: d.y1 }
+    // 拡大の上の範囲は、拡大した範囲を足して元画像の画素へ戻す
+    const rect = z === null ? fractionToRect(f, img) : zoomFractionToRect(f, z)
     if (rect === undefined) return {}
     await update($, selection, () => ({ path: img.path, width: img.width, height: img.height, ...rect }))
     return {}
@@ -738,9 +1092,9 @@ export const register: Register = on => {
         return {}
       }
       const to = list[offset + Math.floor(d.pick * slots)]
-      if (to !== undefined) {
+      if (to !== undefined && to.path !== (await read($, current))) {
         await update($, current, () => to.path)
-        await update($, confirmRemove, () => '')
+        await leaveImage($)
       }
     } else if (typeof d.drag === 'number' && Number.isFinite(d.drag)) {
       // 指でめくるのと同じ向き: 左へドラッグすると右の画像が出てくる
@@ -759,6 +1113,7 @@ export const register: Register = on => {
     const sel = await read($, selection)
     const err = await read($, error)
     const offset = await read($, stripOffset)
+    const working = await read($, busy)
     // current が一覧に無いときは先頭を出す。ハンドラも描いた画像（img.path）を使う
     const index = Math.max(0, list.findIndex(x => x.path === shownPath))
     const img = list[index]
@@ -773,33 +1128,46 @@ export const register: Register = on => {
     }
 
     const mine = all.filter(c => c.path === img.path)
-    const counts = new Map<string, number>()
-    for (const c of all) counts.set(c.path, (counts.get(c.path) ?? 0) + 1)
-    const others = all.length - mine.length
+    // 一覧の赤丸は、直ったを付けていないコメントの数
+    const counts = openCounts(all)
+    const sendable = all.filter(isSendable)
+    const others = sendable.filter(c => c.path !== img.path).length
+
+    // 拡大は、いま出している画像のいまの版のものだけ使う
+    const z0 = await read($, zoom)
+    const z = z0 !== null && z0.path === img.path && z0.version === (img.version ?? 1) ? z0 : null
+    const before = img.before
+    const wantsBefore = (await read($, compare)) && before !== undefined
+    // 拡大中に前の版を切り出せていなければ、今の版のまま理由を出す
+    const showBefore = wantsBefore && (z === null || z.before !== undefined)
+    const view: SvgView = z === null
+      ? fullView(img, showBefore && before !== undefined ? before : img)
+      : { ...(showBefore && z.before !== undefined ? z.before : z.after), x: z.x, y: z.y, w: z.w, h: z.h }
 
     const show = (path: string) =>
       void (async () => {
         const to = (await read($, images)).find(x => x.path === path)
         if (to === undefined) return
+        if (to.path !== (await read($, current))) await leaveImage($)
         await update($, current, () => to.path)
-        await update($, confirmRemove, () => '')
         await revealCurrent($)
       })()
     const remove = async () => {
       const now = img.path
-      // コメントのある画像は、一度目は確かめるだけ
-      if ((await read($, comments)).some(c => c.path === now) && (await read($, confirmRemove)) !== now) {
+      // 未解決のコメント（送信済みも追跡中）のある画像は、一度目は確かめるだけ
+      if ((await read($, comments)).some(c => c.path === now && isOpen(c)) && (await read($, confirmRemove)) !== now) {
         await update($, confirmRemove, () => now)
         return
       }
-      await update($, confirmRemove, () => '')
-      const before = await read($, images)
-      const at = before.findIndex(x => x.path === now)
-      const after = before.filter(x => x.path !== now)
+      await leaveImage($)
+      const prev = await read($, images)
+      const at = prev.findIndex(x => x.path === now)
+      const after = prev.filter(x => x.path !== now)
       await update($, images, () => after)
       await update($, comments, l => l.filter(c => c.path !== now))
       await update($, selection, s => (s !== null && s.path === now ? null : s))
       await update($, current, () => after[Math.min(at, after.length - 1)]?.path ?? '')
+      await removeFiles($, staleSnapshots(prev, after))
       await revealCurrent($)
     }
 
@@ -814,28 +1182,39 @@ export const register: Register = on => {
       if (now === undefined) return
       const text = raw.trim()
       if (text === '') return
-      // 選んでいなければ画像全体へのコメント
+      // 選んでいなければ、拡大中なら拡大している範囲へ、そうでなければ画像全体へのコメント
       const picked = await read($, selection)
       const isMine = picked !== null && picked.path === now.path && picked.width === now.width && picked.height === now.height
-      const { x0, y0, x1, y1 } = isMine ? picked : { x0: 0, y0: 0, x1: now.width, y1: now.height }
+      const zz = await read($, zoom)
+      const zoomed = zz !== null && zz.path === now.path && zz.version === (now.version ?? 1)
+      const { x0, y0, x1, y1 } = isMine
+        ? picked
+        : zoomed
+          ? { x0: zz.x, y0: zz.y, x1: zz.x + zz.w, y1: zz.y + zz.h }
+          : { x0: 0, y0: 0, x1: now.width, y1: now.height }
       await update($, error, () => '')
-      const before = await read($, comments)
-      const id = Math.max(await read($, lastId), ...before.map(x => x.id)) + 1
+      const prev = await read($, comments)
+      const id = Math.max(await read($, lastId), ...prev.map(x => x.id)) + 1
       await update($, lastId, () => id)
-      await update($, comments, l => [...l, { id, path: now.path, x0, y0, x1, y1, text }])
+      await update($, comments, l => [...l, { id, path: now.path, x0, y0, x1, y1, text, status: 'draft' as const }])
       // 次のコメントは選び直す
       await update($, selection, s => (s !== null && s.path === now.path ? null : s))
     }
 
+    const setStatus = (id: number, status: ReviewStatus) =>
+      void update($, comments, l => l.map(x => (x.id === id ? { ...x, status } : x)))
+
     const send = async () => {
-      const sending = (await read($, comments)).filter(c => typeof c.path === 'string')
+      // 送るのは、まだ送っていないものと「まだ」を付けたもの。送ったものは「送信済み」として残す
+      const sending = (await read($, comments)).filter(c => typeof c.path === 'string' && isSendable(c))
       const now = await read($, images)
       if (sending.length === 0) return
       // 切り抜きに失敗しても送る（その行は座標だけ）
       const crops = await writeCrops($, now, sending).catch(() => new Map<number, string>())
       await $.prompt.submit({ text: promptFor(now, sending, crops), asUser: true })
-      // 送っている間に足されたコメントは残す
-      await update($, comments, l => l.filter(x => !sending.some(c => c.id === x.id)))
+      // 送っている間に足したコメントは未送信のまま、消したコメントは消したまま
+      const versions = new Map(now.map(x => [x.path, x.version ?? 1]))
+      await update($, comments, l => markSent(l, new Set(sending.map(c => c.id)), versions))
       $.ui.toast(`kiri-review: ${sending.length} 件を Claude に送りました`)
     }
 
@@ -850,23 +1229,29 @@ export const register: Register = on => {
       }
     }
 
-    const svg = svgFor(img, mine, sel)
+    const svg = svgFor(img, mine, showBefore ? null : sel, view)
+    // 画像を描けるのは Svg のある面（ターミナルには無い）
+    const canSvg = e.surface !== 'terminal'
     // 画像の上でドラッグして選べるのは、Client を描ける面（デスクトップ）だけ。
     // 面に無い要素も ui には空の要素として入っているので、'Client' in ui では分からない
     const hasClient = e.surface === 'desktop'
-    const canDrag = hasClient && svg.length < 131072
+    // 前の版の上では選ばない（コメントは今の版に付ける）
+    const canDrag = hasClient && svg.length < 131072 && !showBefore
+    const what = z === null ? '' : `${describeRect({ x0: z.x, y0: z.y, x1: z.x + z.w, y1: z.y + z.h }, img)} の拡大`
     // 画像の上に透明な Client を重ね、ドラッグした範囲を受け取る（ui.message）。
     // 外側の Box は画像の大きさに縮め、Client の領域と画像を揃える
     const picture =
       svg.length >= 131072
         ? <Text color="red">画像が大きすぎて描けません（{svg.length} 文字）。コメントを減らすか「読み直す」を押してください。</Text>
-        : 'Svg' in ui
+        : canSvg && 'Svg' in ui
           ? (
             <Box position="relative" alignSelf="flex-start" flexDirection="column">
-              <ui.Svg key="picture" source={svg} alt={`${img.path} にコメント位置を重ねたもの`} />
-              {'Client' in ui && (
+              <ui.Svg key="picture" source={svg}
+                alt={`${img.path}${showBefore ? ` の前の版（第 ${before?.version ?? 1} 版）` : ''}${what === '' ? '' : ` の ${what}`} にコメント位置を重ねたもの`} />
+              {canDrag && 'Client' in ui && (
                 <Box position="absolute" top={0} left={0} right={0} bottom={0}>
-                  <ui.Client key={DRAG} module="./drag.tsx" props={{ path: img.path, aspect: img.previewHeight / img.previewWidth }} width="100%" />
+                  <ui.Client key={DRAG} module="./drag.tsx"
+                    props={{ path: img.path, aspect: view.previewHeight / view.previewWidth, view: viewKey(z) }} width="100%" />
                 </Box>
               )}
             </Box>
@@ -874,17 +1259,29 @@ export const register: Register = on => {
           : <Text dimColor>この画面では画像を描けません（デスクトップアプリで開いてください）</Text>
 
     const strip = list.length > 1 ? stripFor(list, img.path, counts, offset) : undefined
-    const isStripShown = strip !== undefined && strip.drawn > 0 && strip.svg.length < 131072 && 'Svg' in ui
+    const isStripShown = strip !== undefined && strip.drawn > 0 && strip.svg.length < 131072 && canSvg && 'Svg' in ui
     // 一覧で全部を選べないとき（Client の無い面では一覧を押せない）だけ、選択肢からも選べるようにする
     const needsSelect = list.length > 1 && (!isStripShown || !hasClient || strip.drawn < strip.slots)
-    const confirming = mine.length > 0 && (await read($, confirmRemove)) === img.path
+    const confirming = mine.some(isOpen) && (await read($, confirmRemove)) === img.path
 
     // いまの状態で次にすること
-    const hint = mySel !== null
-      ? '青い枠の場所へのコメントを書いて Enter'
-      : canDrag
-        ? '画像の上をドラッグして、直したい場所を選びます（選ばずに書けば画像全体へのコメント）'
-        : 'コメントを書いて Enter（画像全体へのコメント）'
+    const hint = showBefore
+      ? `前の版（第 ${before?.version ?? 1} 版）を表示中です。コメントは「今の版を見る」で戻してから付けます`
+      : mySel !== null
+        ? '青い枠の場所へのコメントを書いて Enter'
+        : canDrag
+          ? z !== null
+            ? '拡大の上をドラッグして、直したい場所を選びます（選ばずに書けば拡大している範囲へのコメント）'
+            : '画像の上をドラッグして、直したい場所を選びます（選ばずに書けば画像全体へのコメント）'
+          : z !== null
+            ? 'コメントを書いて Enter（拡大している範囲へのコメント）'
+            : 'コメントを書いて Enter（画像全体へのコメント）'
+
+    // 送ったあとの追跡の内訳（未送信だけなら出さない）
+    const tally = (['sent', 'check', 'again', 'fixed'] as const)
+      .map(s => ({ s, n: mine.filter(c => statusOf(c) === s).length }))
+      .filter(t => t.n > 0)
+      .map(t => `${STATUS_LABEL[t.s].replace(/[（）]/g, '').replace('・次に送ります', '')} ${t.n}`)
 
     return (
       <Box flexDirection="column" gap={1}>
@@ -902,16 +1299,35 @@ export const register: Register = on => {
         {needsSelect && 'Select' in ui && (
           <ui.Select key="img" label="画像" options={imageOptions} value={img.path} onSelect={v => show(v)} />
         )}
-        <Text dimColor>{list.length > 1 ? `${index + 1}/${list.length} · ` : ''}{baseName(img.path)} · {img.width}×{img.height}</Text>
+        <Text dimColor>
+          {list.length > 1 ? `${index + 1}/${list.length} · ` : ''}{baseName(img.path)} · {img.width}×{img.height}
+          {(img.version ?? 1) > 1 ? ` · 第 ${img.version} 版` : ''}
+        </Text>
         <Box flexDirection="row" gap={1}>
-          <Text bold={mySel !== null}>{hint}</Text>
+          <Text bold={mySel !== null || showBefore}>{hint}</Text>
+          {mySel !== null && !showBefore && canSvg && (
+            <Button key="zoom" label="拡大" onPress={() => void zoomSerial($, img.path, mySel)} />
+          )}
           {mySel !== null && (
             <Button key="unselect" plain dimColor label="選択を外す"
               onPress={() => void update($, selection, s => (s !== null && s.path === img.path ? null : s))} />
           )}
         </Box>
+        {canSvg && (z !== null || before !== undefined) && (
+          <Box flexDirection="row" gap={1}>
+            {z !== null && <Button key="unzoom" label="全体に戻る" onPress={() => void update($, zoom, () => null)} />}
+            {before !== undefined && (
+              <Button key="compare" variant={showBefore ? 'primary' : undefined}
+                label={showBefore ? '今の版を見る' : `前の版（第 ${before.version} 版）と比べる`}
+                onPress={() => void update($, compare, v => !v)} />
+            )}
+            {z !== null && <Text dimColor>{what}（{z.w}×{z.h} px を {view.previewWidth}×{view.previewHeight} で表示）</Text>}
+          </Box>
+        )}
+        {wantsBefore && !showBefore && <Text color="yellow">{z?.beforeError ?? '前の版の拡大がありません'}</Text>}
+        {working !== '' && <Text dimColor>{working}</Text>}
         {picture}
-        {'Input' in ui && (
+        {'Input' in ui && !showBefore && (
           <ui.Input key="comment" label="コメント"
             placeholder={mySel !== null ? '例: 髪の輪郭がギザギザ' : '例: 全体に暗い'}
             submitLabel="追加" value="" onSubmit={v => void addComment(v)} />
@@ -919,18 +1335,33 @@ export const register: Register = on => {
         {err !== '' && <Text color="red">{err}</Text>}
         {mine.length > 0 && (
           <Box flexDirection="column">
-            {mine.map((c, i) => (
-              <Box key={`c${c.id}`} flexDirection="row" gap={1}>
-                <Button key={`del${c.id}`} plain dimColor label="×"
-                  onPress={() => void update($, comments, l => l.filter(x => x.id !== c.id))} />
-                <Text>{i + 1}. {c.text}{isWhole(c, img) ? <Text dimColor>（画像全体）</Text> : ''}</Text>
-              </Box>
-            ))}
+            {tally.length > 0 && <Text dimColor>{tally.join(' · ')}</Text>}
+            {mine.map((c, i) => {
+              const st = statusOf(c)
+              const whole = isWhole(c, img)
+              return (
+                <Box key={`c${c.id}`} flexDirection="row" gap={1}>
+                  <Button key={`del${c.id}`} plain dimColor label="×"
+                    onPress={() => void update($, comments, l => l.filter(x => x.id !== c.id))} />
+                  <Text dimColor={st === 'fixed'}>
+                    {i + 1}. {c.text}{whole ? <Text dimColor>（画像全体）</Text> : ''}
+                    {st === 'draft' ? '' : <Text color={st === 'check' ? 'yellow' : st === 'fixed' ? 'green' : st === 'again' ? 'red' : undefined} dimColor={st === 'sent'}>{STATUS_LABEL[st]}</Text>}
+                  </Text>
+                  {!whole && canSvg && <Button key={`zoom${c.id}`} plain dimColor label="拡大" onPress={() => void zoomSerial($, img.path, c)} />}
+                  {(st === 'sent' || st === 'check' || st === 'again') && (
+                    <Button key={`fix${c.id}`} plain label="直った" onPress={() => setStatus(c.id, 'fixed')} />
+                  )}
+                  {(st === 'sent' || st === 'check' || st === 'fixed') && (
+                    <Button key={`again${c.id}`} plain label="まだ" onPress={() => setStatus(c.id, 'again')} />
+                  )}
+                </Box>
+              )
+            })}
           </Box>
         )}
         {others > 0 && <Text dimColor>ほかの画像に {others} 件あります（一緒に送ります）。</Text>}
         <Box flexDirection="row" gap={1}>
-          {all.length > 0 && <Button key="send" variant="primary" label={`Claude に送る（${all.length} 件）`} onPress={() => void send()} />}
+          {sendable.length > 0 && <Button key="send" variant="primary" label={`Claude に送る（${sendable.length} 件）`} onPress={() => void send()} />}
           <Button key="copy" dimColor label="画像をコピー" onPress={() => void copy()} />
           <Button key="reload" dimColor label="読み直す" onPress={() => void openAndReport($, [img.path], false)} />
           {list.length > 1 && (

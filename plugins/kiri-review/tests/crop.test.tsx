@@ -100,10 +100,10 @@ test('送るときにコメントごとの切り抜きを書き、失敗した�
   expect(lines[at + 2]).toMatch(/^2\. x 400–600.*: 影が濃い$/)
   expect(lines[at + 3]).toBe('3. 画像全体: 全体に暗い')
   // 透過 PNG なので JXA でマゼンタに重ねる。画像全体のコメントは切り抜かない
-  const osa = ran.filter(a => a[0] === 'osascript')
+  const osa = ran.filter(a => a[0] === 'osascript' && a.some(x => x.includes('/.cache/crops/')))
   expect(osa).toHaveLength(2)
   expect(osa[0]?.at(-1)).toBe('ff00c8')
   // 寸法は 1 枚につき 1 回だけ読む
-  expect(ran.filter(a => a.includes('hasAlpha'))).toHaveLength(1)
+  expect(ran.filter(a => a.includes('orientation'))).toHaveLength(1)
   await ui.unmount()
 })

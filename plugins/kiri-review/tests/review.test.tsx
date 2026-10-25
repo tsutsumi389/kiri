@@ -75,8 +75,8 @@ test('画像を開き、コメントして Claude に送る', async ($, on) => {
   expect(sent[0]).toContain('画像 /w/out.png（表示の向きで 800×600 px）')
   expect(sent[0]).toContain('1. x 0–410, y 0–320 px（横 0–51%、縦 0–53%）: 髪の輪郭がギザギザ')
   expect(sent[0]).toContain('2. 画像全体: 影が濃い')
-  // 送ったコメントは一覧から消え、送るものが無ければ送るボタンも出さない
-  expect(await ui.find({ type: 'Text', text: /髪の輪郭/ })).toBeUndefined()
+  // 送ったコメントは「送信済み」として残り、送るものが無ければ送るボタンは出さない
+  expect(await ui.find({ type: 'Text', text: /^1\. 髪の輪郭がギザギザ（送信済み）/ })).toBeDefined()
   await expect(ui.press({ key: 'send' })).rejects.toThrow(/send/)
   await ui.unmount()
 })

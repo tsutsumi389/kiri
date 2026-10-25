@@ -147,6 +147,9 @@ test('複数の画像を開き、切り替えて画像ごとにコメントし�
   expect(sent[0]).toContain('1. x 100–210, y 100–220 px')
   expect(sent[0]).toContain('1. 画像全体: 影が濃い')
 
+  // 送ったコメントは送信済みとして追跡しているので、外すときは確かめる
+  await ui.press({ key: 'remove' })
+  expect(await ui.find({ type: 'Text', text: /^1\/3 · a\.png/ })).toBeDefined()
   await ui.press({ key: 'remove' })
   expect(await ui.find({ type: 'Text', text: /^1\/2 · b\.png/ })).toBeDefined()
   await ui.unmount()

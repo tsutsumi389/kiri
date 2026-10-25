@@ -1,18 +1,79 @@
-export type ReviewImage = {
+/** ペインに出す縮小 JPEG（base64）とその寸法 */
+export type ReviewShot = {
+  preview: string
+  previewWidth: number
+  previewHeight: number
+}
+
+/** 差し替えられる前の版。縮小画像と、元画像の写し（拡大して比べるため） */
+export type ReviewVersion = ReviewShot & {
+  /** 元画像の写しのパス（.cache/versions の下）。写せなかったら '' */
+  snapshot: string
+  width: number
+  height: number
+  mtimeMs: number
+  /** 何版目か（1 から） */
+  version: number
+}
+
+/** kiri の警告が指した範囲を、出力画像の画素へ写したもの（左上が原点、右と下の端は含まない） */
+export type KiriRegion = {
+  /** 警告のコード（HALO_REMAINS / CONTOUR_ROUGH / RIM_CONTAMINATED） */
+  code: string
+  score: number
+  x0: number
+  y0: number
+  x1: number
+  y1: number
+}
+
+/** 出力画像と入力画像の対応（kiri の outputs[].source_rect / content_rect。両端を含む） */
+export type KiriMapping = {
+  /** 入力画像のパス（絶対にできなければ kiri に渡したまま） */
+  input: string
+  /** 入力画像の寸法（EXIF を当てたあと） */
+  inputWidth: number
+  inputHeight: number
+  source: [number, number, number, number]
+  content: [number, number, number, number]
+}
+
+/** --edge-repair auto の結果 */
+export type KiriRepair = {
+  repaired: number
+  gatedBy: string | null
+  before: Record<string, number | null>
+  after: Record<string, number | null>
+}
+
+/** kiri の --json の結果から拾った、出力画像 1 枚ぶんの情報 */
+export type KiriInfo = {
+  regions: KiriRegion[]
+  mapping?: KiriMapping
+  repair?: KiriRepair
+}
+
+export type ReviewImage = ReviewShot & {
   /** 元画像の絶対パス */
   path: string
   /** 元画像の画素寸法 */
   width: number
   height: number
-  /** ペイン用に縮めた JPEG（base64）とその寸法 */
-  preview: string
-  previewWidth: number
-  previewHeight: number
   /** 一覧に並べる小さな JPEG（base64）とその寸法 */
   thumb: string
   thumbWidth: number
   thumbHeight: number
   mtimeMs: number
+  /** 透過のある画像。縮小と拡大は市松模様の上に重ねる */
+  hasAlpha?: boolean
+  /** 読んだときの元画像の写し（.cache/versions の下）。差し替えられたら前の版になる。写せなかったら '' */
+  snapshot?: string
+  /** 何版目か（1 から）。同じパスの画像が差し替わるたびに増える */
+  version?: number
+  /** 一つ前の版。差し替わったことが無ければ無い */
+  before?: ReviewVersion
+  /** この版を書いた kiri の結果から拾ったもの。--json の結果が無ければ無い */
+  kiri?: KiriInfo
 }
 
 /** 画像の上をドラッグして選んだ、まだコメントを付けていない範囲（元画像の画素） */
@@ -27,6 +88,12 @@ export type ReviewSelection = {
   y1: number
 }
 
+/**
+ * コメントの状態。draft: まだ送っていない、sent: 送った、check: 送ったあと画像が差し替わった（確認待ち）、
+ * fixed: 人が「直った」を付けた、again: 人が「まだ」を付けた（次の送信に入れる）
+ */
+export type ReviewStatus = 'draft' | 'sent' | 'check' | 'fixed' | 'again'
+
 export type ReviewComment = {
   id: number
   /** どの画像へのコメントか（ReviewImage.path） */
@@ -37,6 +104,28 @@ export type ReviewComment = {
   x1: number
   y1: number
   text: string
+  /** 無ければ draft（追跡を足す前のコメント） */
+  status?: ReviewStatus
+  /** 付けたときの画像の寸法。差し替えで寸法が変わったら、範囲を同じ割合の位置へ移す */
+  width?: number
+  height?: number
+}
+
+/** 元画像から原寸で切り出して大きく出している範囲 */
+export type ReviewZoom = {
+  path: string
+  /** 切り出したときの画像の版。差し替わったら作り直す */
+  version: number
+  /** 切り出した範囲（元画像の画素、左上が原点） */
+  x: number
+  y: number
+  w: number
+  h: number
+  after: ReviewShot
+  /** 前の版の同じ範囲。前の版が無いか、切り出せなかったら無い */
+  before?: ReviewShot
+  /** 前の版を切り出せなかった理由 */
+  beforeError?: string
 }
 
 declare module 'claude-code' {
@@ -56,6 +145,12 @@ declare module 'claude-code' {
       stripOffset: number
       /** 「一覧から外す」を一度押した画像のパス。コメントのある画像は二度押しで外す */
       confirmRemove: string
+      /** 拡大して出している範囲。無ければ画像全体 */
+      zoom: ReviewZoom | null
+      /** 前の版を出しているか */
+      compare: boolean
+      /** 拡大を作っている間の案内 */
+      busy: string
     }
   }
 }

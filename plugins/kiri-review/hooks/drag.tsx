@@ -3,8 +3,9 @@ import type { ClientModule, ClientPointerEvent } from 'claude-code'
 /**
  * path: どの画像の上に重ねているか。送るときに付けて返し、切り替えのあとに届いた選択を取り違えない。
  * aspect: 画像の縦 / 横。領域を画像の高さまで伸ばす行数を決める
+ * view: 何を出している上か（'full' か拡大の範囲）。拡大を出し入れしたあとに届いた選択を取り違えない
  */
-export type DragProps = { path: string; aspect: number }
+export type DragProps = { path: string; aspect: number; view?: string }
 
 /** 領域の中の位置（マス単位）。coarse はマスの中の位置が分からない面 */
 type Point = { x: number; y: number; coarse: boolean }
@@ -47,7 +48,7 @@ const Drag: ClientModule<DragProps, DragState> = (props, surface) => {
       // ボタンを離したのが窓の外で up が来なかったときは、ボタン無しの move で終える
       surface.setState(e.button === 'left' ? { ...now, to: p } : {})
     } else if (e.type === 'up' && now.from !== undefined) {
-      surface.post({ path: props.path, ...span(now.from, p, surface.columns, surface.rows) })
+      surface.post({ path: props.path, view: props.view ?? 'full', ...span(now.from, p, surface.columns, surface.rows) })
       surface.setState({})
     }
   })

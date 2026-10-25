@@ -202,6 +202,14 @@ impl Constraints {
         self.mark_index(index, kind);
     }
 
+    /// 画素の印を消す（`Free` に戻す）。**印を付け直す側のためにある**——
+    /// `mark_index` はビットを足すだけなので、確定前景を確定背景へ付け替えると
+    /// 衝突として残る
+    #[inline]
+    pub fn clear_index(&mut self, index: usize) {
+        self.flags[index] = 0;
+    }
+
     #[inline]
     pub fn mark_index(&mut self, index: usize, kind: Constraint) {
         match kind {

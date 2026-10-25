@@ -52,6 +52,7 @@ product.png  1600x2000  png  841.4 KB  (338 ms)
 | `--matting` | guided | 境界のアルファの解き方。`projection` は F–B 直線への射影だけ、`guided` はその結果を元画像に導かれて均す、`closed-form` は帯を連立方程式として解き直す（[効く素材は限られる](05-3-boundary.md#closed-form-は織り目に効き柔らかい輪郭には効かない)） |
 | `--smooth-contour` | 2.0 | 帯の中の二値輪郭に掛けるメディアンの半径(px)。**長辺 1000px 換算**（上限 16）。0 で無効。実効の実寸半径は `settings.smooth_radius_px` |
 | `--no-reclassify` | | 帯の中の二値画素を局所の前景色・背景色で塗り直さない |
+| `--edge-repair` | off | `auto` で、`CONTOUR_ROUGH` / `RIM_CONTAMINATED` が名指した区間だけ輪郭の内側の帯を解き直す（[悪い区間だけ解き直す](05-3-boundary.md#悪い区間だけ解き直す--edge-repair)） |
 | `--no-refine` | | 境界のアルファを色から推定し直さず、マスクの形から作る旧方式に戻す |
 | `--no-despill` | | 境界画素から背景色の寄与を取り除かない |
 | `--optimize` | | `tolerance` / `bbox` / `background-model` の組を総当たりし、指標で選ぶ（[探索を kiri に任せる](05-4-guidance.md#探索を-kiri-に任せる--optimize)） |

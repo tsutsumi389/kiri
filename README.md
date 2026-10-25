@@ -18,7 +18,7 @@ AIエージェントから使われることを前提とした、EC商品画像�
 - **色で解けないものはモデルに聞ける** — 任意の `--segment` でセグメンテーションモデルを**粗マスクの供給源**として使う。既定では走らず、モデルは別ファイル。[意味の事前知識](docs/commands/05-4-guidance.md#意味の事前知識モデルに何を聞くか)を参照
 - **設定の探索を kiri に任せられる** — `--optimize` は `info` → `cutout` → 調整という 3 手のループを 1 コマンドへ畳む。[探索を kiri に任せる](docs/commands/05-4-guidance.md#探索を-kiri-に任せる--optimize)を参照
 - **仕上げまで 1 本で** — キャンバス配置、[落ち影の合成](docs/commands/05-5-finishing.md#落ち影を合成する)（`--shadow synth`）、[反射の合成](docs/commands/05-5-finishing.md#反射を合成する)（`--reflect on`）、回転、Web配信形式への変換
-- **結果を自分で採点する** — `mask` が返す 7 項目（前景比率・ハロー・境界の色差・遷移幅・輪郭の粗さ・縁の汚染・外周接触）と、機械可読な 34 の警告。縁と輪郭の警告は[悪い区間の座標](docs/commands/05-6-verify.md#警告は場所も言うdataregions)も返し、`--bbox --normalized` へそのまま渡せる
+- **結果を自分で採点する** — `mask` が返す 7 項目（前景比率・ハロー・境界の色差・遷移幅・輪郭の粗さ・縁の汚染・外周接触）と、機械可読な 34 の警告。縁と輪郭の警告は[悪い区間の座標](docs/commands/05-6-verify.md#警告は場所も言うdataregions)も返し、`--bbox --normalized` へそのまま渡せる。`--edge-repair auto` はその区間だけ[境界を解き直す](docs/commands/05-3-boundary.md#悪い区間だけ解き直す--edge-repair)
 - **AIエージェント向けの構造化I/O** — `--json` で結果を返し、stdout はJSONのみ、ログは stderr に分離
 - **契約を自分で配る** — `kiri schema` がオプションと警告・エラー code の一覧を返す。README を読ませなくてよい
 - **書かずに試せる** — `--dry-run` は成果物を 1 バイトも変えずに、書いたときと同じ結果を返す

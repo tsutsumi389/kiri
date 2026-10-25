@@ -403,6 +403,7 @@ cargo tree -e normal --prefix none | sed 's/ (\*)$//' | sort -u | wc -l
 | 4.15 | 背景をグレーカードとして色を正す | [背景を場として持つ](design/04-4-background-field.md) |
 | 4.16 | 反射を合成する | [影と反射の合成](design/04-6-composite.md) |
 | 4.17 | 帯を連立方程式として解く（closed-form matting） | [境界のアルファ](design/04-2-edge-alpha.md) |
+| 4.18 | 悪い区間だけ境界を解き直す（`--edge-repair`） | [境界のアルファ](design/04-2-edge-alpha.md) |
 
 番号の順と文書の順は一致しない。4.11 や 4.15 のように後から足した節があり、
 **番号は足した順、文書は主題ごと**だからである。番号を振り直すほうが読み筋は
@@ -762,6 +763,8 @@ AI エージェントが `--allow-upscale` を付けるか元素材を見直す�
   "elapsed_ms": 13682
 }
 ```
+
+`--edge-repair auto` を渡すと `edge_repair` ブロックが増える（渡さなければキーごと現れない）。解き直した窓の数と窓そのもの（入力の画素）、見送った理由の警告 code、1 回目と差し替えた後の 3 つの指標を持つ。`mask.*` は差し替えた後の値で、`edge_repair.after` と一致する（4.18）。
 
 **`stage` が `"search"` の候補の数値は参考値である。** その候補は縮小版を
 `refine` 抜きで回したものなので、halo・輪郭の粗さ・縁の汚染・`touches_edge` は

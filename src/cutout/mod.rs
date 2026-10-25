@@ -18,6 +18,7 @@ pub mod closed_form;
 pub mod constraints;
 pub mod despill;
 pub mod diagnostics;
+pub mod edge_repair;
 pub mod edges;
 pub mod feather;
 pub mod floodfill;
@@ -149,6 +150,35 @@ pub struct CutoutOptions {
     pub reclassify: bool,
     /// 背景を 1 色で持つか、照明場として持つか
     pub background_model: BackgroundModel,
+}
+
+impl CutoutOptions {
+    /// 指示の表だけを持たない複製。**表は 24.5MP で 24.5MB ある**ので、差し替える
+    /// 側（`edge_repair::repair`）が複製してから捨てずに済むようにする。
+    ///
+    /// `..self.clone()` で書かないのは、それだと表まで複製されるからである。
+    /// 項目を全部並べるので、足した項目を書き忘れればコンパイルが通らない
+    pub(crate) fn clone_without_constraints(&self) -> Self {
+        Self {
+            tolerance: self.tolerance,
+            border: self.border,
+            bbox: self.bbox,
+            fg_seeds: self.fg_seeds.clone(),
+            constraints: None,
+            cleanup: self.cleanup,
+            feather: self.feather,
+            despill: self.despill,
+            edge_threshold: self.edge_threshold,
+            step_tolerance: self.step_tolerance,
+            shadow_tolerance: self.shadow_tolerance,
+            seal: self.seal,
+            refine: self.refine,
+            matting: self.matting,
+            smooth_contour: self.smooth_contour,
+            reclassify: self.reclassify,
+            background_model: self.background_model,
+        }
+    }
 }
 
 impl Default for CutoutOptions {
@@ -453,6 +483,15 @@ pub struct CutoutResult {
     /// **ここで求めた bbox を自動で適用しない**理由は `subject.rs` を参照
     pub subject: Option<SubjectHint>,
     pub warnings: Vec<Warning>,
+    /// `warnings` のうち、**切り抜いた結果から判定した警告**が始まる位置。
+    /// それより前は設定の調整（堤防・場・matting）についての警告である。
+    ///
+    /// `edge_repair::repair` がマスクを差し替えたとき、結果の警告だけを測り直して
+    /// 入れ替えるために要る。設定の警告は 1 回目の設定のまま正しい
+    pub judged_from: usize,
+    /// 実際に使った背景の場。`edge_repair::repair` が混ぜたマスクを 1 回目と同じ
+    /// 背景で測り直すために持つ（格子の数ぶんの小さな表である）
+    pub field: BackgroundField,
 }
 
 /// 実際に使う堤防のしきい値と、自動調整したことを知らせる警告を決める。
@@ -679,40 +718,7 @@ pub fn cutout_seen(
     stages.mark("面積フィルタ 2 回目とアルファ適用");
 
     let stats = mask.stats();
-    // despill 前の元画像で測る。境界の色を書き換えた後では、
-    // 「元々どれだけ違ったか」が分からなくなるため。
-    // 探る深さは、前景の外側に残る背景色の縁を跨げるだけ取る。縁の厚さは
-    // 輪郭検出(1px程度)・形態素処理・フェザリングの合計で決まる。
-    //
-    // `--cleanup` は長辺 1000px 換算の値なので、そのまま足すと実寸を語らない。
-    // 20MP では換算値 2 が実寸 13px 相当になり、換算値のまま足すと高解像度ほど
-    // 縁を跨げなくなる。面積の下限から実効半径を逆算する
-    let inset =
-        morphology::speck_radius(opts.cleanup, image.width(), image.height()) + opts.feather + 4;
-    // **分離度と診断も互いに独立である。** どちらも画像・マスク・場を読む
-    // だけで、相手の結果を見ない。段の表では 1 つにまとめる——同時に走って
-    // いるものを 2 行に分けて出すと、足した数がどこにも存在しない時間になる
-    let (separability, diagnostics) = rayon::join(
-        || {
-            boundary_separability(
-                image,
-                &mask,
-                &field,
-                inset,
-                opts.bbox,
-                opts.constraints.as_ref(),
-            )
-        },
-        || {
-            diagnostics::diagnose(
-                image,
-                &mask,
-                &field,
-                diagnostics::halo_reference_gate(residual.p90),
-                opts.bbox,
-            )
-        },
-    );
+    let (separability, diagnostics) = judge(image, &mask, &field, &residual, opts);
     stages.mark("分離度と診断");
     stages.report();
 
@@ -722,6 +728,7 @@ pub fn cutout_seen(
     warnings.extend(matting_report.and_then(not_converged));
     warnings.extend(field_warning);
     warnings.extend(field_skipped);
+    let judged_from = warnings.len();
     warnings.extend(collect_warnings(
         &background,
         &residual,
@@ -748,7 +755,57 @@ pub fn cutout_seen(
         diagnostics,
         subject,
         warnings,
+        judged_from,
+        field,
     }
+}
+
+/// 切り抜いたマスクの分離度と診断を測る。
+///
+/// `cutout_seen` の最後と、`edge_repair::repair` が混ぜたマスクを測り直すところの
+/// 2 箇所が同じものを呼ぶ。**測り方を 2 つ持たない**——片方だけ inset や門を
+/// 変えると、解き直しの前後の数値が同じ物差しで測ったものでなくなる。
+pub(crate) fn judge(
+    image: &RgbaImage,
+    mask: &Mask,
+    field: &BackgroundField,
+    residual: &DeltaEQuantiles,
+    opts: &CutoutOptions,
+) -> (Option<f64>, Diagnostics) {
+    // despill 前の元画像で測る。境界の色を書き換えた後では、
+    // 「元々どれだけ違ったか」が分からなくなるため。
+    // 探る深さは、前景の外側に残る背景色の縁を跨げるだけ取る。縁の厚さは
+    // 輪郭検出(1px程度)・形態素処理・フェザリングの合計で決まる。
+    //
+    // `--cleanup` は長辺 1000px 換算の値なので、そのまま足すと実寸を語らない。
+    // 20MP では換算値 2 が実寸 13px 相当になり、換算値のまま足すと高解像度ほど
+    // 縁を跨げなくなる。面積の下限から実効半径を逆算する
+    let inset =
+        morphology::speck_radius(opts.cleanup, image.width(), image.height()) + opts.feather + 4;
+    // **分離度と診断も互いに独立である。** どちらも画像・マスク・場を読む
+    // だけで、相手の結果を見ない。段の表では 1 つにまとめる——同時に走って
+    // いるものを 2 行に分けて出すと、足した数がどこにも存在しない時間になる
+    rayon::join(
+        || {
+            boundary_separability(
+                image,
+                mask,
+                field,
+                inset,
+                opts.bbox,
+                opts.constraints.as_ref(),
+            )
+        },
+        || {
+            diagnostics::diagnose(
+                image,
+                mask,
+                field,
+                diagnostics::halo_reference_gate(residual.p90),
+                opts.bbox,
+            )
+        },
+    )
 }
 
 /// 1 回目のフィルの結果を材料に場を作り直し、もう一度フィルする。
@@ -1047,7 +1104,7 @@ fn not_converged(report: closed_form::Report) -> Option<Warning> {
 ///
 /// どの警告も機械可読な `code` を持ち、判断に使った数値を `data` に載せる。
 /// 文言は推敲で変わるが、code と data のキーは契約として動かさない。
-fn collect_warnings(
+pub(crate) fn collect_warnings(
     background: &BackgroundEstimate,
     residual: &DeltaEQuantiles,
     stats: &MaskStats,

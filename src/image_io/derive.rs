@@ -338,6 +338,9 @@ pub fn render(
                     quality_used: quality_used.map(quality_number),
                     attempts,
                     role: d.role.clone(),
+                    // 写像は呼び出し側（cutout）が足す。ここは何が書かれたかしか知らない
+                    source_rect: None,
+                    content_rect: None,
                 },
                 // **ここを通った警告は必ず「どの派生か」を名乗る。** 1 実行で
                 // 複数の派生を書くようになった以上、`ALPHA_FLATTENED` が

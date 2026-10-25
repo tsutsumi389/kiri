@@ -307,9 +307,24 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             final_image.dimensions(),
         ));
     }
-    let (output_reports, save_warnings) =
+    let (mut output_reports, save_warnings) =
         output::write_images(final_image, &loaded, &args.out, &output_plan, &reserved)?;
     warnings.extend(save_warnings);
+    // 入力の座標から出力の座標への写像。最終画像の寸法と配置はここで確定している。
+    //
+    // **目録を書く前に足す。** 目録の `outputs[]` は結果 JSON と「まったく同じ
+    // 要素」だと 03-output.md が約束している。片方にだけ載せると、その 1 文が嘘になる
+    if let Some(from) = placement_of(rotation.is_some(), canvas.as_ref(), content, (w, h)) {
+        let derivations = output::specs(&args.out);
+        for (report, spec) in output_reports.iter_mut().zip(&derivations) {
+            if let Some((source, content)) =
+                from.through(final_image.dimensions(), spec.resize().as_ref())
+            {
+                report.source_rect = Some(source);
+                report.content_rect = Some(content);
+            }
+        }
+    }
 
     // **マスクは本出力の後に書く。** 先に書くと、命名や衝突の検査で落ちる実行でも
     // マスクだけが残り、「どれで落ちてもファイルは 1 つも書かれない」という
@@ -447,6 +462,115 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         elapsed_ms: started.elapsed().as_millis(),
         warnings,
     })
+}
+
+/// 入力の矩形が最終画像（派生のリサイズ前）のどこへ写ったか。
+///
+/// `source` は入力の画素（両端を含む）、`dest` は最終画像の連続座標
+/// （`[左端, 上端, 右端, 下端)`。画素 `x` は `[x, x + 1)` を占める）。
+/// 端を連続座標で持つのは、派生のリサイズが端を画素の境目から外すからで、
+/// 丸めは最後の 1 回だけにする（2 度丸めると縮小で 1px ずつずれが積む）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Placed {
+    source: [u32; 4],
+    dest: [f64; 4],
+}
+
+/// 切り抜きから最終画像までの写像。**回した実行では作らない**——0 度以外の
+/// 回転は矩形を矩形へ写さない（`OutputReport::source_rect`）。
+///
+/// キャンバスが無ければ最終画像は入力と同じ格子に乗っている（影と反射は
+/// 画素を足すだけで、座標を動かさない）。キャンバスがあれば、`content`
+/// （切り詰めた範囲）が `canvas.offset` から `canvas.content` の寸法で置かれる。
+fn placement_of(
+    rotated: bool,
+    canvas: Option<&CanvasReport>,
+    content: Option<(u32, u32, u32, u32)>,
+    (w, h): (u32, u32),
+) -> Option<Placed> {
+    if rotated {
+        return None;
+    }
+    match canvas {
+        None => Some(Placed {
+            source: [0, 0, w - 1, h - 1],
+            dest: [0.0, 0.0, f64::from(w), f64::from(h)],
+        }),
+        Some(c) => {
+            let (x1, y1, x2, y2) = content?;
+            let (ox, oy) = (f64::from(c.offset[0]), f64::from(c.offset[1]));
+            Some(Placed {
+                source: [x1, y1, x2, y2],
+                dest: [
+                    ox,
+                    oy,
+                    ox + f64::from(c.content[0]),
+                    oy + f64::from(c.content[1]),
+                ],
+            })
+        }
+    }
+}
+
+impl Placed {
+    /// 派生のリサイズを通した後の `(source_rect, content_rect)`。
+    ///
+    /// **`cover` で切り取られた分は入力の側も縮める。** 出力からはみ出した
+    /// 範囲を `content_rect` だけ詰めると、2 つの矩形の比が拡縮の倍率を
+    /// 言わなくなる。何も写らなかった（全部切り取られた）なら `None`。
+    fn through(
+        &self,
+        image: (u32, u32),
+        resize: Option<&crate::transform::resize::ResizeSpec>,
+    ) -> Option<([u32; 4], [u32; 4])> {
+        let (scale, crop, out) = match resize {
+            None => ((1.0, 1.0), (0.0, 0.0), image),
+            Some(spec) => {
+                let plan = crate::transform::resize::plan(image, spec).ok()?;
+                let scale = (
+                    f64::from(plan.scaled.0) / f64::from(image.0),
+                    f64::from(plan.scaled.1) / f64::from(image.1),
+                );
+                let crop = plan
+                    .crop
+                    .map_or((0.0, 0.0), |(x, y, _, _)| (f64::from(x), f64::from(y)));
+                (scale, crop, plan.output)
+            }
+        };
+        let mut source = [0u32; 4];
+        let mut content = [0u32; 4];
+        // 軸ごとに独立に解く（`exact` は縦横で倍率が違う）
+        for axis in 0..2 {
+            let (s0, s1) = (
+                f64::from(self.source[axis]),
+                f64::from(self.source[axis + 2]) + 1.0,
+            );
+            let k = if axis == 0 { scale.0 } else { scale.1 };
+            let off = if axis == 0 { crop.0 } else { crop.1 };
+            let limit = f64::from(if axis == 0 { out.0 } else { out.1 });
+            let d0 = self.dest[axis] * k - off;
+            let d1 = self.dest[axis + 2] * k - off;
+            let (c0, c1) = (d0.max(0.0), d1.min(limit));
+            if c1 <= c0 || d1 <= d0 {
+                return None;
+            }
+            // 出力で切り取った分だけ、入力の側も同じ比で詰める
+            let t = |c: f64| s0 + (c - d0) / (d1 - d0) * (s1 - s0);
+            let (from, to) = (t(c0), t(c1));
+            source[axis] = snap(from).floor() as u32;
+            source[axis + 2] = (snap(to).ceil() as u32).max(source[axis] + 1) - 1;
+            content[axis] = snap(c0).floor() as u32;
+            content[axis + 2] = (snap(c1).ceil() as u32).max(content[axis] + 1) - 1;
+        }
+        Some((source, content))
+    }
+}
+
+/// 浮動小数の割り算が整数の端を 1e-9 だけ外したものを、整数へ戻す。
+/// 戻さないと、外側へ丸める `floor` / `ceil` が 1px 余計に広げる
+fn snap(v: f64) -> f64 {
+    let r = v.round();
+    if (v - r).abs() < 1e-6 { r } else { v }
 }
 
 /// 正規化の結果を JSON のブロックへ落とす。
@@ -2497,6 +2621,68 @@ mod tests {
             assert_eq!(angle, deg);
             assert!(warning.is_none(), "{deg} で門の警告が出ている");
         }
+    }
+
+    fn resize_to(
+        width: u32,
+        height: Option<u32>,
+        fit: crate::transform::resize::FitMode,
+    ) -> crate::transform::resize::ResizeSpec {
+        crate::transform::resize::ResizeSpec {
+            width: Some(width),
+            height,
+            fit,
+            allow_upscale: false,
+        }
+    }
+
+    /// 回した実行は写像を持たない。回さなければ全面が全面へ写る。
+    #[test]
+    fn a_rotation_drops_the_mapping() {
+        assert_eq!(placement_of(true, None, None, (40, 30)), None);
+        let whole = placement_of(false, None, None, (40, 30)).unwrap();
+        assert_eq!(
+            whole.through((40, 30), None),
+            Some(([0, 0, 39, 29], [0, 0, 39, 29]))
+        );
+    }
+
+    /// `cover` で切り取られた分は、入力の側も同じ比で詰める。
+    #[test]
+    fn a_cover_crop_narrows_the_source_as_well() {
+        use crate::transform::resize::FitMode;
+        // 200x100 の最終画像を 100x100 へ cover で: 倍率 1.0、左右 50px ずつ切る
+        let whole = placement_of(false, None, None, (200, 100)).unwrap();
+        let spec = resize_to(100, Some(100), FitMode::Cover);
+        assert_eq!(
+            whole.through((200, 100), Some(&spec)),
+            Some(([50, 0, 149, 99], [0, 0, 99, 99]))
+        );
+        // 縦横で倍率の違う指定（片方だけの width で縮小）
+        let spec = resize_to(100, None, FitMode::Contain);
+        assert_eq!(
+            whole.through((200, 100), Some(&spec)),
+            Some(([0, 0, 199, 99], [0, 0, 99, 49]))
+        );
+    }
+
+    /// キャンバスに置いた矩形は `offset` から `content` の寸法で写る。
+    #[test]
+    fn a_canvas_places_the_trimmed_rectangle() {
+        let canvas = CanvasReport {
+            width: 100,
+            height: 100,
+            fill_ratio: 0.5,
+            content: [50, 25],
+            offset: [25, 37],
+            scale: 0.25,
+        };
+        let placed =
+            placement_of(false, Some(&canvas), Some((10, 20, 209, 119)), (400, 300)).unwrap();
+        assert_eq!(
+            placed.through((100, 100), None),
+            Some(([10, 20, 209, 119], [25, 37, 74, 61]))
+        );
     }
 
     #[test]

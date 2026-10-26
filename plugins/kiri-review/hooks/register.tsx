@@ -1891,8 +1891,8 @@ export const register: Register = on => {
             submitLabel="追加" value="" onSubmit={v => void addComment(v)} />
         )}
         {'Input' in ui && !showBefore && (
-          /* 次に付けるコメントの種類。もう一度押すと未分類に戻す */
-          <Box flexDirection="row" gap={1}>
+          /* 次に付けるコメントの種類。もう一度押すと未分類に戻す。狭いペインでは折り返す */
+          <Box flexDirection="row" flexWrap="wrap" gap={1}>
             <Text dimColor>種類</Text>
             {KINDS.map(k => (
               <Button key={`kind-${k}`} {...(nextOne === k ? { variant: 'primary' as const } : { plain: true })} label={KIND_LABEL[k]}

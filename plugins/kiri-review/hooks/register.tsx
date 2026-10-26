@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { KiriInfo, KiriMapping, KiriRegion, KiriRepair, ReviewComment, ReviewImage, ReviewSelection, ReviewShot, ReviewStatus, ReviewVersion, ReviewZoom } from '../types'
+import type { KiriInfo, KiriMapping, KiriRegion, KiriRepair, ReviewComment, ReviewImage, ReviewKind, ReviewSeen, ReviewSelection, ReviewShot, ReviewStatus, ReviewVersion, ReviewZoom } from '../types'
 
 const PANE = 'kiri-review'
 // 画像に重ねるドラッグ用の Client の key
@@ -37,11 +37,21 @@ const confirmRemove = atom({ plugin: 'kiri-review', key: 'confirmRemove' } as co
 const zoom = atom({ plugin: 'kiri-review', key: 'zoom' } as const, null as ReviewZoom | null)
 const compare = atom({ plugin: 'kiri-review', key: 'compare' } as const, false)
 const busy = atom({ plugin: 'kiri-review', key: 'busy' } as const, '')
+const kind = atom({ plugin: 'kiri-review', key: 'kind' } as const, null as ReviewKind | null)
 
 const IMAGE_EXT = /\.(png|jpe?g|webp|avif|heic|tiff?|gif|bmp)$/i
 
 function isKiri(command: string): boolean {
   return /(^|[\s;&|/])kiri\s/.test(command)
+}
+
+/**
+ * つないだコマンドから kiri を走らせた一つだけを取り出し、頭の VAR=... を落とす。
+ * ラベルに残すので、前後のコマンドや環境変数（鍵が入りうる）を書かない
+ */
+export function kiriPart(command: string): string {
+  const part = command.split(/&&|\|\||[;|\n]/).find(isKiri) ?? ''
+  return part.trim().replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|"[^"]*"|\S*)\s+)+/, '')
 }
 
 /** cd したあとの相対パスは、どこを指すか分からないので拾わない */
@@ -250,18 +260,25 @@ export function kiriInfos(command: string, stdout: string, cwd = ''): Map<string
           : undefined
       const size = { width: typeof out.width === 'number' ? out.width : Infinity, height: typeof out.height === 'number' ? out.height : Infinity }
       const regions: KiriRegion[] = []
+      let truncated = false
       for (const w of warnings) {
         const code = (w as { code?: unknown } | null)?.code
         if (typeof code !== 'string' || !(code in REGION_CODES) || mapping === undefined) continue
         const list = (w as { data?: { regions?: unknown } }).data?.regions
+        if (Array.isArray(list) && list.length > 5) truncated = true
         for (const r of Array.isArray(list) ? list.slice(0, 5) : []) {
           const b = rect4((r as { bbox?: unknown } | null)?.bbox)
           const score = (r as { score?: unknown }).score
           const at = b === undefined ? undefined : inputToOutput(b, mapping, size)
-          if (at !== undefined) regions.push({ code, score: typeof score === 'number' ? score : 0, ...at })
+          if (at !== undefined) regions.push({ code, score: typeof score === 'number' ? score : 0, ...at, bbox: b })
         }
       }
-      found.set(out.path, { regions, ...(mapping === undefined ? {} : { mapping }), ...(repair === undefined ? {} : { repair }) })
+      found.set(out.path, {
+        command: kiriPart(command),
+        ...(cwd === '' ? {} : { cwd }),
+        regions,
+        ...(truncated ? { truncated } : {}),
+        ...(mapping === undefined ? {} : { mapping }), ...(repair === undefined ? {} : { repair }) })
     }
   }
   const walk = (v: unknown): void => {
@@ -420,6 +437,150 @@ export function fitComments(
 /** 差し替わった画像への送信済みのコメントを「確認待ち」にする */
 export function markReplaced(all: readonly ReviewComment[], replaced: ReadonlySet<string>): ReviewComment[] {
   return all.map(c => (replaced.has(c.path) && statusOf(c) === 'sent' ? { ...c, status: 'check' } : c))
+}
+
+/** 指摘の種類の並び（ペインのボタンの順、行の「種類」を押すとこの順に進む） */
+export const KINDS: readonly ReviewKind[] = ['halo', 'missing', 'extra', 'rough', 'tint', 'other']
+
+export const KIND_LABEL: Readonly<Record<ReviewKind, string>> = {
+  halo: '縁残り',
+  missing: '欠け',
+  extra: '残り',
+  rough: 'ギザギザ',
+  tint: '混色',
+  other: 'その他',
+}
+
+/** kiri の警告のコードに当たる種類 */
+export const CODE_KIND: Readonly<Record<string, ReviewKind>> = {
+  HALO_REMAINS: 'halo',
+  CONTOUR_ROUGH: 'rough',
+  RIM_CONTAMINATED: 'tint',
+}
+
+/** 行の「種類」を押したときの次の種類。最後の次は未分類に戻る */
+export function nextKind(k: ReviewKind | undefined): ReviewKind | undefined {
+  if (k === undefined) return KINDS[0]
+  return KINDS[KINDS.indexOf(k) + 1]
+}
+
+/** ラベルの書き出しの形式の名前。形を変えたら番号を上げる */
+export const LABELS_SCHEMA = 'kiri-review.labels/1'
+
+/** コメントを付けたときの画像の版を覚える（ラベルは、その版のものとして書き出す） */
+export function seenOf(img: ReviewImage, r: { x0: number; y0: number; x1: number; y1: number }): ReviewSeen {
+  return {
+    mtimeMs: img.mtimeMs, version: img.version ?? 1, width: img.width, height: img.height,
+    x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y1, ...(img.kiri === undefined ? {} : { kiri: img.kiri }),
+  }
+}
+
+/** 書き出す 1 行（画像の 1 版ぶん）。pixels は、その版の画素を写したパスを書き入れる鍵 */
+export type LabelRecord = { key: string; path: string; mtimeMs: number; current: boolean; json: Record<string, unknown> }
+
+/** 画像の版を指す鍵（パスと mtime）。版の番号はセッションごとに 1 から数え直すので使わない */
+export const versionKey = (path: string, mtimeMs: number) => `${path}@${Math.round(mtimeMs)}`
+
+/**
+ * コメントを、付けたときの画像の版ごとに 1 行の JSON にする（ベンチの材料）。
+ * 一覧の画像の今の版は、種類つきのコメントが無くても labels: [] で書く（前に書いた行の取り消しになる）。
+ * 前の版は、種類つきのコメントがあるときだけ書く。範囲の約束は conventions に書いておく
+ */
+export function labelRecords(list: readonly ReviewImage[], all: readonly ReviewComment[], exportedAt: string): LabelRecord[] {
+  return list.flatMap(img => {
+    const mine = all.filter(c => c.path === img.path)
+    const groups = new Map<number, { seen: Omit<ReviewSeen, 'x0' | 'y0' | 'x1' | 'y1'>; items: { c: ReviewComment; r: ReviewSeen }[] }>()
+    groups.set(img.mtimeMs, { seen: seenOf(img, { x0: 0, y0: 0, x1: img.width, y1: img.height }), items: [] })
+    for (const c of mine) {
+      if (c.kind === undefined) continue
+      // 覚える前のコメントは、今の版に付けたものとみなす
+      const r = c.seen ?? seenOf(img, c)
+      const g = groups.get(r.mtimeMs) ?? { seen: r, items: [] }
+      g.items.push({ c, r })
+      groups.set(r.mtimeMs, g)
+    }
+    return [...groups.values()].flatMap(({ seen, items }) => {
+      const current = seen.mtimeMs === img.mtimeMs
+      if (!current && items.length === 0) return []
+      const k = seen.kiri
+      const m = k?.mapping
+      const size = { width: seen.width, height: seen.height }
+      return [{
+        key: versionKey(img.path, seen.mtimeMs),
+        path: img.path,
+        mtimeMs: seen.mtimeMs,
+        current,
+        json: {
+          schema: LABELS_SCHEMA,
+          exported_at: exportedAt,
+          conventions: {
+            rect: '出力画像の画素 [x0, y0, x1, y1]、左上が原点、右と下の端は含まない',
+            input_rect: '入力画像の画素 [x0, y0, x1, y1]、両端を含む（kiri の data.regions[].bbox と同じ）',
+          },
+          image: { path: img.path, width: seen.width, height: seen.height, mtime_ms: seen.mtimeMs, version: seen.version, current },
+          pixels: null,
+          input: m === undefined ? null : { path: m.input, width: m.inputWidth, height: m.inputHeight, source_rect: m.source, content_rect: m.content },
+          command: k?.command ?? null,
+          cwd: k?.cwd ?? null,
+          kiri_regions: (k?.regions ?? []).map(r => ({ code: r.code, score: r.score, rect: [r.x0, r.y0, r.x1, r.y1], input_rect: r.bbox ?? null })),
+          kiri_regions_truncated: k?.truncated === true,
+          labels: items.map(({ c, r }) => {
+            const whole = isWhole(r, size)
+            const back = m === undefined || whole ? undefined : outputToInput(r, m)
+            return {
+              kind: c.kind,
+              text: c.text,
+              status: statusOf(c),
+              whole,
+              rect: [r.x0, r.y0, r.x1, r.y1],
+              input_rect: back ?? null,
+              input_rect_note: m === undefined ? 'no_mapping' : whole ? 'whole' : back === undefined ? 'outside_content' : null,
+              code: c.code ?? null,
+            }
+          }),
+        },
+      }]
+    })
+  })
+}
+
+/** 書き出し先。プラグインの入れ直しや .cache の片付けで消えないよう、プラグインの外に置く */
+export async function labelsDir($: EngineInterface): Promise<string> {
+  const home = await $.env.get('HOME')
+  if (home === undefined || home === '') throw new Error('HOME が分かりません')
+  return `${home}/Library/Application Support/kiri-review/labels`
+}
+
+/**
+ * ラベルを書き出す。押すたびに新しいファイル（<時刻>-<乱数>.jsonl）に書くので、前の書き出しを
+ * 読み直さず、同時に押しても消し合わない。その版の画素は images/ に写し、pixels にパスを入れる
+ * （今の版は読み込み時の写し、前の版は残してある写しから。無ければ null）。書いたファイルと行数を返す
+ */
+async function exportLabels($: EngineInterface): Promise<{ file: string; rows: number; labels: number }> {
+  const list = await read($, images)
+  const records = labelRecords(list, (await read($, comments)).filter(c => typeof c.path === 'string'), new Date().toISOString())
+  const dir = await labelsDir($)
+  await run($, ['mkdir', '-p', `${dir}/images`])
+  for (const r of records) {
+    const img = list.find(x => x.path === r.path)
+    const from = img === undefined
+      ? ''
+      : r.current
+        ? img.snapshot || img.path
+        : img.before !== undefined && img.before.mtimeMs === r.mtimeMs ? img.before.snapshot : ''
+    if (from === '') continue
+    const ext = r.path.match(/\.[^./]+$/)?.[0] ?? ''
+    const to = `${dir}/images/${pathKey(r.path)}-${Math.round(r.mtimeMs)}${ext}`
+    try {
+      if (!(await $.fs.exists(to))) await run($, ['cp', '-c', from, to]).catch(() => run($, ['cp', from, to]))
+      r.json.pixels = to
+    } catch {
+      // 画素は無しで書く
+    }
+  }
+  const file = `${dir}/${new Date().toISOString().replace(/[:.]/g, '-')}-${Math.random().toString(36).slice(2, 8)}.jsonl`
+  await $.fs.write(file, records.map(r => JSON.stringify(r.json)).join('\n') + '\n')
+  return { file, rows: records.length, labels: records.reduce((n, r) => n + (r.json.labels as unknown[]).length, 0) }
 }
 
 /** 切り抜きの余白（範囲の辺の長さに対する割合）と、その最小（px） */
@@ -692,7 +853,7 @@ export function promptFor(
     ...items.flatMap((c, i) => {
       const crop = crops.get(c.id)
       return [
-        `${i + 1}. ${describeRect(c, img)}: ${c.text}${statusOf(c) === 'again' ? '（再指摘: 前回の修正のあとも直っていません）' : ''}`,
+        `${i + 1}. ${c.kind === undefined ? '' : `[${KIND_LABEL[c.kind]}] `}${describeRect(c, img)}: ${c.text}${statusOf(c) === 'again' ? '（再指摘: 前回の修正のあとも直っていません）' : ''}`,
         ...(crop === undefined ? [] : [`   切り抜き: ${crop}（Read で開いて確認できます）`]),
         ...inputLines(c, img),
       ]
@@ -1065,6 +1226,8 @@ async function addImages(
 /** 別の画像へ移るときに、その画像だけの表示（外す確かめ、拡大、前の版）を戻す */
 async function leaveImage($: EngineInterface): Promise<void> {
   await update($, confirmRemove, () => '')
+  // 選んだ種類は、その画像に付けるつもりのもの
+  await update($, kind, () => null)
   await update($, zoom, () => null)
   await update($, compare, () => false)
 }
@@ -1525,6 +1688,7 @@ export const register: Register = on => {
       return { value: x.path, label: `${i + 1}. ${baseName(x.path)}${n > 0 ? `（${n}）` : ''}` }
     })
     const mySel = sel !== null && sel.path === img.path ? sel : null
+    const nextOne = await read($, kind)
 
     const addComment = async (raw: string) => {
       const now = (await read($, images)).find(x => x.path === img.path)
@@ -1545,9 +1709,14 @@ export const register: Register = on => {
       const prev = await read($, comments)
       const id = Math.max(await read($, lastId), ...prev.map(x => x.id)) + 1
       await update($, lastId, () => id)
-      await update($, comments, l => [...l, { id, path: now.path, x0, y0, x1, y1, text, status: 'draft' as const, width: now.width, height: now.height }])
-      // 次のコメントは選び直す
+      const k = await read($, kind)
+      await update($, comments, l => [...l, {
+        id, path: now.path, x0, y0, x1, y1, text, status: 'draft' as const, width: now.width, height: now.height,
+        seen: seenOf(now, { x0, y0, x1, y1 }), ...(k === null ? {} : { kind: k }),
+      }])
+      // 次のコメントは範囲も種類も選び直す
       await update($, selection, s => (s !== null && s.path === now.path ? null : s))
+      await update($, kind, () => null)
     }
 
     // kiri の指摘を、その範囲への未送信のコメントにする（同じ指摘を二度足さない）
@@ -1564,11 +1733,34 @@ export const register: Register = on => {
       if (prev.some(c => c.path === now.path && c.x0 === r.x0 && c.y0 === r.y0 && c.x1 === r.x1 && c.y1 === r.y1 && c.text === text)) return
       const id = Math.max(await read($, lastId), ...prev.map(x => x.id)) + 1
       await update($, lastId, () => id)
-      await update($, comments, l => [...l, { id, path: now.path, x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y1, text, status: 'draft' as const, width: now.width, height: now.height }])
+      const of = CODE_KIND[r.code]
+      await update($, comments, l => [...l, {
+        id, path: now.path, x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y1, text, status: 'draft' as const, width: now.width, height: now.height,
+        code: r.code, seen: seenOf(now, r), ...(of === undefined ? {} : { kind: of }),
+      }])
     }
 
     const setStatus = (id: number, status: ReviewStatus) =>
       void update($, comments, l => l.map(x => (x.id === id ? { ...x, status } : x)))
+    const cycleKind = (id: number) =>
+      void update($, comments, l => l.map(x => {
+        if (x.id !== id) return x
+        const { kind: k, ...rest } = x
+        const n = nextKind(k)
+        return n === undefined ? rest : { ...rest, kind: n }
+      }))
+    const labeledCount = all.filter(c => c.kind !== undefined).length
+    const writeLabels = async () => {
+      try {
+        // 読み込み（写しの片付け）と重ならないよう、同じ列で書く
+        const done = queue.then(() => exportLabels($))
+        queue = done.catch(() => undefined)
+        const { file, labels } = await done
+        $.ui.toast(`kiri-review: ラベル ${labels} 件を ${file} に書き出しました`)
+      } catch (err) {
+        $.ui.toast(`kiri-review: ラベルを書き出せませんでした: ${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
 
     const send = async () => {
       // 送るのは、まだ送っていないものと「まだ」を付けたもの。送ったものは「送信済み」として残す
@@ -1698,6 +1890,16 @@ export const register: Register = on => {
             placeholder={mySel !== null ? '例: 髪の輪郭がギザギザ' : '例: 全体に暗い'}
             submitLabel="追加" value="" onSubmit={v => void addComment(v)} />
         )}
+        {'Input' in ui && !showBefore && (
+          /* 次に付けるコメントの種類。もう一度押すと未分類に戻す。狭いペインでは折り返す */
+          <Box flexDirection="row" flexWrap="wrap" gap={1}>
+            <Text dimColor>種類</Text>
+            {KINDS.map(k => (
+              <Button key={`kind-${k}`} {...(nextOne === k ? { variant: 'primary' as const } : { plain: true })} label={KIND_LABEL[k]}
+                onPress={() => void update($, kind, v => (v === k ? null : k))} />
+            ))}
+          </Box>
+        )}
         {err !== '' && <Text color="red">{err}</Text>}
         {mine.length > 0 && (
           <Box flexDirection="column">
@@ -1710,9 +1912,10 @@ export const register: Register = on => {
                   <Button key={`del${c.id}`} plain dimColor label="×"
                     onPress={() => void update($, comments, l => l.filter(x => x.id !== c.id))} />
                   <Text dimColor={st === 'fixed'}>
-                    {i + 1}. {c.text}{whole ? <Text dimColor>（画像全体）</Text> : ''}
+                    {i + 1}. {c.kind === undefined ? '' : `[${KIND_LABEL[c.kind]}] `}{c.text}{whole ? <Text dimColor>（画像全体）</Text> : ''}
                     {st === 'draft' ? '' : <Text color={st === 'check' ? 'yellow' : st === 'fixed' ? 'green' : st === 'again' ? 'red' : undefined} dimColor={st === 'sent'}>{STATUS_LABEL[st]}</Text>}
                   </Text>
+                  <Button key={`kind${c.id}`} plain dimColor label={c.kind === undefined ? '種類' : '種類を変える'} onPress={() => cycleKind(c.id)} />
                   {!whole && canSvg && <Button key={`zoom${c.id}`} plain dimColor label="拡大" onPress={() => void zoomSerial($, img.path, c)} />}
                   {(st === 'sent' || st === 'check' || st === 'again') && (
                     <Button key={`fix${c.id}`} plain label="直った" onPress={() => setStatus(c.id, 'fixed')} />
@@ -1742,6 +1945,7 @@ export const register: Register = on => {
         {others > 0 && <Text dimColor>ほかの画像に {others} 件あります（一緒に送ります）。</Text>}
         <Box flexDirection="row" gap={1}>
           {sendable.length > 0 && <Button key="send" variant="primary" label={`Claude に送る（${sendable.length} 件）`} onPress={() => void send()} />}
+          {all.length > 0 && <Button key="labels" dimColor label={`ラベルを書き出す（${labeledCount} 件）`} onPress={() => void writeLabels()} />}
           <Button key="copy" dimColor label="画像をコピー" onPress={() => void copy()} />
           <Button key="reload" dimColor label="読み直す" onPress={() => void openAndReport($, [img.path], false)} />
           {list.length > 1 && (

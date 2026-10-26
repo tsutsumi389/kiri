@@ -24,7 +24,7 @@ describe('kiri の結果を読む', () => {
     expect(info?.mapping).toEqual({ input: '/w/in.jpg', inputWidth: 4284, inputHeight: 5712, source: [82, 2073, 4177, 3398], content: [75, 362, 924, 636] })
     // 範囲を写さない警告（EDGE_THRESHOLD_RAISED など）は拾わない
     expect(info?.regions.map(r => r.code)).toEqual([...Array(4).fill('CONTOUR_ROUGH'), ...Array(5).fill('RIM_CONTAMINATED')])
-    expect(info?.regions[0]).toEqual({ code: 'CONTOUR_ROUGH', score: 0.5081, x0: 206, y0: 363, x1: 442, y1: 378 })
+    expect(info?.regions[0]).toEqual({ code: 'CONTOUR_ROUGH', score: 0.5081, x0: 206, y0: 363, x1: 442, y1: 378, bbox: [714, 2078, 1847, 2146] })
     // source_rect の外（上の 2062 < 2073、右の 4186 > 4177）は切り詰める
     expect(info?.regions[4]).toMatchObject({ x0: 75, y0: 362, x1: 290, y1: 468 })
     expect(info?.regions[7]).toMatchObject({ x0: 813, y0: 535, x1: 925, y1: 628 })
@@ -32,7 +32,7 @@ describe('kiri の結果を読む', () => {
   })
   test('source_rect / content_rect の無い出力（--rotate）は範囲も対応も持たない。--dry-run は読まない', async () => {
     const rotated = { ...CANVAS_REPORT, outputs: CANVAS_REPORT.outputs.map(({ source_rect: _s, content_rect: _c, ...o }) => o) }
-    expect(kiriInfos(CMD, stdout(rotated), '/w').get('canvas.png')).toEqual({ regions: [] })
+    expect(kiriInfos(CMD, stdout(rotated), '/w').get('canvas.png')).toEqual({ command: CMD, cwd: '/w', regions: [] })
     expect(kiriInfos(CMD, stdout({ ...CANVAS_REPORT, dry_run: true }), '/w').size).toBe(0)
     expect(kiriInfos('ls --json', stdout(CANVAS_REPORT), '/w').size).toBe(0)
   })
@@ -135,10 +135,10 @@ test('kiri の結果の指摘を重ね、拡大とコメントにでき、送る
 
   // 一押しで、警告のコードを含む未送信のコメントになる（二度は足さない）
   await ui.press({ key: 'kcomment0' })
-  expect(await ui.find({ type: 'Text', text: /^1\. \[CONTOUR_ROUGH\] 輪郭がギザギザ（kiri の指摘 K1、score 0\.5081）/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^1\. \[ギザギザ\] \[CONTOUR_ROUGH\] 輪郭がギザギザ（kiri の指摘 K1、score 0\.5081）/ })).toBeDefined()
   expect(await ui.find({ type: 'Button', key: 'kcomment0' })).toBeUndefined()
   await ui.press({ key: 'send' })
-  expect(sent[0]).toContain('1. x 206–442, y 363–378 px（横 21–44%、縦 36–38%）: [CONTOUR_ROUGH] 輪郭がギザギザ（kiri の指摘 K1、score 0.5081）')
+  expect(sent[0]).toContain('1. [ギザギザ] x 206–442, y 363–378 px（横 21–44%、縦 36–38%）: [CONTOUR_ROUGH] 輪郭がギザギザ（kiri の指摘 K1、score 0.5081）')
   expect(sent[0]).toContain('   入力画像 /w/in.jpg（4284×5712 px）では x 713–1850, y 2077–2150')
   expect(sent[0]).toContain('   多角形: 713,2077,1851,2077,1851,2151,713,2151（normalized: 0.1664,0.3636,0.4321,0.3636,0.4321,0.3766,0.1664,0.3766）')
 

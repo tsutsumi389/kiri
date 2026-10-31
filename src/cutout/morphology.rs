@@ -11,11 +11,9 @@
 //! `erode` / `dilate` / `open` / `close` は境界帯の生成や比較のためにある。
 //! パイプラインでは使わない。理由は `remove_specks` と `close` の項を参照。
 
-use std::collections::VecDeque;
-
 use rayon::prelude::*;
 
-use crate::cutout::mask::Mask;
+use crate::cutout::mask::{FOREGROUND_THRESHOLD, Mask};
 
 /// 孤立ノイズとして消す連結成分の面積の下限(px²)。
 ///
@@ -73,6 +71,14 @@ fn speck_scale(width: u32, height: u32) -> f64 {
 ///
 /// 連結を 8 近傍にするのは、4 近傍だと斜めに走る 1px の構造が細切れになり、
 /// 面積で判定した途端にすべて消えてしまうためである。
+///
+/// # 塗り広げずに、連結成分で答える
+///
+/// 消すかどうかは成分ごとの芯の面積だけで決まり、成分をどの順で辿るかには
+/// 依らない。行ごとのラン（0 でない画素の連続区間）を並列に切り出して芯の
+/// 画素数を数え、上下の行で接するランを `run_components` で結ぶ。1 画素ずつ
+/// キューへ出し入れすると前景の大きい 24.5MP で 1 回 50ms かかるが、前景は
+/// 長いランになるので結ぶ相手はその数十分の 1 しか無い。
 pub fn remove_specks(mask: &Mask, radius: u32) -> Mask {
     if radius == 0 {
         return mask.clone();
@@ -80,68 +86,138 @@ pub fn remove_specks(mask: &Mask, radius: u32) -> Mask {
     let (w, h) = (mask.width(), mask.height());
     let min_area = speck_min_area(radius, w, h);
     let stride = w as usize;
-
     let mut out = mask.clone();
-    let mut visited = vec![false; stride * (h as usize)];
-    let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
+    if stride == 0 || h == 0 {
+        return out;
+    }
+    let alpha = mask.as_slice();
 
-    for y in 0..h {
-        for x in 0..w {
-            let start = (y as usize) * stride + (x as usize);
-            if visited[start] || mask.get(x, y) == 0 {
-                continue;
+    // 行ごとのランと、その中の芯（前景判定）の画素数
+    let runs: Vec<Vec<CountedRun>> = alpha
+        .par_chunks(stride)
+        .map(|row| {
+            let mut runs = Vec::new();
+            let mut open: Option<CountedRun> = None;
+            for (x, &v) in row.iter().enumerate() {
+                if v == 0 {
+                    runs.extend(open.take());
+                    continue;
+                }
+                let run = open.get_or_insert(CountedRun {
+                    x0: x as u32,
+                    x1: x as u32,
+                    core: 0,
+                });
+                run.x1 = x as u32;
+                run.core += usize::from(v >= FOREGROUND_THRESHOLD);
             }
+            runs.extend(open);
+            runs
+        })
+        .collect();
+    let (first, component) = run_components(&runs, true);
+    let mut area = vec![0usize; component.len()];
+    for (y, row) in runs.iter().enumerate() {
+        for (k, run) in row.iter().enumerate() {
+            area[component[first[y] + k] as usize] += run.core;
+        }
+    }
+    // 消す成分のランだけを 0 で塗る。行ごとに書き先が分かれるので並列に回す
+    out.as_mut_slice()
+        .par_chunks_mut(stride)
+        .zip(runs.par_iter())
+        .enumerate()
+        .for_each(|(y, (row, runs))| {
+            for (k, run) in runs.iter().enumerate() {
+                if area[component[first[y] + k] as usize] < min_area {
+                    row[run.x0 as usize..=run.x1 as usize].fill(0);
+                }
+            }
+        });
+    out
+}
 
-            // 1 周目は面積を数えるだけにする。成分の座標を Vec に実体化すると、
-            // 前景がほぼ全面の 12MP で 1 成分が 1200 万画素になり、それだけで
-            // 96MB を余計に抱える。パイプラインは 2 回呼ぶので、ピーク RSS が
-            // 207MB から 400MB へ跳ねる
-            visited[start] = true;
-            queue.clear();
-            queue.push_back((x, y));
-            let mut core = 0usize;
-            while let Some((cx, cy)) = queue.pop_front() {
-                if mask.is_foreground(cx, cy) {
-                    core += 1;
-                }
-                let (x0, x1) = (cx.saturating_sub(1), (cx + 1).min(w - 1));
-                let (y0, y1) = (cy.saturating_sub(1), (cy + 1).min(h - 1));
-                for ny in y0..=y1 {
-                    for nx in x0..=x1 {
-                        let i = (ny as usize) * stride + (nx as usize);
-                        if visited[i] || mask.get(nx, ny) == 0 {
-                            continue;
-                        }
-                        visited[i] = true;
-                        queue.push_back((nx, ny));
-                    }
-                }
-            }
-            if core >= min_area {
-                continue;
-            }
+/// `remove_specks` のラン。芯の画素数を持ち歩く。
+#[derive(Clone, Copy)]
+struct CountedRun {
+    x0: u32,
+    x1: u32,
+    core: usize,
+}
 
-            // 2 周目で 0 を書きながら同じ成分をたどる。書き込んだ 0 がそのまま
-            // 訪問済みの印になるので、座標を覚えておく必要がない
-            queue.clear();
-            out.set(x, y, 0);
-            queue.push_back((x, y));
-            while let Some((cx, cy)) = queue.pop_front() {
-                let (x0, x1) = (cx.saturating_sub(1), (cx + 1).min(w - 1));
-                let (y0, y1) = (cy.saturating_sub(1), (cy + 1).min(h - 1));
-                for ny in y0..=y1 {
-                    for nx in x0..=x1 {
-                        if out.get(nx, ny) == 0 {
-                            continue;
-                        }
-                        out.set(nx, ny, 0);
-                        queue.push_back((nx, ny));
-                    }
-                }
+impl Span for CountedRun {
+    fn span(&self) -> (u32, u32) {
+        (self.x0, self.x1)
+    }
+}
+
+/// 行の中の連続区間（両端を含む x）として読めるもの。
+pub(crate) trait Span {
+    fn span(&self) -> (u32, u32);
+}
+
+/// 行ごとのランを、上下の行で接するもの同士つないだ連結成分に分ける。
+///
+/// 戻り値は (行ごとの先頭の通し番号, ランごとの成分の番号)。行 `y` の `k` 番目の
+/// ランの成分は `component[first[y] + k]` で、番号は成分を代表するランの通し
+/// 番号である。`diagonal` が真なら 8 近傍（斜めに 1 画素ずれて接するランも
+/// つなぐ）、偽なら 4 近傍。各行のランは x の昇順で、重ならないこと。
+///
+/// **成分は結ぶ順序に依らない。** 連結は「接している」という対称な関係の
+/// 推移閉包でしかないので、どの順で union-find に掛けても同じ分け方になる。
+pub(crate) fn run_components<R: Span>(runs: &[Vec<R>], diagonal: bool) -> (Vec<usize>, Vec<u32>) {
+    let mut first = Vec::with_capacity(runs.len() + 1);
+    let mut total = 0usize;
+    for row in runs {
+        first.push(total);
+        total += row.len();
+    }
+    first.push(total);
+    let slack = u32::from(diagonal);
+    let mut parent: Vec<u32> = (0..total as u32).collect();
+    for y in 1..runs.len() {
+        let (above, below) = (&runs[y - 1], &runs[y]);
+        let (mut i, mut j) = (0, 0);
+        while i < above.len() && j < below.len() {
+            let ((a0, a1), (b0, b1)) = (above[i].span(), below[j].span());
+            if a0 <= b1 + slack && b0 <= a1 + slack {
+                union(
+                    &mut parent,
+                    (first[y - 1] + i) as u32,
+                    (first[y] + j) as u32,
+                );
+            }
+            if a1 < b1 {
+                i += 1;
+            } else {
+                j += 1;
             }
         }
     }
-    out
+    for i in 0..total as u32 {
+        let root = find(&mut parent, i);
+        parent[i as usize] = root;
+    }
+    (first, parent)
+}
+
+/// union-find の根。辿った道は半分ずつ縮める。
+fn find(parent: &mut [u32], mut i: u32) -> u32 {
+    while parent[i as usize] != i {
+        let up = parent[parent[i as usize] as usize];
+        parent[i as usize] = up;
+        i = up;
+    }
+    i
+}
+
+/// 2 つの成分を結ぶ。根の小さいほうへ寄せる（どちらへ寄せても成分は同じ）。
+fn union(parent: &mut [u32], a: u32, b: u32) {
+    let (ra, rb) = (find(parent, a), find(parent, b));
+    if ra != rb {
+        let (lo, hi) = (ra.min(rb), ra.max(rb));
+        parent[hi as usize] = lo;
+    }
 }
 
 /// 収縮。前景を `radius` px 削る。
@@ -611,6 +687,78 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// ランで答える `remove_specks` が、8 近傍を 1 画素ずつ辿って芯の面積を
+    /// 数える素直な実装と同じマスクを返すこと。半透明の裾を混ぜる。
+    #[test]
+    fn the_run_speck_filter_agrees_with_a_plain_one() {
+        fn plain(mask: &Mask, min_area: usize) -> Mask {
+            let (w, h) = (mask.width() as i64, mask.height() as i64);
+            let mut out = mask.clone();
+            let mut label = vec![usize::MAX; (w * h) as usize];
+            let mut members = Vec::new();
+            for start in 0..(w * h) as usize {
+                if label[start] != usize::MAX || mask.as_slice()[start] == 0 {
+                    continue;
+                }
+                members.clear();
+                label[start] = start;
+                members.push(start);
+                let mut k = 0;
+                while k < members.len() {
+                    let i = members[k] as i64;
+                    k += 1;
+                    for dy in -1..=1 {
+                        for dx in -1..=1 {
+                            let (nx, ny) = (i % w + dx, i / w + dy);
+                            if nx < 0 || ny < 0 || nx >= w || ny >= h {
+                                continue;
+                            }
+                            let j = (ny * w + nx) as usize;
+                            if label[j] == usize::MAX && mask.as_slice()[j] != 0 {
+                                label[j] = start;
+                                members.push(j);
+                            }
+                        }
+                    }
+                }
+                let core = members
+                    .iter()
+                    .filter(|&&i| mask.as_slice()[i] >= FOREGROUND_THRESHOLD)
+                    .count();
+                if core < min_area {
+                    for &i in &members {
+                        out.as_mut_slice()[i] = 0;
+                    }
+                }
+            }
+            out
+        }
+
+        let (w, h) = (53u32, 41u32);
+        let mut state = 0x1234_5678_u32;
+        for density in [20u32, 45, 60] {
+            let mut mask = Mask::new(w, h, 0);
+            for y in 0..h {
+                for x in 0..w {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    if state % 100 < density {
+                        mask.set(x, y, if state % 7 == 0 { 60 } else { 255 });
+                    }
+                }
+            }
+            for radius in [1, 2, 3] {
+                let want = plain(&mask, speck_min_area(radius, w, h));
+                assert_eq!(
+                    remove_specks(&mask, radius),
+                    want,
+                    "密度 {density} 半径 {radius}"
+                );
+            }
+        }
     }
 
     #[test]

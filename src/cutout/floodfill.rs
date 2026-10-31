@@ -912,35 +912,8 @@ fn fill_from_border(
             out
         })
         .collect();
-    let mut first = Vec::with_capacity(runs.len() + 1);
-    let mut total = 0usize;
-    for row in &runs {
-        first.push(total);
-        total += row.len();
-    }
-    first.push(total);
-
     // 上下の行で x の範囲が重なるランを結ぶ（4 近傍の連結）
-    let mut parent: Vec<u32> = (0..total as u32).collect();
-    for y in 1..runs.len() {
-        let (above, below) = (&runs[y - 1], &runs[y]);
-        let (mut i, mut j) = (0, 0);
-        while i < above.len() && j < below.len() {
-            let (a, b) = (above[i], below[j]);
-            if a.x0 <= b.x1 && b.x0 <= a.x1 {
-                union(
-                    &mut parent,
-                    (first[y - 1] + i) as u32,
-                    (first[y] + j) as u32,
-                );
-            }
-            if a.x1 < b.x1 {
-                i += 1;
-            } else {
-                j += 1;
-            }
-        }
-    }
+    let (first, component) = morphology::run_components(&runs, false);
 
     // 起点を含む成分に印を付ける。起点は確定背景と、矩形の縁の画素である。
     //
@@ -959,7 +932,7 @@ fn fill_from_border(
     let (sx1, sy1, sx2, sy2) = bbox.unwrap_or((0, 0, w - 1, h - 1));
     let (sx1, sx2) = (sx1.min(sx2).min(w - 1), sx2.max(sx1).min(w - 1));
     let (sy1, sy2) = (sy1.min(sy2).min(h - 1), sy2.max(sy1).min(h - 1));
-    let mut rooted = vec![false; total];
+    let mut rooted = vec![false; component.len()];
     for (y, row) in runs.iter().enumerate() {
         let y = y as u32;
         for (k, run) in row.iter().enumerate() {
@@ -971,14 +944,13 @@ fn fill_from_border(
                 false
             };
             if on_edge || run.pinned {
-                let root = find(&mut parent, (first[y as usize] + k) as u32);
-                rooted[root as usize] = true;
+                rooted[component[first[y as usize] + k] as usize] = true;
             }
         }
     }
     for (y, row) in runs.iter().enumerate() {
         for (k, run) in row.iter().enumerate() {
-            if rooted[find(&mut parent, (first[y] + k) as u32) as usize] {
+            if rooted[component[first[y] + k] as usize] {
                 let at = y * stride;
                 filled.insert_range(at + run.x0 as usize, at + run.x1 as usize + 1);
             }
@@ -996,22 +968,9 @@ struct Run {
     pinned: bool,
 }
 
-/// union-find の根。辿った道は半分ずつ縮める。
-fn find(parent: &mut [u32], mut i: u32) -> u32 {
-    while parent[i as usize] != i {
-        let up = parent[parent[i as usize] as usize];
-        parent[i as usize] = up;
-        i = up;
-    }
-    i
-}
-
-/// 2 つの成分を結ぶ。根の小さいほうへ寄せる（どちらへ寄せても成分は同じ）。
-fn union(parent: &mut [u32], a: u32, b: u32) {
-    let (ra, rb) = (find(parent, a), find(parent, b));
-    if ra != rb {
-        let (lo, hi) = (ra.min(rb), ra.max(rb));
-        parent[hi as usize] = lo;
+impl morphology::Span for Run {
+    fn span(&self) -> (u32, u32) {
+        (self.x0, self.x1)
     }
 }
 

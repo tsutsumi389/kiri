@@ -2930,7 +2930,13 @@ fn the_preview_reproduces_the_measured_contrast() {
         back.sort_by(f64::total_cmp);
         let (f, b) = (front[front.len() / 2], back[back.len() / 2]);
         let (hi, lo) = if f > b { (f, b) } else { (b, f) };
-        let expected = (hi + 0.05) / (lo + 0.05);
+        // **期待値も JSON を 1 度くぐらせてから比べる。** kiri は最短の往復表記で
+        // 書くが、serde_json は `float_roundtrip` なしでは読み戻しが 1 ulp ずれる
+        // ことがある（3.8101475409088366 → 3.810147540908837）。くぐらせずに比べると、
+        // ランナーのフォントで値が変わっただけで落ちる
+        let expected: f64 =
+            serde_json::from_str(&serde_json::to_string(&((hi + 0.05) / (lo + 0.05))).unwrap())
+                .unwrap();
         let measured = display_of(heading, name)["contrast"].as_f64().unwrap();
         assert_eq!(measured, expected, "{name}");
     }

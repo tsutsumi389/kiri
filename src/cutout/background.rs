@@ -103,8 +103,11 @@ impl BackgroundEstimate {
 ///
 /// 中央値を使うのは、外周に商品がわずかに掛かっている場合に平均だと引きずられるため。
 pub fn estimate_background(image: &RgbaImage, border: u32) -> BackgroundEstimate {
-    let texture = border_gradient_quantiles(image, texture_band(image, border));
-    let Sampled { samples, opaque } = collect_border_pixels(image, border);
+    // 勾配の分位と色の標本は互いに独立なので同時に測る
+    let (texture, Sampled { samples, opaque }) = rayon::join(
+        || border_gradient_quantiles(image, texture_band(image, border)),
+        || collect_border_pixels(image, border),
+    );
     if samples.is_empty() {
         return BackgroundEstimate {
             rgb: [255, 255, 255],
@@ -118,7 +121,9 @@ pub fn estimate_background(image: &RgbaImage, border: u32) -> BackgroundEstimate
     }
 
     let rgb = median_rgb(&samples);
-    let mut deltas: Vec<f64> = samples.iter().map(|&s| delta_e_rgb(s, rgb)).collect();
+    // 標本ごとに独立なので並列に測る。`collect` は並びを保ち、分位は
+    // 並べ替えた列から取るので、どちらにしても答えは動かない
+    let mut deltas: Vec<f64> = samples.par_iter().map(|&s| delta_e_rgb(s, rgb)).collect();
     let within = deltas.iter().filter(|d| **d <= UNIFORM_DELTA_E).count();
     deltas.sort_by(f64::total_cmp);
 
@@ -1103,15 +1108,28 @@ pub fn perimeter_residual(
         // 1 色に対する分布そのもの。測り直すと同じ量が二通りの数で出る
         return background.delta_e;
     }
-    let mut opaque: Vec<f64> = Vec::new();
-    let mut all: Vec<f64> = Vec::new();
-    for_each_border_pixel(image, border, |x, y, rgb, is_opaque| {
-        let d = delta_e_rgb(rgb, field.rgb_at(x, y));
-        all.push(d);
-        if is_opaque {
-            opaque.push(d);
-        }
-    });
+    // 行ごとに並列に測る。色差は画素ごとに独立で、分位は並べ替えた値の列から
+    // 取るので、集める順序は答えに関わらない
+    let rows: Vec<(Vec<f64>, Vec<f64>)> = (0..image.height())
+        .into_par_iter()
+        .map(|y| {
+            let (mut opaque, mut all) = (Vec::new(), Vec::new());
+            for_each_border_pixel_in_row(image, border, y, |x, rgb, is_opaque| {
+                let d = delta_e_rgb(rgb, field.rgb_at(x, y));
+                all.push(d);
+                if is_opaque {
+                    opaque.push(d);
+                }
+            });
+            (opaque, all)
+        })
+        .collect();
+    let opaque: Vec<f64> = rows.iter().flat_map(|r| r.0.iter().copied()).collect();
+    let all: Vec<f64> = if opaque.is_empty() {
+        rows.iter().flat_map(|r| r.1.iter().copied()).collect()
+    } else {
+        Vec::new()
+    };
     // 透明な画素は背景色の情報を持たない。全て透明だったときだけやむなく全件を使う
     let mut deltas = if opaque.is_empty() { all } else { opaque };
     deltas.sort_by(f64::total_cmp);
@@ -1125,20 +1143,38 @@ fn for_each_border_pixel(
     border: u32,
     mut visit: impl FnMut(u32, u32, [u8; 3], bool),
 ) {
+    for y in 0..image.height() {
+        for_each_border_pixel_in_row(image, border, y, |x, rgb, is_opaque| {
+            visit(x, y, rgb, is_opaque)
+        });
+    }
+}
+
+/// `for_each_border_pixel` の 1 行ぶん。x の昇順に渡す。
+///
+/// **帯の中だけを舐める。** 帯の外の行の内側は 1 画素も帯に入らないので、
+/// 全画素に「帯の中か」を問うと 24.5MP では 2450 万回の判定がほぼ空振りになる。
+fn for_each_border_pixel_in_row(
+    image: &RgbaImage,
+    border: u32,
+    y: u32,
+    mut visit: impl FnMut(u32, [u8; 3], bool),
+) {
     let (w, h) = (image.width(), image.height());
     if w == 0 || h == 0 {
         return;
     }
     let border = border.max(1).min(w.div_ceil(2)).min(h.div_ceil(2));
-    for y in 0..h {
-        for x in 0..w {
-            let on_border = x < border || y < border || x >= w - border || y >= h - border;
-            if !on_border {
-                continue;
-            }
-            let p = image.get_pixel(x, y).0;
-            visit(x, y, [p[0], p[1], p[2]], p[3] >= 250);
-        }
+    let mut take = |x: u32| {
+        let p = image.get_pixel(x, y).0;
+        visit(x, [p[0], p[1], p[2]], p[3] >= 250);
+    };
+    if y < border || y >= h - border {
+        (0..w).for_each(&mut take);
+    } else {
+        // 幅が奇数だと左右の帯が 1 列重なりうる。重なった列は 1 度だけ渡す
+        (0..border).for_each(&mut take);
+        (border.max(w - border)..w).for_each(&mut take);
     }
 }
 

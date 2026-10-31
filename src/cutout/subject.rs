@@ -393,6 +393,22 @@ pub fn detect_subject(
     background: &BackgroundEstimate,
     border: u32,
 ) -> Option<SubjectHint> {
+    if image.width() == 0 || image.height() == 0 {
+        return None;
+    }
+    detect_subject_on(image, background, border, downscale(image))
+}
+
+/// `detect_subject` の、測る縮小版（`downscale` の結果）を呼び出し側が渡す版。
+///
+/// 縮小は背景の見立てに依らないので、見立てと同時に作れる
+/// （`cutout::see_background`）。縮小に失敗したなら `None` を渡す。
+pub(crate) fn detect_subject_on(
+    image: &RgbaImage,
+    background: &BackgroundEstimate,
+    border: u32,
+    small: Option<RgbaImage>,
+) -> Option<SubjectHint> {
     let (full_w, full_h) = (image.width(), image.height());
     if full_w == 0 || full_h == 0 {
         return None;
@@ -402,7 +418,7 @@ pub fn detect_subject(
     // 頭打ちに掛からないので、**1 度も測り直さない**
     let capped = calibrated_border(full_w, full_h, border);
     let background = background_for(image, background, border, capped);
-    let small = downscale(image)?;
+    let small = small?;
     let (w, h) = (small.width(), small.height());
 
     // 閾値の下限に UNIFORM_DELTA_E を置く。均一背景では外周の p90 がほぼ 0 に
@@ -652,7 +668,7 @@ fn leftover_outside(
 ///
 /// 既存のリサイズ経路（Lanczos3・事前乗算つき）を使う。ここだけ別の補間を
 /// 書くと、同じ画像に対して kiri の中に二つの縮小結果が存在することになる。
-fn downscale(image: &RgbaImage) -> Option<RgbaImage> {
+pub(crate) fn downscale(image: &RgbaImage) -> Option<RgbaImage> {
     let (w, h) = (image.width(), image.height());
     if w.max(h) <= MEASURE_LONG_EDGE {
         return Some(image.clone());

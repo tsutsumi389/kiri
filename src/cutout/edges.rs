@@ -8,6 +8,7 @@
 //! 両者は明確に区別できる。
 
 use image::RgbaImage;
+use rayon::prelude::*;
 
 use crate::cutout::morphology::BitPlane;
 
@@ -37,14 +38,40 @@ use crate::cutout::morphology::BitPlane;
 /// **ビット面で返す。** `Vec<bool>` は 1 画素 1 バイトで、24.5MP では 24.5MB
 /// ある。呼び出し側（フィルの下ごしらえ）は 2 回のフィルをまたいでこれを
 /// 生かすので、常駐が 1/8 になる差がそのままピーク RSS に出る。
+///
+/// **行の帯に割って並列に回す。** 画素ごとの強度と抑制は上下 1 行（輝度なら
+/// 2 行）しか読まないので、帯の上下にその分だけ余分に読めば、1 本で流したのと
+/// 同じ値が出る（`walk_ridges_rows`）。帯ごとの作業域は 3 行ずつのままである。
 pub fn edge_ridges(image: &RgbaImage, threshold: f32) -> BitPlane {
+    const STRIP: usize = 64;
     let (w, h) = (image.width() as usize, image.height() as usize);
     let mut out = BitPlane::new(w * h);
-    walk_ridges(image, w, h, |i, m| {
-        if m > threshold {
-            out.insert(i);
-        }
-    });
+    if w < 3 || h < 3 {
+        return out;
+    }
+    // 帯ごとに書き先が分かれるよう、行を語に揃えた面へ書いてから詰め直す
+    let wpr = w.div_ceil(64);
+    let mut words = vec![0u64; wpr * h];
+    words
+        .par_chunks_mut(STRIP * wpr)
+        .enumerate()
+        .for_each(|(k, slab)| {
+            let top = k * STRIP;
+            let bottom = top + slab.len() / wpr;
+            let (from, to) = (top.max(1), bottom.min(h - 1));
+            if from >= to {
+                return;
+            }
+            walk_ridges_rows(image, w, h, (from, to), |i, m| {
+                if m > threshold {
+                    let (y, x) = (i / w - top, i % w);
+                    slab[y * wpr + x / 64] |= 1u64 << (x % 64);
+                }
+            });
+        });
+    for (y, row) in words.chunks_exact(wpr).enumerate() {
+        out.insert_bits(y * w, w, row);
+    }
     out
 }
 
@@ -258,36 +285,68 @@ fn suppress_row(
 ///
 /// 結果を溜める器は呼び出し側に決めさせる。本番は真偽値だけ、テストは強度を
 /// そのまま見たい、という違いのために f32 の表を作らずに済む。
-fn walk_ridges(image: &RgbaImage, w: usize, h: usize, mut keep: impl FnMut(usize, f32)) {
+///
+/// 本番（`edge_ridges`）は行の帯に割った `walk_ridges_rows` を直に呼ぶ。
+/// 1 本で流すこちらはテストの物差しとして残す。
+#[cfg(test)]
+fn walk_ridges(image: &RgbaImage, w: usize, h: usize, keep: impl FnMut(usize, f32)) {
     if w < 3 || h < 3 {
         return;
     }
+    walk_ridges_rows(image, w, h, (1, h - 1), keep);
+}
+
+/// `walk_ridges` の、抑制した結果を出す行を `rows.0..rows.1` に限った版。
+/// `1 <= rows.0 < rows.1 <= h - 1` であること。
+///
+/// 強度の行は画像の上下の端（0 行目と `h - 1` 行目）では 0 として扱う——
+/// 3x3 を読めないので値が無く、1 本で流す版の環も初期値の 0 のまま読んでいた。
+/// 範囲の上下 1 行の強度（輝度ならさらに 1 行）を余分に作るので、どこで
+/// 区切っても 1 本で流したのと同じ値になる。
+fn walk_ridges_rows(
+    image: &RgbaImage,
+    w: usize,
+    h: usize,
+    rows: (usize, usize),
+    mut keep: impl FnMut(usize, f32),
+) {
+    let (from, to) = rows;
     // 行の環。添字は `行番号 % 3` で、1 周前の行を上書きする
     let mut luma = vec![0.0f32; 3 * w];
     let mut mag = vec![0.0f32; 3 * w];
     let mut dir = vec![0u8; 3 * w];
-    // 画像の外に当たる強度の行。最後の抑制で 1 度だけ使う
-    let zeros = vec![0.0f32; w];
-    let row = |y: usize| (y % 3) * w;
+    let slot = |y: usize| (y % 3) * w;
+    // 読み込み済みの輝度の行の次
+    let mut next_luma = (from - 1).saturating_sub(1);
 
-    luma_row(image, 0, w, &mut luma[row(0)..row(0) + w]);
-    luma_row(image, 1, w, &mut luma[row(1)..row(1) + w]);
+    for r in from - 1..=to {
+        let m = slot(r);
+        if (1..h - 1).contains(&r) {
+            // 強度の行 r には輝度の行 r-1, r, r+1 が要る
+            while next_luma <= r + 1 {
+                let at = slot(next_luma);
+                if next_luma + 1 >= r {
+                    luma_row(image, next_luma, w, &mut luma[at..at + w]);
+                }
+                next_luma += 1;
+            }
+            let (a, b) = (slot(r - 1), slot(r + 1));
+            sobel_row(
+                &luma[a..a + w],
+                &luma[m..m + w],
+                &luma[b..b + w],
+                w,
+                &mut mag[m..m + w],
+                &mut dir[m..m + w],
+            );
+        } else {
+            mag[m..m + w].fill(0.0);
+            dir[m..m + w].fill(0);
+        }
 
-    for yy in 1..h - 1 {
-        luma_row(image, yy + 1, w, &mut luma[row(yy + 1)..row(yy + 1) + w]);
-        let (a, m, b) = (row(yy - 1), row(yy), row(yy + 1));
-        sobel_row(
-            &luma[a..a + w],
-            &luma[m..m + w],
-            &luma[b..b + w],
-            w,
-            &mut mag[m..m + w],
-            &mut dir[m..m + w],
-        );
-
-        if yy >= 2 {
-            let y = yy - 1;
-            let (a, m, b) = (row(y - 1), row(y), row(y + 1));
+        if r > from {
+            let y = r - 1;
+            let (a, m, b) = (slot(y - 1), slot(y), slot(y + 1));
             suppress_row(
                 y,
                 w,
@@ -299,19 +358,6 @@ fn walk_ridges(image: &RgbaImage, w: usize, h: usize, mut keep: impl FnMut(usize
             );
         }
     }
-
-    // 最後の行。下の行は画像の外なので強度 0 として扱う
-    let y = h - 2;
-    let (a, m) = (row(y - 1), row(y));
-    suppress_row(
-        y,
-        w,
-        &mag[a..a + w],
-        &mag[m..m + w],
-        &zeros,
-        &dir[m..m + w],
-        &mut keep,
-    );
 }
 
 /// 勾配の向きを 4 方向へ量子化した際の隣接オフセット。
@@ -380,6 +426,33 @@ fn ridge_magnitude(image: &RgbaImage) -> Vec<f32> {
 mod tests {
     use super::*;
     use image::Rgba;
+
+    /// 帯に割った `edge_ridges` が、1 本で流した細線化の強度にしきい値を
+    /// 掛けたものと一致すること。帯の高さ（64 行）を何本もまたぐ高さにする。
+    #[test]
+    fn the_banded_ridges_agree_with_a_single_walk() {
+        let (w, h) = (41u32, 203u32);
+        let mut state = 0x7f4a_7c15_u32;
+        let image = RgbaImage::from_fn(w, h, |x, y| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let base = if (x / 7 + y / 11) % 2 == 0 { 40 } else { 200 };
+            let v = (base + (state % 30) as i32) as u8;
+            Rgba([v, v.wrapping_add(10), v / 2, 255])
+        });
+        let magnitude = ridge_magnitude(&image);
+        for threshold in [5.0f32, 20.0, 60.0] {
+            let ridges = edge_ridges(&image, threshold);
+            for (i, &m) in magnitude.iter().enumerate() {
+                assert_eq!(
+                    ridges.get(i),
+                    m > threshold,
+                    "添字 {i} しきい値 {threshold}"
+                );
+            }
+        }
+    }
 
     fn gray_step(width: u32, left: u8, right: u8) -> RgbaImage {
         let mut img = RgbaImage::new(width, 9);

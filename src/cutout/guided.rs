@@ -40,6 +40,7 @@
 //! 決まるためである。
 
 use image::RgbaImage;
+use rayon::prelude::*;
 
 use crate::cutout::integral::Integral;
 use crate::cutout::mask::Mask;
@@ -183,16 +184,25 @@ pub fn feather(
     if radius == 0 || w == 0 || h == 0 {
         return out;
     }
-    let mut ws = Workspace::default();
-    for ty in (0..h).step_by(TILE as usize) {
-        for tx in (0..w).step_by(TILE as usize) {
-            if let Some(tile) = plan_tile(band, (w, h), (tx, ty), radius) {
-                prepare(image, lut, binary, band, alpha, &mut ws, &tile);
-                solve(&mut ws, &tile, radius);
-                apply(band, solved, w, &ws, &tile, radius, &mut out);
+    // **タイルは自分のタイルの帯画素しか書かない。** 読むのは入力の `alpha` で
+    // あって `out` ではないので、`TILE` 行ずつの帯に割れば書き先が重ならず、
+    // 帯どうしは互いの結果を読まない。タイルの中の積分と和の順序は 1 本で
+    // 回したときと同じなので、浮動小数の値も 1 ビットも動かない
+    let stride = w as usize;
+    let rows = TILE as usize;
+    out.as_mut_slice()
+        .par_chunks_mut(rows * stride)
+        .enumerate()
+        .for_each_init(Workspace::default, |ws, (j, slab)| {
+            let ty = (j * rows) as u32;
+            for tx in (0..w).step_by(TILE as usize) {
+                if let Some(tile) = plan_tile(band, (w, h), (tx, ty), radius) {
+                    prepare(image, lut, binary, band, alpha, ws, &tile);
+                    solve(ws, &tile, radius);
+                    apply(band, solved, w, ws, &tile, radius, (ty, slab));
+                }
             }
-        }
-    }
+        });
     out
 }
 
@@ -454,6 +464,8 @@ pub(crate) fn window(
 }
 
 /// 帯画素へ q = ā・I + b̄ を書き込む。
+///
+/// `out` は画像の `out.0` 行目から始まる行の切れ端で、タイルの行を覆っていること。
 fn apply(
     band: &[u8],
     solved: &Solved,
@@ -461,8 +473,9 @@ fn apply(
     ws: &Workspace,
     tile: &Tile,
     radius: u32,
-    out: &mut Mask,
+    out: (u32, &mut [u8]),
 ) {
+    let (top, out) = out;
     let stride = w as usize;
     for y in tile.by0..=tile.by1 {
         for x in tile.bx0..=tile.bx1 {
@@ -481,7 +494,8 @@ fn apply(
             let q =
                 (s[0] * f64::from(c[0]) + s[1] * f64::from(c[1]) + s[2] * f64::from(c[2]) + s[3])
                     * inv;
-            out.set(x, y, (q.clamp(0.0, 1.0) * 255.0).round() as u8);
+            out[((y - top) as usize) * stride + (x as usize)] =
+                (q.clamp(0.0, 1.0) * 255.0).round() as u8;
         }
     }
 }

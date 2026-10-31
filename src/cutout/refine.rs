@@ -38,7 +38,7 @@
 //! 窓の大きさが画素ごとに違っても成立する。
 
 use std::collections::VecDeque;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use image::RgbaImage;
 use rayon::prelude::*;
@@ -381,9 +381,6 @@ pub fn refine(
         feather_radius: opts.feather,
         core_window: window_for(band_max),
     };
-    // 色で決められなかった画素の受け皿。12MP では単独で 50ms かかるうえ、
-    // 1 画素も落ちない素材のほうが多いので、実際に必要になるまで作らない
-    let fallback: OnceLock<Mask> = OnceLock::new();
     // 色から決まった画素の印。guided のときだけ持つ
     let mut solved = if smooths_alpha {
         guided::Solved::new((w as usize) * (h as usize))
@@ -391,15 +388,7 @@ pub fn refine(
         guided::Solved::default()
     };
 
-    sweep_bands(
-        w,
-        &ctx,
-        &fallback,
-        Pass::Project,
-        &mut out,
-        &mut mask,
-        &mut solved,
-    );
+    sweep_bands(w, &ctx, Pass::Project, &mut out, &mut mask, &mut solved);
 
     let mut matting_report = None;
     if smooths_alpha {
@@ -424,15 +413,7 @@ pub fn refine(
                 despill: true,
                 ..ctx
             };
-            sweep_bands(
-                w,
-                &ctx,
-                &fallback,
-                Pass::Recover,
-                &mut out,
-                &mut mask,
-                &mut solved,
-            );
+            sweep_bands(w, &ctx, Pass::Recover, &mut out, &mut mask, &mut solved);
         }
     }
 
@@ -475,7 +456,6 @@ pub(crate) fn smooth_radius_px(smooth_contour: f64, scale: f64) -> u32 {
 fn sweep_bands(
     w: u32,
     ctx: &Context<'_>,
-    fallback: &OnceLock<Mask>,
     pass: Pass,
     image: &mut RgbaImage,
     mask: &mut Mask,
@@ -491,6 +471,9 @@ fn sweep_bands(
         .for_each(|(band, (image, mask))| {
             let y0 = (band * rows) as u32;
             let mut ws = Workspace::default();
+            // 色で決められなかった画素の受け皿。帯ごとに持ち、要るタイルの
+            // 分だけ作る（`Fallback`）
+            let mut fallback = Fallback::default();
             let mut out = Output {
                 solved: Vec::new(),
                 image,
@@ -500,7 +483,7 @@ fn sweep_bands(
             };
             let mut tx = 0;
             while tx < w {
-                refine_tile(ctx, &mut ws, fallback, (tx, y0), pass, &mut out);
+                refine_tile(ctx, &mut ws, &mut fallback, (tx, y0), pass, &mut out);
                 tx += TILE;
             }
             // 立てる順序は結果に影響しない（同じ添字に同じ 1 を置くだけ）
@@ -700,7 +683,7 @@ impl Output<'_> {
 fn refine_tile(
     ctx: &Context<'_>,
     ws: &mut Workspace,
-    fallback: &OnceLock<Mask>,
+    fallback: &mut Fallback,
     tile: (u32, u32),
     pass: Pass,
     out: &mut Output<'_>,
@@ -818,7 +801,7 @@ fn prepare_tile(ctx: &Context<'_>, ws: &mut Workspace, tile: &Tile) {
 fn estimate_alpha(
     ctx: &Context<'_>,
     ws: &mut Workspace,
-    fallback: &OnceLock<Mask>,
+    fallback: &mut Fallback,
     tile: &Tile,
     pass: Pass,
     out: &mut Output<'_>,
@@ -909,7 +892,7 @@ fn estimate_alpha(
 
             let Some(f) = f else {
                 if pass == Pass::Project {
-                    let v = feather_at(fallback, ctx, x, y);
+                    let v = fallback.at(ctx, x, y);
                     out.set_alpha(x, y, v);
                 }
                 continue;
@@ -920,7 +903,7 @@ fn estimate_alpha(
             if dd < ctx.separation_sq {
                 // 色では決められない。幾何的フェザーへ落とす
                 if pass == Pass::Project {
-                    let v = feather_at(fallback, ctx, x, y);
+                    let v = fallback.at(ctx, x, y);
                     out.set_alpha(x, y, v);
                 }
                 continue;
@@ -1031,11 +1014,41 @@ fn smoothstep(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// 幾何的フェザーの値。初めて必要になったときだけマスク全体を作る。
-fn feather_at(fallback: &OnceLock<Mask>, ctx: &Context<'_>, x: u32, y: u32) -> u8 {
-    fallback
-        .get_or_init(|| feather::feather(ctx.binary, ctx.feather_radius))
-        .get(x, y)
+/// 幾何的フェザー（`feather::feather`）の値の受け皿。**タイルごとに、初めて
+/// 必要になったときだけ**そのタイルの分を作る。
+///
+/// 色で決められなかった画素はたいてい 1 つも無いか、あっても一部のタイルに
+/// 偏る。以前は初めて要った時点でマスク全体を作っていたが、24.5MP では
+/// 単独で 70ms かかり、帯を並列に回している最中に 1 本のスレッドが作る間、
+/// 同じ受け皿を待つ他の帯が止まっていた。作る処理そのものを並列にすると、
+/// rayon の作業盗みで同じ受け皿の初期化に再入して止まる。タイルの分だけを
+/// その場で作れば、待ち合わせも全面の 24.5MB も要らない。値は全面版の
+/// 切り出しと一致する（`feather::feather_window`）。
+#[derive(Default)]
+struct Fallback {
+    /// いま持っているタイルの左上。`values` はそのタイルの行順の値
+    tile: Option<(u32, u32)>,
+    values: Vec<u8>,
+    width: usize,
+}
+
+impl Fallback {
+    fn at(&mut self, ctx: &Context<'_>, x: u32, y: u32) -> u8 {
+        let origin = (x - x % TILE, y - y % TILE);
+        if self.tile != Some(origin) {
+            let (w, h) = (ctx.binary.width(), ctx.binary.height());
+            let rect = (
+                origin.0,
+                origin.1,
+                (origin.0 + TILE - 1).min(w - 1),
+                (origin.1 + TILE - 1).min(h - 1),
+            );
+            self.values = feather::feather_window(ctx.binary, ctx.feather_radius, rect);
+            self.width = (rect.2 - rect.0 + 1) as usize;
+            self.tile = Some(origin);
+        }
+        self.values[((y - origin.1) as usize) * self.width + (x - origin.0) as usize]
+    }
 }
 
 /// 積分画像を張る領域の中身。

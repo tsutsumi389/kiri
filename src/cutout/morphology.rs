@@ -232,6 +232,25 @@ impl BitPlane {
         }
     }
 
+    /// 添字ごとの真偽から面を作る。語ごとに並列に組む。
+    ///
+    /// 面は画素の添字をそのまま詰めるので、1 語は 64 画素ぶんで、語どうしは
+    /// 書き先が重ならない。`f` は添字だけで決まる純粋な判定であること。
+    pub fn from_fn(len: usize, f: impl Fn(usize) -> bool + Sync) -> Self {
+        let mut words = vec![0u64; len.div_ceil(64)];
+        words.par_iter_mut().enumerate().for_each(|(k, word)| {
+            let base = k * 64;
+            let mut v = 0u64;
+            for b in 0..(len - base).min(64) {
+                if f(base + b) {
+                    v |= 1u64 << b;
+                }
+            }
+            *word = v;
+        });
+        Self { words, len }
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }

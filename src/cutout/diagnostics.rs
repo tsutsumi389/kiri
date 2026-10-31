@@ -25,6 +25,7 @@
 //! 素材で 3px なら見える。**縮めたときに見える大きさ**が知りたい量である。
 
 use image::RgbaImage;
+use rayon::prelude::*;
 
 use crate::color::lab::{delta_e76, srgb_to_lab};
 use crate::cutout::background::BackgroundField;
@@ -355,25 +356,32 @@ fn contour_pixels_in(
         }
     };
 
+    // 行ごとに拾って行の順に繋ぐ。並びは 1 本で舐めたときと同じ（ラスター順）で、
+    // 輪郭画素の順に浮動小数を畳む呼び出し側があっても答えは動かない
     let (x0, y0, x1, y1) = roi;
-    let mut pixels = Vec::new();
-    for y in y0..=y1 {
-        for x in x0..=x1 {
-            if !mask.is_foreground(x, y) {
-                continue;
+    let rows: Vec<Vec<(u32, u32)>> = (y0..=y1)
+        .into_par_iter()
+        .map(|y| {
+            let mut row = Vec::new();
+            for x in x0..=x1 {
+                if !mask.is_foreground(x, y) {
+                    continue;
+                }
+                let touches =
+                    [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)]
+                        .into_iter()
+                        .any(|(dx, dy)| {
+                            let (nx, ny) = (x as i64 + dx, y as i64 + dy);
+                            inside(nx, ny) && !mask.is_foreground(nx as u32, ny as u32)
+                        });
+                if touches {
+                    row.push((x, y));
+                }
             }
-            let touches = [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)]
-                .into_iter()
-                .any(|(dx, dy)| {
-                    let (nx, ny) = (x as i64 + dx, y as i64 + dy);
-                    inside(nx, ny) && !mask.is_foreground(nx as u32, ny as u32)
-                });
-            if touches {
-                pixels.push((x, y));
-            }
-        }
-    }
-    pixels
+            row
+        })
+        .collect();
+    rows.concat()
 }
 
 /// 与えた画素からの距離(px)。`CHAMFER_MAX_PX` で飽和する。種が無ければ None。
@@ -409,18 +417,22 @@ pub fn contour_distance_px(width: u32, height: u32, seeds: &[(u32, u32)]) -> Opt
 /// 止まってしまう。
 pub fn farther_than(width: u32, height: u32, seeds: &[(u32, u32)], limit: u32) -> BitPlane {
     let cells = (width as usize) * (height as usize);
-    let mut out = BitPlane::new(cells);
     if seeds.is_empty() {
-        return out;
+        return BitPlane::new(cells);
     }
     let cap = (limit * u32::from(CHAMFER_STEP)).min(u32::from(u8::MAX)) as u8;
-    let field = chamfer_distance(seeds, (0, 0, width - 1, height - 1));
-    for (i, &d) in field.data.iter().enumerate() {
-        if d > cap {
-            out.insert(i);
-        }
+    // u8 の距離は 255 で飽和するので、上限が 255 なら「越えた」画素は無い
+    if cap == u8::MAX {
+        return BitPlane::new(cells);
     }
-    out
+    // **全面を測らない。** 1 歩は少なくとも `CHAMFER_STEP` かかるので、どの種
+    // からも cap / 3 px より離れた画素は cap より遠い。種の外接矩形をそれだけ
+    // 広げた枠の外は測るまでもなく「越えた」側で、枠の外の 255 がそのまま
+    // その答えになる。24.5MP の実写では全面の 1/5 ほどしか舐めずに済む
+    let reach = u32::from(cap / CHAMFER_STEP) + 1;
+    let field = chamfer_capped(seeds, around(seeds, width, height, reach), cap);
+    let w = width as usize;
+    BitPlane::from_fn(cells, |i| field.at((i % w) as u32, (i / w) as u32) > cap)
 }
 
 /// 二値輪郭が、平滑化した参照輪郭からどれだけ離れているかの平均
@@ -485,7 +497,9 @@ fn roughness_of(
         return (None, Vec::new());
     }
 
-    let distance = chamfer_distance(&smooth_contour, roi);
+    let cap = (3 * radius * u32::from(CHAMFER_STEP)).min(u32::from(u8::MAX));
+    // cap より遠い距離は下で頭打ちにするので、測る必要が無い
+    let distance = chamfer_capped(&smooth_contour, roi, cap as u8);
     // **中央値ではなく平均を採る。** チャンファー距離は 1px 刻みでしか
     // 測れないので、中央値は「0 か 1px か」の 2 値にしかならず、しきい値が
     // その段の上に乗る（長辺 6600px を超える素材では中央値 2px 以上でないと
@@ -498,8 +512,7 @@ fn roughness_of(
     // そのまま平均に入る。S9（明度が背景を横切る淡色商品）ではそれで 35.026 と
     // 出て、**輪郭の粗さではなく u8 の上限を報告する**。平滑化が届く距離は
     // 箱ぼかし 3 回ぶんの `3r` しかないのだから、それより遠い距離に情報は無い。
-    // **画素ごとに 3r で clamp してから平均する**
-    let cap = (3 * radius * u32::from(CHAMFER_STEP)).min(u32::from(u8::MAX));
+    // **画素ごとに 3r で clamp してから平均する**（`cap`）
     // 全体の和と同じ値をセルへも足す。整数なので、セルの和を足し直すと
     // 全体の和と 1 ビットも違わない
     let mut cells = grid.tallies();
@@ -583,7 +596,8 @@ fn contamination_of(
     // 画素ごとに割り算が入るだけで、境目は何も変わらない
     let band = rim.min(CHAMFER_MAX_PX) * u32::from(CHAMFER_STEP);
     // 帯の判定にしか使わないので、輪郭から帯幅ぶん離れた外までで足りる
-    let distance = chamfer_distance(contour, around(contour, w, h, rim + 1));
+    // 読むのは「帯幅より遠いか」だけなので、帯幅より遠い距離は測らない
+    let distance = chamfer_capped(contour, around(contour, w, h, rim + 1), band as u8);
     let alpha = mask.as_slice();
     // 参照色を集める範囲は「帯 + 窓」までで足りる。輪郭から遠い画素は
     // どの帯画素の窓にも入らないので、全面を舐める理由が無い
@@ -668,7 +682,7 @@ fn smoothing_radius(scale: f64) -> u32 {
 /// 逆数を小さな表に持って掛け算で済ませる。割り算にすると 12MP では 6 パス ×
 /// 12M 回になり、それだけで 90ms 掛かる。
 fn smoothed(mask: &Mask, radius: u32, roi: (u32, u32, u32, u32)) -> Mask {
-    let (w, h) = (mask.width() as usize, mask.height() as usize);
+    let w = mask.width() as usize;
     let r = radius as usize;
     let (x0, y0, x1, y1) = (
         roi.0 as usize,
@@ -688,16 +702,8 @@ fn smoothed(mask: &Mask, radius: u32, roi: (u32, u32, u32, u32)) -> Mask {
             }
         })
         .collect();
-    let mut line = vec![0u8; w.max(h)];
     for _ in 0..3 {
-        blur_rows(
-            blurred.as_mut_slice(),
-            w,
-            (x0, y0, x1, y1),
-            r,
-            &recip,
-            &mut line,
-        );
+        blur_rows(blurred.as_mut_slice(), w, (x0, y0, x1, y1), r, &recip);
         blur_columns(blurred.as_mut_slice(), w, (x0, y0, x1, y1), r, &recip);
     }
     blurred
@@ -709,26 +715,33 @@ fn blur_rows(
     roi: (usize, usize, usize, usize),
     r: usize,
     recip: &[u64],
-    line: &mut [u8],
 ) {
     let (x0, y0, x1, y1) = roi;
     let span = x1 - x0 + 1;
-    for y in y0..=y1 {
-        let row = &mut data[y * w + x0..y * w + x1 + 1];
-        line[..span].copy_from_slice(row);
-        let (mut sum, mut n) = window_start(&line[..span], r);
-        for (x, slot) in row.iter_mut().enumerate() {
-            *slot = average(sum, n, recip);
-            window_step(&line[..span], r, x, &mut sum, &mut n);
-        }
-    }
+    // 行は互いに独立なので並列に回す。整数の窓和なので順序で値は動かない
+    data[y0 * w..(y1 + 1) * w].par_chunks_mut(w).for_each_init(
+        || vec![0u8; span],
+        |line, row| {
+            let row = &mut row[x0..=x1];
+            line.copy_from_slice(row);
+            let (mut sum, mut n) = window_start(line, r);
+            for (x, slot) in row.iter_mut().enumerate() {
+                *slot = average(sum, n, recip);
+                window_step(line, r, x, &mut sum, &mut n);
+            }
+        },
+    );
 }
 
 /// 列方向のぼかし。**列を 1 本ずつ端から端まで舐めない。**
 ///
 /// 12MP の列を縦に拾うと 1 本ごとに 4000 本のキャッシュラインを跨ぐ。64 列ぶんを
-/// 転置した小さな作業領域（64 × 高さ = 256KB）へ移してから走ると、元の配列への
+/// 転置した小さな作業領域（64 × 高さ）へ移してから走ると、元の配列への
 /// 読み書きは行方向のまま済む。
+///
+/// 64 列の塊は互いに独立なので、**塊ごとに並列にぼかしてから、まとめて
+/// 書き戻す**。ぼかしている間は元の配列を読むだけなので、塊どうしが
+/// 互いの結果を読むことは無い。
 fn blur_columns(
     data: &mut [u8],
     w: usize,
@@ -739,23 +752,32 @@ fn blur_columns(
     const BLOCK: usize = 64;
     let (x0, y0, x1, y1) = roi;
     let span = y1 - y0 + 1;
-    let mut tile = vec![0u8; BLOCK * span];
-    let mut line = vec![0u8; span];
-    for bx in (x0..=x1).step_by(BLOCK) {
-        let n = BLOCK.min(x1 + 1 - bx);
-        for (t, y) in (y0..=y1).enumerate() {
-            tile[t * BLOCK..t * BLOCK + n].copy_from_slice(&data[y * w + bx..y * w + bx + n]);
-        }
-        for k in 0..n {
-            for t in 0..span {
-                line[t] = tile[t * BLOCK + k];
+    let source = &*data;
+    let tiles: Vec<(usize, usize, Vec<u8>)> = (x0..=x1)
+        .step_by(BLOCK)
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|bx| {
+            let n = BLOCK.min(x1 + 1 - bx);
+            let mut tile = vec![0u8; BLOCK * span];
+            let mut line = vec![0u8; span];
+            for (t, y) in (y0..=y1).enumerate() {
+                tile[t * BLOCK..t * BLOCK + n].copy_from_slice(&source[y * w + bx..y * w + bx + n]);
             }
-            let (mut sum, mut count) = window_start(&line, r);
-            for t in 0..span {
-                tile[t * BLOCK + k] = average(sum, count, recip);
-                window_step(&line, r, t, &mut sum, &mut count);
+            for k in 0..n {
+                for t in 0..span {
+                    line[t] = tile[t * BLOCK + k];
+                }
+                let (mut sum, mut count) = window_start(&line, r);
+                for t in 0..span {
+                    tile[t * BLOCK + k] = average(sum, count, recip);
+                    window_step(&line, r, t, &mut sum, &mut count);
+                }
             }
-        }
+            (bx, n, tile)
+        })
+        .collect();
+    for (bx, n, tile) in tiles {
         for (t, y) in (y0..=y1).enumerate() {
             data[y * w + bx..y * w + bx + n].copy_from_slice(&tile[t * BLOCK..t * BLOCK + n]);
         }
@@ -880,6 +902,60 @@ fn chamfer_distance(seeds: &[(u32, u32)], roi: (u32, u32, u32, u32)) -> Field {
     }
     Field {
         data: d,
+        x0,
+        y0,
+        x1,
+        y1,
+        w,
+    }
+}
+
+/// `chamfer_distance` の、`cap` より遠い距離を問わない版。行の帯に割って並列に回す。
+///
+/// 値は **`cap` 以下の画素で `chamfer_distance` と 1 ビットも違わず**、`cap` より
+/// 遠い画素では `cap` より大きい（どれだけ大きいかは問わない）。読む側は
+/// 「`cap` で頭打ちにする」か「`cap` を越えたか」しか問わないこと。
+///
+/// # 帯に割ってよい理由
+///
+/// 3-4 チャンファーの 2 パスは、種と画素の外接矩形を含む矩形の中なら、種からの
+/// 重み付きの最短経路を正しく出す（最短経路は軸と対角の 2 方向だけで組め、
+/// どちらのパスで運ぶかに合わせて順序を並べ替えられる）。距離が `cap` 以下なら
+/// 種は画素から上下 `cap / 3` 行以内にあるので、帯をその行数だけ上下に広げた
+/// 矩形で測れば同じ値が出る。`cap` より遠い画素は、狭い矩形で測っても距離が
+/// 縮むことはないので `cap` より大きいままである。
+fn chamfer_capped(seeds: &[(u32, u32)], roi: (u32, u32, u32, u32), cap: u8) -> Field {
+    let (x0, y0, x1, y1) = (
+        roi.0 as usize,
+        roi.1 as usize,
+        roi.2 as usize,
+        roi.3 as usize,
+    );
+    let w = x1 - x0 + 1;
+    let h = y1 - y0 + 1;
+    let reach = usize::from(cap / CHAMFER_STEP) + 1;
+    // 帯は余白の 4 倍以上にする。細くすると上下の余白を測り直す無駄が勝つ
+    let rows = (4 * reach).max(64);
+    let mut data = vec![u8::MAX; w * h];
+    data.par_chunks_mut(rows * w)
+        .enumerate()
+        .for_each(|(j, core)| {
+            let top = j * rows;
+            let bottom = top + core.len() / w;
+            let (from, to) = (top.saturating_sub(reach), (bottom + reach).min(h));
+            let part = chamfer_distance(
+                seeds,
+                (
+                    x0 as u32,
+                    (y0 + from) as u32,
+                    x1 as u32,
+                    (y0 + to - 1) as u32,
+                ),
+            );
+            core.copy_from_slice(&part.data[(top - from) * w..(bottom - from) * w]);
+        });
+    Field {
+        data,
         x0,
         y0,
         x1,
@@ -1329,6 +1405,65 @@ mod tests {
         assert_eq!(scale_at_1000(1000, 1000), 1.0);
         assert_eq!(scale_at_1000(3000, 4000), 4.0);
         assert_eq!(rim_band(4.0), 12);
+    }
+
+    /// 種を擬似乱数で撒く。外部の乱数に頼らず、試験の再現性を保つ。
+    fn scattered_seeds(w: u32, h: u32, n: usize, mut state: u64) -> Vec<(u32, u32)> {
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        (0..n)
+            .map(|_| {
+                (
+                    (next() % u64::from(w)) as u32,
+                    (next() % u64::from(h)) as u32,
+                )
+            })
+            .collect()
+    }
+
+    /// 帯に割ったチャンファーが、`cap` 以下では 1 本で測ったものと一致し、
+    /// `cap` より遠い画素では `cap` を越えたままであること。
+    ///
+    /// 帯の高さ（余白の 4 倍、最低 64 行）を何本もまたぐ大きさにして、種が
+    /// まばらな場所（帯の外から距離が届く場所）と密な場所を両方作る。
+    #[test]
+    fn the_capped_chamfer_agrees_with_the_whole_one_up_to_the_cap() {
+        let (w, h) = (300u32, 700u32);
+        for (n, cap, seed) in [(5, 30u8, 1u64), (40, 99, 7), (400, 12, 3), (3, 255, 11)] {
+            let seeds = scattered_seeds(w, h, n, seed);
+            let roi = (10, 20, w - 1, h - 31);
+            let whole = chamfer_distance(&seeds, roi);
+            let capped = chamfer_capped(&seeds, roi, cap);
+            for y in 0..h {
+                for x in 0..w {
+                    let (a, b) = (whole.at(x, y), capped.at(x, y));
+                    if a <= cap {
+                        assert_eq!(a, b, "({x}, {y}) cap {cap}");
+                    } else {
+                        assert!(b > cap, "({x}, {y}) cap {cap}: {a} / {b}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// 枠を絞った `farther_than` が、全面のチャンファーを畳んだものと一致すること。
+    #[test]
+    fn farther_than_agrees_with_the_whole_chamfer() {
+        let (w, h) = (257u32, 333u32);
+        for (n, limit, seed) in [(6, 20u32, 5u64), (60, 4, 9), (2, 90, 13), (1, 0, 17)] {
+            let seeds = scattered_seeds(w, h, n, seed);
+            let got = farther_than(w, h, &seeds, limit);
+            let cap = (limit * u32::from(CHAMFER_STEP)).min(u32::from(u8::MAX)) as u8;
+            let whole = chamfer_distance(&seeds, (0, 0, w - 1, h - 1));
+            for (i, &d) in whole.data.iter().enumerate() {
+                assert_eq!(got.get(i), d > cap, "添字 {i} limit {limit}");
+            }
+        }
     }
 
     /// 円盤の輪郭を `amplitude` px でギザギザにしたマスク。

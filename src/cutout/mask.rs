@@ -3,6 +3,8 @@
 //! 統計値は AI エージェントが切り抜きの成否を判定するために使う。
 //! 画像を見なくても `foreground_ratio` や `touches_edge` から失敗を検出できる。
 
+use rayon::prelude::*;
+
 /// 前景の度合いを画素ごとに持つ。0 = 背景、255 = 前景。
 /// フェザリング後は中間値も取る。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,9 +69,10 @@ impl Mask {
         Mask {
             width: self.width,
             height: self.height,
+            // 画素ごとに独立なので並列に写す。`collect` は並びを保つ
             data: self
                 .data
-                .iter()
+                .par_iter()
                 .map(|&v| {
                     if v >= FOREGROUND_THRESHOLD {
                         u8::MAX

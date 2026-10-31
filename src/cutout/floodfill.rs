@@ -763,6 +763,13 @@ impl Expansion<'_> {
     }
 }
 
+/// `expand_closure` が帯に割って回す回数の上限。超えたら 1 本のキューで辿る。
+///
+/// 24.5MP の実写では、受け渡しの大半は 1〜2 回目で済み、3 回目以降は数千件を
+/// 1 つの帯が辿るだけになる（並列の得がほとんど無い）。迷路状の通路では
+/// 回数が数千に達しうる。
+const CLOSURE_ROUNDS: usize = 4;
+
 /// 隣の帯へ受け渡す画素の座標。
 type Handoff = Vec<(u32, u32)>;
 
@@ -804,7 +811,32 @@ fn expand_closure(w: u32, h: u32, seed: BitPlane, stage: &Expansion) -> BitPlane
         words[ly * wpr + x as usize / 64] |= 1u64 << (x % 64);
     };
 
+    let mut rounds = 0;
     while inboxes.iter().any(|inbox| !inbox.is_empty()) {
+        // **回数に上限を置く。** 1 回の受け渡しは帯の境目を 1 本しか越えない
+        // ので、帯を何度も縦に往復する経路（迷路状の通路）では回数が帯の数の
+        // 何倍にも膨らみ、各回は 1 つの帯しか働かない。上限に達したら、残りの
+        // 受け渡しをそのまま種にして 1 本のキューで辿る。閉包は辿る順序に
+        // 依らないので答えは変わらない
+        if rounds == CLOSURE_ROUNDS {
+            let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
+            for (x, y) in inboxes.iter_mut().flat_map(|inbox| inbox.drain(..)) {
+                set(&mut words, x, y as usize);
+                queue.push_back((x, y));
+            }
+            while let Some((x, y)) = queue.pop_front() {
+                let from = lab[(y as usize) * stride + x as usize];
+                for (nx, ny, dx, dy) in neighbours(w, h, x, y) {
+                    if has(&words, nx, ny as usize) || !stage.accepts(w, h, nx, ny, dx, dy, from) {
+                        continue;
+                    }
+                    set(&mut words, nx, ny as usize);
+                    queue.push_back((nx, ny));
+                }
+            }
+            break;
+        }
+        rounds += 1;
         // 帯ごとに (上の帯へ, 下の帯へ) の受け渡しを返す
         let outboxes: Vec<(Handoff, Handoff)> = words
             .par_chunks_mut(band * wpr)
@@ -1244,11 +1276,138 @@ mod tests {
         );
     }
 
-    /// 帯に割って辿る到達閉包（`expand_closure`）が、1 本のキューで辿ったものと
-    /// 一致すること。距離の上限を事実上無限にした影の段の経路は、1 本のキューで
-    /// 閉包を辿る（u8 の距離は飽和しても上限に届かない）ので、それと比べる。
+    /// Phase 35 より前の `expand` を**逐語のまま**残した物差し（origin/main から
+    /// 写した）。帯に割った到達閉包と影の段の両方をこれと比べる。新しい経路と
+    /// 判定（`Expansion::accepts`）を共有すると、判定の写し間違いを見逃すため
+    /// である。
+    fn expand_reference(w: u32, h: u32, seed: BitPlane, stage: &Expansion) -> BitPlane {
+        let Expansion {
+            candidates,
+            lab,
+            step_tolerance,
+            with_shadow,
+            reach,
+        } = *stage;
+
+        let mut filled = seed;
+        let stride = w as usize;
+        let idx = |x: u32, y: u32| (y as usize) * stride + (x as usize);
+        let floor = step_tolerance * RIDGE_FLOOR;
+        // 起点からの測地距離。起点そのものは 0、そこから 1px 進むごとに 1 増える。
+        //
+        // 距離を数えるのは影の段だけなので、その段でしか確保しない。12MP では
+        // `u32` の表が 48MB あり、使わない段でも積むと丸ごと無駄になる。
+        // 進める距離は `shadow_reach` の上限 64px までなので 1 バイトで足りる
+        // （万一それを超える指定が来ても、飽和して早く止まるだけで壊れない）
+        let limit = reach.unwrap_or(u32::MAX);
+        let mut distance = reach.map(|_| vec![0u8; filled.len()]);
+
+        // キューに積むのは「まだ埋まっていない 4 近傍を持つ画素」だけにする。
+        //
+        // 種は前段の背景そのもので、12MP では 700 万画素に達する。全部積むと
+        // `VecDeque` の倍化だけで 100MB を超えるが、隣がすべて埋まっている画素を
+        // 取り出しても何も起きないので、結果は変わらない
+        let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
+        push_frontier_reference(w, h, &filled, &mut queue);
+
+        // 進行方向の先で続いている変化量。画像の外へ出る向きでは測れないので、
+        // その場合は「いくらでも続いている」とみなして段差の検査を見送る。
+        // 端で止めると見切れた商品の周りに背景が残るほうが害が大きい。
+        //
+        // 副作用として、画像の端から 2px の帯では段差の検査が働かない。見切れた
+        // 商品はそこで削れる可能性があるが、その帯には「輪郭の外側」が無いので
+        // どのみち色の手がかりが足りない
+        let ahead_change = |nx: u32, ny: u32, dx: i64, dy: i64| -> f32 {
+            let here = lab[idx(nx, ny)];
+            let mut change = f32::INFINITY;
+            for step in 1..=2i64 {
+                let (ax, ay) = (i64::from(nx) + dx * step, i64::from(ny) + dy * step);
+                if ax < 0 || ay < 0 || ax >= i64::from(w) || ay >= i64::from(h) {
+                    return f32::INFINITY;
+                }
+                let d = delta_e_q(lab[idx(ax as u32, ay as u32)], here) / step as f32;
+                change = if step == 1 { d } else { change.max(d) };
+            }
+            change
+        };
+
+        while let Some((x, y)) = queue.pop_front() {
+            let from = lab[idx(x, y)];
+            let travelled = distance.as_ref().map_or(0, |d| u32::from(d[idx(x, y)]));
+            if travelled >= limit {
+                continue;
+            }
+            let mut visit = |nx: u32, ny: u32, dx: i64, dy: i64, q: &mut VecDeque<(u32, u32)>| {
+                let i = idx(nx, ny);
+                if filled.get(i) {
+                    return;
+                }
+                if !candidates.has(i, LOOSE) && !(with_shadow && candidates.has(i, SHADOW)) {
+                    return;
+                }
+                // 芯に入れてよい色なら段差は問わない。背景と言い切れる画素を
+                // 段差で弾くと、圧縮ノイズの多い背景に穴が残る
+                if !candidates.has(i, STRICT) {
+                    let step = delta_e_q(lab[i], from);
+                    let allowance =
+                        step_tolerance.min(RIDGE_RATIO * ahead_change(nx, ny, dx, dy) + floor);
+                    if step > allowance {
+                        return;
+                    }
+                }
+                filled.insert(i);
+                if let Some(d) = distance.as_mut() {
+                    d[i] = u8::try_from(travelled + 1).unwrap_or(u8::MAX);
+                }
+                q.push_back((nx, ny));
+            };
+            if x > 0 {
+                visit(x - 1, y, -1, 0, &mut queue);
+            }
+            if y > 0 {
+                visit(x, y - 1, 0, -1, &mut queue);
+            }
+            if x + 1 < w {
+                visit(x + 1, y, 1, 0, &mut queue);
+            }
+            if y + 1 < h {
+                visit(x, y + 1, 0, 1, &mut queue);
+            }
+        }
+
+        filled
+    }
+
+    /// `expand_reference` が使う、Phase 35 より前の `push_frontier`（逐語）。
+    fn push_frontier_reference(
+        w: u32,
+        h: u32,
+        filled: &BitPlane,
+        queue: &mut VecDeque<(u32, u32)>,
+    ) {
+        let idx = |x: u32, y: u32| (y as usize) * (w as usize) + (x as usize);
+        for y in 0..h {
+            for x in 0..w {
+                if !filled.get(idx(x, y)) {
+                    continue;
+                }
+                let open = (x > 0 && !filled.get(idx(x - 1, y)))
+                    || (y > 0 && !filled.get(idx(x, y - 1)))
+                    || (x + 1 < w && !filled.get(idx(x + 1, y)))
+                    || (y + 1 < h && !filled.get(idx(x, y + 1)));
+                if open {
+                    queue.push_back((x, y));
+                }
+            }
+        }
+    }
+
+    /// 帯に割って辿る到達閉包（`expand_closure`）と、距離を数える影の段の
+    /// 経路が、Phase 35 より前の `expand`（`expand_reference`）と一致すること。
+    /// 帯の高さ（32 行）を何本もまたぎ、回数の上限（`CLOSURE_ROUNDS`）を越えて
+    /// 1 本のキューへ落ちる経路も通るよう、縦に蛇行する通路を混ぜる。
     #[test]
-    fn the_banded_closure_agrees_with_a_single_queue() {
+    fn the_banded_closure_agrees_with_the_old_expand() {
         let (w, h) = (90u32, 300u32);
         let mut state = 0x0bad_cafe_u32;
         let mut next = move || {
@@ -1257,6 +1416,7 @@ mod tests {
             state ^= state << 5;
             state
         };
+        let mut scenes: Vec<(Vec<u8>, Vec<LabQ>, BitPlane)> = Vec::new();
         for density in [40u32, 60, 80] {
             let flags: Vec<u8> = (0..w * h)
                 .map(|_| {
@@ -1278,33 +1438,52 @@ mod tests {
                     [v, v / 3, -v / 5]
                 })
                 .collect();
-            let candidates = Candidates {
-                flags,
-                shadow: true,
-            };
             let mut seed = BitPlane::new((w * h) as usize);
             for _ in 0..12 {
                 seed.insert((next() % (w * h)) as usize);
             }
+            scenes.push((flags, lab, seed));
+        }
+        // 縦に蛇行する幅 1px の通路。奇数列を上下に走り、偶数列の端で隣へ渡る。
+        // 帯の境目を何十回も往復するので、回数の上限を越えて 1 本のキューへ落ちる
+        let mut flags = vec![0u8; (w * h) as usize];
+        for x in (1..w - 1).step_by(2) {
+            for y in 1..h - 1 {
+                flags[(y * w + x) as usize] = LOOSE;
+            }
+            let turn = if (x / 2) % 2 == 0 { h - 2 } else { 1 };
+            if x + 2 < w - 1 {
+                flags[(turn * w + x + 1) as usize] = LOOSE;
+            }
+        }
+        let mut seed = BitPlane::new((w * h) as usize);
+        seed.insert((w + 1) as usize);
+        scenes.push((flags, vec![[500, 0, 0]; (w * h) as usize], seed));
+
+        for (k, (flags, lab, seed)) in scenes.into_iter().enumerate() {
+            let candidates = Candidates {
+                flags,
+                shadow: true,
+            };
             for with_shadow in [false, true] {
-                let stage = Expansion {
-                    candidates: &candidates,
-                    lab: &lab,
-                    step_tolerance: 2.5,
-                    with_shadow,
-                    reach: None,
-                };
-                let banded = expand(w, h, seed.clone(), &stage);
-                let single = expand(
-                    w,
-                    h,
-                    seed.clone(),
-                    &Expansion {
-                        reach: Some(u32::MAX),
-                        ..stage
-                    },
-                );
-                assert_eq!(banded, single, "密度 {density} 影 {with_shadow}");
+                for reach in [None, Some(3), Some(64)] {
+                    let stage = Expansion {
+                        candidates: &candidates,
+                        lab: &lab,
+                        step_tolerance: 2.5,
+                        with_shadow,
+                        reach,
+                    };
+                    let got = expand(w, h, seed.clone(), &stage);
+                    let want = expand_reference(w, h, seed.clone(), &stage);
+                    assert_eq!(got, want, "場面 {k} 影 {with_shadow} 上限 {reach:?}");
+                    if k == 3 && reach.is_none() {
+                        // 通路を端まで辿れていること（物差しが空振りしていない）
+                        let mut filled = 0;
+                        got.for_each_set(|_| filled += 1);
+                        assert!(filled > 40 * 298, "通路を辿れていない: {filled}");
+                    }
+                }
             }
         }
     }

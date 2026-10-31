@@ -800,21 +800,17 @@ fn seal_narrow_gaps(
 
     // 収縮の入力はビット面で作る。`Vec<bool>` なら 24.5MP で 24.5MB、ここは
     // 元の背景マスクと同時に生きるので、そのぶんがそのままピークに乗る
-    let mut permeable = BitPlane::new(background.len());
-    for y in 0..h {
-        for x in 0..w {
-            let i = idx(x, y);
-            let open = background.get(i)
-                || (candidates.has(i, NEAR_BG)
-                    && ((x > 0 && background.get(idx(x - 1, y)))
-                        || (y > 0 && background.get(idx(x, y - 1)))
-                        || (x + 1 < w && background.get(idx(x + 1, y)))
-                        || (y + 1 < h && background.get(idx(x, y + 1)))));
-            if open {
-                permeable.insert(i);
-            }
-        }
-    }
+    //
+    // 画素ごとに独立な判定なので、語ごとに並列に組む
+    let permeable = BitPlane::from_fn(background.len(), |i| {
+        let (x, y) = ((i % stride) as u32, (i / stride) as u32);
+        background.get(i)
+            || (candidates.has(i, NEAR_BG)
+                && ((x > 0 && background.get(idx(x - 1, y)))
+                    || (y > 0 && background.get(idx(x, y - 1)))
+                    || (x + 1 < w && background.get(idx(x + 1, y)))
+                    || (y + 1 < h && background.get(idx(x, y + 1)))))
+    });
     let eroded = morphology::separable(stride, h as usize, &permeable, radius, false);
     drop(permeable);
 
@@ -847,13 +843,7 @@ fn seal_narrow_gaps(
     drop(trusted);
     let grown = morphology::separable(stride, h as usize, &reachable, radius, true);
 
-    let mut out = BitPlane::new(background.len());
-    for i in 0..background.len() {
-        if grown.get(i) && background.get(i) {
-            out.insert(i);
-        }
-    }
-    out
+    grown.and(background)
 }
 
 /// 外周を起点に 4 近傍で塗り広げる。
@@ -868,43 +858,92 @@ fn seal_narrow_gaps(
 /// のだから、色が背景と違うことは指示を退ける理由にならない。そこから先の
 /// 拡張は既存の規則どおりなので、商品と違う色の小道具を確定背景にしても、
 /// そこから商品へは色の規則で進めず侵入しない。
+///
+/// # 塗り広げずに、連結成分で答える
+///
+/// 埋まる集合は「候補または確定背景の画素」が作る 4 連結成分のうち、確定背景か
+/// 矩形の縁の画素を含むものの和である。確定背景は色によらず埋まり、そこから
+/// 先は候補だけを辿るので、辿れる経路はちょうど「候補か確定背景の画素だけを
+/// 通る経路」になる。**辿る順序は答えに関わらない。**
+///
+/// そこで画素を 1 つずつ辿る代わりに、行ごとの連続区間（ラン）を並列に切り出し、
+/// 上下の行で重なるランを union-find で結ぶ。24.5MP の背景を 1 画素ずつ
+/// キューへ出し入れすると 1 回で 90ms かかるが、背景は長いランになるので、
+/// 結ぶ相手はその数十分の 1 しか無い。
 fn fill_from_border(
     w: u32,
     h: u32,
-    candidate: impl Fn(usize) -> bool,
+    candidate: impl Fn(usize) -> bool + Sync,
     bbox: Option<(u32, u32, u32, u32)>,
     forced: Option<&Constraints>,
 ) -> BitPlane {
-    let mut filled = BitPlane::new((w as usize) * (h as usize));
-    let mut queue = VecDeque::new();
-    let idx = |x: u32, y: u32| (y as usize) * (w as usize) + (x as usize);
+    let stride = w as usize;
+    let mut filled = BitPlane::new(stride * (h as usize));
+    if stride == 0 || h == 0 {
+        return filled;
+    }
+    // 確定背景が 1 画素も無ければ問わない。`--fg-polygon` だけを渡した実行や、
+    // 渡したのに空だった指示で、画素ごとに表を引く理由が無い
+    let forced = forced.filter(|c| c.any_bg());
 
-    // 確定背景を先に埋め、**縁の画素だけ**をキューへ積む。
-    //
-    // 種を全部積むと、トライマップのように画像の 7 割を背景だと言い切った指示で
-    // キューが数百万要素になる（12MP の実測でピーク RSS が 160MB 増える）。
-    // 縁だけを積んでも結果は変わらない（`push_frontier`）。
-    //
-    // 確定背景が 1 画素も無ければ走査そのものを省く。`--fg-polygon` だけを
-    // 渡した実行や、渡したのに空だった指示で、12MP の表を 2 度舐める理由が無い
-    if let Some(c) = forced.filter(|c| c.any_bg()) {
-        for i in 0..filled.len() {
-            if c.has_bg(i) {
-                filled.insert(i);
+    // 行ごとのラン。両端を含む x と、確定背景を含むか
+    let runs: Vec<Vec<Run>> = (0..h as usize)
+        .into_par_iter()
+        .map(|y| {
+            let row = y * stride;
+            let mut out = Vec::new();
+            let mut open: Option<Run> = None;
+            for x in 0..stride {
+                let i = row + x;
+                let pinned = forced.is_some_and(|c| c.has_bg(i));
+                if pinned || candidate(i) {
+                    let run = open.get_or_insert(Run {
+                        x0: x as u32,
+                        x1: x as u32,
+                        pinned: false,
+                    });
+                    run.x1 = x as u32;
+                    run.pinned |= pinned;
+                } else if let Some(run) = open.take() {
+                    out.push(run);
+                }
+            }
+            out.extend(open);
+            out
+        })
+        .collect();
+    let mut first = Vec::with_capacity(runs.len() + 1);
+    let mut total = 0usize;
+    for row in &runs {
+        first.push(total);
+        total += row.len();
+    }
+    first.push(total);
+
+    // 上下の行で x の範囲が重なるランを結ぶ（4 近傍の連結）
+    let mut parent: Vec<u32> = (0..total as u32).collect();
+    for y in 1..runs.len() {
+        let (above, below) = (&runs[y - 1], &runs[y]);
+        let (mut i, mut j) = (0, 0);
+        while i < above.len() && j < below.len() {
+            let (a, b) = (above[i], below[j]);
+            if a.x0 <= b.x1 && b.x0 <= a.x1 {
+                union(
+                    &mut parent,
+                    (first[y - 1] + i) as u32,
+                    (first[y] + j) as u32,
+                );
+            }
+            if a.x1 < b.x1 {
+                i += 1;
+            } else {
+                j += 1;
             }
         }
-        push_frontier(w, h, &filled, &mut queue);
     }
 
-    // 起点の種まきと塗り広げは同じ規則（候補で、まだ埋まっていない）で積む
-    let seed = |x: u32, y: u32, filled: &mut BitPlane, queue: &mut VecDeque<(u32, u32)>| {
-        let i = idx(x, y);
-        if candidate(i) && !filled.get(i) {
-            filled.insert(i);
-            queue.push_back((x, y));
-        }
-    };
-
+    // 起点を含む成分に印を付ける。起点は確定背景と、矩形の縁の画素である。
+    //
     // bbox が与えられていれば、その矩形の縁から塗り始める。
     //
     // bbox の外は色によらず背景と確定しているので、フィルの起点として画像の
@@ -920,31 +959,60 @@ fn fill_from_border(
     let (sx1, sy1, sx2, sy2) = bbox.unwrap_or((0, 0, w - 1, h - 1));
     let (sx1, sx2) = (sx1.min(sx2).min(w - 1), sx2.max(sx1).min(w - 1));
     let (sy1, sy2) = (sy1.min(sy2).min(h - 1), sy2.max(sy1).min(h - 1));
-    for x in sx1..=sx2 {
-        seed(x, sy1, &mut filled, &mut queue);
-        seed(x, sy2, &mut filled, &mut queue);
-    }
-    for y in sy1..=sy2 {
-        seed(sx1, y, &mut filled, &mut queue);
-        seed(sx2, y, &mut filled, &mut queue);
-    }
-
-    while let Some((x, y)) = queue.pop_front() {
-        if x > 0 {
-            seed(x - 1, y, &mut filled, &mut queue);
-        }
-        if y > 0 {
-            seed(x, y - 1, &mut filled, &mut queue);
-        }
-        if x + 1 < w {
-            seed(x + 1, y, &mut filled, &mut queue);
-        }
-        if y + 1 < h {
-            seed(x, y + 1, &mut filled, &mut queue);
+    let mut rooted = vec![false; total];
+    for (y, row) in runs.iter().enumerate() {
+        let y = y as u32;
+        for (k, run) in row.iter().enumerate() {
+            let on_edge = if y == sy1 || y == sy2 {
+                run.x0 <= sx2 && sx1 <= run.x1
+            } else if y > sy1 && y < sy2 {
+                (run.x0 <= sx1 && sx1 <= run.x1) || (run.x0 <= sx2 && sx2 <= run.x1)
+            } else {
+                false
+            };
+            if on_edge || run.pinned {
+                let root = find(&mut parent, (first[y as usize] + k) as u32);
+                rooted[root as usize] = true;
+            }
         }
     }
-
+    for (y, row) in runs.iter().enumerate() {
+        for (k, run) in row.iter().enumerate() {
+            if rooted[find(&mut parent, (first[y] + k) as u32) as usize] {
+                let at = y * stride;
+                filled.insert_range(at + run.x0 as usize, at + run.x1 as usize + 1);
+            }
+        }
+    }
     filled
+}
+
+/// 行の中の連続区間。`x0..=x1` がすべて候補か確定背景である。
+#[derive(Clone, Copy)]
+struct Run {
+    x0: u32,
+    x1: u32,
+    /// 確定背景の画素を含むか（含めば成分ごと起点になる）
+    pinned: bool,
+}
+
+/// union-find の根。辿った道は半分ずつ縮める。
+fn find(parent: &mut [u32], mut i: u32) -> u32 {
+    while parent[i as usize] != i {
+        let up = parent[parent[i as usize] as usize];
+        parent[i as usize] = up;
+        i = up;
+    }
+    i
+}
+
+/// 2 つの成分を結ぶ。根の小さいほうへ寄せる（どちらへ寄せても成分は同じ）。
+fn union(parent: &mut [u32], a: u32, b: u32) {
+    let (ra, rb) = (find(parent, a), find(parent, b));
+    if ra != rb {
+        let (lo, hi) = (ra.min(rb), ra.max(rb));
+        parent[hi as usize] = lo;
+    }
 }
 
 /// 埋まった画素のうち、まだ埋まっていない 4 近傍を持つものだけをキューへ積む。
@@ -1087,6 +1155,82 @@ mod tests {
             "外側の白が残っている\n{}",
             render(&mask)
         );
+    }
+
+    /// 連結成分で答える `fill_from_border` が、1 画素ずつ辿る素直な塗り広げと
+    /// 同じ集合を返すこと。矩形・確定背景・候補の密度を振る。
+    #[test]
+    fn the_run_fill_agrees_with_a_plain_flood() {
+        fn plain(
+            w: u32,
+            h: u32,
+            candidate: &dyn Fn(usize) -> bool,
+            bbox: Option<(u32, u32, u32, u32)>,
+            forced: Option<&Constraints>,
+        ) -> Vec<bool> {
+            let idx = |x: u32, y: u32| (y as usize) * (w as usize) + (x as usize);
+            let mut filled = vec![false; (w * h) as usize];
+            let mut queue = VecDeque::new();
+            if let Some(c) = forced {
+                for (i, slot) in filled.iter_mut().enumerate() {
+                    if c.has_bg(i) {
+                        *slot = true;
+                        queue.push_back(((i as u32) % w, (i as u32) / w));
+                    }
+                }
+            }
+            let (x1, y1, x2, y2) = bbox.unwrap_or((0, 0, w - 1, h - 1));
+            for y in y1..=y2 {
+                for x in x1..=x2 {
+                    let edge = y == y1 || y == y2 || x == x1 || x == x2;
+                    if edge && candidate(idx(x, y)) && !filled[idx(x, y)] {
+                        filled[idx(x, y)] = true;
+                        queue.push_back((x, y));
+                    }
+                }
+            }
+            while let Some((x, y)) = queue.pop_front() {
+                let near = [
+                    (x.wrapping_sub(1), y),
+                    (x + 1, y),
+                    (x, y.wrapping_sub(1)),
+                    (x, y + 1),
+                ];
+                for (nx, ny) in near {
+                    if nx < w && ny < h && !filled[idx(nx, ny)] && candidate(idx(nx, ny)) {
+                        filled[idx(nx, ny)] = true;
+                        queue.push_back((nx, ny));
+                    }
+                }
+            }
+            filled
+        }
+
+        let (w, h) = (61u32, 47u32);
+        let mut state = 0x2545_f491_u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for density in [35u32, 55, 70, 90] {
+            let open: Vec<bool> = (0..w * h).map(|_| next() % 100 < density).collect();
+            let mut forced = Constraints::new(w, h);
+            for _ in 0..6 {
+                forced.mark(next() % w, next() % h, Constraint::ForcedBg);
+            }
+            for bbox in [None, Some((5, 7, 50, 40)), Some((30, 0, 30, 46))] {
+                for c in [None, Some(&forced)] {
+                    let candidate = |i: usize| open[i];
+                    let got = fill_from_border(w, h, candidate, bbox, c);
+                    let want = plain(w, h, &candidate, bbox, c);
+                    for (i, &v) in want.iter().enumerate() {
+                        assert_eq!(got.get(i), v, "密度 {density} 矩形 {bbox:?} 添字 {i}");
+                    }
+                }
+            }
+        }
     }
 
     /// ascii シーンと同じ寸法（8x6）の指示を組む。

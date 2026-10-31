@@ -255,6 +255,21 @@ impl BitPlane {
         self.len
     }
 
+    /// 2 枚の面の積（両方で立っている画素）。語ごとに畳む。
+    pub fn and(&self, other: &BitPlane) -> BitPlane {
+        assert_eq!(self.len, other.len, "面の大きさが違う");
+        let words = self
+            .words
+            .par_iter()
+            .zip(&other.words)
+            .map(|(a, b)| a & b)
+            .collect();
+        BitPlane {
+            words,
+            len: self.len,
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }

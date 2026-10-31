@@ -31,7 +31,7 @@ use crate::color::lab::{delta_e76, srgb_to_lab};
 use crate::cutout::background::BackgroundField;
 use crate::cutout::local_colour::{self, Lean, Role};
 use crate::cutout::mask::{FOREGROUND_THRESHOLD, Mask};
-use crate::cutout::morphology::BitPlane;
+use crate::cutout::morphology::{self, BitPlane};
 use crate::cutout::regions::{self, Grid, Measure, Region, Tally};
 
 /// 局所背景の参照に採る色の窓を、背景の残差 p90 の何倍に取るか。
@@ -1004,119 +1004,70 @@ fn halo_of(
     if image.width() != w || image.height() != h {
         return (None, Vec::new());
     }
-    let (mut halo, mut total) = (0u64, 0u64);
-    let mut cells = grid.tallies();
     // 「境界近傍か」は前景でない画素からのチェビシェフ距離で引く。画素ごとに
     // 7x7 を数えると前景の内側ほど全部を舐めることになり、12MP で 125ms を
-    // ここだけで食う。距離を 1 度作れば同じ答えが O(N) で出る（7x7 の窓は
-    // 3px のチェビシェフ近傍そのもので、画像の外は数えない）
-    let near = background_distance(mask);
+    // ここだけで食う。7x7 の窓は 3px のチェビシェフ近傍そのもので（画像の外は
+    // 数えない）、「窓に前景でない画素があるか」は半径 3 の膨張と同じである
+    let near = near_to(mask, NEAR_BOUNDARY as u32, false);
     // **参照に採れる画素は 1 度だけ決める。** 窓は重なり合うので、画素ごとに
     // 門を掛け直すと同じ画素の色差を何十回も測ることになる（17x17 の窓で
     // 24.5MP の実写の `--optimize` が 12.9 → 16.0 秒へ伸びる）
     let usable = usable_references(image, mask, field, reference_gate);
 
-    for y in 0..h {
-        for x in 0..w {
-            let i = (y as usize) * (w as usize) + (x as usize);
-            if !mask.is_foreground(x, y) || i64::from(near[i]) > NEAR_BOUNDARY {
-                continue;
+    // **格子の行ごとに並列に数える。** 格子の 1 行は画素の `cell` 行に当たり、
+    // ほかの行の画素は入らないので書き先のセルが重ならない。数はすべて整数で、
+    // 外接矩形は最小と最大なので、畳む順序で値は動かない
+    let mut cells = grid.tallies();
+    let cols = grid.cols as usize;
+    let (halo, total) = cells
+        .par_chunks_mut(cols)
+        .enumerate()
+        .map(|(row, cells)| {
+            let (mut halo, mut total) = (0u64, 0u64);
+            let top = row as u32 * grid.cell;
+            for y in top..(top + grid.cell).min(h) {
+                for x in 0..w {
+                    let i = (y as usize) * (w as usize) + (x as usize);
+                    if !mask.is_foreground(x, y) || !near.get(i) {
+                        continue;
+                    }
+                    total += 1;
+                    let cell = &mut cells[(x / grid.cell) as usize];
+                    cell.see(x, y);
+                    cell.den += 1;
+                    // 参照が 1 つも採れなければ、その場所の背景モデルそのものを使う。
+                    // 大域の 1 色へ落とすと、照明場を持っている素材で「その場所の
+                    // 背景」ではない色と比べることになる
+                    let local = local_background(image, mask, x, y, &usable);
+                    let reference = srgb_to_lab(local.unwrap_or_else(|| field.rgb_at(x, y)));
+                    let p = image.get_pixel(x, y).0;
+                    if delta_e76(srgb_to_lab([p[0], p[1], p[2]]), reference) <= SAME_AS_BACKGROUND {
+                        halo += 1;
+                        cell.num += 1;
+                    }
+                }
             }
-            total += 1;
-            let cell = &mut cells[grid.index(x, y)];
-            cell.see(x, y);
-            cell.den += 1;
-            // 参照が 1 つも採れなければ、その場所の背景モデルそのものを使う。
-            // 大域の 1 色へ落とすと、照明場を持っている素材で「その場所の
-            // 背景」ではない色と比べることになる
-            let local = local_background(image, mask, x, y, &usable);
-            let reference = srgb_to_lab(local.unwrap_or_else(|| field.rgb_at(x, y)));
-            let p = image.get_pixel(x, y).0;
-            if delta_e76(srgb_to_lab([p[0], p[1], p[2]]), reference) <= SAME_AS_BACKGROUND {
-                halo += 1;
-                cell.num += 1;
-            }
-        }
-    }
+            (halo, total)
+        })
+        .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
     ((total > 0).then(|| halo as f64 / total as f64), cells)
 }
 
-/// 前景でない画素からのチェビシェフ距離(px)。255 で飽和する。
+/// 種（`seed_foreground` が真なら前景、偽なら前景でない画素）からのチェビシェフ
+/// 距離が `radius` 以下の画素の印。画像の外は種にしない。見切れた商品の縁を
+/// 境界と見なさないためである。
 ///
-/// 8 近傍の重み 1 で 2 パス回すと、チェビシェフ距離はそのまま厳密に求まる。
-/// 画像の外は種にしない。見切れた商品の縁を境界と見なさないためである。
-fn background_distance(mask: &Mask) -> Vec<u8> {
-    chebyshev_distance(mask, false)
-}
-
-/// 前景画素からのチェビシェフ距離(px)。255 で飽和する。
-///
-/// `background_distance` の裏返しで、種が前景の側にある。`usable_references`
-/// が「参照として見られうる背景画素」を帯へ絞るのに使う。
-fn foreground_distance(mask: &Mask) -> Vec<u8> {
-    chebyshev_distance(mask, true)
-}
-
-/// 種からのチェビシェフ距離(px)。`seed_foreground` が種の側を選ぶ。
-fn chebyshev_distance(mask: &Mask, seed_foreground: bool) -> Vec<u8> {
+/// チェビシェフ距離 r 以内とは「(2r+1) 四方の窓（画像の外は含めない）に種が
+/// ある」ことで、正方形の構造要素の膨張そのものである。以前は 8 近傍の 2 パスで
+/// 距離を測ってから比べていたが、要るのは「越えたか」だけなので、行ごとに
+/// 並列に畳める膨張で同じ答えを出す。
+fn near_to(mask: &Mask, radius: u32, seed_foreground: bool) -> BitPlane {
     let (w, h) = (mask.width() as usize, mask.height() as usize);
     let alpha = mask.as_slice();
-    let mut d: Vec<u8> = alpha
-        .iter()
-        .map(|&v| {
-            if (v >= FOREGROUND_THRESHOLD) != seed_foreground {
-                u8::MAX
-            } else {
-                0
-            }
-        })
-        .collect();
-
-    for y in 0..h {
-        for x in 0..w {
-            let i = y * w + x;
-            if d[i] == 0 {
-                continue;
-            }
-            let mut best = d[i];
-            if y > 0 {
-                best = best.min(d[i - w].saturating_add(1));
-                if x > 0 {
-                    best = best.min(d[i - w - 1].saturating_add(1));
-                }
-                if x + 1 < w {
-                    best = best.min(d[i - w + 1].saturating_add(1));
-                }
-            }
-            if x > 0 {
-                best = best.min(d[i - 1].saturating_add(1));
-            }
-            d[i] = best;
-        }
-    }
-    for y in (0..h).rev() {
-        for x in (0..w).rev() {
-            let i = y * w + x;
-            if d[i] == 0 {
-                continue;
-            }
-            let mut best = d[i];
-            if y + 1 < h {
-                best = best.min(d[i + w].saturating_add(1));
-                if x > 0 {
-                    best = best.min(d[i + w - 1].saturating_add(1));
-                }
-                if x + 1 < w {
-                    best = best.min(d[i + w + 1].saturating_add(1));
-                }
-            }
-            if x + 1 < w {
-                best = best.min(d[i + 1].saturating_add(1));
-            }
-            d[i] = best;
-        }
-    }
-    d
+    let seeds = BitPlane::from_fn(w * h, |i| {
+        (alpha[i] >= FOREGROUND_THRESHOLD) == seed_foreground
+    });
+    morphology::separable(w, h, &seeds, radius, true)
 }
 
 /// 窓内の完全に透明な画素のうち、**背景モデルと矛盾しないもの**の平均色。
@@ -1178,20 +1129,26 @@ fn usable_references(
     gate: f64,
 ) -> Vec<bool> {
     let (w, h) = (mask.width(), mask.height());
-    let reach = (NEAR_BOUNDARY + LOCAL_BG_WINDOW) as u8;
-    let far = foreground_distance(mask);
+    let reach = (NEAR_BOUNDARY + LOCAL_BG_WINDOW) as u32;
+    let near = near_to(mask, reach, true);
+    // 画素ごとに独立な判定なので行で割って回す
     let mut usable = vec![false; (w as usize) * (h as usize)];
-    for y in 0..h {
-        for x in 0..w {
-            let i = (y as usize) * (w as usize) + (x as usize);
-            if mask.get(x, y) != 0 || far[i] > reach {
-                continue;
+    usable
+        .par_chunks_mut((w as usize).max(1))
+        .enumerate()
+        .for_each(|(y, row)| {
+            let y = y as u32;
+            for x in 0..w {
+                let i = (y as usize) * (w as usize) + (x as usize);
+                if mask.get(x, y) != 0 || !near.get(i) {
+                    continue;
+                }
+                let p = image.get_pixel(x, y).0;
+                let rgb = [p[0], p[1], p[2]];
+                row[x as usize] =
+                    delta_e76(srgb_to_lab(rgb), srgb_to_lab(field.rgb_at(x, y))) <= gate;
             }
-            let p = image.get_pixel(x, y).0;
-            let rgb = [p[0], p[1], p[2]];
-            usable[i] = delta_e76(srgb_to_lab(rgb), srgb_to_lab(field.rgb_at(x, y))) <= gate;
-        }
-    }
+        });
     usable
 }
 
@@ -1423,6 +1380,37 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// `near_to` が「(2r+1) 四方の窓（画像の外は含めない）に種があるか」を
+    /// 素直に数えたものと一致すること。
+    #[test]
+    fn near_to_is_the_chebyshev_neighbourhood() {
+        let (w, h) = (70u32, 33u32);
+        let mut mask = Mask::new(w, h, 0);
+        for (i, (x, y)) in scattered_seeds(w, h, 400, 21).into_iter().enumerate() {
+            mask.set(x, y, if i % 3 == 0 { 128 } else { 255 });
+        }
+        for (radius, seed_foreground) in [(0, true), (3, false), (3, true), (11, true)] {
+            let got = near_to(&mask, radius, seed_foreground);
+            for y in 0..h {
+                for x in 0..w {
+                    let r = radius as i64;
+                    let want = (-r..=r).any(|dy| {
+                        (-r..=r).any(|dx| {
+                            let (nx, ny) = (x as i64 + dx, y as i64 + dy);
+                            nx >= 0
+                                && ny >= 0
+                                && nx < i64::from(w)
+                                && ny < i64::from(h)
+                                && mask.is_foreground(nx as u32, ny as u32) == seed_foreground
+                        })
+                    });
+                    let i = (y * w + x) as usize;
+                    assert_eq!(got.get(i), want, "r {radius} ({x}, {y})");
+                }
+            }
+        }
     }
 
     /// 帯に割ったチャンファーが、`cap` 以下では 1 本で測ったものと一致し、

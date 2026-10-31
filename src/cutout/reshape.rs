@@ -16,12 +16,13 @@
 use std::collections::VecDeque;
 
 use image::RgbaImage;
+use rayon::prelude::*;
 
 use crate::cutout::background::BackgroundField;
 use crate::cutout::diagnostics;
 use crate::cutout::guided;
 use crate::cutout::local_colour::{self, Lean, LocalColours, Role};
-use crate::cutout::mask::Mask;
+use crate::cutout::mask::{FOREGROUND_THRESHOLD, Mask};
 use crate::cutout::morphology::{self, BitPlane};
 use crate::cutout::refine::{RADIUS_CEILING, RefineOptions, TILE, band_map_into, smooth_radius_px};
 
@@ -254,19 +255,23 @@ fn role(band: &[u8], shape: &Mask, sealed: &BitPlane, x: u32, y: u32) -> Role {
 /// 帯画素の外接矩形。帯が 1 画素も無ければ None。
 pub(crate) fn band_bounds(band: &[u8], w: u32, h: u32) -> Option<(u32, u32, u32, u32)> {
     let stride = w as usize;
-    let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
-    for y in 0..h {
-        let row = (y as usize) * stride;
-        for x in 0..w {
-            if band[row + (x as usize)] == 0 {
-                continue;
-            }
-            x0 = x0.min(x);
-            y0 = y0.min(y);
-            x1 = x1.max(x);
-            y1 = y1.max(y);
-        }
+    if stride == 0 {
+        return None;
     }
+    // 行ごとに端を求めて畳む。最小と最大は順序に依らない
+    let (x0, y0, x1, y1) = band
+        .par_chunks(stride)
+        .take(h as usize)
+        .enumerate()
+        .filter_map(|(y, row)| {
+            let first = row.iter().position(|&v| v != 0)?;
+            let last = row.iter().rposition(|&v| v != 0)?;
+            Some((first as u32, y as u32, last as u32, y as u32))
+        })
+        .reduce(
+            || (u32::MAX, u32::MAX, 0u32, 0u32),
+            |a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)),
+        );
     (x0 != u32::MAX).then_some((x0, y0, x1, y1))
 }
 
@@ -308,31 +313,40 @@ impl Repaint<'_> {
         } = self;
         let w = image.width() as usize;
         let pixels = image.as_raw();
-        let mut changed = 0usize;
-        for y in y0..=y1 {
-            let row = (y as usize) * w;
-            for x in x0..=x1 {
-                let i = row + (x as usize);
-                if band[i] == 0 || out_of_reach.contains(i) {
-                    continue;
-                }
-                let Some(lean) = grid.classify(grid.cell(x, y), &pixels[i * 4..i * 4 + 3]) else {
-                    continue;
-                };
-                match (shape.is_foreground(x, y), lean) {
-                    (true, Lean::Background) => {
-                        shape.set(x, y, 0);
-                        changed += 1;
+        // 画素ごとに自分の画素しか読み書きしないので、行で割って回す。
+        // 数えた画素数は整数の和なので、畳む順序に依らない
+        let rows = &mut shape.as_mut_slice()[(y0 as usize) * w..(y1 as usize + 1) * w];
+        rows.par_chunks_mut(w)
+            .enumerate()
+            .map(|(dy, alpha)| {
+                let row = (y0 as usize + dy) * w;
+                let y = y0 + dy as u32;
+                let mut changed = 0usize;
+                for x in x0..=x1 {
+                    let i = row + (x as usize);
+                    if band[i] == 0 || out_of_reach.contains(i) {
+                        continue;
                     }
-                    (false, Lean::Foreground) => {
-                        shape.set(x, y, u8::MAX);
-                        changed += 1;
+                    let Some(lean) = grid.classify(grid.cell(x, y), &pixels[i * 4..i * 4 + 3])
+                    else {
+                        continue;
+                    };
+                    let slot = &mut alpha[x as usize];
+                    match (*slot >= FOREGROUND_THRESHOLD, lean) {
+                        (true, Lean::Background) => {
+                            *slot = 0;
+                            changed += 1;
+                        }
+                        (false, Lean::Foreground) => {
+                            *slot = u8::MAX;
+                            changed += 1;
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
-            }
-        }
-        changed
+                changed
+            })
+            .sum()
     }
 
     /// (c) 帯の中の二値マスクにメディアン（多数決）を掛け、**色が変化に矛盾する
@@ -367,100 +381,118 @@ impl Repaint<'_> {
         // 積分画像は「128px + 窓の余白」ぶんの数百 KB にしかならない。窓は画素ごとに
         // [x-r, x+r]（画像の外は含めない）なので、タイルを半径ぶん広げた矩形を
         // 覆えば全面に張ったのと同じ合計が引ける
+        //
+        // 写しは行ごとに語へ揃えて持つ。写しを取る走査も、タイルの行ごとの
+        // 多数決も行で割って並列に回せる——多数決は写しと元のマスクと色しか
+        // 読まず、書くのは自分の画素だけだからである
         let (ex0, ey0, ex1, ey1) = grow(bounds, radius, w, h);
         let ew = (ex1 - ex0 + 1) as usize;
-        let mut snapshot = BitPlane::new(ew * ((ey1 - ey0 + 1) as usize));
-        for y in ey0..=ey1 {
-            let row = ((y - ey0) as usize) * ew;
-            for x in ex0..=ex1 {
-                if shape.is_foreground(x, y) {
-                    snapshot.insert(row + (x - ex0) as usize);
+        let ewpr = ew.div_ceil(64);
+        let mut snapshot = vec![0u64; ewpr * ((ey1 - ey0 + 1) as usize)];
+        snapshot
+            .par_chunks_mut(ewpr)
+            .enumerate()
+            .for_each(|(ly, words)| {
+                let y = ey0 + ly as u32;
+                for x in ex0..=ex1 {
+                    if shape.is_foreground(x, y) {
+                        let lx = (x - ex0) as usize;
+                        words[lx / 64] |= 1u64 << (lx % 64);
+                    }
                 }
-            }
-        }
+            });
+        let snapped =
+            |lx: usize, ly: usize| ((snapshot[ly * ewpr + lx / 64] >> (lx % 64)) & 1) as u32;
 
         let (x0, y0, x1, y1) = bounds;
-        let mut integral: Vec<u32> = Vec::new();
-        let mut changed = 0usize;
-        for tile_y in (y0..=y1).step_by(TILE as usize) {
-            let ty1 = (tile_y + TILE - 1).min(y1);
-            for tile_x in (x0..=x1).step_by(TILE as usize) {
-                let tx1 = (tile_x + TILE - 1).min(x1);
-                // 帯の無いタイルには積分画像も要らない
-                let has_band = (tile_y..=ty1).any(|y| {
-                    let row = (y as usize) * stride;
-                    (tile_x..=tx1).any(|x| band[row + (x as usize)] != 0)
-                });
-                if !has_band {
-                    continue;
-                }
-                let (px0, py0, px1, py1) = grow((tile_x, tile_y, tx1, ty1), radius, w, h);
-                let (pw, ph) = ((px1 - px0 + 1) as usize, (py1 - py0 + 1) as usize);
-                let span = pw + 1;
-                integral.clear();
-                integral.resize(span * (ph + 1), 0);
-                for y in 0..ph {
-                    let (row, prev) = ((y + 1) * span, y * span);
-                    let src = ((py0 - ey0) as usize + y) * ew + (px0 - ex0) as usize;
-                    let mut acc = 0u32;
-                    for x in 0..pw {
-                        acc += u32::from(snapshot.get(src + x));
-                        integral[row + x + 1] = integral[prev + x + 1] + acc;
+        let rows = TILE as usize;
+        let slab = &mut shape.as_mut_slice()[(y0 as usize) * stride..(y1 as usize + 1) * stride];
+        slab.par_chunks_mut(rows * stride)
+            .enumerate()
+            .map_init(Vec::new, |integral: &mut Vec<u32>, (j, alpha)| {
+                let tile_y = y0 + (j * rows) as u32;
+                let ty1 = (tile_y + TILE - 1).min(y1);
+                let mut changed = 0usize;
+                for tile_x in (x0..=x1).step_by(TILE as usize) {
+                    let tx1 = (tile_x + TILE - 1).min(x1);
+                    // 帯の無いタイルには積分画像も要らない
+                    let has_band = (tile_y..=ty1).any(|y| {
+                        let row = (y as usize) * stride;
+                        (tile_x..=tx1).any(|x| band[row + (x as usize)] != 0)
+                    });
+                    if !has_band {
+                        continue;
                     }
-                }
-                let count = |x0: usize, y0: usize, x1: usize, y1: usize| -> u32 {
-                    let (a, b) = (y0 * span + x0, y0 * span + x1 + 1);
-                    let (c, d) = ((y1 + 1) * span + x0, (y1 + 1) * span + x1 + 1);
-                    integral[d] + integral[a] - integral[b] - integral[c]
-                };
+                    let (px0, py0, px1, py1) = grow((tile_x, tile_y, tx1, ty1), radius, w, h);
+                    let (pw, ph) = ((px1 - px0 + 1) as usize, (py1 - py0 + 1) as usize);
+                    let span = pw + 1;
+                    integral.clear();
+                    integral.resize(span * (ph + 1), 0);
+                    for y in 0..ph {
+                        let (row, prev) = ((y + 1) * span, y * span);
+                        let (sy, sx) = ((py0 - ey0) as usize + y, (px0 - ex0) as usize);
+                        let mut acc = 0u32;
+                        for x in 0..pw {
+                            acc += snapped(sx + x, sy);
+                            integral[row + x + 1] = integral[prev + x + 1] + acc;
+                        }
+                    }
+                    let integral = &*integral;
+                    let count = |x0: usize, y0: usize, x1: usize, y1: usize| -> u32 {
+                        let (a, b) = (y0 * span + x0, y0 * span + x1 + 1);
+                        let (c, d) = ((y1 + 1) * span + x0, (y1 + 1) * span + x1 + 1);
+                        integral[d] + integral[a] - integral[b] - integral[c]
+                    };
 
-                for y in tile_y..=ty1 {
-                    let row = (y as usize) * stride;
-                    for x in tile_x..=tx1 {
-                        let i = row + (x as usize);
-                        if band[i] == 0 || out_of_reach.contains(i) {
-                            continue;
+                    for y in tile_y..=ty1 {
+                        let row = (y as usize) * stride;
+                        let local = ((y - tile_y) as usize) * stride;
+                        for x in tile_x..=tx1 {
+                            let i = row + (x as usize);
+                            if band[i] == 0 || out_of_reach.contains(i) {
+                                continue;
+                            }
+                            let (qx0, qy0, qx1, qy1) =
+                                guided::window((px0, py0, px1, py1), x, y, radius);
+                            let inside = count(qx0, qy0, qx1, qy1);
+                            let total = ((qx1 - qx0 + 1) * (qy1 - qy0 + 1)) as u32;
+                            // 同数なら動かさない。どちらへ倒しても根拠が無い
+                            if inside * 2 == total {
+                                continue;
+                            }
+                            let want = inside * 2 > total;
+                            let (lx, ly) = ((x - px0) as usize, (y - py0) as usize);
+                            if want == (count(lx, ly, lx, ly) == 1) {
+                                continue;
+                            }
+                            // **形だけの多数決で、フィルが背景と決めた画素を前景へ戻さない。**
+                            // フィルの決定は連結性・堤防・`--seal`・空間的な指示という、色より
+                            // 多くの情報を使っている。ここで戻してよいのは、同じ refine の中で
+                            // (b) や前のパスが動かした画素だけである。これが無いと、櫛の
+                            // 幅 3px の隙間（`--seal 1` が「塞がない」と約束した幅）が
+                            // メディアンで塞がる——堤防が隙間の両側 1px を背景候補から外すので、
+                            // 二値マスクの上では 1px にしか見えないためである
+                            if want && !original.is_foreground(x, y) {
+                                continue;
+                            }
+                            // 色の門。変化に矛盾する色なら形の言い分を採らない
+                            let lean = grid.classify(grid.cell(x, y), &pixels[i * 4..i * 4 + 3]);
+                            let contradicts = if want {
+                                lean == Some(Lean::Background)
+                            } else {
+                                lean == Some(Lean::Foreground)
+                            };
+                            if contradicts {
+                                continue;
+                            }
+                            alpha[local + x as usize] = if want { u8::MAX } else { 0 };
+                            changed += 1;
                         }
-                        let (qx0, qy0, qx1, qy1) =
-                            guided::window((px0, py0, px1, py1), x, y, radius);
-                        let inside = count(qx0, qy0, qx1, qy1);
-                        let total = ((qx1 - qx0 + 1) * (qy1 - qy0 + 1)) as u32;
-                        // 同数なら動かさない。どちらへ倒しても根拠が無い
-                        if inside * 2 == total {
-                            continue;
-                        }
-                        let want = inside * 2 > total;
-                        let (lx, ly) = ((x - px0) as usize, (y - py0) as usize);
-                        if want == (count(lx, ly, lx, ly) == 1) {
-                            continue;
-                        }
-                        // **形だけの多数決で、フィルが背景と決めた画素を前景へ戻さない。**
-                        // フィルの決定は連結性・堤防・`--seal`・空間的な指示という、色より
-                        // 多くの情報を使っている。ここで戻してよいのは、同じ refine の中で
-                        // (b) や前のパスが動かした画素だけである。これが無いと、櫛の
-                        // 幅 3px の隙間（`--seal 1` が「塞がない」と約束した幅）が
-                        // メディアンで塞がる——堤防が隙間の両側 1px を背景候補から外すので、
-                        // 二値マスクの上では 1px にしか見えないためである
-                        if want && !original.is_foreground(x, y) {
-                            continue;
-                        }
-                        // 色の門。変化に矛盾する色なら形の言い分を採らない
-                        let lean = grid.classify(grid.cell(x, y), &pixels[i * 4..i * 4 + 3]);
-                        let contradicts = if want {
-                            lean == Some(Lean::Background)
-                        } else {
-                            lean == Some(Lean::Foreground)
-                        };
-                        if contradicts {
-                            continue;
-                        }
-                        shape.set(x, y, if want { u8::MAX } else { 0 });
-                        changed += 1;
                     }
                 }
-            }
-        }
-        changed
+                changed
+            })
+            .sum()
     }
 }
 
@@ -501,30 +533,44 @@ fn close_new_gaps(
     let stride = w as usize;
     let (rx0, ry0, rx1, ry1) = grow(bounds, seal + 1, w, h);
     let (pw, ph) = ((rx1 - rx0 + 1) as usize, (ry1 - ry0 + 1) as usize);
-    let local = |x: u32, y: u32| ((y - ry0) as usize) * pw + (x - rx0) as usize;
+    // 面は 1 画素 1 ビットで、**行ごとに語へ揃えて**持つ。`Vec<bool>` だと元の
+    // 面・芯・到達済み・膨張の 4 枚で 24.5MP の実写が 98MB になる。行を語に
+    // 揃えるのは、面を組む走査と最後の書き戻しを行ごとに並列に回すためで、
+    // 枠は帯の外接矩形——ほぼ商品全体——なので、1 画素ずつ逐次に舐めると
+    // パスごとに数十 ms かかる
+    let wpr = pw.div_ceil(64);
+    let bit = |lx: usize| 1u64 << (lx % 64);
 
-    // 面は 1 画素 1 ビットで持つ。`Vec<bool>` だと元の面・芯・到達済み・膨張の
-    // 4 枚で 24.5MP の実写が 98MB になる
-    let mut background = BitPlane::new(pw * ph);
-    for y in ry0..=ry1 {
-        for x in rx0..=rx1 {
-            if !shape.is_foreground(x, y) {
-                background.insert(local(x, y));
-            }
-        }
-    }
-    // 収縮で残った芯と、「帯の外の背景」「画像の外周の背景」を信用する。帯の外の
+    // 背景と、起点として信用する「帯の外の背景」「画像の外周の背景」。帯の外の
     // 背景はフィルが外周から到達した画素なので、隙間を通って入ってきたもので
     // はありえない（`floodfill::seal_narrow_gaps` と同じ扱い）
-    let eroded = morphology::separable(pw, ph, &background, seal, false);
-    let outside = |x: u32, y: u32| {
-        band[(y as usize) * stride + (x as usize)] == 0
-            || x == 0
-            || y == 0
-            || x + 1 == w
-            || y + 1 == h
-    };
-    let trusted = |i: usize, x: u32, y: u32| eroded.get(i) || (background.get(i) && outside(x, y));
+    let mut background = vec![0u64; wpr * ph];
+    let mut roots = vec![0u64; wpr * ph];
+    background
+        .par_chunks_mut(wpr)
+        .zip(roots.par_chunks_mut(wpr))
+        .enumerate()
+        .for_each(|(ly, (bg, root))| {
+            let y = ry0 + ly as u32;
+            let edge_row = y == 0 || y + 1 == h;
+            for lx in 0..pw {
+                let x = rx0 + lx as u32;
+                if shape.is_foreground(x, y) {
+                    continue;
+                }
+                bg[lx / 64] |= bit(lx);
+                let outside = edge_row
+                    || x == 0
+                    || x + 1 == w
+                    || band[(y as usize) * stride + (x as usize)] == 0;
+                if outside {
+                    root[lx / 64] |= bit(lx);
+                }
+            }
+        });
+    // 収縮で残った芯と、起点を信用する
+    let eroded = morphology::separable_rows(pw, ph, background.clone(), seal, false);
+    let trusted: Vec<u64> = eroded.iter().zip(&roots).map(|(e, r)| e | r).collect();
 
     // **芯の上だけを辿る。** 背景の上を辿ると、細い通路がそのまま外周へ
     // つながってしまい、収縮した意味が消える。
@@ -532,73 +578,88 @@ fn close_new_gaps(
     // 起点（帯の外の背景と外周の背景）は**キューへ積まない**。24.5MP の実写
     // では帯の外の背景が 2000 万画素あり、積めば `VecDeque` の倍々確保だけで
     // ピークが 400MB 級に跳ねる。起点は定義上すべて到達済みなので印だけ付け、
-    // 積むのは「そこから帯の中の芯へ入る一歩」だけでよい
-    let mut seen = BitPlane::new(pw * ph);
-    for y in ry0..=ry1 {
-        for x in rx0..=rx1 {
-            let i = local(x, y);
-            if background.get(i) && outside(x, y) {
-                seen.insert(i);
+    // 積むのは「起点の 4 近傍にある、信用できる画素」だけでよい。
+    // 到達する集合は「起点を含む、信用できる画素の 4 連結成分」で、積む順序に
+    // 依らない
+    let mut seen = roots.clone();
+    let mut queue: VecDeque<(usize, usize)> = VecDeque::new();
+    for ly in 0..ph {
+        let row = &roots[ly * wpr..(ly + 1) * wpr];
+        for k in 0..wpr {
+            // 起点の左右上下の隣。行の端より先のビットは 0 なので、右の隣は
+            // 端で自然に切れる
+            let left = (row[k] << 1) | if k > 0 { row[k - 1] >> 63 } else { 0 };
+            let right = (row[k] >> 1) | row.get(k + 1).map_or(0, |v| v << 63);
+            let up = if ly > 0 { roots[(ly - 1) * wpr + k] } else { 0 };
+            let down = if ly + 1 < ph {
+                roots[(ly + 1) * wpr + k]
+            } else {
+                0
+            };
+            let mut seeds = trusted[ly * wpr + k] & !row[k] & (left | right | up | down);
+            seen[ly * wpr + k] |= seeds;
+            while seeds != 0 {
+                let lx = k * 64 + seeds.trailing_zeros() as usize;
+                queue.push_back((lx, ly));
+                seeds &= seeds - 1;
             }
         }
     }
-    let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
-    for y in ry0..=ry1 {
-        for x in rx0..=rx1 {
-            let i = local(x, y);
-            if seen.get(i) || !trusted(i, x, y) {
-                continue;
-            }
-            let touches = (x > rx0 && seen.get(i - 1))
-                || (x < rx1 && seen.get(i + 1))
-                || (y > ry0 && seen.get(i - pw))
-                || (y < ry1 && seen.get(i + pw));
-            if touches {
-                seen.insert(i);
-                queue.push_back((x, y));
-            }
-        }
-    }
+    let has = |plane: &[u64], lx: usize, ly: usize| plane[ly * wpr + lx / 64] & bit(lx) != 0;
     while let Some((cx, cy)) = queue.pop_front() {
-        for (dx, dy) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
-            let (nx, ny) = (cx as i64 + dx, cy as i64 + dy);
-            if nx < i64::from(rx0) || ny < i64::from(ry0) {
+        let neighbours = [
+            (cx > 0).then(|| (cx - 1, cy)),
+            (cx + 1 < pw).then_some((cx + 1, cy)),
+            (cy > 0).then(|| (cx, cy - 1)),
+            (cy + 1 < ph).then_some((cx, cy + 1)),
+        ];
+        for (nx, ny) in neighbours.into_iter().flatten() {
+            if has(&seen, nx, ny) || !has(&trusted, nx, ny) {
                 continue;
             }
-            let (nx, ny) = (nx as u32, ny as u32);
-            if nx > rx1 || ny > ry1 {
-                continue;
-            }
-            let j = local(nx, ny);
-            if seen.get(j) || !trusted(j, nx, ny) {
-                continue;
-            }
-            seen.insert(j);
+            seen[ny * wpr + nx / 64] |= bit(nx);
             queue.push_back((nx, ny));
         }
     }
+    drop(trusted);
     // 膨張させるのは**収縮で取れた芯**だけにする。起点として信用しただけの
     // 「帯の外の背景」まで膨らませると、帯に接した通路が幅によらず seal px ぶん
     // 開いてしまい、`--seal` を大きくするほど隙間が塞がらなくなる
-    for i in 0..pw * ph {
-        if !eroded.get(i) {
-            seen.set(i, false);
-        }
+    for (s, e) in seen.iter_mut().zip(&eroded) {
+        *s &= e;
     }
-    let grown = morphology::separable(pw, ph, &seen, seal, true);
-    drop(seen);
+    drop(eroded);
+    let grown = morphology::separable_rows(pw, ph, seen, seal, true);
 
-    let mut changed = 0usize;
-    for y in ry0..=ry1 {
-        for x in rx0..=rx1 {
-            let i = local(x, y);
-            let at = (y as usize) * stride + (x as usize);
-            if band[at] == 0 || !background.get(i) || grown.get(i) || !original.is_foreground(x, y)
-            {
-                continue;
+    // 戻す画素を行ごとに拾い、書き戻しは 1 本で行う。戻る画素は帯の中の
+    // 一部しかないので、書き戻しの順序を気にするほどの量にはならない
+    let candidates: Vec<Vec<u32>> = (0..ph)
+        .into_par_iter()
+        .map(|ly| {
+            let y = ry0 + ly as u32;
+            let mut found = Vec::new();
+            for k in 0..wpr {
+                let mut open = background[ly * wpr + k] & !grown[ly * wpr + k];
+                while open != 0 {
+                    let lx = k * 64 + open.trailing_zeros() as usize;
+                    open &= open - 1;
+                    let x = rx0 + lx as u32;
+                    if band[(y as usize) * stride + (x as usize)] != 0
+                        && original.is_foreground(x, y)
+                    {
+                        found.push(x);
+                    }
+                }
             }
+            found
+        })
+        .collect();
+    let mut changed = 0usize;
+    for (ly, xs) in candidates.iter().enumerate() {
+        let y = ry0 + ly as u32;
+        for &x in xs {
             shape.set(x, y, u8::MAX);
-            sealed.insert(at);
+            sealed.insert((y as usize) * stride + (x as usize));
             changed += 1;
         }
     }

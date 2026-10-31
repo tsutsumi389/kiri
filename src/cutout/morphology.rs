@@ -13,7 +13,9 @@
 
 use std::collections::VecDeque;
 
-use crate::cutout::mask::Mask;
+use rayon::prelude::*;
+
+use crate::cutout::mask::{FOREGROUND_THRESHOLD, Mask};
 
 /// 孤立ノイズとして消す連結成分の面積の下限(px²)。
 ///
@@ -71,7 +73,72 @@ fn speck_scale(width: u32, height: u32) -> f64 {
 ///
 /// 連結を 8 近傍にするのは、4 近傍だと斜めに走る 1px の構造が細切れになり、
 /// 面積で判定した途端にすべて消えてしまうためである。
+///
+/// # 塗り広げずに、連結成分で答える
+///
+/// 消すかどうかは成分ごとの芯の面積だけで決まり、成分をどの順で辿るかには
+/// 依らない。行ごとのラン（0 でない画素の連続区間）を並列に切り出して芯の
+/// 画素数を数え、上下の行で接するランを `Runs::components` で結ぶ。1 画素ずつ
+/// キューへ出し入れすると前景の大きい 24.5MP で 1 回 50ms かかるが、前景は
+/// 長いランになるので結ぶ相手はその数十分の 1 しか無い。ランが細かく割れる
+/// 素材では表が膨らむので、1 画素ずつ辿る旧来の経路へ落とす。
 pub fn remove_specks(mask: &Mask, radius: u32) -> Mask {
+    remove_specks_limited(mask, radius, RUN_DENSITY_LIMIT)
+}
+
+/// `remove_specks` の、ランの表を使ってよい密度（`Runs::collect` の `divisor`）を
+/// 呼び出し側が決める版。試験は 1 を渡して、ランで答える経路を必ず通す。
+fn remove_specks_limited(mask: &Mask, radius: u32, divisor: usize) -> Mask {
+    if radius == 0 {
+        return mask.clone();
+    }
+    let (w, h) = (mask.width(), mask.height());
+    let min_area = speck_min_area(radius, w, h);
+    let stride = w as usize;
+    if stride == 0 || h == 0 {
+        return mask.clone();
+    }
+    let alpha = mask.as_slice();
+    // ランが細かく割れる素材（1px の市松など）では、ランの表が画素数に比例して
+    // 膨らみ、1 画素ずつ辿るより重くなる。そこでは 1 画素ずつ辿る旧来の経路へ
+    // 落とす（`RUN_DENSITY_LIMIT`）
+    let Some(runs) = Runs::collect(stride, h as usize, divisor, |i| alpha[i] != 0) else {
+        return remove_specks_bfs(mask, radius);
+    };
+    let component = runs.components(true);
+    // 芯（前景判定）の画素数をランごとに数え、成分の代表へ畳む。整数の和なので
+    // 足す順序で値は動かない
+    let core = runs.per_run(|y, run| {
+        let row = &alpha[y * stride + run.x0 as usize..=y * stride + run.x1 as usize];
+        row.iter().filter(|&&v| v >= FOREGROUND_THRESHOLD).count() as u32
+    });
+    let mut area = vec![0u32; component.len()];
+    for (r, &c) in core.iter().enumerate() {
+        area[component[r] as usize] += c;
+    }
+    drop(core);
+    // 消す成分のランだけを 0 で塗る。行ごとに書き先が分かれるので並列に回す
+    let mut out = mask.clone();
+    out.as_mut_slice()
+        .par_chunks_mut(stride)
+        .enumerate()
+        .for_each(|(y, row)| {
+            for r in runs.first[y]..runs.first[y + 1] {
+                let run = runs.runs[r];
+                if (area[component[r] as usize] as usize) < min_area {
+                    row[run.x0 as usize..=run.x1 as usize].fill(0);
+                }
+            }
+        });
+    out
+}
+
+/// `remove_specks` の、1 画素ずつ辿る旧来の経路（Phase 35 より前の実装を
+/// 逐語のまま残したもの）。ランが細かく割れる素材で使う。
+///
+/// 試験の物差しも兼ねる。ランで答える経路と一致することを
+/// `the_run_speck_filter_agrees_with_the_old_one` が見ている。
+fn remove_specks_bfs(mask: &Mask, radius: u32) -> Mask {
     if radius == 0 {
         return mask.clone();
     }
@@ -140,6 +207,181 @@ pub fn remove_specks(mask: &Mask, radius: u32) -> Mask {
         }
     }
     out
+}
+
+/// ランの表を使ってよい密度の上限。ランの総数が画素数のこの分の 1 を超えたら、
+/// ランで答える経路は使わない。
+///
+/// ラン 1 本は 8 バイト（`Run`）、連結の親が 4 バイト、`remove_specks` の芯の
+/// 数と成分の面積が 4 バイトずつで、上限ちょうどでも画素あたり 2.5 バイトに
+/// 収まる。1px の市松のようにランが画素数の半分まで割れる素材で表を作ると、
+/// 5000x4000 で 100MB を超え、1 画素ずつ辿る旧来の経路よりピーク RSS が上がる
+/// （581 → 674MB と測れた）。
+///
+/// 8 は実写の分布から決めた。24.5MP の実写リモコンでいちばん割れるフィルの
+/// 芯でも画素数の 1.1%、実写キーボードで 7.4% に
+/// 留まり、市松は 41% ある。32 にするとキーボードの芯が旧来の経路へ落ちる。
+pub(crate) const RUN_DENSITY_LIMIT: usize = 8;
+
+/// 行の中の連続区間。`x0..=x1`（両端を含む）。
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct Run {
+    pub x0: u32,
+    pub x1: u32,
+}
+
+/// 行ごとのランを平坦に並べた表。行 `y` のランは `runs[first[y]..first[y + 1]]`
+/// で、x の昇順に並ぶ。
+///
+/// `Vec<Vec<Run>>` にしないのは、行ごとの器の頭と倍々の余りが、ランが細かい
+/// 素材でそのまま常駐量に乗るためである。
+pub(crate) struct Runs {
+    pub runs: Vec<Run>,
+    pub first: Vec<usize>,
+}
+
+impl Runs {
+    /// `inside(添字)` が真の画素の連続区間を、行ごとに並列に切り出す。
+    ///
+    /// 1 度目の走査で行ごとの本数を数えて表の大きさを決め、2 度目で書く。
+    /// 総数が画素数の `divisor` 分の 1 を超えたら `None` を返し、表は作らない
+    /// （本番は `RUN_DENSITY_LIMIT`）。
+    pub(crate) fn collect(
+        w: usize,
+        h: usize,
+        divisor: usize,
+        inside: impl Fn(usize) -> bool + Sync,
+    ) -> Option<Runs> {
+        let scan = |y: usize, mut put: Option<&mut [Run]>| -> usize {
+            let row = y * w;
+            let mut n = 0;
+            let mut start: Option<usize> = None;
+            for x in 0..=w {
+                let on = x < w && inside(row + x);
+                match (on, start) {
+                    (true, None) => start = Some(x),
+                    (false, Some(x0)) => {
+                        if let Some(out) = put.as_deref_mut() {
+                            out[n] = Run {
+                                x0: x0 as u32,
+                                x1: (x - 1) as u32,
+                            };
+                        }
+                        n += 1;
+                        start = None;
+                    }
+                    _ => {}
+                }
+            }
+            n
+        };
+        let counts: Vec<usize> = (0..h).into_par_iter().map(|y| scan(y, None)).collect();
+        let mut first = Vec::with_capacity(h + 1);
+        let mut total = 0usize;
+        for &n in &counts {
+            first.push(total);
+            total += n;
+        }
+        first.push(total);
+        drop(counts);
+        if total > (w * h) / divisor.max(1) {
+            return None;
+        }
+        let mut runs = vec![Run::default(); total];
+        let mut slices = Vec::with_capacity(h);
+        let mut rest = runs.as_mut_slice();
+        for y in 0..h {
+            let (head, tail) = rest.split_at_mut(first[y + 1] - first[y]);
+            slices.push(head);
+            rest = tail;
+        }
+        slices.into_par_iter().enumerate().for_each(|(y, out)| {
+            scan(y, Some(out));
+        });
+        Some(Runs { runs, first })
+    }
+
+    /// 行の数。
+    pub(crate) fn rows(&self) -> usize {
+        self.first.len() - 1
+    }
+
+    /// ランごとに `f(行, ラン)` を求めた表。行ごとに並列に回す。
+    pub(crate) fn per_run<T: Send + Default + Clone>(
+        &self,
+        f: impl Fn(usize, Run) -> T + Sync,
+    ) -> Vec<T> {
+        let mut out = vec![T::default(); self.runs.len()];
+        let mut slices = Vec::with_capacity(self.rows());
+        let mut rest = out.as_mut_slice();
+        for y in 0..self.rows() {
+            let (head, tail) = rest.split_at_mut(self.first[y + 1] - self.first[y]);
+            slices.push(head);
+            rest = tail;
+        }
+        slices.into_par_iter().enumerate().for_each(|(y, slots)| {
+            for (k, slot) in slots.iter_mut().enumerate() {
+                *slot = f(y, self.runs[self.first[y] + k]);
+            }
+        });
+        out
+    }
+
+    /// 上下の行で接するランどうしをつないだ連結成分。ランごとに成分の番号
+    /// （成分を代表するランの通し番号）を返す。`diagonal` が真なら 8 近傍
+    /// （斜めに 1 画素ずれて接するランもつなぐ）、偽なら 4 近傍。
+    ///
+    /// **成分は結ぶ順序に依らない。** 連結は「接している」という対称な関係の
+    /// 推移閉包でしかないので、どの順で union-find に掛けても同じ分け方になる。
+    pub(crate) fn components(&self, diagonal: bool) -> Vec<u32> {
+        let total = self.runs.len();
+        let slack = u32::from(diagonal);
+        let mut parent: Vec<u32> = (0..total as u32).collect();
+        for y in 1..self.rows() {
+            let above = &self.runs[self.first[y - 1]..self.first[y]];
+            let below = &self.runs[self.first[y]..self.first[y + 1]];
+            let (mut i, mut j) = (0, 0);
+            while i < above.len() && j < below.len() {
+                let (a, b) = (above[i], below[j]);
+                if a.x0 <= b.x1 + slack && b.x0 <= a.x1 + slack {
+                    union(
+                        &mut parent,
+                        (self.first[y - 1] + i) as u32,
+                        (self.first[y] + j) as u32,
+                    );
+                }
+                if a.x1 < b.x1 {
+                    i += 1;
+                } else {
+                    j += 1;
+                }
+            }
+        }
+        for i in 0..total as u32 {
+            let root = find(&mut parent, i);
+            parent[i as usize] = root;
+        }
+        parent
+    }
+}
+
+/// union-find の根。辿った道は半分ずつ縮める。
+fn find(parent: &mut [u32], mut i: u32) -> u32 {
+    while parent[i as usize] != i {
+        let up = parent[parent[i as usize] as usize];
+        parent[i as usize] = up;
+        i = up;
+    }
+    i
+}
+
+/// 2 つの成分を結ぶ。根の小さいほうへ寄せる（どちらへ寄せても成分は同じ）。
+fn union(parent: &mut [u32], a: u32, b: u32) {
+    let (ra, rb) = (find(parent, a), find(parent, b));
+    if ra != rb {
+        let (lo, hi) = (ra.min(rb), ra.max(rb));
+        parent[hi as usize] = lo;
+    }
 }
 
 /// 収縮。前景を `radius` px 削る。
@@ -230,8 +472,42 @@ impl BitPlane {
         }
     }
 
+    /// 添字ごとの真偽から面を作る。語ごとに並列に組む。
+    ///
+    /// 面は画素の添字をそのまま詰めるので、1 語は 64 画素ぶんで、語どうしは
+    /// 書き先が重ならない。`f` は添字だけで決まる純粋な判定であること。
+    pub fn from_fn(len: usize, f: impl Fn(usize) -> bool + Sync) -> Self {
+        let mut words = vec![0u64; len.div_ceil(64)];
+        words.par_iter_mut().enumerate().for_each(|(k, word)| {
+            let base = k * 64;
+            let mut v = 0u64;
+            for b in 0..(len - base).min(64) {
+                if f(base + b) {
+                    v |= 1u64 << b;
+                }
+            }
+            *word = v;
+        });
+        Self { words, len }
+    }
+
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// 2 枚の面の積（両方で立っている画素）。語ごとに畳む。
+    pub fn and(&self, other: &BitPlane) -> BitPlane {
+        assert_eq!(self.len, other.len, "面の大きさが違う");
+        let words = self
+            .words
+            .par_iter()
+            .zip(&other.words)
+            .map(|(a, b)| a & b)
+            .collect();
+        BitPlane {
+            words,
+            len: self.len,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -411,7 +687,7 @@ impl Plane for BitPlane {
 ///
 /// `floodfill` の測地的オープニングと `reshape` の隙間の閉じ直しが同じ規約で
 /// 使う。規約（枠の外の扱い）を 2 箇所に持つと必ず離れるので、ここ 1 本に置く。
-pub fn separable<P: Plane + ?Sized>(
+pub fn separable<P: Plane + Sync + ?Sized>(
     w: usize,
     h: usize,
     src: &P,
@@ -428,6 +704,36 @@ pub fn separable<P: Plane + ?Sized>(
         }
         return out;
     }
+    let wpr = w.div_ceil(64);
+    let mut rows = vec![0u64; h * wpr];
+    rows.par_chunks_mut(wpr)
+        .enumerate()
+        .for_each(|(y, row)| src.read_bits(y * w, w, row));
+    let rows = separable_rows(w, h, rows, radius, take_max);
+    for (y, row) in rows.chunks_exact(wpr).enumerate() {
+        out.insert_bits(y * w, w, row);
+    }
+    out
+}
+
+/// `separable` を**行ごとに語へ揃えた面**の上でやる版。
+///
+/// 面は 1 行 `w.div_ceil(64)` 語で、行の端より先のビットは 0 であること。
+/// 返す面も同じ形で、端より先は 0 に揃えて返す。
+///
+/// 行を語に揃えておくと、行ごとの処理を並列に回せる（書き先の語が行を
+/// またがない）。`separable` の詰めた面と行のあいだの写しは、語をずらして
+/// 繋ぐだけなので安い。
+pub(crate) fn separable_rows(
+    w: usize,
+    h: usize,
+    mut rows: Vec<u64>,
+    radius: u32,
+    take_max: bool,
+) -> Vec<u64> {
+    if w == 0 || h == 0 || radius == 0 {
+        return rows;
+    }
     let r = radius as usize;
     // **窓の外は単位元で埋める。** 収縮（AND）なら真、膨張（OR）なら偽を
     // 置けば、畳んだ答えが「窓に含めない」と同じになる。枠の外の扱いを
@@ -436,54 +742,53 @@ pub fn separable<P: Plane + ?Sized>(
     let filler: u64 = if identity { !0 } else { 0 };
     let wpr = w.div_ceil(64);
     let used = w % 64;
-
-    // 行の端のビットを単位元へ揃える。`read_bits` は行の外を 0 にするので、
-    // 収縮のときだけ立て直す必要がある
-    let seal_tail = |row: &mut [u64]| {
-        if used != 0 && identity {
-            row[wpr - 1] |= !0u64 << used;
-        }
-    };
+    // 行の端より先のビット。入口では単位元へ、出口では 0 へ揃える
+    let tail = if used == 0 { 0 } else { !0u64 << used };
 
     // 横方向。**1 語 64 画素を一度に畳む。** 1 画素ずつ窓を舐めると
-    // 24.5MP・半径 1 で 7350 万回の読みになる
-    let mut rows = vec![0u64; h * wpr];
-    let mut line = vec![0u64; wpr];
-    for y in 0..h {
-        src.read_bits(y * w, w, &mut line);
-        seal_tail(&mut line);
-        let acc = &mut rows[y * wpr..(y + 1) * wpr];
-        acc.copy_from_slice(&line);
-        for d in 1..=r as isize {
-            for (i, slot) in acc.iter_mut().enumerate() {
-                let a = shifted(&line, i, d, filler);
-                let b = shifted(&line, i, -d, filler);
-                *slot = if take_max {
-                    *slot | a | b
-                } else {
-                    *slot & a & b
-                };
+    // 24.5MP・半径 1 で 7350 万回の読みになる。行は互いに独立なので並列に回し、
+    // 元の行は作業用の 1 行へ写してから同じ場所へ畳み込む
+    rows.par_chunks_mut(wpr).for_each_init(
+        || vec![0u64; wpr],
+        |line, acc| {
+            line.copy_from_slice(acc);
+            if identity {
+                line[wpr - 1] |= tail;
             }
-        }
-    }
+            acc.copy_from_slice(line);
+            for d in 1..=r as isize {
+                for (i, slot) in acc.iter_mut().enumerate() {
+                    let a = shifted(line, i, d, filler);
+                    let b = shifted(line, i, -d, filler);
+                    *slot = if take_max {
+                        *slot | a | b
+                    } else {
+                        *slot & a & b
+                    };
+                }
+            }
+        },
+    );
+    let across = rows;
 
-    // 縦方向。行どうしをそのまま語で畳む（ずらしが要らない）
-    let mut acc = vec![0u64; wpr];
-    for y in 0..h {
-        acc.copy_from_slice(&rows[y * wpr..(y + 1) * wpr]);
+    // 縦方向。行どうしをそのまま語で畳む（ずらしが要らない）。出力の行は
+    // 横方向の結果を読むだけなので、これも行ごとに並列に回せる
+    let mut out = vec![0u64; h * wpr];
+    out.par_chunks_mut(wpr).enumerate().for_each(|(y, acc)| {
+        acc.copy_from_slice(&across[y * wpr..(y + 1) * wpr]);
         let from = y.saturating_sub(r);
         let to = (y + r).min(h - 1);
         for k in from..=to {
             if k == y {
                 continue;
             }
-            let other = &rows[k * wpr..(k + 1) * wpr];
+            let other = &across[k * wpr..(k + 1) * wpr];
             for (slot, &v) in acc.iter_mut().zip(other) {
                 *slot = if take_max { *slot | v } else { *slot & v };
             }
         }
-        out.insert_bits(y * w, w, &acc);
-    }
+        acc[wpr - 1] &= !tail;
+    });
     out
 }
 
@@ -546,6 +851,92 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// ランで答える `remove_specks` が、Phase 35 より前の実装
+    /// （`remove_specks_bfs`、逐語）と、8 近傍を 1 画素ずつ辿って芯の面積を
+    /// 数える素直な実装の両方と同じマスクを返すこと。半透明の裾を混ぜ、
+    /// 寸法を振る。ランの経路は密度の上限を外して（`divisor` 1）必ず通す。
+    #[test]
+    fn the_run_speck_filter_agrees_with_the_old_one() {
+        fn plain(mask: &Mask, min_area: usize) -> Mask {
+            let (w, h) = (mask.width() as i64, mask.height() as i64);
+            let mut out = mask.clone();
+            let mut label = vec![usize::MAX; (w * h) as usize];
+            let mut members = Vec::new();
+            for start in 0..(w * h) as usize {
+                if label[start] != usize::MAX || mask.as_slice()[start] == 0 {
+                    continue;
+                }
+                members.clear();
+                label[start] = start;
+                members.push(start);
+                let mut k = 0;
+                while k < members.len() {
+                    let i = members[k] as i64;
+                    k += 1;
+                    for dy in -1..=1 {
+                        for dx in -1..=1 {
+                            let (nx, ny) = (i % w + dx, i / w + dy);
+                            if nx < 0 || ny < 0 || nx >= w || ny >= h {
+                                continue;
+                            }
+                            let j = (ny * w + nx) as usize;
+                            if label[j] == usize::MAX && mask.as_slice()[j] != 0 {
+                                label[j] = start;
+                                members.push(j);
+                            }
+                        }
+                    }
+                }
+                let core = members
+                    .iter()
+                    .filter(|&&i| mask.as_slice()[i] >= FOREGROUND_THRESHOLD)
+                    .count();
+                if core < min_area {
+                    for &i in &members {
+                        out.as_mut_slice()[i] = 0;
+                    }
+                }
+            }
+            out
+        }
+
+        let mut state = 0x1234_5678_u32;
+        let sizes = [
+            (53u32, 41u32),
+            (1, 1),
+            (1, 9),
+            (9, 1),
+            (63, 20),
+            (64, 20),
+            (65, 20),
+            (127, 7),
+            (129, 7),
+            (12, 300),
+        ];
+        for (w, h) in sizes {
+            for density in [20u32, 45, 60, 95] {
+                let mut mask = Mask::new(w, h, 0);
+                for y in 0..h {
+                    for x in 0..w {
+                        state ^= state << 13;
+                        state ^= state >> 17;
+                        state ^= state << 5;
+                        if state % 100 < density {
+                            mask.set(x, y, if state % 7 == 0 { 60 } else { 255 });
+                        }
+                    }
+                }
+                for radius in [1, 2, 3] {
+                    let label = format!("{w}x{h} 密度 {density} 半径 {radius}");
+                    let old = remove_specks_bfs(&mask, radius);
+                    assert_eq!(remove_specks_limited(&mask, radius, 1), old, "{label}");
+                    assert_eq!(remove_specks(&mask, radius), old, "{label}");
+                    assert_eq!(plain(&mask, speck_min_area(radius, w, h)), old, "{label}");
+                }
+            }
+        }
     }
 
     #[test]

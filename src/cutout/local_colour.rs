@@ -26,6 +26,7 @@
 //! 「色が何も言っていない画素」を動かしてはいけないため、3 つ目の状態が要る。
 
 use image::RgbaImage;
+use rayon::prelude::*;
 
 /// 比べる空間の 1.0（線形 RGB）を表す整数。
 ///
@@ -290,7 +291,7 @@ pub fn build(
     image: &RgbaImage,
     roi: (u32, u32, u32, u32),
     scale: f64,
-    role: impl Fn(u32, u32) -> Role,
+    role: impl Fn(u32, u32) -> Role + Sync,
 ) -> LocalColours {
     let w = image.width();
     let window = (RIM_WINDOW * scale).ceil() as u32;
@@ -308,22 +309,32 @@ pub fn build(
         .collect();
     let pixels = image.as_raw();
 
+    // **格子の行ごとに並列に集める。** 格子の 1 行は画素の `step` 行に当たり、
+    // ほかの行の画素は入らないので書き先が重ならない。和はすべて整数なので、
+    // 足す順序が変わっても 1 ビットも動かない
     let mut behind = vec![Sums::default(); gw * gh];
     let mut front = vec![Sums::default(); gw * gh];
-    for y in y0..=y1 {
-        let row = (y as usize) * (w as usize);
-        let cells = ((y as usize / step) - cy) * gw;
-        for x in x0..=x1 {
-            let slot = match role(x, y) {
-                Role::Skip => continue,
-                Role::Background => &mut behind,
-                Role::Foreground => &mut front,
-            };
-            let i = row + (x as usize);
-            let p = &pixels[i * 4..i * 4 + 3];
-            slot[cells + column[x as usize]].add(p);
-        }
-    }
+    behind
+        .par_chunks_mut(gw)
+        .zip(front.par_chunks_mut(gw))
+        .enumerate()
+        .for_each(|(gy, (behind, front))| {
+            let top = ((cy + gy) * step).max(y0 as usize) as u32;
+            let bottom = ((cy + gy + 1) * step - 1).min(y1 as usize) as u32;
+            for y in top..=bottom {
+                let row = (y as usize) * (w as usize);
+                for x in x0..=x1 {
+                    let slot = match role(x, y) {
+                        Role::Skip => continue,
+                        Role::Background => &mut *behind,
+                        Role::Foreground => &mut *front,
+                    };
+                    let i = row + (x as usize);
+                    let p = &pixels[i * 4..i * 4 + 3];
+                    slot[column[x as usize]].add(p);
+                }
+            }
+        });
     box_sum(&mut behind, gw, gh, radius);
     box_sum(&mut front, gw, gh, radius);
     // 窓に確定前景が無いセルへ、借りられる範囲のいちばん近い統計を配る

@@ -38,7 +38,7 @@
 //! 窓の大きさが画素ごとに違っても成立する。
 
 use std::collections::VecDeque;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use image::RgbaImage;
 use rayon::prelude::*;
@@ -381,9 +381,6 @@ pub fn refine(
         feather_radius: opts.feather,
         core_window: window_for(band_max),
     };
-    // 色で決められなかった画素の受け皿。12MP では単独で 50ms かかるうえ、
-    // 1 画素も落ちない素材のほうが多いので、実際に必要になるまで作らない
-    let fallback: OnceLock<Mask> = OnceLock::new();
     // 色から決まった画素の印。guided のときだけ持つ
     let mut solved = if smooths_alpha {
         guided::Solved::new((w as usize) * (h as usize))
@@ -391,15 +388,7 @@ pub fn refine(
         guided::Solved::default()
     };
 
-    sweep_bands(
-        w,
-        &ctx,
-        &fallback,
-        Pass::Project,
-        &mut out,
-        &mut mask,
-        &mut solved,
-    );
+    sweep_bands(w, &ctx, Pass::Project, &mut out, &mut mask, &mut solved);
 
     let mut matting_report = None;
     if smooths_alpha {
@@ -424,15 +413,7 @@ pub fn refine(
                 despill: true,
                 ..ctx
             };
-            sweep_bands(
-                w,
-                &ctx,
-                &fallback,
-                Pass::Recover,
-                &mut out,
-                &mut mask,
-                &mut solved,
-            );
+            sweep_bands(w, &ctx, Pass::Recover, &mut out, &mut mask, &mut solved);
         }
     }
 
@@ -475,7 +456,6 @@ pub(crate) fn smooth_radius_px(smooth_contour: f64, scale: f64) -> u32 {
 fn sweep_bands(
     w: u32,
     ctx: &Context<'_>,
-    fallback: &OnceLock<Mask>,
     pass: Pass,
     image: &mut RgbaImage,
     mask: &mut Mask,
@@ -491,6 +471,9 @@ fn sweep_bands(
         .for_each(|(band, (image, mask))| {
             let y0 = (band * rows) as u32;
             let mut ws = Workspace::default();
+            // 色で決められなかった画素の受け皿。帯ごとに持ち、要るタイルの
+            // 分だけ作る（`Fallback`）
+            let mut fallback = Fallback::default();
             let mut out = Output {
                 solved: Vec::new(),
                 image,
@@ -500,7 +483,7 @@ fn sweep_bands(
             };
             let mut tx = 0;
             while tx < w {
-                refine_tile(ctx, &mut ws, fallback, (tx, y0), pass, &mut out);
+                refine_tile(ctx, &mut ws, &mut fallback, (tx, y0), pass, &mut out);
                 tx += TILE;
             }
             // 立てる順序は結果に影響しない（同じ添字に同じ 1 を置くだけ）
@@ -700,7 +683,7 @@ impl Output<'_> {
 fn refine_tile(
     ctx: &Context<'_>,
     ws: &mut Workspace,
-    fallback: &OnceLock<Mask>,
+    fallback: &mut Fallback,
     tile: (u32, u32),
     pass: Pass,
     out: &mut Output<'_>,
@@ -818,7 +801,7 @@ fn prepare_tile(ctx: &Context<'_>, ws: &mut Workspace, tile: &Tile) {
 fn estimate_alpha(
     ctx: &Context<'_>,
     ws: &mut Workspace,
-    fallback: &OnceLock<Mask>,
+    fallback: &mut Fallback,
     tile: &Tile,
     pass: Pass,
     out: &mut Output<'_>,
@@ -909,7 +892,7 @@ fn estimate_alpha(
 
             let Some(f) = f else {
                 if pass == Pass::Project {
-                    let v = feather_at(fallback, ctx, x, y);
+                    let v = fallback.at(ctx, x, y);
                     out.set_alpha(x, y, v);
                 }
                 continue;
@@ -920,7 +903,7 @@ fn estimate_alpha(
             if dd < ctx.separation_sq {
                 // 色では決められない。幾何的フェザーへ落とす
                 if pass == Pass::Project {
-                    let v = feather_at(fallback, ctx, x, y);
+                    let v = fallback.at(ctx, x, y);
                     out.set_alpha(x, y, v);
                 }
                 continue;
@@ -1031,11 +1014,41 @@ fn smoothstep(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// 幾何的フェザーの値。初めて必要になったときだけマスク全体を作る。
-fn feather_at(fallback: &OnceLock<Mask>, ctx: &Context<'_>, x: u32, y: u32) -> u8 {
-    fallback
-        .get_or_init(|| feather::feather(ctx.binary, ctx.feather_radius))
-        .get(x, y)
+/// 幾何的フェザー（`feather::feather`）の値の受け皿。**タイルごとに、初めて
+/// 必要になったときだけ**そのタイルの分を作る。
+///
+/// 色で決められなかった画素はたいてい 1 つも無いか、あっても一部のタイルに
+/// 偏る。以前は初めて要った時点でマスク全体を作っていたが、24.5MP では
+/// 単独で 70ms かかり、帯を並列に回している最中に 1 本のスレッドが作る間、
+/// 同じ受け皿を待つ他の帯が止まっていた。作る処理そのものを並列にすると、
+/// rayon の作業盗みで同じ受け皿の初期化に再入して止まる。タイルの分だけを
+/// その場で作れば、待ち合わせも全面の 24.5MB も要らない。値は全面版の
+/// 切り出しと一致する（`feather::feather_window`）。
+#[derive(Default)]
+struct Fallback {
+    /// いま持っているタイルの左上。`values` はそのタイルの行順の値
+    tile: Option<(u32, u32)>,
+    values: Vec<u8>,
+    width: usize,
+}
+
+impl Fallback {
+    fn at(&mut self, ctx: &Context<'_>, x: u32, y: u32) -> u8 {
+        let origin = (x - x % TILE, y - y % TILE);
+        if self.tile != Some(origin) {
+            let (w, h) = (ctx.binary.width(), ctx.binary.height());
+            let rect = (
+                origin.0,
+                origin.1,
+                (origin.0 + TILE - 1).min(w - 1),
+                (origin.1 + TILE - 1).min(h - 1),
+            );
+            self.values = feather::feather_window(ctx.binary, ctx.feather_radius, rect);
+            self.width = (rect.2 - rect.0 + 1) as usize;
+            self.tile = Some(origin);
+        }
+        self.values[((y - origin.1) as usize) * self.width + (x - origin.0) as usize]
+    }
 }
 
 /// 積分画像を張る領域の中身。
@@ -1254,31 +1267,65 @@ pub(crate) fn band_map_into(
     band: &mut [u8],
 ) -> Vec<u32> {
     let (w, h) = (binary.width(), binary.height());
-    band.fill(0);
     let min_r = min_radius.clamp(1, RADIUS_CEILING);
     let max_r = max_radius.clamp(min_r, RADIUS_CEILING);
+    let stride = w as usize;
+
+    // **幅を測る段と塗る段を分ける。** 輪郭画素ごとの `transition_width` は
+    // 互いに独立なので行で割って測る。`collect` は行の順を保つが、塗りは
+    // 「既にある値との大きいほう」なので順序にそもそも依らない
+    let contour: Vec<Vec<(u32, u32)>> = (0..h)
+        .into_par_iter()
+        .map(|y| {
+            let mut row = Vec::new();
+            for x in 0..w {
+                if !binary.is_foreground(x, y) || !binary.touches_background(x, y) {
+                    continue;
+                }
+                let width = match binary.outward_normal(x, y) {
+                    Some(normal) => {
+                        transition_width(image, binary, field, x, y, normal, min_r, max_r)
+                    }
+                    // 幅 1px の構造では背景が両側にあって法線が打ち消し合う。
+                    // 遷移幅は測れないが、帯を張らないとその画素だけ二値のまま
+                    // 取り残され、色が背景寄りでも不透明で残ってしまう
+                    None => min_r,
+                };
+                row.push((x, width));
+            }
+            row
+        })
+        .collect();
+
     // 添字が帯幅(px)。帯幅は `RADIUS_CEILING` で抑えてあるので固定長で足りる
     let mut widths = vec![0u32; (RADIUS_CEILING + 1) as usize];
-
-    for y in 0..h {
-        for x in 0..w {
-            if !binary.is_foreground(x, y) || !binary.touches_background(x, y) {
-                continue;
-            }
-            let width = match binary.outward_normal(x, y) {
-                Some(normal) => transition_width(image, binary, field, x, y, normal, min_r, max_r),
-                // 幅 1px の構造では背景が両側にあって法線が打ち消し合う。
-                // 遷移幅は測れないが、帯を張らないとその画素だけ二値のまま
-                // 取り残され、色が背景寄りでも不透明で残ってしまう
-                None => min_r,
-            };
-            // 値域は上の 2 本の clamp で [1, RADIUS_CEILING] に閉じているので
-            // ここは届かない防御である。上限を後から動かしたときに添字で落ちる
-            // より、最終ビンへ飽和させて表が濁るほうがまだ直しやすい
-            widths[width.min(RADIUS_CEILING) as usize] += 1;
-            paint_disc(band, w, h, x, y, width);
-        }
+    for &(_, width) in contour.iter().flatten() {
+        // 値域は上の 2 本の clamp で [1, RADIUS_CEILING] に閉じているので
+        // ここは届かない防御である。上限を後から動かしたときに添字で落ちる
+        // より、最終ビンへ飽和させて表が濁るほうがまだ直しやすい
+        widths[width.min(RADIUS_CEILING) as usize] += 1;
     }
+
+    // 塗りは帯の行を `TILE` 行ずつに割り、各帯が**自分の行に掛かる円だけ**を
+    // 自分の行の範囲で塗る。円の半径は `max_r` 以下なので、見に行く輪郭の行は
+    // 上下 `max_r` 行ぶんで足りる。どの画素も同じ円の集合の最大を受けるので、
+    // 1 本で全部塗ったのと 1 ビットも変わらない
+    let rows = TILE as usize;
+    // 幅 0 の画像では帯も空で、塗るものが無い（`par_chunks_mut(0)` は落ちる）
+    band.par_chunks_mut((rows * stride).max(1))
+        .enumerate()
+        .for_each(|(chunk, slab)| {
+            slab.fill(0);
+            let y0 = (chunk * rows) as u32;
+            let y1 = y0 + (slab.len() / stride) as u32;
+            let from = y0.saturating_sub(max_r);
+            let to = (y1 + max_r).min(h);
+            for cy in from..to {
+                for &(cx, width) in &contour[cy as usize] {
+                    paint_disc(slab, (y0, y1), w, cx, cy, width);
+                }
+            }
+        });
     // **確定した画素は帯から外す。** 指示は色より強いという規約の帰結で、
     // ここを外せば (b) の塗り直しも (d)(e) のアルファも触らない。寸法の合わない
     // 指示は無かったことにする（`foreground_mask` と同じ規約）。
@@ -1289,11 +1336,11 @@ pub(crate) fn band_map_into(
     // 1.39 → 3.86、rim 正解は 0.128 → 0.256 と悪化する。
     // 帯は遷移幅から引き、指示は「触ってはいけない場所」を教える側に徹する
     if let Some(c) = constraints.filter(|c| c.width() == w && c.height() == h) {
-        for (i, slot) in band.iter_mut().enumerate() {
+        band.par_iter_mut().enumerate().for_each(|(i, slot)| {
             if c.has_fg(i) || c.has_bg(i) {
                 *slot = 0;
             }
-        }
+        });
     }
     widths
 }
@@ -1302,14 +1349,19 @@ pub(crate) fn band_map_into(
 ///
 /// 行ごとに x の範囲を先に決めて連続領域として塗る。画素ごとに距離を測り直すと、
 /// メッシュのように境界画素が数百万ある素材で無視できない時間になる。
-fn paint_disc(band: &mut [u8], w: u32, h: u32, cx: u32, cy: u32, width: u32) {
+///
+/// `band` は画像の `rows.0..rows.1` 行ぶんの切れ端で、円はその行の範囲で切って
+/// 塗る。帯を行で割って並列に塗るためで、切れ端の外の行は別の帯が塗る。
+fn paint_disc(band: &mut [u8], rows: (u32, u32), w: u32, cx: u32, cy: u32, width: u32) {
     let stride = w as usize;
     let r = i64::from(width);
     // 帯幅は RADIUS_CEILING で抑えてあるので u8 に収まるが、上限を後から
     // 動かしたときに環状に切り捨てて幅 0 にならないよう飽和させておく
     let value = width.min(u32::from(u8::MAX)) as u8;
-    let y0 = (i64::from(cy) - r).max(0);
-    let y1 = (i64::from(cy) + r).min(i64::from(h) - 1);
+    // `band` は画像の `rows.0..rows.1` 行だけを持つ。円はその範囲で切って塗る
+    let y0 = (i64::from(cy) - r).max(i64::from(rows.0));
+    // 切れ端の下端は画像の下端を越えないので、画像の高さで切り直す必要は無い
+    let y1 = (i64::from(cy) + r).min(i64::from(rows.1) - 1);
     for ny in y0..=y1 {
         let dy = ny - i64::from(cy);
         // dx² <= r² - dy² を満たす最大の dx。平方根の丸めに頼らず整数で詰める
@@ -1323,7 +1375,7 @@ fn paint_disc(band: &mut [u8], w: u32, h: u32, cx: u32, cy: u32, width: u32) {
         }
         let x0 = (i64::from(cx) - dx).max(0) as usize;
         let x1 = ((i64::from(cx) + dx).min(i64::from(w) - 1)) as usize;
-        let row = (ny as usize) * stride;
+        let row = ((ny - i64::from(rows.0)) as usize) * stride;
         for slot in &mut band[row + x0..=row + x1] {
             *slot = (*slot).max(value);
         }

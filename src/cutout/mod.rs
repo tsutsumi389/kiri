@@ -35,6 +35,7 @@ pub mod stage;
 pub mod subject;
 
 use image::RgbaImage;
+use rayon::prelude::*;
 
 use crate::warning::{Warning, WarningCode};
 
@@ -325,8 +326,12 @@ impl BackgroundSeen {
 
 /// 画像と `border` だけで決まるぶんを 1 度だけ測る。
 pub fn see_background(image: &RgbaImage, border: u32) -> BackgroundSeen {
-    let estimate = estimate_background(image, border);
-    let subject = detect_subject(image, &estimate, border);
+    // 主体を測る縮小版は背景の見立てに依らないので、見立てと同時に作る
+    let (estimate, small) = rayon::join(
+        || estimate_background(image, border),
+        || subject::downscale(image),
+    );
+    let subject = subject::detect_subject_on(image, &estimate, border, small);
     BackgroundSeen {
         border,
         estimate,
@@ -830,9 +835,10 @@ fn second_pass(
         //
         // しきい値は書き写さない。`FOREGROUND_THRESHOLD` の doc が
         // 「定義はここ 1 箇所にしかない」と名乗っている
+        // 画素ごとに独立なので並列に写す。`collect` は並びを保つ
         let filled: Vec<bool> = mask
             .as_slice()
-            .iter()
+            .par_iter()
             .map(|&v| v < mask::FOREGROUND_THRESHOLD)
             .collect();
         let known = background::KnownBackground {

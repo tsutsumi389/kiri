@@ -287,13 +287,63 @@ fn suppress_row(
 /// そのまま見たい、という違いのために f32 の表を作らずに済む。
 ///
 /// 本番（`edge_ridges`）は行の帯に割った `walk_ridges_rows` を直に呼ぶ。
-/// 1 本で流すこちらはテストの物差しとして残す。
+/// 1 本で流すこちらは Phase 35 より前の実装を**逐語のまま**残した物差しで、
+/// 帯に割った版と式を共有しない（共有すると、割り方の誤りを見逃す）。
 #[cfg(test)]
-fn walk_ridges(image: &RgbaImage, w: usize, h: usize, keep: impl FnMut(usize, f32)) {
+fn walk_ridges(image: &RgbaImage, w: usize, h: usize, mut keep: impl FnMut(usize, f32)) {
     if w < 3 || h < 3 {
         return;
     }
-    walk_ridges_rows(image, w, h, (1, h - 1), keep);
+    // 行の環。添字は `行番号 % 3` で、1 周前の行を上書きする
+    let mut luma = vec![0.0f32; 3 * w];
+    let mut mag = vec![0.0f32; 3 * w];
+    let mut dir = vec![0u8; 3 * w];
+    // 画像の外に当たる強度の行。最後の抑制で 1 度だけ使う
+    let zeros = vec![0.0f32; w];
+    let row = |y: usize| (y % 3) * w;
+
+    luma_row(image, 0, w, &mut luma[row(0)..row(0) + w]);
+    luma_row(image, 1, w, &mut luma[row(1)..row(1) + w]);
+
+    for yy in 1..h - 1 {
+        luma_row(image, yy + 1, w, &mut luma[row(yy + 1)..row(yy + 1) + w]);
+        let (a, m, b) = (row(yy - 1), row(yy), row(yy + 1));
+        sobel_row(
+            &luma[a..a + w],
+            &luma[m..m + w],
+            &luma[b..b + w],
+            w,
+            &mut mag[m..m + w],
+            &mut dir[m..m + w],
+        );
+
+        if yy >= 2 {
+            let y = yy - 1;
+            let (a, m, b) = (row(y - 1), row(y), row(y + 1));
+            suppress_row(
+                y,
+                w,
+                &mag[a..a + w],
+                &mag[m..m + w],
+                &mag[b..b + w],
+                &dir[m..m + w],
+                &mut keep,
+            );
+        }
+    }
+
+    // 最後の行。下の行は画像の外なので強度 0 として扱う
+    let y = h - 2;
+    let (a, m) = (row(y - 1), row(y));
+    suppress_row(
+        y,
+        w,
+        &mag[a..a + w],
+        &mag[m..m + w],
+        &zeros,
+        &dir[m..m + w],
+        &mut keep,
+    );
 }
 
 /// `walk_ridges` の、抑制した結果を出す行を `rows.0..rows.1` に限った版。

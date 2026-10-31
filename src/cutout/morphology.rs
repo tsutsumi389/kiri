@@ -13,6 +13,8 @@
 
 use std::collections::VecDeque;
 
+use rayon::prelude::*;
+
 use crate::cutout::mask::Mask;
 
 /// 孤立ノイズとして消す連結成分の面積の下限(px²)。
@@ -411,7 +413,7 @@ impl Plane for BitPlane {
 ///
 /// `floodfill` の測地的オープニングと `reshape` の隙間の閉じ直しが同じ規約で
 /// 使う。規約（枠の外の扱い）を 2 箇所に持つと必ず離れるので、ここ 1 本に置く。
-pub fn separable<P: Plane + ?Sized>(
+pub fn separable<P: Plane + Sync + ?Sized>(
     w: usize,
     h: usize,
     src: &P,
@@ -428,6 +430,36 @@ pub fn separable<P: Plane + ?Sized>(
         }
         return out;
     }
+    let wpr = w.div_ceil(64);
+    let mut rows = vec![0u64; h * wpr];
+    rows.par_chunks_mut(wpr)
+        .enumerate()
+        .for_each(|(y, row)| src.read_bits(y * w, w, row));
+    let rows = separable_rows(w, h, rows, radius, take_max);
+    for (y, row) in rows.chunks_exact(wpr).enumerate() {
+        out.insert_bits(y * w, w, row);
+    }
+    out
+}
+
+/// `separable` を**行ごとに語へ揃えた面**の上でやる版。
+///
+/// 面は 1 行 `w.div_ceil(64)` 語で、行の端より先のビットは 0 であること。
+/// 返す面も同じ形で、端より先は 0 に揃えて返す。
+///
+/// 行を語に揃えておくと、行ごとの処理を並列に回せる（書き先の語が行を
+/// またがない）。`separable` の詰めた面と行のあいだの写しは、語をずらして
+/// 繋ぐだけなので安い。
+pub(crate) fn separable_rows(
+    w: usize,
+    h: usize,
+    mut rows: Vec<u64>,
+    radius: u32,
+    take_max: bool,
+) -> Vec<u64> {
+    if w == 0 || h == 0 || radius == 0 {
+        return rows;
+    }
     let r = radius as usize;
     // **窓の外は単位元で埋める。** 収縮（AND）なら真、膨張（OR）なら偽を
     // 置けば、畳んだ答えが「窓に含めない」と同じになる。枠の外の扱いを
@@ -436,54 +468,53 @@ pub fn separable<P: Plane + ?Sized>(
     let filler: u64 = if identity { !0 } else { 0 };
     let wpr = w.div_ceil(64);
     let used = w % 64;
-
-    // 行の端のビットを単位元へ揃える。`read_bits` は行の外を 0 にするので、
-    // 収縮のときだけ立て直す必要がある
-    let seal_tail = |row: &mut [u64]| {
-        if used != 0 && identity {
-            row[wpr - 1] |= !0u64 << used;
-        }
-    };
+    // 行の端より先のビット。入口では単位元へ、出口では 0 へ揃える
+    let tail = if used == 0 { 0 } else { !0u64 << used };
 
     // 横方向。**1 語 64 画素を一度に畳む。** 1 画素ずつ窓を舐めると
-    // 24.5MP・半径 1 で 7350 万回の読みになる
-    let mut rows = vec![0u64; h * wpr];
-    let mut line = vec![0u64; wpr];
-    for y in 0..h {
-        src.read_bits(y * w, w, &mut line);
-        seal_tail(&mut line);
-        let acc = &mut rows[y * wpr..(y + 1) * wpr];
-        acc.copy_from_slice(&line);
-        for d in 1..=r as isize {
-            for (i, slot) in acc.iter_mut().enumerate() {
-                let a = shifted(&line, i, d, filler);
-                let b = shifted(&line, i, -d, filler);
-                *slot = if take_max {
-                    *slot | a | b
-                } else {
-                    *slot & a & b
-                };
+    // 24.5MP・半径 1 で 7350 万回の読みになる。行は互いに独立なので並列に回し、
+    // 元の行は作業用の 1 行へ写してから同じ場所へ畳み込む
+    rows.par_chunks_mut(wpr).for_each_init(
+        || vec![0u64; wpr],
+        |line, acc| {
+            line.copy_from_slice(acc);
+            if identity {
+                line[wpr - 1] |= tail;
             }
-        }
-    }
+            acc.copy_from_slice(line);
+            for d in 1..=r as isize {
+                for (i, slot) in acc.iter_mut().enumerate() {
+                    let a = shifted(line, i, d, filler);
+                    let b = shifted(line, i, -d, filler);
+                    *slot = if take_max {
+                        *slot | a | b
+                    } else {
+                        *slot & a & b
+                    };
+                }
+            }
+        },
+    );
+    let across = rows;
 
-    // 縦方向。行どうしをそのまま語で畳む（ずらしが要らない）
-    let mut acc = vec![0u64; wpr];
-    for y in 0..h {
-        acc.copy_from_slice(&rows[y * wpr..(y + 1) * wpr]);
+    // 縦方向。行どうしをそのまま語で畳む（ずらしが要らない）。出力の行は
+    // 横方向の結果を読むだけなので、これも行ごとに並列に回せる
+    let mut out = vec![0u64; h * wpr];
+    out.par_chunks_mut(wpr).enumerate().for_each(|(y, acc)| {
+        acc.copy_from_slice(&across[y * wpr..(y + 1) * wpr]);
         let from = y.saturating_sub(r);
         let to = (y + r).min(h - 1);
         for k in from..=to {
             if k == y {
                 continue;
             }
-            let other = &rows[k * wpr..(k + 1) * wpr];
+            let other = &across[k * wpr..(k + 1) * wpr];
             for (slot, &v) in acc.iter_mut().zip(other) {
                 *slot = if take_max { *slot | v } else { *slot & v };
             }
         }
-        out.insert_bits(y * w, w, &acc);
-    }
+        acc[wpr - 1] &= !tail;
+    });
     out
 }
 

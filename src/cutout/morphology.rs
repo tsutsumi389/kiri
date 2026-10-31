@@ -11,6 +11,8 @@
 //! `erode` / `dilate` / `open` / `close` は境界帯の生成や比較のためにある。
 //! パイプラインでは使わない。理由は `remove_specks` と `close` の項を参照。
 
+use std::collections::VecDeque;
+
 use rayon::prelude::*;
 
 use crate::cutout::mask::{FOREGROUND_THRESHOLD, Mask};
@@ -76,60 +78,54 @@ fn speck_scale(width: u32, height: u32) -> f64 {
 ///
 /// 消すかどうかは成分ごとの芯の面積だけで決まり、成分をどの順で辿るかには
 /// 依らない。行ごとのラン（0 でない画素の連続区間）を並列に切り出して芯の
-/// 画素数を数え、上下の行で接するランを `run_components` で結ぶ。1 画素ずつ
+/// 画素数を数え、上下の行で接するランを `Runs::components` で結ぶ。1 画素ずつ
 /// キューへ出し入れすると前景の大きい 24.5MP で 1 回 50ms かかるが、前景は
-/// 長いランになるので結ぶ相手はその数十分の 1 しか無い。
+/// 長いランになるので結ぶ相手はその数十分の 1 しか無い。ランが細かく割れる
+/// 素材では表が膨らむので、1 画素ずつ辿る旧来の経路へ落とす。
 pub fn remove_specks(mask: &Mask, radius: u32) -> Mask {
+    remove_specks_limited(mask, radius, RUN_DENSITY_LIMIT)
+}
+
+/// `remove_specks` の、ランの表を使ってよい密度（`Runs::collect` の `divisor`）を
+/// 呼び出し側が決める版。試験は 1 を渡して、ランで答える経路を必ず通す。
+fn remove_specks_limited(mask: &Mask, radius: u32, divisor: usize) -> Mask {
     if radius == 0 {
         return mask.clone();
     }
     let (w, h) = (mask.width(), mask.height());
     let min_area = speck_min_area(radius, w, h);
     let stride = w as usize;
-    let mut out = mask.clone();
     if stride == 0 || h == 0 {
-        return out;
+        return mask.clone();
     }
     let alpha = mask.as_slice();
-
-    // 行ごとのランと、その中の芯（前景判定）の画素数
-    let runs: Vec<Vec<CountedRun>> = alpha
-        .par_chunks(stride)
-        .map(|row| {
-            let mut runs = Vec::new();
-            let mut open: Option<CountedRun> = None;
-            for (x, &v) in row.iter().enumerate() {
-                if v == 0 {
-                    runs.extend(open.take());
-                    continue;
-                }
-                let run = open.get_or_insert(CountedRun {
-                    x0: x as u32,
-                    x1: x as u32,
-                    core: 0,
-                });
-                run.x1 = x as u32;
-                run.core += usize::from(v >= FOREGROUND_THRESHOLD);
-            }
-            runs.extend(open);
-            runs
-        })
-        .collect();
-    let (first, component) = run_components(&runs, true);
-    let mut area = vec![0usize; component.len()];
-    for (y, row) in runs.iter().enumerate() {
-        for (k, run) in row.iter().enumerate() {
-            area[component[first[y] + k] as usize] += run.core;
-        }
+    // ランが細かく割れる素材（1px の市松など）では、ランの表が画素数に比例して
+    // 膨らみ、1 画素ずつ辿るより重くなる。そこでは 1 画素ずつ辿る旧来の経路へ
+    // 落とす（`RUN_DENSITY_LIMIT`）
+    let Some(runs) = Runs::collect(stride, h as usize, divisor, |i| alpha[i] != 0) else {
+        return remove_specks_bfs(mask, radius);
+    };
+    let component = runs.components(true);
+    // 芯（前景判定）の画素数をランごとに数え、成分の代表へ畳む。整数の和なので
+    // 足す順序で値は動かない
+    let core = runs.per_run(|y, run| {
+        let row = &alpha[y * stride + run.x0 as usize..=y * stride + run.x1 as usize];
+        row.iter().filter(|&&v| v >= FOREGROUND_THRESHOLD).count() as u32
+    });
+    let mut area = vec![0u32; component.len()];
+    for (r, &c) in core.iter().enumerate() {
+        area[component[r] as usize] += c;
     }
+    drop(core);
     // 消す成分のランだけを 0 で塗る。行ごとに書き先が分かれるので並列に回す
+    let mut out = mask.clone();
     out.as_mut_slice()
         .par_chunks_mut(stride)
-        .zip(runs.par_iter())
         .enumerate()
-        .for_each(|(y, (row, runs))| {
-            for (k, run) in runs.iter().enumerate() {
-                if area[component[first[y] + k] as usize] < min_area {
+        .for_each(|(y, row)| {
+            for r in runs.first[y]..runs.first[y + 1] {
+                let run = runs.runs[r];
+                if (area[component[r] as usize] as usize) < min_area {
                     row[run.x0 as usize..=run.x1 as usize].fill(0);
                 }
             }
@@ -137,68 +133,236 @@ pub fn remove_specks(mask: &Mask, radius: u32) -> Mask {
     out
 }
 
-/// `remove_specks` のラン。芯の画素数を持ち歩く。
-#[derive(Clone, Copy)]
-struct CountedRun {
-    x0: u32,
-    x1: u32,
-    core: usize,
-}
-
-impl Span for CountedRun {
-    fn span(&self) -> (u32, u32) {
-        (self.x0, self.x1)
-    }
-}
-
-/// 行の中の連続区間（両端を含む x）として読めるもの。
-pub(crate) trait Span {
-    fn span(&self) -> (u32, u32);
-}
-
-/// 行ごとのランを、上下の行で接するもの同士つないだ連結成分に分ける。
+/// `remove_specks` の、1 画素ずつ辿る旧来の経路（Phase 35 より前の実装を
+/// 逐語のまま残したもの）。ランが細かく割れる素材で使う。
 ///
-/// 戻り値は (行ごとの先頭の通し番号, ランごとの成分の番号)。行 `y` の `k` 番目の
-/// ランの成分は `component[first[y] + k]` で、番号は成分を代表するランの通し
-/// 番号である。`diagonal` が真なら 8 近傍（斜めに 1 画素ずれて接するランも
-/// つなぐ）、偽なら 4 近傍。各行のランは x の昇順で、重ならないこと。
-///
-/// **成分は結ぶ順序に依らない。** 連結は「接している」という対称な関係の
-/// 推移閉包でしかないので、どの順で union-find に掛けても同じ分け方になる。
-pub(crate) fn run_components<R: Span>(runs: &[Vec<R>], diagonal: bool) -> (Vec<usize>, Vec<u32>) {
-    let mut first = Vec::with_capacity(runs.len() + 1);
-    let mut total = 0usize;
-    for row in runs {
-        first.push(total);
-        total += row.len();
+/// 試験の物差しも兼ねる。ランで答える経路と一致することを
+/// `the_run_speck_filter_agrees_with_the_old_one` が見ている。
+fn remove_specks_bfs(mask: &Mask, radius: u32) -> Mask {
+    if radius == 0 {
+        return mask.clone();
     }
-    first.push(total);
-    let slack = u32::from(diagonal);
-    let mut parent: Vec<u32> = (0..total as u32).collect();
-    for y in 1..runs.len() {
-        let (above, below) = (&runs[y - 1], &runs[y]);
-        let (mut i, mut j) = (0, 0);
-        while i < above.len() && j < below.len() {
-            let ((a0, a1), (b0, b1)) = (above[i].span(), below[j].span());
-            if a0 <= b1 + slack && b0 <= a1 + slack {
-                union(
-                    &mut parent,
-                    (first[y - 1] + i) as u32,
-                    (first[y] + j) as u32,
-                );
+    let (w, h) = (mask.width(), mask.height());
+    let min_area = speck_min_area(radius, w, h);
+    let stride = w as usize;
+
+    let mut out = mask.clone();
+    let mut visited = vec![false; stride * (h as usize)];
+    let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
+
+    for y in 0..h {
+        for x in 0..w {
+            let start = (y as usize) * stride + (x as usize);
+            if visited[start] || mask.get(x, y) == 0 {
+                continue;
             }
-            if a1 < b1 {
-                i += 1;
-            } else {
-                j += 1;
+
+            // 1 周目は面積を数えるだけにする。成分の座標を Vec に実体化すると、
+            // 前景がほぼ全面の 12MP で 1 成分が 1200 万画素になり、それだけで
+            // 96MB を余計に抱える。パイプラインは 2 回呼ぶので、ピーク RSS が
+            // 207MB から 400MB へ跳ねる
+            visited[start] = true;
+            queue.clear();
+            queue.push_back((x, y));
+            let mut core = 0usize;
+            while let Some((cx, cy)) = queue.pop_front() {
+                if mask.is_foreground(cx, cy) {
+                    core += 1;
+                }
+                let (x0, x1) = (cx.saturating_sub(1), (cx + 1).min(w - 1));
+                let (y0, y1) = (cy.saturating_sub(1), (cy + 1).min(h - 1));
+                for ny in y0..=y1 {
+                    for nx in x0..=x1 {
+                        let i = (ny as usize) * stride + (nx as usize);
+                        if visited[i] || mask.get(nx, ny) == 0 {
+                            continue;
+                        }
+                        visited[i] = true;
+                        queue.push_back((nx, ny));
+                    }
+                }
+            }
+            if core >= min_area {
+                continue;
+            }
+
+            // 2 周目で 0 を書きながら同じ成分をたどる。書き込んだ 0 がそのまま
+            // 訪問済みの印になるので、座標を覚えておく必要がない
+            queue.clear();
+            out.set(x, y, 0);
+            queue.push_back((x, y));
+            while let Some((cx, cy)) = queue.pop_front() {
+                let (x0, x1) = (cx.saturating_sub(1), (cx + 1).min(w - 1));
+                let (y0, y1) = (cy.saturating_sub(1), (cy + 1).min(h - 1));
+                for ny in y0..=y1 {
+                    for nx in x0..=x1 {
+                        if out.get(nx, ny) == 0 {
+                            continue;
+                        }
+                        out.set(nx, ny, 0);
+                        queue.push_back((nx, ny));
+                    }
+                }
             }
         }
     }
-    for i in 0..total as u32 {
-        let root = find(&mut parent, i);
-        parent[i as usize] = root;
+    out
+}
+
+/// ランの表を使ってよい密度の上限。ランの総数が画素数のこの分の 1 を超えたら、
+/// ランで答える経路は使わない。
+///
+/// ラン 1 本は 8 バイト（`Run`）、連結の親が 4 バイト、`remove_specks` の芯の
+/// 数と成分の面積が 4 バイトずつで、上限ちょうどでも画素あたり 2.5 バイトに
+/// 収まる。1px の市松のようにランが画素数の半分まで割れる素材で表を作ると、
+/// 5000x4000 で 100MB を超え、1 画素ずつ辿る旧来の経路よりピーク RSS が上がる
+/// （581 → 674MB と測れた）。
+///
+/// 8 は実写の分布から決めた。24.5MP の実写リモコンでいちばん割れるフィルの
+/// 芯でも画素数の 1.1%、実写キーボードで 7.4% に
+/// 留まり、市松は 41% ある。32 にするとキーボードの芯が旧来の経路へ落ちる。
+pub(crate) const RUN_DENSITY_LIMIT: usize = 8;
+
+/// 行の中の連続区間。`x0..=x1`（両端を含む）。
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct Run {
+    pub x0: u32,
+    pub x1: u32,
+}
+
+/// 行ごとのランを平坦に並べた表。行 `y` のランは `runs[first[y]..first[y + 1]]`
+/// で、x の昇順に並ぶ。
+///
+/// `Vec<Vec<Run>>` にしないのは、行ごとの器の頭と倍々の余りが、ランが細かい
+/// 素材でそのまま常駐量に乗るためである。
+pub(crate) struct Runs {
+    pub runs: Vec<Run>,
+    pub first: Vec<usize>,
+}
+
+impl Runs {
+    /// `inside(添字)` が真の画素の連続区間を、行ごとに並列に切り出す。
+    ///
+    /// 1 度目の走査で行ごとの本数を数えて表の大きさを決め、2 度目で書く。
+    /// 総数が画素数の `divisor` 分の 1 を超えたら `None` を返し、表は作らない
+    /// （本番は `RUN_DENSITY_LIMIT`）。
+    pub(crate) fn collect(
+        w: usize,
+        h: usize,
+        divisor: usize,
+        inside: impl Fn(usize) -> bool + Sync,
+    ) -> Option<Runs> {
+        let scan = |y: usize, mut put: Option<&mut [Run]>| -> usize {
+            let row = y * w;
+            let mut n = 0;
+            let mut start: Option<usize> = None;
+            for x in 0..=w {
+                let on = x < w && inside(row + x);
+                match (on, start) {
+                    (true, None) => start = Some(x),
+                    (false, Some(x0)) => {
+                        if let Some(out) = put.as_deref_mut() {
+                            out[n] = Run {
+                                x0: x0 as u32,
+                                x1: (x - 1) as u32,
+                            };
+                        }
+                        n += 1;
+                        start = None;
+                    }
+                    _ => {}
+                }
+            }
+            n
+        };
+        let counts: Vec<usize> = (0..h).into_par_iter().map(|y| scan(y, None)).collect();
+        let mut first = Vec::with_capacity(h + 1);
+        let mut total = 0usize;
+        for &n in &counts {
+            first.push(total);
+            total += n;
+        }
+        first.push(total);
+        drop(counts);
+        if total > (w * h) / divisor.max(1) {
+            return None;
+        }
+        let mut runs = vec![Run::default(); total];
+        let mut slices = Vec::with_capacity(h);
+        let mut rest = runs.as_mut_slice();
+        for y in 0..h {
+            let (head, tail) = rest.split_at_mut(first[y + 1] - first[y]);
+            slices.push(head);
+            rest = tail;
+        }
+        slices.into_par_iter().enumerate().for_each(|(y, out)| {
+            scan(y, Some(out));
+        });
+        Some(Runs { runs, first })
     }
-    (first, parent)
+
+    /// 行の数。
+    pub(crate) fn rows(&self) -> usize {
+        self.first.len() - 1
+    }
+
+    /// ランごとに `f(行, ラン)` を求めた表。行ごとに並列に回す。
+    pub(crate) fn per_run<T: Send + Default + Clone>(
+        &self,
+        f: impl Fn(usize, Run) -> T + Sync,
+    ) -> Vec<T> {
+        let mut out = vec![T::default(); self.runs.len()];
+        let mut slices = Vec::with_capacity(self.rows());
+        let mut rest = out.as_mut_slice();
+        for y in 0..self.rows() {
+            let (head, tail) = rest.split_at_mut(self.first[y + 1] - self.first[y]);
+            slices.push(head);
+            rest = tail;
+        }
+        slices.into_par_iter().enumerate().for_each(|(y, slots)| {
+            for (k, slot) in slots.iter_mut().enumerate() {
+                *slot = f(y, self.runs[self.first[y] + k]);
+            }
+        });
+        out
+    }
+
+    /// 上下の行で接するランどうしをつないだ連結成分。ランごとに成分の番号
+    /// （成分を代表するランの通し番号）を返す。`diagonal` が真なら 8 近傍
+    /// （斜めに 1 画素ずれて接するランもつなぐ）、偽なら 4 近傍。
+    ///
+    /// **成分は結ぶ順序に依らない。** 連結は「接している」という対称な関係の
+    /// 推移閉包でしかないので、どの順で union-find に掛けても同じ分け方になる。
+    pub(crate) fn components(&self, diagonal: bool) -> Vec<u32> {
+        let total = self.runs.len();
+        let slack = u32::from(diagonal);
+        let mut parent: Vec<u32> = (0..total as u32).collect();
+        for y in 1..self.rows() {
+            let above = &self.runs[self.first[y - 1]..self.first[y]];
+            let below = &self.runs[self.first[y]..self.first[y + 1]];
+            let (mut i, mut j) = (0, 0);
+            while i < above.len() && j < below.len() {
+                let (a, b) = (above[i], below[j]);
+                if a.x0 <= b.x1 + slack && b.x0 <= a.x1 + slack {
+                    union(
+                        &mut parent,
+                        (self.first[y - 1] + i) as u32,
+                        (self.first[y] + j) as u32,
+                    );
+                }
+                if a.x1 < b.x1 {
+                    i += 1;
+                } else {
+                    j += 1;
+                }
+            }
+        }
+        for i in 0..total as u32 {
+            let root = find(&mut parent, i);
+            parent[i as usize] = root;
+        }
+        parent
+    }
 }
 
 /// union-find の根。辿った道は半分ずつ縮める。
@@ -689,10 +853,12 @@ mod tests {
             .join("\n")
     }
 
-    /// ランで答える `remove_specks` が、8 近傍を 1 画素ずつ辿って芯の面積を
-    /// 数える素直な実装と同じマスクを返すこと。半透明の裾を混ぜる。
+    /// ランで答える `remove_specks` が、Phase 35 より前の実装
+    /// （`remove_specks_bfs`、逐語）と、8 近傍を 1 画素ずつ辿って芯の面積を
+    /// 数える素直な実装の両方と同じマスクを返すこと。半透明の裾を混ぜ、
+    /// 寸法を振る。ランの経路は密度の上限を外して（`divisor` 1）必ず通す。
     #[test]
-    fn the_run_speck_filter_agrees_with_a_plain_one() {
+    fn the_run_speck_filter_agrees_with_the_old_one() {
         fn plain(mask: &Mask, min_area: usize) -> Mask {
             let (w, h) = (mask.width() as i64, mask.height() as i64);
             let mut out = mask.clone();
@@ -736,27 +902,39 @@ mod tests {
             out
         }
 
-        let (w, h) = (53u32, 41u32);
         let mut state = 0x1234_5678_u32;
-        for density in [20u32, 45, 60] {
-            let mut mask = Mask::new(w, h, 0);
-            for y in 0..h {
-                for x in 0..w {
-                    state ^= state << 13;
-                    state ^= state >> 17;
-                    state ^= state << 5;
-                    if state % 100 < density {
-                        mask.set(x, y, if state % 7 == 0 { 60 } else { 255 });
+        let sizes = [
+            (53u32, 41u32),
+            (1, 1),
+            (1, 9),
+            (9, 1),
+            (63, 20),
+            (64, 20),
+            (65, 20),
+            (127, 7),
+            (129, 7),
+            (12, 300),
+        ];
+        for (w, h) in sizes {
+            for density in [20u32, 45, 60, 95] {
+                let mut mask = Mask::new(w, h, 0);
+                for y in 0..h {
+                    for x in 0..w {
+                        state ^= state << 13;
+                        state ^= state >> 17;
+                        state ^= state << 5;
+                        if state % 100 < density {
+                            mask.set(x, y, if state % 7 == 0 { 60 } else { 255 });
+                        }
                     }
                 }
-            }
-            for radius in [1, 2, 3] {
-                let want = plain(&mask, speck_min_area(radius, w, h));
-                assert_eq!(
-                    remove_specks(&mask, radius),
-                    want,
-                    "密度 {density} 半径 {radius}"
-                );
+                for radius in [1, 2, 3] {
+                    let label = format!("{w}x{h} 密度 {density} 半径 {radius}");
+                    let old = remove_specks_bfs(&mask, radius);
+                    assert_eq!(remove_specks_limited(&mask, radius, 1), old, "{label}");
+                    assert_eq!(remove_specks(&mask, radius), old, "{label}");
+                    assert_eq!(plain(&mask, speck_min_area(radius, w, h)), old, "{label}");
+                }
             }
         }
     }

@@ -1028,6 +1028,19 @@ fn fill_from_border(
     bbox: Option<(u32, u32, u32, u32)>,
     forced: Option<&Constraints>,
 ) -> BitPlane {
+    fill_from_border_limited(w, h, candidate, bbox, forced, morphology::RUN_DENSITY_LIMIT)
+}
+
+/// `fill_from_border` の、ランの表を使ってよい密度（`Runs::collect` の
+/// `divisor`）を呼び出し側が決める版。試験は 1 を渡して、ランの経路を必ず通す。
+fn fill_from_border_limited(
+    w: u32,
+    h: u32,
+    candidate: impl Fn(usize) -> bool + Sync,
+    bbox: Option<(u32, u32, u32, u32)>,
+    forced: Option<&Constraints>,
+    divisor: usize,
+) -> BitPlane {
     let stride = w as usize;
     let mut filled = BitPlane::new(stride * (h as usize));
     if stride == 0 || h == 0 {
@@ -1037,34 +1050,15 @@ fn fill_from_border(
     // 渡したのに空だった指示で、画素ごとに表を引く理由が無い
     let forced = forced.filter(|c| c.any_bg());
 
-    // 行ごとのラン。両端を含む x と、確定背景を含むか
-    let runs: Vec<Vec<Run>> = (0..h as usize)
-        .into_par_iter()
-        .map(|y| {
-            let row = y * stride;
-            let mut out = Vec::new();
-            let mut open: Option<Run> = None;
-            for x in 0..stride {
-                let i = row + x;
-                let pinned = forced.is_some_and(|c| c.has_bg(i));
-                if pinned || candidate(i) {
-                    let run = open.get_or_insert(Run {
-                        x0: x as u32,
-                        x1: x as u32,
-                        pinned: false,
-                    });
-                    run.x1 = x as u32;
-                    run.pinned |= pinned;
-                } else if let Some(run) = open.take() {
-                    out.push(run);
-                }
-            }
-            out.extend(open);
-            out
-        })
-        .collect();
+    // 行ごとのラン。ランが細かく割れる素材（1px の市松など）では表が画素数に
+    // 比例して膨らみ、1 画素ずつ辿るより重くなるので、旧来の経路へ落とす
+    let Some(runs) = morphology::Runs::collect(stride, h as usize, divisor, |i| {
+        forced.is_some_and(|c| c.has_bg(i)) || candidate(i)
+    }) else {
+        return fill_from_border_bfs(w, h, candidate, bbox, forced);
+    };
     // 上下の行で x の範囲が重なるランを結ぶ（4 近傍の連結）
-    let (first, component) = morphology::run_components(&runs, false);
+    let component = runs.components(false);
 
     // 起点を含む成分に印を付ける。起点は確定背景と、矩形の縁の画素である。
     //
@@ -1084,9 +1078,11 @@ fn fill_from_border(
     let (sx1, sx2) = (sx1.min(sx2).min(w - 1), sx2.max(sx1).min(w - 1));
     let (sy1, sy2) = (sy1.min(sy2).min(h - 1), sy2.max(sy1).min(h - 1));
     let mut rooted = vec![false; component.len()];
-    for (y, row) in runs.iter().enumerate() {
+    for y in 0..runs.rows() {
+        let row = y * stride;
         let y = y as u32;
-        for (k, run) in row.iter().enumerate() {
+        for r in runs.first[y as usize]..runs.first[y as usize + 1] {
+            let run = runs.runs[r];
             let on_edge = if y == sy1 || y == sy2 {
                 run.x0 <= sx2 && sx1 <= run.x1
             } else if y > sy1 && y < sy2 {
@@ -1094,15 +1090,18 @@ fn fill_from_border(
             } else {
                 false
             };
-            if on_edge || run.pinned {
-                rooted[component[first[y as usize] + k] as usize] = true;
+            // 確定背景を含むランは成分ごと起点になる。指示がある経路だけ問う
+            let pinned = forced
+                .is_some_and(|c| (run.x0 as usize..=run.x1 as usize).any(|x| c.has_bg(row + x)));
+            if on_edge || pinned {
+                rooted[component[r] as usize] = true;
             }
         }
     }
-    for (y, row) in runs.iter().enumerate() {
-        for (k, run) in row.iter().enumerate() {
-            if rooted[component[first[y] + k] as usize] {
-                let at = y * stride;
+    for y in 0..runs.rows() {
+        for r in runs.first[y]..runs.first[y + 1] {
+            if rooted[component[r] as usize] {
+                let (run, at) = (runs.runs[r], y * stride);
                 filled.insert_range(at + run.x0 as usize, at + run.x1 as usize + 1);
             }
         }
@@ -1110,19 +1109,85 @@ fn fill_from_border(
     filled
 }
 
-/// 行の中の連続区間。`x0..=x1` がすべて候補か確定背景である。
-#[derive(Clone, Copy)]
-struct Run {
-    x0: u32,
-    x1: u32,
-    /// 確定背景の画素を含むか（含めば成分ごと起点になる）
-    pinned: bool,
-}
+/// `fill_from_border` の、1 画素ずつ辿る旧来の経路（Phase 35 より前の実装を
+/// 逐語のまま残したもの）。ランが細かく割れる素材で使う。
+fn fill_from_border_bfs(
+    w: u32,
+    h: u32,
+    candidate: impl Fn(usize) -> bool,
+    bbox: Option<(u32, u32, u32, u32)>,
+    forced: Option<&Constraints>,
+) -> BitPlane {
+    let mut filled = BitPlane::new((w as usize) * (h as usize));
+    let mut queue = VecDeque::new();
+    let idx = |x: u32, y: u32| (y as usize) * (w as usize) + (x as usize);
 
-impl morphology::Span for Run {
-    fn span(&self) -> (u32, u32) {
-        (self.x0, self.x1)
+    // 確定背景を先に埋め、**縁の画素だけ**をキューへ積む。
+    //
+    // 種を全部積むと、トライマップのように画像の 7 割を背景だと言い切った指示で
+    // キューが数百万要素になる（12MP の実測でピーク RSS が 160MB 増える）。
+    // 縁だけを積んでも結果は変わらない（`push_frontier`）。
+    //
+    // 確定背景が 1 画素も無ければ走査そのものを省く。`--fg-polygon` だけを
+    // 渡した実行や、渡したのに空だった指示で、12MP の表を 2 度舐める理由が無い
+    if let Some(c) = forced.filter(|c| c.any_bg()) {
+        for i in 0..filled.len() {
+            if c.has_bg(i) {
+                filled.insert(i);
+            }
+        }
+        push_frontier(w, h, &filled, &mut queue);
     }
+
+    // 起点の種まきと塗り広げは同じ規則（候補で、まだ埋まっていない）で積む
+    let seed = |x: u32, y: u32, filled: &mut BitPlane, queue: &mut VecDeque<(u32, u32)>| {
+        let i = idx(x, y);
+        if candidate(i) && !filled.get(i) {
+            filled.insert(i);
+            queue.push_back((x, y));
+        }
+    };
+
+    // bbox が与えられていれば、その矩形の縁から塗り始める。
+    //
+    // bbox の外は色によらず背景と確定しているので、フィルの起点として画像の
+    // 外周より内側にある矩形の縁のほうが正しい。画像の外周からしか塗れないと、
+    // 途中に背景色から外れた領域（照明ムラや別の物体）があるだけでフィルが
+    // 遮られ、bbox の内側に一切届かなくなる。それでは bbox が「商品はここに
+    // ある」という指示ではなく、単なる切り取り枠に留まってしまう。
+    //
+    // 画像の外へはみ出した矩形は縁へ寄せる。`foreground_mask` はライブラリの
+    // 公開関数なので、CLI の `resolve_bbox` を通さずに呼ばれれば範囲外の bbox が
+    // 届きうる。添字が破裂して panic するより、指示を画像の中へ丸めるほうが
+    // 親切である。左右・上下が反転している指定もここで正す
+    let (sx1, sy1, sx2, sy2) = bbox.unwrap_or((0, 0, w - 1, h - 1));
+    let (sx1, sx2) = (sx1.min(sx2).min(w - 1), sx2.max(sx1).min(w - 1));
+    let (sy1, sy2) = (sy1.min(sy2).min(h - 1), sy2.max(sy1).min(h - 1));
+    for x in sx1..=sx2 {
+        seed(x, sy1, &mut filled, &mut queue);
+        seed(x, sy2, &mut filled, &mut queue);
+    }
+    for y in sy1..=sy2 {
+        seed(sx1, y, &mut filled, &mut queue);
+        seed(sx2, y, &mut filled, &mut queue);
+    }
+
+    while let Some((x, y)) = queue.pop_front() {
+        if x > 0 {
+            seed(x - 1, y, &mut filled, &mut queue);
+        }
+        if y > 0 {
+            seed(x, y - 1, &mut filled, &mut queue);
+        }
+        if x + 1 < w {
+            seed(x + 1, y, &mut filled, &mut queue);
+        }
+        if y + 1 < h {
+            seed(x, y + 1, &mut filled, &mut queue);
+        }
+    }
+
+    filled
 }
 
 /// 埋まった画素のうち、まだ埋まっていない 4 近傍を持つものだけをキューへ積む。
@@ -1488,10 +1553,12 @@ mod tests {
         }
     }
 
-    /// 連結成分で答える `fill_from_border` が、1 画素ずつ辿る素直な塗り広げと
-    /// 同じ集合を返すこと。矩形・確定背景・候補の密度を振る。
+    /// 連結成分で答える `fill_from_border` が、Phase 35 より前の実装
+    /// （`fill_from_border_bfs`、逐語）と 1 画素ずつ辿る素直な塗り広げの両方と
+    /// 同じ集合を返すこと。矩形・確定背景・候補の密度・寸法を振る。ランの経路は
+    /// 密度の上限を外して（`divisor` 1）必ず通す。
     #[test]
-    fn the_run_fill_agrees_with_a_plain_flood() {
+    fn the_run_fill_agrees_with_the_old_one() {
         fn plain(
             w: u32,
             h: u32,
@@ -1537,7 +1604,6 @@ mod tests {
             filled
         }
 
-        let (w, h) = (61u32, 47u32);
         let mut state = 0x2545_f491_u32;
         let mut next = move || {
             state ^= state << 13;
@@ -1545,19 +1611,52 @@ mod tests {
             state ^= state << 5;
             state
         };
-        for density in [35u32, 55, 70, 90] {
-            let open: Vec<bool> = (0..w * h).map(|_| next() % 100 < density).collect();
-            let mut forced = Constraints::new(w, h);
-            for _ in 0..6 {
-                forced.mark(next() % w, next() % h, Constraint::ForcedBg);
-            }
-            for bbox in [None, Some((5, 7, 50, 40)), Some((30, 0, 30, 46))] {
-                for c in [None, Some(&forced)] {
-                    let candidate = |i: usize| open[i];
-                    let got = fill_from_border(w, h, candidate, bbox, c);
-                    let want = plain(w, h, &candidate, bbox, c);
-                    for (i, &v) in want.iter().enumerate() {
-                        assert_eq!(got.get(i), v, "密度 {density} 矩形 {bbox:?} 添字 {i}");
+        // 退化した寸法（1 行・1 列）、幅が 64 の倍数の前後、ランの帯（行）を
+        // 何本もまたぐ高さ
+        let sizes = [
+            (61u32, 47u32),
+            (1, 1),
+            (1, 9),
+            (9, 1),
+            (63, 20),
+            (64, 20),
+            (65, 20),
+            (127, 7),
+            (129, 7),
+            (12, 300),
+        ];
+        for (w, h) in sizes {
+            for density in [35u32, 55, 70, 90] {
+                let open: Vec<bool> = (0..w * h).map(|_| next() % 100 < density).collect();
+                let mut forced = Constraints::new(w, h);
+                for _ in 0..6 {
+                    forced.mark(next() % w, next() % h, Constraint::ForcedBg);
+                }
+                let inner = (w / 6, h / 6, w - 1 - w / 6, h - 1 - h / 6);
+                // 逆順の矩形と画像の外へはみ出す矩形は、旧来の経路と比べる
+                // （素直な塗り広げは矩形を正さない）
+                let boxes = [
+                    (None, true),
+                    (Some(inner), true),
+                    (Some((w / 2, 0, w / 2, h - 1)), true),
+                    (Some((inner.2, inner.3, inner.0, inner.1)), false),
+                    (Some((0, 0, w + 5, h + 5)), false),
+                ];
+                for (bbox, comparable) in boxes {
+                    for c in [None, Some(&forced)] {
+                        let candidate = |i: usize| open[i];
+                        let runs = fill_from_border_limited(w, h, candidate, bbox, c, 1);
+                        let old = fill_from_border_bfs(w, h, candidate, bbox, c);
+                        let chosen = fill_from_border(w, h, candidate, bbox, c);
+                        let label = format!("{w}x{h} 密度 {density} 矩形 {bbox:?}");
+                        assert_eq!(runs, old, "{label}");
+                        assert_eq!(chosen, old, "{label}");
+                        if comparable {
+                            let want = plain(w, h, &candidate, bbox, c);
+                            for (i, &v) in want.iter().enumerate() {
+                                assert_eq!(runs.get(i), v, "{label} 添字 {i}");
+                            }
+                        }
                     }
                 }
             }

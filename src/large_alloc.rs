@@ -136,7 +136,7 @@ impl Pool {
         Some(ptr)
     }
 
-    /// 新しく `len` を写像する前に、和が最大を超えないよう棚を空ける。
+    /// 新しく `len` を写像するときに、和が最大を超えないよう棚を空ける。
     fn reserve(&mut self, len: usize, release: &mut Release) {
         self.live += len;
         self.high = self.high.max(self.live);
@@ -227,6 +227,42 @@ fn obtain(size: usize) -> (*mut u8, bool) {
     (p.cast(), false)
 }
 
+/// 写像の尻のすぐ後ろへ写像を足して、その場で `had` から `want` へ伸ばす。
+///
+/// **伸びる `Vec` を写し直さないためにある。** 写し直すと一瞬だけ新旧 2 本を
+/// 抱える——PNG の書き出しは 45MB から 91MB へ伸びる瞬間に 136MB を持ち、
+/// 24.5MP ではそこが切り抜き全体のピークになった（Phase 36）。
+///
+/// 尻の後ろが空いているかは `mmap` に番地の希望を渡して確かめる。
+/// `MAP_FIXED` は使わない（既存の写像を黙って潰す）ので、空いていなければ
+/// 別の番地が返る。そのときは返して、呼び出し側が写し直す。
+fn extend(ptr: *mut u8, had: usize, want: usize) -> bool {
+    let tail = want - had;
+    let hint = ptr.wrapping_add(had);
+    // SAFETY: 番地は希望でしかなく、既存の写像には触れない
+    let p = unsafe {
+        libc::mmap(
+            hint.cast(),
+            tail,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        )
+    };
+    if p.cast::<u8>() == hint {
+        let mut release = Release::new();
+        lock().reserve(tail, &mut release);
+        release.run();
+        return true;
+    }
+    if p != libc::MAP_FAILED {
+        // SAFETY: いま取ったばかりの、誰も指していない写像
+        unsafe { libc::munmap(p, tail) };
+    }
+    false
+}
+
 /// 大きな塊を棚へ戻す（棚が埋まっていれば OS へ返す）。
 fn relinquish(ptr: *mut u8, size: usize) {
     let mut release = Release::new();
@@ -287,6 +323,7 @@ unsafe impl GlobalAlloc for LargeAlloc {
                 }
                 ptr
             }
+            (true, true) if extend(ptr, round_up(layout.size()), round_up(new_size)) => ptr,
             _ => {
                 // SAFETY: `new` は上で作った正しい `Layout` である
                 let moved = unsafe { self.alloc(new) };

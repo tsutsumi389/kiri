@@ -306,3 +306,4 @@ test / MSRV を GitHub Actions へ移した。**新規のコードは無い**—
 | 14 | Phase 33: 文字を置ける空き領域を返す（`--free-regions`） | [14-phase-33.md](phases/14-phase-33.md) |
 | 15 | Phase 34: 収まる文字サイズの範囲を返す（`--size-range`） | [15-phase-34.md](phases/15-phase-34.md) |
 | 16 | Phase 35: 切り抜きの残る逐次の段を並列にする | [16-phase-35.md](phases/16-phase-35.md) |
+| 17 | Phase 36: 切り抜きのピーク RSS を下げる | [17-phase-36.md](phases/17-phase-36.md) |

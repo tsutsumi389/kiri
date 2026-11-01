@@ -295,10 +295,9 @@ pub fn refine(
     opts: &RefineOptions<'_>,
 ) -> Refined {
     let (w, h) = (image.width(), image.height());
-    let mut out = image.clone();
     if w == 0 || h == 0 || w != binary.width() || h != binary.height() {
         return Refined {
-            image: out,
+            image: image.clone(),
             mask: binary.clone(),
             band_min_radius: 0,
             smooth_radius_px: 0,
@@ -353,7 +352,7 @@ pub fn refine(
     let band_max = band.iter().copied().max().unwrap_or(0);
     if band_max == 0 {
         return Refined {
-            image: out,
+            image: image.clone(),
             mask,
             band_min_radius: min_radius,
             smooth_radius_px: smooth_radius,
@@ -388,7 +387,12 @@ pub fn refine(
         guided::Solved::default()
     };
 
-    sweep_bands(w, &ctx, Pass::Project, &mut out, &mut mask, &mut solved);
+    // **出力の画像は、色を書く段の直前まで複製しない。** 24.5MP では 98MB あり、
+    // 先に取ると (e) の作業域と重なって切り抜き全体のピークを作っていた
+    // （Phase 36）。guided と closed-form の射影の段は色を書かないので、
+    // 複製は (f) まで待てる
+    let mut out = ctx.despill.then(|| image.clone());
+    sweep_bands(w, &ctx, Pass::Project, out.as_mut(), &mut mask, &mut solved);
 
     let mut matting_report = None;
     if smooths_alpha {
@@ -413,10 +417,15 @@ pub fn refine(
                 despill: true,
                 ..ctx
             };
-            sweep_bands(w, &ctx, Pass::Recover, &mut out, &mut mask, &mut solved);
+            let out = out.get_or_insert_with(|| image.clone());
+            sweep_bands(w, &ctx, Pass::Recover, Some(out), &mut mask, &mut solved);
         }
     }
 
+    // 色を 1 画素も書かなかった（`--no-despill`）なら、ここで初めて複製する。
+    // 帯と印はもう読まないので、先に手放して複製と重ねない
+    drop((band, sealed, solved, reshaped));
+    let out = out.unwrap_or_else(|| image.clone());
     Refined {
         image: out,
         mask,
@@ -453,20 +462,31 @@ pub(crate) fn smooth_radius_px(smooth_contour: f64, scale: f64) -> u32 {
 ///
 /// 作業領域は帯ごとに持つ。帯の中では使い回すので、タイルごとに作り直す
 /// わけではない。
+///
+/// **色を書かない段では `image` を渡さない**（`ctx.despill` が偽の段）。帯ごとの
+/// 書き先は空のスライスになり、`Output::rgb_mut` は呼ばれない。
 fn sweep_bands(
     w: u32,
     ctx: &Context<'_>,
     pass: Pass,
-    image: &mut RgbaImage,
+    image: Option<&mut RgbaImage>,
     mask: &mut Mask,
     solved: &mut guided::Solved,
 ) {
+    debug_assert!(image.is_some() || !ctx.despill, "色を書く段に書き先が無い");
     let stride = w as usize;
     let rows = TILE as usize;
     let marks = Mutex::new(solved);
-    image
-        .par_chunks_mut(rows * stride * 4)
-        .zip(mask.as_mut_slice().par_chunks_mut(rows * stride))
+    let pixels = mask.as_mut_slice();
+    let bands = pixels.len().div_ceil(rows * stride);
+    let mut colours: Vec<&mut [u8]> = match image {
+        Some(image) => image.chunks_mut(rows * stride * 4).collect(),
+        None => Vec::new(),
+    };
+    colours.resize_with(bands, Default::default);
+    colours
+        .into_par_iter()
+        .zip(pixels.par_chunks_mut(rows * stride))
         .enumerate()
         .for_each(|(band, (image, mask))| {
             let y0 = (band * rows) as u32;

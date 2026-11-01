@@ -72,13 +72,7 @@ struct Pool {
     len: usize,
 }
 
-static POOL: Mutex<Pool> = Mutex::new(Pool {
-    live: 0,
-    high: 0,
-    cached: 0,
-    slots: [(0, 0); SLOTS],
-    len: 0,
-});
+static POOL: Mutex<Pool> = Mutex::new(Pool::new());
 
 /// 棚から返す塊を、錠の外で `munmap` するために一時に持つ器。
 struct Release {
@@ -114,6 +108,16 @@ fn lock() -> std::sync::MutexGuard<'static, Pool> {
 }
 
 impl Pool {
+    const fn new() -> Self {
+        Self {
+            live: 0,
+            high: 0,
+            cached: 0,
+            slots: [(0, 0); SLOTS],
+            len: 0,
+        }
+    }
+
     fn remove(&mut self, k: usize) -> (usize, usize) {
         let got = self.slots[k];
         self.slots.copy_within(k + 1..self.len, k);
@@ -131,19 +135,33 @@ impl Pool {
         if had > len {
             release.push(ptr + len, had - len);
         }
+        // 棚から生きている側へ移るだけで、和は変わらない。最大も動かさない
         self.live += len;
-        self.high = self.high.max(self.live);
         Some(ptr)
     }
 
-    /// 新しく `len` を写像するときに、和が最大を超えないよう棚を空ける。
+    /// 新しく `len` を写像する前に、和が最大を超えないよう棚を空ける。
+    ///
+    /// **最大はここでは動かさない。** 写像に失敗したとき（`try_reserve` の
+    /// 巨大な確保など）に最大が膨らんだまま残ると、棚の頭打ちが外れる。最大は
+    /// 写像が取れてから `settle` で上げ、失敗したら `cancel` で `live` だけ戻す。
+    /// 上げる前の最大と `live` の大きい方を上限に見れば、追い出す量は同じになる
     fn reserve(&mut self, len: usize, release: &mut Release) {
         self.live += len;
-        self.high = self.high.max(self.live);
-        while self.len > 0 && self.live + self.cached > self.high {
+        while self.len > 0 && self.live + self.cached > self.high.max(self.live) {
             let (ptr, had) = self.remove(0);
             release.push(ptr, had);
         }
+    }
+
+    /// 写像が取れた。最大を上げる
+    fn settle(&mut self) {
+        self.high = self.high.max(self.live);
+    }
+
+    /// 写像が取れなかった。`reserve` で足した分を戻す（最大は動いていない）
+    fn cancel(&mut self, len: usize) {
+        self.live -= len;
     }
 
     /// 解放した塊を棚へ置く。棚が埋まっていれば返す。
@@ -221,10 +239,23 @@ fn obtain(size: usize) -> (*mut u8, bool) {
         )
     };
     if p == libc::MAP_FAILED {
-        lock().live -= len;
+        lock().cancel(len);
         return (std::ptr::null_mut(), false);
     }
+    lock().settle();
     (p.cast(), false)
+}
+
+/// 0 で埋まった大きな塊を取る。戻り値の 2 つ目は `obtain` と同じ。
+fn obtain_zeroed(size: usize) -> (*mut u8, bool) {
+    let (ptr, reused) = obtain(size);
+    // まっさらな写像はもともと 0 で埋まっている。書いて埋め直すと、
+    // 触っていないページまで RSS に乗せることになる
+    if reused {
+        // SAFETY: 棚の塊は少なくとも `size` の長さを持つ
+        unsafe { ptr.write_bytes(0, size) };
+    }
+    (ptr, reused)
 }
 
 /// 写像の尻のすぐ後ろへ写像を足して、その場で `had` から `want` へ伸ばす。
@@ -252,7 +283,11 @@ fn extend(ptr: *mut u8, had: usize, want: usize) -> bool {
     };
     if p.cast::<u8>() == hint {
         let mut release = Release::new();
-        lock().reserve(tail, &mut release);
+        {
+            let mut pool = lock();
+            pool.reserve(tail, &mut release);
+            pool.settle();
+        }
         release.run();
         return true;
     }
@@ -282,14 +317,7 @@ unsafe impl GlobalAlloc for LargeAlloc {
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         if is_large(&layout) {
-            let (ptr, reused) = obtain(layout.size());
-            // まっさらな写像はもともと 0 で埋まっている。書いて埋め直すと、
-            // 触っていないページまで RSS に乗せることになる
-            if reused {
-                // SAFETY: 棚の塊は少なくとも `size` の長さを持つ
-                unsafe { ptr.write_bytes(0, layout.size()) };
-            }
-            ptr
+            obtain_zeroed(layout.size()).0
         } else {
             // SAFETY: 受け取った約束をそのまま渡す
             unsafe { System.alloc_zeroed(layout) }
@@ -423,26 +451,28 @@ mod tests {
         }
     }
 
-    /// 生きている量と棚の和は、生きていた量の最大を超えない（この不変条件が
-    /// RSS の頭打ちそのものである）。テストの並行実行で他の確保が混ざっても
-    /// 条件は崩れないので、錠の中で読めば常に成り立つ
+    /// 生きている量と棚の和は、生きていた量の最大（写像を待っている間は
+    /// `live` との大きい方）を超えない。この不変条件が RSS の頭打ちそのもので
+    /// ある。テストの並行実行で他の確保が混ざっても条件は崩れないので、錠の
+    /// 中で読めば常に成り立つ
+    fn check_global() {
+        let pool = lock();
+        assert!(
+            pool.live + pool.cached <= pool.high.max(pool.live),
+            "live {} + cached {} > high {}",
+            pool.live,
+            pool.cached,
+            pool.high
+        );
+        assert_eq!(
+            pool.cached,
+            pool.slots[..pool.len].iter().map(|s| s.1).sum::<usize>()
+        );
+    }
+
     #[test]
     fn the_shelf_never_pushes_past_the_high_water_mark() {
         let a = LargeAlloc;
-        let check = || {
-            let pool = lock();
-            assert!(
-                pool.live + pool.cached <= pool.high,
-                "live {} + cached {} > high {}",
-                pool.live,
-                pool.cached,
-                pool.high
-            );
-            assert_eq!(
-                pool.cached,
-                pool.slots[..pool.len].iter().map(|s| s.1).sum::<usize>()
-            );
-        };
         unsafe {
             let sizes = [2 * LARGE, 7 * LARGE, LARGE, 4 * LARGE + 3, 9 * LARGE];
             let layouts: Vec<Layout> = sizes
@@ -451,20 +481,34 @@ mod tests {
                 .collect();
             for round in 0..3 {
                 let ptrs: Vec<*mut u8> = layouts.iter().map(|&l| a.alloc(l)).collect();
-                check();
+                check_global();
                 for (k, (&p, &l)) in ptrs.iter().zip(&layouts).enumerate() {
                     if (k + round) % 2 == 0 {
                         a.dealloc(p, l);
-                        check();
+                        check_global();
                     }
                 }
                 for (k, (&p, &l)) in ptrs.iter().zip(&layouts).enumerate() {
                     if (k + round) % 2 == 1 {
                         a.dealloc(p, l);
-                        check();
+                        check_global();
                     }
                 }
             }
         }
+    }
+
+    /// **写像に失敗した確保は最大を膨らませない。** 膨らんだまま残ると、棚が
+    /// その分まで捨てた塊を抱えてよいことになり、頭打ちが外れる
+    #[test]
+    fn a_failed_mapping_leaves_the_high_water_mark_alone() {
+        let huge = 1usize << 62;
+        let (p, reused) = obtain(huge);
+        assert!(
+            p.is_null() && !reused,
+            "{huge} バイトの写像が取れてしまった"
+        );
+        assert!(lock().high < huge, "失敗した確保で最大が膨らんだ");
+        check_global();
     }
 }

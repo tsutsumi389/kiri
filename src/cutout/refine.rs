@@ -387,12 +387,11 @@ pub fn refine(
         guided::Solved::default()
     };
 
-    // **出力の画像は、色を書く段の直前まで複製しない。** 24.5MP では 98MB あり、
-    // 先に取ると (e) の作業域と重なって切り抜き全体のピークを作っていた
-    // （Phase 36）。guided と closed-form の射影の段は色を書かないので、
-    // 複製は (f) まで待てる
-    let mut out = ctx.despill.then(|| image.clone());
-    sweep_bands(w, &ctx, Pass::Project, out.as_mut(), &mut mask, &mut solved);
+    // **復元した色は帯の画素ぶんだけ溜め、出力の画像は最後に 1 度だけ作る。**
+    // 24.5MP の画像は 98MB あり、入口で複製すると (e) の作業域と (f) の帯の
+    // 走査に重なって、切り抜き全体のピークを作っていた（Phase 36）。色を書く
+    // 画素は帯の中にしか無いので、溜める量は帯の画素数で決まる
+    let mut colours = sweep_bands(w, &ctx, Pass::Project, &mut mask, &mut solved);
 
     let mut matting_report = None;
     if smooths_alpha {
@@ -417,15 +416,14 @@ pub fn refine(
                 despill: true,
                 ..ctx
             };
-            let out = out.get_or_insert_with(|| image.clone());
-            sweep_bands(w, &ctx, Pass::Recover, Some(out), &mut mask, &mut solved);
+            colours.extend(sweep_bands(w, &ctx, Pass::Recover, &mut mask, &mut solved));
         }
     }
 
-    // 色を 1 画素も書かなかった（`--no-despill`）なら、ここで初めて複製する。
     // 帯と印はもう読まないので、先に手放して複製と重ねない
     drop((band, sealed, solved, reshaped));
-    let out = out.unwrap_or_else(|| image.clone());
+    let mut out = image.clone();
+    paint(&mut out, &colours);
     Refined {
         image: out,
         mask,
@@ -454,7 +452,7 @@ pub(crate) fn smooth_radius_px(smooth_contour: f64, scale: f64) -> u32 {
 ///
 /// **タイルは自分のタイルの画素しか書かない。** 読みは積分画像の余白ぶん
 /// 外へ伸びるが、そちらは共有の不変参照で足りる。だから行で割れば書き先が
-/// 重ならず、`out` と `mask` を帯ごとの可変スライスに分けられる。
+/// 重ならず、`mask` を帯ごとの可変スライスに分けられる。
 ///
 /// 結果がタイルの位置に依存しないことは
 /// `the_result_does_not_depend_on_where_the_tiles_fall` が見ている。走査順が
@@ -463,32 +461,22 @@ pub(crate) fn smooth_radius_px(smooth_contour: f64, scale: f64) -> u32 {
 /// 作業領域は帯ごとに持つ。帯の中では使い回すので、タイルごとに作り直す
 /// わけではない。
 ///
-/// **色を書かない段では `image` を渡さない**（`ctx.despill` が偽の段）。帯ごとの
-/// 書き先は空のスライスになり、`Output::rgb_mut` は呼ばれない。
+/// 復元した色は画像へ書かず、帯ごとの `(添字, sRGB)` の列で返す（`paint` が
+/// 最後に書く）。色を書かない段（`ctx.despill` が偽）では空の列が並ぶ。
 fn sweep_bands(
     w: u32,
     ctx: &Context<'_>,
     pass: Pass,
-    image: Option<&mut RgbaImage>,
     mask: &mut Mask,
     solved: &mut guided::Solved,
-) {
-    debug_assert!(image.is_some() || !ctx.despill, "色を書く段に書き先が無い");
+) -> Vec<Vec<Recovered>> {
     let stride = w as usize;
     let rows = TILE as usize;
     let marks = Mutex::new(solved);
-    let pixels = mask.as_mut_slice();
-    let bands = pixels.len().div_ceil(rows * stride);
-    let mut colours: Vec<&mut [u8]> = match image {
-        Some(image) => image.chunks_mut(rows * stride * 4).collect(),
-        None => Vec::new(),
-    };
-    colours.resize_with(bands, Default::default);
-    colours
-        .into_par_iter()
-        .zip(pixels.par_chunks_mut(rows * stride))
+    mask.as_mut_slice()
+        .par_chunks_mut(rows * stride)
         .enumerate()
-        .for_each(|(band, (image, mask))| {
+        .map(|(band, mask)| {
             let y0 = (band * rows) as u32;
             let mut ws = Workspace::default();
             // 色で決められなかった画素の受け皿。帯ごとに持ち、要るタイルの
@@ -496,7 +484,7 @@ fn sweep_bands(
             let mut fallback = Fallback::default();
             let mut out = Output {
                 solved: Vec::new(),
-                image,
+                colours: Vec::new(),
                 mask,
                 y0,
                 stride,
@@ -511,7 +499,9 @@ fn sweep_bands(
             for index in out.solved {
                 solved.set(index as usize);
             }
-        });
+            out.colours
+        })
+        .collect()
 }
 
 /// タイルをまたいで変わらない入力。
@@ -641,7 +631,7 @@ enum Pass {
 
 /// 1 本の帯（`TILE` 行ぶん）の書き先。タイルをまたいで**書き換えていく側**。
 ///
-/// 3 つは常に一緒に動く——アルファを書けば印が立ち、色を復元すれば画像が
+/// 3 つは常に一緒に動く——アルファを書けば印が立ち、色を復元すれば色の列が
 /// 変わる。引数として並べると、呼ぶ側が順序を間違えても型が違うぶんしか
 /// 守られない。
 ///
@@ -661,8 +651,8 @@ struct Output<'a> {
     /// 二重に抱えることになる）。錠を取るのは帯 1 本につき 1 回なので、
     /// 待ちは測れるほど出ない
     solved: Vec<u32>,
-    /// 色を復元する先。この帯の行だけ
-    image: &'a mut [u8],
+    /// 復元した色。添字は画像全体の画素の番号（`solved` と同じ）
+    colours: Vec<Recovered>,
     /// アルファを書く先。この帯の行だけ
     mask: &'a mut [u8],
     /// この帯の先頭行
@@ -693,9 +683,25 @@ impl Output<'_> {
     }
 
     #[inline]
-    fn rgb_mut(&mut self, x: u32, y: u32) -> &mut [u8] {
-        let i = self.at(x, y) * 4;
-        &mut self.image[i..i + 3]
+    fn set_rgb(&mut self, x: u32, y: u32, rgb: [u8; 3]) {
+        let index = (y as usize) * self.stride + (x as usize);
+        self.colours.push((index as u32, rgb));
+    }
+}
+
+/// 復元した 1 画素。`(画像全体の画素の番号, sRGB)`
+type Recovered = (u32, [u8; 3]);
+
+/// 溜めた色を出力の画像へ書く。
+///
+/// **書く順序は結果に影響しない。** 同じ画素を 2 度書くことが無いからである
+/// ——1 つの段の中ではタイルが重ならず、色を書く段は 1 回の `refine` で
+/// 1 つしか走らない（射影では (d)、guided と closed-form では (f) だけ）。
+fn paint(image: &mut RgbaImage, colours: &[Vec<Recovered>]) {
+    let raw: &mut [u8] = image;
+    for &(index, rgb) in colours.iter().flatten() {
+        let i = index as usize * 4;
+        raw[i..i + 3].copy_from_slice(&rgb);
     }
 }
 
@@ -949,10 +955,7 @@ fn estimate_alpha(
                 continue;
             }
             let recovered = recover_foreground(observed, b, f, alpha);
-            let pixel = out.rgb_mut(x, y);
-            for (k, slot) in pixel.iter_mut().enumerate() {
-                *slot = linear_to_srgb(recovered[k]);
-            }
+            out.set_rgb(x, y, recovered.map(linear_to_srgb));
         }
     }
 }

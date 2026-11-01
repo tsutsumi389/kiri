@@ -96,9 +96,21 @@ impl Release {
     fn run(&self) {
         for &(ptr, len) in &self.items[..self.len] {
             // SAFETY: 棚の塊（またはその尻）で、もう誰も指していない
-            unsafe { libc::munmap(ptr as *mut libc::c_void, len) };
+            unsafe { unmap(ptr as *mut u8, len) };
         }
     }
+}
+
+/// 写像（またはその一部）を返す。
+///
+/// # Safety
+///
+/// `[ptr, ptr + len)` はこのアロケータが持つ写像の内側で、もう誰も指していないこと
+unsafe fn unmap(ptr: *mut u8, len: usize) {
+    // SAFETY: 呼び出し側の約束による
+    let rc = unsafe { libc::munmap(ptr.cast(), len) };
+    // 失敗するのは範囲が壊れているときだけで、それは帳簿の誤りである
+    debug_assert_eq!(rc, 0, "munmap に失敗した: {ptr:p} + {len}");
 }
 
 fn lock() -> std::sync::MutexGuard<'static, Pool> {
@@ -293,7 +305,7 @@ fn extend(ptr: *mut u8, had: usize, want: usize) -> bool {
     }
     if p != libc::MAP_FAILED {
         // SAFETY: いま取ったばかりの、誰も指していない写像
-        unsafe { libc::munmap(p, tail) };
+        unsafe { unmap(p.cast(), tail) };
     }
     false
 }
@@ -347,7 +359,7 @@ unsafe impl GlobalAlloc for LargeAlloc {
                 if keep < had {
                     lock().live -= had - keep;
                     // SAFETY: `keep` はページ境界で、尻は同じ写像の内側にある
-                    unsafe { libc::munmap(ptr.add(keep).cast(), had - keep) };
+                    unsafe { unmap(ptr.add(keep), had - keep) };
                 }
                 ptr
             }

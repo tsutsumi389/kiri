@@ -53,8 +53,21 @@ pub struct LargeAlloc;
 /// # 取っておいてよい量
 ///
 /// **生きている量と棚の和が、これまでに生きていた量の最大を超えない**ように
-/// 保つ。解放は和を変えない（生きている側から棚へ移るだけ）ので常に棚へ置き、
-/// 新しく写像を取るときに、和が最大を超えるぶんだけ棚から古い順に返す。
+/// 保つ。解放は和を変えない（生きている側から棚へ移るだけ）ので原則として
+/// 棚へ置き、新しく写像を取るときに、和が最大を超えるぶんだけ棚から古い順に
+/// 返す。
+///
+/// 写像を待っている確保（`pending`）は、取れるまで最大に数えない。失敗した
+/// 確保（`try_reserve` の巨大な確保など）で最大が膨らむと、頭打ちが外れる
+/// からである。そのかわり上限は「最大」と「生きている量 + 待っている量」の
+/// 大きい方で見る。正確には
+///
+/// ```text
+/// live + pending + cached <= max(high, live + pending)
+/// ```
+///
+/// を保つ。待っている間に別のスレッドが解放すると `live` が減って右辺が縮む
+/// ので、そのときに収まらない塊は棚へ置かずに返す（`give`）。
 ///
 /// こうすると大きな塊の RSS は「同時に生きていた量の最大」で頭打ちになる——
 /// malloc に任せたときの山（捨てた塊の積み上がり）は立たず、それでいて山の
@@ -63,6 +76,8 @@ pub struct LargeAlloc;
 struct Pool {
     /// 生きている大きな確保の和（ページへ切り上げた長さ）
     live: usize,
+    /// 写像を待っている確保の和。取れたら `live` へ、取れなければ消える
+    pending: usize,
     /// `live` のこれまでの最大
     high: usize,
     /// 棚に置いた塊の和
@@ -123,6 +138,7 @@ impl Pool {
     const fn new() -> Self {
         Self {
             live: 0,
+            pending: 0,
             high: 0,
             cached: 0,
             slots: [(0, 0); SLOTS],
@@ -152,34 +168,37 @@ impl Pool {
         Some(ptr)
     }
 
-    /// 新しく `len` を写像する前に、和が最大を超えないよう棚を空ける。
-    ///
-    /// **最大はここでは動かさない。** 写像に失敗したとき（`try_reserve` の
-    /// 巨大な確保など）に最大が膨らんだまま残ると、棚の頭打ちが外れる。最大は
-    /// 写像が取れてから `settle` で上げ、失敗したら `cancel` で `live` だけ戻す。
-    /// 上げる前の最大と `live` の大きい方を上限に見れば、追い出す量は同じになる
+    /// 上限。最大と、生きている量 + 待っている量の大きい方
+    fn ceiling(&self) -> usize {
+        self.high.max(self.live + self.pending)
+    }
+
+    /// 新しく `len` を写像する前に、和が上限を超えないよう棚を空ける。
+    /// **最大はここでは動かさない**（`Pool` の doc）
     fn reserve(&mut self, len: usize, release: &mut Release) {
-        self.live += len;
-        while self.len > 0 && self.live + self.cached > self.high.max(self.live) {
+        self.pending += len;
+        while self.len > 0 && self.live + self.pending + self.cached > self.ceiling() {
             let (ptr, had) = self.remove(0);
             release.push(ptr, had);
         }
     }
 
-    /// 写像が取れた。最大を上げる
-    fn settle(&mut self) {
+    /// `reserve` した `len` の写像が取れた。生きている側へ移し、最大を上げる
+    fn settle(&mut self, len: usize) {
+        self.pending -= len;
+        self.live += len;
         self.high = self.high.max(self.live);
     }
 
-    /// 写像が取れなかった。`reserve` で足した分を戻す（最大は動いていない）
+    /// `reserve` した `len` の写像が取れなかった。最大は動いていない
     fn cancel(&mut self, len: usize) {
-        self.live -= len;
+        self.pending -= len;
     }
 
-    /// 解放した塊を棚へ置く。棚が埋まっていれば返す。
+    /// 解放した塊を棚へ置く。棚が埋まっているか、置くと上限を超えるなら返す。
     fn give(&mut self, ptr: usize, len: usize, release: &mut Release) {
         self.live -= len;
-        if self.len == SLOTS {
+        if self.len == SLOTS || self.live + self.pending + self.cached + len > self.ceiling() {
             release.push(ptr, len);
         } else {
             self.slots[self.len] = (ptr, len);
@@ -254,7 +273,7 @@ fn obtain(size: usize) -> (*mut u8, bool) {
         lock().cancel(len);
         return (std::ptr::null_mut(), false);
     }
-    lock().settle();
+    lock().settle(len);
     (p.cast(), false)
 }
 
@@ -298,7 +317,7 @@ fn extend(ptr: *mut u8, had: usize, want: usize) -> bool {
         {
             let mut pool = lock();
             pool.reserve(tail, &mut release);
-            pool.settle();
+            pool.settle(tail);
         }
         release.run();
         return true;
@@ -470,9 +489,10 @@ mod tests {
     fn check_global() {
         let pool = lock();
         assert!(
-            pool.live + pool.cached <= pool.high.max(pool.live),
-            "live {} + cached {} > high {}",
+            pool.live + pool.pending + pool.cached <= pool.ceiling(),
+            "live {} + pending {} + cached {} > high {}",
             pool.live,
+            pool.pending,
             pool.cached,
             pool.high
         );
@@ -522,5 +542,43 @@ mod tests {
         );
         assert!(lock().high < huge, "失敗した確保で最大が膨らんだ");
         check_global();
+    }
+
+    /// 偽の番地で `Pool` の出し入れを決定的に確かめる（写像には触れない）。
+    /// 最大 `high`・生きている量 `live` の帳簿から始める
+    fn pool_with(high: usize, live: usize) -> Pool {
+        Pool {
+            high,
+            live,
+            ..Pool::new()
+        }
+    }
+
+    fn holds(pool: &Pool) -> bool {
+        pool.live + pool.pending + pool.cached <= pool.ceiling()
+    }
+
+    const P: usize = 1 << 14;
+
+    /// 写像を待っている間に別のスレッドが解放しても、上限を超えては棚へ
+    /// 置かない。置けば、待っていた確保が取れた瞬間に RSS が最大を超える
+    #[test]
+    fn a_block_freed_while_another_waits_is_shelved_only_within_the_ceiling() {
+        // 最大 10P、生きている 8P。5P を待つ間に 4P が解放される
+        let mut pool = pool_with(10 * P, 8 * P);
+        let mut release = Release::new();
+        pool.reserve(5 * P, &mut release);
+        pool.give(0x5000_0000, 4 * P, &mut release);
+        // live 4P + 待ち 5P + 棚 4P = 13P は上限 max(10P, 9P) を超える
+        assert_eq!(&release.items[..release.len], &[(0x5000_0000, 4 * P)]);
+        assert_eq!(pool.cached, 0);
+        assert!(holds(&pool));
+        pool.settle(5 * P);
+        assert_eq!((pool.live, pool.high), (9 * P, 10 * P));
+        // 収まる解放は棚へ置く: live 6P + 棚 3P <= 10P
+        let mut fits = Release::new();
+        pool.give(0x6000_0000, 3 * P, &mut fits);
+        assert_eq!((fits.len, pool.cached), (0, 3 * P));
+        assert!(holds(&pool));
     }
 }

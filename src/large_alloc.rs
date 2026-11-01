@@ -435,7 +435,8 @@ mod tests {
     #[test]
     fn realloc_keeps_the_contents_across_the_threshold() {
         let a = LargeAlloc;
-        // 小 → 大 → さらに大 → ページを跨いで縮める → 同じページの内で縮める → 小
+        // 小 → 大 → さらに大 → ページを跨いで縮める → 小。同じページの内で縮める
+        // 枝は `shrinking_within_the_same_pages_keeps_the_block` が見る
         let sizes = [4096, LARGE + 10, 5 * LARGE, 2 * LARGE + 1, 2 * LARGE, 100];
         unsafe {
             let mut layout = Layout::from_size_align(sizes[0], 8).unwrap();
@@ -463,23 +464,343 @@ mod tests {
     }
 
     /// 棚から使い回した塊も、`alloc_zeroed` なら 0 で渡す。尻を切り詰めて
-    /// 使い回す場合（大きい塊を小さい確保へ回す）も同じである
+    /// 使い回す場合（大きい塊を小さい確保へ回す）も同じである。
+    ///
+    /// 並行して走る別の試験に棚の塊を取られると使い回しが起きず、素通りで
+    /// 緑になる。**使い回しが起きたことを確かめるまで繰り返す**
     #[test]
     fn zeroed_blocks_are_zero_even_when_reused() {
         let a = LargeAlloc;
-        for &(first, second) in &[(3 * LARGE, 3 * LARGE), (5 * LARGE, 2 * LARGE + 7)] {
+        // 他の試験と大きさが重なりにくい半端なページ数にする
+        for &(first, second) in &[
+            (2 * LARGE + 37 * page() + 5, 2 * LARGE + 37 * page()),
+            (3 * LARGE + 53 * page(), 2 * LARGE + 41 * page() + 7),
+        ] {
+            let mut reused_once = false;
+            for _ in 0..50 {
+                unsafe {
+                    let l1 = Layout::from_size_align(first, 8).unwrap();
+                    let p = a.alloc(l1);
+                    p.write_bytes(0xab, first);
+                    a.dealloc(p, l1);
+                    let (q, reused) = obtain_zeroed(second);
+                    let s = std::slice::from_raw_parts(q, second);
+                    assert!(
+                        s.iter().all(|&b| b == 0),
+                        "{second} が 0 でない（reused={reused}）"
+                    );
+                    a.dealloc(q, Layout::from_size_align(second, 8).unwrap());
+                    if reused {
+                        reused_once = true;
+                        break;
+                    }
+                }
+            }
+            assert!(
+                reused_once,
+                "{first} → {second} で 1 度も使い回しが起きなかった"
+            );
+        }
+    }
+
+    /// ページの数が変わらない縮小は何もしない枝（`keep == had`）、変わる縮小は
+    /// 尻だけ返す枝を通る。どちらも番地は動かず、中身は保たれる
+    #[test]
+    fn shrinking_within_the_same_pages_keeps_the_block() {
+        let a = LargeAlloc;
+        let base = 3 * LARGE;
+        let (same_from, same_to) = (base + 100, base + 50);
+        assert_eq!(
+            round_up(same_from),
+            round_up(same_to),
+            "同じページ数の組でない"
+        );
+        let (cross_to,) = (base - page() + 1,);
+        assert!(
+            round_up(cross_to) < round_up(same_to),
+            "ページをまたぐ組でない"
+        );
+        unsafe {
+            let l = Layout::from_size_align(same_from, 8).unwrap();
+            let p = a.alloc(l);
+            for i in 0..same_from {
+                *p.add(i) = (i % 241) as u8;
+            }
+            let q = a.realloc(p, l, same_to);
+            assert_eq!(q, p, "同じページ数の縮小で番地が動いた");
+            let r = a.realloc(q, Layout::from_size_align(same_to, 8).unwrap(), cross_to);
+            assert_eq!(r, p, "ページをまたぐ縮小で番地が動いた");
+            for i in 0..cross_to {
+                assert_eq!(*r.add(i), (i % 241) as u8, "{i} 番目");
+            }
+            a.dealloc(r, Layout::from_size_align(cross_to, 8).unwrap());
+        }
+        check_global();
+    }
+
+    /// 尻の後ろが埋まっていれば `extend` は断り、写像には触れない
+    #[test]
+    fn extend_refuses_when_the_tail_is_taken() {
+        let a = LargeAlloc;
+        unsafe {
+            let l = Layout::from_size_align(2 * LARGE, 8).unwrap();
+            let p = a.alloc(l);
+            p.write_bytes(0x5a, 2 * LARGE);
+            // 写像は 2MB あるので、1MB の位置から先は自分の写像で埋まっている
+            assert!(
+                !extend(p, LARGE, 2 * LARGE),
+                "埋まった番地へ伸ばせてしまった"
+            );
+            let s = std::slice::from_raw_parts(p, 2 * LARGE);
+            assert!(s.iter().all(|&b| b == 0x5a), "断った extend が写像を壊した");
+            a.dealloc(p, l);
+        }
+        check_global();
+    }
+
+    /// 尻の後ろが空いていれば `extend` はその場で伸ばし、伸ばした分も
+    /// 書ける。空けた番地を別のスレッドの写像に取られることがあるので、
+    /// 成功するまで数回やり直す
+    #[test]
+    fn extend_grows_in_place_when_the_tail_is_free() {
+        let mut grown = false;
+        for _ in 0..20 {
             unsafe {
-                let l1 = Layout::from_size_align(first, 8).unwrap();
-                let p = a.alloc(l1);
-                p.write_bytes(0xab, first);
-                a.dealloc(p, l1);
-                let l2 = Layout::from_size_align(second, 8).unwrap();
-                let q = a.alloc_zeroed(l2);
-                let s = std::slice::from_raw_parts(q, second);
-                assert!(s.iter().all(|&b| b == 0), "使い回した {second} が 0 でない");
-                a.dealloc(q, l2);
+                // 2MB を取り、後ろ半分を返して、そこを空き地にする
+                let p = libc::mmap(
+                    std::ptr::null_mut(),
+                    2 * LARGE,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                );
+                assert_ne!(p, libc::MAP_FAILED);
+                let p: *mut u8 = p.cast();
+                unmap(p.add(LARGE), LARGE);
+                {
+                    let mut release = Release::new();
+                    let mut pool = lock();
+                    pool.reserve(LARGE, &mut release);
+                    pool.settle(LARGE);
+                    drop(pool);
+                    release.run();
+                }
+                p.write_bytes(0x33, LARGE);
+                if extend(p, LARGE, 2 * LARGE) {
+                    let s = std::slice::from_raw_parts_mut(p, 2 * LARGE);
+                    assert!(
+                        s[..LARGE].iter().all(|&b| b == 0x33),
+                        "伸ばして前半が壊れた"
+                    );
+                    assert!(s[LARGE..].iter().all(|&b| b == 0), "伸ばした分が 0 でない");
+                    s.fill(0x44);
+                    relinquish(p, 2 * LARGE);
+                    grown = true;
+                    break;
+                }
+                relinquish(p, LARGE);
             }
         }
+        assert!(grown, "空けた尻へ 1 度も伸ばせなかった");
+        check_global();
+    }
+
+    /// 偽の番地で `Pool` の出し入れを決定的に確かめる（写像には触れない）。
+    /// 最大 `high`・生きている量 `live` の帳簿から始める
+    fn pool_with(high: usize, live: usize) -> Pool {
+        Pool {
+            high,
+            live,
+            ..Pool::new()
+        }
+    }
+
+    fn holds(pool: &Pool) -> bool {
+        pool.live + pool.pending + pool.cached <= pool.ceiling()
+    }
+
+    const P: usize = 1 << 14;
+
+    #[test]
+    fn take_picks_the_smallest_block_that_fits_and_returns_its_tail() {
+        let mut pool = pool_with(16 * P, 16 * P);
+        let mut release = Release::new();
+        pool.give(0x10_0000, 8 * P, &mut release);
+        pool.give(0x20_0000, 3 * P, &mut release);
+        pool.give(0x30_0000, 5 * P, &mut release);
+        assert_eq!((release.len, pool.live, pool.cached), (0, 0, 16 * P));
+        let got = pool.take(4 * P, &mut release);
+        assert_eq!(got, Some(0x30_0000), "4P に 5P ではない塊を回した");
+        assert_eq!(&release.items[..release.len], &[(0x30_0000 + 4 * P, P)]);
+        assert_eq!((pool.cached, pool.live), (11 * P, 4 * P));
+        assert_eq!(pool.high, 16 * P, "棚から取っただけで最大が動いた");
+        assert_eq!(
+            pool.take(9 * P, &mut Release::new()),
+            None,
+            "合わない塊を回した"
+        );
+        // ちょうどの大きさなら尻は出ない
+        let mut exact = Release::new();
+        assert_eq!(pool.take(3 * P, &mut exact), Some(0x20_0000));
+        assert_eq!(exact.len, 0);
+        assert!(holds(&pool));
+    }
+
+    #[test]
+    fn a_full_shelf_hands_the_block_back() {
+        let mut pool = pool_with((SLOTS + 1) * P, (SLOTS + 1) * P);
+        let mut release = Release::new();
+        for k in 0..SLOTS {
+            pool.give(0x1_0000_0000 + k * P, P, &mut release);
+        }
+        assert_eq!((pool.len, release.len), (SLOTS, 0));
+        pool.give(0xdead_0000, P, &mut release);
+        assert_eq!(&release.items[..release.len], &[(0xdead_0000, P)]);
+        assert_eq!(pool.cached, SLOTS * P, "溢れた塊を棚に数えた");
+        assert_eq!(pool.live, 0);
+        assert!(holds(&pool));
+    }
+
+    #[test]
+    fn reserve_evicts_the_oldest_blocks_until_the_sum_fits() {
+        let mut pool = pool_with(9 * P, 9 * P);
+        let mut release = Release::new();
+        for ptr in [0xa000_0000usize, 0xb000_0000, 0xc000_0000] {
+            pool.give(ptr, 3 * P, &mut release);
+        }
+        assert_eq!((pool.live, pool.cached), (0, 9 * P));
+        // 待ち 4P + 棚 9P > 最大 9P。古い順に A、B を返すと棚 3P で収まる
+        pool.reserve(4 * P, &mut release);
+        assert_eq!(
+            &release.items[..release.len],
+            &[(0xa000_0000, 3 * P), (0xb000_0000, 3 * P)]
+        );
+        assert_eq!((pool.len, pool.cached), (1, 3 * P));
+        assert_eq!(pool.slots[0], (0xc000_0000, 3 * P));
+        assert!(holds(&pool));
+        pool.settle(4 * P);
+        assert_eq!((pool.live, pool.pending), (4 * P, 0));
+        assert_eq!(pool.high, 9 * P, "最大の内側の確保で最大が動いた");
+        assert!(holds(&pool));
+    }
+
+    #[test]
+    fn a_cancelled_reservation_leaves_the_books_as_they_were() {
+        let mut pool = pool_with(9 * P, 3 * P);
+        let mut release = Release::new();
+        pool.give(0x1000_0000, 3 * P, &mut release);
+        // 最大を超える確保は棚をすべて空けさせる
+        pool.reserve(100 * P, &mut release);
+        assert_eq!(pool.len, 0);
+        assert_eq!(&release.items[..release.len], &[(0x1000_0000, 3 * P)]);
+        assert!(holds(&pool));
+        pool.cancel(100 * P);
+        assert_eq!(
+            (pool.live, pool.pending, pool.high),
+            (0, 0, 9 * P),
+            "失敗の後始末で帳簿が戻らない"
+        );
+        // 取れた場合は最大が上がる
+        pool.reserve(100 * P, &mut Release::new());
+        pool.settle(100 * P);
+        assert_eq!(pool.high, 100 * P);
+    }
+
+    /// 写像を待っている間に別のスレッドが解放しても、上限を超えては棚へ
+    /// 置かない。置けば、待っていた確保が取れた瞬間に RSS が最大を超える
+    #[test]
+    fn a_block_freed_while_another_waits_is_shelved_only_within_the_ceiling() {
+        // 最大 10P、生きている 8P。5P を待つ間に 4P が解放される
+        let mut pool = pool_with(10 * P, 8 * P);
+        let mut release = Release::new();
+        pool.reserve(5 * P, &mut release);
+        pool.give(0x5000_0000, 4 * P, &mut release);
+        // live 4P + 待ち 5P + 棚 4P = 13P は上限 max(10P, 9P) を超える
+        assert_eq!(&release.items[..release.len], &[(0x5000_0000, 4 * P)]);
+        assert_eq!(pool.cached, 0);
+        assert!(holds(&pool));
+        pool.settle(5 * P);
+        assert_eq!((pool.live, pool.high), (9 * P, 10 * P));
+        // 収まる解放は棚へ置く: live 6P + 棚 3P <= 10P
+        let mut fits = Release::new();
+        pool.give(0x6000_0000, 3 * P, &mut fits);
+        assert_eq!((fits.len, pool.cached), (0, 3 * P));
+        assert!(holds(&pool));
+    }
+
+    /// 16 スレッドで確保・0 埋めの確保・伸び縮み・解放を混ぜ、どの塊も
+    /// 別のスレッドに書き潰されていないことを中身で照らす
+    #[test]
+    fn concurrent_traffic_keeps_every_block_intact() {
+        let threads: Vec<_> = (0..16u64)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    let a = LargeAlloc;
+                    let mut s = 0x9e37_79b9_7f4a_7c15u64 ^ (t * 7919 + 1);
+                    let mut next = move || {
+                        s ^= s << 13;
+                        s ^= s >> 7;
+                        s ^= s << 17;
+                        s
+                    };
+                    let mut live: Vec<(*mut u8, Layout, u8)> = Vec::new();
+                    let check = |p: *mut u8, n: usize, tag: u8| {
+                        let sl = unsafe { std::slice::from_raw_parts(p, n) };
+                        assert!(sl.iter().all(|&b| b == tag), "別のスレッドに書き潰された");
+                    };
+                    for _ in 0..400 {
+                        let r = next();
+                        match r % 5 {
+                            0 | 1 => {
+                                let size = LARGE / 2 + next() as usize % (3 * LARGE);
+                                let l = Layout::from_size_align(size, 8).unwrap();
+                                let zero = r % 2 == 0;
+                                let p =
+                                    unsafe { if zero { a.alloc_zeroed(l) } else { a.alloc(l) } };
+                                assert!(!p.is_null());
+                                if zero {
+                                    check(p, size, 0);
+                                }
+                                let tag = (next() & 0xff) as u8;
+                                unsafe { p.write_bytes(tag, size) };
+                                live.push((p, l, tag));
+                            }
+                            2 if !live.is_empty() => {
+                                let k = next() as usize % live.len();
+                                let (p, l, tag) = live[k];
+                                let size = LARGE / 2 + next() as usize % (4 * LARGE);
+                                let q = unsafe { a.realloc(p, l, size) };
+                                assert!(!q.is_null());
+                                check(q, l.size().min(size), tag);
+                                unsafe { q.write_bytes(tag, size) };
+                                live[k] = (q, Layout::from_size_align(size, 8).unwrap(), tag);
+                            }
+                            _ if !live.is_empty() => {
+                                let k = next() as usize % live.len();
+                                let (p, l, tag) = live.swap_remove(k);
+                                check(p, l.size(), tag);
+                                unsafe { a.dealloc(p, l) };
+                            }
+                            _ => {}
+                        }
+                        if live.len() > 8 {
+                            let (p, l, tag) = live.remove(0);
+                            check(p, l.size(), tag);
+                            unsafe { a.dealloc(p, l) };
+                        }
+                    }
+                    for (p, l, tag) in live {
+                        check(p, l.size(), tag);
+                        unsafe { a.dealloc(p, l) };
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        check_global();
     }
 
     /// 生きている量と棚の和は、生きていた量の最大（写像を待っている間は
@@ -542,43 +863,5 @@ mod tests {
         );
         assert!(lock().high < huge, "失敗した確保で最大が膨らんだ");
         check_global();
-    }
-
-    /// 偽の番地で `Pool` の出し入れを決定的に確かめる（写像には触れない）。
-    /// 最大 `high`・生きている量 `live` の帳簿から始める
-    fn pool_with(high: usize, live: usize) -> Pool {
-        Pool {
-            high,
-            live,
-            ..Pool::new()
-        }
-    }
-
-    fn holds(pool: &Pool) -> bool {
-        pool.live + pool.pending + pool.cached <= pool.ceiling()
-    }
-
-    const P: usize = 1 << 14;
-
-    /// 写像を待っている間に別のスレッドが解放しても、上限を超えては棚へ
-    /// 置かない。置けば、待っていた確保が取れた瞬間に RSS が最大を超える
-    #[test]
-    fn a_block_freed_while_another_waits_is_shelved_only_within_the_ceiling() {
-        // 最大 10P、生きている 8P。5P を待つ間に 4P が解放される
-        let mut pool = pool_with(10 * P, 8 * P);
-        let mut release = Release::new();
-        pool.reserve(5 * P, &mut release);
-        pool.give(0x5000_0000, 4 * P, &mut release);
-        // live 4P + 待ち 5P + 棚 4P = 13P は上限 max(10P, 9P) を超える
-        assert_eq!(&release.items[..release.len], &[(0x5000_0000, 4 * P)]);
-        assert_eq!(pool.cached, 0);
-        assert!(holds(&pool));
-        pool.settle(5 * P);
-        assert_eq!((pool.live, pool.high), (9 * P, 10 * P));
-        // 収まる解放は棚へ置く: live 6P + 棚 3P <= 10P
-        let mut fits = Release::new();
-        pool.give(0x6000_0000, 3 * P, &mut fits);
-        assert_eq!((fits.len, pool.cached), (0, 3 * P));
-        assert!(holds(&pool));
     }
 }

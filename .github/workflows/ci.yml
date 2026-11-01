@@ -3,7 +3,7 @@
 #
 # public リポジトリなので GitHub 製の標準ランナーは分数無制限で無料である。
 # larger runner は public でも課金されるので、`runs-on` には標準のラベル
-# （`ubuntu-latest`）以外を書かないこと。
+# （`ubuntu-latest` と `macos-latest`）以外を書かないこと。
 #
 # ツールチェーンの用意にサードパーティの action を使わないのは、Cargo.toml が
 # 依存について立てた基準（C 依存を持ち込まない、素性の知れたものだけを引く）を
@@ -152,6 +152,39 @@ jobs:
       - run: cargo test --profile ci-test --locked ${{ matrix.features }} ${{ matrix.targets }}
         env:
           KIRI_REQUIRE_FONT: "1"
+      # kiri 自身の生成物はキャッシュに載せない（毎回作り直すので太るだけ）。
+      - run: cargo clean --profile ci-test -p kiri
+
+  macos:
+    # **大きな確保のアロケータ（src/large_alloc.rs）は macOS でしか建たない。**
+    # 他のジョブはすべて ubuntu で走るので、ここが無いとアロケータの試験も
+    # clippy も 1 度も回らない（Phase 36）。回すのはアロケータの単体試験と
+    # clippy だけにする——切り抜きの試験は ubuntu の test ジョブが見ており、
+    # macOS で全部を回し直しても守るものが増えない。
+    #
+    # aarch64 なので nasm は要らない（rav1e の asm は x86_64 だけ）。
+    name: macos (large_alloc)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup component add clippy
+      # 鍵に rustc の版を混ぜる理由は test ジョブのコメント。macOS には
+      # sha256sum が無いので shasum で同じものを作る。
+      - id: rustc
+        run: echo "hash=$(rustc -V | shasum -a 256 | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: macos-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: macos-${{ runner.os }}-${{ steps.rustc.outputs.hash }}-
+      # `ci-test` は debug-assertions を残すので、`munmap` の戻り値の表明も効く
+      - run: cargo test --profile ci-test --locked --bin kiri large_alloc
+      - run: cargo clippy --profile ci-test --locked --all-targets -- -D warnings
       # kiri 自身の生成物はキャッシュに載せない（毎回作り直すので太るだけ）。
       - run: cargo clean --profile ci-test -p kiri
 

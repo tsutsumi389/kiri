@@ -77,6 +77,20 @@ pub(crate) const RADIUS_CEILING: u32 = 48;
 /// 小さくすると帯から離れた画素まで積分する無駄が減る。
 pub(crate) const TILE: u32 = 128;
 
+/// 復元した色を溜める（`Recovered` の列）のは、帯が画素数のこの割合（の逆数）
+/// 以下のときだけ。超えたら出力の画像を先に複製し、そこへ直接書く。
+///
+/// 列は 1 画素 8 バイト（添字 4 + 色 3 + 詰め物 1）で、`Vec` の伸び代で最大
+/// 2 倍になる。帯が 1/4 以下なら、伸び代込みでも画像の複製（1 画素 4 バイト）を
+/// 超えない。実写では帯は 2.5〜3.6%（リモコン・キーボード）に収まり、四角い
+/// 斑点を敷き詰めた合成画像では 70〜93% に達する（Phase 36）。
+const LISTED_BAND_DIVISOR: usize = 4;
+
+/// 帯の画素数 `band` と画素数 `pixels` から、色を列へ溜めるかを決める。
+fn lists_colours(band: usize, pixels: usize) -> bool {
+    band <= pixels / LISTED_BAND_DIVISOR
+}
+
 /// 観測色が参照色に「収束した」とみなす色差。CIE76 で 2 前後が見分けの限界。
 const CONVERGED: f64 = 2.0;
 
@@ -294,11 +308,24 @@ pub fn refine(
     field: &BackgroundField,
     opts: &RefineOptions<'_>,
 ) -> Refined {
+    refine_listing(image, binary, field, opts, None)
+}
+
+/// 帯の割合で色の書き方を決めるか（`None`）、決め打ちにするか。
+///
+/// 決め打ちは試験のためだけにある——2 つの書き方が同じバイト列を出すことを、
+/// どちらの書き方にも落ちる素材を用意せずに比べられる。
+fn refine_listing(
+    image: &RgbaImage,
+    binary: &Mask,
+    field: &BackgroundField,
+    opts: &RefineOptions<'_>,
+    listing: Option<bool>,
+) -> Refined {
     let (w, h) = (image.width(), image.height());
-    let mut out = image.clone();
     if w == 0 || h == 0 || w != binary.width() || h != binary.height() {
         return Refined {
-            image: out,
+            image: image.clone(),
             mask: binary.clone(),
             band_min_radius: 0,
             smooth_radius_px: 0,
@@ -350,10 +377,16 @@ pub fn refine(
 
     let mut mask = shape.clone();
     // 帯幅の最大は代役前景の近傍半径を決めるのに要る。0 なら帯そのものが無い
-    let band_max = band.iter().copied().max().unwrap_or(0);
+    let (band_max, band_count) = band
+        .par_iter()
+        .fold(
+            || (0u8, 0usize),
+            |(m, n), &b| (m.max(b), n + usize::from(b > 0)),
+        )
+        .reduce(|| (0, 0), |a, b| (a.0.max(b.0), a.1 + b.1));
     if band_max == 0 {
         return Refined {
-            image: out,
+            image: image.clone(),
             mask,
             band_min_radius: min_radius,
             smooth_radius_px: smooth_radius,
@@ -388,7 +421,17 @@ pub fn refine(
         guided::Solved::default()
     };
 
-    sweep_bands(w, &ctx, Pass::Project, &mut out, &mut mask, &mut solved);
+    // **復元した色は帯の画素ぶんだけ溜め、出力の画像は最後に 1 度だけ作る。**
+    // 24.5MP の画像は 98MB あり、入口で複製すると (e) の作業域と (f) の帯の
+    // 走査に重なって、切り抜き全体のピークを作っていた（Phase 36）。色を書く
+    // 画素は帯の中にしか無いので、溜める量は帯の画素数で決まる。
+    //
+    // 帯が画像の大半を覆う素材では列のほうが複製より大きくなるので、そのときは
+    // 色を書く段の直前に複製して、そこへ直接書く（`LISTED_BAND_DIVISOR`）
+    let listed = listing.unwrap_or_else(|| lists_colours(band_count, band.len()));
+    let mut canvas: Option<RgbaImage> = None;
+    let target = (!listed && ctx.despill).then(|| canvas.insert(image.clone()));
+    let mut colours = sweep_bands(w, &ctx, Pass::Project, target, &mut mask, &mut solved);
 
     let mut matting_report = None;
     if smooths_alpha {
@@ -413,10 +456,22 @@ pub fn refine(
                 despill: true,
                 ..ctx
             };
-            sweep_bands(w, &ctx, Pass::Recover, &mut out, &mut mask, &mut solved);
+            let target = (!listed).then(|| canvas.get_or_insert_with(|| image.clone()));
+            colours.extend(sweep_bands(
+                w,
+                &ctx,
+                Pass::Recover,
+                target,
+                &mut mask,
+                &mut solved,
+            ));
         }
     }
 
+    // 帯と印はもう読まないので、先に手放して複製と重ねない
+    drop((band, sealed, solved, reshaped));
+    let mut out = canvas.unwrap_or_else(|| image.clone());
+    paint(&mut out, &colours);
     Refined {
         image: out,
         mask,
@@ -445,7 +500,7 @@ pub(crate) fn smooth_radius_px(smooth_contour: f64, scale: f64) -> u32 {
 ///
 /// **タイルは自分のタイルの画素しか書かない。** 読みは積分画像の余白ぶん
 /// 外へ伸びるが、そちらは共有の不変参照で足りる。だから行で割れば書き先が
-/// 重ならず、`out` と `mask` を帯ごとの可変スライスに分けられる。
+/// 重ならず、`mask` を帯ごとの可変スライスに分けられる。
 ///
 /// 結果がタイルの位置に依存しないことは
 /// `the_result_does_not_depend_on_where_the_tiles_fall` が見ている。走査順が
@@ -453,22 +508,34 @@ pub(crate) fn smooth_radius_px(smooth_contour: f64, scale: f64) -> u32 {
 ///
 /// 作業領域は帯ごとに持つ。帯の中では使い回すので、タイルごとに作り直す
 /// わけではない。
+///
+/// 復元した色は、`image` を渡せばそこへ直接書き、渡さなければ帯ごとの
+/// `(添字, sRGB)` の列で返す（`paint` が最後に書く）。色を書かない段
+/// （`ctx.despill` が偽）と直接書いた段では空の列が並ぶ。
 fn sweep_bands(
     w: u32,
     ctx: &Context<'_>,
     pass: Pass,
-    image: &mut RgbaImage,
+    image: Option<&mut RgbaImage>,
     mask: &mut Mask,
     solved: &mut guided::Solved,
-) {
+) -> Vec<Vec<Recovered>> {
     let stride = w as usize;
     let rows = TILE as usize;
     let marks = Mutex::new(solved);
-    image
-        .par_chunks_mut(rows * stride * 4)
-        .zip(mask.as_mut_slice().par_chunks_mut(rows * stride))
+    let pixels = mask.as_mut_slice();
+    let bands = pixels.len().div_ceil(rows * stride);
+    // 画像を渡さない段では、帯ごとの書き先を空のスライスにして列へ溜める
+    let mut canvases: Vec<&mut [u8]> = match image {
+        Some(image) => image.chunks_mut(rows * stride * 4).collect(),
+        None => Vec::new(),
+    };
+    canvases.resize_with(bands, Default::default);
+    canvases
+        .into_par_iter()
+        .zip(pixels.par_chunks_mut(rows * stride))
         .enumerate()
-        .for_each(|(band, (image, mask))| {
+        .map(|(band, (canvas, mask))| {
             let y0 = (band * rows) as u32;
             let mut ws = Workspace::default();
             // 色で決められなかった画素の受け皿。帯ごとに持ち、要るタイルの
@@ -476,7 +543,8 @@ fn sweep_bands(
             let mut fallback = Fallback::default();
             let mut out = Output {
                 solved: Vec::new(),
-                image,
+                colours: Vec::new(),
+                canvas,
                 mask,
                 y0,
                 stride,
@@ -491,7 +559,9 @@ fn sweep_bands(
             for index in out.solved {
                 solved.set(index as usize);
             }
-        });
+            out.colours
+        })
+        .collect()
 }
 
 /// タイルをまたいで変わらない入力。
@@ -621,7 +691,7 @@ enum Pass {
 
 /// 1 本の帯（`TILE` 行ぶん）の書き先。タイルをまたいで**書き換えていく側**。
 ///
-/// 3 つは常に一緒に動く——アルファを書けば印が立ち、色を復元すれば画像が
+/// 3 つは常に一緒に動く——アルファを書けば印が立ち、色を復元すれば色の列が
 /// 変わる。引数として並べると、呼ぶ側が順序を間違えても型が違うぶんしか
 /// 守られない。
 ///
@@ -641,8 +711,11 @@ struct Output<'a> {
     /// 二重に抱えることになる）。錠を取るのは帯 1 本につき 1 回なので、
     /// 待ちは測れるほど出ない
     solved: Vec<u32>,
-    /// 色を復元する先。この帯の行だけ
-    image: &'a mut [u8],
+    /// 復元した色。添字は画像全体の画素の番号（`solved` と同じ）。
+    /// `canvas` が空のときだけ溜める
+    colours: Vec<Recovered>,
+    /// 色を直接書く先。この帯の行だけで、列へ溜める実行では空
+    canvas: &'a mut [u8],
     /// アルファを書く先。この帯の行だけ
     mask: &'a mut [u8],
     /// この帯の先頭行
@@ -673,9 +746,30 @@ impl Output<'_> {
     }
 
     #[inline]
-    fn rgb_mut(&mut self, x: u32, y: u32) -> &mut [u8] {
-        let i = self.at(x, y) * 4;
-        &mut self.image[i..i + 3]
+    fn set_rgb(&mut self, x: u32, y: u32, rgb: [u8; 3]) {
+        if self.canvas.is_empty() {
+            let index = (y as usize) * self.stride + (x as usize);
+            self.colours.push((index as u32, rgb));
+        } else {
+            let i = self.at(x, y) * 4;
+            self.canvas[i..i + 3].copy_from_slice(&rgb);
+        }
+    }
+}
+
+/// 復元した 1 画素。`(画像全体の画素の番号, sRGB)`
+type Recovered = (u32, [u8; 3]);
+
+/// 溜めた色を出力の画像へ書く。
+///
+/// **書く順序は結果に影響しない。** 同じ画素を 2 度書くことが無いからである
+/// ——1 つの段の中ではタイルが重ならず、色を書く段は 1 回の `refine` で
+/// 1 つしか走らない（射影では (d)、guided と closed-form では (f) だけ）。
+fn paint(image: &mut RgbaImage, colours: &[Vec<Recovered>]) {
+    let raw: &mut [u8] = image;
+    for &(index, rgb) in colours.iter().flatten() {
+        let i = index as usize * 4;
+        raw[i..i + 3].copy_from_slice(&rgb);
     }
 }
 
@@ -929,10 +1023,7 @@ fn estimate_alpha(
                 continue;
             }
             let recovered = recover_foreground(observed, b, f, alpha);
-            let pixel = out.rgb_mut(x, y);
-            for (k, slot) in pixel.iter_mut().enumerate() {
-                *slot = linear_to_srgb(recovered[k]);
-            }
+            out.set_rgb(x, y, recovered.map(linear_to_srgb));
         }
     }
 }
@@ -1738,6 +1829,75 @@ mod tests {
 
     /// タイルの切れ目で結果が変わらないこと。積分画像はタイルごとに作り直すので、
     /// 窓がタイルの外へはみ出す画素を取りこぼすと、ここで縦縞になって現れる。
+    #[test]
+    fn listing_and_painting_in_place_write_the_same_bytes() {
+        // 斑点を敷き詰めて帯を画像の大半に広げる。どちらの書き方にも落ちうる
+        let (w, h) = (300u32, 200u32);
+        let bg = [240, 238, 236];
+        let mut img = RgbaImage::from_pixel(w, h, Rgba([bg[0], bg[1], bg[2], 255]));
+        let mut mask = Mask::new(w, h, 0);
+        let mut seed = 7u32;
+        for y0 in (6..h - 18).step_by(15) {
+            for x0 in (6..w - 18).step_by(15) {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                let c = (seed >> 16) as u8 % 120 + 20;
+                let fg = [c, c / 2 + 30, 150 - c / 2];
+                // 縁の 1 画素は背景と半々に混ぜる。硬い縁では復元する色が無い
+                let mix = |k: usize| ((u16::from(fg[k]) + u16::from(bg[k])) / 2) as u8;
+                for y in y0 - 1..y0 + 12 {
+                    for x in x0 - 1..x0 + 12 {
+                        img.put_pixel(x, y, Rgba([mix(0), mix(1), mix(2), 255]));
+                    }
+                }
+                for y in y0..y0 + 11 {
+                    for x in x0..x0 + 11 {
+                        img.put_pixel(x, y, Rgba([fg[0], fg[1], fg[2], 255]));
+                        mask.set(x, y, 255);
+                    }
+                }
+            }
+        }
+        for matting in [Matting::Guided, Matting::Projection, Matting::ClosedForm] {
+            for despill in [true, false] {
+                let opts = RefineOptions {
+                    matting,
+                    despill,
+                    ..Default::default()
+                };
+                let field = flat(bg);
+                let listed = refine_listing(&img, &mask, &field, &opts, Some(true));
+                let painted = refine_listing(&img, &mask, &field, &opts, Some(false));
+                let chosen = refine(&img, &mask, &field, &opts);
+                assert!(
+                    listed.image.as_raw() != img.as_raw() || !despill,
+                    "{matting:?}: 色が 1 画素も復元されず、比べる意味が無い"
+                );
+                for (name, other) in [("直接", &painted), ("自動", &chosen)] {
+                    assert_eq!(
+                        listed.image.as_raw(),
+                        other.image.as_raw(),
+                        "{matting:?} despill={despill}: 列と{name}で色が違う"
+                    );
+                    assert_eq!(
+                        listed.mask.as_slice(),
+                        other.mask.as_slice(),
+                        "{matting:?} despill={despill}: 列と{name}でアルファが違う"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn colours_are_listed_only_while_the_band_is_small() {
+        // 実写の帯は 2.5〜3.6%。1/4 を境に、超えたら画像へ直接書く
+        assert!(lists_colours(0, 100));
+        assert!(lists_colours(25, 100));
+        assert!(!lists_colours(26, 100));
+        assert!(lists_colours(774_186, 24_470_208));
+        assert!(!lists_colours(18_657_080, 20_000_000));
+    }
+
     #[test]
     fn the_result_does_not_depend_on_where_the_tiles_fall() {
         let (w, h) = (400u32, 40u32);

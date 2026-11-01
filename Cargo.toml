@@ -94,6 +94,14 @@ resvg = { version = "0.48.1", default-features = false, features = [
 # 可変フォントで毎回誤検出する（`compose::font` の doc）
 ttf-parser = { version = "0.25.1", default-features = false, features = ["std", "variable-fonts"] }
 
+# 大きな確保を `mmap` / `munmap` へ直接回すためだけに引く（`src/large_alloc.rs`）。
+#
+# **新しく木に入るものは無い。** `memmap2`（resvg）と `rav1e`（ravif）が既に
+# 同じ版を引いている。macOS に限るのは、malloc が解放した大きな塊を手放さない
+# 山を測ったのが macOS だけだからである（Phase 36）
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.189"
+
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"

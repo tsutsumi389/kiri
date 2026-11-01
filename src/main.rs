@@ -23,6 +23,17 @@ use kiri::report::{
 };
 use kiri::warning::Warning;
 
+#[cfg(target_os = "macos")]
+mod large_alloc;
+
+/// 大きな確保は OS へ直接返す。macOS の malloc は解放した大きな塊を抱えた
+/// ままにするので、24.5MP の切り抜きでピーク RSS が生きている量の 2 倍を超える
+/// （`large_alloc` の doc）。**ライブラリには置かない**——どのアロケータで
+/// 動かすかは、組み込む側のプログラムが決めることである
+#[cfg(target_os = "macos")]
+#[global_allocator]
+static GLOBAL: large_alloc::LargeAlloc = large_alloc::LargeAlloc;
+
 fn main() -> ExitCode {
     let cli = parse();
     match dispatch(&cli) {

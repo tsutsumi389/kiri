@@ -307,3 +307,4 @@ test / MSRV を GitHub Actions へ移した。**新規のコードは無い**—
 | 15 | Phase 34: 収まる文字サイズの範囲を返す（`--size-range`） | [15-phase-34.md](phases/15-phase-34.md) |
 | 16 | Phase 35: 切り抜きの残る逐次の段を並列にする | [16-phase-35.md](phases/16-phase-35.md) |
 | 17 | Phase 36: 切り抜きのピーク RSS を下げる | [17-phase-36.md](phases/17-phase-36.md) |
+| 18 | Phase 37: `--optimize` の候補をまたいで下ごしらえを使い回す | [18-phase-37.md](phases/18-phase-37.md) |

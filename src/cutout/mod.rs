@@ -595,6 +595,45 @@ pub fn cutout_seen(
     opts: &CutoutOptions,
     seen: Option<&BackgroundSeen>,
 ) -> CutoutResult {
+    cutout_shared(image, opts, seen, None)
+}
+
+/// 候補をまたいで使い回すフィルの下ごしらえを作る。
+///
+/// **`--optimize` の探索段のためにある。** 下ごしらえ（Lab の表・堤防・種の
+/// 保護円）は画像・`edge_threshold`・`fg_seeds` だけで決まり、候補が動かす
+/// 許容量・矩形・モデルに依らない。`edge_threshold` の自動調整は外周の
+/// テクスチャから決まり、そのテクスチャは `seen` が持っている——候補の
+/// 誰が測っても同じ値になる。探索段では（実写リモコン 24.5MP、1 スレッド）
+/// 20 候補ぶんの下ごしらえが CPU 時間の 15% を占めていた。
+///
+/// 原寸では使わない。Lab の表は 24.5MP で 147MB あり、`cutout_seen` は
+/// 2 回のフィルを終えた時点でそれを手放してから境界の帯へ進む。候補を
+/// またいで抱えると、その 147MB が境界の帯のピークに重なる。
+pub(crate) fn shared_terrain(
+    image: &RgbaImage,
+    opts: &CutoutOptions,
+    seen: &BackgroundSeen,
+) -> floodfill::Terrain {
+    let (edge_threshold, _) = resolve_edge_threshold(opts.edge_threshold, &seen.estimate.texture);
+    let flood = FloodOptions {
+        edge_threshold,
+        fg_seeds: opts.fg_seeds.clone(),
+        ..Default::default()
+    };
+    floodfill::prepare(image, &flood)
+}
+
+/// 下ごしらえを借りられる版の `cutout_seen`。
+///
+/// `terrain` が合わなければ（`Terrain::suits`）その場で作るので、渡し間違えても
+/// 答えは変わらない。
+pub(crate) fn cutout_shared(
+    image: &RgbaImage,
+    opts: &CutoutOptions,
+    seen: Option<&BackgroundSeen>,
+    terrain: Option<&floodfill::Terrain>,
+) -> CutoutResult {
     // 段ごとの時間は `KIRI_STAGE_MS=1` のときだけ採る。既定では何も持たない
     let mut stages = stage::Stages::new();
     // 元画像から測る。アルファを適用した後の画像を渡すと、透明になった背景が
@@ -637,9 +676,13 @@ pub fn cutout_seen(
     // **下ごしらえは 1 度だけ。** Lab の表・堤防・種の保護円は画像と `flood`
     // だけで決まり、場にも許容量にも依らない。2 回目のフィルで作り直すと、
     // 24.5MP では Lab の表 147MB と Sobel の作業域 220MB をもう一度払う
-    let terrain = floodfill::prepare(image, &flood);
+    let shared = terrain.filter(|t| t.suits(image, &flood));
+    let owned = shared.is_none().then(|| floodfill::prepare(image, &flood));
+    let terrain = shared
+        .or(owned.as_ref())
+        .expect("借りるか作るかのどちらかはある");
     stages.mark("フィルの下ごしらえ");
-    let mut mask = floodfill::fill(image, &terrain, &field, &flood);
+    let mut mask = floodfill::fill(image, terrain, &field, &flood);
     stages.mark("フィル 1 回目");
 
     // **2 回目のパス。** 1 回目のフィルが背景と判定した画素をすべて「既知の
@@ -650,7 +693,7 @@ pub fn cutout_seen(
     // 1 色モデルでは走らせない。場が無いのだから作り直すものも無い
     if model == ResolvedModel::Field {
         if let Some((again, next_field, next_residual)) =
-            second_pass(image, &terrain, &background, &mask, opts, &flood)
+            second_pass(image, terrain, &background, &mask, opts, &flood)
         {
             mask = again;
             field = next_field;
@@ -660,8 +703,8 @@ pub fn cutout_seen(
 
     // **下ごしらえはここで手放す。** Lab の表は 24.5MP で 147MB あり、この先の
     // 境界の帯と診断はどちらも自前で 3 桁 MB を確保する。2 回のフィルを終えた
-    // 時点で用済みなので、生存期間を重ねない
-    drop(terrain);
+    // 時点で用済みなので、生存期間を重ねない。借りた下ごしらえは貸し手が持つ
+    drop(owned);
     stages.mark("フィル 2 回目");
 
     // 孤立ノイズは面積で落とす。オープニングは幅で落とすため、ストラップや
@@ -1405,6 +1448,64 @@ mod tests {
         assert_eq!(warning.data["iterations"], 200);
         assert_eq!(warning.data["unknowns"], 1000);
         assert!(warning.hint.is_some(), "逃げ道を示していない");
+    }
+
+    /// 借りた下ごしらえで切っても、自前で作ったときと 1 画素も違わない。
+    ///
+    /// **背景には勾配とテクスチャを敷く。** 1 色の背景では堤防が立たず
+    /// （`edge_threshold` の自動調整も働かない）、下ごしらえのうち Lab の表しか
+    /// 比べていないことになる。焼き込みの違う下ごしらえを渡したときは、
+    /// 借りずに作り直すので、やはり同じ答えになる。
+    #[test]
+    fn a_borrowed_terrain_cuts_exactly_like_a_fresh_one() {
+        let mut image = RgbaImage::new(96, 80);
+        for (x, y, p) in image.enumerate_pixels_mut() {
+            let grain = ((x * 7 + y * 13) % 5) as u8 * 6;
+            let v = 200u8.saturating_sub((x / 3) as u8) + grain;
+            *p = Rgba([v, v, v.saturating_sub(4), 255]);
+        }
+        for y in 24..56 {
+            for x in 30..70 {
+                image.put_pixel(x, y, Rgba([40, 30, 90, 255]));
+            }
+        }
+        let base = CutoutOptions {
+            refine: false,
+            fg_seeds: vec![(48, 40)],
+            ..Default::default()
+        };
+        let seen = see_background(&image, base.border);
+        let terrain = shared_terrain(&image, &base, &seen);
+        let stale = shared_terrain(
+            &image,
+            &CutoutOptions {
+                edge_threshold: Some(0.0),
+                ..base.clone()
+            },
+            &seen,
+        );
+        let other_seed = shared_terrain(
+            &image,
+            &CutoutOptions {
+                fg_seeds: vec![(10, 10)],
+                ..base.clone()
+            },
+            &seen,
+        );
+        for (tolerance, bbox) in [(12.0, None), (45.0, None), (30.0, Some((20, 16, 80, 64)))] {
+            let opts = CutoutOptions {
+                tolerance,
+                bbox,
+                ..base.clone()
+            };
+            let fresh = cutout_seen(&image, &opts, Some(&seen));
+            for borrowed in [&terrain, &stale, &other_seed] {
+                let shared = cutout_shared(&image, &opts, Some(&seen), Some(borrowed));
+                assert_eq!(shared.mask.as_slice(), fresh.mask.as_slice());
+                assert_eq!(shared.image.as_raw(), fresh.image.as_raw());
+                assert_eq!(shared.edge_threshold, fresh.edge_threshold);
+            }
+        }
     }
 
     /// 背景色の上に矩形の商品を置いた画像と、その矩形どおりのマスクを作る。

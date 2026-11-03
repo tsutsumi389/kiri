@@ -143,6 +143,31 @@ pub struct Terrain {
     dam: Option<BitPlane>,
     /// `--fg-seed` の保護円。種が無ければ持たない
     seeds: Option<BitPlane>,
+    /// 何から作ったか。**合わない呼び出しには使わせない**（`suits`）
+    baked: Baked,
+}
+
+/// 下ごしらえに焼き込んだもの。`suits` が照合する。
+struct Baked {
+    size: (u32, u32),
+    edge_threshold: f64,
+    fg_seeds: Vec<(u32, u32)>,
+}
+
+impl Terrain {
+    /// この画像と `opts` のフィルに使えるか。
+    ///
+    /// **`--optimize` の探索段は 1 つの下ごしらえを候補 20 通りで使い回す。**
+    /// 候補が動かすのは許容量・矩形・モデルで、どれもここに入っていない。
+    /// 焼き込んだ値が食い違う呼び出しが来たら、黙って違う堤防でフィルするより
+    /// 作り直して正しい答えを出すほうがよい（`BackgroundSeen::usable_for` と
+    /// 同じ規約）。画素そのものは照合しない——寸法までしか見ないので、
+    /// **同じ画像から作ったものを渡すのは呼ぶ側の責任である**
+    pub fn suits(&self, image: &RgbaImage, opts: &FloodOptions<'_>) -> bool {
+        self.baked.size == (image.width(), image.height())
+            && self.baked.edge_threshold == opts.edge_threshold
+            && self.baked.fg_seeds == opts.fg_seeds
+    }
 }
 
 /// 場に依らない下ごしらえを 1 度だけ作る。
@@ -160,6 +185,11 @@ pub fn prepare(image: &RgbaImage, opts: &FloodOptions<'_>) -> Terrain {
         lab: lab_map(image, srgb_linear_lut()),
         dam,
         seeds: protected_pixels(w, h, &opts.fg_seeds),
+        baked: Baked {
+            size: (w, h),
+            edge_threshold: opts.edge_threshold,
+            fg_seeds: opts.fg_seeds.clone(),
+        },
     }
 }
 
@@ -1300,6 +1330,43 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// 焼き込んだ値が 1 つでも違えば借りさせない。
+    ///
+    /// **`--optimize` の探索段は 1 つの下ごしらえを 20 候補で使い回す。** 候補が
+    /// 動かす許容量・矩形は照合に入れない——入れると共有が効かなくなる。
+    /// 堤防と種は入れる——外すと、違う堤防で黙ってフィルすることになる。
+    #[test]
+    fn a_terrain_is_borrowed_only_for_what_it_was_baked_with() {
+        let image = ascii(&["....", ".##.", ".##.", "...."]);
+        let baked = FloodOptions {
+            edge_threshold: 8.0,
+            fg_seeds: vec![(1, 1)],
+            ..opts(12.0)
+        };
+        let terrain = prepare(&image, &baked);
+        assert!(terrain.suits(&image, &baked));
+        let candidate = FloodOptions {
+            tolerance: 60.0,
+            bbox: Some((0, 0, 3, 3)),
+            core_tolerance: 4.0,
+            ..baked.clone()
+        };
+        assert!(terrain.suits(&image, &candidate), "候補の軸で外れている");
+
+        let dam = FloodOptions {
+            edge_threshold: 41.8,
+            ..baked.clone()
+        };
+        assert!(!terrain.suits(&image, &dam), "別の堤防の下ごしらえを借りた");
+        let seeds = FloodOptions {
+            fg_seeds: vec![(2, 2)],
+            ..baked.clone()
+        };
+        assert!(!terrain.suits(&image, &seeds), "別の種の下ごしらえを借りた");
+        let other = ascii(&["...", ".#.", "..."]);
+        assert!(!terrain.suits(&other, &baked), "寸法の違う画像に貸した");
     }
 
     #[test]

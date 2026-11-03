@@ -20,7 +20,10 @@
 //! ```
 //!
 //! `--optimize` は候補ごとに `cutout_seen` を呼ぶので、表は候補の数だけ出る。
+//! 探索段の候補は並列に回るので、表の順は候補の順ではなく、各段の時間は
+//! 他の候補と CPU を取り合った壁時計である。
 
+use std::io::Write;
 use std::time::Instant;
 
 /// 段ごとの経過時間を出すかを決める環境変数。`1` のときだけ出す。
@@ -75,14 +78,24 @@ impl Stages {
         let Some(clock) = self.clock.as_ref() else {
             return;
         };
+        // **1 度だけ stderr を握る。** `--optimize` の探索段は候補を並列に回すので、
+        // 行ごとに握り直すと候補の表が行単位で混ざる
+        let mut err = std::io::stderr().lock();
         let total = (Instant::now() - clock.begun).as_secs_f64() * 1e3;
-        eprintln!("段ごとの経過 (ms)");
+        let _ = writeln!(err, "段ごとの経過 (ms)");
         for (name, ms) in &clock.marks {
-            eprintln!("  {}{:>9.1}{:>7.1}%", pad(name, 28), ms, ms / total * 1e2);
+            let _ = writeln!(
+                err,
+                "  {}{:>9.1}{:>7.1}%",
+                pad(name, 28),
+                ms,
+                ms / total * 1e2
+            );
         }
         let counted: f64 = clock.marks.iter().map(|(_, ms)| ms).sum();
-        eprintln!("  {}{:>9.1}", pad("合計", 28), total);
-        eprintln!(
+        let _ = writeln!(err, "  {}{:>9.1}", pad("合計", 28), total);
+        let _ = writeln!(
+            err,
             "  {}{:>9.1}{:>7.1}%",
             pad("うち段に数えていない", 28),
             total - counted,

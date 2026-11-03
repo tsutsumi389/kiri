@@ -12,7 +12,8 @@
 //! 2. **最終段** — 探索段の上位 `FINALISTS` を、原寸・利用者の設定そのままで
 //!    順に回す。致命的な警告も品質の警告も出なければそこで打ち切る
 //!
-//! 原寸 1 回が 24.5MP で 5〜7 秒あるので、**早期打ち切りが所要時間の要**である。
+//! 原寸 1 回は探索段の全候補ぶんより重い（24.5MP で約 0.5 秒、探索段は 0.35 秒）
+//! ので、**早期打ち切りが所要時間の要**である。
 //!
 //! **2 つの段は別の物差しで並べる**（`better_search` / `better_final`）。
 //! 縮小と `refine` 抜きで意味が変わってしまう量——halo・輪郭の粗さ・縁の汚染、
@@ -24,13 +25,15 @@ use std::cmp::Ordering;
 use std::time::Instant;
 
 use image::RgbaImage;
+use rayon::prelude::*;
 
 use crate::cutout::constraints::nearest;
 use crate::cutout::diagnostics::{CONTOUR_ROUGH_WARN, HALO_WARN, RIM_CONTAMINATION_WARN};
 use crate::cutout::stage;
 use crate::cutout::{
     BackgroundModel, BackgroundSeen, CutoutOptions, CutoutResult, Diagnostics, ResolvedModel,
-    SubjectHint, analyse_background_seen, bbox_to_pixels, cutout_seen, see_background,
+    SubjectHint, analyse_background_seen, bbox_to_pixels, cutout_seen, cutout_shared,
+    see_background, shared_terrain,
 };
 use crate::error::{Error, ErrorCode, Result};
 use crate::transform::resize::{self, FitMode, ResizeSpec};
@@ -618,7 +621,7 @@ pub fn optimize(
     //
     // **`--feather` は縮めない。** 探索段は `refine: false` で回るので、その値を
     // 読む段そのものが走らない。縮める形だけ書くと「効いている」と誤読させる
-    let mut search = CutoutOptions {
+    let search = CutoutOptions {
         border: scale_length(base.border, source, target).max(1),
         bbox: base
             .bbox
@@ -652,15 +655,34 @@ pub fn optimize(
     let set = candidates(&base, fixed, analysis.subject.as_ref(), analysis.model);
     drop(analysis);
 
-    // 候補ごとに表を組み直さず、**3 つの値だけを書き換えて回す**
+    // フィルの下ごしらえも候補に依らない（`shared_terrain`）。縮小版なので
+    // 抱えても 10MB ほどで済む
+    let terrain = shared_terrain(&small, &search, &small_seen);
+
+    // **候補は互いに独立なので並列に回す。** 縮小版の 1 候補は単独では
+    // コアを使い切れない（1 本で 3.6 秒の仕事が 14 スレッドで 0.9 秒止まり
+    // だった）。`collect` は入力順を保ち、1 候補の答えはスレッドの割り方に
+    // 依らない（docs/phases/16-phase-35.md §16.3）ので、並びも中身も逐次と同じになる。
+    //
+    // 表は候補ごとに組み直さず、**rayon の分割ごとに 1 つ複製して 3 つの値だけを
+    // 書き換えて回す**（`apply` は 3 つとも必ず上書きする）。分割は多くても候補の
+    // 数までなので、複製は多くて 20 回（縮小版の指示の表は数 MB）
+    //
+    // 内側の `join` で待つスレッドが別の候補を盗むので、候補は 14 本より多く
+    // 同時に走りうる。それでもピーク RSS は最終段（原寸）にあり、実測で
+    // +7〜11MB しか動かなかった（docs/phases/18-phase-37.md §18.3）
     let mut trials: Vec<Trial> = set
-        .iter()
-        .map(|candidate| {
-            apply(&mut search, candidate, source, target);
-            let result = cutout_seen(&small, &search, Some(&small_seen));
-            Trial::new(*candidate, Stage::Search, &result, false)
-        })
+        .par_iter()
+        .map_init(
+            || search.clone(),
+            |search, candidate| {
+                apply(search, candidate, source, target);
+                let result = cutout_shared(&small, search, Some(&small_seen), Some(&terrain));
+                Trial::new(*candidate, Stage::Search, &result, false)
+            },
+        )
         .collect();
+    drop(terrain);
     drop(search);
     drop(small);
     stages.mark("探索段（縮小版）");
@@ -671,9 +693,16 @@ pub fn optimize(
 
     // 原寸の指示を戻す。最終段は**縮小していない指示そのまま**で回る
     base.constraints = full_constraints;
+    // **原寸の見立ても 1 回だけ。** 渡されていなければ（`--segment auto` の門を
+    // 通っていなければ）候補ごとに `cutout_seen` が測り直すことになる。見立ては
+    // 画像と `border` だけで決まり、抱えても数値と小さな矩形しかない
+    let seen = match seen.filter(|s| s.usable_for(base.border)) {
+        Some(seen) => Cow::Borrowed(seen),
+        None => Cow::Owned(see_background(image, base.border)),
+    };
     let best = finalists(&mut trials, |candidate| {
         apply(&mut base, candidate, source, source);
-        let result = cutout_seen(image, &base, seen);
+        let result = cutout_seen(image, &base, Some(&seen));
         let trial = Trial::new(*candidate, Stage::Final, &result, false);
         (trial, result)
     });

@@ -10,8 +10,8 @@ use image::{DynamicImage, ImageDecoder, ImageReader, RgbaImage};
 
 use crate::color::icc::{self, Interpretation};
 use crate::error::{Error, ErrorCode, Result};
-use crate::image_io::heif;
 use crate::image_io::save::OutputFormat;
+use crate::image_io::{heif, orient};
 use crate::warning::{Warning, WarningCode};
 
 /// 読み込み時の振る舞い。
@@ -187,13 +187,8 @@ pub fn load_with(path: &Path, opts: &LoadOptions) -> Result<LoadedImage> {
         OutputFormat::WebP => webp_exif.as_deref().map_or((1, None), read_webp_exif),
         _ => read_exif(&bytes),
     };
-    let (image, orientation_applied) = if opts.apply_orientation {
-        apply_orientation(dynamic, exif_orientation)
-    } else {
-        (dynamic, false)
-    };
-
-    let mut image = image.to_rgba8();
+    let (mut image, orientation_applied) =
+        apply_orientation(dynamic, exif_orientation, opts.apply_orientation);
     let color = normalize_color(&mut image, icc.as_deref(), exif_color_space, opts);
     let has_alpha = image.pixels().any(|p| p[3] != 255);
 
@@ -406,20 +401,13 @@ fn exif_fields(exif: &exif::Exif) -> (u16, Option<u16>) {
     (field(Tag::Orientation).unwrap_or(1), field(Tag::ColorSpace))
 }
 
-/// EXIF Orientation に従って回転・反転を適用する。
-/// 変換自体は image クレートの実装に委ねる（8 通りの取り違えは事故のもとであるため）。
-fn apply_orientation(mut image: DynamicImage, exif_orientation: u16) -> (DynamicImage, bool) {
-    let orientation = u8::try_from(exif_orientation)
-        .ok()
-        .filter(|v| (2..=8).contains(v))
-        .and_then(image::metadata::Orientation::from_exif);
-    match orientation {
-        Some(orientation) => {
-            image.apply_orientation(orientation);
-            (image, true)
-        }
-        None => (image, false),
-    }
+/// RGBA へ変換し、`apply` なら EXIF Orientation に従って回転・反転も適用する。
+///
+/// 並べ替えは `orient` が変換と同じ走査で並列に行う。結果は `image` クレートの
+/// `apply_orientation` と画素単位で同じ（8 通りの取り違えを防ぐため、`orient` の
+/// テストが `image` の実装を正解として突き合わせている）。
+fn apply_orientation(image: DynamicImage, exif_orientation: u16, apply: bool) -> (RgbaImage, bool) {
+    orient::to_rgba8_oriented(image, if apply { exif_orientation } else { 1 })
 }
 
 #[cfg(test)]
@@ -435,9 +423,8 @@ mod tests {
     }
 
     /// 目印(赤)の座標を返す。
-    fn mark_at(img: &DynamicImage) -> (u32, u32) {
-        let rgba = img.to_rgba8();
-        rgba.enumerate_pixels()
+    fn mark_at(img: &RgbaImage) -> (u32, u32) {
+        img.enumerate_pixels()
             .find(|(_, _, p)| p[0] == 255)
             .map(|(x, y, _)| (x, y))
             .expect("目印が消えている")
@@ -445,7 +432,15 @@ mod tests {
 
     #[test]
     fn orientation_1_leaves_the_image_untouched() {
-        let (img, applied) = apply_orientation(marked(), 1);
+        let (img, applied) = apply_orientation(marked(), 1, true);
+        assert!(!applied);
+        assert_eq!((img.width(), img.height()), (2, 3));
+        assert_eq!(mark_at(&img), (0, 0));
+    }
+
+    #[test]
+    fn orientation_is_skipped_when_disabled() {
+        let (img, applied) = apply_orientation(marked(), 6, false);
         assert!(!applied);
         assert_eq!((img.width(), img.height()), (2, 3));
         assert_eq!(mark_at(&img), (0, 0));
@@ -453,7 +448,7 @@ mod tests {
 
     #[test]
     fn orientation_2_mirrors_horizontally() {
-        let (img, applied) = apply_orientation(marked(), 2);
+        let (img, applied) = apply_orientation(marked(), 2, true);
         assert!(applied);
         assert_eq!((img.width(), img.height()), (2, 3));
         assert_eq!(mark_at(&img), (1, 0), "左上の目印が右上に移るべき");
@@ -461,21 +456,21 @@ mod tests {
 
     #[test]
     fn orientation_3_rotates_180_degrees() {
-        let (img, _) = apply_orientation(marked(), 3);
+        let (img, _) = apply_orientation(marked(), 3, true);
         assert_eq!((img.width(), img.height()), (2, 3));
         assert_eq!(mark_at(&img), (1, 2), "左上の目印が右下に移るべき");
     }
 
     #[test]
     fn orientation_4_mirrors_vertically() {
-        let (img, _) = apply_orientation(marked(), 4);
+        let (img, _) = apply_orientation(marked(), 4, true);
         assert_eq!((img.width(), img.height()), (2, 3));
         assert_eq!(mark_at(&img), (0, 2), "左上の目印が左下に移るべき");
     }
 
     #[test]
     fn orientation_6_rotates_90_clockwise() {
-        let (img, applied) = apply_orientation(marked(), 6);
+        let (img, applied) = apply_orientation(marked(), 6, true);
         assert!(applied);
         assert_eq!((img.width(), img.height()), (3, 2), "縦横が入れ替わるべき");
         assert_eq!(mark_at(&img), (2, 0), "左上の目印が右上に移るべき");
@@ -483,7 +478,7 @@ mod tests {
 
     #[test]
     fn orientation_8_rotates_270_clockwise() {
-        let (img, _) = apply_orientation(marked(), 8);
+        let (img, _) = apply_orientation(marked(), 8, true);
         assert_eq!((img.width(), img.height()), (3, 2), "縦横が入れ替わるべき");
         assert_eq!(mark_at(&img), (0, 1), "左上の目印が左下に移るべき");
     }
@@ -491,7 +486,7 @@ mod tests {
     #[test]
     fn transposed_orientations_swap_dimensions() {
         for value in [5, 7] {
-            let (img, applied) = apply_orientation(marked(), value);
+            let (img, applied) = apply_orientation(marked(), value, true);
             assert!(applied, "orientation {value} が適用されていない");
             assert_eq!((img.width(), img.height()), (3, 2), "orientation {value}");
         }
@@ -500,7 +495,7 @@ mod tests {
     #[test]
     fn out_of_range_orientations_are_ignored() {
         for value in [0, 9, 65535] {
-            let (img, applied) = apply_orientation(marked(), value);
+            let (img, applied) = apply_orientation(marked(), value, true);
             assert!(!applied, "orientation {value} を適用してはいけない");
             assert_eq!((img.width(), img.height()), (2, 3));
         }

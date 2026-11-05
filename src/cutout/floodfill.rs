@@ -693,45 +693,97 @@ fn expand(w: u32, h: u32, seed: BitPlane, stage: &Expansion) -> BitPlane {
     let Some(limit) = stage.reach else {
         return expand_closure(w, h, seed, stage);
     };
-    let lab = stage.lab;
     let mut filled = seed;
     let stride = w as usize;
-    let idx = |x: u32, y: u32| (y as usize) * stride + (x as usize);
-    // 起点からの測地距離。起点そのものは 0、そこから 1px 進むごとに 1 増える。
+
+    // 測地距離で 1 層ずつ進める（`grow_by_layers`）。距離の表は要らない——
+    // いま何層目かを数えれば足りる。
     //
-    // 距離を数えるのは影の段だけなので、その段でしか確保しない。12MP では
-    // `u32` の表が 48MB あり、使わない段でも積むと丸ごと無駄になる。
-    // 進める距離は `shadow_reach` の上限 64px までなので 1 バイトで足りる
-    // （万一それを超える指定が来ても、飽和して早く止まるだけで壊れない）
-    let mut distance = vec![0u8; filled.len()];
-
-    // キューに積むのは「まだ埋まっていない 4 近傍を持つ画素」だけにする。
-    //
-    // 種は前段の背景そのもので、12MP では 700 万画素に達する。全部積むと
-    // `VecDeque` の倍化だけで 100MB を超えるが、隣がすべて埋まっている画素を
-    // 取り出しても何も起きないので、結果は変わらない
-    let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
-    push_frontier(w, h, &filled, &mut queue);
-
-    while let Some((x, y)) = queue.pop_front() {
-        let from = lab[idx(x, y)];
-        let travelled = u32::from(distance[idx(x, y)]);
-        if travelled >= limit {
-            continue;
-        }
-        for (nx, ny, dx, dy) in neighbours(w, h, x, y) {
-            let i = idx(nx, ny);
-            if filled.get(i) || !stage.accepts(w, h, nx, ny, dx, dy, from) {
-                continue;
-            }
-            filled.insert(i);
-            distance[i] = u8::try_from(travelled + 1).unwrap_or(u8::MAX);
-            queue.push_back((nx, ny));
-        }
-    }
-
+    // 0 層目に積むのは「まだ埋まっていない 4 近傍を持つ画素」だけにする。
+    // 種は前段の背景そのもので、12MP では 700 万画素に達する。隣がすべて
+    // 埋まっている画素からは何も進めないので、結果は変わらない
+    let layer: Vec<usize> = frontier_rows(w, h, &filled)
+        .into_iter()
+        .enumerate()
+        .flat_map(|(y, row)| row.into_iter().map(move |x| y * stride + x as usize))
+        .collect();
+    grow_by_layers(w, h, &mut filled, layer, limit, stage);
     filled
 }
+
+/// `layer`（埋まっている画素）から、測地距離で 1 層ずつ `limit` 層まで広げる。
+///
+/// k+1 層目は「k 層目のどれかの隣から受け入れられ、まだ埋まっていない画素」の
+/// 集合で、`accepts` がフィルの状態を見ない以上、層の中を辿る順序に依らない。
+/// だから 1 本のキューで辿ったときと同じ画素に同じ距離がつき、層の中は並列に
+/// 回せる。大きな層は塊に割って並列に候補を集め、小さな層はその場で 1 本の
+/// スレッドで辿る——層ごとに rayon へ渡す手間は数十 µs あり、数千画素までの
+/// 層では辿る仕事より重い。
+///
+/// 距離の上限が無い `expand_closure` の 1 本のキューへ落ちる経路には使わない。
+/// 24.5MP の実写では、そこは千数百画素の層が 1800 段続く細い波面で、並列に
+/// 回すと 51ms が 85〜108ms に延びた
+fn grow_by_layers(
+    w: u32,
+    h: u32,
+    filled: &mut BitPlane,
+    mut layer: Vec<usize>,
+    limit: u32,
+    stage: &Expansion,
+) {
+    let (stride, lab) = (w as usize, stage.lab);
+    let mut next = Vec::new();
+    for _ in 0..limit {
+        if layer.is_empty() {
+            break;
+        }
+        if layer.len() <= LAYER_CHUNK {
+            for &i in &layer {
+                let (x, y) = ((i % stride) as u32, (i / stride) as u32);
+                for (nx, ny, dx, dy) in neighbours(w, h, x, y) {
+                    let j = (ny as usize) * stride + nx as usize;
+                    if !filled.get(j) && stage.accepts(w, h, nx, ny, dx, dy, lab[i]) {
+                        filled.insert(j);
+                        next.push(j);
+                    }
+                }
+            }
+        } else {
+            // 層の間は `filled` を書き換えないので、塊ごとに読むだけで済む。
+            // 同じ画素が複数の隣から挙がりうるが、下で 1 度だけ埋める
+            let filled_now = &*filled;
+            let reached: Vec<usize> = layer
+                .par_chunks(LAYER_CHUNK)
+                .flat_map_iter(|chunk| {
+                    let mut out = Vec::new();
+                    for &i in chunk {
+                        let (x, y) = ((i % stride) as u32, (i / stride) as u32);
+                        for (nx, ny, dx, dy) in neighbours(w, h, x, y) {
+                            let j = (ny as usize) * stride + nx as usize;
+                            if !filled_now.get(j) && stage.accepts(w, h, nx, ny, dx, dy, lab[i]) {
+                                out.push(j);
+                            }
+                        }
+                    }
+                    out
+                })
+                .collect();
+            for j in reached {
+                if !filled.get(j) {
+                    filled.insert(j);
+                    next.push(j);
+                }
+            }
+        }
+        std::mem::swap(&mut layer, &mut next);
+        next.clear();
+    }
+}
+
+/// `expand` が 1 層を割る単位。`accepts` は 1 画素あたり数十 ns なので、
+/// これより細かく割ると rayon の受け渡しのほうが重くなる。テストでは小さな
+/// 画像でも層が複数の塊に割れるよう、細かくする
+const LAYER_CHUNK: usize = if cfg!(test) { 16 } else { 4096 };
 
 /// 4 近傍のうち画像の中にあるものを、(x, y, 進む向き) で返す。
 #[inline]
@@ -1225,9 +1277,16 @@ fn fill_from_border_bfs(
 /// 隣がすべて埋まっている画素を取り出しても何も起きないので、結果は変わらない。
 /// 種が画像の大半を占めるとき、全部積むとキューだけで 3 桁 MB になる。
 fn push_frontier(w: u32, h: u32, filled: &BitPlane, queue: &mut VecDeque<(u32, u32)>) {
-    let idx = |x: u32, y: u32| (y as usize) * (w as usize) + (x as usize);
     // 行ごとに並列に拾い、行の順に積む。積む順序はラスター順のまま変わらない
-    let rows: Vec<Vec<u32>> = (0..h)
+    for (y, row) in frontier_rows(w, h, filled).into_iter().enumerate() {
+        queue.extend(row.into_iter().map(|x| (x, y as u32)));
+    }
+}
+
+/// 埋まっていて、まだ埋まっていない 4 近傍を持つ画素の x を、行ごとに返す。
+fn frontier_rows(w: u32, h: u32, filled: &BitPlane) -> Vec<Vec<u32>> {
+    let idx = |x: u32, y: u32| (y as usize) * (w as usize) + (x as usize);
+    (0..h)
         .into_par_iter()
         .map(|y| {
             let mut row = Vec::new();
@@ -1245,10 +1304,7 @@ fn push_frontier(w: u32, h: u32, filled: &BitPlane, queue: &mut VecDeque<(u32, u
             }
             row
         })
-        .collect();
-    for (y, row) in rows.into_iter().enumerate() {
-        queue.extend(row.into_iter().map(|x| (x, y as u32)));
-    }
+        .collect()
 }
 
 /// `--fg-seed` の周囲を保護領域として塗る。種が無ければ表そのものを作らない。

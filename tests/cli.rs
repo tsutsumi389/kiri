@@ -3302,20 +3302,6 @@ fn png_chunk_kinds(bytes: &[u8]) -> Vec<[u8; 4]> {
     kinds
 }
 
-/// 指定した型のチャンクを落とす。CRC はチャンクごと持ち運ぶので計算し直さない
-fn png_without_chunk(bytes: &[u8], kind: &[u8; 4]) -> Vec<u8> {
-    let mut out = bytes[..8].to_vec();
-    let mut i = 8;
-    while i < bytes.len() {
-        let len = u32::from_be_bytes(bytes[i..i + 4].try_into().unwrap()) as usize;
-        if &bytes[i + 4..i + 8] != kind {
-            out.extend_from_slice(&bytes[i..i + 12 + len]);
-        }
-        i += 12 + len;
-    }
-    out
-}
-
 /// 回転結果の JSON を取る。角度以外は常に同じ呼び方をする。
 fn rotate_json(input: &Path, output: &Path, angle: &str, extra: &[&str]) -> Value {
     let mut args: Vec<String> = vec![
@@ -3376,7 +3362,7 @@ fn rotate_normalizes_a_negative_angle_to_a_clockwise_one() {
 }
 
 #[test]
-fn rotate_by_a_full_turn_returns_the_original_bytes() {
+fn rotate_by_a_full_turn_returns_the_original_pixels() {
     let dir = fixture_dir();
     let input = rotate_fixture(&dir);
     let output = dir.path().join("out.png");
@@ -3392,10 +3378,17 @@ fn rotate_by_a_full_turn_returns_the_original_bytes() {
             .count(),
         1
     );
+    // **バイト列では比べない。** 入力は `image` の素のエンコーダで書いたもので、
+    // kiri の PNG は deflate を塊ごとに並列に回すので、同じ画素でも圧縮の中身が違う
+    let decode = |bytes: &[u8]| {
+        image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
+            .unwrap()
+            .into_rgba8()
+    };
     assert_eq!(
-        std::fs::read(&input).unwrap(),
-        png_without_chunk(&written, b"iCCP"),
-        "1 周は何もしないのと同じでなければならない（sRGB の名乗りを除く）"
+        decode(&std::fs::read(&input).unwrap()),
+        decode(&written),
+        "1 周は何もしないのと同じでなければならない"
     );
 }
 

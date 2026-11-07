@@ -51,6 +51,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 fast_image_resize = "5.1.4"
 rayon = "1.12.0"
+# PNG の書き出しを行の塊ごとに並列にする（`image_io/png_encode.rs`）。3 つとも
+# `image` の png 経路がすでに引いている版で、依存の木は増えない。png は IHDR・iCCP・
+# IEND の書き出しに、flate2 は塊ごとの raw deflate に、simd-adler32 は塊ごとの
+# adler32 に使う
+png = "0.18.1"
+flate2 = "1.1"
+simd-adler32 = "0.3"
 # pure Rust の ONNX 推論。C 依存は無い（`cargo tree -e normal` に `*-sys` が
 # 1 つも現れない）。`segment` feature でのみ引く
 tract-onnx = { version = "0.23.7", optional = true }

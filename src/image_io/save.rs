@@ -387,24 +387,13 @@ fn encode_avif(image: &RgbaImage, opts: &SaveOptions) -> Result<Vec<u8>> {
 }
 
 fn encode_png(image: &RgbaImage, icc: IccPolicy) -> Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    let mut encoder = image::codecs::png::PngEncoder::new(&mut buf);
-    if icc == IccPolicy::Embed {
-        // sRGB チャンクは併記しない。PNG 3 が iCCP との併存を should not とし、
-        // png クレートも 2 つを排他にしている
-        encoder
-            .set_icc_profile(srgb_icc().to_vec())
-            .map_err(|e| Error::new(ErrorCode::PngEncodeFailed, e.to_string()))?;
-    }
-    encoder
-        .write_image(
-            image.as_raw(),
-            image.width(),
-            image.height(),
-            ExtendedColorType::Rgba8,
-        )
-        .map_err(|e| Error::new(ErrorCode::PngEncodeFailed, e.to_string()))?;
-    Ok(buf)
+    // sRGB チャンクは併記しない。PNG 3 が iCCP との併存を should not とし、
+    // png クレートも 2 つを排他にしている
+    let profile = (icc == IccPolicy::Embed).then(srgb_icc);
+    // 行の塊ごとに並列に圧縮する。デコードした画素は `image` の `PngEncoder` と
+    // 同じで、違うのは deflate の中身（圧縮器と塊の切れ目）だけ（`png_encode` の冒頭を参照）
+    super::png_encode::encode_rgba8(image.as_raw(), image.width(), image.height(), profile)
+        .map_err(|e| Error::new(ErrorCode::PngEncodeFailed, e))
 }
 
 /// WebP が 1 辺に持てる最大の画素数。VP8L のヘッダが幅と高さを 14 bit で持つ。
@@ -1114,9 +1103,12 @@ mod tests {
         None
     }
 
-    /// ICC を抜けば `image` の素の PNG エンコーダと 1 バイトも違わない
+    /// ICC を抜けば、チャンクの並びとデコードした画素が `image` の素の PNG
+    /// エンコーダと同じ。**バイト列は一致しない**（圧縮器が違い、deflate を塊ごとに
+    /// 切って並列に回すため）。フィルタ済みの列の一致は
+    /// `png_encode::tests::filtered_rows_match_png_crate_after_inflate` が見る
     #[test]
-    fn icc_none_png_is_the_plain_encoder_output() {
+    fn icc_none_png_decodes_like_the_plain_encoder() {
         let img = gradient(true);
         let mut plain = Vec::new();
         image::codecs::png::PngEncoder::new(&mut plain)
@@ -1127,7 +1119,16 @@ mod tests {
                 ExtendedColorType::Rgba8,
             )
             .unwrap();
-        assert_eq!(encoded(&img, OutputFormat::Png, IccPolicy::None), plain);
+        let ours = encoded(&img, OutputFormat::Png, IccPolicy::None);
+        let kinds =
+            |png: &[u8]| -> Vec<[u8; 4]> { png_chunks(png).into_iter().map(|(k, _)| k).collect() };
+        assert_eq!(kinds(&ours), kinds(&plain));
+        let decode = |png: &[u8]| {
+            image::load_from_memory_with_format(png, image::ImageFormat::Png)
+                .unwrap()
+                .into_rgba8()
+        };
+        assert_eq!(decode(&ours), img);
     }
 
     /// **品質は `DEFAULT_QUALITY` から引く。** ここが見ているのは「ICC を抜けば

@@ -2007,9 +2007,15 @@ fn a_decoration_has_no_display() {
 /// **`--profile` を渡さない出力を main の build に釘で留める**（§12.5 の 1）。
 ///
 /// 字体の要らない spec（画像 1 枚、枠と素材が同じ寸法なので縮小も走らない）を
-/// 組み、書いたバイト列の SHA-256 と結果 JSON のキーの集合を、Phase 31 の前の
-/// build（6c380ec）で取った値と比べる。**手で並べて確かめた一致を、次の変更で
-/// 黙って失わないため**である。
+/// 組み、デコードした画素の SHA-256 と結果 JSON のキーの集合を、Phase 31 の前の
+/// build（6c380ec）と同じ画素を書いていた build で取った値と比べる。**手で並べて
+/// 確かめた一致を、次の変更で黙って失わないため**である。
+///
+/// **バイト列ではなく画素で留める。** 以前はファイルの SHA-256 とバイト数を
+/// 留めていたが、PNG の圧縮を塊ごとの並列に替えた（`image_io/png_encode.rs`）
+/// ときに、画素は同じまま圧縮の中身だけが変わった。留めたいのは組版の結果で
+/// あって、圧縮器の選び方ではない。値は替える直前の main（4153334、ファイルの
+/// SHA-256 が 6c380ec と一致していた build）の出力をデコードして取った
 ///
 /// 素材は透過の余白を持つので、`"trim": "none"` を書いて**`trim` を足す前の
 /// 振る舞い**で組む。既定（`alpha`）では余白を落として拡大するのでバイト列が
@@ -2052,14 +2058,19 @@ fn without_a_profile_the_output_matches_the_build_before_phase_31() {
     assert!(result.status.success());
     let report = json_stdout(&result);
 
+    let pixels = image::open(&out).unwrap().into_rgba8();
+    assert_eq!(pixels.dimensions(), (400, 400));
     let mut hasher = kiri::segment::sha256::Sha256::new();
-    hasher.update(&std::fs::read(&out).unwrap());
+    hasher.update(pixels.as_raw());
     assert_eq!(
         hasher.finish(),
-        PRE_PHASE_31_SHA256,
-        "書いたバイト列が変わった"
+        PRE_PHASE_31_PIXELS_SHA256,
+        "書いた画素が変わった"
     );
-    assert_eq!(report["output"]["bytes"], PRE_PHASE_31_BYTES);
+    assert_eq!(
+        report["output"]["bytes"],
+        std::fs::metadata(&out).unwrap().len()
+    );
 
     let keys = |v: &Value| -> Vec<String> {
         let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
@@ -2119,11 +2130,11 @@ fn without_a_profile_the_output_matches_the_build_before_phase_31() {
     );
 }
 
-/// 6c380ec の build で `without_a_profile_the_output_matches_the_build_before_phase_31`
-/// の spec を組んだときの値。
-const PRE_PHASE_31_SHA256: &str =
-    "e71520e62be951f84aff8decc1ed4d704d2946d9273b2f8f1549546bd178268e";
-const PRE_PHASE_31_BYTES: u64 = 63235;
+/// `without_a_profile_the_output_matches_the_build_before_phase_31` の spec を
+/// 組んだ出力の、デコードした RGBA の SHA-256。ファイルとしては 6c380ec の
+/// build で SHA-256 `e71520e6…268e`・63235 バイトだったもの
+const PRE_PHASE_31_PIXELS_SHA256: &str =
+    "4ab3f8add8d7caf6848cc0692d68e8c83e33213eff60302c0532ffd1e6e0746b";
 
 // ---------------------------------------------------------------------------
 // 透過の余白: image 層の `trim` と `opaque_rect`

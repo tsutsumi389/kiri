@@ -8,6 +8,8 @@ use std::path::Path;
 use exif::{In, Tag};
 use image::{DynamicImage, ImageDecoder, ImageReader, RgbaImage};
 
+use rayon::prelude::*;
+
 use crate::color::icc::{self, Interpretation};
 use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::save::OutputFormat;
@@ -187,10 +189,21 @@ pub fn load_with(path: &Path, opts: &LoadOptions) -> Result<LoadedImage> {
         OutputFormat::WebP => webp_exif.as_deref().map_or((1, None), read_webp_exif),
         _ => read_exif(&bytes),
     };
-    let (mut image, orientation_applied) =
-        apply_orientation(dynamic, exif_orientation, opts.apply_orientation);
-    let color = normalize_color(&mut image, icc.as_deref(), exif_color_space, opts);
-    let has_alpha = image.pixels().any(|p| p[3] != 255);
+    // **ICC は回す前に解く。** 色の変換を RGBA 化・回転と同じ走査に載せるため
+    // （`orient::to_rgba8_oriented`）。分けると 24.5MP で 98MB をもう 1 度舐める
+    let interpreted = icc.as_deref().map(icc::interpret);
+    let transform = match interpreted.as_ref().map(|i| &i.interpretation) {
+        Some(Interpretation::Convertible(t)) if opts.convert_color => Some(&**t),
+        _ => None,
+    };
+    // **アルファを持てない形式は走査しない。** RGB やグレーは RGBA 化で 255 が
+    // 埋まり、色の変換もアルファに触れないので、答えは必ず `false` になる。
+    // 24.5MP の JPEG で 1 本 6ms の逐次の走査だった
+    let source_has_alpha = dynamic.color().has_alpha();
+    let (image, orientation_applied) =
+        apply_orientation(dynamic, exif_orientation, opts.apply_orientation, transform);
+    let color = normalize_color(interpreted, exif_color_space, opts);
+    let has_alpha = source_has_alpha && image.as_raw().par_chunks_exact(4).any(|p| p[3] != 255);
 
     Ok(LoadedImage {
         image,
@@ -261,13 +274,17 @@ struct ColorOutcome {
 ///
 /// ICC を EXIF より優先するのは、iPhone の JPEG が EXIF では uncalibrated と
 /// 名乗りつつ ICC で Display P3 だと明かすため。曖昧な申告より実体を採る。
+///
+/// **画素には触れない。** 変換そのものは `orient::to_rgba8_oriented` が RGBA 化と
+/// 同じ走査で済ませている。ここは「何をしたか」を報告に起こすだけで、
+/// `converted: true` を返す条件（`Convertible` かつ `convert_color`）は
+/// `load_with` が変換を渡す条件と同じでなければならない。
 fn normalize_color(
-    image: &mut RgbaImage,
-    icc: Option<&[u8]>,
+    icc: Option<icc::Icc>,
     exif_color_space: Option<u16>,
     opts: &LoadOptions,
 ) -> ColorOutcome {
-    let Some(bytes) = icc else {
+    let Some(interpreted) = icc else {
         return match exif_color_space {
             Some(0xFFFF) => ColorOutcome {
                 name: COLOR_SPACE_UNCALIBRATED.into(),
@@ -300,7 +317,7 @@ fn normalize_color(
     let icc::Icc {
         name: profile,
         interpretation,
-    } = icc::interpret(bytes);
+    } = interpreted;
     let label = match &profile {
         Some(n) => format!("'{n}'"),
         None => "（名前なし）".to_string(),
@@ -318,10 +335,9 @@ fn normalize_color(
             srgb: true,
             warnings: Vec::new(),
         },
-        Interpretation::Convertible(transform) => {
+        Interpretation::Convertible(_) => {
             let name = reported();
             if opts.convert_color {
-                transform.apply(image);
                 ColorOutcome {
                     name,
                     profile,
@@ -402,12 +418,18 @@ fn exif_fields(exif: &exif::Exif) -> (u16, Option<u16>) {
 }
 
 /// RGBA へ変換し、`apply` なら EXIF Orientation に従って回転・反転も適用する。
+/// `colour` があれば同じ走査で sRGB へ色を移す。
 ///
 /// 並べ替えは `orient` が変換と同じ走査で並列に行う。結果は `image` クレートの
 /// `apply_orientation` と画素単位で同じ（8 通りの取り違えを防ぐため、`orient` の
 /// テストが `image` の実装を正解として突き合わせている）。
-fn apply_orientation(image: DynamicImage, exif_orientation: u16, apply: bool) -> (RgbaImage, bool) {
-    orient::to_rgba8_oriented(image, if apply { exif_orientation } else { 1 })
+fn apply_orientation(
+    image: DynamicImage,
+    exif_orientation: u16,
+    apply: bool,
+    colour: Option<&icc::Transform>,
+) -> (RgbaImage, bool) {
+    orient::to_rgba8_oriented(image, if apply { exif_orientation } else { 1 }, colour)
 }
 
 #[cfg(test)]
@@ -432,7 +454,7 @@ mod tests {
 
     #[test]
     fn orientation_1_leaves_the_image_untouched() {
-        let (img, applied) = apply_orientation(marked(), 1, true);
+        let (img, applied) = apply_orientation(marked(), 1, true, None);
         assert!(!applied);
         assert_eq!((img.width(), img.height()), (2, 3));
         assert_eq!(mark_at(&img), (0, 0));
@@ -440,7 +462,7 @@ mod tests {
 
     #[test]
     fn orientation_is_skipped_when_disabled() {
-        let (img, applied) = apply_orientation(marked(), 6, false);
+        let (img, applied) = apply_orientation(marked(), 6, false, None);
         assert!(!applied);
         assert_eq!((img.width(), img.height()), (2, 3));
         assert_eq!(mark_at(&img), (0, 0));
@@ -448,7 +470,7 @@ mod tests {
 
     #[test]
     fn orientation_2_mirrors_horizontally() {
-        let (img, applied) = apply_orientation(marked(), 2, true);
+        let (img, applied) = apply_orientation(marked(), 2, true, None);
         assert!(applied);
         assert_eq!((img.width(), img.height()), (2, 3));
         assert_eq!(mark_at(&img), (1, 0), "左上の目印が右上に移るべき");
@@ -456,21 +478,21 @@ mod tests {
 
     #[test]
     fn orientation_3_rotates_180_degrees() {
-        let (img, _) = apply_orientation(marked(), 3, true);
+        let (img, _) = apply_orientation(marked(), 3, true, None);
         assert_eq!((img.width(), img.height()), (2, 3));
         assert_eq!(mark_at(&img), (1, 2), "左上の目印が右下に移るべき");
     }
 
     #[test]
     fn orientation_4_mirrors_vertically() {
-        let (img, _) = apply_orientation(marked(), 4, true);
+        let (img, _) = apply_orientation(marked(), 4, true, None);
         assert_eq!((img.width(), img.height()), (2, 3));
         assert_eq!(mark_at(&img), (0, 2), "左上の目印が左下に移るべき");
     }
 
     #[test]
     fn orientation_6_rotates_90_clockwise() {
-        let (img, applied) = apply_orientation(marked(), 6, true);
+        let (img, applied) = apply_orientation(marked(), 6, true, None);
         assert!(applied);
         assert_eq!((img.width(), img.height()), (3, 2), "縦横が入れ替わるべき");
         assert_eq!(mark_at(&img), (2, 0), "左上の目印が右上に移るべき");
@@ -478,7 +500,7 @@ mod tests {
 
     #[test]
     fn orientation_8_rotates_270_clockwise() {
-        let (img, _) = apply_orientation(marked(), 8, true);
+        let (img, _) = apply_orientation(marked(), 8, true, None);
         assert_eq!((img.width(), img.height()), (3, 2), "縦横が入れ替わるべき");
         assert_eq!(mark_at(&img), (0, 1), "左上の目印が左下に移るべき");
     }
@@ -486,7 +508,7 @@ mod tests {
     #[test]
     fn transposed_orientations_swap_dimensions() {
         for value in [5, 7] {
-            let (img, applied) = apply_orientation(marked(), value, true);
+            let (img, applied) = apply_orientation(marked(), value, true, None);
             assert!(applied, "orientation {value} が適用されていない");
             assert_eq!((img.width(), img.height()), (3, 2), "orientation {value}");
         }
@@ -495,7 +517,7 @@ mod tests {
     #[test]
     fn out_of_range_orientations_are_ignored() {
         for value in [0, 9, 65535] {
-            let (img, applied) = apply_orientation(marked(), value, true);
+            let (img, applied) = apply_orientation(marked(), value, true, None);
             assert!(!applied, "orientation {value} を適用してはいけない");
             assert_eq!((img.width(), img.height()), (2, 3));
         }
@@ -600,6 +622,45 @@ mod tests {
             converted.image.get_pixel(12, 12),
             "変換の有無で結果が変わらないのはおかしい"
         );
+    }
+
+    /// 向きを直さない読み込みでも色は移す。
+    ///
+    /// 色の変換は RGBA 化・回転と同じ走査に載っている（`orient`）。回さない
+    /// 経路で変換を落とすと、`--trimap` などの指示画像だけが P3 のまま残り、
+    /// しかも `color_converted: true` を名乗ることになる
+    #[test]
+    fn colour_is_converted_even_when_orientation_is_not_applied() {
+        use crate::color::synthetic::{build, display_p3};
+        let dir = tempfile::tempdir().unwrap();
+        let path = jpeg_with_profile(dir.path(), "p3.jpg", [200, 60, 40], &build(&display_p3()));
+        let unrotated = load_with(
+            &path,
+            &LoadOptions {
+                apply_orientation: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let raw = load_with(
+            &path,
+            &LoadOptions {
+                convert_color: false,
+                apply_orientation: false,
+            },
+        )
+        .unwrap();
+        assert!(unrotated.color_converted);
+        assert_eq!(
+            unrotated.image.as_raw(),
+            load(&path).unwrap().image.as_raw(),
+            "向きの無い素材では、向きを直すかどうかで色が変わってはいけない"
+        );
+        assert_ne!(
+            unrotated.image.get_pixel(12, 12),
+            raw.image.get_pixel(12, 12)
+        );
+        assert!(!unrotated.has_alpha && !raw.has_alpha);
     }
 
     /// sRGB 相当と判定して素通ししても、どのプロファイルが付いていたかは残す。

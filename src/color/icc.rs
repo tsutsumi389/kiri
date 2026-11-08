@@ -78,6 +78,14 @@ impl Transform {
         });
     }
 
+    /// 1 画素の変換を閉包で返す。**読み込みが RGBA 化・回転と同じ走査で色を移す**
+    /// ための入口（`image_io::orient`）。答えは `apply` と 1 ビットも違わない——
+    /// 同じ `convert_with` を同じ表で引くだけで、どこで呼ぶかが違うだけである。
+    pub fn pixel_map(&self) -> impl Fn([u8; 3]) -> [u8; 3] + Sync + '_ {
+        let enc: &[f32; ENCODE_STEPS + 1] = &ENCODE;
+        move |rgb| self.convert_with(enc, rgb)
+    }
+
     /// 1 画素だけ変換する。検証と診断のための入口。
     pub fn convert_pixel(&self, rgb: [u8; 3]) -> [u8; 3] {
         self.convert_with(&ENCODE, rgb)

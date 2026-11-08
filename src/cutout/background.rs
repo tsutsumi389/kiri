@@ -715,26 +715,82 @@ impl KnownBackground<'_> {
         off_band && inside(self.outside_bbox) && inside(self.outside_subject)
     }
 
+    /// 行 `y` の判定を先に済ませる。
+    ///
+    /// 帯・矩形の「y の側」は行の中で変わらないので、画素ごとに測り直さない。
+    /// 2 回目のパスは `filled` があるので全画素を舐める（20MP で 2000 万回）
+    fn row(&self, y: u32, w: u32, h: u32) -> KnownRow<'_> {
+        // 矩形の外か：行そのものが矩形の上下に外れていれば、行全体が外
+        let span = |r: Option<(u32, u32, u32, u32)>| match r {
+            None => RowSpan::Never,
+            Some((_, y1, _, y2)) if y < y1 || y > y2 => RowSpan::Always,
+            Some((x1, _, x2, _)) => RowSpan::Outside(x1, x2),
+        };
+        KnownRow {
+            band: self.band,
+            w,
+            band_row: self.band > 0 && (y < self.band || y + self.band >= h),
+            bbox: span(self.outside_bbox),
+            subject: span(self.outside_subject),
+            // 寸法の合わない制約は無いものとして扱う（もとの判定と同じ）
+            constraints: self
+                .constraints
+                .filter(|c| c.width() == w && c.height() == h),
+            filled: self.filled,
+        }
+    }
+}
+
+/// [`KnownBackground::row`] が返す、1 行ぶんの判定。
+struct KnownRow<'a> {
+    band: u32,
+    w: u32,
+    /// 行そのものが外周の帯（上端か下端）にかかっている
+    band_row: bool,
+    bbox: RowSpan,
+    subject: RowSpan,
+    constraints: Option<&'a Constraints>,
+    filled: Option<&'a [bool]>,
+}
+
+/// 「矩形の外は背景」が 1 行の中でどう効くか。
+#[derive(Clone, Copy)]
+enum RowSpan {
+    /// 矩形が無い
+    Never,
+    /// 行が矩形の上下に外れている。行の全画素が外
+    Always,
+    /// `x < x1 || x > x2` の画素だけが外
+    Outside(u32, u32),
+}
+
+impl RowSpan {
+    #[inline]
+    fn holds(self, x: u32) -> bool {
+        match self {
+            RowSpan::Never => false,
+            RowSpan::Always => true,
+            RowSpan::Outside(x1, x2) => x < x1 || x > x2,
+        }
+    }
+}
+
+impl KnownRow<'_> {
     /// 外周の帯の上か。**場を諦めるかどうかは帯だけで決める。**
     /// `--bbox` の外や確定背景は利用者が与えたもので、「この素材から場を
     /// 作れるか」は kiri 自身が見た帯の話である。
     #[inline]
-    fn on_band(&self, x: u32, y: u32, w: u32, h: u32) -> bool {
-        self.band > 0
-            && (x < self.band || y < self.band || x + self.band >= w || y + self.band >= h)
+    fn on_band(&self, x: u32) -> bool {
+        self.band > 0 && (self.band_row || x < self.band || x + self.band >= self.w)
     }
 
+    /// 画素 `x`（全体の添字 `i`）が既知の背景か。
     #[inline]
-    fn holds(&self, x: u32, y: u32, i: usize, w: u32, h: u32) -> bool {
-        let outside = |r: Option<(u32, u32, u32, u32)>| {
-            r.is_some_and(|(x1, y1, x2, y2)| x < x1 || x > x2 || y < y1 || y > y2)
-        };
-        self.on_band(x, y, w, h)
-            || outside(self.outside_bbox)
-            || outside(self.outside_subject)
-            || self
-                .constraints
-                .is_some_and(|c| c.width() == w && c.height() == h && c.has_bg(i))
+    fn holds(&self, x: u32, i: usize) -> bool {
+        self.on_band(x)
+            || self.bbox.holds(x)
+            || self.subject.holds(x)
+            || self.constraints.is_some_and(|c| c.has_bg(i))
             || self.filled.is_some_and(|f| f.get(i) == Some(&true))
     }
 }
@@ -813,9 +869,9 @@ pub fn estimate_field(
     // 働くスレッドの数だけ作る（セルの行ごとではない——256KB の表を 256 回
     // 確保する理由が無い）
     //
-    // セル 1 つぶんの標本だけを持ち、セルごとに使い回す。**全画素ぶんの表は
-    // 作らない**——20MP の線形 RGB を溜めると 240MB になり、場そのものより
-    // 桁違いに重い。1 セルは 20MP / 49152 セルで 400 画素ほどにしかならない。
+    // セル 1 つぶんの度数表（3 チャンネル x 256 段）だけを持ち、セルごとに
+    // 使い回す。**全画素ぶんの表は作らない**——20MP の線形 RGB を溜めると
+    // 240MB になり、場そのものより桁違いに重い。
     //
     // 中央値は単調変換と交換できるので、8bit のまま採ってから線形へ移してよい
     let (band_seen, band_kept) = value
@@ -823,17 +879,12 @@ pub fn estimate_field(
         .zip(weight.par_chunks_mut(cols))
         .enumerate()
         .map_init(
-            || {
-                (
-                    ColourGate::new(rgb, limit),
-                    Vec::<[u8; 3]>::new(),
-                    Vec::<u8>::new(),
-                )
-            },
-            |(gate, samples, channel), (cy, (value, weight))| {
+            || (ColourGate::new(rgb, limit), Box::new([[0u32; 256]; 3])),
+            |(gate, hist), (cy, (value, weight))| {
                 let (mut band_seen, mut band_kept) = (0u64, 0u64);
                 let y0 = (cy as u64 * u64::from(h) / rows as u64) as u32;
                 let y1 = (((cy + 1) as u64 * u64::from(h) / rows as u64) as u32).max(y0 + 1);
+                let raw = image.as_raw();
                 for cx in 0..cols {
                     let x0 = (cx as u64 * u64::from(w) / cols as u64) as u32;
                     let x1 = (((cx + 1) as u64 * u64::from(w) / cols as u64) as u32).max(x0 + 1);
@@ -841,41 +892,47 @@ pub fn estimate_field(
                     if known.certainly_empty(x0, y0, x1.min(w) - 1, y1.min(h) - 1, w, h) {
                         continue;
                     }
-                    samples.clear();
+                    // **中央値は 256 段の度数表で採る。** 値は 8bit なので、
+                    // 標本を溜めて `select_nth_unstable` に掛けたのと同じ値が出る
+                    // （n/2 番目＝累積が初めて n/2 を超える段）
+                    for channel in hist.iter_mut() {
+                        channel.fill(0);
+                    }
+                    let mut taken = 0usize;
                     for y in y0..y1.min(h) {
                         let row = (y as usize) * (w as usize);
+                        let line = known.row(y, w, h);
                         for x in x0..x1.min(w) {
                             let i = row + (x as usize);
-                            let p = image.get_pixel(x, y).0;
+                            let p = &raw[i * 4..i * 4 + 4];
                             // 透明な画素は色を持たない。切り抜き済みの再処理で
                             // 混ぜると、透明部の黒が場を暗い側へ引く
-                            if p[3] < 250 || !known.holds(x, y, i, w, h) {
+                            if p[3] < 250 || !line.holds(x, i) {
                                 continue;
                             }
                             // 帯の画素がどれだけ門を通ったかを数える。**帯の
                             // 大半が商品なら場そのものを諦める**ための材料で、
                             // 門より先に数える
-                            let on_band = known.on_band(x, y, w, h);
+                            let on_band = line.on_band(x);
                             band_seen += u64::from(on_band);
                             if !gate.passes([p[0], p[1], p[2]]) {
                                 continue;
                             }
                             band_kept += u64::from(on_band);
-                            samples.push([p[0], p[1], p[2]]);
+                            hist[0][usize::from(p[0])] += 1;
+                            hist[1][usize::from(p[1])] += 1;
+                            hist[2][usize::from(p[2])] += 1;
+                            taken += 1;
                         }
                     }
                     let area = ((x1.min(w) - x0) as usize) * ((y1.min(h) - y0) as usize);
                     let needed = (area / MIN_CELL_SAMPLE_DIVISOR).max(1);
-                    if samples.len() < needed {
+                    if taken < needed {
                         continue;
                     }
-                    let middle = samples.len() / 2;
-                    for k in 0..3 {
-                        channel.clear();
-                        channel.extend(samples.iter().map(|s| s[k]));
-                        // 全部を並べ替える必要は無い。要るのは真ん中の 1 つだけ
-                        let (_, median, _) = channel.select_nth_unstable(middle);
-                        value[cx][k] = lut[*median as usize];
+                    let middle = taken / 2;
+                    for (k, channel) in hist.iter().enumerate() {
+                        value[cx][k] = lut[median_of(channel, middle)];
                     }
                     weight[cx] = 1.0;
                 }
@@ -927,6 +984,21 @@ pub fn estimate_field(
         },
         band_material,
     }
+}
+
+/// 度数表から、小さい順に並べて `middle` 番目（0 始まり）に来る値を返す。
+///
+/// 標本を並べ替えて `middle` 番目を採るのと同じ値になる。`middle` は
+/// 標本の数より小さいこと
+fn median_of(hist: &[u32; 256], middle: usize) -> usize {
+    let mut seen = 0usize;
+    for (value, &count) in hist.iter().enumerate() {
+        seen += count as usize;
+        if seen > middle {
+            return value;
+        }
+    }
+    unreachable!("middle は標本の数より小さい")
 }
 
 /// 未知のセルを正規化畳み込みで埋める。
@@ -1254,6 +1326,88 @@ mod tests {
 
     fn solid(w: u32, h: u32, rgba: [u8; 4]) -> RgbaImage {
         RgbaImage::from_pixel(w, h, Rgba(rgba))
+    }
+
+    /// 度数表の中央値は、標本を並べて n/2 番目を採ったのと同じ値になる。
+    /// 偶数個・重複・端の値（0 と 255）・1 個だけ、を通す
+    #[test]
+    fn the_histogram_median_matches_selecting_the_middle_sample() {
+        let mut state = 0x2545_f491_u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for n in [1usize, 2, 3, 4, 7, 64, 255, 256, 501] {
+            for spread in [1u32, 3, 40, 256] {
+                let mut samples: Vec<u8> = (0..n)
+                    .map(|i| match i % 11 {
+                        0 => 0,
+                        1 => 255,
+                        _ => (next() % spread) as u8,
+                    })
+                    .collect();
+                let mut hist = [0u32; 256];
+                for &s in &samples {
+                    hist[usize::from(s)] += 1;
+                }
+                let middle = n / 2;
+                let (_, want, _) = samples.select_nth_unstable(middle);
+                assert_eq!(
+                    median_of(&hist, middle),
+                    usize::from(*want),
+                    "n={n} spread={spread}"
+                );
+            }
+        }
+    }
+
+    /// 行ごとに先に求めた判定は、矩形・帯・制約・1 回目のフィルのどれについても
+    /// 画素ごとに素直に測った答えと一致する
+    #[test]
+    fn the_row_hoisted_known_test_matches_the_per_pixel_one() {
+        let (w, h) = (23u32, 17u32);
+        let mut constraints = Constraints::new(w, h);
+        let filled: Vec<bool> = (0..w * h).map(|i| i % 7 == 3).collect();
+        for i in (0..(w * h) as usize).step_by(5) {
+            constraints.mark_index(i, crate::cutout::constraints::Constraint::ForcedBg);
+        }
+        let cases = [
+            (0, None, None, false, false),
+            (2, None, None, false, false),
+            (3, Some((4, 5, 18, 12)), None, false, false),
+            (0, Some((4, 5, 18, 12)), Some((2, 1, 20, 15)), true, false),
+            (1, None, Some((0, 0, 22, 16)), false, true),
+            (4, Some((0, 3, 22, 9)), Some((6, 0, 10, 16)), true, true),
+        ];
+        for (band, bbox, subject, use_c, use_f) in cases {
+            let known = KnownBackground {
+                band,
+                outside_bbox: bbox,
+                outside_subject: subject,
+                constraints: use_c.then_some(&constraints),
+                filled: use_f.then_some(&filled[..]),
+            };
+            for y in 0..h {
+                let line = known.row(y, w, h);
+                for x in 0..w {
+                    let i = (y * w + x) as usize;
+                    let on_band =
+                        band > 0 && (x < band || y < band || x + band >= w || y + band >= h);
+                    let outside = |r: Option<(u32, u32, u32, u32)>| {
+                        r.is_some_and(|(x1, y1, x2, y2)| x < x1 || x > x2 || y < y1 || y > y2)
+                    };
+                    let want = on_band
+                        || outside(bbox)
+                        || outside(subject)
+                        || (use_c && constraints.has_bg(i))
+                        || (use_f && filled[i]);
+                    assert_eq!(line.on_band(x), on_band, "band x={x} y={y}");
+                    assert_eq!(line.holds(x, i), want, "holds x={x} y={y}");
+                }
+            }
+        }
     }
 
     #[test]

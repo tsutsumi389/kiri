@@ -22,6 +22,7 @@ use rayon::prelude::*;
 use crate::color::lab::{delta_e_rgb, delta_e76, linear_to_lab, srgb_linear_lut, srgb_to_lab};
 use crate::cutout::constraints::Constraints;
 use crate::cutout::edges::{GradientQuantiles, border_gradient_quantiles};
+use crate::cutout::mask::{FOREGROUND_THRESHOLD, Mask};
 
 /// 外周サンプルが背景色とみなせる ΔE の上限。
 /// CIE76 で 5 前後は「注意すれば違いが分かる」水準にあたる。
@@ -668,8 +669,12 @@ pub struct KnownBackground<'a> {
     pub outside_subject: Option<(u32, u32, u32, u32)>,
     /// 確定背景（`--trimap` / `--bg-mask` / `--bg-polygon`）
     pub constraints: Option<&'a Constraints>,
-    /// 1 回目のフィルが背景と判定した画素。2 回目のパスでだけ与える
-    pub filled: Option<&'a [bool]>,
+    /// 1 回目のフィルのマスク。背景と判定された画素（[`FOREGROUND_THRESHOLD`]
+    /// 未満）を既知の背景に数える。2 回目のパスでだけ与える。
+    ///
+    /// **真偽の表へ写さずにマスクのまま借りる。** 写すと 24.5MP で 24.5MB の
+    /// 表がもう 1 本、Lab の表と同じ区間に生きる
+    pub filled: Option<&'a Mask>,
 }
 
 /// 主体の矩形を場の推定で外側へ広げる割合。
@@ -736,7 +741,7 @@ impl KnownBackground<'_> {
             constraints: self
                 .constraints
                 .filter(|c| c.width() == w && c.height() == h),
-            filled: self.filled,
+            filled: self.filled.map(Mask::as_slice),
         }
     }
 }
@@ -750,7 +755,8 @@ struct KnownRow<'a> {
     bbox: RowSpan,
     subject: RowSpan,
     constraints: Option<&'a Constraints>,
-    filled: Option<&'a [bool]>,
+    /// 1 回目のフィルのマスクの画素。前景のしきい値未満が背景
+    filled: Option<&'a [u8]>,
 }
 
 /// 「矩形の外は背景」が 1 行の中でどう効くか。
@@ -791,7 +797,9 @@ impl KnownRow<'_> {
             || self.bbox.holds(x)
             || self.subject.holds(x)
             || self.constraints.is_some_and(|c| c.has_bg(i))
-            || self.filled.is_some_and(|f| f.get(i) == Some(&true))
+            || self
+                .filled
+                .is_some_and(|f| f.get(i).is_some_and(|&v| v < FOREGROUND_THRESHOLD))
     }
 }
 
@@ -1369,7 +1377,17 @@ mod tests {
     fn the_row_hoisted_known_test_matches_the_per_pixel_one() {
         let (w, h) = (23u32, 17u32);
         let mut constraints = Constraints::new(w, h);
+        // しきい値の両側（127 / 128）と両端を混ぜる
         let filled: Vec<bool> = (0..w * h).map(|i| i % 7 == 3).collect();
+        let mut filled_mask = Mask::new(w, h, 255);
+        for (i, slot) in filled_mask.as_mut_slice().iter_mut().enumerate() {
+            *slot = match (filled[i], i % 2 == 0) {
+                (true, true) => 0,
+                (true, false) => 127,
+                (false, true) => 128,
+                (false, false) => 255,
+            };
+        }
         for i in (0..(w * h) as usize).step_by(5) {
             constraints.mark_index(i, crate::cutout::constraints::Constraint::ForcedBg);
         }
@@ -1387,7 +1405,7 @@ mod tests {
                 outside_bbox: bbox,
                 outside_subject: subject,
                 constraints: use_c.then_some(&constraints),
-                filled: use_f.then_some(&filled[..]),
+                filled: use_f.then_some(&filled_mask),
             };
             for y in 0..h {
                 let line = known.row(y, w, h);

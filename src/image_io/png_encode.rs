@@ -56,7 +56,7 @@ pub fn encode_rgba8(
     height: u32,
     icc: Option<&[u8]>,
 ) -> Result<Vec<u8>, String> {
-    encode_with(data, width, height, icc, STRIP_BYTES)
+    encode_with(data, width, height, icc, STRIP_BYTES, MAX_IDAT_LEN)
 }
 
 fn encode_with(
@@ -65,6 +65,7 @@ fn encode_with(
     height: u32,
     icc: Option<&[u8]>,
     strip_bytes: usize,
+    max_idat: usize,
 ) -> Result<Vec<u8>, String> {
     let row = width as usize * 4;
     if data.len() != row * height as usize {
@@ -75,7 +76,9 @@ fn encode_with(
     }
 
     // 圧縮を先に済ませ、書き出し先を最終の大きさで一度だけ確保する
-    let zlib = zlib_stream(data, row, height as usize, strip_bytes)?;
+    let (strips, adler) = deflate_strips(data, row, height as usize, strip_bytes)?;
+    let deflated: usize = strips.iter().map(Vec::len).sum();
+    let zlib_len = ZLIB_HEADER.len() + deflated + 4;
 
     let mut info = png::Info::with_size(width, height);
     info.color_type = png::ColorType::Rgba;
@@ -83,25 +86,98 @@ fn encode_with(
     if let Some(profile) = icc {
         info.icc_profile = Some(Cow::Borrowed(profile));
     }
-    let mut buf = Vec::with_capacity(zlib.len() + icc.map_or(0, <[u8]>::len) + 1024);
+    let mut buf = Vec::with_capacity(zlib_len + icc.map_or(0, <[u8]>::len) + 1024);
+    // ヘッダ（IHDR・iCCP など）は png クレートに書かせる。IDAT を 1 つも渡さずに
+    // 閉じると末尾に IEND だけが付くので、それを外して IDAT を自分で足す
     let encoder = png::Encoder::with_info(&mut buf, info).map_err(|e| e.to_string())?;
-    let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
-    for chunk in zlib.chunks(MAX_IDAT_LEN) {
-        writer
-            .write_chunk(png::chunk::IDAT, chunk)
-            .map_err(|e| e.to_string())?;
-    }
+    let writer = encoder.write_header().map_err(|e| e.to_string())?;
     writer.finish().map_err(|e| e.to_string())?;
+    if !buf.ends_with(&IEND) {
+        return Err("PNG のヘッダの末尾に IEND がありません".to_string());
+    }
+    buf.truncate(buf.len() - IEND.len());
+
+    // **zlib の列を 1 本につなげた写しを作らない。** 塊を順に IDAT へ流し、流した塊は
+    // その場で手放す。つなげてから写すと、24.5MP では 25MB の列をもう 1 本抱える
+    let mut idat = IdatWriter::new(&mut buf, zlib_len, max_idat);
+    idat.write(&ZLIB_HEADER);
+    for strip in strips {
+        idat.write(&strip);
+    }
+    idat.write(&adler.to_be_bytes());
+    // 申告した長さを書き切っていないと、最後の IDAT が CRC を欠いたまま IEND が続く
+    debug_assert_eq!((idat.left_total, idat.left_chunk), (0, 0));
+    buf.extend_from_slice(&IEND);
     Ok(buf)
 }
 
-/// フィルタ済みの全行を 1 本の zlib ストリームにする。
-fn zlib_stream(
+/// CMF = deflate・窓 32KB、FLG = 水準 2 の「速い」（zlib が水準 2〜5 で書くのと同じ
+/// 2 バイト。FLEVEL は目安でしかなく、デコーダは見ない）
+const ZLIB_HEADER: [u8; 2] = [0x78, 0x5E];
+
+/// 中身の無い IEND チャンク（長さ 0・型・CRC）
+const IEND: [u8; 12] = [0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82];
+
+/// 長さの分かっている列を、切れ切れに受け取りながら IDAT チャンクとして書く。
+///
+/// 切れ目は `zlib.chunks(max)` と同じ——`max` バイトごとに 1 チャンク、最後だけ
+/// 端数——なので、列をつなげてから書いたときとバイト単位で同じ出力になる
+struct IdatWriter<'a> {
+    buf: &'a mut Vec<u8>,
+    /// まだ書いていない列の残り
+    left_total: usize,
+    /// 開いているチャンクの残り。0 なら次の `write` がチャンクを開く
+    left_chunk: usize,
+    max: usize,
+    crc: flate2::Crc,
+}
+
+impl<'a> IdatWriter<'a> {
+    fn new(buf: &'a mut Vec<u8>, total: usize, max: usize) -> Self {
+        // 0 では `write` がチャンクを開けずに回り続け、u32 を超えると長さの欄に載らない
+        debug_assert!(max > 0 && max <= u32::MAX as usize);
+        Self {
+            buf,
+            left_total: total,
+            left_chunk: 0,
+            max,
+            crc: flate2::Crc::new(),
+        }
+    }
+
+    fn write(&mut self, mut data: &[u8]) {
+        debug_assert!(data.len() <= self.left_total, "申告した長さを超えて書いた");
+        while !data.is_empty() {
+            if self.left_chunk == 0 {
+                let len = self.left_total.min(self.max);
+                self.buf.extend_from_slice(&(len as u32).to_be_bytes());
+                self.buf.extend_from_slice(b"IDAT");
+                self.crc = flate2::Crc::new();
+                self.crc.update(b"IDAT");
+                self.left_chunk = len;
+            }
+            let n = data.len().min(self.left_chunk);
+            let (now, rest) = data.split_at(n);
+            self.buf.extend_from_slice(now);
+            self.crc.update(now);
+            self.left_chunk -= n;
+            self.left_total -= n;
+            data = rest;
+            if self.left_chunk == 0 {
+                self.buf.extend_from_slice(&self.crc.sum().to_be_bytes());
+            }
+        }
+    }
+}
+
+/// フィルタ済みの全行を塊ごとに raw deflate にする。順につなげば 1 本の deflate
+/// ストリームになる。併せて、フィルタ済みの列全体の adler32 を返す。
+fn deflate_strips(
     data: &[u8],
     row: usize,
     height: usize,
     strip_bytes: usize,
-) -> Result<Vec<u8>, String> {
+) -> Result<(Vec<Vec<u8>>, u32), String> {
     let rows_per_strip = (strip_bytes / (row + 1)).max(1);
     let zero = vec![0u8; row];
 
@@ -117,18 +193,13 @@ fn zlib_stream(
         })
         .collect::<Result<_, String>>()?;
 
-    let total: usize = strips.iter().map(|s| s.0.len()).sum();
-    let mut out = Vec::with_capacity(2 + total + 4);
-    // CMF = deflate・窓 32KB、FLG = 水準 2 の「速い」（zlib が水準 2〜5 で書くのと同じ
-    // 2 バイト。FLEVEL は目安でしかなく、デコーダは見ない）
-    out.extend_from_slice(&[0x78, 0x5E]);
     let mut adler = 1u32;
-    for (deflated, strip_adler, len) in &strips {
-        out.extend_from_slice(deflated);
-        adler = adler32_combine(adler, *strip_adler, *len);
+    let mut out = Vec::with_capacity(strips.len());
+    for (deflated, strip_adler, len) in strips {
+        adler = adler32_combine(adler, strip_adler, len);
+        out.push(deflated);
     }
-    out.extend_from_slice(&adler.to_be_bytes());
-    Ok(out)
+    Ok((out, adler))
 }
 
 /// `y0..y1` の行に png クレートの `Filter::Adaptive` を掛け、行頭にフィルタの型を付けて並べる。
@@ -403,7 +474,7 @@ mod tests {
             let reference = adaptive_reference(&img);
             let row = w as usize * 4 + 1;
             for strip in [1, row, row * 3 + 1, row * 8, STRIP_BYTES] {
-                let ours = encode_with(img.as_raw(), w, h, None, strip).unwrap();
+                let ours = encode_with(img.as_raw(), w, h, None, strip, MAX_IDAT_LEN).unwrap();
                 assert_eq!(decoded(&ours), img, "{w}x{h} strip {strip}: 画素が違う");
                 assert_eq!(
                     inflated(&ours),
@@ -420,7 +491,7 @@ mod tests {
         let img = sample(20, 9);
         let profile = crate::color::srgb_profile::srgb_icc();
         for icc in [None, Some(profile)] {
-            let ours = chunks(&encode_with(img.as_raw(), 20, 9, icc, 64).unwrap());
+            let ours = chunks(&encode_with(img.as_raw(), 20, 9, icc, 64, MAX_IDAT_LEN).unwrap());
             let reference = chunks(&plain(&img, icc));
             let strip = |c: Vec<([u8; 4], Vec<u8>)>| -> Vec<([u8; 4], Vec<u8>)> {
                 c.into_iter().filter(|(k, _)| k != b"IDAT").collect()
@@ -452,9 +523,34 @@ mod tests {
     #[test]
     fn large_image_spanning_many_strips_round_trips() {
         let img = sample(300, 500);
-        let ours = encode_with(img.as_raw(), 300, 500, None, 4096).unwrap();
+        let ours = encode_with(img.as_raw(), 300, 500, None, 4096, MAX_IDAT_LEN).unwrap();
         assert_eq!(decoded(&ours), img);
         assert_eq!(inflated(&ours).len(), (300 * 4 + 1) * 500);
+    }
+
+    /// IDAT の上限を小さくして、塊の切れ目と IDAT の切れ目が食い違う形を通す。
+    /// 切れ目は「列をつなげてから上限ごとに切った」ものと同じで、CRC も合う
+    /// （`decoded` は CRC の合わないチャンクで落ちる）
+    #[test]
+    fn idat_chunks_split_at_the_limit_regardless_of_strip_boundaries() {
+        let img = sample(120, 90);
+        let whole = encode_with(img.as_raw(), 120, 90, None, 2048, MAX_IDAT_LEN).unwrap();
+        let stream: Vec<u8> = chunks(&whole)
+            .into_iter()
+            .filter(|(k, _)| k == b"IDAT")
+            .flat_map(|(_, d)| d)
+            .collect();
+        for max in [1, 7, 1000, stream.len() - 1, stream.len(), stream.len() + 1] {
+            let ours = encode_with(img.as_raw(), 120, 90, None, 2048, max).unwrap();
+            let idats: Vec<Vec<u8>> = chunks(&ours)
+                .into_iter()
+                .filter(|(k, _)| k == b"IDAT")
+                .map(|(_, d)| d)
+                .collect();
+            let want: Vec<Vec<u8>> = stream.chunks(max).map(<[u8]>::to_vec).collect();
+            assert_eq!(idats, want, "上限 {max}");
+            assert_eq!(decoded(&ours), img, "上限 {max}");
+        }
     }
 
     /// 圧縮の効かない入力を、小さな最初の確保で回す。「容量を使い切って広げ直す」

@@ -190,6 +190,14 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         }
     };
 
+    // **元画像はここで手放す。** この先で元の画素を読むのは `--preview` の
+    // 並べた図だけで、配置・影・書き出しはどれも切り抜いた結果のほうを使う。
+    // 抱えたままだと、24.5MP では 98MB が書き出しの山（切り抜いた画像と
+    // エンコードの作業域）にそのまま重なる。寸法は冒頭の `(w, h)` に取ってある
+    if args.preview.is_none() {
+        loaded.image = image::RgbaImage::default();
+    }
+
     // **`--rotate auto` はここで畳む。** 新しい幾何は 1 行も書かない——
     // `subject.level_rotation` は「`--rotate` にそのまま渡せる値」として
     // 返っているので、測ったものをそのまま下の `apply_rotation` へ渡す。

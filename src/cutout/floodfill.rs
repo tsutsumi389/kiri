@@ -31,6 +31,7 @@
 //! これがあるおかげで `step_tolerance` を小さく取っても背景が残らない。
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use image::RgbaImage;
 use rayon::prelude::*;
@@ -901,8 +902,15 @@ fn expand_closure(w: u32, h: u32, seed: BitPlane, stage: &Expansion) -> BitPlane
         // 受け渡しをそのまま種にして 1 本のキューで辿る。閉包は辿る順序に
         // 依らないので答えは変わらない
         if rounds == CLOSURE_ROUNDS {
+            // **その前に、列の帯で同じことを試す。** 行の帯で回が尽きない入力の
+            // 典型は「横に広い波面が縦に進む」形で、回ごとに帯を 1 本ずつしか
+            // 越えられないのが遅さの原因である。列に割れば波面そのものが帯ごとに
+            // 分かれ、それぞれが縦へ進み切る。列でも尽きなければ（迷路）、残りを
+            // 1 本のキューへ渡す
+            let pending: Handoff = inboxes.iter_mut().flat_map(|i| i.drain(..)).collect();
+            let pending = closure_by_columns(w, h, &mut words, pending, stage);
             let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
-            for (x, y) in inboxes.iter_mut().flat_map(|inbox| inbox.drain(..)) {
+            for (x, y) in pending {
                 set(&mut words, x, y as usize);
                 queue.push_back((x, y));
             }
@@ -988,6 +996,113 @@ fn expand_closure(w: u32, h: u32, seed: BitPlane, stage: &Expansion) -> BitPlane
         filled.insert_bits(y * stride, stride, row);
     }
     filled
+}
+
+/// `expand_closure` の続きを、**列の帯**に割って辿る。辿り切れなかった受け渡しを返す。
+///
+/// `pending` は「進んでよいと判定済みで、まだ立っていない画素」。`words` は行ごとに
+/// 語へ揃えた面（1 行 `w.div_ceil(64)` 語）で、辿った画素をそこへ立てて返す。
+///
+/// 作りは行の帯と同じ——帯ごとに自分の列だけを辿り、帯の外へ出る一歩は隣への
+/// 受け渡しに積み、回を重ねる。回数の上限も同じ（`CLOSURE_ROUNDS`）。閉包は辿る
+/// 順序に依らないので、ここでどこまで進めても、残りを誰が辿っても答えは同じである。
+///
+/// **面は原子的な語で共有する。** 列の帯は行と違って語の並びを連続した区間に
+/// 切れない（どの行にも全部の帯の語が並ぶ）し、帯の境目は語の途中に来る。
+/// 帯は自分の列のビットしか読まず、自分の列のビットしか立てないので、同じ語を
+/// 隣の帯と分け合っても `fetch_or` で互いの書き込みは失われない。順序づけは
+/// 要らない（`Relaxed`）——他の帯のビットを読まないからである。
+///
+/// 24.5MP の実写（`--tolerance 60`）では、1 本のキューで 51ms かかっていた 228 万
+/// 画素が、ここで並列に辿れる
+fn closure_by_columns(
+    w: u32,
+    h: u32,
+    words: &mut [u64],
+    pending: Handoff,
+    stage: &Expansion,
+) -> Handoff {
+    let stride = w as usize;
+    let wpr = stride.div_ceil(64);
+    // 帯の幅。行の帯の高さと同じ決め方
+    let strip = stride.div_ceil(4 * rayon::current_num_threads()).max(32);
+    let strips = stride.div_ceil(strip);
+    if strips < 2 || pending.is_empty() {
+        return pending;
+    }
+    let lab = stage.lab;
+    let shared: Vec<AtomicU64> = words.par_iter().map(|&v| AtomicU64::new(v)).collect();
+    let at = |x: u32, y: u32| &shared[y as usize * wpr + x as usize / 64];
+    let has = |x: u32, y: u32| at(x, y).load(Ordering::Relaxed) >> (x % 64) & 1 == 1;
+    let set = |x: u32, y: u32| {
+        at(x, y).fetch_or(1u64 << (x % 64), Ordering::Relaxed);
+    };
+
+    let mut inboxes: Vec<Handoff> = vec![Vec::new(); strips];
+    for (x, y) in pending {
+        inboxes[x as usize / strip].push((x, y));
+    }
+    for _ in 0..CLOSURE_ROUNDS {
+        if inboxes.iter().all(Vec::is_empty) {
+            break;
+        }
+        // 帯ごとに (左の帯へ, 右の帯へ) の受け渡しを返す
+        let outboxes: Vec<(Handoff, Handoff)> = inboxes
+            .par_iter_mut()
+            .enumerate()
+            .map(|(s, inbox)| {
+                let (x0, x1) = ((s * strip) as u32, ((s + 1) * strip).min(stride) as u32);
+                let mut left = Vec::new();
+                let mut right = Vec::new();
+                let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
+                for (x, y) in inbox.drain(..) {
+                    set(x, y);
+                    queue.push_back((x, y));
+                }
+                while let Some((x, y)) = queue.pop_front() {
+                    let from = lab[(y as usize) * stride + x as usize];
+                    for (nx, ny, dx, dy) in neighbours(w, h, x, y) {
+                        if nx < x0 || nx >= x1 {
+                            if stage.accepts(w, h, nx, ny, dx, dy, from) {
+                                if nx < x0 {
+                                    left.push((nx, ny))
+                                } else {
+                                    right.push((nx, ny))
+                                }
+                            }
+                            continue;
+                        }
+                        if has(nx, ny) || !stage.accepts(w, h, nx, ny, dx, dy, from) {
+                            continue;
+                        }
+                        set(nx, ny);
+                        queue.push_back((nx, ny));
+                    }
+                }
+                (left, right)
+            })
+            .collect();
+        for (s, (left, right)) in outboxes.into_iter().enumerate() {
+            if s > 0 {
+                inboxes[s - 1].extend(left);
+            }
+            if s + 1 < strips {
+                inboxes[s + 1].extend(right);
+            }
+        }
+        // すでに埋まっている画素への受け渡しは辿っても何も起きないので捨てる
+        inboxes.par_iter_mut().for_each(|inbox| {
+            inbox.retain(|&(x, y)| !has(x, y));
+            inbox.sort_unstable();
+            inbox.dedup();
+        });
+    }
+
+    words
+        .par_iter_mut()
+        .zip(shared)
+        .for_each(|(slot, word)| *slot = word.into_inner());
+    inboxes.into_iter().flatten().collect()
 }
 
 /// 幅 2k 以下の隙間を通ってしか外周に届かない背景を前景へ戻す（測地的オープニング）。
@@ -1647,6 +1762,23 @@ mod tests {
         let mut seed = BitPlane::new((w * h) as usize);
         seed.insert((w + 1) as usize);
         scenes.push((flags, vec![[500, 0, 0]; (w * h) as usize], seed));
+        // 横に蛇行する幅 1px の通路。奇数行を左右に走り、偶数行の端で下へ渡る。
+        // 行の帯を 1 本ずつ下りるので行の回数の上限を越え、列の帯の境目も
+        // 行ごとに往復するので列の回数の上限も越えて、1 本のキューまで落ちる。
+        // 上の縦の通路は逆に、列の帯へ渡ったところで辿り切れる
+        let mut flags = vec![0u8; (w * h) as usize];
+        for y in (1..h - 1).step_by(2) {
+            for x in 1..w - 1 {
+                flags[(y * w + x) as usize] = LOOSE;
+            }
+            let turn = if (y / 2) % 2 == 0 { w - 2 } else { 1 };
+            if y + 2 < h - 1 {
+                flags[((y + 1) * w + turn) as usize] = LOOSE;
+            }
+        }
+        let mut seed = BitPlane::new((w * h) as usize);
+        seed.insert((w + 1) as usize);
+        scenes.push((flags, vec![[500, 0, 0]; (w * h) as usize], seed));
 
         for (k, (flags, lab, seed)) in scenes.into_iter().enumerate() {
             let candidates = Candidates {
@@ -1670,6 +1802,11 @@ mod tests {
                         let mut filled = 0;
                         got.for_each_set(|_| filled += 1);
                         assert!(filled > 40 * 298, "通路を辿れていない: {filled}");
+                    }
+                    if k == 4 && reach.is_none() {
+                        let mut filled = 0;
+                        got.for_each_set(|_| filled += 1);
+                        assert!(filled > 140 * 88, "通路を辿れていない: {filled}");
                     }
                 }
             }

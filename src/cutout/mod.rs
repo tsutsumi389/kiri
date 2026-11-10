@@ -35,7 +35,6 @@ pub mod stage;
 pub mod subject;
 
 use image::RgbaImage;
-use rayon::prelude::*;
 
 use crate::warning::{Warning, WarningCode};
 
@@ -692,10 +691,9 @@ pub(crate) fn cutout_shared(
     //
     // 1 色モデルでは走らせない。場が無いのだから作り直すものも無い
     if model == ResolvedModel::Field {
-        if let Some((again, next_field, next_residual)) =
-            second_pass(image, terrain, &background, &mask, opts, &flood)
-        {
-            mask = again;
+        let (again, renewed) = second_pass(image, terrain, &background, mask, opts, &flood);
+        mask = again;
+        if let Some((next_field, next_residual)) = renewed {
             field = next_field;
             residual = next_residual;
         }
@@ -860,6 +858,11 @@ pub(crate) fn judge(
 ///
 /// 戻すのは新しいマスクと、新しい場、そして新しい残差である。芯の許容量は
 /// 残差から導くので、場を作り直したら許容量も引き直さなければ辻褄が合わない。
+/// 場を作り直せなかったときは、受け取ったマスクをそのまま返す（場と残差は `None`）。
+///
+/// **1 回目のマスクは受け取り切る（借りない）。** 要るのは場を作り直すところ
+/// までで、2 回目のフィルの前に手放す。借りたままだと、24.5MP では 24.5MB が
+/// Lab の表・候補のフラグ・2 回目のマスクと同じ区間に生きる
 ///
 /// **1 回目の結果を「背景」として信じてよい理由**は、フィルが外周からの連結性で
 /// しか背景を広げないことにある。商品の内部が背景と判定されることは（輪郭が
@@ -869,21 +872,11 @@ fn second_pass(
     image: &RgbaImage,
     terrain: &floodfill::Terrain,
     background: &BackgroundEstimate,
-    mask: &Mask,
+    mask: Mask,
     opts: &CutoutOptions,
     flood: &FloodOptions<'_>,
-) -> Option<(Mask, BackgroundField, DeltaEQuantiles)> {
+) -> (Mask, Option<(BackgroundField, DeltaEQuantiles)>) {
     let field = {
-        // 1 画素 1 バイトの表は 20MP で 20MB ある。場を作り終えたら手放す。
-        //
-        // しきい値は書き写さない。`FOREGROUND_THRESHOLD` の doc が
-        // 「定義はここ 1 箇所にしかない」と名乗っている
-        // 画素ごとに独立なので並列に写す。`collect` は並びを保つ
-        let filled: Vec<bool> = mask
-            .as_slice()
-            .par_iter()
-            .map(|&v| v < mask::FOREGROUND_THRESHOLD)
-            .collect();
         let known = background::KnownBackground {
             band: background::field_band(image, opts.border),
             outside_bbox: opts.bbox,
@@ -891,7 +884,9 @@ fn second_pass(
             // 矩形よりはるかに細かく答えている
             outside_subject: None,
             constraints: opts.constraints.as_ref(),
-            filled: Some(&filled),
+            // マスクのまま貸す。背景かどうかのしきい値は読む側が
+            // `FOREGROUND_THRESHOLD` で引く（定義はそこ 1 箇所にしかない）
+            filled: Some(&mask),
         };
         background::estimate_field(image, background, &known).field
     };
@@ -899,13 +894,14 @@ fn second_pass(
     // 効いたモデル（`field`）と実際に使った場が食い違う。** 門は 1 回目と
     // 同じ帯・同じしきい値なので、通常はここへ来ない
     if field.is_flat() {
-        return None;
+        return (mask, None);
     }
+    drop(mask);
     let residual = background::perimeter_residual(image, opts.border, background, &field);
     let mut flood = flood.clone();
     flood.core_tolerance = floodfill::core_tolerance(opts.tolerance, residual.p90);
     let mask = floodfill::fill(image, terrain, &field, &flood);
-    Some((mask, field, residual))
+    (mask, Some((field, residual)))
 }
 
 /// 確定前景（`--fg-seed` の円を含む）を不透明へ塗り戻す。

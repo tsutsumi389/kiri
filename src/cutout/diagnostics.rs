@@ -910,20 +910,28 @@ fn chamfer_distance(seeds: &[(u32, u32)], roi: (u32, u32, u32, u32)) -> Field {
     }
 }
 
-/// `chamfer_distance` の、`cap` より遠い距離を問わない版。行の帯に割って並列に回す。
+/// `chamfer_distance` の、`cap` より遠い距離を問わない版。タイルに割り、**種が
+/// 近くに無いタイルは測らずに**、残りを行の帯ごとに並列に回す。
 ///
 /// 値は **`cap` 以下の画素で `chamfer_distance` と 1 ビットも違わず**、`cap` より
 /// 遠い画素では `cap` より大きい（どれだけ大きいかは問わない）。読む側は
 /// 「`cap` で頭打ちにする」か「`cap` を越えたか」しか問わないこと。
 ///
-/// # 帯に割ってよい理由
+/// # タイルに割ってよい理由
 ///
 /// 3-4 チャンファーの 2 パスは、種と画素の外接矩形を含む矩形の中なら、種からの
 /// 重み付きの最短経路を正しく出す（最短経路は軸と対角の 2 方向だけで組め、
 /// どちらのパスで運ぶかに合わせて順序を並べ替えられる）。距離が `cap` 以下なら
-/// 種は画素から上下 `cap / 3` 行以内にあるので、帯をその行数だけ上下に広げた
-/// 矩形で測れば同じ値が出る。`cap` より遠い画素は、狭い矩形で測っても距離が
-/// 縮むことはないので `cap` より大きいままである。
+/// 種は画素から上下左右 `cap / 3` px 以内にあるので、タイルをその幅だけ四方に
+/// 広げた矩形で測れば同じ値が出る。`cap` より遠い画素は、狭い矩形で測っても
+/// 距離が縮むことはないので `cap` より大きいままである。
+///
+/// # 測らないタイル
+///
+/// 広げた矩形に種が 1 つも無ければ、タイルの画素はどの種からも `cap / 3` px
+/// より離れている——測るまでもなく `cap` より遠いので、255 のまま残す。
+/// **種は輪郭であり、輪郭は枠の中の細い帯でしかない。** 24.5MP の実写では枠は
+/// 商品の外接矩形（1200 万画素）だが、種が届くタイルはその 1〜2 割しか無い
 fn chamfer_capped(seeds: &[(u32, u32)], roi: (u32, u32, u32, u32), cap: u8) -> Field {
     let (x0, y0, x1, y1) = (
         roi.0 as usize,
@@ -934,26 +942,56 @@ fn chamfer_capped(seeds: &[(u32, u32)], roi: (u32, u32, u32, u32), cap: u8) -> F
     let w = x1 - x0 + 1;
     let h = y1 - y0 + 1;
     let reach = usize::from(cap / CHAMFER_STEP) + 1;
-    // 帯は余白の 4 倍以上にする。細くすると上下の余白を測り直す無駄が勝つ
-    let rows = (4 * reach).max(64);
+    // タイルは余白の 4 倍以上にする。小さくすると四方の余白を測り直す無駄が勝つ。
+    // 余白より大きいので、広げた矩形に入る種は隣のタイルまでにしか無い
+    let tile = (4 * reach).max(64);
+    let (cols, bands) = (w.div_ceil(tile), h.div_ceil(tile));
+    // 種を、自分が載っているタイルへ分ける（枠の外の種は捨てる）
+    let mut buckets: Vec<Vec<(u32, u32)>> = vec![Vec::new(); cols * bands];
+    for &(x, y) in seeds {
+        let (sx, sy) = (x as usize, y as usize);
+        if sx >= x0 && sx <= x1 && sy >= y0 && sy <= y1 {
+            buckets[((sy - y0) / tile) * cols + (sx - x0) / tile].push((x, y));
+        }
+    }
     let mut data = vec![u8::MAX; w * h];
-    data.par_chunks_mut(rows * w)
-        .enumerate()
-        .for_each(|(j, core)| {
-            let top = j * rows;
+    data.par_chunks_mut(tile * w).enumerate().for_each_init(
+        Vec::new,
+        |near: &mut Vec<(u32, u32)>, (j, core)| {
+            let top = j * tile;
             let bottom = top + core.len() / w;
             let (from, to) = (top.saturating_sub(reach), (bottom + reach).min(h));
-            let part = chamfer_distance(
-                seeds,
-                (
-                    x0 as u32,
-                    (y0 + from) as u32,
-                    x1 as u32,
-                    (y0 + to - 1) as u32,
-                ),
-            );
-            core.copy_from_slice(&part.data[(top - from) * w..(bottom - from) * w]);
-        });
+            for i in 0..cols {
+                let left = i * tile;
+                let right = (left + tile).min(w);
+                let (lo, hi) = (left.saturating_sub(reach), (right + reach).min(w));
+                // 広げた矩形（画像座標、両端を含む）
+                let rect = (x0 + lo, y0 + from, x0 + hi - 1, y0 + to - 1);
+                near.clear();
+                for bj in j.saturating_sub(1)..=(j + 1).min(bands - 1) {
+                    for bi in i.saturating_sub(1)..=(i + 1).min(cols - 1) {
+                        near.extend(buckets[bj * cols + bi].iter().filter(|&&(x, y)| {
+                            let (sx, sy) = (x as usize, y as usize);
+                            sx >= rect.0 && sx <= rect.2 && sy >= rect.1 && sy <= rect.3
+                        }));
+                    }
+                }
+                if near.is_empty() {
+                    continue;
+                }
+                let part = chamfer_distance(
+                    near,
+                    (rect.0 as u32, rect.1 as u32, rect.2 as u32, rect.3 as u32),
+                );
+                let span = hi - lo;
+                for y in top..bottom {
+                    let source = (y - from) * span;
+                    core[(y - top) * w + left..(y - top) * w + right]
+                        .copy_from_slice(&part.data[source + left - lo..source + right - lo]);
+                }
+            }
+        },
+    );
     Field {
         data,
         x0,
@@ -1413,11 +1451,12 @@ mod tests {
         }
     }
 
-    /// 帯に割ったチャンファーが、`cap` 以下では 1 本で測ったものと一致し、
+    /// タイルに割ったチャンファーが、`cap` 以下では 1 本で測ったものと一致し、
     /// `cap` より遠い画素では `cap` を越えたままであること。
     ///
-    /// 帯の高さ（余白の 4 倍、最低 64 行）を何本もまたぐ大きさにして、種が
-    /// まばらな場所（帯の外から距離が届く場所）と密な場所を両方作る。
+    /// タイルの辺（余白の 4 倍、最低 64px）を縦にも横にも何枚もまたぐ大きさに
+    /// して、種がまばらな場所（隣のタイルから距離が届く場所、種が届かず測らない
+    /// タイル）と密な場所を両方作る。
     #[test]
     fn the_capped_chamfer_agrees_with_the_whole_one_up_to_the_cap() {
         let (w, h) = (300u32, 700u32);

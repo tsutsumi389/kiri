@@ -13,8 +13,6 @@
 //! `Repaint` にまとめてある。**引数を 8 個並べると、呼ぶ側が順序を間違えても
 //! 型が同じなら通ってしまう。**
 
-use std::collections::VecDeque;
-
 use image::RgbaImage;
 use rayon::prelude::*;
 
@@ -573,54 +571,8 @@ fn close_new_gaps(
     let trusted: Vec<u64> = eroded.iter().zip(&roots).map(|(e, r)| e | r).collect();
 
     // **芯の上だけを辿る。** 背景の上を辿ると、細い通路がそのまま外周へ
-    // つながってしまい、収縮した意味が消える。
-    //
-    // 起点（帯の外の背景と外周の背景）は**キューへ積まない**。24.5MP の実写
-    // では帯の外の背景が 2000 万画素あり、積めば `VecDeque` の倍々確保だけで
-    // ピークが 400MB 級に跳ねる。起点は定義上すべて到達済みなので印だけ付け、
-    // 積むのは「起点の 4 近傍にある、信用できる画素」だけでよい。
-    // 到達する集合は「起点を含む、信用できる画素の 4 連結成分」で、積む順序に
-    // 依らない
-    let mut seen = roots.clone();
-    let mut queue: VecDeque<(usize, usize)> = VecDeque::new();
-    for ly in 0..ph {
-        let row = &roots[ly * wpr..(ly + 1) * wpr];
-        for k in 0..wpr {
-            // 起点の左右上下の隣。行の端より先のビットは 0 なので、右の隣は
-            // 端で自然に切れる
-            let left = (row[k] << 1) | if k > 0 { row[k - 1] >> 63 } else { 0 };
-            let right = (row[k] >> 1) | row.get(k + 1).map_or(0, |v| v << 63);
-            let up = if ly > 0 { roots[(ly - 1) * wpr + k] } else { 0 };
-            let down = if ly + 1 < ph {
-                roots[(ly + 1) * wpr + k]
-            } else {
-                0
-            };
-            let mut seeds = trusted[ly * wpr + k] & !row[k] & (left | right | up | down);
-            seen[ly * wpr + k] |= seeds;
-            while seeds != 0 {
-                let lx = k * 64 + seeds.trailing_zeros() as usize;
-                queue.push_back((lx, ly));
-                seeds &= seeds - 1;
-            }
-        }
-    }
-    let has = |plane: &[u64], lx: usize, ly: usize| plane[ly * wpr + lx / 64] & bit(lx) != 0;
-    while let Some((cx, cy)) = queue.pop_front() {
-        let neighbours = [
-            (cx > 0).then(|| (cx - 1, cy)),
-            (cx + 1 < pw).then_some((cx + 1, cy)),
-            (cy > 0).then(|| (cx, cy - 1)),
-            (cy + 1 < ph).then_some((cx, cy + 1)),
-        ];
-        for (nx, ny) in neighbours.into_iter().flatten() {
-            if has(&seen, nx, ny) || !has(&trusted, nx, ny) {
-                continue;
-            }
-            seen[ny * wpr + nx / 64] |= bit(nx);
-            queue.push_back((nx, ny));
-        }
-    }
+    // つながってしまい、収縮した意味が消える
+    let mut seen = reach_within(&roots, &trusted, wpr, ph);
     drop(trusted);
     // 膨張させるのは**収縮で取れた芯**だけにする。起点として信用しただけの
     // 「帯の外の背景」まで膨らませると、帯に接した通路が幅によらず seal px ぶん
@@ -666,11 +618,95 @@ fn close_new_gaps(
     changed
 }
 
+/// `roots` から、`trusted` の上を 4 近傍で辿って届く画素の面を返す（`roots` 自身を含む）。
+///
+/// 面はどちらも 1 行 `wpr` 語で、行の端より先のビットは 0 であること。`roots` は
+/// `trusted` に含まれていること。
+///
+/// **起点（`roots`）は積まない。** 24.5MP の実写では帯の外の背景が 2000 万画素
+/// あり、積めば確保だけでピークが跳ねる。起点は定義上すべて到達済みなので印だけ
+/// 付け、積むのは「起点の 4 近傍に、信用できてまだ届いていない画素を持つ語」
+/// だけでよい。
+///
+/// **辿るのは画素ではなく語である。** 語の中は `spread` が連なりの端まで一度に
+/// 塗り、上下の語へは AND 1 つ、左右の語へは端の 1 ビットで渡す。24.5MP の実写
+/// （`--tolerance 60`）では 1 パスに 40〜86 万画素を 1 つずつ積み下ろしていて、
+/// 4 パスで 20ms の逐次処理になっていた。届く集合は「起点を含む、信用できる
+/// 画素の 4 連結成分」で、辿る順序にも単位にも依らない
+fn reach_within(roots: &[u64], trusted: &[u64], wpr: usize, ph: usize) -> Vec<u64> {
+    let mut seen = roots.to_vec();
+    let mut stack: Vec<usize> = Vec::new();
+    for ly in 0..ph {
+        let row = &roots[ly * wpr..(ly + 1) * wpr];
+        for k in 0..wpr {
+            // 起点の左右上下の隣。行の端より先のビットは 0 なので、右の隣は
+            // 端で自然に切れる
+            let left = (row[k] << 1) | if k > 0 { row[k - 1] >> 63 } else { 0 };
+            let right = (row[k] >> 1) | row.get(k + 1).map_or(0, |v| v << 63);
+            let up = if ly > 0 { roots[(ly - 1) * wpr + k] } else { 0 };
+            let down = if ly + 1 < ph {
+                roots[(ly + 1) * wpr + k]
+            } else {
+                0
+            };
+            let seeds = trusted[ly * wpr + k] & !row[k] & (left | right | up | down);
+            if seeds != 0 {
+                seen[ly * wpr + k] |= seeds;
+                stack.push(ly * wpr + k);
+            }
+        }
+    }
+    // 隣の語へ渡す。新しく届いた画素があるときだけ、その語を積み直す
+    let pass = |seen: &mut [u64], stack: &mut Vec<usize>, to: usize, bits: u64| {
+        let fresh = bits & trusted[to] & !seen[to];
+        if fresh != 0 {
+            seen[to] |= fresh;
+            stack.push(to);
+        }
+    };
+    while let Some(at) = stack.pop() {
+        let (ly, k) = (at / wpr, at % wpr);
+        let here = seen[at] | spread(seen[at] & trusted[at], trusted[at]);
+        seen[at] = here;
+        if k > 0 {
+            pass(&mut seen, &mut stack, at - 1, (here & 1) << 63);
+        }
+        if k + 1 < wpr {
+            pass(&mut seen, &mut stack, at + 1, here >> 63);
+        }
+        if ly > 0 {
+            pass(&mut seen, &mut stack, at - wpr, here);
+        }
+        if ly + 1 < ph {
+            pass(&mut seen, &mut stack, at + wpr, here);
+        }
+    }
+    seen
+}
+
+/// 語の中で、`open` の連なりに沿って `seen` を両側の端まで広げる。
+///
+/// 1 ビットずつ隣へ移すと連なりの長さだけ回るので、移す幅を倍々にする
+/// （Kogge–Stone）。`reach` は「ここまで切れ目なく開いている」幅を持つ
+#[inline]
+fn spread(seen: u64, open: u64) -> u64 {
+    let (mut high, mut low) = (seen, seen);
+    let (mut reach_high, mut reach_low) = (open, open);
+    for shift in [1u32, 2, 4, 8, 16, 32] {
+        high |= reach_high & (high << shift);
+        reach_high &= reach_high << shift;
+        low |= reach_low & (low >> shift);
+        reach_low &= reach_low >> shift;
+    }
+    high | low
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cutout::refine::{DEFAULT_MAX_RADIUS, DEFAULT_MIN_RADIUS, band_map};
     use image::Rgba;
+    use std::collections::VecDeque;
 
     /// 1 パスぶんの入力を組む。累積の上限を掛けないときは空の `BitPlane` を渡す。
     fn repaint<'a>(
@@ -906,5 +942,75 @@ mod tests {
             all > moved,
             "上限を外しても塗り直しが増えない＝対照になっていない: {all} vs {moved}"
         );
+    }
+
+    /// 語で辿る到達と、画素を 1 つずつ辿る素朴な到達が同じ面を返す。
+    ///
+    /// 幅は語の境目（64）をまたぐものと、ちょうど語に収まるもの、1 語に満たない
+    /// ものを混ぜる。密度を振るのは、長い連なり（`spread` が端まで塗る）と
+    /// 迷路（語を何度も積み直す）の両方を通すためである。
+    #[test]
+    fn the_word_reach_agrees_with_a_pixel_by_pixel_reach() {
+        let mut state = 0x5eed_1234_u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for (pw, ph) in [
+            (1usize, 1usize),
+            (7, 5),
+            (64, 9),
+            (65, 30),
+            (200, 41),
+            (130, 1),
+        ] {
+            let wpr = pw.div_ceil(64);
+            for density in [30u32, 55, 62, 75, 95] {
+                for root_one_in in [3u32, 40, 400] {
+                    let mut trusted = vec![0u64; wpr * ph];
+                    let mut roots = vec![0u64; wpr * ph];
+                    for ly in 0..ph {
+                        for lx in 0..pw {
+                            if next() % 100 < density {
+                                trusted[ly * wpr + lx / 64] |= 1u64 << (lx % 64);
+                                if next() % root_one_in == 0 {
+                                    roots[ly * wpr + lx / 64] |= 1u64 << (lx % 64);
+                                }
+                            }
+                        }
+                    }
+                    let has = |plane: &[u64], lx: usize, ly: usize| {
+                        plane[ly * wpr + lx / 64] & (1u64 << (lx % 64)) != 0
+                    };
+                    let mut expected = roots.clone();
+                    let mut queue: VecDeque<(usize, usize)> = (0..ph)
+                        .flat_map(|ly| (0..pw).map(move |lx| (lx, ly)))
+                        .filter(|&(lx, ly)| has(&roots, lx, ly))
+                        .collect();
+                    while let Some((cx, cy)) = queue.pop_front() {
+                        let neighbours = [
+                            (cx > 0).then(|| (cx - 1, cy)),
+                            (cx + 1 < pw).then_some((cx + 1, cy)),
+                            (cy > 0).then(|| (cx, cy - 1)),
+                            (cy + 1 < ph).then_some((cx, cy + 1)),
+                        ];
+                        for (nx, ny) in neighbours.into_iter().flatten() {
+                            if has(&expected, nx, ny) || !has(&trusted, nx, ny) {
+                                continue;
+                            }
+                            expected[ny * wpr + nx / 64] |= 1u64 << (nx % 64);
+                            queue.push_back((nx, ny));
+                        }
+                    }
+                    assert_eq!(
+                        reach_within(&roots, &trusted, wpr, ph),
+                        expected,
+                        "{pw}x{ph} 密度 {density}% 起点 1/{root_one_in}"
+                    );
+                }
+            }
+        }
     }
 }

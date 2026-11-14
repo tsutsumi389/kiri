@@ -389,7 +389,8 @@ sRGB のまま比べると**ガンマぶんだけ暗い側へ偏る**（黒い�
 | `HALO_REMAINS`（連れて出た `RIM_CONTAMINATED` も同じ文面） | `--optimize` なし | `--optimize`（`--tolerance` を明示していれば、外してから） |
 | 同上 | `--optimize` あり | `--bg-polygon` / `--trimap`（既に渡していれば、その指示を直す。`--tolerance` を明示していれば、外す） |
 | `CONTOUR_ROUGH` / 単独の `RIM_CONTAMINATED` | `--edge-repair off` | `--edge-repair auto`。**門の警告（`HALO_REMAINS` / `BBOX_RECOMMENDED` / `NOT_SEPARABLE` / `FOREGROUND_TOO_SMALL` / `FOREGROUND_TOO_LARGE` / `SUBJECT_TOUCHES_EDGE`）が `warnings[]` に出ているあいだは付かない**——付けても 1 画素も直らない |
-| 同上 | `--edge-repair auto` | 付かない（その先は `remedy` の `--trimap`） |
+| 同上 | `--edge-repair auto`、門で見送られた | **止めた警告の code を名指す**（`edge_repair.gated_by` と同じ code）。先にその警告を消す |
+| 同上 | `--edge-repair auto`、解き直しても残った | 付かない（その先は `remedy` の `--trimap`） |
 
 「`--tolerance` を上げる」とは言わない。照明場の上では効く範囲が狭く（実写の
 リモコンで 42〜48）、外すと別の連結成分へ飛んで崩れる。値を探すのは

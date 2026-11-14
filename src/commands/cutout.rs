@@ -197,7 +197,10 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         args.optimize,
         args.fixed.tolerance,
         opts.constraints.is_some(),
-        args.edge_repair,
+        match &edge_repair {
+            None => Repair::Off,
+            Some(report) => report.gated_by.map_or(Repair::Ran, Repair::Gated),
+        },
     );
 
     // **元画像はここで手放す。** この先で元の画素を読むのは `--preview` の
@@ -512,6 +515,11 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
 ///   **`edge_repair::GATES` の警告が出ているあいだは勧めない**——付けても門で
 ///   1 画素も直らず、実行できない助言になる。既に付けていて残ったときも言わない
 ///   （その先は schema の `remedy` が言う `--trimap`）
+/// - **`--edge-repair auto` を付けたのに門で見送られたときは、どの警告が止めたかを
+///   言う。** `edge_repair.gated_by` に code は出るが、`repaired: 0` を読まなければ
+///   「付けたのに何も変わらない」としか見えない。**名指す code は `gated_by`
+///   そのものを受け取る**——ここで `warnings` から数え直すと、解き直した後の
+///   測り直しで初めて門の警告が出た実行を「見送った」と言ってしまう
 ///
 /// 同じ原因には同じ文面を返す。別の言い方をすると、手が 2 つあると読まれる。
 fn guide_hints(
@@ -519,7 +527,7 @@ fn guide_hints(
     optimized: bool,
     tolerance_fixed: bool,
     constrained: bool,
-    edge_repair: EdgeRepairMode,
+    repair: Repair,
 ) {
     let halo_remains = warnings.iter().any(|w| w.code == WarningCode::HaloRemains);
     let gated = warnings
@@ -538,8 +546,17 @@ fn guide_hints(
             "探索しても縁が残りました。data.regions の区間を --bg-polygon で指すか、--trimap を渡してください"
         }
     };
-    let repair_hint = (edge_repair == EdgeRepairMode::Off && !gated)
-        .then_some("--edge-repair auto を付けると、data.regions の区間だけ境界を解き直します");
+    let repair_hint = match repair {
+        Repair::Off if !gated => Some(
+            "--edge-repair auto を付けると、data.regions の区間だけ境界を解き直します".to_string(),
+        ),
+        Repair::Gated(gate) => Some(format!(
+            "--edge-repair auto は {gate} が出ているため見送りました。先に {gate} を消してください\
+             （直し方はその警告の hint、無ければ schema の remedy）",
+            gate = gate.as_str(),
+        )),
+        Repair::Off | Repair::Ran => None,
+    };
     for warning in warnings.iter_mut() {
         match warning.code {
             WarningCode::HaloRemains => warning.hint = Some(halo_hint.to_string()),
@@ -547,11 +564,22 @@ fn guide_hints(
                 warning.hint = Some(halo_hint.to_string());
             }
             WarningCode::ContourRough | WarningCode::RimContaminated => {
-                warning.hint = repair_hint.map(str::to_string);
+                warning.hint = repair_hint.clone();
             }
             _ => {}
         }
     }
+}
+
+/// `--edge-repair` がこの実行で何をしたか。`guide_hints` が次の一手を選ぶのに使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Repair {
+    /// 付けていない
+    Off,
+    /// 付けたが、この警告が出ていたので見送った（`edge_repair.gated_by`）
+    Gated(WarningCode),
+    /// 付けて、解き直した（または直す区間が無かった）
+    Ran,
 }
 
 /// 解き直しの結果を JSON のブロックへ落とす。丸めは `mask.*` と同じ。
@@ -2552,9 +2580,9 @@ mod tests {
         codes: &[WarningCode],
         optimized: bool,
         tolerance_fixed: bool,
-        edge_repair: EdgeRepairMode,
+        repair: Repair,
     ) -> Vec<Option<String>> {
-        hints_given(codes, optimized, tolerance_fixed, false, edge_repair)
+        hints_given(codes, optimized, tolerance_fixed, false, repair)
     }
 
     fn hints_given(
@@ -2562,7 +2590,7 @@ mod tests {
         optimized: bool,
         tolerance_fixed: bool,
         constrained: bool,
-        edge_repair: EdgeRepairMode,
+        repair: Repair,
     ) -> Vec<Option<String>> {
         let mut warnings: Vec<Warning> = codes.iter().map(|&c| Warning::new(c, "")).collect();
         guide_hints(
@@ -2570,7 +2598,7 @@ mod tests {
             optimized,
             tolerance_fixed,
             constrained,
-            edge_repair,
+            repair,
         );
         warnings.into_iter().map(|w| w.hint).collect()
     }
@@ -2587,7 +2615,7 @@ mod tests {
             ],
             false,
             false,
-            EdgeRepairMode::Off,
+            Repair::Off,
         );
         assert!(hints[0].as_deref().unwrap().starts_with("--optimize"));
         assert_eq!(hints[1], None);
@@ -2598,12 +2626,7 @@ mod tests {
     #[test]
     fn halo_hint_says_to_drop_explicit_tolerance() {
         for optimized in [false, true] {
-            let hints = hints_of(
-                &[WarningCode::HaloRemains],
-                optimized,
-                true,
-                EdgeRepairMode::Off,
-            );
+            let hints = hints_of(&[WarningCode::HaloRemains], optimized, true, Repair::Off);
             assert!(
                 hints[0]
                     .as_deref()
@@ -2616,12 +2639,7 @@ mod tests {
     /// 探索しても残ったなら、数値ではなく面の指示へ送る
     #[test]
     fn halo_hint_after_optimize_sends_to_spatial_constraints() {
-        let hints = hints_of(
-            &[WarningCode::HaloRemains],
-            true,
-            false,
-            EdgeRepairMode::Off,
-        );
+        let hints = hints_of(&[WarningCode::HaloRemains], true, false, Repair::Off);
         let hint = hints[0].as_deref().unwrap();
         assert!(hint.contains("--bg-polygon") && hint.contains("--trimap"));
         assert!(!hint.contains("--optimize を付ける"));
@@ -2630,33 +2648,59 @@ mod tests {
     /// 面の指示を既に渡した実行に「渡せ」とは言わない
     #[test]
     fn halo_hint_does_not_ask_for_constraints_already_given() {
-        let hints = hints_given(
-            &[WarningCode::HaloRemains],
-            true,
-            false,
-            true,
-            EdgeRepairMode::Off,
-        );
+        let hints = hints_given(&[WarningCode::HaloRemains], true, false, true, Repair::Off);
         let hint = hints[0].as_deref().unwrap();
         assert!(hint.contains("直してください") && !hint.contains("渡してください"));
+    }
+
+    /// 付けた `--edge-repair auto` が門で見送られたら、止めた警告を名指す。
+    /// 名指すのは渡された `edge_repair.gated_by` で、`warnings` の並びからは数え直さない
+    #[test]
+    fn gated_repair_names_the_warning_that_stopped_it() {
+        let hints = hints_of(
+            &[
+                WarningCode::SubjectTouchesEdge,
+                WarningCode::HaloRemains,
+                WarningCode::ContourRough,
+                WarningCode::RimContaminated,
+            ],
+            true,
+            false,
+            Repair::Gated(WarningCode::SubjectTouchesEdge),
+        );
+        let rough = hints[2].as_deref().unwrap();
+        assert!(rough.contains("SUBJECT_TOUCHES_EDGE") && rough.contains("見送りました"));
+        assert!(!rough.contains("HALO_REMAINS"));
+        // 縁の残りに連れて出た汚染は、縁の残りと同じ文面のまま
+        assert_eq!(hints[3], hints[1]);
+    }
+
+    /// 解き直した後の測り直しで初めて門の警告が出ても、「見送った」とは言わない
+    #[test]
+    fn a_gate_that_appears_after_the_repair_is_not_blamed() {
+        let hints = hints_of(
+            &[WarningCode::NotSeparable, WarningCode::ContourRough],
+            true,
+            false,
+            Repair::Ran,
+        );
+        assert_eq!(hints[1], None);
     }
 
     /// 門が開いていれば `--edge-repair auto` を勧め、既に付けていれば黙る
     #[test]
     fn repair_hint_only_when_it_can_run() {
         let codes = [WarningCode::ContourRough, WarningCode::RimContaminated];
-        let off = hints_of(&codes, true, false, EdgeRepairMode::Off);
+        let off = hints_of(&codes, true, false, Repair::Off);
         assert!(off[0].as_deref().unwrap().starts_with("--edge-repair auto"));
         assert_eq!(off[0], off[1]);
-        let auto = hints_of(&codes, true, false, EdgeRepairMode::Auto);
+        let auto = hints_of(&codes, true, false, Repair::Ran);
         assert_eq!(auto, vec![None, None]);
+        let touching = [WarningCode::SubjectTouchesEdge, WarningCode::ContourRough];
+        let waiting = hints_of(&touching, true, false, Repair::Off);
+        assert_eq!(waiting[1], None);
         for &gate in edge_repair::GATES {
-            let gated = hints_of(
-                &[gate, WarningCode::ContourRough],
-                true,
-                false,
-                EdgeRepairMode::Off,
-            );
+            let gated = hints_of(&[gate, WarningCode::ContourRough], true, false, Repair::Off);
             assert_eq!(gated[1], None, "{gate:?}");
         }
     }

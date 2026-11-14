@@ -94,7 +94,8 @@ kiri cutout in.jpg -o out.png --dry-run --preview /tmp/kiri-preview.png --force 
 2. **`HALO_REMAINS` / `CONTOUR_ROUGH` / `RIM_CONTAMINATED` が出たら `--optimize --edge-repair auto` を足す。**
    `--optimize` が tolerance / bbox / 背景の持ち方を探索し、`--edge-repair auto` が粗い区間だけ境界を解き直す。
    24MP でも合わせて 2 秒ほどなので、`--tolerance` を手で振るより先に試す。
-   `edge_repair.gated_by` に code が出ていたら解き直しは見送られている——その警告を先に消す
+   解き直しが見送られたときは、`CONTOUR_ROUGH` / `RIM_CONTAMINATED` の hint が止めた警告の code を言う
+   （`edge_repair.gated_by` と同じ）——その警告を先に消す
 3. **どこが商品かを面で教える。** 探索と解き直しで直らない輪郭も、これで直る。
    preview の元画像パネルのグリッドから座標を読み、正規化座標で渡す
    ```bash

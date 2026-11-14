@@ -190,6 +190,16 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         }
     };
 
+    // **hint は「いま渡された指定」から見た次の一手を言う。** 切り抜きの層は
+    // `--optimize` も `--edge-repair` も知らないので、ここで差し替える
+    guide_hints(
+        &mut result.warnings,
+        args.optimize,
+        args.fixed.tolerance,
+        opts.constraints.is_some(),
+        args.edge_repair,
+    );
+
     // **元画像はここで手放す。** この先で元の画素を読むのは `--preview` の
     // 並べた図だけで、配置・影・書き出しはどれも切り抜いた結果のほうを使う。
     // 抱えたままだと、24.5MP では 98MB が書き出しの山（切り抜いた画像と
@@ -485,6 +495,63 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         elapsed_ms: started.elapsed().as_millis(),
         warnings,
     })
+}
+
+/// 縁の警告の hint を、渡された指定から見た次の一手へ差し替える。
+///
+/// **最良の経路は `--optimize` → `--edge-repair auto` である**（実写の不織布の
+/// 上のリモコン、24.5MP: 既定は halo 0.13 / 粗さ 1.24、`--optimize` で
+/// 0.024 / 0.25、さらに `--edge-repair auto` で 0.007 / 0.094 になり品質の警告が
+/// 消える。合わせて 1.9 秒）。「--tolerance を上げる」とだけ言うと、エージェントは
+/// 値を勘で振る——照明場の上では効く範囲が 42〜48 のように狭く、外すと崩れる。
+///
+/// - `HALO_REMAINS`（と、それに連れて出た `RIM_CONTAMINATED`）: 探索していなければ
+///   `--optimize` を勧める。探索しても残ったなら、数値ではなく面の指示を勧める
+///   （既に渡していれば、渡せとは言わず直せと言う）
+/// - `CONTOUR_ROUGH` / 単独の `RIM_CONTAMINATED`: `--edge-repair auto` を勧める。
+///   **`edge_repair::GATES` の警告が出ているあいだは勧めない**——付けても門で
+///   1 画素も直らず、実行できない助言になる。既に付けていて残ったときも言わない
+///   （その先は schema の `remedy` が言う `--trimap`）
+///
+/// 同じ原因には同じ文面を返す。別の言い方をすると、手が 2 つあると読まれる。
+fn guide_hints(
+    warnings: &mut [Warning],
+    optimized: bool,
+    tolerance_fixed: bool,
+    constrained: bool,
+    edge_repair: EdgeRepairMode,
+) {
+    let halo_remains = warnings.iter().any(|w| w.code == WarningCode::HaloRemains);
+    let gated = warnings
+        .iter()
+        .any(|w| edge_repair::GATES.contains(&w.code));
+    let halo_hint = match (optimized, tolerance_fixed) {
+        (false, false) => {
+            "--optimize を付けると tolerance を探索します（効く範囲は素材ごとに狭く、手で上げると外しやすい）"
+        }
+        (false, true) => "--tolerance の指定を外して --optimize を付けると、効く値を探索します",
+        (true, true) => "--tolerance の指定を外すと、--optimize が効く値を探索します",
+        (true, false) if constrained => {
+            "探索しても縁が残りました。data.regions の区間で、渡した面の指示（--trimap / --bg-polygon など）を直してください"
+        }
+        (true, false) => {
+            "探索しても縁が残りました。data.regions の区間を --bg-polygon で指すか、--trimap を渡してください"
+        }
+    };
+    let repair_hint = (edge_repair == EdgeRepairMode::Off && !gated)
+        .then_some("--edge-repair auto を付けると、data.regions の区間だけ境界を解き直します");
+    for warning in warnings.iter_mut() {
+        match warning.code {
+            WarningCode::HaloRemains => warning.hint = Some(halo_hint.to_string()),
+            WarningCode::RimContaminated if halo_remains => {
+                warning.hint = Some(halo_hint.to_string());
+            }
+            WarningCode::ContourRough | WarningCode::RimContaminated => {
+                warning.hint = repair_hint.map(str::to_string);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// 解き直しの結果を JSON のブロックへ落とす。丸めは `mask.*` と同じ。
@@ -2480,6 +2547,119 @@ fn resolve_point(point: [f64; 2], normalized: bool, width: u32, height: u32) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hints_of(
+        codes: &[WarningCode],
+        optimized: bool,
+        tolerance_fixed: bool,
+        edge_repair: EdgeRepairMode,
+    ) -> Vec<Option<String>> {
+        hints_given(codes, optimized, tolerance_fixed, false, edge_repair)
+    }
+
+    fn hints_given(
+        codes: &[WarningCode],
+        optimized: bool,
+        tolerance_fixed: bool,
+        constrained: bool,
+        edge_repair: EdgeRepairMode,
+    ) -> Vec<Option<String>> {
+        let mut warnings: Vec<Warning> = codes.iter().map(|&c| Warning::new(c, "")).collect();
+        guide_hints(
+            &mut warnings,
+            optimized,
+            tolerance_fixed,
+            constrained,
+            edge_repair,
+        );
+        warnings.into_iter().map(|w| w.hint).collect()
+    }
+
+    /// 縁が残ったら、値を勘で振らせずに `--optimize` へ送る。連れて出た
+    /// `RIM_CONTAMINATED` は同じ文面で、門が閉じている `CONTOUR_ROUGH` は黙る
+    #[test]
+    fn halo_hint_sends_to_optimize_and_keeps_gated_repair_silent() {
+        let hints = hints_of(
+            &[
+                WarningCode::HaloRemains,
+                WarningCode::ContourRough,
+                WarningCode::RimContaminated,
+            ],
+            false,
+            false,
+            EdgeRepairMode::Off,
+        );
+        assert!(hints[0].as_deref().unwrap().starts_with("--optimize"));
+        assert_eq!(hints[1], None);
+        assert_eq!(hints[2], hints[0]);
+    }
+
+    /// 明示した `--tolerance` は探索より強いので、外せと言う
+    #[test]
+    fn halo_hint_says_to_drop_explicit_tolerance() {
+        for optimized in [false, true] {
+            let hints = hints_of(
+                &[WarningCode::HaloRemains],
+                optimized,
+                true,
+                EdgeRepairMode::Off,
+            );
+            assert!(
+                hints[0]
+                    .as_deref()
+                    .unwrap()
+                    .contains("--tolerance の指定を外")
+            );
+        }
+    }
+
+    /// 探索しても残ったなら、数値ではなく面の指示へ送る
+    #[test]
+    fn halo_hint_after_optimize_sends_to_spatial_constraints() {
+        let hints = hints_of(
+            &[WarningCode::HaloRemains],
+            true,
+            false,
+            EdgeRepairMode::Off,
+        );
+        let hint = hints[0].as_deref().unwrap();
+        assert!(hint.contains("--bg-polygon") && hint.contains("--trimap"));
+        assert!(!hint.contains("--optimize を付ける"));
+    }
+
+    /// 面の指示を既に渡した実行に「渡せ」とは言わない
+    #[test]
+    fn halo_hint_does_not_ask_for_constraints_already_given() {
+        let hints = hints_given(
+            &[WarningCode::HaloRemains],
+            true,
+            false,
+            true,
+            EdgeRepairMode::Off,
+        );
+        let hint = hints[0].as_deref().unwrap();
+        assert!(hint.contains("直してください") && !hint.contains("渡してください"));
+    }
+
+    /// 門が開いていれば `--edge-repair auto` を勧め、既に付けていれば黙る
+    #[test]
+    fn repair_hint_only_when_it_can_run() {
+        let codes = [WarningCode::ContourRough, WarningCode::RimContaminated];
+        let off = hints_of(&codes, true, false, EdgeRepairMode::Off);
+        assert!(off[0].as_deref().unwrap().starts_with("--edge-repair auto"));
+        assert_eq!(off[0], off[1]);
+        let auto = hints_of(&codes, true, false, EdgeRepairMode::Auto);
+        assert_eq!(auto, vec![None, None]);
+        for &gate in edge_repair::GATES {
+            let gated = hints_of(
+                &[gate, WarningCode::ContourRough],
+                true,
+                false,
+                EdgeRepairMode::Off,
+            );
+            assert_eq!(gated[1], None, "{gate:?}");
+        }
+    }
 
     /// 中央に不透明な正方形、その外側に薄いアルファの縁を持つ画像。
     ///

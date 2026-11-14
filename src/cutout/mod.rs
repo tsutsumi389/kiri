@@ -1267,6 +1267,11 @@ pub(crate) fn collect_warnings(
                 //
                 // 上げすぎれば商品を食うため、値そのものは示さない。倍率を
                 // 一つ書くと、素材によらずそれが正解であるかのように読まれる
+                //
+                // **`kiri cutout` はこの hint を差し替える**（`commands::cutout::
+                // guide_hints`）。値を探すのは `--optimize` の仕事で、それを
+                // 渡したかどうかはこの層からは見えない。ここの文面は、ライブラリ
+                // として直に呼んだ側のための既定である
                 .with_hint("--tolerance を上げると背景の残りが減ります")
                 .with_data("halo_ratio", round4(halo))
                 .with_data(
@@ -1291,9 +1296,11 @@ pub(crate) fn collect_warnings(
                          ギザギザ）。背景のテクスチャが輪郭に乗っている可能性があります"
                     ),
                 )
-                // **hint は付けない。** 今の kiri に粗さを直すノブは無く、
+                // **この層では hint を付けない。** 粗さを直す数値のノブは無く、
                 // 実行できない助言は助言が無いより悪い（`--tolerance` を上げても
-                // 蛇行そのものは動かない。動くのは次の指標のほうである）
+                // 蛇行そのものは動かない。動くのは次の指標のほうである）。
+                // 直す手は `--edge-repair auto` で、門が開いているときに限って
+                // `commands::cutout::guide_hints` が勧める
                 .with_data("contour_roughness", round4(roughness))
                 .with_data(
                     "regions",

@@ -201,14 +201,18 @@ sRGB のまま比べると**ガンマぶんだけ暗い側へ偏る**（黒い�
       輪郭に背景のテクスチャが張り付いている可能性があります
 ```
 
-`CONTOUR_ROUGH` には**実行時のヒントを付けない**。粗さを直す数値のノブは無く、
+`CONTOUR_ROUGH` に**数値のノブを勧めるヒントは付けない**。粗さを直す数値のノブは無く、
 **実行できない助言は助言が無いより悪い**（信頼度 low で bbox を勧めないのと
-同じ判断である）。直す手は面の指示——輪郭の帯だけを不明にした `--trimap`——で、
+同じ判断である）。直す手は 2 つで、先に試すのは `--edge-repair auto`
+（[悪い区間だけ解き直す](05-3-boundary.md#悪い区間だけ解き直す--edge-repair)）——
+**門の警告が出ておらず、まだ付けていない実行に限って**ヒントがそれを勧める。
+残ったときの手は面の指示——輪郭の帯だけを不明にした `--trimap`——で、
 渡す画像は素材ごとに作るものなので、その手順は `kiri schema` の
 `warnings[].remedy` が配る
-（[警告と次の一手](#警告と次の一手remedy)）。`RIM_CONTAMINATED` のヒント（`--tolerance` を上げる、文面は
-`HALO_REMAINS` と同じ）は、**`HALO_REMAINS` が一緒に出ているときだけ**付く。
-縁が「背景色のまま」残っているなら上げれば減るが、汚染だけが出ている状態は別物で、
+（[警告と次の一手](#警告と次の一手remedy)）。`RIM_CONTAMINATED` は、**`HALO_REMAINS` が
+一緒に出ているときだけ** `HALO_REMAINS` と同じヒント（`--optimize` に tolerance を
+探索させる）になり、単独で出ているときは `CONTOUR_ROUGH` と同じ扱いになる。
+縁が「背景色のまま」残っているなら tolerance を上げれば減るが、汚染だけが出ている状態は別物で、
 中間グレーの商品に落ち影がかかったケースでは tolerance をどちらへ動かしても値が
 動かない——縁に乗っているのが背景色そのものではなく、影や繊維との混色だからである。
 
@@ -325,9 +329,9 @@ sRGB のまま比べると**ガンマぶんだけ暗い側へ偏る**（黒い�
 | `NOT_SEPARABLE` | 主体と背景の色差が背景自身のばらつきを下回る。調整では改善しない |
 | `FOREGROUND_TOO_SMALL` | 前景比率が小さすぎる。商品が消えている可能性がある |
 | `FOREGROUND_TOO_LARGE` | 前景比率が大きすぎる。背景が残っている可能性がある |
-| `HALO_REMAINS` | 境界に背景色のままの縁が残っている。`--tolerance` を上げると減る |
+| `HALO_REMAINS` | 境界に背景色のままの縁が残っている。`--optimize` が tolerance を探索する |
 | `CONTOUR_ROUGH` | 輪郭がギザギザに蛇行している。背景のテクスチャが輪郭に乗っている |
-| `RIM_CONTAMINATED` | 縁の色が商品より背景に近い（`HALO_REMAINS` も出ていれば `--tolerance` で減る） |
+| `RIM_CONTAMINATED` | 縁の色が商品より背景に近い（`HALO_REMAINS` も出ていれば `--optimize` で減る） |
 | `EDGE_THRESHOLD_RAISED` | 背景のテクスチャに合わせて堤防を引き上げた |
 | `MATTING_NOT_CONVERGED` | `--matting closed-form` が反復の上限で止まった。帯のアルファは解き切れていない |
 | `BACKGROUND_FIELD_USED` | 背景が均一でないため、1 色ではなく照明場として推定した（直すものは無い） |
@@ -377,12 +381,26 @@ sRGB のまま比べると**ガンマぶんだけ暗い側へ偏る**（黒い�
 （`--bbox 0,0.354,0.9834,0.662 --normalized`）で、`remedy` は数値を持たない
 一般の手順である（`hint の --bbox <値> --normalized をそのまま渡す`）。
 
+**縁の警告の `hint` は、渡された指定から見た次の一手を言う。** 最良の経路は
+`--optimize` → `--edge-repair auto` で、hint はその順に送る。
+
+| 警告 | 渡した指定 | hint が勧めるもの |
+|---|---|---|
+| `HALO_REMAINS`（連れて出た `RIM_CONTAMINATED` も同じ文面） | `--optimize` なし | `--optimize`（`--tolerance` を明示していれば、外してから） |
+| 同上 | `--optimize` あり | `--bg-polygon` / `--trimap`（既に渡していれば、その指示を直す。`--tolerance` を明示していれば、外す） |
+| `CONTOUR_ROUGH` / 単独の `RIM_CONTAMINATED` | `--edge-repair off` | `--edge-repair auto`。**門の警告（`HALO_REMAINS` / `BBOX_RECOMMENDED` / `NOT_SEPARABLE` / `FOREGROUND_TOO_SMALL` / `FOREGROUND_TOO_LARGE` / `SUBJECT_TOUCHES_EDGE`）が `warnings[]` に出ているあいだは付かない**——付けても 1 画素も直らない |
+| 同上 | `--edge-repair auto` | 付かない（その先は `remedy` の `--trimap`） |
+
+「`--tolerance` を上げる」とは言わない。照明場の上では効く範囲が狭く（実写の
+リモコンで 42〜48）、外すと別の連結成分へ飛んで崩れる。値を探すのは
+`--optimize` の仕事である。
+
 ```
 $ kiri schema cutout --brief --json | jq '.warnings[] | select(.code == "CONTOUR_ROUGH")'
 {
   "code": "CONTOUR_ROUGH",
   "summary": "輪郭がギザギザに蛇行している。背景のテクスチャが輪郭に乗っている",
-  "remedy": "数値の調整では直らない。--debug-mask のマスクを外部の道具で縮めて --trimap を作る。…"
+  "remedy": "数値の調整では直らない。--edge-repair auto を付ける（粗い区間だけ境界を解き直す。…）。それでも残るなら、--debug-mask のマスクを外部の道具で縮めて --trimap を作る。…"
 }
 ```
 

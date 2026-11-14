@@ -82,14 +82,14 @@ warning_catalog! {
         => "前景比率が大きすぎる。背景が残っている可能性がある",
         remedy: Some("--tolerance を上げるか、残った背景を --bg-polygon で指す"),
     HaloRemains = "HALO_REMAINS"
-        => "境界に背景色のままの縁が残っている。--tolerance を上げると減る",
-        remedy: Some("--tolerance を上げる（効く範囲は狭いので --dry-run で確かめる）。直らなければ CONTOUR_ROUGH と同じく --trimap を渡す。どこに残っているかは data.regions が悪い順に言う"),
+        => "境界に背景色のままの縁が残っている。--optimize が tolerance を探索する",
+        remedy: Some("--optimize を付ける（tolerance を探索する。手で上げてもよいが、効く範囲は狭いので --dry-run で確かめる）。探索しても残るなら、data.regions の区間を --bg-polygon で指すか --trimap を渡す。どこに残っているかは data.regions が悪い順に言う"),
     ContourRough = "CONTOUR_ROUGH"
         => "輪郭がギザギザに蛇行している。背景のテクスチャが輪郭に乗っている",
-        remedy: Some("数値の調整では直らない。--debug-mask のマスクを外部の道具で縮めて --trimap を作る。確定背景を輪郭の数 px 内側から、確定前景を 20px ほど内側から取り、そのあいだを不明の帯にする。どこが粗いかは data.regions が悪い順に言う"),
+        remedy: Some("数値の調整では直らない。--edge-repair auto を付ける（粗い区間だけ境界を解き直す。HALO_REMAINS などが一緒に出ていれば、先にそちらを --optimize で消す）。それでも残るなら、--debug-mask のマスクを外部の道具で縮めて --trimap を作る。確定背景を輪郭の数 px 内側から、確定前景を 20px ほど内側から取り、そのあいだを不明の帯にする。どこが粗いかは data.regions が悪い順に言う"),
     RimContaminated = "RIM_CONTAMINATED"
-        => "縁の色が商品より背景に近い（HALO_REMAINS も出ていれば --tolerance で減る）",
-        remedy: Some("HALO_REMAINS も出ていれば --tolerance を上げる。単独で出ているなら CONTOUR_ROUGH と同じく --trimap を渡す。どこが汚れているかは data.regions が悪い順に言う"),
+        => "縁の色が商品より背景に近い（HALO_REMAINS も出ていれば --optimize で減る）",
+        remedy: Some("HALO_REMAINS も出ていれば --optimize を付ける。単独で出ているなら CONTOUR_ROUGH と同じく --edge-repair auto を付け、残るなら --trimap を渡す。どこが汚れているかは data.regions が悪い順に言う"),
     MattingNotConverged = "MATTING_NOT_CONVERGED"
         => "closed-form matting が反復の上限で止まった。帯のアルファは解き切れていない",
         remedy: Some("--matting guided に戻す"),

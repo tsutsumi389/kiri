@@ -89,9 +89,14 @@ kiri cutout in.jpg -o out.png --dry-run --preview /tmp/kiri-preview.png --force 
 
 上から順に試す。
 
-1. **`warnings[].hint` に従う**（例: `--tolerance を上げると背景の残りが減ります`）。
+1. **`warnings[].hint` に従う**（例: `--bbox 0,0.354,0.9834,0.662 --normalized を指定してください`）。
    hint が無ければ schema の `warnings[].remedy` を見る
-2. **どこが商品かを面で教える。** 数値の調整では直らない輪郭も、これで直る。
+2. **`HALO_REMAINS` / `CONTOUR_ROUGH` / `RIM_CONTAMINATED` が出たら `--optimize --edge-repair auto` を足す。**
+   `--optimize` が tolerance / bbox / 背景の持ち方を探索し、`--edge-repair auto` が粗い区間だけ境界を解き直す。
+   24MP でも合わせて 2 秒ほどなので、`--tolerance` を手で振るより先に試す。
+   解き直しが見送られたときは、`CONTOUR_ROUGH` / `RIM_CONTAMINATED` の hint が止めた警告の code を言う
+   （`edge_repair.gated_by` と同じ）——その警告を先に消す
+3. **どこが商品かを面で教える。** 探索と解き直しで直らない輪郭も、これで直る。
    preview の元画像パネルのグリッドから座標を読み、正規化座標で渡す
    ```bash
    kiri cutout in.jpg -o out.png --dry-run --preview /tmp/kiri-preview.png --force --json \
@@ -104,9 +109,8 @@ kiri cutout in.jpg -o out.png --dry-run --preview /tmp/kiri-preview.png --force 
    たとえば商品の下に影が残っていれば、その帯を囲む横長の四角形を `--bg-polygon` に渡す。
    指定した多角形は、次の preview の元画像に重ねて描かれる（緑が前景、赤が背景）。
    指定がずれていないかはそこで確かめる。前景の多角形は**輪郭の少し内側**に置く
-3. **探索を kiri に任せる。** `--optimize` は tolerance / bbox / 背景の持ち方を総当たりする。
-   24MP で十数秒かかる
-4. `--tolerance` などの数値は最後に回す。効く範囲が狭く、外すと急に崩れる
+4. `--tolerance` などの数値は最後に回す。効く範囲が狭く、外すと急に崩れる。
+   明示した `--tolerance` は `--optimize` の探索から外れるので、探索させたいときは書かない
 
 `--trimap` / `--fg-mask` / `--bg-mask` を使えば、画像で範囲を渡すこともできる。
 寸法は EXIF の向きを適用した後の入力と一致させる。

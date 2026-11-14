@@ -12,7 +12,7 @@ $ kiri schema --json
   "scope": { "command": null, "brief": false, "summary": false },
   "exit_codes": [{ "code": 0, "meaning": "成功" }, ...],
   "errors":   [{ "code": "OUTPUT_EXISTS",  "exit_code": 2, "summary": "出力先が既に存在する。--force が要る" }, ...],
-  "warnings": [{ "code": "HALO_REMAINS", "summary": "境界に背景色のままの縁が残っている。...", "remedy": "--tolerance を上げる（...）" }, ...],
+  "warnings": [{ "code": "HALO_REMAINS", "summary": "境界に背景色のままの縁が残っている。...", "remedy": "--optimize を付ける（...）" }, ...],
   "profiles":  [{ "name": "amazon", "revision": "2026-09", "rules": { ... } }, ...],
   "lint_checks": [{ "name": "format", "needs_pixels": false }, ...],
   "global_options": [{ "name": "--json", "global": true, "takes_value": false, ... }],

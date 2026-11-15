@@ -74,9 +74,12 @@ kiri info in.jpg --json
 ### 3. 書き出さずに試し、preview を見る
 
 ```bash
-kiri cutout in.jpg -o out.png --dry-run --preview /tmp/kiri-preview.png --force --json
+kiri cutout in.jpg -o out.png --auto --dry-run --preview /tmp/kiri-preview.png --force --json
 ```
 
+- **`--auto` は最初から付ける。** 既定で切り、警告が出たときだけ設定の探索と境界の解き直しへ
+  昇格する。きれいに切れる画像では何も足さない（速さも成果物も変わらない）。
+  昇格しても 24MP で 3 秒ほど
 - `--dry-run` は成果物を書かない。**ただし `--preview` は書き出す**ので、2 回目以降は
   `--force` が要る。preview の置き場所は一時ディレクトリにする
 - **preview を Read で開いて目で確かめる。** 3 枚のパネルが並び、左から
@@ -91,15 +94,16 @@ kiri cutout in.jpg -o out.png --dry-run --preview /tmp/kiri-preview.png --force 
 
 1. **`warnings[].hint` に従う**（例: `--bbox 0,0.354,0.9834,0.662 --normalized を指定してください`）。
    hint が無ければ schema の `warnings[].remedy` を見る
-2. **`HALO_REMAINS` / `CONTOUR_ROUGH` / `RIM_CONTAMINATED` が出たら `--optimize --edge-repair auto` を足す。**
-   `--optimize` が tolerance / bbox / 背景の持ち方を探索し、`--edge-repair auto` が粗い区間だけ境界を解き直す。
-   24MP でも合わせて 2 秒ほどなので、`--tolerance` を手で振るより先に試す。
+2. **`--auto` を付けていなければ付ける。** `HALO_REMAINS` / `CONTOUR_ROUGH` / `RIM_CONTAMINATED` などが
+   出た画像で、tolerance / bbox / 背景の持ち方を探索し（`--optimize`）、粗い区間だけ境界を解き直す
+   （`--edge-repair auto`）。`--tolerance` を手で振るより先にこれを試す。
+   探索が走ったかは結果の `optimize` ブロックの有無で、解き直した窓の数は `edge_repair.repaired` で分かる。
    解き直しが見送られたときは、`CONTOUR_ROUGH` / `RIM_CONTAMINATED` の hint が止めた警告の code を言う
    （`edge_repair.gated_by` と同じ）——その警告を先に消す
 3. **どこが商品かを面で教える。** 探索と解き直しで直らない輪郭も、これで直る。
    preview の元画像パネルのグリッドから座標を読み、正規化座標で渡す
    ```bash
-   kiri cutout in.jpg -o out.png --dry-run --preview /tmp/kiri-preview.png --force --json \
+   kiri cutout in.jpg -o out.png --auto --dry-run --preview /tmp/kiri-preview.png --force --json \
      --normalized \
      --fg-polygon X1,Y1,X2,Y2,X3,Y3,... \
      --bg-polygon X1,Y1,X2,Y2,X3,Y3,...
@@ -110,7 +114,7 @@ kiri cutout in.jpg -o out.png --dry-run --preview /tmp/kiri-preview.png --force 
    指定した多角形は、次の preview の元画像に重ねて描かれる（緑が前景、赤が背景）。
    指定がずれていないかはそこで確かめる。前景の多角形は**輪郭の少し内側**に置く
 4. `--tolerance` などの数値は最後に回す。効く範囲が狭く、外すと急に崩れる。
-   明示した `--tolerance` は `--optimize` の探索から外れるので、探索させたいときは書かない
+   明示した `--tolerance` は `--auto` / `--optimize` の探索から外れるので、探索させたいときは書かない
 
 `--trimap` / `--fg-mask` / `--bg-mask` を使えば、画像で範囲を渡すこともできる。
 寸法は EXIF の向きを適用した後の入力と一致させる。

@@ -12183,6 +12183,214 @@ fn a_trimap_survives_the_optimize_search() {
     assert_eq!(cut.get_pixel(5, 5)[3], 0, "確定背景が残っている");
 }
 
+// --- 1 手で最良の経路を通す（--auto） ---
+
+/// `cutout <input> -o <out> --json` に引数を足して回す。
+fn cutout_with(input: &Path, output: &Path, extra: &[&str]) -> std::process::Output {
+    kiri()
+        .args([
+            "cutout",
+            input.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+        ])
+        .args(extra)
+        .arg("--json")
+        .output()
+        .unwrap()
+}
+
+/// 色では分けられない場面。既定でも探索しても致命的な警告が残る
+/// （`an_inseparable_scene_says_that_no_candidate_was_clean` と同じ素材）。
+fn inseparable_scene() -> image::RgbaImage {
+    let mut img = image::RgbaImage::from_pixel(200, 200, image::Rgba([120, 118, 112, 255]));
+    for y in 90..200 {
+        for x in 50..150 {
+            img.put_pixel(x, y, image::Rgba([126, 124, 118, 255]));
+        }
+    }
+    img
+}
+
+/// **きれいに切れる画像では `--auto` は何も足さない。** 探索は走らず、
+/// 成果物は既定の実行と 1 バイトも違わない。
+///
+/// これが崩れると「常に `--auto` を付けてよい」と言えなくなる——単色背景の
+/// 速い経路に探索の時間を乗せ、同じ素材の出力を指定の有無で変えてしまう。
+#[test]
+fn auto_leaves_a_clean_cutout_untouched() {
+    let dir = fixture_dir();
+    let img = product_image(&ProductSpec {
+        width: 200,
+        height: 200,
+        ..Default::default()
+    });
+    let input = write_png(dir.path(), "in.png", &img);
+    let plain = dir.path().join("plain.png");
+    let auto = dir.path().join("auto.png");
+
+    let out = cutout_with(&input, &plain, &[]);
+    assert!(out.status.success());
+    let before = json_stdout(&out);
+    assert_eq!(before["settings"]["auto"], false);
+    assert!(
+        warning_codes(&before).is_empty(),
+        "素材が前提を満たさない: {before}"
+    );
+
+    let out = cutout_with(&input, &auto, &["--auto"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    assert_eq!(v["settings"]["auto"], true);
+    // 探索は指定ではなく kiri の判断で走るので、指定値のほうは false のまま
+    assert_eq!(v["settings"]["optimize"], false);
+    assert!(v.get("optimize").is_none(), "警告が無いのに探索した: {v}");
+    assert_eq!(v["edge_repair"]["repaired"], 0, "{v}");
+    assert!(v["edge_repair"]["gated_by"].is_null(), "{v}");
+    assert_eq!(
+        std::fs::read(&plain).unwrap(),
+        std::fs::read(&auto).unwrap(),
+        "警告の無い画像で --auto が画素を動かした"
+    );
+}
+
+/// 既定の切り抜きに致命か品質の警告が出たら、探索へ昇格する。
+#[test]
+fn auto_escalates_to_the_search_when_the_plain_cutout_warns() {
+    let dir = fixture_dir();
+    let input = write_png(dir.path(), "flat.png", &inseparable_scene());
+    let output = dir.path().join("out.png");
+
+    let plain = json_stdout(&cutout_with(&input, &output, &["--dry-run"]));
+    assert!(
+        !warning_codes(&plain).is_empty(),
+        "素材が前提を満たさない: {plain}"
+    );
+
+    let out = cutout_with(&input, &output, &["--auto"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_stdout(&out);
+    assert_eq!(v["settings"]["auto"], true);
+    assert_eq!(v["settings"]["optimize"], false);
+    assert!(
+        v["optimize"]["candidates"].as_array().unwrap().len() > 1,
+        "警告が出たのに探索していない: {v}"
+    );
+    // 選ばれた候補と settings が一致する規約は --optimize と同じ
+    assert_eq!(
+        v["optimize"]["chosen"]["tolerance"],
+        v["settings"]["tolerance"]
+    );
+    assert!(v.get("edge_repair").is_some(), "{v}");
+    // 済んだ手（--optimize / --edge-repair auto を付ける）は勧めない。
+    // どちらも --auto とは併記できず、従うと exit 2 になる
+    for w in v["warnings"].as_array().unwrap() {
+        let hint = w["hint"].as_str().unwrap_or("");
+        assert!(!hint.contains("を付けると"), "{w}");
+    }
+    // 探索しても駄目だった事実は、--optimize と同じ code で言う
+    assert!(
+        has_warning(&v, "OPTIMIZE_NO_CLEAN_CANDIDATE"),
+        "{:?}",
+        warning_codes(&v)
+    );
+}
+
+/// 昇格した実行は、`--optimize --edge-repair auto` を自分で渡した実行と
+/// 同じ成果物を返す。**`--auto` は経路を選ぶだけで、別の切り方を持たない。**
+#[test]
+fn auto_matches_the_explicit_best_path_once_escalated() {
+    let dir = fixture_dir();
+    let input = write_png(dir.path(), "flat.png", &inseparable_scene());
+    let auto = dir.path().join("auto.png");
+    let explicit = dir.path().join("explicit.png");
+
+    assert!(cutout_with(&input, &auto, &["--auto"]).status.success());
+    assert!(
+        cutout_with(&input, &explicit, &["--optimize", "--edge-repair", "auto"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        std::fs::read(&auto).unwrap(),
+        std::fs::read(&explicit).unwrap()
+    );
+}
+
+/// `--auto` は探索と解き直しを自分で決めるので、同じことを言う指定とは併記できない。
+#[test]
+fn auto_refuses_the_flags_it_decides_itself() {
+    let dir = fixture_dir();
+    let input = write_png(
+        dir.path(),
+        "in.png",
+        &product_image(&ProductSpec::default()),
+    );
+    let output = dir.path().join("out.png");
+
+    for extra in [
+        &["--auto", "--optimize"][..],
+        &["--auto", "--edge-repair", "auto"],
+        &["--auto", "--edge-repair", "off"],
+    ] {
+        let out = cutout_with(&input, &output, extra);
+        assert_eq!(out.status.code(), Some(2), "{extra:?}");
+        assert!(!output.exists(), "{extra:?}");
+    }
+}
+
+/// spec の `auto: true` が効き、`optimize: true` / `edge_repair: "off"` との併記は
+/// その項目だけを落とす。
+#[test]
+fn batch_accepts_the_auto_key() {
+    let dir = fixture_dir();
+    write_png(dir.path(), "a.png", &inseparable_scene());
+    write_png(dir.path(), "b.png", &inseparable_scene());
+    write_png(dir.path(), "c.png", &inseparable_scene());
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        r#"{"defaults":{"auto":true},
+             "items":[{"input":"a.png","output":"a.out.png"},
+                      {"input":"b.png","output":"b.out.png","optimize":true},
+                      {"input":"c.png","output":"c.out.png","edge_repair":"off"},
+                      {"input":"a.png","output":"d.out.png","optimize":false,"edge_repair":"auto"},
+                      {"input":"a.png","output":"e.out.png","auto":false,"optimize":true}]}"#,
+    )
+    .unwrap();
+
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let v = json_stdout(&out);
+    assert_eq!(v["succeeded"], 3, "{v}");
+    assert_eq!(v["failed"], 2, "{v}");
+    let results = v["results"].as_array().unwrap();
+    // `auto` がやることと同じ指定は並べてよい。`"auto": false` を並べれば
+    // 項目だけ自分で指定できる
+    assert_eq!(results[3]["result"]["settings"]["auto"], true, "{v}");
+    assert_eq!(results[4]["result"]["settings"]["auto"], false, "{v}");
+    assert_eq!(results[4]["result"]["settings"]["optimize"], true, "{v}");
+    let ran = &results[0]["result"];
+    assert_eq!(ran["settings"]["auto"], true);
+    assert!(
+        ran["optimize"]["candidates"].as_array().unwrap().len() > 1,
+        "{ran}"
+    );
+    for failed in &results[1..3] {
+        assert_eq!(failed["error"]["code"], "SPEC_INVALID", "{failed}");
+    }
+}
+
 // --- cutout --rotate ---
 
 /// 切り抜きと回転を 1 本の実行に畳む。

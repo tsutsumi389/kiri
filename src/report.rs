@@ -774,6 +774,12 @@ pub struct SettingsReport {
     /// `applied_bbox` の出所を変えるからである。true なら 3 つとも kiri が
     /// 探索して選んだ値で、何を試したかは `optimize.candidates[]` にある
     pub optimize: bool,
+    /// `--auto` を渡したか。**常に出す。**
+    ///
+    /// true なら、探索するか・解き直すかを kiri が既定の切り抜きの警告から
+    /// 決めている。実際に走ったかは `optimize` ブロックの有無と
+    /// `edge_repair.repaired` が言う
+    pub auto: bool,
     /// 落ち影を合成したか（"off" / "synth"）。**常に出す。**
     /// 実際に効いたずらし量とぼかしは `shadow` ブロックのほう
     pub shadow: &'static str,
@@ -964,10 +970,12 @@ pub struct CutoutReport {
     /// モデルが走ったときだけ出る。`--segment off`（既定）ではキーごと無い
     #[serde(skip_serializing_if = "Option::is_none")]
     pub segment: Option<SegmentReport>,
-    /// 探索が走ったときだけ出る。`--optimize` 無しではキーごと無い
+    /// 探索が走ったときだけ出る（`--optimize`、または `--auto` が昇格した実行）。
+    /// 走らなければキーごと無い
     #[serde(skip_serializing_if = "Option::is_none")]
     pub optimize: Option<OptimizeReport>,
-    /// `--edge-repair auto` を渡したときだけ出る。off の実行の JSON は 1 バイトも動かない
+    /// `--edge-repair auto` か `--auto` を渡したときだけ出る。off の実行の JSON は
+    /// 1 バイトも動かない
     #[serde(skip_serializing_if = "Option::is_none")]
     pub edge_repair: Option<EdgeRepairReport>,
     /// `--white-balance` / `--exposure` のどちらかに `auto` を渡したときだけ出る。

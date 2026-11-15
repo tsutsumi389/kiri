@@ -161,7 +161,25 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     // **`auto` の門が測った見立てをそのまま渡す。** 門を通らなかった実行では
     // `None` で、切り抜き側が自分で測る
     let seen = decision.seen.as_ref();
-    let (mut result, optimize, optimize_warning) = if args.optimize {
+    //
+    // **`--auto` は既定の 1 回を先に回し、警告が出たときだけ探索へ昇格する。**
+    // 警告の無い結果はそのまま流れるので、成果物は `--auto` 無しと 1 バイトも
+    // 違わない。昇格するときは 1 回目を**探索の前に手放す**——抱えたままだと
+    // 24.5MP では切り抜いた画像（98MB）が探索の山にそのまま重なる
+    let plain = if args.optimize {
+        None
+    } else {
+        Some(cutout_seen(&loaded.image, &opts, seen)).filter(|first| {
+            // `--auto` が無ければ、何が出ていてもこの結果をそのまま使う。
+            // **3 軸とも明示されていれば昇格しない**——候補はいま切った 1 つ
+            // だけなので、同じ切り抜きをもう 1 度回して「全候補を試したが
+            // 駄目だった」と言うことになる
+            !args.auto || optimize::settled(first) || args.fixed.all()
+        })
+    };
+    let (mut result, optimize, optimize_warning) = if let Some(result) = plain {
+        (result, None, None)
+    } else {
         // 表を渡し切る（借りない）。借りると候補ごとに原寸の `Constraints`
         // （24.5MP で 24MB）を複製することになる。`found.options` が
         // 「効いた設定」として返ってくるので、下の `opts` はそれで置き換わる
@@ -172,29 +190,34 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         // 選ばれた候補のものと合わせて 24.5MB を 2 本抱えることになる
         opts = found.options;
         (found.result, Some(report), found.warning)
-    } else {
-        (cutout_seen(&loaded.image, &opts, seen), None, None)
     };
     let bbox = opts.bbox;
 
     // **解き直しは探索の後ろに 1 度だけ掛ける。** 探索の候補ごとに掛けると、
     // 候補の順位が解き直した後の指標で決まり、`--edge-repair` の有無で
     // `--optimize` の選ぶ設定まで変わる。選ばれた 1 つの結果だけを直す
-    let edge_repair = match args.edge_repair {
-        EdgeRepairMode::Off => None,
-        EdgeRepairMode::Auto => {
-            let (repaired, outcome) =
-                edge_repair::repair(&loaded.image, &opts, result, seen, &Bands::default());
-            result = repaired;
-            Some(edge_repair_report(&outcome))
-        }
+    //
+    // **`--auto` はここを必ず通る。** 区間が無ければ（警告が無い、門に当たった）
+    // `repair` は 1 回目をそのまま返すので、きれいな画像の画素は動かない
+    let edge_repair = if args.auto || args.edge_repair == EdgeRepairMode::Auto {
+        let (repaired, outcome) =
+            edge_repair::repair(&loaded.image, &opts, result, seen, &Bands::default());
+        result = repaired;
+        Some(edge_repair_report(&outcome))
+    } else {
+        None
     };
 
     // **hint は「いま渡された指定」から見た次の一手を言う。** 切り抜きの層は
     // `--optimize` も `--edge-repair` も知らないので、ここで差し替える
     guide_hints(
         &mut result.warnings,
-        args.optimize,
+        // 指定ではなく**探索が走ったか**で言う。`--auto` が昇格した実行に
+        // 「--optimize を付けると」と返すと、もう済んだ手を勧めることになる。
+        // **`--auto` で探索が走らなかった実行も同じ側に置く**——警告が残って
+        // いるのに走らないのは 3 軸とも明示したときだけで、そこへ `--optimize` を
+        // 勧めると clap が断る併記になる。言うべきは「明示を外せ」である
+        optimize.is_some() || args.auto,
         args.fixed.tolerance,
         opts.constraints.is_some(),
         match &edge_repair {
@@ -461,6 +484,9 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             // 指定値。**選ばれた候補ではない**——探索したかどうかそのものは
             // 利用者が決める。何が選ばれたかは上の 3 つと optimize ブロックが言う
             optimize: args.optimize,
+            // 同じく指定値。探索が走ったかは optimize ブロックの有無が、
+            // 解き直したかは edge_repair.repaired が言う
+            auto: args.auto,
             // 指定値。実際に効いたずらし量とぼかしは `shadow` ブロックのほう
             shadow: args.shadow.as_str(),
             // 同じく指定値。実際に効いた高さと隙間は `reflect` ブロックのほう
@@ -538,7 +564,7 @@ fn guide_hints(
             "--optimize を付けると tolerance を探索します（効く範囲は素材ごとに狭く、手で上げると外しやすい）"
         }
         (false, true) => "--tolerance の指定を外して --optimize を付けると、効く値を探索します",
-        (true, true) => "--tolerance の指定を外すと、--optimize が効く値を探索します",
+        (true, true) => "--tolerance の指定を外すと、探索が効く値を選びます",
         (true, false) if constrained => {
             "探索しても縁が残りました。data.regions の区間で、渡した面の指示（--trimap / --bg-polygon など）を直してください"
         }
@@ -551,7 +577,7 @@ fn guide_hints(
             "--edge-repair auto を付けると、data.regions の区間だけ境界を解き直します".to_string(),
         ),
         Repair::Gated(gate) => Some(format!(
-            "--edge-repair auto は {gate} が出ているため見送りました。先に {gate} を消してください\
+            "境界の解き直しは {gate} が出ているため見送りました。先に {gate} を消してください\
              （直し方はその警告の hint、無ければ schema の remedy）",
             gate = gate.as_str(),
         )),

@@ -220,6 +220,13 @@ pub struct ItemSettings {
     /// tolerance を書いた項目では tolerance を探索しない（CLI で
     /// `--tolerance` を明示したときと同じ規約）
     pub optimize: Option<bool>,
+    /// 警告が出たときだけ探索と解き直しへ昇格するか（CLI の `--auto`）。
+    ///
+    /// **`optimize: true` / `edge_repair: "off"` とは併記できない。** 継承の後で
+    /// 見るので、`defaults` に `auto` を書いた spec で項目が `optimize: true` を
+    /// 書くと、その項目は SPEC_INVALID で落ちる（`"auto": false` を並べれば通る）。
+    /// `edge_repair: "auto"` は `auto` がやることと同じなので許す
+    pub auto: Option<bool>,
     /// 埋め込み ICC を sRGB へ変換するか（既定 true）
     pub color_convert: Option<bool>,
     pub edge_threshold: Option<f64>,
@@ -335,6 +342,7 @@ impl ItemSettings {
             segment,
             model_path,
             optimize,
+            auto,
             color_convert,
             edge_threshold,
             step_tolerance,
@@ -395,6 +403,7 @@ const SETTING_KEYS: &[&str] = &[
     "segment",
     "model_path",
     "optimize",
+    "auto",
     "color_convert",
     "edge_threshold",
     "step_tolerance",

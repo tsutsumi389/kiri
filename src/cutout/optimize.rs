@@ -154,6 +154,19 @@ pub const QUALITY_CODES: [WarningCode; 3] = [
     WarningCode::RimContaminated,
 ];
 
+/// 致命的な警告も品質の警告も出ていないか。`--auto` が探索へ昇格するかを決める。
+///
+/// **`Trial::clean` と同じ 2 つの集合を数える。** 別の集合を定義すると、
+/// `--auto` が「探索は要らない」と見た結果を、`--optimize` が「きれいではない」と
+/// 呼ぶことになる。崩れ（`collapsed`）は候補を並べて初めて分かる性質なので、
+/// 1 つの結果には立てようが無い。
+pub fn settled(result: &CutoutResult) -> bool {
+    !result
+        .warnings
+        .iter()
+        .any(|w| FATAL_CODES.contains(&w.code) || QUALITY_CODES.contains(&w.code))
+}
+
 /// 利用者が明示したために探索の軸から外れた項目。
 ///
 /// **明示は探索より強い。** `--tolerance 30 --optimize` は「30 の中で最良を
@@ -165,6 +178,13 @@ pub struct OptimizeFixed {
     pub tolerance: bool,
     pub bbox: bool,
     pub background_model: bool,
+}
+
+impl OptimizeFixed {
+    /// 探索の軸が 1 つも残っていないか。候補は渡された設定そのもの 1 つになる
+    pub fn all(&self) -> bool {
+        self.tolerance && self.bbox && self.background_model
+    }
 }
 
 /// 候補が使う矩形。**寸法ごとに解き直す。**

@@ -937,8 +937,29 @@ fn fields() -> Vec<FieldEntry> {
                  optimize.candidates[]、選ばれた理由は optimize.chosen.score が言う。\
                  **明示した軸は探索しない**——--tolerance 30 --optimize なら候補の \
                  tolerance は全部 30 になる。false のときの成果物の画素は --optimize を\
-                 足す前と 1 バイトも変わらない（報告 JSON にはこの 1 キーだけが増える。\
-                 schema_version は据え置き）",
+                 足す前と 1 バイトも変わらない。--auto が探索へ昇格した実行では false のまま \
+                 optimize ブロックが現れる（settings.auto を参照）",
+            ),
+        },
+        FieldEntry {
+            path: "settings.auto",
+            appears_in: vec!["cutout"],
+            unit: "bool",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "--auto を渡したか",
+            notes: Some(
+                "true なら、探索するか・解き直すかを kiri が既定の切り抜きの警告から決めている。\
+                 既定の結果に致命の警告（NOT_SEPARABLE / FOREGROUND_TOO_SMALL / \
+                 FOREGROUND_TOO_LARGE / SUBJECT_TOUCHES_EDGE / BBOX_RECOMMENDED）か品質の警告\
+                 （HALO_REMAINS / CONTOUR_ROUGH / RIM_CONTAMINATED）が出たときだけ --optimize の\
+                 探索へ昇格し、最後に --edge-repair auto を掛ける。**探索が走ったかは optimize \
+                 ブロックの有無が、解き直したかは edge_repair.repaired が言う**（settings.optimize \
+                 は指定値なので false のまま）。--tolerance / --bbox / --background-model を 3 つとも\
+                 明示した実行は、探索の軸が残っていないので昇格しない。警告の出ない画像の成果物は --auto 無しと \
+                 1 バイトも違わず、昇格した実行の成果物は --optimize --edge-repair auto と同じである",
             ),
         },
         FieldEntry {
@@ -1059,8 +1080,8 @@ fn fields() -> Vec<FieldEntry> {
                  stage が final の候補の指標は原寸のものである",
             ),
         },
-        // `edge_repair` ブロックは `--edge-repair auto` を渡した実行にしか現れない
-        // （`optimize` と同じ規約）。off の実行の JSON は 1 バイトも動かない
+        // `edge_repair` ブロックは `--edge-repair auto` か `--auto` を渡した実行にしか
+        // 現れない（`optimize` と同じ規約）。off の実行の JSON は 1 バイトも動かない
         FieldEntry {
             path: "edge_repair.repaired",
             appears_in: vec!["cutout"],
@@ -1069,7 +1090,7 @@ fn fields() -> Vec<FieldEntry> {
             null_means: None,
             warns: vec![],
             gates: None,
-            summary: "--edge-repair auto が解き直した窓の数（0 なら何もしていない）",
+            summary: "--edge-repair auto / --auto が解き直した窓の数（0 なら何もしていない）",
             notes: Some(
                 "1 回目の切り抜きで CONTOUR_ROUGH か RIM_CONTAMINATED が出たときだけ、その\
                  data.regions を広げた窓で 2 回目を切って差し替える。0 のときの成果物は\

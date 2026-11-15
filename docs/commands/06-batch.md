@@ -34,7 +34,7 @@ x broken.jpg  失敗
 オプションと対応する（`bbox` / `normalized` / `fg_seeds` / `trimap` / `alpha_trimap` / `fg_mask` /
 `bg_mask` / `fg_polygons` / `bg_polygons` / `tolerance` / `border` /
 `cleanup` / `feather` / `despill` / `refine` / `matting` / `smooth_contour` /
-`reclassify` / `background_model` / `segment` / `model_path` / `optimize` /
+`reclassify` / `background_model` / `segment` / `model_path` / `optimize` / `auto` /
 `color_convert` / `edge_threshold` /
 `step_tolerance` / `shadow_tolerance` / `shadow` / `shadow_offset` / `shadow_blur` /
 `shadow_color` / `shadow_opacity` / `reflect` / `reflect_height` / `reflect_opacity` /
@@ -56,6 +56,16 @@ x broken.jpg  失敗
 **同じ項目に書いた `tolerance` / `bbox` / `background_model` は探索の軸から外れる**
 ——CLI で明示したときと同じ規約で、spec では「書いたかどうか」がそのまま明示に
 あたる。1 件が数秒から十数秒になるので、数百点に一律で付ける値ではない。
+
+**素材が混ざっているなら `auto` を `defaults` に書く**（[警告が出たときだけ任せる](05-4-guidance.md#警告が出たときだけ任せる--auto)）。
+既定の切り抜きに致命か品質の警告が出た項目だけが探索と解き直しへ昇格し、きれいに
+切れる項目は 1 バイトも変わらない。`auto` は `"optimize": true` / `"edge_repair": "off"`
+と併記できない——継承の後で見るので、`defaults` に `auto` を書いた spec で項目が
+`"optimize": true` を書くと、その項目は `SPEC_INVALID` で落ちる。項目だけ自分で
+指定するときは `"auto": false` を並べて書く。逆に `defaults` が `optimize` /
+`edge_repair` を書いている spec の項目で `auto` を使うときは、`"optimize": false` /
+`"edge_repair": "auto"` を並べる（`"edge_repair": "auto"` は `auto` がやることと
+同じなので、併記してよい）。
 
 `max_bytes` は**数値でも文字列でも書ける**（`"max_bytes": 500000` と `"max_bytes": "500k"` は
 同じ意味になる。数値は常にバイト数で、単位を付けたいときだけ文字列にする）。読めない値

@@ -1950,6 +1950,20 @@ pub struct CutoutArgs {
     #[arg(long, long_help = optimize_long_help())]
     pub optimize: bool,
 
+    /// 既定で切り、致命か品質の警告が出たときだけ --optimize の探索へ昇格して、最後に --edge-repair auto を掛ける（既定 off）
+    ///
+    /// **警告の出ない画像では何も足さない。** 探索は走らず、成果物は --auto 無しと 1 バイトも違わない。単色背景の速い経路はそのままなので、素材の質が分からないときは常に付けてよい。
+    ///
+    /// 昇格の条件は --optimize が「きれい」と呼ぶ集合と同じで、既定の切り抜きに NOT_SEPARABLE / FOREGROUND_TOO_SMALL / FOREGROUND_TOO_LARGE / SUBJECT_TOUCHES_EDGE / BBOX_RECOMMENDED / HALO_REMAINS / CONTOUR_ROUGH / RIM_CONTAMINATED のどれかが出たときに探索する。昇格した実行の成果物は --optimize --edge-repair auto と同じで、既定の 1 回ぶんだけ遅い（24MP で 1 秒ほど）。
+    ///
+    /// 探索が走ったかは結果の optimize ブロックの有無が、解き直したかは edge_repair.repaired が言う。--tolerance などの明示した値は、昇格しても探索の軸から外れる（--optimize と同じ規約）。
+    ///
+    /// --tolerance / --bbox / --background-model を 3 つとも明示した実行は昇格しない（探索の軸が残っていない）。
+    ///
+    /// --optimize / --edge-repair とは併記できない。どちらも --auto が自分で決める。
+    #[arg(long, conflicts_with_all = ["optimize", "edge_repair"])]
+    pub auto: bool,
+
     /// 利用者が明示した軸。**引数ではない**——`main.rs` が clap の
     /// `ValueSource` を見て埋める。
     ///

@@ -447,6 +447,27 @@ fn to_cutout_args(
         .map(|s| parse_size(s).map_err(|e| Error::new(ErrorCode::InvalidCanvas, e)))
         .transpose()?;
 
+    // **CLI では clap が同じ併記を断っている。** `auto` は探索と解き直しを
+    // 自分で決めるので、同じことを言う指定が並ぶとどちらが効くのかを読めない。
+    // 継承の後で見る——`defaults` の `auto` に項目の `optimize` が重なる形も断る
+    let auto = settings.auto.unwrap_or(false);
+    //
+    // **`edge_repair: "auto"` は許す。** `auto` がやることと同じで、断ると
+    // `defaults` に `edge_repair` を書いた spec の項目で `auto` を使う道が
+    // 無くなる（継承は項目から `None` へ戻せない）。読めない綴りはここを
+    // 素通りして、下の `value_enum` が綴り違いとして断る
+    if auto && (settings.optimize == Some(true) || settings.edge_repair.as_deref() == Some("off")) {
+        return Err(Error::new(
+            ErrorCode::SpecInvalid,
+            "auto は optimize: true / edge_repair: \"off\" と併記できません",
+        )
+        .with_hint(
+            "auto が探索と解き直しを自分で決めます。この項目で自分で指定するなら \
+             \"auto\": false を、auto に任せるなら \"optimize\": false / \
+             \"edge_repair\": \"auto\" を書いてください",
+        ));
+    }
+
     let background = color(settings.background.as_deref(), [255, 255, 255])?;
 
     let max_bytes = max_bytes(settings.max_bytes.as_ref())?;
@@ -551,6 +572,7 @@ fn to_cutout_args(
         )?,
         exposure: value_enum(settings.exposure.as_deref(), NormalizeMode::Off, "exposure")?,
         optimize: settings.optimize.unwrap_or(false),
+        auto,
         // spec では `Some` がそのまま「明示した」である。CLI 側が clap の
         // `ValueSource` を見て解いているのと同じ問いに、JSON では素直に答えられる
         fixed: OptimizeFixed {

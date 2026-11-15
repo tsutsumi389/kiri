@@ -404,6 +404,81 @@ fn the_block_reports_what_the_mask_now_says() {
     );
 }
 
+/// **`--optimize --edge-repair auto` と同じ成果物を、解き直しが働く場面でも返す。**
+///
+/// 致命の警告で昇格する場面は門で解き直しが見送られるので、「同じ」のうち
+/// 解き直しの側はここでしか確かめられない。矩形と tolerance は明示するので、
+/// 探索に残る軸は背景の持ち方だけである。
+#[test]
+fn auto_reaches_the_repair_and_matches_the_explicit_path() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let s = scene("R1");
+    let truth = real_scene(&s);
+    let input = common::write_png(dir.path(), "r1.png", &truth.image);
+    let (x1, y1, x2, y2) = common::assisted_bbox(&truth);
+    let bbox = format!("{x1},{y1},{x2},{y2}");
+    let tolerance = s.assisted_tolerance.to_string();
+    let given = ["--bbox", &bbox, "--tolerance", &tolerance];
+
+    let auto = dir.path().join("auto.png");
+    let explicit = dir.path().join("explicit.png");
+    let v = cli(&input, &auto, &[&given[..], &["--auto"]].concat());
+    cli(
+        &input,
+        &explicit,
+        &[&given[..], &["--optimize", "--edge-repair", "auto"]].concat(),
+    );
+
+    // 品質の警告だけで昇格している（致命の警告が無いので門は開いている）
+    assert!(v["optimize"]["candidates"].is_array(), "{v}");
+    assert!(v["edge_repair"]["repaired"].as_u64().unwrap() > 0, "{v}");
+    assert_eq!(
+        std::fs::read(&auto).unwrap(),
+        std::fs::read(&explicit).unwrap()
+    );
+    // 明示した軸は昇格しても探索されない
+    for candidate in v["optimize"]["candidates"].as_array().unwrap() {
+        assert_eq!(candidate["tolerance"], s.assisted_tolerance, "{candidate}");
+    }
+}
+
+/// 3 軸とも明示した実行は昇格しない。候補はいま切った 1 つだけなので、
+/// 探索は同じ切り抜きをもう 1 度回すだけになる。解き直しは掛かる。
+#[test]
+fn auto_does_not_search_when_every_axis_is_given() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let s = scene("R1");
+    let truth = real_scene(&s);
+    let input = common::write_png(dir.path(), "r1.png", &truth.image);
+    let (x1, y1, x2, y2) = common::assisted_bbox(&truth);
+    let bbox = format!("{x1},{y1},{x2},{y2}");
+    let tolerance = s.assisted_tolerance.to_string();
+    let given = [
+        "--bbox",
+        &bbox,
+        "--tolerance",
+        &tolerance,
+        "--background-model",
+        "auto",
+    ];
+
+    let auto = dir.path().join("auto.png");
+    let repaired = dir.path().join("repaired.png");
+    let v = cli(&input, &auto, &[&given[..], &["--auto"]].concat());
+    cli(
+        &input,
+        &repaired,
+        &[&given[..], &["--edge-repair", "auto"]].concat(),
+    );
+
+    assert!(v.get("optimize").is_none(), "{v}");
+    assert!(v["edge_repair"]["repaired"].as_u64().unwrap() > 0, "{v}");
+    assert_eq!(
+        std::fs::read(&auto).unwrap(),
+        std::fs::read(&repaired).unwrap()
+    );
+}
+
 /// batch の spec でも書ける。綴り違いの値は断る。
 #[test]
 fn the_batch_spec_takes_edge_repair() {

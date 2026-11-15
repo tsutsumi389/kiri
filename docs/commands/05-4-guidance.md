@@ -493,6 +493,7 @@ out.png  4284x5712  png  41.6 MB  (13256 ms)
 ### どう見せるか
 
 `--json` を付けると `optimize` ブロックが増える（付けなければキーごと現れない）。
+[`--auto`](#警告が出たときだけ任せる--auto) が探索へ昇格した実行でも同じブロックが出る。
 
 ```json
 "optimize": {
@@ -595,3 +596,45 @@ out.png  4284x5712  png  41.6 MB  (13256 ms)
 （前景比率 0.0664）。**探索は毎回引き直す。**
 
 `--dry-run` と併用できる。`batch` の spec では `"optimize": true` と書く。
+
+### 警告が出たときだけ任せる（`--auto`）
+
+`--optimize` は付ければ必ず探索する。素材の質が分からないうちは、付けるかどうかを
+決めるために 1 回切ってみることになり、それが 1 往復になる。**`--auto` はその
+1 回を kiri の中で済ませる。**
+
+```
+$ kiri cutout remote.jpg -o out.png --auto
+```
+
+1. 既定の設定で切る
+2. その結果に致命の警告（`NOT_SEPARABLE` / `FOREGROUND_TOO_SMALL` /
+   `FOREGROUND_TOO_LARGE` / `SUBJECT_TOUCHES_EDGE` / `BBOX_RECOMMENDED`）か品質の警告
+   （`HALO_REMAINS` / `CONTOUR_ROUGH` / `RIM_CONTAMINATED`）が出たときだけ、
+   `--optimize` の探索へ昇格する
+3. 最後に [`--edge-repair auto`](05-3-boundary.md#悪い区間だけ解き直す--edge-repair) を掛ける
+
+**警告の出ない画像では何も足さない。** 探索は走らず、成果物は `--auto` 無しと
+1 バイトも違わない。昇格の条件は `--optimize` が「きれい」と呼ぶ集合そのもので、
+別の基準は持たない。昇格した実行の成果物は `--optimize --edge-repair auto` と
+同じである——`--auto` は経路を選ぶだけで、別の切り方を持たない。
+
+| 実写のリモコン（24.5MP） | 所要 | `halo_ratio` | `contour_roughness` | 品質の警告 |
+|---|---|---|---|---|
+| 既定 | 0.95 秒 | 0.1275 | 1.2393 | `HALO_REMAINS` / `CONTOUR_ROUGH` |
+| `--optimize --edge-repair auto` | 1.90 秒 | 0.0068 | 0.0939 | なし |
+| **`--auto`** | **2.73 秒** | **0.0068** | **0.0939** | **なし** |
+
+昇格した実行は、捨てた既定の 1 回ぶんだけ遅い。最初から探索が要ると分かっている
+素材なら `--optimize --edge-repair auto` を直接渡すほうが速い。
+
+探索が走ったかは結果の `optimize` ブロックの有無が、解き直したかは
+`edge_repair.repaired` が言う。`settings.auto` は指定値で、`settings.optimize` は
+`--auto` の実行では `false` のままである。明示した `--tolerance` / `--bbox` /
+`--background-model` は、昇格しても探索の軸から外れる。
+
+**`--tolerance` / `--bbox` / `--background-model` を 3 つとも明示した実行は昇格しない。**
+探索の軸が残っておらず、候補はいま切った 1 つだけになる。解き直しだけが掛かる。
+
+`--optimize` / `--edge-repair` とは併記できない（どちらも `--auto` が決める）。
+`batch` の spec では `"auto": true` と書く。

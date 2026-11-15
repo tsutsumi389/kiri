@@ -56,6 +56,7 @@ product.png  1600x2000  png  841.4 KB  (338 ms)
 | `--no-refine` | | 境界のアルファを色から推定し直さず、マスクの形から作る旧方式に戻す |
 | `--no-despill` | | 境界画素から背景色の寄与を取り除かない |
 | `--optimize` | | `tolerance` / `bbox` / `background-model` の組を総当たりし、指標で選ぶ（[探索を kiri に任せる](05-4-guidance.md#探索を-kiri-に任せる--optimize)） |
+| `--auto` | | 既定で切り、致命か品質の警告が出たときだけ `--optimize` の探索へ昇格して、最後に `--edge-repair auto` を掛ける。警告の出ない画像では何も足さない（[警告が出たときだけ任せる](05-4-guidance.md#警告が出たときだけ任せる--auto)） |
 | `--fail-on SPEC` | — | 指標がこの条件に触れたら **exit 5** で返す（[合否を exit code で返す](05-6-verify.md#合否を-exit-code-で返す--fail-on)） |
 | `--rotate` | 0 | 切り抜いた**後に**時計回りへ回す角度(度)。負値は反時計回り。90 の倍数のみ無劣化。`auto` で `subject.level_rotation` を適用（[切り抜いた後に回す](05-5-finishing.md#切り抜いた後に回す--rotate)） |
 | `--profile NAME` | — | モール規格のプリセット。`--canvas` / `--fill-ratio` / `--format` / `--background` / `--flatten` / `--max-bytes` をまとめて決める（[規格をプリセットで指定する](05-6-verify.md#規格をプリセットで指定する--profile)） |

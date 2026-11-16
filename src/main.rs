@@ -336,8 +336,10 @@ fn print_optimize(optimize: Option<&OptimizeReport>, settings: &SettingsReport) 
     // （`auto`）だが、すぐ上の「背景」ブロックは効いた値を語っているので、
     // 効いた値だけを出すと `--background-model auto` を写せる候補表の側と
     // 食い違い、要求値だけを出すと同じ画面で同じ語が 2 つの意味を持つ
-    let model = if settings.background_model == c.background_model {
-        settings.background_model.to_string()
+    // **採らなかった候補には要求値だけを出す。** `settings` は返した結果
+    // （既定の 1 回）のもので、この候補が効かせた値ではない
+    let model = if !o.adopted || settings.background_model == c.background_model {
+        c.background_model.to_string()
     } else {
         format!(
             "{}（要求 {}）",
@@ -345,7 +347,13 @@ fn print_optimize(optimize: Option<&OptimizeReport>, settings: &SettingsReport) 
         )
     };
     println!(
-        "  採用      tolerance {}  bbox {}  background-model {model}  (致命 {} / 品質 {:.2}{})",
+        "  {}tolerance {}  bbox {}  background-model {model}  (致命 {} / 品質 {:.2}{})",
+        // 幅は「採用」の行と揃える（全角 2 字 + 半角 6 字 = 全角 5 字）
+        if o.adopted {
+            "採用      "
+        } else {
+            "探索の1位 "
+        },
         c.tolerance,
         match c.bbox {
             Some([x1, y1, x2, y2]) => format!("{x1},{y1} - {x2},{y2}"),
@@ -359,6 +367,13 @@ fn print_optimize(optimize: Option<&OptimizeReport>, settings: &SettingsReport) 
             ""
         }
     );
+    // **`--auto` はきれいな候補が無かった探索の結果を採らない。** 上の行を
+    // 「採用」のまま出すと、使っていない設定を使ったと言うことになる
+    if !o.adopted {
+        println!(
+            "  採用      なし（致命的な警告が残ったので、既定の設定で切った結果を返しました）"
+        );
+    }
 }
 
 /// `--json` なら JSON を、そうでなければ人間向けの要約を stdout に出す。

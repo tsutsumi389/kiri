@@ -12284,11 +12284,10 @@ fn auto_escalates_to_the_search_when_the_plain_cutout_warns() {
         v["optimize"]["candidates"].as_array().unwrap().len() > 1,
         "警告が出たのに探索していない: {v}"
     );
-    // 選ばれた候補と settings が一致する規約は --optimize と同じ
-    assert_eq!(
-        v["optimize"]["chosen"]["tolerance"],
-        v["settings"]["tolerance"]
-    );
+    // きれいな候補が無かったので、探索の結果は採らず既定の 1 回を返している。
+    // settings は返した結果のもので、探索が選んだ候補のものではない
+    assert_eq!(v["optimize"]["adopted"], false);
+    assert_eq!(v["settings"]["tolerance"], plain["settings"]["tolerance"]);
     assert!(v.get("edge_repair").is_some(), "{v}");
     // 済んだ手（--optimize / --edge-repair auto を付ける）は勧めない。
     // どちらも --auto とは併記できず、従うと exit 2 になる
@@ -12304,25 +12303,61 @@ fn auto_escalates_to_the_search_when_the_plain_cutout_warns() {
     );
 }
 
-/// 昇格した実行は、`--optimize --edge-repair auto` を自分で渡した実行と
-/// 同じ成果物を返す。**`--auto` は経路を選ぶだけで、別の切り方を持たない。**
+/// きれいな候補が無いまま探索を終えた実行は、既定の 1 回と同じ成果物を返す。
+/// **`--auto` は付けないより悪い結果を返さない。** 探索が直した実行が
+/// `--optimize --edge-repair auto` と一致することは `tests/edge_repair.rs` の
+/// `auto_reaches_the_repair_and_matches_the_explicit_path` が見る。
 #[test]
-fn auto_matches_the_explicit_best_path_once_escalated() {
+fn auto_falls_back_to_the_plain_cut_when_nothing_is_clean() {
     let dir = fixture_dir();
     let input = write_png(dir.path(), "flat.png", &inseparable_scene());
     let auto = dir.path().join("auto.png");
-    let explicit = dir.path().join("explicit.png");
+    let plain = dir.path().join("plain.png");
 
     assert!(cutout_with(&input, &auto, &["--auto"]).status.success());
     assert!(
-        cutout_with(&input, &explicit, &["--optimize", "--edge-repair", "auto"])
+        cutout_with(&input, &plain, &["--edge-repair", "auto"])
             .status
             .success()
     );
     assert_eq!(
         std::fs::read(&auto).unwrap(),
-        std::fs::read(&explicit).unwrap()
+        std::fs::read(&plain).unwrap()
     );
+
+    // 明示した軸は戻った先でも生きている（戻るのは「渡された設定の 1 回」である）
+    let pinned = ["--tolerance", "30"];
+    let v = json_stdout(&cutout_with(
+        &input,
+        &auto,
+        &[&pinned[..], &["--auto", "--force"]].concat(),
+    ));
+    assert!(
+        cutout_with(
+            &input,
+            &plain,
+            &[&pinned[..], &["--edge-repair", "auto", "--force"]].concat()
+        )
+        .status
+        .success()
+    );
+    assert_eq!(v["optimize"]["adopted"], false, "{v}");
+    assert_eq!(v["settings"]["tolerance"], 30.0);
+    assert_eq!(
+        std::fs::read(&auto).unwrap(),
+        std::fs::read(&plain).unwrap()
+    );
+
+    // 人間向けの出力も、使っていない設定を「採用」と呼ばない
+    let text = kiri()
+        .args(["cutout", input.to_str().unwrap(), "-o"])
+        .arg(&auto)
+        .args(["--auto", "--force"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&text.stdout).to_string();
+    assert!(text.contains("探索の1位"), "{text}");
+    assert!(text.contains("採用      なし"), "{text}");
 }
 
 /// `--auto` は探索と解き直しを自分で決めるので、同じことを言う指定とは併記できない。
@@ -12386,6 +12421,10 @@ fn batch_accepts_the_auto_key() {
         ran["optimize"]["candidates"].as_array().unwrap().len() > 1,
         "{ran}"
     );
+    // きれいな候補の無い素材なので、auto は既定の 1 回へ戻り、
+    // 自分で optimize を渡した項目は選ばれた候補をそのまま受け取る
+    assert_eq!(ran["optimize"]["adopted"], false, "{ran}");
+    assert_eq!(results[4]["result"]["optimize"]["adopted"], true, "{v}");
     for failed in &results[1..3] {
         assert_eq!(failed["error"]["code"], "SPEC_INVALID", "{failed}");
     }

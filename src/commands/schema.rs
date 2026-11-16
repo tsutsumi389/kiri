@@ -959,7 +959,9 @@ fn fields() -> Vec<FieldEntry> {
                  ブロックの有無が、解き直したかは edge_repair.repaired が言う**（settings.optimize \
                  は指定値なので false のまま）。--tolerance / --bbox / --background-model を 3 つとも\
                  明示した実行は、探索の軸が残っていないので昇格しない。警告の出ない画像の成果物は --auto 無しと \
-                 1 バイトも違わず、昇格した実行の成果物は --optimize --edge-repair auto と同じである",
+                 1 バイトも違わず、昇格した実行の成果物は --optimize --edge-repair auto と同じである。\
+                 **探索しても致命の警告が残ったとき（OPTIMIZE_NO_CLEAN_CANDIDATE）だけは探索の結果を\
+                 採らず、既定の 1 回を返す**（optimize.adopted が false）",
             ),
         },
         FieldEntry {
@@ -1078,6 +1080,26 @@ fn fields() -> Vec<FieldEntry> {
                 "全候補はこの寸法で、境界処理（refine）抜きに回す。元の長辺がこれより\
                  小さければ元の寸法がそのまま入る。上位の候補だけを原寸で回し直すので、\
                  stage が final の候補の指標は原寸のものである",
+            ),
+        },
+        FieldEntry {
+            path: "optimize.adopted",
+            appears_in: vec!["cutout"],
+            unit: "bool",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "成果物が optimize.chosen の候補で切ったものか",
+            notes: Some(
+                "--optimize の実行では常に true。--auto が昇格した探索で致命的な警告が残った\
+                 （OPTIMIZE_NO_CLEAN_CANDIDATE）ときだけ false になり、成果物は既定の設定で\
+                 切った 1 回目（に --edge-repair auto を掛けたもの）である。きれいな候補が\
+                 無いとき致命の警告どうしの順位は当てにならず、選ばれた候補が 1 回目より\
+                 商品を削っていることがあるので、--auto は付けないより悪い結果を返さない。\
+                 false のとき settings / applied_bbox / mask は返した結果のもので、\
+                 optimize.chosen とは一致しない。探索が選んだ候補を見たければ \
+                 --optimize を自分で渡す",
             ),
         },
         // `edge_repair` ブロックは `--edge-repair auto` か `--auto` を渡した実行にしか

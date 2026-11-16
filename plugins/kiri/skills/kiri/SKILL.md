@@ -79,7 +79,9 @@ kiri cutout in.jpg -o out.png --auto --dry-run --preview /tmp/kiri-preview.png -
 
 - **`--auto` は最初から付ける。** 既定で切り、警告が出たときだけ設定の探索と境界の解き直しへ
   昇格する。きれいに切れる画像では何も足さない（速さも成果物も変わらない）。
-  昇格しても 24MP で 3 秒ほど
+  昇格しても 24MP で 3 秒ほど。探索しても致命の警告が残ったら（`OPTIMIZE_NO_CLEAN_CANDIDATE`、
+  `optimize.adopted` が `false`）既定の 1 回を返すので、付けないより悪くはならない。
+  そのときは数値では解けない素材なので、`--trimap` / `--segment isnet` か撮り直しへ進む
 - `--dry-run` は成果物を書かない。**ただし `--preview` は書き出す**ので、2 回目以降は
   `--force` が要る。preview の置き場所は一時ディレクトリにする
 - **preview を Read で開いて目で確かめる。** 3 枚のパネルが並び、左から

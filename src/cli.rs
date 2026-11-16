@@ -1954,11 +1954,13 @@ pub struct CutoutArgs {
     ///
     /// **警告の出ない画像では何も足さない。** 探索は走らず、成果物は --auto 無しと 1 バイトも違わない。単色背景の速い経路はそのままなので、素材の質が分からないときは常に付けてよい。
     ///
-    /// 昇格の条件は --optimize が「きれい」と呼ぶ集合と同じで、既定の切り抜きに NOT_SEPARABLE / FOREGROUND_TOO_SMALL / FOREGROUND_TOO_LARGE / SUBJECT_TOUCHES_EDGE / BBOX_RECOMMENDED / HALO_REMAINS / CONTOUR_ROUGH / RIM_CONTAMINATED のどれかが出たときに探索する。昇格した実行の成果物は --optimize --edge-repair auto と同じで、既定の 1 回ぶんだけ遅い（24MP で 1 秒ほど）。
+    /// 昇格の条件は --optimize が「きれい」と呼ぶ集合と同じで、既定の切り抜きに NOT_SEPARABLE / FOREGROUND_TOO_SMALL / FOREGROUND_TOO_LARGE / SUBJECT_TOUCHES_EDGE / BBOX_RECOMMENDED / HALO_REMAINS / CONTOUR_ROUGH / RIM_CONTAMINATED のどれかが出たときに探索する。昇格した実行の成果物は（下の、致命の警告が残った場合を除いて）--optimize --edge-repair auto と同じで、既定の 1 回ぶんだけ遅い（24MP で 1 秒ほど）。
     ///
     /// 探索が走ったかは結果の optimize ブロックの有無が、解き直したかは edge_repair.repaired が言う。--tolerance などの明示した値は、昇格しても探索の軸から外れる（--optimize と同じ規約）。
     ///
     /// --tolerance / --bbox / --background-model を 3 つとも明示した実行は昇格しない（探索の軸が残っていない）。
+    ///
+    /// 探索しても致命の警告が残ったとき（OPTIMIZE_NO_CLEAN_CANDIDATE）は探索の結果を採らず、既定の 1 回を返す（optimize.adopted が false）。--auto は付けないより悪い結果を返さない。
     ///
     /// --optimize / --edge-repair とは併記できない。どちらも --auto が自分で決める。
     #[arg(long, conflicts_with_all = ["optimize", "edge_repair"])]

@@ -442,6 +442,70 @@ fn auto_reaches_the_repair_and_matches_the_explicit_path() {
     }
 }
 
+/// **探索しても致命の警告が残ったら、探索の結果ではなく既定の 1 回を返す。**
+///
+/// きれいな候補が 1 つも無いとき、致命の警告どうしの順位は当てにならない。
+/// R3（不織布 + 淡色商品）では探索が選んだ候補は商品を丸ごと消す（正解に対する
+/// 欠け 0.04 → 0.9995）。**`--auto` は付けないより悪くなってはならない**——
+/// それが崩れると Skill が「最初から付ける」と言えなくなる。
+#[test]
+fn auto_returns_the_plain_cut_when_the_search_finds_nothing_clean() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let truth = real_scene(&scene("R3"));
+    let input = common::write_png(dir.path(), "r3.png", &truth.image);
+
+    let plain = dir.path().join("plain.png");
+    let searched = dir.path().join("searched.png");
+    let auto = dir.path().join("auto.png");
+    let p = cli(&input, &plain, &["--edge-repair", "auto"]);
+    let s = cli(&input, &searched, &["--optimize", "--edge-repair", "auto"]);
+    let v = cli(&input, &auto, &["--auto"]);
+
+    // 前提: 探索は既定と違う結果を選び、それでも致命の警告が残る
+    assert_ne!(
+        std::fs::read(&plain).unwrap(),
+        std::fs::read(&searched).unwrap(),
+        "素材が前提を満たさない"
+    );
+    let codes = |v: &serde_json::Value| -> Vec<String> {
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["code"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert!(
+        codes(&s).iter().any(|c| c == "OPTIMIZE_NO_CLEAN_CANDIDATE"),
+        "{:?}",
+        codes(&s)
+    );
+    // 自分で --optimize を渡した実行は、選ばれた候補をそのまま返す
+    assert_eq!(s["optimize"]["adopted"], true);
+
+    // --auto は既定の 1 回（に解き直しを掛けたもの）へ戻る
+    assert_eq!(
+        std::fs::read(&auto).unwrap(),
+        std::fs::read(&plain).unwrap()
+    );
+    // 探索が走った事実は残し、採らなかったことを言う
+    assert!(v["optimize"]["candidates"].is_array(), "{v}");
+    assert_eq!(v["optimize"]["adopted"], false);
+    // settings / mask は返した結果のもの（探索が選んだ候補のものではない）
+    for key in ["tolerance", "background_model"] {
+        assert_eq!(v["settings"][key], p["settings"][key], "{key}");
+    }
+    assert_eq!(v["applied_bbox"], p["applied_bbox"]);
+    assert_eq!(v["mask"], p["mask"]);
+    let warning = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "OPTIMIZE_NO_CLEAN_CANDIDATE")
+        .unwrap_or_else(|| panic!("{:?}", codes(&v)));
+    assert_eq!(warning["data"]["adopted"], false, "{warning}");
+}
+
 /// 3 軸とも明示した実行は昇格しない。候補はいま切った 1 つだけなので、
 /// 探索は同じ切り抜きをもう 1 度回すだけになる。解き直しは掛かる。
 #[test]

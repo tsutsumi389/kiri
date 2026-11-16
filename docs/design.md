@@ -760,9 +760,12 @@ AI エージェントが `--allow-upscale` を付けるか元素材を見直す�
       "chosen": true }
   ],
   "chosen": { "...": "同じ形" },
+  "adopted": true,
   "elapsed_ms": 13682
 }
 ```
+
+**`adopted` は成果物が `chosen` の候補で切ったものかを言う。** `--optimize` では常に `true`。`--auto` が昇格した探索で致命の警告が残った（`OPTIMIZE_NO_CLEAN_CANDIDATE`）ときだけ `false` になり、成果物は既定の 1 回である——きれいな候補が無いとき致命の警告どうしの順位は当てにならず、選ばれた候補が 1 回目より商品を削ることがある（R3 で欠け 0.041 → 0.9995）。`false` のとき `settings` / `applied_bbox` / `mask` は返した結果のもので、`chosen` とは一致しない。
 
 `--edge-repair auto` か `--auto` を渡すと `edge_repair` ブロックが増える（渡さなければキーごと現れない）。解き直した窓の数と窓そのもの（入力の画素）、見送った理由の警告 code、1 回目と差し替えた後の 3 つの指標を持つ。`mask.*` は差し替えた後の値で、`edge_repair.after` と一致する（4.18）。
 

@@ -183,13 +183,46 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         // 表を渡し切る（借りない）。借りると候補ごとに原寸の `Constraints`
         // （24.5MP で 24MB）を複製することになる。`found.options` が
         // 「効いた設定」として返ってくるので、下の `opts` はそれで置き換わる
+        //
+        // 探索が動かす 3 軸の、探索前の値。`--auto` が 1 回目へ戻るときに使う
+        let first = (opts.tolerance, opts.bbox, opts.background_model);
         let found = optimize::optimize(&loaded.image, opts, &args.fixed, seen)?;
-        let report = optimize_report(&found, w, h);
+        let mut report = optimize_report(&found, w, h);
         // 代入で置き換える（シャドーイングではない）。**束縛を増やすと、
         // 探索前の指示の表が関数の終わりまで生き残る**——24.5MP では
         // 選ばれた候補のものと合わせて 24.5MB を 2 本抱えることになる
         opts = found.options;
-        (found.result, Some(report), found.warning)
+        // **`--auto` は、きれいな候補が無かった探索の結果を採らない。** 致命の
+        // 警告どうしの順位は当てにならず、選ばれた候補が 1 回目より壊れている
+        // ことがある（R3 は商品が丸ごと消え、実写のキーボードはキーの半分が
+        // 消える）。`--auto` は付けないより悪い結果を返してはならないので、
+        // 既定の 1 回へ戻る。自分で `--optimize` を渡した実行は選ばれた候補を
+        // そのまま受け取る——あちらは「探索の答えをくれ」という指定である。
+        //
+        // **1 回目は抱えておかず、切り直す。** 抱えると 24.5MP では 98MB が
+        // 探索の山に重なる。切り直しは決定的で、払うのは失敗した経路だけである。
+        // この枝へ来るのは昇格した `--auto` か `--optimize` で、両者は併記できない
+        match found.warning {
+            Some(warning) if args.auto => {
+                drop(found.result);
+                (opts.tolerance, opts.bbox, opts.background_model) = first;
+                report.adopted = false;
+                let warning = Warning {
+                    message: format!(
+                        "{}。探索の結果は採らず、既定の設定で切った結果を返しました",
+                        warning.message
+                    ),
+                    ..warning
+                }
+                .with_data("adopted", false);
+                (
+                    cutout_seen(&loaded.image, &opts, seen),
+                    Some(report),
+                    Some(warning),
+                )
+            }
+            warning => (found.result, Some(report), warning),
+        }
     };
     let bbox = opts.bbox;
 
@@ -265,6 +298,8 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     // 探索が「どれも駄目だった」と言うのも結果の警告より先である。以降に並ぶ
     // 警告はすべて**選ばれた 1 つの候補**についてのもので、それが 20 通りの
     // 中で最良だったという事実を知らずに読むと、まだ手が残っていると読める
+    // （`--auto` が既定の 1 回へ戻った実行では、以降は**その 1 回**の警告で
+    // ある。この警告の `data.remaining` だけが探索の選んだ候補のものになる）
     warnings.extend(optimize_warning);
     // **`--rotate auto` が効かなかったことも指示についての警告である。**
     // 渡した指示がそのまま効いていない側の話なので、結果の警告より先に置く
@@ -1410,6 +1445,8 @@ fn optimize_report(found: &crate::cutout::Optimized, width: u32, height: u32) ->
         searched_at: found.searched_at,
         chosen: candidates[found.chosen].clone(),
         candidates,
+        // 探索は選んだ候補を返す。採らないと決めるのは `--auto` の側である
+        adopted: true,
         elapsed_ms: found.elapsed_ms,
     }
 }

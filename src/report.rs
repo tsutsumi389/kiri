@@ -850,6 +850,10 @@ pub struct OptimizeReport {
     pub candidates: Vec<OptimizeCandidate>,
     /// 選ばれた候補。`candidates[]` の中の 1 つと同じ内容
     pub chosen: OptimizeCandidate,
+    /// 成果物が `chosen` の候補で切ったものか。**`--auto` は、致命の警告が
+    /// 残った探索の結果を採らず既定の 1 回を返す**ので、そのときだけ false。
+    /// false のとき `settings` / `mask` は返した結果のもので、`chosen` とは一致しない
+    pub adopted: bool,
     /// 探索そのものに掛かった時間。結果全体の `elapsed_ms` の内数
     pub elapsed_ms: u128,
 }

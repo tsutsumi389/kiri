@@ -2280,3 +2280,110 @@ pub fn layer<'a>(report: &'a serde_json::Value, id: &str) -> &'a serde_json::Val
         .find(|l| l["id"] == id)
         .unwrap_or_else(|| panic!("レイヤ '{id}' が結果に無い: {report}"))
 }
+
+/// CLI を通した実写のベンチ（`print_the_external_cli_bench`）に足す経路。
+///
+/// `;` 区切りで、各々は `kiri cutout` に足す空白区切りの引数。`{name}` は素材の
+/// 名前に、`{dir}` は `KIRI_BENCH_DIR` に置き換わる。
+pub const KIRI_BENCH_VARIANTS: &str = "KIRI_BENCH_VARIANTS";
+
+/// 正解に対する**面の誤差**。輪郭の近傍ではなく、商品の面をどれだけ失い、
+/// 背景の面をどれだけ残したかを測る。
+///
+/// **`EdgeMetrics` は輪郭の数 px しか見ない**（`eaten` は縁から 6px まで、
+/// `rim` は帯の中だけ）。色のフィルが狭い口から商品の内側へ数十 px 食い込む
+/// 「えぐれ」は、縁の指標をほとんど動かさずに商品の形を壊す。
+/// `mask.contour_roughness` も細かいギザギザを測る量で、えぐれを埋めると
+/// かえって悪化することがある（実写のキーボードで 0.39 → 0.47）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RegionMetrics {
+    /// 商品の面のうち失われた割合(0.0-1.0)。分母は正解の商品の画素数
+    pub lost: f32,
+    /// 背景の面のうち前景として残った量の、商品の面に対する割合(0.0-1.0 超もありうる)。
+    /// 分母を商品にそろえるのは、`lost` と同じ単位で並べるため
+    pub leaked: f32,
+    /// **外から食い込んだ**欠けの、いちばん深い点の深さ(px、長辺 1000px 換算)。
+    ///
+    /// 商品の内側に孤立した穴は数えない——それは別の欠陥（面の穴）で、深さを
+    /// 「縁からの距離」で測ると、中央の 1 画素の穴が最悪の値になってしまう。
+    /// 外周から背景をたどって届く欠けだけを見る。
+    ///
+    /// `REGION_MARGIN` は引いていない。正解の縁のずれ（2px ほど）はそのまま乗る
+    pub gouge: f32,
+}
+
+/// 縁の位置の不確かさとして、面の指標から外す幅(px、長辺 1000px 換算)。
+///
+/// 手で起こした正解の縁は数 px ずれる。その帯を数えると、指標が正解の
+/// 誤差を測ることになる
+pub const REGION_MARGIN: f32 = 2.0;
+
+/// 切り抜いたマスクを正解と面で突き合わせる。
+pub fn measure_regions(truth: &EdgeTruth, mask: &kiri::cutout::Mask) -> RegionMetrics {
+    let (w, h) = (truth.image.width(), truth.image.height());
+    assert_eq!(
+        (mask.width(), mask.height()),
+        (w, h),
+        "マスクと正解の寸法が違う（--canvas など寸法を変える指定は測れない）"
+    );
+    let scale = w.max(h) as f32 / 1000.0;
+    let margin = REGION_MARGIN * scale;
+    let n = (w as usize) * (h as usize);
+    let fg: Vec<bool> = mask.as_slice().iter().map(|&a| a >= 128).collect();
+
+    let (mut product, mut lost, mut leaked) = (0u64, 0u64, 0u64);
+    for (&d, &kept) in truth.distance.iter().zip(&fg) {
+        if d <= -margin {
+            product += 1;
+            if !kept {
+                lost += 1;
+            }
+        } else if d >= margin && kept {
+            leaked += 1;
+        }
+    }
+
+    // 外周から、前景でない画素を 4 近傍でたどる。届いた画素のうち商品の
+    // 内側にあるものが「外から食い込んだ欠け」である
+    let mut seen = vec![false; n];
+    let mut queue = std::collections::VecDeque::new();
+    let push = |i: usize, seen: &mut Vec<bool>, queue: &mut std::collections::VecDeque<usize>| {
+        if !fg[i] && !seen[i] {
+            seen[i] = true;
+            queue.push_back(i);
+        }
+    };
+    let (wu, hu) = (w as usize, h as usize);
+    for x in 0..wu {
+        push(x, &mut seen, &mut queue);
+        push((hu - 1) * wu + x, &mut seen, &mut queue);
+    }
+    for y in 0..hu {
+        push(y * wu, &mut seen, &mut queue);
+        push(y * wu + wu - 1, &mut seen, &mut queue);
+    }
+    let mut deepest = 0f32;
+    while let Some(i) = queue.pop_front() {
+        deepest = deepest.max(-truth.distance[i]);
+        let (x, y) = (i % wu, i / wu);
+        if x > 0 {
+            push(i - 1, &mut seen, &mut queue);
+        }
+        if x + 1 < wu {
+            push(i + 1, &mut seen, &mut queue);
+        }
+        if y > 0 {
+            push(i - wu, &mut seen, &mut queue);
+        }
+        if y + 1 < hu {
+            push(i + wu, &mut seen, &mut queue);
+        }
+    }
+
+    let product = product.max(1) as f32;
+    RegionMetrics {
+        lost: lost as f32 / product,
+        leaked: leaked as f32 / product,
+        gouge: (deepest / scale).max(0.0),
+    }
+}

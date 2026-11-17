@@ -2430,3 +2430,188 @@ fn closed_form_is_deterministic() {
         "同じ入力で復元した画素が違う"
     );
 }
+
+// --- 面の指標と、CLI を通した実写のベンチ ---
+
+/// 中央に正方形の商品がある正解。面の指標の検査に使う。
+fn square_truth(size: u32, lo: u32, hi: u32) -> common::EdgeTruth {
+    let image = image::RgbaImage::from_pixel(size, size, image::Rgba([255, 255, 255, 255]));
+    let alpha = image::GrayImage::from_fn(size, size, |x, y| {
+        image::Luma([if (lo..hi).contains(&x) && (lo..hi).contains(&y) {
+            255
+        } else {
+            0
+        }])
+    });
+    common::truth_from_alpha(image, &alpha).unwrap()
+}
+
+fn mask_of(size: u32, inside: impl Fn(u32, u32) -> bool) -> kiri::cutout::Mask {
+    let values: Vec<bool> = (0..size * size)
+        .map(|i| inside(i % size, i / size))
+        .collect();
+    kiri::cutout::Mask::from_bools(size, size, &values)
+}
+
+/// **えぐれは深さで見える。縁の指標では見えない。**
+///
+/// 1000px の画像の商品（600px 角）に、右辺から幅 20px・深さ 60px の切り欠きを
+/// 入れる。失った面は 0.4% に満たないが、深さは 60px と出る。
+#[test]
+fn a_gouge_is_measured_by_its_depth_not_its_area() {
+    let truth = square_truth(1000, 200, 800);
+    let square = |x: u32, y: u32| (200..800).contains(&x) && (200..800).contains(&y);
+
+    let perfect = common::measure_regions(&truth, &mask_of(1000, square));
+    assert_eq!(perfect.lost, 0.0);
+    assert_eq!(perfect.leaked, 0.0);
+    assert!(perfect.gouge <= common::REGION_MARGIN, "{perfect:?}");
+
+    let notched = mask_of(1000, |x, y| {
+        square(x, y) && !((740..800).contains(&x) && (490..510).contains(&y))
+    });
+    let m = common::measure_regions(&truth, &notched);
+    assert!(m.lost > 0.0 && m.lost < 0.004, "{m:?}");
+    assert_eq!(m.leaked, 0.0);
+    assert!((m.gouge - 60.0).abs() <= 2.0, "深さが 60px と出ない: {m:?}");
+}
+
+/// 商品の内側に孤立した穴は、えぐれとしては数えない（面の欠けには数える）。
+/// 背景に残った面は `leaked` に出る。
+#[test]
+fn an_interior_hole_is_lost_area_but_not_a_gouge() {
+    let truth = square_truth(1000, 200, 800);
+    let square = |x: u32, y: u32| (200..800).contains(&x) && (200..800).contains(&y);
+
+    let holed = mask_of(1000, |x, y| {
+        square(x, y) && !((480..520).contains(&x) && (480..520).contains(&y))
+    });
+    let m = common::measure_regions(&truth, &holed);
+    assert!(m.lost > 0.0, "{m:?}");
+    assert!(
+        m.gouge <= common::REGION_MARGIN,
+        "穴をえぐれに数えた: {m:?}"
+    );
+
+    // 商品の外に 100px 角の面が残る
+    let extra = mask_of(1000, |x, y| {
+        square(x, y) || ((50..150).contains(&x) && (50..150).contains(&y))
+    });
+    let m = common::measure_regions(&truth, &extra);
+    assert_eq!(m.lost, 0.0);
+    assert!(m.leaked > 0.02, "{m:?}");
+}
+
+/// 正解つき実写を **CLI の経路ごと**に回して、面の指標を並べる。
+///
+/// `print_the_external_bench` はライブラリの `cutout` を 1 つの設定で回す。
+/// こちらは `kiri cutout` に引数を足して回すので、`--auto` の昇格や
+/// `--segment` のような、コマンドの層にしか無い経路を同じ物差しで比べられる。
+///
+/// ```text
+/// KIRI_BENCH_DIR=out/bench cargo test --release --features segment \
+///     --test real_backgrounds -- --ignored --nocapture print_the_external_cli_bench
+/// ```
+///
+/// 経路は下の表に、`KIRI_BENCH_VARIANTS` の値（`;` 区切り、各々は空白区切りの
+/// 引数）を足したもの。値の中の `{name}` は素材の名前に、`{dir}` は
+/// `KIRI_BENCH_DIR` に置き換わる（`--fg-mask {dir}/{name}.bites.png` のように
+/// 素材ごとのファイルを指せる）。失敗した経路（この build に segment が無い、
+/// など）は理由を 1 行で出して飛ばす。
+///
+/// **`欠け` / `漏れ` / `えぐれ` は正解の面から測る**（`common::measure_regions`）。
+/// 手で起こした正解でも数 px の誤差しか持たないので、面の指標は信用できる。
+/// `輪郭誤差` は 1px 未満の差を比べる根拠にはならない（正解の縁がその程度ずれる）。
+#[test]
+#[ignore = "計測用。KIRI_BENCH_DIR が無ければ何もしない"]
+fn print_the_external_cli_bench() {
+    let Ok(dir) = std::env::var(common::KIRI_BENCH_DIR) else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let pairs = common::external_bench_pairs(&dir);
+    if pairs.is_empty() {
+        println!("{}: 対が 1 つも無い", dir.display());
+        return;
+    }
+    let mut variants: Vec<String> = ["", "--auto", "--auto --segment off", "--segment isnet"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if let Ok(extra) = std::env::var(common::KIRI_BENCH_VARIANTS) {
+        variants.extend(
+            extra
+                .split(';')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        );
+    }
+    let out = tempfile::TempDir::new().unwrap();
+    println!(
+        "\n{:<10} {:<34} {:>7} {:>7} {:>7} {:>8} {:>7} {:>7} {:>6} {:>8}",
+        "素材", "経路", "欠け%", "漏れ%", "えぐれ", "輪郭誤差", "halo", "粗さ", "ms", "returned"
+    );
+    for pair in &pairs {
+        let input = ["png", "jpg", "jpeg"]
+            .iter()
+            .map(|ext| dir.join(format!("{}.{ext}", pair.name)))
+            .find(|p| p.is_file())
+            .unwrap();
+        for variant in &variants {
+            let args = variant
+                .replace("{name}", &pair.name)
+                .replace("{dir}", &dir.display().to_string());
+            let cut = out.path().join("cut.png");
+            let run = common::kiri()
+                .arg("cutout")
+                .arg(&input)
+                .arg("-o")
+                .arg(&cut)
+                .args(args.split_whitespace())
+                .args(["--force", "--json"])
+                .output()
+                .unwrap();
+            let label = if variant.is_empty() {
+                "(既定)"
+            } else {
+                variant.as_str()
+            };
+            if !run.status.success() {
+                // `--json` の実行は error も stdout の JSON で返す
+                let reason = serde_json::from_slice::<serde_json::Value>(&run.stdout)
+                    .ok()
+                    .and_then(|v| v["error"]["code"].as_str().map(str::to_string))
+                    .unwrap_or_else(|| String::from_utf8_lossy(&run.stderr).trim().to_string());
+                println!("{:<10} {:<34} 飛ばす: {reason}", pair.name, label);
+                continue;
+            }
+            let v = common::json_stdout(&run);
+            let image = image::open(&cut).unwrap().to_rgba8();
+            let mask = kiri::cutout::Mask::from_bools(
+                image.width(),
+                image.height(),
+                &image.pixels().map(|p| p[3] >= 128).collect::<Vec<_>>(),
+            );
+            let regions = common::measure_regions(&pair.truth, &mask);
+            let edges = measure_edges(&pair.truth, &image, &mask);
+            let show = |v: &serde_json::Value| match v.as_f64() {
+                Some(v) => format!("{v:.3}"),
+                None => "null".to_string(),
+            };
+            println!(
+                "{:<10} {:<34} {:>7.2} {:>7.2} {:>7.1} {:>8.2} {:>7} {:>7} {:>6} {:>8}",
+                pair.name,
+                label,
+                regions.lost * 100.0,
+                regions.leaked * 100.0,
+                regions.gouge,
+                edges.contour_error,
+                show(&v["mask"]["halo_ratio"]),
+                show(&v["mask"]["contour_roughness"]),
+                v["elapsed_ms"].as_u64().unwrap_or(0),
+                v["optimize"]["returned"].as_str().unwrap_or("-"),
+            );
+        }
+    }
+}

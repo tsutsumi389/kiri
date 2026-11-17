@@ -13,7 +13,10 @@ mod common;
 use std::path::Path;
 
 use assert_cmd::Command;
-use common::{ProductSpec, product_image, write_png};
+use common::{
+    ProductSpec, bleeding_product_scene, dense_key_grid, oversized_product_scene, product_image,
+    write_png,
+};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -1159,4 +1162,379 @@ fn a_spec_model_path_resolves_against_the_spec_file() {
             .contains(expected.to_str().unwrap()),
         "spec の場所を基準にしていない: {error}"
     );
+}
+
+// --- `--auto` がモデルへ昇格する ---
+
+/// `cutout <input> -o <out> --json` に引数を足して回し、JSON を返す。
+fn cut(input: &Path, output: &Path, extra: &[&str]) -> Value {
+    let out = kiri()
+        .args(["cutout", input.to_str().unwrap(), "-o"])
+        .arg(output)
+        .args(extra)
+        .args(["--force", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{extra:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    json_stdout(&out)
+}
+
+fn codes(v: &Value) -> Vec<&str> {
+    v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["code"].as_str().unwrap())
+        .collect()
+}
+
+fn no_clean_candidate(v: &Value) -> &Value {
+    v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "OPTIMIZE_NO_CLEAN_CANDIDATE")
+        .unwrap_or_else(|| panic!("OPTIMIZE_NO_CLEAN_CANDIDATE が無い: {v}"))
+}
+
+/// **探索しても致命の警告が残ったら、`--auto` はモデルの領域で切り直す。**
+///
+/// 素材は白地の左に灰色の帯が外周まで抜けている場面で、色だけでは帯が商品の
+/// 側に残る（`SUBJECT_TOUCHES_EDGE`。探索の 20 候補すべてで残る）。これまでは
+/// hint が「--segment isnet を試してください」と言い、エージェントがもう 1 手
+/// 打っていた。その 1 手を kiri の中で済ませる。
+///
+/// 成果物は `--segment isnet --edge-repair auto` と 1 バイトも違わない——
+/// 昇格は「既定の設定にモデルの領域を敷く」だけで、別の経路を作っていない。
+#[test]
+fn auto_promotes_to_the_model_when_the_search_leaves_a_fatal_warning() {
+    if skip_without_model() {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let input = write_png(dir.path(), "in.png", &bleeding_product_scene(600, 600));
+    let auto = dir.path().join("auto.png");
+    let explicit = dir.path().join("explicit.png");
+
+    let v = cut(&input, &auto, &["--auto"]);
+    // 指定は off のまま、走ったことは segment_ran が言う
+    assert_eq!(v["settings"]["segment"], "off", "{v}");
+    assert_eq!(v["settings"]["segment_ran"], true, "{v}");
+    assert_eq!(v["segment"]["model"], "isnet", "{v}");
+    assert_eq!(v["constraints"]["sources"][0], "segment", "{v}");
+    // 探索の結果は採っていない
+    assert_eq!(v["optimize"]["adopted"], false, "{v}");
+    assert_eq!(v["optimize"]["returned"], "segment", "{v}");
+    assert!(
+        !codes(&v).contains(&"SUBJECT_TOUCHES_EDGE"),
+        "モデルへ昇格したのに致命の警告が残った: {:?}",
+        codes(&v)
+    );
+    // 探索が駄目だった事実は残し、何を返したかを言う。済んだ手は勧めない
+    let w = no_clean_candidate(&v);
+    assert_eq!(w["data"]["adopted"], false, "{w}");
+    assert_eq!(w["data"]["returned"], "segment", "{w}");
+    assert_eq!(w["data"]["segment_tried"], true, "{w}");
+    assert!(
+        !w["hint"].as_str().unwrap().contains("--segment isnet"),
+        "{w}"
+    );
+
+    cut(
+        &input,
+        &explicit,
+        &["--segment", "isnet", "--edge-repair", "auto"],
+    );
+    assert_eq!(
+        std::fs::read(&auto).unwrap(),
+        std::fs::read(&explicit).unwrap(),
+        "昇格した実行が --segment isnet --edge-repair auto と違う"
+    );
+
+    // 人間向けの出力も、何を返したかを言う
+    let text = kiri()
+        .args(["cutout", input.to_str().unwrap(), "-o"])
+        .arg(&auto)
+        .args(["--auto", "--force"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&text.stdout).to_string();
+    assert!(text.contains("探索の1位"), "{text}");
+    assert!(text.contains("モデル（isnet）が示した範囲"), "{text}");
+}
+
+/// **`--segment off` を書いた実行は昇格しない。** 既定値の off と違い、
+/// 書いた off は「モデルを使うな」という指定である。
+///
+/// 成果物はモデルを置いていない機械の `--auto` と同じになる。spec の
+/// `"segment": "off"` も同じ扱いである。
+#[test]
+fn an_explicit_segment_off_keeps_auto_away_from_the_model() {
+    if skip_without_model() {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let input = write_png(dir.path(), "in.png", &bleeding_product_scene(600, 600));
+    let off = dir.path().join("off.png");
+    let bare = dir.path().join("bare.png");
+
+    let v = cut(&input, &off, &["--auto", "--segment", "off"]);
+    assert_eq!(v["settings"]["segment_ran"], false, "{v}");
+    assert!(v.get("segment").is_none(), "{v}");
+    assert!(codes(&v).contains(&"SUBJECT_TOUCHES_EDGE"), "{v}");
+    let w = no_clean_candidate(&v);
+    assert_eq!(w["data"]["returned"], "default", "{w}");
+    assert_eq!(w["data"]["segment_tried"], false, "{w}");
+
+    // モデルの無い機械と同じ成果物
+    let out = kiri()
+        .args(["cutout", input.to_str().unwrap(), "-o"])
+        .arg(&bare)
+        .args(["--auto", "--json"])
+        .env(kiri::segment::model::KIRI_MODEL_DIR, dir.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(json_stdout(&out)["settings"]["segment_ran"], false);
+    assert_eq!(std::fs::read(&off).unwrap(), std::fs::read(&bare).unwrap());
+
+    let spec = dir.path().join("spec.json");
+    std::fs::write(
+        &spec,
+        r#"{"defaults":{"auto":true},
+             "items":[{"input":"in.png","output":"a.out.png"},
+                      {"input":"in.png","output":"b.out.png","segment":"off"}]}"#,
+    )
+    .unwrap();
+    let out = kiri()
+        .args(["batch", spec.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let v = json_stdout(&out);
+    let results = v["results"].as_array().unwrap();
+    assert_eq!(results[0]["result"]["settings"]["segment_ran"], true, "{v}");
+    assert_eq!(
+        results[1]["result"]["settings"]["segment_ran"], false,
+        "{v}"
+    );
+}
+
+/// **モデルの結果も、既定の 1 回より良いときしか採らない。**
+///
+/// 画面いっぱいの商品は、モデルの領域を敷いても外周に接したままである
+/// （接しているのが正しい）。`--auto` は付けないより悪い結果を返さないので、
+/// 既定の 1 回を返し、モデルも試したことを警告が言う。
+#[test]
+fn auto_keeps_the_plain_cut_when_the_model_does_not_help() {
+    if skip_without_model() {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let input = write_png(dir.path(), "in.png", &oversized_product_scene(600, 600));
+    let auto = dir.path().join("auto.png");
+    let bare = dir.path().join("bare.png");
+
+    let v = cut(&input, &auto, &["--auto"]);
+    assert_eq!(v["optimize"]["adopted"], false, "{v}");
+    assert_eq!(v["optimize"]["returned"], "default", "{v}");
+    // 返した結果はモデルのものではない
+    assert_eq!(v["settings"]["segment_ran"], false, "{v}");
+    assert!(v.get("segment").is_none(), "{v}");
+    assert!(v.get("constraints").is_none(), "{v}");
+    let w = no_clean_candidate(&v);
+    assert_eq!(w["data"]["returned"], "default", "{w}");
+    assert_eq!(w["data"]["segment_tried"], true, "{w}");
+    assert!(
+        !w["hint"].as_str().unwrap().contains("--segment isnet"),
+        "試した手を勧めている: {w}"
+    );
+
+    let out = kiri()
+        .args(["cutout", input.to_str().unwrap(), "-o"])
+        .arg(&bare)
+        .args(["--auto", "--json"])
+        .env(kiri::segment::model::KIRI_MODEL_DIR, dir.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(std::fs::read(&auto).unwrap(), std::fs::read(&bare).unwrap());
+}
+
+/// **モデルが既に走っている実行は、もう 1 度走らせない。** 返す 1 回目が
+/// モデルの領域の上で切られているので、「--segment isnet を試せ」は済んだ手である。
+#[test]
+fn auto_does_not_recommend_the_model_it_already_used() {
+    if skip_without_model() {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let input = write_png(dir.path(), "in.png", &oversized_product_scene(600, 600));
+    let out = dir.path().join("out.png");
+
+    let v = cut(&input, &out, &["--auto", "--segment", "isnet"]);
+    assert_eq!(v["settings"]["segment_ran"], true, "{v}");
+    assert_eq!(v["optimize"]["adopted"], false, "{v}");
+    assert_eq!(v["optimize"]["returned"], "default", "{v}");
+    let w = no_clean_candidate(&v);
+    assert_eq!(w["data"]["segment_tried"], true, "{w}");
+    assert!(
+        !w["hint"].as_str().unwrap().contains("--segment isnet"),
+        "使った手を勧めている: {w}"
+    );
+}
+
+/// **モデルが壊れていても `--auto` の実行は落ちない。ただし黙らない。**
+///
+/// 付けない実行なら成功しているので、既定の 1 回を返す。失敗の code は警告の
+/// `data.segment_error` に載せる——黙って戻ると、置いたつもりのモデルが
+/// 1 度も効いていないことに気づけない。「読んでいません」（`MODEL_PATH_IGNORED`）
+/// も言わない。読もうとはしている。
+#[test]
+fn a_broken_model_does_not_fail_auto_but_is_reported() {
+    if !cfg!(feature = "segment") {
+        eprintln!("この build に segment 機能が無いので飛ばす（昇格そのものが無い）");
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let input = write_png(dir.path(), "in.png", &bleeding_product_scene(600, 600));
+    let broken = dir.path().join("broken.onnx");
+    std::fs::write(&broken, b"not an onnx file").unwrap();
+    let auto = dir.path().join("auto.png");
+    let bare = dir.path().join("bare.png");
+
+    let v = cut(
+        &input,
+        &auto,
+        &["--auto", "--model-path", broken.to_str().unwrap()],
+    );
+    assert_eq!(v["optimize"]["returned"], "default", "{v}");
+    assert_eq!(v["settings"]["segment_ran"], false, "{v}");
+    let w = no_clean_candidate(&v);
+    assert_eq!(w["data"]["segment_tried"], false, "{w}");
+    assert!(
+        w["data"]["segment_error"].as_str().is_some(),
+        "失敗の code が載っていない: {w}"
+    );
+    assert!(
+        !codes(&v).contains(&"MODEL_PATH_IGNORED"),
+        "{:?}",
+        codes(&v)
+    );
+
+    let out = kiri()
+        .args(["cutout", input.to_str().unwrap(), "-o"])
+        .arg(&bare)
+        .args(["--auto", "--json"])
+        .env(kiri::segment::model::KIRI_MODEL_DIR, dir.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(std::fs::read(&auto).unwrap(), std::fs::read(&bare).unwrap());
+}
+
+// --- モデルの外形の内側に食い込んだ窪みを埋め戻す ---
+
+/// **モデルが外形は捉えたが内側を言い切れない商品で、色が食い込んだ面を戻す。**
+///
+/// 素材はキーの格子で、キーの隙間（本体）が背景に近い色をしている。モデルは
+/// 外形を捉えるが内側を迷う（不明の帯が 7 割）ので、残りは色が決め、隙間を
+/// 伝ってフィルが商品の内側まで入る。埋め戻すと前景が 4 割増える。
+///
+/// `info` の `segment` ブロックにこのキーは無い（切り抜かないので）。
+#[test]
+fn bites_inside_the_models_silhouette_are_filled_back() {
+    if skip_without_model() {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let input = write_png(dir.path(), "keys.png", &dense_key_grid(600, 600));
+    let out = dir.path().join("out.png");
+
+    let v = cut(&input, &out, &["--segment", "isnet"]);
+    let filled = v["segment"]["filled_ratio"].as_f64().unwrap();
+    assert!(filled > 0.05, "窪みを埋め戻していない: {v}");
+    assert!(
+        v["mask"]["foreground_ratio"].as_f64().unwrap() > 0.6,
+        "隙間が商品へ戻っていない: {v}"
+    );
+    // 足した面は確定前景として constraints にも数えられる
+    assert!(
+        v["constraints"]["fg_ratio"].as_f64().unwrap() >= filled - 0.01,
+        "{v}"
+    );
+    // 人間向けの出力も言う
+    let text = kiri()
+        .args(["cutout", input.to_str().unwrap(), "-o"])
+        .arg(&out)
+        .args(["--segment", "isnet", "--force"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&text.stdout).to_string();
+    assert!(text.contains("埋め戻し"), "{text}");
+
+    // 決定的である
+    let again = dir.path().join("again.png");
+    cut(&input, &again, &["--segment", "isnet"]);
+    assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&again).unwrap());
+
+    let info = kiri()
+        .args([
+            "info",
+            input.to_str().unwrap(),
+            "--segment",
+            "isnet",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let info = json_stdout(&info);
+    assert!(info["segment"].get("model").is_some(), "{info}");
+    assert!(info["segment"].get("filled_ratio").is_none(), "{info}");
+}
+
+/// 窪みの無い切り抜きは切り直さず、報告に `filled_ratio: 0` が出る。
+#[test]
+fn a_cut_without_bites_reports_zero_and_fills_nothing() {
+    if skip_without_model() {
+        return;
+    }
+    let (dir, input) = fixture();
+    let v = cut(&input, &dir.path().join("out.png"), &["--segment", "isnet"]);
+    assert_eq!(v["segment"]["filled_ratio"], 0.0, "{v}");
+}
+
+/// **利用者が背景と言った画素は、埋め戻しても背景のままである。**
+///
+/// 指すのはキーの隙間の中の数 px で、**指さなければ埋め戻しが商品へ戻す**
+/// 場所である（先にそれを確かめる）。広い面を指すと、そこは口が広すぎて
+/// もともと窪みにならず、重ね直しが無くても通ってしまう。
+#[test]
+fn a_users_background_survives_the_fill() {
+    if skip_without_model() {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let input = write_png(dir.path(), "keys.png", &dense_key_grid(600, 600));
+    let out = dir.path().join("out.png");
+    let alpha_at = |path: &Path| image::open(path).unwrap().to_rgba8().get_pixel(243, 203)[3];
+
+    cut(&input, &out, &["--segment", "isnet"]);
+    assert_eq!(alpha_at(&out), 255, "前提: 指さなければ埋め戻される画素");
+
+    let v = cut(
+        &input,
+        &out,
+        &[
+            "--segment",
+            "isnet",
+            "--bg-polygon",
+            "241,201,246,201,246,206,241,206",
+        ],
+    );
+    assert!(v["segment"]["filled_ratio"].as_f64().unwrap() > 0.0, "{v}");
+    assert_eq!(alpha_at(&out), 0, "利用者の背景が商品へ戻った");
 }

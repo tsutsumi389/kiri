@@ -79,9 +79,13 @@ kiri cutout in.jpg -o out.png --auto --dry-run --preview /tmp/kiri-preview.png -
 
 - **`--auto` は最初から付ける。** 既定で切り、警告が出たときだけ設定の探索と境界の解き直しへ
   昇格する。きれいに切れる画像では何も足さない（速さも成果物も変わらない）。
-  昇格しても 24MP で 3 秒ほど。探索しても致命の警告が残ったら（`OPTIMIZE_NO_CLEAN_CANDIDATE`、
-  `optimize.adopted` が `false`）既定の 1 回を返すので、付けないより悪くはならない。
-  そのときは数値では解けない素材なので、`--trimap` / `--segment isnet` か撮り直しへ進む
+  昇格しても 24MP で 3 秒ほど。探索の結果が既定の 1 回を上回らなければ採らない
+  （`optimize.adopted` が `false`）ので、付けないより悪くはならない。
+  探索しても致命の警告が残ったら（`OPTIMIZE_NO_CLEAN_CANDIDATE`）、モデル（isnet）が使える環境では
+  自分でモデルへ昇格し、良くなったときだけその結果を返す。何を返したかは `optimize.returned`
+  （`"search"` / `"segment"` / `"default"`）が言う。`"default"` で致命の警告が残っていたら、
+  警告の `data.segment_tried` が `false` なら `--segment isnet` を試し、`true` なら `--trimap` などで
+  範囲を直接渡すか撮り直す
 - `--dry-run` は成果物を書かない。**ただし `--preview` は書き出す**ので、2 回目以降は
   `--force` が要る。preview の置き場所は一時ディレクトリにする
 - **preview を Read で開いて目で確かめる。** 3 枚のパネルが並び、左から

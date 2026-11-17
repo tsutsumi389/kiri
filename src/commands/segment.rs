@@ -178,6 +178,8 @@ pub fn report(run: &SegmentRun, stats: &SegmentStats) -> SegmentReport {
         fg_ratio: round4(stats.fg_ratio),
         bg_ratio: round4(stats.bg_ratio),
         uncertain_ratio: round4(stats.uncertain_ratio),
+        // 埋め戻しは切り抜いた後に決まる。`cutout` が書く（`info` には無い）
+        filled_ratio: None,
         model_path: run.model_path.clone(),
     }
 }

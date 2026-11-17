@@ -235,6 +235,14 @@ pub struct SegmentReport {
     /// どちらでもない帯の割合。**大きいほどモデルが迷っている**。
     /// 0.3 を超えると `SEGMENT_UNCERTAIN` が出る
     pub uncertain_ratio: f64,
+    /// モデルの外形の内側で、色のフィルが食い込んだ窪みを埋め戻した面の割合。
+    /// **0 なら埋め戻していない。** 埋め戻した面は確定前景として
+    /// `constraints` にも数えられる。
+    ///
+    /// **`cutout` の報告にだけ出る。** `info` は切り抜かないので、埋め戻す
+    /// 対象が無い
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filled_ratio: Option<f64>,
     /// 実際に読んだファイル
     pub model_path: String,
 }
@@ -850,10 +858,22 @@ pub struct OptimizeReport {
     pub candidates: Vec<OptimizeCandidate>,
     /// 選ばれた候補。`candidates[]` の中の 1 つと同じ内容
     pub chosen: OptimizeCandidate,
-    /// 成果物が `chosen` の候補で切ったものか。**`--auto` は、致命の警告が
-    /// 残った探索の結果を採らず既定の 1 回を返す**ので、そのときだけ false。
+    /// 成果物が `chosen` の候補で切ったものか。**`--auto` は、既定の 1 回を
+    /// 上回らない探索の結果を採らない**（`optimize::search_beats_first`）ので、
+    /// そのときだけ false。返すのは既定の 1 回か、致命の警告が残った探索では
+    /// モデルの領域で切り直した結果（`settings.segment_ran`）である。
     /// false のとき `settings` / `mask` は返した結果のもので、`chosen` とは一致しない
     pub adopted: bool,
+    /// 成果物の出所。**常に出す。**
+    ///
+    /// - `"search"`: `chosen` の候補（`adopted` が true）
+    /// - `"segment"`: `--auto` がモデルへ昇格し、その領域を既定の設定で切った結果
+    /// - `"default"`: 既定の設定で切った 1 回
+    ///
+    /// `settings.segment` / `settings.segment_ran` から推し量らせない——
+    /// `--segment auto` の門が走らせなかった後に昇格した実行では、指定値は
+    /// "auto" のままである
+    pub returned: &'static str,
     /// 探索そのものに掛かった時間。結果全体の `elapsed_ms` の内数
     pub elapsed_ms: u128,
 }

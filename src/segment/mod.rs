@@ -37,7 +37,7 @@ use std::path::PathBuf;
 use image::RgbaImage;
 
 use crate::cutout::constraints::{Constraint, ConstraintSource, Constraints};
-use crate::cutout::mask::Mask;
+use crate::cutout::mask::{FOREGROUND_THRESHOLD, Mask};
 use crate::cutout::morphology::erode;
 use crate::error::{Error, ErrorCode, Result};
 use crate::transform::{FitMode, ResizeSpec, apply as resize_apply, plan as resize_plan};
@@ -106,6 +106,28 @@ pub const SEG_MARGIN: f64 = 8.0;
 /// 入るなら、それは「柔らかい輪郭」ではなくモデルが対象を掴めていない。
 /// 残りは色と連結性が決めるので、結果は `--segment off` に近づく。
 pub const SEG_UNCERTAIN_WARN: f64 = 0.3;
+
+/// モデルの外形の外とみなす確率の上限。**`SEG_BG` よりずっと低い。**
+///
+/// 外形（`Silhouette`）は「モデルが背景だと言い切った領域が、外周から届く
+/// 範囲」の補集合である。`SEG_BG` の 0.1 で切ると、商品の縁でモデルが少し
+/// 迷っただけの場所（実写のキーボードの枠で 0.03〜0.1）が外形の外へ落ち、
+/// 窪みを 3 か所のうち 1 か所しか拾えなかった。外形は窪みを埋め戻す**上限**
+/// としてしか使わない（埋めるのは色のマスクを閉じた内側だけ）ので、確定背景
+/// より緩く取ってよい。
+pub const SEG_SILHOUETTE: f32 = 0.03;
+
+/// 窪みとみなす口の幅の半分(px、**長辺 1000px 換算**)。閉処理の半径である。
+///
+/// 口がこの 2 倍（長辺の 4%）より広い欠けは窪みではなく、色のフィルが辺ごと
+/// 削った結果（モデルの外形のほうが外へ膨らんでいる）か、商品の本物の凹みで
+/// ある。どちらも埋めてはならない。実写のキーボードの窪みは口が 25〜35px。
+pub const SEG_BITE_MOUTH: f64 = 20.0;
+
+/// 埋め戻すに値する窪みの面の下限（格子に占める割合）。
+///
+/// これより小さければ切り直さない。切り直しは原寸の切り抜きをもう 1 回払う
+pub const SEG_BITE_MIN: f64 = 0.0002;
 
 /// 前処理で正方形へ落とすときの当てはめ方。
 ///
@@ -650,6 +672,267 @@ fn reachable_from_the_border(low: &Mask) -> Mask {
     out
 }
 
+/// モデルの外形。**格子の上で持つ**（1024² で 2MB）。
+///
+/// 確率の表そのものは切り抜きの前に手放したい（原寸の山に重ねない）が、
+/// 窪みの埋め戻しは切り抜いた**後**に外形を要る。要るのは二値の面だけなので、
+/// それだけを先に取り出しておく。
+pub struct Silhouette {
+    /// 外形から `SEG_MARGIN` だけ内側。255 が内側
+    inside: Mask,
+    /// モデルが背景と言い切って**いない**格子（`SEG_SILHOUETTE` を超える）。
+    ///
+    /// 外形は囲まれた低確率の島も内側に数える（キーキャップを商品に残すため）。
+    /// だが**囲まれていて、かつモデルが背景と言い切った島**は本物の穴でありうる
+    /// ——ハサミの指穴、バックルの輪。そこは色が抜いた結果のまま残す
+    unsure: Mask,
+}
+
+/// 外形の内側に、色のフィルが狭い口から食い込んだ窪み。
+pub struct Bites {
+    grid: Mask,
+    /// 窪みが格子に占める割合
+    pub ratio: f64,
+}
+
+/// モデルの外形を取り出す。確率の表が空なら `None`。
+///
+/// 外形は「`SEG_SILHOUETTE` 以下の領域が外周から届く範囲」の補集合を、
+/// `SEG_MARGIN` だけ収縮したものである。囲まれた低確率の島（キーキャップ）は
+/// 外形の内側に入る——`reachable_from_the_border` と同じ読み方をしている。
+pub fn silhouette(probability: &Probability) -> Option<Silhouette> {
+    let (pw, ph) = (probability.width(), probability.height());
+    if pw == 0 || ph == 0 {
+        return None;
+    }
+    let mut low = Mask::new(pw, ph, 0);
+    let mut unsure = Mask::new(pw, ph, 0);
+    for (i, &p) in probability.as_slice().iter().enumerate() {
+        if p <= SEG_SILHOUETTE {
+            low.as_mut_slice()[i] = 255;
+        } else {
+            unsure.as_mut_slice()[i] = 255;
+        }
+    }
+    let outside = reachable_from_the_border(&low);
+    let mut inside = Mask::new(pw, ph, 0);
+    for (slot, &out) in inside.as_mut_slice().iter_mut().zip(outside.as_slice()) {
+        *slot = if out == 255 { 0 } else { 255 };
+    }
+    Some(Silhouette {
+        inside: erode(&inside, margin_radius(pw, ph)),
+        unsure,
+    })
+}
+
+impl Silhouette {
+    /// 切り抜いたマスクから窪みを探す。埋め戻すに値しなければ `None`。
+    ///
+    /// 窪みは次の 4 つを同時に満たす格子である。
+    ///
+    /// 1. 切り抜きでは背景になった
+    /// 2. マスクを `SEG_BITE_MOUTH` で閉じると前景になる（口が狭い）
+    /// 3. モデルの外形の内側にある
+    /// 4. モデルが背景と言い切っていない
+    ///
+    /// **閉処理はパイプラインでは使わない約束である**（`morphology::close`）。
+    /// 細い隙間で外周とつながった領域を埋めるのは形の改変で、取っ手の内側を
+    /// 塞ぐ害のほうが大きい。ここで使えるのは 3 と 4 があるからで、モデルが
+    /// 背景と言い切った隙間は、外周から届くなら外形の外にあり（3）、囲まれて
+    /// いても埋めない（4）。
+    ///
+    /// **辺ごと削られた帯は拾わない。** 閉処理は平らな辺を外へ広げないので、
+    /// 外形が商品より外へ膨らんでいる場所（影や台を商品に含めたモデルの誤り）
+    /// を、色が正しく削った結果のまま残せる。**画像の端でも同じである**——
+    /// 閉処理は画像の外を背景として扱う（`close_on_the_plane`）。
+    ///
+    /// 口の幅は格子の上で測る。格子は画像を正方形へ歪めたものなので、上限は
+    /// 画像の幅・高さそれぞれの 4% になる。
+    pub fn bites(&self, mask: &Mask) -> Option<Bites> {
+        let (pw, ph) = (self.inside.width(), self.inside.height());
+        let (w, h) = (mask.width(), mask.height());
+        if w == 0 || h == 0 {
+            return None;
+        }
+        // 原寸のマスクを格子へ落とす。格子の中心に対応する 1 画素を見る
+        let mut kept = Mask::new(pw, ph, 0);
+        // 閉じるまでもなく窪みが無いことは多い（外形の内側がすべて前景）。
+        // 候補が下限に届かなければ閉処理を払わない
+        let mut candidates = 0usize;
+        for gy in 0..ph {
+            let y = grid_index(gy, ph, h);
+            for gx in 0..pw {
+                if mask.get(grid_index(gx, pw, w), y) >= FOREGROUND_THRESHOLD {
+                    kept.set(gx, gy, 255);
+                } else if self.inside.get(gx, gy) == 255 && self.unsure.get(gx, gy) == 255 {
+                    candidates += 1;
+                }
+            }
+        }
+        let cells = f64::from(pw) * f64::from(ph);
+        if (candidates as f64) < SEG_BITE_MIN * cells {
+            return None;
+        }
+        let scale = f64::from(pw.max(ph)) / 1000.0;
+        let closed = close_on_the_plane(&kept, (SEG_BITE_MOUTH * scale).ceil() as u32);
+        let mut grid = Mask::new(pw, ph, 0);
+        let mut count = 0usize;
+        for (i, slot) in grid.as_mut_slice().iter_mut().enumerate() {
+            if kept.as_slice()[i] == 0
+                && closed.as_slice()[i] == 255
+                && self.inside.as_slice()[i] == 255
+                && self.unsure.as_slice()[i] == 255
+            {
+                *slot = 255;
+                count += 1;
+            }
+        }
+        let ratio = count as f64 / cells;
+        (ratio >= SEG_BITE_MIN).then_some(Bites { grid, ratio })
+    }
+}
+
+/// 閉処理（膨張 → 収縮）。**画像の外を背景として扱う。**
+///
+/// `morphology::close` は窓を画像の内側へ切り詰めるので、膨張が端まで届いた
+/// 前景を収縮が戻せない——商品と画像の端のあいだの帯が丸ごと埋まる。ここでは
+/// 四方に `radius` の背景を足した面の上で閉じ、元の範囲を切り出す。
+///
+/// 面は二値なので、窓の中の前景の数を走らせれば 1 パスが `O(n)` で済む
+/// （`morphology` の `O(n * radius)` は 1024² ・半径 21 で 1.7 億回の比較になる）。
+fn close_on_the_plane(mask: &Mask, radius: u32) -> Mask {
+    if radius == 0 {
+        return mask.clone();
+    }
+    let (w, h) = (mask.width() as usize, mask.height() as usize);
+    let r = radius as usize;
+    let (pw, ph) = (w + 2 * r, h + 2 * r);
+    let mut plane = vec![false; pw * ph];
+    for y in 0..h {
+        for x in 0..w {
+            plane[(y + r) * pw + x + r] = mask.as_slice()[y * w + x] == 255;
+        }
+    }
+    // 膨張は「窓に前景が 1 つでもある」、収縮は「窓がすべて前景」。
+    // 面の外は背景なので、収縮の窓が面をはみ出せば必ず偽になる
+    let dilated = box_pass(
+        &box_pass(&plane, pw, ph, r, true, true),
+        pw,
+        ph,
+        r,
+        true,
+        false,
+    );
+    let eroded = box_pass(
+        &box_pass(&dilated, pw, ph, r, false, true),
+        pw,
+        ph,
+        r,
+        false,
+        false,
+    );
+    let mut out = Mask::new(mask.width(), mask.height(), 0);
+    for y in 0..h {
+        for x in 0..w {
+            if eroded[(y + r) * pw + x + r] {
+                out.as_mut_slice()[y * w + x] = 255;
+            }
+        }
+    }
+    out
+}
+
+/// 1 方向の箱型フィルタ。`any` なら窓に真が 1 つでもあれば真（膨張）、
+/// そうでなければ窓がすべて真のとき真（収縮）。面の外は偽として数える。
+fn box_pass(
+    plane: &[bool],
+    width: usize,
+    height: usize,
+    radius: usize,
+    any: bool,
+    horizontal: bool,
+) -> Vec<bool> {
+    let mut out = vec![false; plane.len()];
+    let (lines, len) = if horizontal {
+        (height, width)
+    } else {
+        (width, height)
+    };
+    let at = |line: usize, k: usize| {
+        if horizontal {
+            line * width + k
+        } else {
+            k * width + line
+        }
+    };
+    let window = 2 * radius + 1;
+    for line in 0..lines {
+        // 位置 k の窓は [k - radius, k + radius]。真の数を走らせる
+        let mut count = (0..radius.min(len)).filter(|&k| plane[at(line, k)]).count();
+        for k in 0..len {
+            if k + radius < len && plane[at(line, k + radius)] {
+                count += 1;
+            }
+            out[at(line, k)] = if any { count > 0 } else { count == window };
+            if k >= radius && plane[at(line, k - radius)] {
+                count -= 1;
+            }
+        }
+    }
+    out
+}
+
+impl Bites {
+    /// 窪みを確定前景として敷く。**モデルの確定背景の上にも敷く**——
+    /// `SEG_SILHOUETTE` は `SEG_BG` より低いので、窪みはモデルが 0.03〜0.1 と
+    /// 言った場所（確定背景になりうる）に重なる。そこを商品へ戻すのが
+    /// この処理である。利用者の指示は、呼ぶ側がこの後でもう 1 度重ねる。
+    ///
+    /// **書き換えた画素の元の印を、書いた順で返す。** 採らなかったときに
+    /// `unmark` へ渡せば元へ戻る。表を丸ごと複製すると 24.5MP で 24MB を
+    /// 切り直しのあいだ抱えるが、こちらは窪みの画素ぶんだけで済む
+    pub fn mark(&self, constraints: &mut Constraints) -> Vec<Constraint> {
+        let mut before = Vec::new();
+        self.each_pixel(constraints.width(), constraints.height(), |index| {
+            let (x, y) = (
+                (index % constraints.width() as usize) as u32,
+                (index / constraints.width() as usize) as u32,
+            );
+            before.push(constraints.at(x, y));
+            constraints.clear_index(index);
+            constraints.mark_index(index, Constraint::ForcedFg);
+        });
+        before
+    }
+
+    /// `mark` を取り消す。`before` は `mark` が返したもの
+    pub fn unmark(&self, constraints: &mut Constraints, before: &[Constraint]) {
+        let mut before = before.iter();
+        self.each_pixel(constraints.width(), constraints.height(), |index| {
+            constraints.clear_index(index);
+            match before.next() {
+                Some(Constraint::Free) | None => {}
+                Some(&kind) => constraints.mark_index(index, kind),
+            }
+        });
+    }
+
+    /// 窪みに当たる原寸の画素を、行の順にたどる
+    fn each_pixel(&self, w: u32, h: u32, mut visit: impl FnMut(usize)) {
+        let (pw, ph) = (self.grid.width(), self.grid.height());
+        let columns: Vec<u32> = (0..w).map(|x| grid_index(x, w, pw)).collect();
+        for y in 0..h {
+            let sy = grid_index(y, h, ph);
+            let row = (y as usize) * (w as usize);
+            for (x, &sx) in columns.iter().enumerate() {
+                if self.grid.get(sx, sy) == 255 {
+                    visit(row + x);
+                }
+            }
+        }
+    }
+}
+
 /// 原寸の座標に対応する格子の座標。画素の中心どうしを合わせる
 /// （`Probability::at` の双線形と同じ対応で、丸めるだけの違い）。
 ///
@@ -701,6 +984,168 @@ pub fn unavailable(model: &str) -> Error {
 mod tests {
     use super::*;
     use image::Rgba;
+
+    /// 200x200 の格子。中央の正方形（40..160）の内側は「迷っている」0.5、
+    /// 外側は「背景と言い切った」0.0。`hole` は外側と同じ 0.0 にする格子
+    fn unsure_square(hole: impl Fn(u32, u32) -> bool) -> Probability {
+        let data = (0..200u32 * 200)
+            .map(|i| {
+                let (x, y) = (i % 200, i / 200);
+                let inside = (40..160).contains(&x) && (40..160).contains(&y);
+                if inside && !hole(x, y) { 0.5 } else { 0.0 }
+            })
+            .collect();
+        Probability::new(200, 200, data).unwrap()
+    }
+
+    /// 400x400 の原寸のマスク。格子の 1 つが原寸の 2x2 に当たる
+    fn cut(kept: impl Fn(u32, u32) -> bool) -> Mask {
+        let values: Vec<bool> = (0..400u32 * 400)
+            .map(|i| kept((i % 400) / 2, (i / 400) / 2))
+            .collect();
+        Mask::from_bools(400, 400, &values)
+    }
+
+    fn square(x: u32, y: u32) -> bool {
+        (40..160).contains(&x) && (40..160).contains(&y)
+    }
+
+    /// **狭い口から食い込んだ窪みは拾う。**
+    ///
+    /// 右辺から幅 8・深さ 30 の切り欠き。モデルは内側を「迷っている」としか
+    /// 言っていないが、外形の内側で、口が狭い。
+    #[test]
+    fn a_narrow_bite_inside_the_silhouette_is_found() {
+        let sil = silhouette(&unsure_square(|_, _| false)).unwrap();
+        let notch = |x: u32, y: u32| (130..160).contains(&x) && (96..104).contains(&y);
+        let bites = sil
+            .bites(&cut(|x, y| square(x, y) && !notch(x, y)))
+            .expect("窪みを拾えていない");
+        // 切り欠きの奥は埋まり、外形の縁（収縮した帯）は埋めない
+        assert_eq!(bites.grid.get(135, 100), 255);
+        assert_eq!(bites.grid.get(150, 100), 255);
+        assert_eq!(bites.grid.get(159, 100), 0, "縁の帯まで確定させた");
+        // 切り欠きの外は 1 つも触らない
+        assert_eq!(bites.grid.get(135, 90), 0);
+        assert_eq!(bites.grid.get(170, 100), 0);
+
+        let mut constraints = Constraints::new(400, 400);
+        constraints.mark(270, 200, Constraint::ForcedBg);
+        let before = bites.mark(&mut constraints);
+        assert_eq!(constraints.at(270, 200), Constraint::ForcedFg);
+        assert_eq!(constraints.at(270, 180), Constraint::Free);
+        // 取り消せば、元の印まで含めて戻る
+        bites.unmark(&mut constraints, &before);
+        assert_eq!(constraints.at(270, 200), Constraint::ForcedBg);
+        assert_eq!(constraints.at(272, 200), Constraint::Free);
+        assert_eq!(constraints.counts(), (0, 1));
+    }
+
+    /// **囲まれていても、モデルが背景と言い切った穴は埋めない。**
+    ///
+    /// ハサミの指穴やバックルの輪がこれに当たる。外形は囲まれた島を内側に
+    /// 数えるので、外形だけを条件にすると本物の穴が商品へ戻ってしまう。
+    #[test]
+    fn an_enclosed_hole_the_model_calls_background_is_not_a_bite() {
+        // 閉処理の半径（格子で 4）で塞がる大きさの穴
+        let hole = |x: u32, y: u32| (97..103).contains(&x) && (97..103).contains(&y);
+        let sil = silhouette(&unsure_square(hole)).unwrap();
+        assert!(
+            sil.bites(&cut(|x, y| square(x, y) && !hole(x, y)))
+                .is_none()
+        );
+        // 同じ穴でも、モデルが迷っている（0.5）なら窪みとして拾う
+        let unsure = silhouette(&unsure_square(|_, _| false)).unwrap();
+        assert!(
+            unsure
+                .bites(&cut(|x, y| square(x, y) && !hole(x, y)))
+                .is_some()
+        );
+    }
+
+    /// **画像の端と商品のあいだの帯は埋めない。**
+    ///
+    /// 商品が格子の左端から 3 つ内側で止まり、モデルは端まで商品だと言う。
+    /// 窓を画像の内側へ切り詰める閉処理だと、この帯が丸ごと前景になる。
+    #[test]
+    fn a_strip_along_the_image_edge_is_not_a_bite() {
+        let data = (0..200u32 * 200)
+            .map(|i| {
+                let (x, y) = (i % 200, i / 200);
+                if x < 100 && (20..180).contains(&y) {
+                    0.5
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let sil = silhouette(&Probability::new(200, 200, data).unwrap()).unwrap();
+        let kept = |x: u32, y: u32| (3..100).contains(&x) && (20..180).contains(&y);
+        assert!(sil.bites(&cut(kept)).is_none());
+    }
+
+    /// 閉処理は口の狭い切り欠きだけを埋め、形の外へは広げない。
+    #[test]
+    fn closing_on_the_plane_fills_notches_without_growing_the_shape() {
+        let mut mask = Mask::new(40, 30, 0);
+        for y in 0..30 {
+            for x in 0..40 {
+                // 左端に接する矩形に、右辺から幅 4 の切り欠き
+                let notch = (20..30).contains(&x) && (13..17).contains(&y);
+                if x < 30 && (5..25).contains(&y) && !notch {
+                    mask.set(x, y, 255);
+                }
+            }
+        }
+        let closed = close_on_the_plane(&mask, 3);
+        assert_eq!(closed.get(25, 15), 255, "切り欠きが埋まっていない");
+        assert_eq!(closed.get(31, 15), 0, "右へ広がった");
+        assert_eq!(closed.get(10, 3), 0, "上へ広がった");
+        assert_eq!(closed.get(0, 10), 255);
+        // 縦横比の違う原寸でも、格子との対応は外へ出ない
+        let sil = silhouette(&unsure_square(|_, _| false)).unwrap();
+        let wide = Mask::new(300, 120, 255);
+        assert!(sil.bites(&wide).is_none());
+    }
+
+    /// **辺ごと削られた帯は窪みではない。** 外形が商品より外へ膨らんでいる
+    /// （モデルが影や台を商品に含めた）場所を、色が正しく削った結果である。
+    #[test]
+    fn a_strip_shaved_off_a_whole_side_is_not_a_bite() {
+        let sil = silhouette(&unsure_square(|_, _| false)).unwrap();
+        assert!(sil.bites(&cut(|x, y| square(x, y) && x < 145)).is_none());
+    }
+
+    /// 口の広い欠けは埋めない。商品の本物の凹みかもしれない。
+    #[test]
+    fn a_wide_notch_is_left_alone() {
+        let sil = silhouette(&unsure_square(|_, _| false)).unwrap();
+        let notch = |x: u32, y: u32| (130..160).contains(&x) && (80..120).contains(&y);
+        let bites = sil.bites(&cut(|x, y| square(x, y) && !notch(x, y)));
+        // 閉処理が角を少し丸めるぶんは下限に届かない
+        assert!(bites.is_none(), "{:?}", bites.map(|b| b.ratio));
+    }
+
+    /// **モデルが背景と言い切った隙間は、口が狭くても埋めない。**
+    ///
+    /// 同じ切り欠きでも、モデルがそこを 0.0 と言っていれば外周から届くので
+    /// 外形の外にある。取っ手の隙間や指のあいだがこれに当たる。
+    #[test]
+    fn a_gap_the_model_calls_background_is_not_a_bite() {
+        let notch = |x: u32, y: u32| (130..160).contains(&x) && (96..104).contains(&y);
+        let sil = silhouette(&unsure_square(notch)).unwrap();
+        assert!(
+            sil.bites(&cut(|x, y| square(x, y) && !notch(x, y)))
+                .is_none()
+        );
+    }
+
+    /// 欠けの無い切り抜きには何も足さない。
+    #[test]
+    fn a_cut_that_matches_the_silhouette_has_no_bites() {
+        let sil = silhouette(&unsure_square(|_, _| false)).unwrap();
+        assert!(sil.bites(&cut(square)).is_none());
+    }
 
     fn flat(w: u32, h: u32, rgb: [u8; 3]) -> RgbaImage {
         RgbaImage::from_pixel(w, h, Rgba([rgb[0], rgb[1], rgb[2], 255]))

@@ -110,7 +110,7 @@ warning_catalog! {
         remedy: Some("--normalized の付け忘れと、マスクが空でないかを確かめる"),
     OptimizeNoCleanCandidate = "OPTIMIZE_NO_CLEAN_CANDIDATE"
         => "--optimize が候補をすべて試しても致命的な警告が残った（調整では解けない）",
-        remedy: Some("数値の探索では解けない（--auto の実行は探索の結果を採らず既定の 1 回を返している。optimize.adopted を参照）。--trimap / --fg-polygon / --bg-polygon で範囲を渡すか、--segment isnet を試すか、撮り直す"),
+        remedy: Some("数値の探索では解けない（--auto の実行は探索の結果を採っていない。optimize.adopted を参照。何を返したかは data.returned が言う——\"segment\" ならモデルが示した範囲で切った結果、\"default\" なら既定の 1 回）。--trimap / --fg-polygon / --bg-polygon で範囲を渡すか、--segment isnet を試すか（data.segment_tried が true ならモデルの範囲はもう見ている。data.segment_error があれば、モデルを走らせようとしてその code で失敗している）、撮り直す"),
     SegmentUncertain = "SEGMENT_UNCERTAIN"
         => "モデルが対象を掴めておらず、不明の帯が広すぎる（結果は --segment off に近づく）",
         remedy: Some("--trimap や --bg-polygon で、どこが商品かを直接渡す"),

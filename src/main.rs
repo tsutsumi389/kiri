@@ -79,6 +79,7 @@ fn parse() -> Cli {
             bbox: from_command_line(sub, "bbox"),
             background_model: from_command_line(sub, "background_model"),
         };
+        args.segment_fixed = from_command_line(sub, "segment");
         // **`--profile` が触りうる項目も同じ問いを立てる。** `--fill-ratio` の
         // 0.85 も `--background` の白も `default_value_t` なので、値だけでは
         // 「明示した」と「既定のまま」を区別できない。区別できなければ
@@ -313,6 +314,13 @@ fn print_segment(segment: Option<&SegmentReport>) {
         s.uncertain_ratio * 100.0,
         s.elapsed_ms
     );
+    // 埋め戻したときだけ言う。0 は「何もしていない」で、行を足す情報が無い
+    if let Some(filled) = s.filled_ratio.filter(|&f| f > 0.0) {
+        println!(
+            "  埋め戻し  モデルの外形の内側に食い込んだ窪み {:.2}% を商品へ戻した",
+            filled * 100.0
+        );
+    }
 }
 
 /// 探索の要約。**走ったときしか出ない。**
@@ -370,8 +378,14 @@ fn print_optimize(optimize: Option<&OptimizeReport>, settings: &SettingsReport) 
     // **`--auto` はきれいな候補が無かった探索の結果を採らない。** 上の行を
     // 「採用」のまま出すと、使っていない設定を使ったと言うことになる
     if !o.adopted {
+        // 理由は上の警告が言っている。ここでは何を返したかだけを言う
         println!(
-            "  採用      なし（致命的な警告が残ったので、既定の設定で切った結果を返しました）"
+            "  採用      なし（{}）",
+            if o.returned == "segment" {
+                "モデル（isnet）が示した範囲を既定の設定で切った結果を返しました"
+            } else {
+                "既定の設定で切った結果を返しました"
+            }
         );
     }
 }

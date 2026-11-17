@@ -580,6 +580,8 @@ fn to_cutout_args(
             bbox: settings.bbox.is_some(),
             background_model: settings.background_model.is_some(),
         },
+        // spec に `segment` を書いた項目は、`"off"` でも明示である
+        segment_fixed: settings.segment.is_some(),
         color: color_opts(settings),
         // **spec からも segment を受ける。** 計画をプロセスで 1 つ持ち
         // （`segment::isnet`）、推論そのものは 1 本ずつ通すので、`--jobs` を

@@ -1960,7 +1960,9 @@ pub struct CutoutArgs {
     ///
     /// --tolerance / --bbox / --background-model を 3 つとも明示した実行は昇格しない（探索の軸が残っていない）。
     ///
-    /// 探索しても致命の警告が残ったとき（OPTIMIZE_NO_CLEAN_CANDIDATE）は探索の結果を採らず、既定の 1 回を返す（optimize.adopted が false）。--auto は付けないより悪い結果を返さない。
+    /// 探索の結果が既定の 1 回を上回らなかったときは採らず、既定の 1 回を返す（optimize.adopted が false）。致命の警告が残った探索（OPTIMIZE_NO_CLEAN_CANDIDATE）、商品を飲んだ探索、致命は無いがスコアが既定より良くない探索がこれに当たる。--auto は付けないより悪い結果を返さない。
+    ///
+    /// 探索しても致命の警告が残ったときは、さらにモデル（isnet）へ昇格する。モデルが示した範囲を既定の設定で切り、既定の 1 回より良ければそれを返す（settings.segment は指定値のまま settings.segment_ran が true になり、segment ブロックが現れる。成果物は --segment isnet --edge-repair auto と同じ）。この build に segment 機能が無い・モデルが置いていない・--segment off を明示した・モデルが既に走っている（--segment isnet）ときは昇格しない。モデルが壊れているなどで走らせられなかったときも実行は成功し、既定の 1 回を返す（警告の data.segment_error に code が載る）。どれを返したかは optimize.returned（search / segment / default）が言う。
     ///
     /// --optimize / --edge-repair とは併記できない。どちらも --auto が自分で決める。
     #[arg(long, conflicts_with_all = ["optimize", "edge_repair"])]
@@ -1976,6 +1978,14 @@ pub struct CutoutArgs {
     /// どうかだけを別経路で運ぶ
     #[arg(skip)]
     pub fixed: OptimizeFixed,
+
+    /// `--segment` を利用者が明示したか。**引数ではない**（`fixed` と同じ作り）。
+    ///
+    /// `--auto` は、探索しても致命の警告が残ったときにモデルへ昇格する。
+    /// `--segment off` を**書いた**実行は「モデルを使うな」という指定なので
+    /// 昇格しない——既定値の off と区別できなければ、止める手段が無くなる
+    #[arg(skip)]
+    pub segment_fixed: bool,
 
     /// 切り抜いた後に時計回りへ回す角度(度)。負値は反時計回り。既定 0（回さない）。auto で subject.level_rotation を適用する
     ///

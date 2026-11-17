@@ -167,6 +167,58 @@ pub fn settled(result: &CutoutResult) -> bool {
         .any(|w| FATAL_CODES.contains(&w.code) || QUALITY_CODES.contains(&w.code))
 }
 
+/// 切り抜き `a` が `b` より良いか。**同点は「良くない」。**
+///
+/// `better_final` と同じ項を同じ順に見る（致命 → 測れなかった数 → 品質の重み和 →
+/// 境界の色差）。`--auto` が「昇格した先の結果」を既定の 1 回と比べるのに使う。
+/// 同点を採らないのは、同じ出来なら余計なことをしていない側（既定の 1 回）を
+/// 返すためである。
+pub fn improves(a: &Score, b: &Score) -> bool {
+    a.fatal
+        .cmp(&b.fatal)
+        .then_with(|| a.unmeasured.cmp(&b.unmeasured))
+        .then_with(|| a.quality.total_cmp(&b.quality))
+        .then_with(|| b.separability.total_cmp(&a.separability))
+        == Ordering::Less
+}
+
+/// `--auto` が探索の勝者を採るか。`first` は既定の 1 回のスコア。
+///
+/// **`--auto` は付けないより悪い結果を返さない。** 採るのは次のどちらかである。
+///
+/// - 勝者がきれい（致命も品質の警告も崩れも無い）
+/// - 勝者に致命の警告が残っておらず、かつ既定の 1 回より良い（`improves`）
+///
+/// 致命の警告が残った勝者は、数値が良く見えても採らない——致命どうしの順位は
+/// 当てにならない（`OPTIMIZE_NO_CLEAN_CANDIDATE`）。**`BBOX_RECOMMENDED` だけが
+/// 残った勝者**はあの警告の対象ではない（`NO_CLEAN_CANDIDATE_CODES`）が、順位の
+/// 上では致命なので、既定の 1 回より致命の数が減るときだけ採る。
+///
+/// **2 つ目の比較が要るのは、既定の 1 回が最終段を走るとは限らないからである。**
+/// 探索段の順位は `refine` 抜きの縮小版で付くので、原寸では最良の既定の設定が
+/// 下位に沈み、原寸で回されないまま負けることがある。実写（暗い机の上の黒い
+/// キーボード、モデルの領域つき）では探索が tolerance 60 を選び、致命の警告を
+/// 1 つも出さずに商品の半分を消した（前景比率 0.45 → 0.23、粗さ 0.39 → 0.86）。
+/// 既定の 1 回は原寸の数値を既に持っているので、最終段の物差しでそのまま比べる。
+///
+/// 崩れた勝者（商品を飲んだ候補）も採らない。きれいな勝者を無条件に
+/// 採るのは、きれいでない 1 回目の重み和が測れなかった項の数え方だけで勝者を
+/// 下回ることがあるためで、警告の無い結果を警告のある結果へ戻してはならない。
+pub fn search_beats_first(first: &Score, winner: &Trial) -> bool {
+    if !winner.remaining_codes().is_empty() || winner.collapsed {
+        return false;
+    }
+    if winner.clean() {
+        return true;
+    }
+    // `BBOX_RECOMMENDED` だけが残った勝者。致命の数が同じなら品質で比べることに
+    // なるが、それは「致命どうしの順位」そのものである。数が減るときだけ採る
+    if winner.score.fatal > 0 {
+        return winner.score.fatal < first.fatal;
+    }
+    improves(&winner.score, first)
+}
+
 /// 利用者が明示したために探索の軸から外れた項目。
 ///
 /// **明示は探索より強い。** `--tolerance 30 --optimize` は「30 の中で最良を
@@ -1292,6 +1344,99 @@ mod tests {
             trials.iter().all(|t| !t.collapsed),
             "bbox の違う候補どうしを比べてはいけない"
         );
+    }
+
+    fn first(fatal: usize, quality: f64, separability: f64) -> Score {
+        Score {
+            fatal,
+            unmeasured: 0,
+            quality,
+            separability,
+        }
+    }
+
+    /// `--auto` は、既定の 1 回を上回らない勝者を採らない。
+    ///
+    /// 実写のキーボード（モデルの領域つき）の数値そのまま: 既定は重み和 4.82、
+    /// 探索の勝者は致命 0 のまま 11.19 で、商品の半分を消していた。
+    #[test]
+    fn auto_keeps_the_first_cut_when_the_winner_is_not_better() {
+        let mut winner = trial(0, 11.19, 34.8, plain(60.0));
+        winner.warnings = vec![WarningCode::ContourRough];
+        assert!(!search_beats_first(&first(0, 4.82, 16.6), &winner));
+        // 同点も採らない。同じ出来なら既定の 1 回を返す
+        assert!(!search_beats_first(&first(0, 11.19, 34.8), &winner));
+        // 上回れば採る（実写のリモコン: 既定 9.0 → 探索 4.9、警告は残る）
+        assert!(search_beats_first(&first(0, 14.0, 50.0), &winner));
+        // 既定に致命が残っていれば、致命の無い勝者は重み和が悪くても採る
+        assert!(search_beats_first(&first(1, 2.0, 50.0), &winner));
+    }
+
+    /// きれいな勝者は、重み和が既定の 1 回より大きくても採る。
+    ///
+    /// 警告の無い結果を、警告のある結果へ戻してはならない。
+    #[test]
+    fn auto_always_adopts_a_clean_winner() {
+        let winner = trial(0, 2.7, 50.0, plain(30.0));
+        assert!(winner.clean());
+        assert!(search_beats_first(&first(0, 1.1, 50.0), &winner));
+    }
+
+    /// 致命の警告が残った勝者と、崩れた勝者は採らない。
+    #[test]
+    fn auto_never_adopts_a_fatal_or_collapsed_winner() {
+        let mut fatal = trial(1, 0.5, 60.0, plain(30.0));
+        fatal.warnings = vec![WarningCode::SubjectTouchesEdge];
+        assert!(!search_beats_first(&first(2, 9.0, 10.0), &fatal));
+
+        let mut collapsed = trial(0, 0.5, 60.0, plain(60.0));
+        collapsed.collapsed = true;
+        assert!(!search_beats_first(&first(0, 9.0, 10.0), &collapsed));
+        // 既定に致命があっても同じ。飲まれた商品は警告を出さずに指標だけ良くなる
+        assert!(!search_beats_first(&first(1, 9.0, 10.0), &collapsed));
+    }
+
+    /// `BBOX_RECOMMENDED` だけが残った勝者は、致命の数が減るときだけ採る。
+    ///
+    /// あの code は `OPTIMIZE_NO_CLEAN_CANDIDATE` を出さないが、順位の上では
+    /// 致命である。同じ数の致命どうしを品質で比べて採ってはならない。
+    #[test]
+    fn auto_adopts_a_bbox_only_winner_only_when_it_has_fewer_fatals() {
+        let mut winner = trial(1, 0.5, 60.0, plain(30.0));
+        winner.warnings = vec![WarningCode::BboxRecommended];
+        assert!(winner.remaining_codes().is_empty(), "前提");
+        assert!(!search_beats_first(&first(1, 9.0, 10.0), &winner));
+        assert!(!search_beats_first(&first(0, 9.0, 10.0), &winner));
+        assert!(search_beats_first(&first(2, 9.0, 10.0), &winner));
+    }
+
+    /// 測れなかった診断値の数は、品質の重み和より先に効く。
+    #[test]
+    fn auto_weighs_unmeasured_before_quality() {
+        let mut winner = trial(0, 9.0, 60.0, plain(30.0));
+        winner.warnings = vec![WarningCode::ContourRough];
+        let blind = Score {
+            unmeasured: 1,
+            ..first(0, 1.0, 60.0)
+        };
+        assert!(search_beats_first(&blind, &winner));
+        winner.score.unmeasured = 2;
+        assert!(!search_beats_first(&blind, &winner));
+    }
+
+    /// `improves` は同点を「良くない」と答える。
+    #[test]
+    fn improves_is_strict() {
+        let a = first(0, 3.0, 40.0);
+        assert!(!improves(&a, &a));
+        assert!(improves(&first(0, 2.9, 40.0), &a));
+        assert!(improves(&first(0, 3.0, 40.1), &a));
+        assert!(!improves(&first(1, 0.0, 99.0), &a));
+        let unmeasured = Score {
+            unmeasured: 1,
+            ..first(0, 0.0, 99.0)
+        };
+        assert!(!improves(&unmeasured, &a));
     }
 
     /// 崩れた候補は「綺麗」ではない。**早期打ち切りをそこで止めない。**

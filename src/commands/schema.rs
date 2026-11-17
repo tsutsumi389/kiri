@@ -854,6 +854,27 @@ fn fields() -> Vec<FieldEntry> {
             ),
         },
         FieldEntry {
+            path: "segment.filled_ratio",
+            appears_in: vec!["cutout"],
+            unit: "ratio",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "モデルの外形の内側に食い込んだ窪みを埋め戻した面の割合（0 なら埋め戻していない）",
+            notes: Some(
+                "モデルが外形は捉えたが内側を言い切れない商品（segment.uncertain_ratio が大きい）では、\
+                 不明の帯を色が決めるので、色の近い場所でフィルが狭い口から商品の内側へ食い込む。\
+                 その窪み（切り抜きでは背景になった・口が長辺の 4% より狭い・モデルの外形の内側）を\
+                 確定前景として足し、同じ設定で切り直している。足した面は constraints の fg にも\
+                 数えられる。致命的な警告が新しく出る切り直しは採らない（そのとき 0）。値は確率マップの\
+                 格子で数えた窪みの割合で、利用者の指示が上から戻した画素も含む。モデルが背景と\
+                 言い切った穴（囲まれていても）と、画像の端に沿った帯は埋めない。\
+                 **mask.contour_roughness は埋め戻しで増えることがある**——あの値は細かいギザギザを\
+                 測る量で、えぐれを見ていない。info の segment ブロックには無い（切り抜かないので）",
+            ),
+        },
+        FieldEntry {
             path: "segment.model_path",
             appears_in: both(),
             unit: "path",
@@ -893,7 +914,11 @@ fn fields() -> Vec<FieldEntry> {
                  NOT_SEPARABLE になるか subject.confidence が low のときだけ走る。off なら\
                  必ず false で、そのときの成果物の画素は --segment を足す前と 1 バイトも\
                  変わらない（報告 JSON には subject.source / settings.segment / \
-                 settings.segment_ran の 3 つが増える。schema_version は据え置き）",
+                 settings.segment_ran の 3 つが増える。schema_version は据え置き）。\
+                 **例外は --auto で、指定が off（または門が走らせなかった auto）のまま true に\
+                 なることがある**——探索しても致命的な警告が残ったとき、--auto が自分でモデルへ\
+                 昇格した実行である（optimize.returned が segment。--segment off を明示すれば\
+                 昇格しない）",
             ),
         },
         FieldEntry {
@@ -960,8 +985,14 @@ fn fields() -> Vec<FieldEntry> {
                  は指定値なので false のまま）。--tolerance / --bbox / --background-model を 3 つとも\
                  明示した実行は、探索の軸が残っていないので昇格しない。警告の出ない画像の成果物は --auto 無しと \
                  1 バイトも違わず、昇格した実行の成果物は --optimize --edge-repair auto と同じである。\
-                 **探索しても致命の警告が残ったとき（OPTIMIZE_NO_CLEAN_CANDIDATE）だけは探索の結果を\
-                 採らず、既定の 1 回を返す**（optimize.adopted が false）",
+                 **探索の結果が既定の 1 回を上回らなかったときだけは探索の結果を採らず、\
+                 既定の 1 回を返す**（optimize.adopted が false）。致命の警告が残った探索\
+                 （OPTIMIZE_NO_CLEAN_CANDIDATE）では、さらにモデル（isnet）へ昇格する——\
+                 モデルが示した範囲を既定の設定で切り、既定の 1 回より良ければそれを返す\
+                 （settings.segment_ran が true になる。成果物は --segment isnet --edge-repair auto \
+                 と同じ）。segment 機能の無い build・モデルが置いていない・--segment off を明示した・\
+                 モデルが既に走っている実行では昇格しない。どれを返したかは \
+                 optimize.returned（search / segment / default）が言う",
             ),
         },
         FieldEntry {
@@ -1092,14 +1123,40 @@ fn fields() -> Vec<FieldEntry> {
             gates: None,
             summary: "成果物が optimize.chosen の候補で切ったものか",
             notes: Some(
-                "--optimize の実行では常に true。--auto が昇格した探索で致命的な警告が残った\
-                 （OPTIMIZE_NO_CLEAN_CANDIDATE）ときだけ false になり、成果物は既定の設定で\
-                 切った 1 回目（に --edge-repair auto を掛けたもの）である。きれいな候補が\
+                "--optimize の実行では常に true。--auto が昇格した探索の勝者が既定の 1 回を\
+                 上回らなかったときだけ false になる。上回らないとは、勝者に致命的な警告が\
+                 残った（OPTIMIZE_NO_CLEAN_CANDIDATE）か、商品を飲んだ（collapsed）か、\
+                 致命は無いがきれいでもなく、score（fatal → unmeasured → quality → \
+                 separability）が既定の 1 回より良くないことを言う。false のときの成果物は\
+                 既定の設定で切ったもの（に --edge-repair auto を掛けたもの）で、致命的な警告が\
+                 残った探索では、モデル（isnet）が示した範囲を敷いて切ったものになりうる\
+                 （settings.segment_ran を参照）。きれいな候補が\
                  無いとき致命の警告どうしの順位は当てにならず、選ばれた候補が 1 回目より\
                  商品を削っていることがあるので、--auto は付けないより悪い結果を返さない。\
                  false のとき settings / applied_bbox / mask は返した結果のもので、\
                  optimize.chosen とは一致しない。探索が選んだ候補を見たければ \
                  --optimize を自分で渡す",
+            ),
+        },
+        FieldEntry {
+            path: "optimize.returned",
+            appears_in: vec!["cutout"],
+            unit: "enum",
+            nullable: false,
+            null_means: None,
+            warns: vec![],
+            gates: None,
+            summary: "成果物の出所（search / segment / default）",
+            notes: Some(
+                "search は optimize.chosen の候補（optimize.adopted が true）。segment は、\
+                 --auto がモデル（isnet）へ昇格し、その範囲を既定の設定で切った結果\
+                 （settings.segment_ran が true。成果物は --segment isnet --edge-repair auto \
+                 と同じ）。default は既定の設定で切った 1 回。--optimize の実行では常に search。\
+                 **settings.segment から推し量らないこと**——--segment auto の門が走らせなかった\
+                 後に昇格した実行では、指定値は auto のままである。昇格するのは、探索の結果を\
+                 採らず、かつ返す 1 回目に致命的な警告が残るときだけ。default で終わった理由\
+                 （モデルを試していない・試したが良くならなかった・走らせられなかった）は \
+                 OPTIMIZE_NO_CLEAN_CANDIDATE の data.segment_tried / data.segment_error が言う",
             ),
         },
         // `edge_repair` ブロックは `--edge-repair auto` か `--auto` を渡した実行にしか

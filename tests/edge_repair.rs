@@ -321,7 +321,17 @@ fn cli(input: &std::path::Path, out: &std::path::Path, extra: &[&str]) -> serde_
         "--json",
     ];
     args.extend_from_slice(extra);
-    let run = common::kiri().args(&args).output().unwrap();
+    // **モデルの無い機械と同じ条件で回す。** `--auto` は探索しても致命の警告が
+    // 残るとモデルへ昇格するので、置いてある機械でだけ結果が変わる検査にしない
+    // （昇格そのものは `tests/segment.rs` が見る）
+    let run = common::kiri()
+        .args(&args)
+        .env(
+            kiri::segment::model::KIRI_MODEL_DIR,
+            input.parent().unwrap(),
+        )
+        .output()
+        .unwrap();
     assert!(
         run.status.success(),
         "{}",

@@ -24,8 +24,8 @@ use crate::cutout::mask::FOREGROUND_THRESHOLD;
 use crate::cutout::optimize;
 use crate::cutout::subject::TILT_SHAPE_MIN_FILL;
 use crate::cutout::{
-    Constraint, ConstraintSource, Constraints, CutoutOptions, FG_SEED_RADIUS, LowReason, Matting,
-    SubjectHint, cutout_seen,
+    BackgroundSeen, Constraint, ConstraintSource, Constraints, CutoutOptions, CutoutResult,
+    FG_SEED_RADIUS, LowReason, Matting, SubjectHint, cutout_seen,
 };
 use crate::error::{Error, ErrorCode, Result};
 use crate::image_io::{IccPolicy, LoadOptions, OutputFormat, SaveOptions, load, save};
@@ -34,7 +34,7 @@ use crate::profile;
 use crate::report::{
     CanvasReport, ColorReport, ConstraintsReport, CutoutReport, Dimensions, EdgeRepairMetrics,
     EdgeRepairReport, MaskReport, OptimizeCandidate, OptimizeReport, OptimizeScore, ProfileRef,
-    ReflectReport, RotateReport, SCHEMA_VERSION, SettingsReport, ShadowReport,
+    ReflectReport, RotateReport, SCHEMA_VERSION, SegmentReport, SettingsReport, ShadowReport,
 };
 use crate::transform::canvas::{CanvasSpec, apply as canvas_apply, composite, plan as canvas_plan};
 use crate::transform::reflect::{self, ReflectMode, ReflectSpec};
@@ -120,17 +120,24 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     let mut segment_report = None;
     // 判断そのものから出た警告（`--segment off` に添えた `--model-path` など）
     let mut segment_warnings = std::mem::take(&mut decision.warnings);
-    let constraints = match decision.run.as_ref() {
+    // モデルの外形。**モデルの領域の上で切った結果にだけ使う**（窪みの埋め戻し）。
+    // `--auto` がモデルへ昇格して採った実行では、そこで埋まる
+    let mut silhouette = None;
+    // モデルの領域を敷いた実行で、利用者が渡した指示だけを別に持っておく。
+    // 窪みを確定前景として足した後に、もう 1 度上から重ねるためである
+    // （利用者が背景と言った画素を、埋め戻しが商品へ戻してはならない）
+    let (constraints, mut user_marks) = match decision.run.as_ref() {
         Some(run) => {
             let (mut from_model, stats) = crate::segment::to_constraints(&run.probability, w, h);
             segment_report = Some(segment::report(run, &stats));
             segment_warnings.extend(segment::uncertain_warning(&stats));
+            silhouette = crate::segment::silhouette(&run.probability);
             if let Some(user) = user_constraints.as_ref() {
                 from_model.overlay(user);
             }
-            Some(from_model)
+            (Some(from_model), user_constraints)
         }
-        None => user_constraints,
+        None => (user_constraints, None),
     };
 
     let mut opts = CutoutOptions {
@@ -166,18 +173,21 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
     // 警告の無い結果はそのまま流れるので、成果物は `--auto` 無しと 1 バイトも
     // 違わない。昇格するときは 1 回目を**探索の前に手放す**——抱えたままだと
     // 24.5MP では切り抜いた画像（98MB）が探索の山にそのまま重なる
-    let plain = if args.optimize {
-        None
-    } else {
-        Some(cutout_seen(&loaded.image, &opts, seen)).filter(|first| {
-            // `--auto` が無ければ、何が出ていてもこの結果をそのまま使う。
-            // **3 軸とも明示されていれば昇格しない**——候補はいま切った 1 つ
-            // だけなので、同じ切り抜きをもう 1 度回して「全候補を試したが
-            // 駄目だった」と言うことになる
-            !args.auto || optimize::settled(first) || args.fixed.all()
-        })
-    };
-    let (mut result, optimize, optimize_warning) = if let Some(result) = plain {
+    let first = (!args.optimize).then(|| cutout_seen(&loaded.image, &opts, seen));
+    // 昇格した先の結果を 1 回目と比べる物差し。**画像は抱えず、数だけ残す**
+    let first_score = first.as_ref().map(optimize::score);
+    let plain = first.filter(|first| {
+        // `--auto` が無ければ、何が出ていてもこの結果をそのまま使う。
+        // **3 軸とも明示されていれば昇格しない**——候補はいま切った 1 つ
+        // だけなので、同じ切り抜きをもう 1 度回して「全候補を試したが
+        // 駄目だった」と言うことになる
+        !args.auto || optimize::settled(first) || args.fixed.all()
+    });
+    // `--auto` がモデルへ昇格したか。`settings.segment_ran` が言う
+    let mut promoted = false;
+    // 昇格して採った実行の、既定の 1 回のスコア。窪みの埋め戻しの下限になる
+    let mut promoted_over = None;
+    let (result, optimize, optimize_warning) = if let Some(result) = plain {
         (result, None, None)
     } else {
         // 表を渡し切る（借りない）。借りると候補ごとに原寸の `Constraints`
@@ -185,45 +195,113 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         // 「効いた設定」として返ってくるので、下の `opts` はそれで置き換わる
         //
         // 探索が動かす 3 軸の、探索前の値。`--auto` が 1 回目へ戻るときに使う
-        let first = (opts.tolerance, opts.bbox, opts.background_model);
+        let given = (opts.tolerance, opts.bbox, opts.background_model);
         let found = optimize::optimize(&loaded.image, opts, &args.fixed, seen)?;
         let mut report = optimize_report(&found, w, h);
         // 代入で置き換える（シャドーイングではない）。**束縛を増やすと、
         // 探索前の指示の表が関数の終わりまで生き残る**——24.5MP では
         // 選ばれた候補のものと合わせて 24.5MB を 2 本抱えることになる
         opts = found.options;
-        // **`--auto` は、きれいな候補が無かった探索の結果を採らない。** 致命の
-        // 警告どうしの順位は当てにならず、選ばれた候補が 1 回目より壊れている
-        // ことがある（R3 は商品が丸ごと消え、実写のキーボードはキーの半分が
-        // 消える）。`--auto` は付けないより悪い結果を返してはならないので、
-        // 既定の 1 回へ戻る。自分で `--optimize` を渡した実行は選ばれた候補を
-        // そのまま受け取る——あちらは「探索の答えをくれ」という指定である。
+        // **`--auto` は、既定の 1 回を上回らない探索の結果を採らない**
+        // （`optimize::search_beats_first`）。致命の警告どうしの順位は当てに
+        // ならず、選ばれた候補が 1 回目より壊れていることがある（R3 は商品が
+        // 丸ごと消え、実写のキーボードはキーの半分が消える）。`--auto` は
+        // 付けないより悪い結果を返してはならないので、既定の 1 回へ戻る。
+        // 自分で `--optimize` を渡した実行は選ばれた候補をそのまま受け取る——
+        // あちらは「探索の答えをくれ」という指定である。
         //
         // **1 回目は抱えておかず、切り直す。** 抱えると 24.5MP では 98MB が
         // 探索の山に重なる。切り直しは決定的で、払うのは失敗した経路だけである。
-        // この枝へ来るのは昇格した `--auto` か `--optimize` で、両者は併記できない
-        match found.warning {
-            Some(warning) if args.auto => {
+        // この枝へ来るのは昇格した `--auto`（`first_score` が `Some`）か
+        // `--optimize`（`None`）で、両者は併記できない
+        match first_score {
+            Some(before) if !optimize::search_beats_first(&before, &found.trials[found.chosen]) => {
                 drop(found.result);
-                (opts.tolerance, opts.bbox, opts.background_model) = first;
-                report.adopted = false;
-                let warning = Warning {
-                    message: format!(
-                        "{}。探索の結果は採らず、既定の設定で切った結果を返しました",
-                        warning.message
-                    ),
-                    ..warning
+                (opts.tolerance, opts.bbox, opts.background_model) = given;
+                // **返す 1 回目に致命の警告が残るなら、色の手がかりは尽きている。**
+                // 残る手は色ではない手がかり（モデル）で、
+                // `OPTIMIZE_NO_CLEAN_CANDIDATE` の hint が「--segment isnet を
+                // 試してください」と言ってきた一手をここで済ませる。
+                // **モデルの結果も 1 回目より良いときしか採らない**
+                //
+                // 探索の勝者の警告ではなく**返す結果の致命**で決める——勝者が
+                // 崩れただけ（code は無い）の実行でも、返す 1 回目が外周に
+                // 接していれば、モデルが要ることは変わらない。致命の無い 1 回目
+                // では走らせない——色で切れてはいるので、1.5 秒を払う理由が無い
+                let rescue = if before.fatal == 0 {
+                    Rescue::Untried
+                } else if decision.ran() {
+                    Rescue::AlreadyLaid
+                } else if may_promote(decision.mode, args.segment_fixed) {
+                    promote_to_segment(&loaded.image, args, &mut opts, seen, &before)
+                } else {
+                    Rescue::Untried
+                };
+                // モデルを読んだ（読もうとした）なら、「--segment off なので
+                // 読んでいません」はもう嘘になる
+                if matches!(
+                    rescue,
+                    Rescue::Adopted(_) | Rescue::NotBetter | Rescue::Failed(_)
+                ) {
+                    segment_warnings.retain(|w| w.code != WarningCode::ModelPathIgnored);
                 }
-                .with_data("adopted", false);
-                (
-                    cutout_seen(&loaded.image, &opts, seen),
-                    Some(report),
-                    Some(warning),
-                )
+                let (rescued, returned) = match rescue {
+                    Rescue::Adopted(adopted) => {
+                        let adopted = *adopted;
+                        promoted = true;
+                        promoted_over = Some(before);
+                        segment_report = Some(adopted.report);
+                        segment_warnings.extend(adopted.warnings);
+                        silhouette = adopted.silhouette;
+                        user_marks = adopted.user_marks;
+                        (Some(adopted.result), Returned::Segment)
+                    }
+                    Rescue::NotBetter => (None, Returned::Default(Model::NotBetter)),
+                    Rescue::AlreadyLaid => (None, Returned::Default(Model::AlreadyLaid)),
+                    Rescue::Failed(code) => (None, Returned::Default(Model::Failed(code))),
+                    Rescue::Untried => (None, Returned::Default(Model::Untried)),
+                };
+                // 昇格で得た結果が無ければ、既定の 1 回を切り直す
+                let result = rescued.unwrap_or_else(|| cutout_seen(&loaded.image, &opts, seen));
+                report.adopted = false;
+                report.returned = returned.as_str();
+                let warning = found.warning.map(|w| not_adopted_warning(w, returned));
+                (result, Some(report), warning)
             }
-            warning => (found.result, Some(report), warning),
+            _ => (found.result, Some(report), found.warning),
         }
     };
+    // **モデルの領域の上で切った結果に、窪みがあれば埋め戻す**（`fill_bites`）。
+    // 探索の候補ごとには掛けない——解き直しと同じ理由で、選ばれた 1 つだけを直す
+    let mut filled_ratio = 0.0;
+    let mut result = match silhouette
+        .as_ref()
+        .and_then(|outline| outline.bites(&result.mask))
+    {
+        None => result,
+        Some(bites) => {
+            let (filled, adopted) = fill_bites(
+                &loaded.image,
+                &mut opts,
+                result,
+                &bites,
+                user_marks.as_ref(),
+                seen,
+                promoted_over.as_ref(),
+            );
+            if adopted {
+                filled_ratio = round4(bites.ratio);
+            }
+            filled
+        }
+    };
+    // `cutout` の報告では常に出す（0 なら埋め戻していない）。`info` は切り抜かない
+    // ので、あちらの `segment` ブロックにはキーごと無い
+    if let Some(report) = segment_report.as_mut() {
+        report.filled_ratio = Some(filled_ratio);
+    }
+    // 利用者の指示だけの表はもう要らない（24.5MP で 24MB）
+    drop(user_marks);
     let bbox = opts.bbox;
 
     // **解き直しは探索の後ろに 1 度だけ掛ける。** 探索の候補ごとに掛けると、
@@ -530,8 +608,11 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
             // （`auto` を渡した実行では "auto" がそのまま出る）
             rotate: args.rotate.rounded(),
             // 指定値。`auto` が走らせたかどうかは次の行が言う
+            // **`--auto` が自分で走らせた実行では "off" と true が並ぶ**
+            // （指定は off のまま、探索で解けなかったのでモデルへ昇格した。
+            // 何を返したかは `optimize.returned` が言う）
             segment: decision.mode.as_str(),
-            segment_ran: decision.ran(),
+            segment_ran: decision.ran() || promoted,
             // **指定値である。** profile が実際に何を決めたかは、同じ
             // settings の他の項目と canvas ブロックが効いた値として語る。
             // 条件そのもの（長辺・背景・占有率と出典）は載せない——同じ表が
@@ -629,6 +710,281 @@ fn guide_hints(
             }
             _ => {}
         }
+    }
+}
+
+/// `--auto` がモデルへ昇格してよいか。**モデルがまだ走っていない実行について問う。**
+///
+/// `--segment off` を**書いて**いれば昇格しない（書いたなら「使うな」という
+/// 指定である）。既定値の off と、門が走らせなかった `auto` は昇格してよい。
+///
+/// この build が推論できるか・モデルが置いてあるかは、ここでは見ない。
+/// 走らせてみて断られたら昇格しないだけで、答えは同じになる
+fn may_promote(mode: crate::segment::SegmentMode, segment_fixed: bool) -> bool {
+    !(mode.is_off() && segment_fixed)
+}
+
+/// `--auto` がモデルへ昇格した結果。
+enum Rescue {
+    /// モデルの領域で切った結果が 1 回目より良かった
+    Adopted(Box<Promoted>),
+    /// モデルは走ったが、1 回目より良くならなかった
+    NotBetter,
+    /// モデルは既に走っていて（`--segment isnet`、門を通った `auto`）、
+    /// 1 回目がもうその領域の上で切られている
+    AlreadyLaid,
+    /// 走らせようとして失敗した（モデルが壊れている、`--model-path` の先が無い）
+    Failed(ErrorCode),
+    /// 走らせていない。条件を満たさない（1 回目に致命が無い・`--segment off` を
+    /// 書いた）か、この build に機能が無いか、モデルが置いていない
+    Untried,
+}
+
+struct Promoted {
+    result: CutoutResult,
+    report: SegmentReport,
+    /// モデルの読み込みと、不明の帯の広さについての警告
+    warnings: Vec<Warning>,
+    /// モデルの外形。この後の窪みの埋め戻しが使う
+    silhouette: Option<crate::segment::Silhouette>,
+    /// 利用者が渡した指示だけの表（モデルの領域を重ねる前のもの）
+    user_marks: Option<Constraints>,
+}
+
+/// 色のフィルがモデルの外形の内側へ食い込んだ窪みを、確定前景として足して
+/// 切り直す。返すのは（結果, 埋め戻しを採ったか）。
+///
+/// **モデルが迷っている商品で起きる。** 実写のキーボードでは、モデルは外形を
+/// 正しく捉えているのにキートップを前景と言い切れず、確定前景が画像の 0.8% しか
+/// 無い。残りは色が決めるので、枠と机の色が近い場所でフィルが狭い口から
+/// 数十 px 食い込む。正解に対しては、商品の欠けが 1.29% → 0.33%、いちばん深い
+/// えぐれが 21 → 14px（長辺 1000px 換算）になる。
+///
+/// **`mask.contour_roughness` は逆に悪化する**（同じ素材で 0.39 → 0.48）。
+/// あの指標は細かいギザギザを測る量で、えぐれを見ていない。埋め戻した面の縁が
+/// 輪郭に足されるぶんだけ増える。だから採否を品質の重み和では決めず、
+/// **致命の警告が増えないこと**だけを門にする。
+///
+/// 採らなかったときは元の指示へ戻して切り直す（1 回目は抱えていない。
+/// `--auto` が既定の 1 回へ戻るときと同じ理由）。**採らない実行は原寸の
+/// 切り抜きを 2 回余計に払う。**
+///
+/// `floor` は `--auto` がモデルへ昇格した実行の、既定の 1 回のスコア。
+/// 埋め戻した結果がそれを上回らなければ採らない（`--auto` は付けないより
+/// 悪い結果を返さない）。
+fn fill_bites(
+    image: &image::RgbaImage,
+    opts: &mut CutoutOptions,
+    result: CutoutResult,
+    bites: &crate::segment::Bites,
+    user_marks: Option<&Constraints>,
+    seen: Option<&BackgroundSeen>,
+    floor: Option<&optimize::Score>,
+) -> (CutoutResult, bool) {
+    let Some(laid) = opts.constraints.as_mut() else {
+        return (result, false);
+    };
+    let before = fatal_codes(&result);
+    drop(result);
+    let undo = bites.mark(laid);
+    // 利用者は決定。埋め戻しより上に置く
+    if let Some(user) = user_marks {
+        laid.overlay(user);
+    }
+    let filled = cutout_seen(image, opts, seen);
+    // **数ではなく code で比べる。** 1 つ消えて別の 1 つが出た切り直しは、
+    // 数が同じでも別の壊れ方をしている
+    let no_new_fatal = fatal_codes(&filled).iter().all(|c| before.contains(c));
+    // `--auto` がモデルへ昇格した実行は、既定の 1 回より良いことが採った
+    // 理由である。埋め戻した後もそれが成り立っていなければならない
+    let above_floor =
+        floor.is_none_or(|first| optimize::improves(&optimize::score(&filled), first));
+    if no_new_fatal && above_floor {
+        return (filled, true);
+    }
+    drop(filled);
+    if let Some(laid) = opts.constraints.as_mut() {
+        // 利用者の印は窪みの上へ同じ値を書き直しただけなので、窪みの画素を
+        // 元へ戻せば表は埋め戻す前と同じになる
+        bites.unmark(laid, &undo);
+    }
+    (cutout_seen(image, opts, seen), false)
+}
+
+/// 結果に出た致命の警告の code（`optimize::FATAL_CODES`）。
+fn fatal_codes(result: &CutoutResult) -> Vec<WarningCode> {
+    result
+        .warnings
+        .iter()
+        .map(|w| w.code)
+        .filter(|c| optimize::FATAL_CODES.contains(c))
+        .collect()
+}
+
+/// `--auto` が探索の結果を採らなかったとき、代わりに何を返したか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Returned {
+    /// モデルの領域で切った結果
+    Segment,
+    /// 既定の 1 回。モデルがどうなったかを添える
+    Default(Model),
+}
+
+/// 既定の 1 回を返した実行で、モデルがどうなったか。次の一手がこれで変わる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Model {
+    /// 試していない。「--segment isnet を試せ」が残る
+    Untried,
+    /// 既に走っていて、返した 1 回がその領域の上で切られている
+    AlreadyLaid,
+    /// 試したが良くならなかった
+    NotBetter,
+    /// 試そうとして失敗した
+    Failed(ErrorCode),
+}
+
+impl Returned {
+    /// `optimize.returned` と警告の `data.returned` に出す綴り
+    fn as_str(self) -> &'static str {
+        match self {
+            Returned::Segment => "segment",
+            Returned::Default(_) => "default",
+        }
+    }
+
+    /// モデルの領域を見た上での結果か。true なら「--segment isnet を試せ」は
+    /// 済んだ手である
+    fn segment_tried(self) -> bool {
+        matches!(
+            self,
+            Returned::Segment | Returned::Default(Model::AlreadyLaid | Model::NotBetter)
+        )
+    }
+}
+
+/// モデルの領域を敷いて、既定の設定で切り直す。**1 回目より良いときだけ採る。**
+///
+/// 採ったときは `opts.constraints` をモデルの領域（に利用者の指示を重ねたもの）へ
+/// 置き換えて返す——以降の解き直しと `constraints` の報告は、切った結果と同じ
+/// 指示を見なければならない。採らなかったときは元の指示へ戻す。
+///
+/// **探索はやり直さない。** モデルの領域つきの探索は、実写（暗い机の上の黒い
+/// キーボード）で tolerance 60 を選んで商品の半分を消した。色の手がかりが
+/// 尽きたからモデルへ来たのであって、その上で色の許容量を振る意味は薄い。
+///
+/// **失敗しても実行は落とさない。** モデルが置いていない・壊れているのは
+/// `--auto` を付けた利用者の誤りではなく、付けない実行なら成功している。
+/// ただし**「置いていない」と「壊れている」は分ける**——前者は昇格しないだけの
+/// 普通の状態（`Untried`）、後者は黙っていると気づけない（`Failed`。警告の
+/// `data.segment_error` に code を載せる）。`--model-path` を書いた実行は、
+/// その先が無いことも後者に数える
+fn promote_to_segment(
+    image: &image::RgbaImage,
+    args: &CutoutArgs,
+    opts: &mut CutoutOptions,
+    seen: Option<&BackgroundSeen>,
+    first: &optimize::Score,
+) -> Rescue {
+    let model = crate::cli::SegmentOpts {
+        segment: crate::segment::SegmentMode::Isnet,
+        model_path: args.segment.model_path.clone(),
+    };
+    let decision = match segment::decide(image, &model, args.border, None) {
+        Ok(decision) => decision,
+        Err(e) => return failed_or_untried(e.code, model.model_path.is_some()),
+    };
+    let segment::Decision {
+        run, mut warnings, ..
+    } = decision;
+    let Some(run) = run else {
+        return Rescue::Untried;
+    };
+    let (mut from_model, stats) =
+        crate::segment::to_constraints(&run.probability, image.width(), image.height());
+    let report = segment::report(&run, &stats);
+    warnings.extend(segment::uncertain_warning(&stats));
+    let silhouette = crate::segment::silhouette(&run.probability);
+    // 確率の表はもう要らない。原寸の切り抜きの山に重ねない
+    drop(run);
+    // モデルは提案、利用者は決定（`run` の同じ箇所を参照）
+    let user = opts.constraints.take();
+    if let Some(user) = user.as_ref() {
+        from_model.overlay(user);
+    }
+    opts.constraints = Some(from_model);
+    let result = cutout_seen(image, opts, seen);
+    if !optimize::improves(&optimize::score(&result), first) {
+        opts.constraints = user;
+        return Rescue::NotBetter;
+    }
+    Rescue::Adopted(Box::new(Promoted {
+        result,
+        report,
+        warnings,
+        silhouette,
+        user_marks: user,
+    }))
+}
+
+/// モデルを走らせられなかった理由を、「無いだけ」と「失敗」に分ける。
+fn failed_or_untried(code: ErrorCode, explicit_path: bool) -> Rescue {
+    match code {
+        // この build に機能が無い。`--auto` はどの build でも同じ綴りで通る
+        ErrorCode::SegmentUnavailable => Rescue::Untried,
+        // 既定の置き場所に無い。モデルを取っていない利用者の普通の状態である
+        ErrorCode::ModelNotFound if !explicit_path => Rescue::Untried,
+        code => Rescue::Failed(code),
+    }
+}
+
+/// 探索の結果を採らなかったことを、探索の警告に書き足す。
+///
+/// **何を返したかで次の一手が変わる。** モデルを試していなければ
+/// 「--segment isnet を試せ」が残り、試した後なら残るのは範囲を直接渡すことだけ。
+/// モデルの結果を返した実行に「--segment isnet を試せ」と言うと、済んだ手を
+/// 勧めることになる
+fn not_adopted_warning(warning: Warning, returned: Returned) -> Warning {
+    const SPATIAL: &str =
+        "--trimap / --fg-polygon / --bg-polygon で範囲を直接渡すか、撮り直してください";
+    let (tail, hint) = match returned {
+        Returned::Segment => (
+            "探索の結果は採らず、モデル（isnet）が示した範囲を既定の設定で切った結果を返しました"
+                .to_string(),
+            Some("範囲が違っていれば、--trimap / --fg-polygon / --bg-polygon で直接渡してください"),
+        ),
+        Returned::Default(Model::Untried) => (
+            "探索の結果は採らず、既定の設定で切った結果を返しました".to_string(),
+            None,
+        ),
+        Returned::Default(Model::AlreadyLaid) => (
+            "探索の結果は採らず、既定の設定で切った結果を返しました（モデルの範囲は敷いたまま）"
+                .to_string(),
+            Some(SPATIAL),
+        ),
+        Returned::Default(Model::NotBetter) => (
+            "モデル（isnet）でも良くならなかったので、探索の結果もモデルの結果も採らず、既定の設定で切った結果を返しました"
+                .to_string(),
+            Some(SPATIAL),
+        ),
+        Returned::Default(Model::Failed(code)) => (
+            format!(
+                "モデル（isnet）は走らせられなかった（{}）ので、探索の結果は採らず、既定の設定で切った結果を返しました",
+                code.as_str()
+            ),
+            Some("--segment isnet を付けて回すと、モデルを走らせられない原因が error として返ります"),
+        ),
+    };
+    let warning = Warning {
+        message: format!("{}。{tail}", warning.message),
+        hint: hint.map(str::to_string).or(warning.hint),
+        ..warning
+    }
+    .with_data("adopted", false)
+    .with_data("returned", returned.as_str())
+    .with_data("segment_tried", returned.segment_tried());
+    match returned {
+        Returned::Default(Model::Failed(code)) => warning.with_data("segment_error", code.as_str()),
+        _ => warning,
     }
 }
 
@@ -1447,6 +1803,7 @@ fn optimize_report(found: &crate::cutout::Optimized, width: u32, height: u32) ->
         candidates,
         // 探索は選んだ候補を返す。採らないと決めるのは `--auto` の側である
         adopted: true,
+        returned: "search",
         elapsed_ms: found.elapsed_ms,
     }
 }
@@ -2638,6 +2995,79 @@ fn resolve_point(point: [f64; 2], normalized: bool, width: u32, height: u32) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--auto` がモデルへ昇格してよいのは、`--segment off` を書いていないとき。
+    ///
+    /// 既定値の off と、門が走らせなかった `auto` は昇格してよい（モデルが既に
+    /// 走った実行は、ここへ来る前に `Rescue::AlreadyLaid` へ分かれる）。
+    #[test]
+    fn only_a_written_segment_off_keeps_auto_from_the_model() {
+        use crate::segment::SegmentMode;
+        assert!(may_promote(SegmentMode::Off, false));
+        assert!(!may_promote(SegmentMode::Off, true));
+        assert!(may_promote(SegmentMode::Auto, true));
+        assert!(may_promote(SegmentMode::Auto, false));
+    }
+
+    /// 「置いていない」は昇格しないだけ、「壊れている」は失敗として残す。
+    #[test]
+    fn a_missing_model_is_not_a_failure_but_a_broken_one_is() {
+        assert!(matches!(
+            failed_or_untried(ErrorCode::SegmentUnavailable, false),
+            Rescue::Untried
+        ));
+        assert!(matches!(
+            failed_or_untried(ErrorCode::ModelNotFound, false),
+            Rescue::Untried
+        ));
+        // `--model-path` を書いたのに、その先が無い
+        assert!(matches!(
+            failed_or_untried(ErrorCode::ModelNotFound, true),
+            Rescue::Failed(ErrorCode::ModelNotFound)
+        ));
+        assert!(matches!(
+            failed_or_untried(ErrorCode::ModelUnreadable, false),
+            Rescue::Failed(ErrorCode::ModelUnreadable)
+        ));
+    }
+
+    /// 済んだ手を勧めない。モデルの領域を見た後の実行に「--segment isnet を
+    /// 試せ」とは言わず、試していない実行にだけ言う。
+    #[test]
+    fn the_warning_names_what_was_returned_and_the_next_step() {
+        let base = || {
+            Warning::new(WarningCode::OptimizeNoCleanCandidate, "残りました")
+                .with_hint("撮り直すか、--segment isnet を試してください")
+        };
+        let said = |returned: Returned| {
+            let w = not_adopted_warning(base(), returned);
+            let data = serde_json::to_value(&w).unwrap()["data"].clone();
+            (w.hint.unwrap(), data)
+        };
+
+        let (hint, data) = said(Returned::Default(Model::Untried));
+        assert!(hint.contains("--segment isnet"));
+        assert_eq!(data["returned"], "default");
+        assert_eq!(data["segment_tried"], false);
+        assert_eq!(data["adopted"], false);
+        assert!(data.get("segment_error").is_none());
+
+        for tried in [
+            Returned::Segment,
+            Returned::Default(Model::AlreadyLaid),
+            Returned::Default(Model::NotBetter),
+        ] {
+            let (hint, data) = said(tried);
+            assert!(!hint.contains("--segment isnet"), "{tried:?}: {hint}");
+            assert_eq!(data["segment_tried"], true, "{tried:?}");
+            assert_eq!(data["returned"], tried.as_str(), "{tried:?}");
+        }
+
+        let (hint, data) = said(Returned::Default(Model::Failed(ErrorCode::ModelUnreadable)));
+        assert!(hint.contains("--segment isnet"), "{hint}");
+        assert_eq!(data["segment_tried"], false);
+        assert_eq!(data["segment_error"], "MODEL_UNREADABLE");
+    }
 
     fn hints_of(
         codes: &[WarningCode],

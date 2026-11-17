@@ -12196,6 +12196,14 @@ fn cutout_with(input: &Path, output: &Path, extra: &[&str]) -> std::process::Out
         ])
         .args(extra)
         .arg("--json")
+        // **モデルの無い機械と同じ条件で回す。** `--auto` は、探索しても致命の
+        // 警告が残るとモデルへ昇格する。モデルが置いてある機械でだけ結果が
+        // 変わる検査にしないために、モデルの置き場所を空の場所へ向ける
+        // （昇格そのものは `tests/segment.rs` が見る）
+        .env(
+            kiri::segment::model::KIRI_MODEL_DIR,
+            input.parent().unwrap(),
+        )
         .output()
         .unwrap()
 }
@@ -12301,6 +12309,23 @@ fn auto_escalates_to_the_search_when_the_plain_cutout_warns() {
         "{:?}",
         warning_codes(&v)
     );
+    // 何を返したかも同じ警告が言う。モデルを試せなかった実行には、
+    // 「--segment isnet を試せ」が次の一手として残る
+    let w = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "OPTIMIZE_NO_CLEAN_CANDIDATE")
+        .unwrap();
+    assert_eq!(w["data"]["adopted"], false, "{w}");
+    assert_eq!(w["data"]["returned"], "default", "{w}");
+    assert_eq!(v["optimize"]["returned"], "default", "{v}");
+    assert_eq!(w["data"]["segment_tried"], false, "{w}");
+    assert!(
+        w["hint"].as_str().unwrap().contains("--segment isnet"),
+        "{w}"
+    );
+    assert_eq!(v["settings"]["segment_ran"], false, "{v}");
 }
 
 /// きれいな候補が無いまま探索を終えた実行は、既定の 1 回と同じ成果物を返す。
@@ -12353,6 +12378,7 @@ fn auto_falls_back_to_the_plain_cut_when_nothing_is_clean() {
         .args(["cutout", input.to_str().unwrap(), "-o"])
         .arg(&auto)
         .args(["--auto", "--force"])
+        .env(kiri::segment::model::KIRI_MODEL_DIR, dir.path())
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&text.stdout).to_string();
@@ -12404,6 +12430,8 @@ fn batch_accepts_the_auto_key() {
 
     let out = kiri()
         .args(["batch", spec.to_str().unwrap(), "--json"])
+        // モデルの無い機械と同じ条件で回す（`cutout_with` と同じ理由）
+        .env(kiri::segment::model::KIRI_MODEL_DIR, dir.path())
         .output()
         .unwrap();
     let v = json_stdout(&out);

@@ -103,6 +103,6 @@ test('送ったコメントは残り、差し替わったら確認待ちにな�
 
   // 別の画像を開き直しても、未解決のコメントのある画像は一覧に残す
   const r = await $.command.run({ command: 'kiri-review', args: 'b.png' } as never)
-  expect(r.text).toContain('未解決のコメントのある画像 1 枚は一覧に残しました。')
+  expect(r.text).toContain('未解決のコメントか、書き出していない判定のある画像 1 枚は一覧に残しました。')
   await ui.unmount()
 })

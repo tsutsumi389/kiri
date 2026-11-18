@@ -82,6 +82,21 @@ export type ReviewImage = ReviewShot & {
   before?: ReviewVersion
   /** この版を書いた kiri の結果から拾ったもの。--json の結果が無ければ無い */
   kiri?: KiriInfo
+  /** 入力画像の隣にある正解アルファ（<名前>.alpha.png、255 = 商品）のパス。無ければ無い */
+  truth?: string
+}
+
+/** 正解アルファとの差分を色分けして重ねた画像（欠けは赤、漏れは青） */
+export type ReviewDiff = {
+  path: string
+  /** 作ったときの画像の版。差し替わったら使わない */
+  version: number
+  /** 原寸の合成画像（.cache の下）。拡大はここから切り出す */
+  file: string
+  shot: ReviewShot
+  /** 欠け・漏れの面積（正解の商品の面積に対する割合） */
+  missing: number
+  leak: number
 }
 
 /** 画像の上をドラッグして選んだ、まだコメントを付けていない範囲（元画像の画素） */
@@ -144,6 +159,30 @@ export type ReviewSeen = {
   kiri?: KiriInfo
 }
 
+/** kiri の指摘 1 件への人の判定。hit: 当たり（そこに欠陥がある）、miss: 外れ（欠陥は無い） */
+export type ReviewVerdict = 'hit' | 'miss'
+
+/** 画像の 1 版ぶんの判定。差し替わったあとも、その版の kiri の結果といっしょにラベルへ書き出す */
+export type ReviewJudged = {
+  path: string
+  /** 判定したときの版（範囲は画像全体）と、その版の kiri の結果 */
+  seen: ReviewSeen
+  /** 指摘の鍵（コードと出力画像での範囲）ごとの判定 */
+  verdicts: Record<string, ReviewVerdict>
+  /** いまの判定をラベルに書き出してあるか。付け直すと外れる。書き出していない判定のある画像は、黙って一覧から外さない */
+  saved?: boolean
+}
+
+/** 指摘を順に確かめている途中の位置 */
+export type ReviewTriage = {
+  /** いま確かめている指摘のある画像 */
+  path: string
+  /** いま確かめている指摘（画像の版と指摘の鍵） */
+  id: string
+  /** 飛ばした指摘。一巡するまで出さない */
+  skipped: string[]
+}
+
 /** 元画像から原寸で切り出して大きく出している範囲 */
 export type ReviewZoom = {
   path: string
@@ -159,6 +198,8 @@ export type ReviewZoom = {
   before?: ReviewShot
   /** 前の版を切り出せなかった理由 */
   beforeError?: string
+  /** 正解との差分の合成画像から切り出したか */
+  diff?: boolean
 }
 
 declare module 'claude-code' {
@@ -186,6 +227,14 @@ declare module 'claude-code' {
       busy: string
       /** 次に付けるコメントの種類。無ければ未分類 */
       kind: ReviewKind | null
+      /** kiri の指摘への判定（画像の版ごと） */
+      judged: ReviewJudged[]
+      /** 指摘を順に確かめている途中なら、その位置 */
+      triage: ReviewTriage | null
+      /** 正解との差分を出しているなら、その合成画像 */
+      diff: ReviewDiff | null
+      /** このセッションで、中身（ラベルか判定）のある行を書き出した画像の版。中身が無くなったら、取り消しの行を書く */
+      exported: string[]
     }
   }
 }

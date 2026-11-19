@@ -51,7 +51,7 @@ describe('ラベルの書き出し', () => {
     expect(r.input).toEqual({ path: '/w/in.jpg', width: 4284, height: 5712, source_rect: [82, 2073, 4177, 3398], content_rect: [75, 362, 924, 636] })
     expect([r.command, r.cwd, r.pixels]).toEqual([CMD, '/w', null])
     expect(r.kiri_regions).toHaveLength(9)
-    expect(r.kiri_regions[0]).toEqual({ code: 'CONTOUR_ROUGH', score: 0.5081, rect: [206, 363, 442, 378], input_rect: [714, 2078, 1847, 2146], verdict: null })
+    expect(r.kiri_regions[0]).toEqual({ code: 'CONTOUR_ROUGH', score: 0.5081, rect: [206, 363, 442, 378], input_rect: [714, 2078, 1847, 2146], verdict: null, truth: null })
     expect(r.labels).toEqual([
       { kind: 'rough', text: 'ギザ', status: 'sent', whole: false, rect: [206, 363, 442, 378], input_rect: [713, 2077, 1850, 2150], input_rect_note: null, code: 'CONTOUR_ROUGH' },
       { kind: 'other', text: '全体', status: 'draft', whole: true, rect: [0, 0, 1000, 1000], input_rect: null, input_rect_note: 'whole', code: null },

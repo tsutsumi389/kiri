@@ -147,7 +147,7 @@ test('指摘を順に拡大して当たり・外れを付け、画像をまた�
   await ui.press({ key: 'labels' })
   const rows = ([...files].find(([p]) => p.endsWith('.jsonl'))?.[1] ?? '').trimEnd().split('\n').map(l => JSON.parse(l))
   expect(rows).toHaveLength(2)
-  expect(rows[0].schema).toBe('kiri-review.labels/2')
+  expect(rows[0].schema).toBe('kiri-review.labels/3')
   expect(rows[0].kiri_regions.map((r: { verdict: string }) => r.verdict)).toEqual(['hit', 'miss', 'miss', 'miss', 'miss', 'miss', 'miss', 'miss', 'miss'])
   expect(rows[1].kiri_regions.every((r: { verdict: string }) => r.verdict === 'hit')).toBe(true)
 

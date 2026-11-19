@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { calibrate, calibrationText, latestRows } from '../hooks/register'
+import { calibrate, calibrationText, latestRows, proposeThreshold } from '../hooks/register'
 import { CANVAS_REPORT } from './fixtures/kiri'
 
 const PANE = { component: 'Pane', requestId: 'kiri-review' } as const
@@ -50,7 +50,7 @@ describe('較正', () => {
       row('/b.png', 1, 't', { command: null, labels: [label('halo', 0), label('extra', 0)] }),
     ])
     expect(c).toMatchObject({ rows: 2, withKiri: 1, truncated: 1, whole: 1, uncovered: { missing: 1, extra: 1 } })
-    expect(c.codes[0]).toEqual({ code: 'HALO_REMAINS', regions: 4, hit: 1, miss: 1, implied: 1, unjudged: 1, labels: 2, matched: 1, hitScores: [0.9, 0.5], missScores: [0.2] })
+    expect(c.codes[0]).toEqual({ code: 'HALO_REMAINS', regions: 4, hit: 1, miss: 1, implied: 1, truthHit: 0, truthMiss: 0, unjudged: 1, labels: 2, matched: 1, hitScores: [0.9, 0.5], missScores: [0.2] })
     expect(c.codes[1]).toMatchObject({ code: 'CONTOUR_ROUGH', regions: 1, miss: 1, labels: 1, matched: 0 })
     expect(c.missed).toEqual([
       { image: '/a.png', kind: 'halo', rect: [500, 0, 510, 10], text: '見逃し' },
@@ -60,11 +60,61 @@ describe('較正', () => {
     expect(text).toContain('| HALO_REMAINS | 4 | 2（うちラベルから 1） | 1 | 1 | 67%（2/3） | 2 | 50%（1/2） | 0.5–0.9（中央 0.5） | 0.2–0.2（中央 0.2） |')
     expect(text).toContain('| RIM_CONTAMINATED | 0 | 0 | 0 | 0 | — | 0 | — | — | — |')
     expect(text).toContain('- HALO_REMAINS: 外れは全部 score 0.2 以下、当たりは 0.5 以上。')
+    // どこまで上げるかと、上げたあとの数を、kiri の定数の名前つきで出す
+    expect(text).toContain('  - しきい値の候補 0.35（kiri の HALO_WARN）: 適合率 67%（2/3） → 100%（2/2）、当たりの残り 2/2、消える外れ 1/1。 当たりと外れが合わせて 3 件と少ないので、めやすです。')
+    expect(text).toContain('同じ定数（src/cutout/diagnostics.rs）は画像全体の警告にも使われている')
     expect(text).toContain('## 見逃し 2 件')
     expect(text).toContain('- [縁残り] /a.png x 500–510, y 0–10: 見逃し')
     expect(text).toContain('欠け 1 · 残り 1')
     expect(text).toContain('場所の無い（画像全体への）ラベル 1 件')
     expect(text).toContain('1 件の版では、指摘を警告ごとに 5 件までに落としています')
+  })
+  test('しきい値の候補は、適合率と当たりの残りの釣り合いが、上げないときより良くなる最良の中点', async () => {
+    expect(proposeThreshold([0.9, 0.5], [0.2])).toEqual({ threshold: 0.35, keptHits: 2, keptMisses: 0 })
+    // 重なっていても、外れを減らすほうが得なら上げる。当たりを多く失う候補は選ばない
+    expect(proposeThreshold([0.3, 0.8, 0.9], [0.4, 0.2])).toEqual({ threshold: 0.25, keptHits: 3, keptMisses: 1 })
+    // 外れのほうが score が高ければ、上げても良くならない
+    expect(proposeThreshold([0.1], [0.9])).toBeUndefined()
+    expect(proposeThreshold([], [0.9])).toBeUndefined()
+    expect(proposeThreshold([0.9], [])).toBeUndefined()
+    const c = calibrate([row('/a.png', 1, 't', { kiri_regions: [region('CONTOUR_ROUGH', 0.3, 0, 'hit'), region('CONTOUR_ROUGH', 0.4, 50, 'miss')] })])
+    expect(calibrationText(c)).toContain('  - しきい値を上げても、適合率と当たりの残りの釣り合いは良くなりません。')
+  })
+  test('人の判定が無い指摘は、正解からの見立てで数える。人の判定があればそちら', async () => {
+    const seen = (code: string, score: number, x0: number, verdict: string | null, suggest: string | null) =>
+      ({ ...region(code, score, x0, verdict), truth: { missing_px: 0, leak_px: 0, suggest } })
+    const c = calibrate([row('/a.png', 1, 't', {
+      kiri_regions: [
+        seen('HALO_REMAINS', 0.9, 0, null, 'hit'), seen('HALO_REMAINS', 0.2, 100, null, 'miss'),
+        seen('HALO_REMAINS', 0.3, 200, 'hit', 'miss'), seen('HALO_REMAINS', 0.4, 300, null, null),
+        // 人が同じ種類のラベルを重ねていれば、見立てが外れでも当たりに数える（人の根拠が先）
+        seen('HALO_REMAINS', 0.6, 400, null, 'miss'),
+      ],
+      labels: [label('halo', 405)],
+    })])
+    expect(c.codes[0]).toMatchObject({ regions: 5, hit: 1, miss: 0, implied: 1, truthHit: 1, truthMiss: 1, unjudged: 1, hitScores: [0.9, 0.3, 0.6], missScores: [0.2] })
+    const text = calibrationText(c)
+    expect(text).toContain('| HALO_REMAINS | 5 | 3（うちラベルから 1・正解から 1） | 1（うち正解から 1） | 1 | 75%（3/4） |')
+    expect(text).toContain('「正解から」は、人の判定の無い指摘を正解アルファとの差分で見立てたものです（範囲の中の誤差の太さが 8px 以上なら当たり、2px 以下なら外れ。')
+  })
+  test('見立てだけの行は、同じ版の人の行を取り消さず、測定の無い指摘に測定を足すだけ', async () => {
+    const t = { missing_px: 0, leak_px: 9, suggest: 'hit' }
+    const rows = latestRows([
+      row('/a.png', 1, '2026-11-01', { kiri_regions: [region('HALO_REMAINS', 0.9, 0, 'miss'), region('HALO_REMAINS', 0.5, 100)], labels: [label('halo', 500, '人のラベル')] }),
+      // 次のセッションで開いただけ。新しい行だが、人の判定とラベルは残る
+      row('/a.png', 1, '2026-11-02', { truth_only: true, kiri_regions: [{ ...region('HALO_REMAINS', 0.9, 0), truth: t }, { ...region('HALO_REMAINS', 0.5, 100), truth: t }] }),
+      // 人の行の無い版は、見立てだけの行をそのまま使う
+      row('/b.png', 1, '2026-11-02', { truth_only: true, kiri_regions: [{ ...region('HALO_REMAINS', 0.7, 0), truth: t }] }),
+    ])
+    expect(rows).toHaveLength(2)
+    expect(rows[0]).toMatchObject({ exported_at: '2026-11-01', labels: [{ text: '人のラベル' }], kiri_regions: [{ verdict: 'miss', truth: t }, { verdict: null, truth: t }] })
+    expect(calibrate(rows).codes[0]).toMatchObject({ regions: 3, miss: 1, truthHit: 2, labels: 1 })
+    // 人が取り消した行（truth_only でない新しい行）は、これまでどおり前の行を取り消す
+    expect(latestRows([
+      row('/a.png', 1, '2026-11-01', { labels: [label('halo', 0)] }),
+      row('/a.png', 1, '2026-11-02', { truth_only: true }),
+      row('/a.png', 1, '2026-11-03'),
+    ])[0]).toMatchObject({ exported_at: '2026-11-03', labels: [] })
   })
   test('当たりと外れの score が重なっていれば、切り分けられないと書く', async () => {
     const c = calibrate([row('/a.png', 1, 't', { kiri_regions: [region('CONTOUR_ROUGH', 0.3, 0, 'hit'), region('CONTOUR_ROUGH', 0.4, 50, 'miss')] })])

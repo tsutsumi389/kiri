@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { KiriInfo, KiriMapping, KiriRegion, KiriRepair, ReviewComment, ReviewDiff, ReviewImage, ReviewJudged, ReviewKind, ReviewSeen, ReviewSelection, ReviewShot, ReviewStatus, ReviewTriage, ReviewVerdict, ReviewVersion, ReviewZoom } from '../types'
+import type { KiriInfo, KiriMapping, KiriRegion, KiriRepair, RegionTruth, ReviewComment, ReviewDiff, ReviewImage, ReviewJudged, ReviewKind, ReviewMeasured, ReviewSeen, ReviewSelection, ReviewShot, ReviewStatus, ReviewTriage, ReviewVerdict, ReviewVersion, ReviewZoom } from '../types'
 
 const PANE = 'kiri-review'
 // 画像に重ねるドラッグ用の Client の key
@@ -43,6 +43,8 @@ const judged = atom({ plugin: 'kiri-review', key: 'judged' } as const, [] as Rev
 const triage = atom({ plugin: 'kiri-review', key: 'triage' } as const, null as ReviewTriage | null)
 const diff = atom({ plugin: 'kiri-review', key: 'diff' } as const, null as ReviewDiff | null)
 const exported = atom({ plugin: 'kiri-review', key: 'exported' } as const, [] as string[])
+// 正解との差分を、kiri の指摘の範囲ごとに測ったもの（画像の版ごと）
+const measured = atom({ plugin: 'kiri-review', key: 'measured' } as const, [] as ReviewMeasured[])
 
 const IMAGE_EXT = /\.(png|jpe?g|webp|avif|heic|tiff?|gif|bmp)$/i
 
@@ -470,7 +472,7 @@ export function nextKind(k: ReviewKind | undefined): ReviewKind | undefined {
 }
 
 /** ラベルの書き出しの形式の名前。形を変えたら番号を上げる */
-export const LABELS_SCHEMA = 'kiri-review.labels/2'
+export const LABELS_SCHEMA = 'kiri-review.labels/3'
 
 /** コメントを付けたときの画像の版を覚える（ラベルは、その版のものとして書き出す） */
 export function seenOf(img: ReviewImage, r: { x0: number; y0: number; x1: number; y1: number }): ReviewSeen {
@@ -546,7 +548,8 @@ export const VERDICT_LABEL: Readonly<Record<ReviewVerdict, string>> = { hit: '�
  * コメントを、付けたときの画像の版ごとに 1 行の JSON にする（ベンチの材料）。
  * 一覧の画像の今の版は、種類つきのコメントが無くても labels: [] で書く（前に書いた行の取り消しになる）。
  * 前の版は、種類つきのコメントか指摘への判定があるときだけ書く。範囲の約束は conventions に書いておく。
- * kiri の指摘には、人の判定（verdict: hit / miss、無ければ null）を添える
+ * kiri の指摘には、人の判定（verdict: hit / miss、無ければ null）と、正解アルファがあればその範囲で測った
+ * 誤差の太さと見立て（truth: { missing_px, leak_px, suggest }、測っていなければ null）を添える
  */
 export function labelRecords(
   list: readonly ReviewImage[],
@@ -558,6 +561,7 @@ export function labelRecords(
    * state はセッションごとに空から始まるので、開いただけの画像の空の行で、前のセッションの行を取り消さないため
    */
   touched?: ReadonlySet<string>,
+  truths: readonly ReviewMeasured[] = [],
 ): LabelRecord[] {
   return list.flatMap(img => {
     const mine = all.filter(c => c.path === img.path)
@@ -578,8 +582,14 @@ export function labelRecords(
     }
     return [...groups.values()].flatMap(({ seen, items, verdicts: done }) => {
       const current = seen.mtimeMs === img.mtimeMs
+      const truth = truthOf(truths, { path: img.path, mtimeMs: seen.mtimeMs })
+      const isSuggested = (seen.kiri?.regions ?? []).some(r => suggestVerdict(r.code, truth[regionKey(r)]) !== undefined)
       const isEmpty = items.length === 0 && Object.keys(done).length === 0
-      if (isEmpty && (!current || (touched !== undefined && !touched.has(versionKey(img.path, seen.mtimeMs))))) return []
+      const isTouched = touched === undefined || touched.has(versionKey(img.path, seen.mtimeMs))
+      // 開いただけの画像でも、正解からの見立てがあれば較正の材料になるので書く。ただし人が何も付けていない
+      // ことの記録ではないので truth_only を立て、読む側（latestRows）は前の行の判定とラベルを取り消さない
+      const isTruthOnly = isEmpty && current && !isTouched && isSuggested
+      if (isEmpty && (!current || !isTouched) && !isTruthOnly) return []
       const k = seen.kiri
       const m = k?.mapping
       const size = { width: seen.width, height: seen.height }
@@ -591,6 +601,7 @@ export function labelRecords(
         json: {
           schema: LABELS_SCHEMA,
           exported_at: exportedAt,
+          ...(isTruthOnly ? { truth_only: true } : {}),
           conventions: {
             rect: '出力画像の画素 [x0, y0, x1, y1]、左上が原点、右と下の端は含まない',
             input_rect: '入力画像の画素 [x0, y0, x1, y1]、両端を含む（kiri の data.regions[].bbox と同じ）',
@@ -600,7 +611,7 @@ export function labelRecords(
           input: m === undefined ? null : { path: m.input, width: m.inputWidth, height: m.inputHeight, source_rect: m.source, content_rect: m.content },
           command: k?.command ?? null,
           cwd: k?.cwd ?? null,
-          kiri_regions: (k?.regions ?? []).map(r => ({ code: r.code, score: r.score, rect: [r.x0, r.y0, r.x1, r.y1], input_rect: r.bbox ?? null, verdict: done[regionKey(r)] ?? null })),
+          kiri_regions: (k?.regions ?? []).map(r => ({ code: r.code, score: r.score, rect: [r.x0, r.y0, r.x1, r.y1], input_rect: r.bbox ?? null, verdict: done[regionKey(r)] ?? null, truth: truthJson(r.code, truth[regionKey(r)]) })),
           kiri_regions_truncated: k?.truncated === true,
           labels: items.map(({ c, r }) => {
             const whole = isWhole(r, size)
@@ -622,7 +633,7 @@ export function labelRecords(
   })
 }
 
-/** 行にラベルか判定があるか */
+/** 行に人の付けたもの（ラベルか判定）があるか。正解からの見立ては数えない（見立てだけの行は、取り消しの元にしない） */
 function hasContent(r: LabelRecord): boolean {
   return (r.json.labels as unknown[]).length > 0 || (r.json.kiri_regions as { verdict: unknown }[]).some(x => x.verdict !== null)
 }
@@ -646,7 +657,7 @@ export async function labelsDir($: EngineInterface): Promise<string> {
  */
 async function exportLabels($: EngineInterface): Promise<{ file: string; rows: number; labels: number }> {
   const list = await read($, images)
-  const records = labelRecords(list, (await read($, comments)).filter(c => typeof c.path === 'string'), new Date().toISOString(), await read($, judged), new Set(await read($, exported)))
+  const records = labelRecords(list, (await read($, comments)).filter(c => typeof c.path === 'string'), new Date().toISOString(), await read($, judged), new Set(await read($, exported)), await read($, measured))
   const dir = await labelsDir($)
   await run($, ['mkdir', '-p', `${dir}/images`])
   for (const r of records) {
@@ -683,6 +694,9 @@ export type CodeStats = {
   hit: number
   miss: number
   implied: number
+  /** 判定は無いが、正解アルファとの差分から当たり・外れと見立てたもの */
+  truthHit: number
+  truthMiss: number
   unjudged: number
   /** 人が付けた、この警告に当たる種類の場所つきのラベルの数と、指摘が重なっていた数 */
   labels: number
@@ -709,20 +723,37 @@ export type Calibration = {
 
 /**
  * 書き出したラベルの行から、画像の版ごとに最新の 1 行を残す（鍵は image.path と image.mtime_ms、
- * exported_at の新しいほう。同じなら後ろの行）。読めない行と知らない形式の行は捨てる
+ * exported_at の新しいほう。同じなら後ろの行）。読めない行と知らない形式の行は捨てる。
+ * 見立てだけの行（truth_only）は、人の行を取り消さない: 同じ版に人の行があれば、その指摘のうち測定の無いものに
+ * 測定を足すだけにし、無ければそのまま使う
  */
 export function latestRows(rows: readonly unknown[]): Record<string, unknown>[] {
   const latest = new Map<string, { at: string; row: Record<string, unknown> }>()
+  const measuredOnly = new Map<string, { at: string; row: Record<string, unknown> }>()
   for (const v of rows) {
     if (v === null || typeof v !== 'object' || Array.isArray(v)) continue
     const row = v as Record<string, unknown>
-    if (typeof row.schema !== 'string' || !/^kiri-review\.labels\/[12]$/.test(row.schema)) continue
+    if (typeof row.schema !== 'string' || !/^kiri-review\.labels\/[123]$/.test(row.schema)) continue
     const image = row.image as { path?: unknown; mtime_ms?: unknown } | null | undefined
     if (typeof image?.path !== 'string' || typeof image.mtime_ms !== 'number') continue
     const key = versionKey(image.path, image.mtime_ms)
     const at = typeof row.exported_at === 'string' ? row.exported_at : ''
-    const old = latest.get(key)
-    if (old === undefined || at >= old.at) latest.set(key, { at, row })
+    const into = row.truth_only === true ? measuredOnly : latest
+    const old = into.get(key)
+    if (old === undefined || at >= old.at) into.set(key, { at, row })
+  }
+  type Seen = { code?: unknown; rect?: unknown; truth?: unknown }
+  const regionsOf = (row: Record<string, unknown>) => (Array.isArray(row.kiri_regions) ? row.kiri_regions as (Seen | null)[] : [])
+  const same = (a: Seen | null, b: Seen | null) => a?.code === b?.code && JSON.stringify(a?.rect) === JSON.stringify(b?.rect)
+  for (const [key, extra] of measuredOnly) {
+    const base = latest.get(key)
+    if (base === undefined) {
+      latest.set(key, extra)
+      continue
+    }
+    const kiri_regions = regionsOf(base.row).map(r =>
+      r === null || (r.truth ?? null) !== null ? r : { ...r, truth: regionsOf(extra.row).find(x => same(x, r))?.truth ?? null })
+    latest.set(key, { at: base.at, row: { ...base.row, kiri_regions } })
   }
   return [...latest.values()].map(x => x.row)
 }
@@ -737,7 +768,7 @@ function overlaps(a: Rect4, b: Rect4): boolean {
  */
 export function calibrate(rows: readonly Record<string, unknown>[]): Calibration {
   const codes = new Map<string, CodeStats>(Object.keys(REGION_CODES).map(code =>
-    [code, { code, regions: 0, hit: 0, miss: 0, implied: 0, unjudged: 0, labels: 0, matched: 0, hitScores: [], missScores: [] }]))
+    [code, { code, regions: 0, hit: 0, miss: 0, implied: 0, truthHit: 0, truthMiss: 0, unjudged: 0, labels: 0, matched: 0, hitScores: [], missScores: [] }]))
   const missed: MissedLabel[] = []
   const uncovered: Partial<Record<ReviewKind, number>> = {}
   let whole = 0
@@ -746,10 +777,11 @@ export function calibrate(rows: readonly Record<string, unknown>[]): Calibration
   for (const row of rows) {
     const image = String((row.image as { path?: unknown } | undefined)?.path ?? '')
     const regions = (Array.isArray(row.kiri_regions) ? row.kiri_regions : []).flatMap(v => {
-      const r = v as { code?: unknown; score?: unknown; rect?: unknown; verdict?: unknown } | null
+      const r = v as { code?: unknown; score?: unknown; rect?: unknown; verdict?: unknown; truth?: { suggest?: unknown } | null } | null
       const rect = rect4(r?.rect)
+      const verdict = (x: unknown) => (x === 'hit' || x === 'miss' ? x as ReviewVerdict : undefined)
       return typeof r?.code === 'string' && rect !== undefined
-        ? [{ code: r.code, score: typeof r.score === 'number' ? r.score : 0, rect, verdict: r.verdict === 'hit' || r.verdict === 'miss' ? r.verdict as ReviewVerdict : undefined }]
+        ? [{ code: r.code, score: typeof r.score === 'number' ? r.score : 0, rect, verdict: verdict(r.verdict), suggest: verdict(r.truth?.suggest) }]
         : []
     })
     const labels = (Array.isArray(row.labels) ? row.labels : []).flatMap(v => {
@@ -774,7 +806,10 @@ export function calibrate(rows: readonly Record<string, unknown>[]): Calibration
         st.regions += 1
         if (r.verdict === 'hit') { st.hit += 1; st.hitScores.push(r.score) }
         else if (r.verdict === 'miss') { st.miss += 1; st.missScores.push(r.score) }
+        // 人の判定が無ければ、人が重ねたラベル。それも無ければ、正解からの見立て（人の根拠を測定より先に）
         else if (ls.some(l => overlaps(l.rect, r.rect))) { st.implied += 1; st.hitScores.push(r.score) }
+        else if (r.suggest === 'hit') { st.truthHit += 1; st.hitScores.push(r.score) }
+        else if (r.suggest === 'miss') { st.truthMiss += 1; st.missScores.push(r.score) }
         else st.unjudged += 1
       }
       for (const l of ls) {
@@ -796,6 +831,49 @@ function spread(scores: readonly number[]): string {
   return `${s[0]}–${s.at(-1)}（中央 ${mid}）`
 }
 
+/** 当たり・外れに数える指摘の数（人の判定、正解からの見立て、重なっているラベル） */
+export const hitsOf = (s: CodeStats) => s.hit + s.implied + s.truthHit
+export const missesOf = (s: CodeStats) => s.miss + s.truthMiss
+
+/** 警告のしきい値にしている kiri の定数（src/cutout/diagnostics.rs）。区間の score が、これを越えると指摘になる */
+export const CODE_CONST: Readonly<Record<string, string>> = {
+  HALO_REMAINS: 'HALO_WARN',
+  CONTOUR_ROUGH: 'CONTOUR_ROUGH_WARN',
+  RIM_CONTAMINATED: 'RIM_CONTAMINATION_WARN',
+}
+
+/** しきい値の候補と、そこまで上げたときに残る当たり・外れの数（score が候補を越える指摘） */
+export type ThresholdProposal = { threshold: number; keptHits: number; keptMisses: number }
+
+/** これより判定が少なければ、候補はめやすと書く */
+const FEW_JUDGED = 8
+
+/**
+ * 当たりと外れの score から、しきい値をどこまで上げるとよいかを探す。候補は隣り合う score の中点で、
+ * 適合率と「当たりの残る割合」の調和平均（F1）が、上げないときより良くなる最良のもの（同じなら低いほう）。
+ * 見えているのは今のしきい値を越えた指摘だけなので、下げる側は分からない。良くならなければ undefined
+ */
+export function proposeThreshold(hitScores: readonly number[], missScores: readonly number[]): ThresholdProposal | undefined {
+  const hits = hitScores.length
+  if (hits === 0 || missScores.length === 0) return undefined
+  const f1 = (kh: number, km: number) => (kh === 0 ? 0 : (2 * kh) / (kh + km + hits))
+  const scores = [...new Set([...hitScores, ...missScores])].sort((a, b) => a - b)
+  let best: ThresholdProposal | undefined
+  let bestF = f1(hits, missScores.length)
+  for (let i = 0; i + 1 < scores.length; i++) {
+    // score は小数 4 桁なので、中点は 5 桁まで持つ（4 桁に丸めると、上の score に重なることがある）
+    const threshold = Math.round((((scores[i] ?? 0) + (scores[i + 1] ?? 0)) / 2) * 1e5) / 1e5
+    const keptHits = hitScores.filter(v => v > threshold).length
+    const keptMisses = missScores.filter(v => v > threshold).length
+    const f = f1(keptHits, keptMisses)
+    if (f > bestF + 1e-9) {
+      best = { threshold, keptHits, keptMisses }
+      bestF = f
+    }
+  }
+  return best
+}
+
 const oneLine = (text: string) => text.replace(/[\u0000-\u001f\u007f]/g, ' ')
 
 /** 報告に並べる見逃しの上限 */
@@ -811,12 +889,15 @@ export function calibrationText(c: Calibration): string {
     '| 警告 | 指摘 | 当たり | 外れ | 未判定 | 適合率 | 人のラベル | 再現率 | 当たりの score | 外れの score |',
     '|---|---|---|---|---|---|---|---|---|---|',
     ...c.codes.map(s => {
-      const hits = s.hit + s.implied
-      return `| ${s.code} | ${s.regions} | ${hits}${s.implied > 0 ? `（うちラベルから ${s.implied}）` : ''} | ${s.miss} | ${s.unjudged} | ${ratio(hits, hits + s.miss)} | ${s.labels} | ${ratio(s.matched, s.labels)} | ${spread(s.hitScores)} | ${spread(s.missScores)} |`
+      const hits = hitsOf(s)
+      const misses = missesOf(s)
+      const from = [...(s.implied > 0 ? [`ラベルから ${s.implied}`] : []), ...(s.truthHit > 0 ? [`正解から ${s.truthHit}`] : [])]
+      return `| ${s.code} | ${s.regions} | ${hits}${from.length > 0 ? `（うち${from.join('・')}）` : ''} | ${misses}${s.truthMiss > 0 ? `（うち正解から ${s.truthMiss}）` : ''} | ${s.unjudged} | ${ratio(hits, hits + misses)} | ${s.labels} | ${ratio(s.matched, s.labels)} | ${spread(s.hitScores)} | ${spread(s.missScores)} |`
     }),
     '',
   ]
   // 外れが全部、当たりより低い score に固まっていれば、しきい値で切り分けられる
+  let proposed = false
   for (const s of c.codes) {
     if (s.hitScores.length === 0 || s.missScores.length === 0) continue
     const lo = Math.min(...s.hitScores)
@@ -824,6 +905,17 @@ export function calibrationText(c: Calibration): string {
     lines.push(hi < lo
       ? `- ${s.code}: 外れは全部 score ${hi} 以下、当たりは ${lo} 以上。しきい値をこの間へ上げれば外れが消えます。`
       : `- ${s.code}: 当たりと外れの score が重なっています（外れの最大 ${hi}、当たりの最小 ${lo}）。score だけでは切り分けられません。`)
+    const h = s.hitScores.length
+    const m = s.missScores.length
+    const p = proposeThreshold(s.hitScores, s.missScores)
+    const few = h + m < FEW_JUDGED ? ` 当たりと外れが合わせて ${h + m} 件と少ないので、めやすです。` : ''
+    lines.push(p === undefined
+      ? `  - しきい値を上げても、適合率と当たりの残りの釣り合いは良くなりません。${few}`
+      : `  - しきい値の候補 ${p.threshold}（kiri の ${CODE_CONST[s.code] ?? 'しきい値'}）: 適合率 ${ratio(h, h + m)} → ${ratio(p.keptHits, p.keptHits + p.keptMisses)}、当たりの残り ${p.keptHits}/${h}、消える外れ ${m - p.keptMisses}/${m}。${few}`)
+    proposed = proposed || p !== undefined
+  }
+  if (proposed) {
+    lines.push('', '候補は区間の score（局所の指標）に対するものです。同じ定数（src/cutout/diagnostics.rs）は画像全体の警告にも使われているので、上げる前に全体の指標への効き方を確かめてください。見えているのは今のしきい値を越えた指摘だけなので、下げる側は分かりません。')
   }
   if (c.missed.length > 0) {
     lines.push('', `## 見逃し ${c.missed.length} 件（人が指したのに、同じ種類の指摘が無かった）`,
@@ -835,6 +927,9 @@ export function calibrationText(c: Calibration): string {
   if (others.length > 0) lines.push('', `## kiri に当たる警告の無い種類`, others.join(' · '))
   const notes = [
     ...(c.whole > 0 ? [`場所の無い（画像全体への）ラベル ${c.whole} 件は突き合わせていません。`] : []),
+    ...(c.codes.some(s => s.truthHit + s.truthMiss > 0)
+      ? [`「正解から」は、人の判定の無い指摘を正解アルファとの差分で見立てたものです（範囲の中の誤差の太さが ${TRUTH_HIT_PX}px 以上なら当たり、${TRUTH_MISS_PX}px 以下なら外れ。間は見立てません。縁残りは漏れ、ギザギザは欠けと漏れの大きいほうで見ます）。`]
+      : []),
     ...(c.truncated > 0 ? [`${c.truncated} 件の版では、指摘を警告ごとに 5 件までに落としています（再現率は低めに出ます）。`] : []),
   ]
   if (notes.length > 0) lines.push('', ...notes)
@@ -867,6 +962,7 @@ async function buildCalibration($: EngineInterface): Promise<Calibration> {
     new Date().toISOString(),
     await read($, judged),
     new Set(await read($, exported)),
+    await read($, measured),
   ).map(r => r.json)
   return calibrate(latestRows([...stored, ...session]))
 }
@@ -1131,15 +1227,22 @@ async function buildZoom($: EngineInterface, img: ReviewImage, r: PxRect): Promi
  * 切り抜きの結果と正解アルファの差分を色分けして PNG に書く JXA（CoreImage。画素ごとのループは無い）。
  * 市松模様の上に出力画像を薄く敷き、欠け（正解では商品なのに出力に無い）を赤、漏れ（正解では背景なのに
  * 出力にある）を青で重ねる。正解は source_rect の範囲を content_rect へ拡縮して置き、その外は背景とみなす。
- * 標準出力は {"missing", "leak", "truth"}（欠け・漏れは正解の商品の面積に対する割合、アルファを重みに全画素を数える）
+ * 標準出力は {"missing", "leak", "truth"}（欠け・漏れは正解の商品の面積に対する割合、アルファを重みに全画素を数える）。
+ * 続けて範囲（出力画像の画素、右と下の端を含まない）を 4 つずつ渡すと、範囲ごとの誤差の太さを "regions" に、
+ * 測った升の一辺を "cell" に返す（どちらも入力画像の px）。太さは、誤差の画像を升（入力画像でおよそ
+ * TRUTH_CELL px 角）ごとに平均し、範囲に掛かる升のうち最大の 平均 × 升の一辺。輪郭がまっすぐ升を横切って
+ * いれば、ずれの幅になる。面積の割合と違い、範囲の広さで薄まらない。書き出し先が空なら合成画像は書かない
  */
+/** 誤差の太さを測る升の一辺（入力画像の px のめやす。出力画像の画素で 2 の冪に丸める） */
+export const TRUTH_CELL = 32
+
 export const TRUTH_JXA = `function run(argv) {
   ObjC.import('AppKit')
   ObjC.import('CoreImage')
-  // 引数: 出力画像 正解アルファ 書き出し先 表示の幅 高さ source_rect(x0 y0 x1 y1) content_rect(x0 y0 x1 y1)
+  // 引数: 出力画像 正解アルファ 書き出し先 表示の幅 高さ source_rect(x0 y0 x1 y1) content_rect(x0 y0 x1 y1) [範囲(x0 y0 x1 y1) …]
   // 矩形は左上原点・画素・両端を含む。CoreImage は左下原点・画素（dpi に依らない）
   const [outPath, truthPath, dest, W, H, sx0, sy0, sx1, sy1, cx0, cy0, cx1, cy1] = argv
-  if (argv.length !== 13) throw new Error('引数は 13 個: 出力 正解 書き出し先 幅 高さ source_rect×4 content_rect×4（' + argv.length + ' 個でした）')
+  if (argv.length < 13 || (argv.length - 13) % 4 !== 0) throw new Error('引数は 13 個と、範囲ごとに 4 個: 出力 正解 書き出し先 幅 高さ source_rect×4 content_rect×4 [範囲×4 …]（' + argv.length + ' 個でした）')
   const n = Number
   argv.slice(3).forEach(function (v) { if (v === '' || !isFinite(Number(v))) throw new Error('数ではありません: ' + v) })
   const load = function (p) {
@@ -1218,6 +1321,41 @@ export const TRUTH_JXA = `function run(argv) {
   // どの層もアルファ 1 なので、平均のアルファが 1 でなければ描けていない
   if (Math.abs(px.alphaComponent - 1) > 1e-3) throw new Error('面積を測れませんでした')
 
+  const r5 = function (v) { return Math.round(v * 1e5) / 1e5 }
+  // 範囲ごとの誤差の太さ。半分に縮める（2×2 の平均）のを重ねて升ごとの平均にし、範囲に掛かる升の最大を読む
+  const steps = Math.max(1, Math.min(6, Math.round(Math.log(${TRUTH_CELL} * a) / Math.LN2)))
+  const cell = Math.pow(2, steps)
+  let small = packed.imageByClampingToExtent
+  for (let i = 0; i < steps; i++) {
+    const half = $.NSAffineTransform.transform
+    half.scaleXByYBy(0.5, 0.5)
+    const hf = $.CIFilter.filterWithName('CIAffineTransform')
+    hf.setValueForKey(small, 'inputImage')
+    hf.setValueForKey(half, 'inputTransform')
+    small = hf.outputImage
+  }
+  const cw = Math.ceil(ow / cell)
+  const ch = Math.ceil(oh / cell)
+  const regions = []
+  for (let i = 13; i < argv.length; i += 4) {
+    const x0 = Math.max(0, Math.floor(n(argv[i]) * kx / cell))
+    const x1 = Math.min(cw, Math.ceil(n(argv[i + 2]) * kx / cell))
+    const y0 = Math.max(0, Math.floor((oh - n(argv[i + 3]) * ky) / cell))
+    const y1 = Math.min(ch, Math.ceil((oh - n(argv[i + 1]) * ky) / cell))
+    if (x1 <= x0 || y1 <= y0) { regions.push(null); continue }
+    // 範囲を測れなくても、面積と合成画像は出す
+    try {
+      const peak = small.imageByApplyingFilterWithInputParameters('CIAreaMaximum', $({ inputExtent: $.CIVector.vectorWithCGRect($.CGRectMake(x0, y0, x1 - x0, y1 - y0)) }))
+      const cgp = ctx.createCGImageFromRectFormatColorSpace(peak, $.CGRectMake(0, 0, 1, 1), $.kCIFormatRGBAf, $.NSColorSpace.genericRGBColorSpace.CGColorSpace)
+      const pk = $.NSBitmapImageRep.alloc.initWithCGImage(cgp).colorAtXY(0, 0)
+      regions.push({ missing: Math.round(pk.redComponent * cell / a * 10) / 10, leak: Math.round(pk.greenComponent * cell / a * 10) / 10 })
+    } catch (e) {
+      regions.push(null)
+    }
+  }
+  const stats = JSON.stringify({ missing: t > 0 ? r5(m / t) : 0, leak: t > 0 ? r5(l / t) : 0, truth: r5(t), cell: r5(cell / a), regions: regions })
+  if (dest === '') return stats
+
   // 合成: 市松 → 出力を薄く → 欠け（赤）→ 漏れ（青）
   const checker = $.CIFilter.filterWithName('CICheckerboardGenerator')
   checker.setValueForKey($.CIVector.vectorWithXY(0, 0), 'inputCenter')
@@ -1237,8 +1375,7 @@ export const TRUTH_JXA = `function run(argv) {
   const png = rep.representationUsingTypeProperties($.NSBitmapImageFileTypePNG, $())
   if (!png.writeToFileAtomically(dest, true)) throw new Error('書けません: ' + dest)
 
-  const r5 = function (v) { return Math.round(v * 1e5) / 1e5 }
-  return JSON.stringify({ missing: t > 0 ? r5(m / t) : 0, leak: t > 0 ? r5(l / t) : 0, truth: r5(t) })
+  return stats
 }`
 
 /** 入力画像の隣の正解アルファのパス（<名前>.alpha.png）。正解アルファ自身には無い */
@@ -1248,8 +1385,93 @@ export function truthPathFor(input: string): string | undefined {
 }
 
 /** 差分を書くコマンド。src は出力画像（読んだときの写し）、out は書き出す PNG */
-export function truthArgv(img: Pick<ReviewImage, 'width' | 'height'>, m: Pick<KiriMapping, 'source' | 'content'>, src: string, truth: string, out: string): string[] {
-  return ['osascript', '-l', 'JavaScript', '-e', TRUTH_JXA, src, truth, out, ...[img.width, img.height, ...m.source, ...m.content].map(String)]
+export function truthArgv(
+  img: Pick<ReviewImage, 'width' | 'height'>,
+  m: Pick<KiriMapping, 'source' | 'content'>,
+  src: string,
+  truth: string,
+  /** 合成画像の書き出し先。空なら測るだけ */
+  out: string,
+  /** 誤差の太さを測る範囲（kiri の指摘） */
+  regions: readonly Pick<KiriRegion, 'x0' | 'y0' | 'x1' | 'y1'>[] = [],
+): string[] {
+  return ['osascript', '-l', 'JavaScript', '-e', TRUTH_JXA, src, truth, out,
+    ...[img.width, img.height, ...m.source, ...m.content, ...regions.flatMap(r => [r.x0, r.y0, r.x1, r.y1])].map(String)]
+}
+
+/** 見立ての境。正解の縁の誤差（幾何の当てはめで ±2〜4px）より確かに太ければ当たり、それより細ければ外れ */
+export const TRUTH_HIT_PX = 8
+export const TRUTH_MISS_PX = 2
+
+/** 警告ごとに、正解との差分のどれを見るか。縁の混色（RIM_CONTAMINATED）は色の話で、アルファの差分では分からない */
+const TRUTH_BASIS: Readonly<Record<string, (t: RegionTruth) => number>> = {
+  HALO_REMAINS: t => t.leak,
+  CONTOUR_ROUGH: t => Math.max(t.missing, t.leak),
+}
+
+/** 正解との差分から、指摘が当たりか外れかを見立てる。測っていないか、どちらとも言えなければ undefined */
+export function suggestVerdict(code: string, t: RegionTruth | undefined): ReviewVerdict | undefined {
+  const width = t === undefined ? undefined : TRUTH_BASIS[code]?.(t)
+  if (width === undefined) return undefined
+  return width >= TRUTH_HIT_PX ? 'hit' : width <= TRUTH_MISS_PX ? 'miss' : undefined
+}
+
+/** 画像の版の、指摘ごとの測定（指摘の鍵ごと） */
+export function truthOf(all: readonly ReviewMeasured[], img: Pick<ReviewImage, 'path' | 'mtimeMs'>): Readonly<Record<string, RegionTruth>> {
+  return all.find(x => x.path === img.path && x.mtimeMs === img.mtimeMs)?.regions ?? {}
+}
+
+/** ラベルに書く形 */
+function truthJson(code: string, t: RegionTruth | undefined): { missing_px: number; leak_px: number; suggest: ReviewVerdict | null } | null {
+  return t === undefined ? null : { missing_px: t.missing, leak_px: t.leak, suggest: suggestVerdict(code, t) ?? null }
+}
+
+/** 「正解では 欠け 0px・漏れ 32px → 当たりの見立て」。測っていなければ '' */
+export function truthNote(code: string, t: RegionTruth | undefined): string {
+  if (t === undefined) return ''
+  const v = suggestVerdict(code, t)
+  return `正解では 欠け ${t.missing}px・漏れ ${t.leak}px${v === undefined ? '' : ` → ${VERDICT_LABEL[v]}の見立て`}`
+}
+
+export type TruthStats = { missing: number; leak: number; regions: Record<string, RegionTruth> }
+
+/** TRUTH_JXA の標準出力を読む。regions は渡した範囲と同じ順。形が違えば undefined */
+export function parseTruth(stdout: string, regions: readonly KiriRegion[]): TruthStats | undefined {
+  const v = parseJson(stdout.trim()) as { missing?: unknown; leak?: unknown; regions?: unknown } | undefined
+  if (typeof v?.missing !== 'number' || typeof v.leak !== 'number') return undefined
+  const list = Array.isArray(v.regions) ? v.regions : []
+  const found = regions.flatMap((r, i): [string, RegionTruth][] => {
+    const t = list[i] as { missing?: unknown; leak?: unknown } | null | undefined
+    return typeof t?.missing === 'number' && typeof t.leak === 'number' && Number.isFinite(t.missing) && Number.isFinite(t.leak)
+      ? [[regionKey(r), { missing: t.missing, leak: t.leak }]]
+      : []
+  })
+  return { missing: v.missing, leak: v.leak, regions: Object.fromEntries(found) }
+}
+
+/** 正解との差分を測り、指摘ごとの測定を覚える。out があれば合成画像も書く */
+async function measureTruth($: EngineInterface, img: ReviewImage, out: string): Promise<TruthStats> {
+  const m = img.kiri?.mapping
+  if (img.truth === undefined || m === undefined) throw new Error('正解アルファがありません')
+  const regions = img.kiri?.regions ?? []
+  const stats = parseTruth(await run($, truthArgv(img, m, img.snapshot || img.path, img.truth, out, regions)), regions)
+  if (stats === undefined) throw new Error('差分の結果が読めません')
+  await markMeasured($, img, stats.regions)
+  return stats
+}
+
+/** その版を測った印を付ける（測れた範囲が無くても付け、読み直すたびに測り直さない） */
+async function markMeasured($: EngineInterface, img: Pick<ReviewImage, 'path' | 'mtimeMs'>, regions: Record<string, RegionTruth>): Promise<void> {
+  await update($, measured, l => [...l.filter(x => !(x.path === img.path && x.mtimeMs === img.mtimeMs)), { path: img.path, mtimeMs: img.mtimeMs, regions }])
+}
+
+/** 読んだ画像に正解アルファと指摘があれば、指摘ごとの誤差を測っておく（見立て用）。測れなくても読み込みは止めない */
+async function measureLoaded($: EngineInterface, list: readonly ReviewImage[]): Promise<void> {
+  for (const img of list) {
+    if (img.truth === undefined || img.hasAlpha !== true || (img.kiri?.regions.length ?? 0) === 0) continue
+    if ((await read($, measured)).some(x => x.path === img.path && x.mtimeMs === img.mtimeMs)) continue
+    await measureTruth($, img, '').catch(() => markMeasured($, img, {}))
+  }
 }
 
 const percent = (v: number) => `${(100 * v).toFixed(2)}%`
@@ -1261,14 +1483,11 @@ export function diffLine(d: Pick<ReviewDiff, 'missing' | 'leak'>): string {
 
 /** 正解との差分の合成画像を作り、ペイン用の縮小も作る */
 async function buildDiff($: EngineInterface, img: ReviewImage): Promise<ReviewDiff> {
-  const m = img.kiri?.mapping
-  if (img.truth === undefined || m === undefined) throw new Error('正解アルファがありません')
   const dir = `${$.plugin.root}/.cache`
   await run($, ['mkdir', '-p', dir])
   const file = `${dir}/truth-diff.png`
   const jpg = `${dir}/truth-diff.jpg`
-  const stats = parseJson(await run($, truthArgv(img, m, img.snapshot || img.path, img.truth, file)).then(s => s.trim())) as { missing?: unknown; leak?: unknown } | undefined
-  if (typeof stats?.missing !== 'number' || typeof stats.leak !== 'number') throw new Error('差分の結果が読めません')
+  const stats = await measureTruth($, img, file)
   let preview = ''
   for (const [side, q] of ZOOM_STEPS) {
     await run($, ['sips', '-s', 'format', 'jpeg', '-s', 'formatOptions', String(q), '-Z', String(side), file, '--out', jpg])
@@ -1655,6 +1874,7 @@ async function addImages(
   const lost = was.filter(c => dropped.includes(c.path)).length
   await update($, comments, l => markReplaced(fitComments(l.filter(c => next.some(x => x.path === c.path)), prev, next), replaced))
   await update($, judged, l => l.filter(j => next.some(x => x.path === j.path)))
+  await update($, measured, l => l.filter(t => next.some(x => x.path === t.path)))
   await update($, current, () => first?.path ?? '')
   // 別の画像へ移ったら、「一覧から外す」の確かめと、拡大と前の版の表示はやり直す
   if (first?.path !== shown) await leaveImage($)
@@ -1672,7 +1892,9 @@ async function addImages(
     const now = sel === null ? undefined : next.find(x => x.path === sel.path)
     return now === undefined || sel === null || now.width !== sel.width || now.height !== sel.height ? null : sel
   })
-  return { loaded: fresh.filter(x => next.some(y => y.path === x.path)), failed, kept, checking, dropped, lost }
+  const shownNow = fresh.filter(x => next.some(y => y.path === x.path))
+  await measureLoaded($, shownNow)
+  return { loaded: shownNow, failed, kept, checking, dropped, lost }
 }
 
 /** 別の画像へ移るときに、その画像だけの表示（外す確かめ、拡大、前の版）を戻す */
@@ -2188,6 +2410,7 @@ export const register: Register = on => {
       await update($, images, () => after)
       await update($, comments, l => l.filter(c => c.path !== now))
       await update($, judged, l => l.filter(j => j.path !== now))
+      await update($, measured, l => l.filter(t => t.path !== now))
       await update($, selection, s => (s !== null && s.path === now ? null : s))
       await update($, current, () => after[Math.min(at, after.length - 1)]?.path ?? '')
       await removeFiles($, staleSnapshots(prev, after))
@@ -2254,6 +2477,14 @@ export const register: Register = on => {
     // kiri の指摘への判定。描いたあとに画像が差し替わっていたら（番号が別の指摘を指す）何もしない
     const allJudged = await read($, judged)
     const verdicts = verdictsOf(allJudged, img)
+    const allMeasured = await read($, measured)
+    const truths = truthOf(allMeasured, img)
+    // 正解からの見立てのある、人がまだ判定していない指摘の数（一覧の画像の今の版）
+    const suggestedCount = list.reduce((n, x) => {
+      const done = verdictsOf(allJudged, x)
+      const t = truthOf(allMeasured, x)
+      return n + (x.kiri?.regions ?? []).filter(r => !(regionKey(r) in done) && suggestVerdict(r.code, t[regionKey(r)]) !== undefined).length
+    }, 0)
     const tri = await read($, triage)
     const triIndex = tri !== null && tri.path === img.path ? regions.findIndex(r => regionId(img, r) === tri.id) : -1
     const pending = pendingRegions(list, allJudged, img.path)
@@ -2346,8 +2577,8 @@ export const register: Register = on => {
         await run($, ['mkdir', '-p', dir])
         const file = `${dir}/report.md`
         await $.fs.write(file, calibrationText(c) + '\n')
-        const brief = c.codes.filter(s => s.hit + s.implied + s.miss > 0)
-          .map(s => `${s.code} 適合率 ${ratio(s.hit + s.implied, s.hit + s.implied + s.miss)}`).join('、')
+        const brief = c.codes.filter(s => hitsOf(s) + missesOf(s) > 0)
+          .map(s => `${s.code} 適合率 ${ratio(hitsOf(s), hitsOf(s) + missesOf(s))}`).join('、')
         $.ui.toast(`kiri-review: 較正レポートを ${file} に書きました${brief === '' ? '' : `（${brief}）`}${c.missed.length > 0 ? `。見逃し ${c.missed.length} 件` : ''}`)
       } catch (err) {
         $.ui.toast(`kiri-review: 較正レポートを作れませんでした: ${err instanceof Error ? err.message : String(err)}`)
@@ -2531,7 +2762,8 @@ export const register: Register = on => {
         {triIndex >= 0 && !showBefore && (
           /* 順に確かめている指摘。判定すると次の指摘へ進む */
           <Box flexDirection="row" flexWrap="wrap" gap={1}>
-            <Text bold>K{triIndex + 1} を確かめています: {REGION_CODES[regions[triIndex]?.code ?? ''] ?? regions[triIndex]?.code}<Text dimColor>（残り {pending.length} 件）</Text></Text>
+            <Text bold>K{triIndex + 1} を確かめています: {REGION_CODES[regions[triIndex]?.code ?? ''] ?? regions[triIndex]?.code}<Text dimColor>（残り {pending.length} 件）</Text>
+              {truthNote(regions[triIndex]?.code ?? '', truths[regions[triIndex] === undefined ? '' : regionKey(regions[triIndex])]) === '' ? '' : <Text dimColor>（{truthNote(regions[triIndex]?.code ?? '', truths[regions[triIndex] === undefined ? '' : regionKey(regions[triIndex])])}）</Text>}</Text>
             <Button key="thit" variant="primary" label="当たり（欠陥がある）" onPress={() => void triJudge('hit')} />
             <Button key="tmiss" label="外れ（問題ない）" onPress={() => void triJudge('miss')} />
             <Button key="tskip" plain label="飛ばす" onPress={() => void triSkip()} />
@@ -2545,6 +2777,7 @@ export const register: Register = on => {
               <Box key={`k${k}`} flexDirection="row" gap={1}>
                 <Text bold={k === triIndex}>K{k + 1}. {r.code} {REGION_CODES[r.code] ?? ''}<Text dimColor>（score {r.score}）</Text>
                   {verdicts[regionKey(r)] === undefined ? '' : <Text color={verdicts[regionKey(r)] === 'hit' ? 'red' : undefined} dimColor={verdicts[regionKey(r)] === 'miss'}>（{VERDICT_LABEL[verdicts[regionKey(r)] ?? 'hit']}）</Text>}
+                  {truthNote(r.code, truths[regionKey(r)]) === '' ? '' : <Text dimColor>（{truthNote(r.code, truths[regionKey(r)])}）</Text>}
                 </Text>
                 <Button key={`khit${k}`} plain dimColor={verdicts[regionKey(r)] !== 'hit'} label="当たり" onPress={() => void judge(k, 'hit', true)} />
                 <Button key={`kmiss${k}`} plain dimColor={verdicts[regionKey(r)] !== 'miss'} label="外れ" onPress={() => void judge(k, 'miss', true)} />
@@ -2562,10 +2795,10 @@ export const register: Register = on => {
           {pending.length > 0 && triIndex < 0 && canSvg && !showBefore && (
             <Button key="triage" label={`指摘を順に確かめる（未判定 ${pending.length} 件）`} onPress={() => void stepTriage([])} />
           )}
-          {(all.length > 0 || judgedCount > 0) && (
-            <Button key="labels" dimColor label={`ラベルを書き出す（${labeledCount} 件${judgedCount > 0 ? `・判定 ${judgedCount} 件` : ''}）`} onPress={() => void writeLabels()} />
+          {(all.length > 0 || judgedCount > 0 || suggestedCount > 0) && (
+            <Button key="labels" dimColor label={`ラベルを書き出す（${labeledCount} 件${judgedCount > 0 ? `・判定 ${judgedCount} 件` : ''}${suggestedCount > 0 ? `・正解の見立て ${suggestedCount} 件` : ''}）`} onPress={() => void writeLabels()} />
           )}
-          {(labeledCount > 0 || judgedCount > 0) && <Button key="report" dimColor label="較正レポート" onPress={() => void writeReport()} />}
+          {(labeledCount > 0 || judgedCount > 0 || suggestedCount > 0) && <Button key="report" dimColor label="較正レポート" onPress={() => void writeReport()} />}
           <Button key="copy" dimColor label="画像をコピー" onPress={() => void copy()} />
           <Button key="reload" dimColor label="読み直す" onPress={() => void openAndReport($, [img.path], false)} />
           {list.length > 1 && (

@@ -173,6 +173,12 @@ export type ReviewJudged = {
   saved?: boolean
 }
 
+/** 正解アルファとの差分を、kiri の指摘の範囲で測った誤差の太さ（入力画像の px。升ごとの平均の最大） */
+export type RegionTruth = { missing: number; leak: number }
+
+/** 画像の 1 版ぶんの、指摘ごとの測定（指摘の鍵ごと） */
+export type ReviewMeasured = { path: string; mtimeMs: number; regions: Record<string, RegionTruth> }
+
 /** 指摘を順に確かめている途中の位置 */
 export type ReviewTriage = {
   /** いま確かめている指摘のある画像 */
@@ -235,6 +241,8 @@ declare module 'claude-code' {
       diff: ReviewDiff | null
       /** このセッションで、中身（ラベルか判定）のある行を書き出した画像の版。中身が無くなったら、取り消しの行を書く */
       exported: string[]
+      /** 正解との差分を、kiri の指摘の範囲ごとに測ったもの（画像の版ごと）。判定の見立てに使う */
+      measured: ReviewMeasured[]
     }
   }
 }

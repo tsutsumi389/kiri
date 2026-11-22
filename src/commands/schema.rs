@@ -832,7 +832,10 @@ fn fields() -> Vec<FieldEntry> {
             warns: vec![],
             gates: None,
             summary: "モデルが確定背景として置いた画素の割合",
-            notes: Some("確率が 0.1 以下の領域を同じだけ収縮したもの"),
+            notes: Some(
+                "確率が 0.03 以下で外周から届く領域を、長辺 1000px 換算で 2px 収縮したもの。\
+                 確定前景（8px）より狭くしか削らない",
+            ),
         },
         FieldEntry {
             path: "segment.uncertain_ratio",

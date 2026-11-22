@@ -85,14 +85,22 @@ impl SegmentMode {
 /// 外に張り付く。モデルが言い切っている芯だけを採る。
 pub const SEG_FG: f32 = 0.9;
 
-/// 確定背景とみなす確率の上限。`SEG_FG` と対称の理由で 0.1。
-pub const SEG_BG: f32 = 0.1;
+/// 確定背景とみなす確率の上限。
+///
+/// **`SEG_FG` と対称の 0.1 にはしない。** 商品の縁でモデルが少し迷っただけの
+/// 場所（実写のキーボードの枠で 0.03〜0.1）は商品であり、0.1 で切ると
+/// そこが確定背景に落ちる。0.03 は `SEG_SILHOUETTE` と同じ線で、実写の
+/// キーボードでは正解の背景の 96.7% がこの下にある。
+///
+/// 余白（`SEG_BG_MARGIN`）と組で決めた値である。実測は `SEG_BG_MARGIN` の表。
+pub const SEG_BG: f32 = 0.03;
 
-/// 確定領域を内側へ削る幅(px、**長辺 1000px 換算**)。
+/// 確定前景と外形（`Silhouette`）を内側へ削る幅(px、**長辺 1000px 換算**)。
+/// 確定背景の幅は `SEG_BG_MARGIN` が別に決める。
 ///
 /// **1024² の 1 画素は 24MP では 4.8 画素ぶんある。** 確率マップを原寸へ
-/// 双線形で伸ばした時点で、0.9 / 0.1 の等高線は真の輪郭から数 px ずれうる。
-/// 両側から `r` ずつ削って不明の帯を広げれば、ずれはその帯の中に収まり、
+/// 双線形で伸ばした時点で、等高線は真の輪郭から数 px ずれうる。
+/// 削って不明の帯を広げれば、ずれはその帯の中に収まり、
 /// 輪郭は既存の matting が色から決める。
 ///
 /// 8 は、正解から作った粗いトライマップ（長辺の 2% = 1200px で 24px 収縮）
@@ -100,21 +108,53 @@ pub const SEG_BG: f32 = 0.1;
 /// 指示の価値を捨てることになる。
 pub const SEG_MARGIN: f64 = 8.0;
 
+/// 確定背景を内側へ削る幅(px、**長辺 1000px 換算**)。`SEG_MARGIN` より狭い。
+///
+/// **背景の側は、モデルが言い切った線のすぐ近くまで信用する。** 確定前景と
+/// 同じ 8 を削ると、輪郭の外側に原寸で 30px 級（24MP）の不明の帯が残り、
+/// そこは色だけが決める。商品と背景の色が近い縁では、その帯がそのまま
+/// 商品の外に張り付く——実写のキーボードで `--segment isnet` の漏れの 69% は
+/// モデルが 0.03 未満と言っていた画素だった。
+///
+/// 正解つきの実写 2 枚（`--segment isnet`。欠け% / 漏れ% / 輪郭誤差）。
+/// **半径は 1024 の格子で数えた値**で、採った 2.0 は切り上げで 3 になる:
+///
+/// | `SEG_BG` / 格子での半径 | キーボード | リモコン |
+/// |---|---|---|
+/// | 0.1 / 9（以前。`SEG_MARGIN` と同じ） | 0.34 / 1.01 / 3.71 | 0.02 / 0.66 / 1.14 |
+/// | 0.1 / 2 | 0.67 / 0.23 / 2.46 | 0.02 / 0.00 / 0.69 |
+/// | 0.03 / 4 | 0.22 / 0.52 / 2.53 | 0.02 / 0.32 / 0.91 |
+/// | **0.03 / 3（採用）** | **0.28 / 0.37 / 1.95** | **0.02 / 0.19 / 0.97** |
+/// | 0.03 / 2 | 0.33 / 0.29 / 1.90 | 0.02 / 0.01 / 0.71 |
+/// | 0.03 / 0 | 0.37 / 0.25 / 1.89 | 0.02 / 0.00 / 0.66 |
+///
+/// 0.1 のまま余白だけ詰めると商品が欠ける（0.34 → 0.67）。0.03 へ下げてから
+/// 詰めれば欠けはほぼ動かず、漏れだけが減る。3 より詰めた得（輪郭誤差で
+/// 0.05〜0.3px）は正解の縁の誤差の内で、格子 1 つぶんのずれ（24MP で 4.8px）を
+/// 吸う帯を残すほうを採る。
+/// 正解つきの合成 7 シーン（R1〜R7）でも、輪郭誤差は 7 つとも同じか良くなる。
+///
+/// **確定前景の側は動かしていない。** しきい値と余白を振るとキーボードの
+/// えぐれは動く（`SEG_FG` 0.3 で 13.6 → 6.9）が、リモコンと合成シーンは
+/// 動かず、根拠が 1 枚しか無い。
+pub const SEG_BG_MARGIN: f64 = 2.0;
+
 /// 不明の帯が広すぎると報せる割合。
 ///
-/// **モデルが迷っている状態である。** 0.9 と 0.1 のあいだに画像の 3 割以上が
+/// **モデルが迷っている状態である。** 確定前景と確定背景のあいだに画像の 3 割以上が
 /// 入るなら、それは「柔らかい輪郭」ではなくモデルが対象を掴めていない。
 /// 残りは色と連結性が決めるので、結果は `--segment off` に近づく。
 pub const SEG_UNCERTAIN_WARN: f64 = 0.3;
 
-/// モデルの外形の外とみなす確率の上限。**`SEG_BG` よりずっと低い。**
+/// モデルの外形の外とみなす確率の上限。**いまは `SEG_BG` と同じ値である。**
 ///
 /// 外形（`Silhouette`）は「モデルが背景だと言い切った領域が、外周から届く
-/// 範囲」の補集合である。`SEG_BG` の 0.1 で切ると、商品の縁でモデルが少し
+/// 範囲」の補集合である。0.1（以前の `SEG_BG`）で切ると、商品の縁でモデルが少し
 /// 迷っただけの場所（実写のキーボードの枠で 0.03〜0.1）が外形の外へ落ち、
 /// 窪みを 3 か所のうち 1 か所しか拾えなかった。外形は窪みを埋め戻す**上限**
-/// としてしか使わない（埋めるのは色のマスクを閉じた内側だけ）ので、確定背景
-/// より緩く取ってよい。
+/// としてしか使わない（埋めるのは色のマスクを閉じた内側だけ）ので、緩く
+/// 取ってよい。確定背景との違いは余白に残る——外形は `SEG_MARGIN`、確定背景は
+/// `SEG_BG_MARGIN` だけ削る。
 pub const SEG_SILHOUETTE: f32 = 0.03;
 
 /// 窪みとみなす口の幅の半分(px、**長辺 1000px 換算**)。閉処理の半径である。
@@ -219,7 +259,7 @@ pub struct SegmentRun {
 /// 原寸へ伸ばす前の確率マップ。
 ///
 /// **原寸の f32 を持たない。** 24MP では 96MB になり、そのために持つ価値が
-/// 無い——読み出す側は「0.9 以上か」「0.1 以下か」しか問わないので、
+/// 無い——読み出す側は「0.9 以上か」「0.03 以下か」しか問わないので、
 /// 必要な場所で双線形に引けば足りる。
 #[derive(Debug, Clone)]
 pub struct Probability {
@@ -468,8 +508,9 @@ pub fn to_probability(
 
 /// 確率マップを `Constraints`（確定前景・確定背景）へ落とす。
 ///
-/// `p >= SEG_FG` を `r` 収縮したものが確定前景、`p <= SEG_BG` を `r` 収縮した
-/// ものが確定背景。**削るのは不明の帯を両側へ `r` ずつ広げることと同じである。**
+/// `p >= SEG_FG` を `SEG_MARGIN` だけ収縮したものが確定前景、`p <= SEG_BG` を
+/// `SEG_BG_MARGIN` だけ収縮したものが確定背景。**削るのは不明の帯を両側へ
+/// 広げることと同じである。** 背景の側は狭くしか削らない（`SEG_BG_MARGIN`）。
 ///
 /// # 二値化も収縮も、確率マップ自身の格子で行う
 ///
@@ -546,7 +587,6 @@ fn decide_on_the_grid(probability: &Probability) -> Option<Decided> {
     if pw == 0 || ph == 0 {
         return None;
     }
-    let radius = margin_radius(pw, ph);
     let mut fg = Mask::new(pw, ph, 0);
     let mut low = Mask::new(pw, ph, 0);
     for (i, &p) in probability.as_slice().iter().enumerate() {
@@ -557,8 +597,8 @@ fn decide_on_the_grid(probability: &Probability) -> Option<Decided> {
         }
     }
     Some(Decided {
-        fg: erode(&fg, radius),
-        bg: erode(&reachable_from_the_border(&low), radius),
+        fg: erode(&fg, margin_radius(pw, ph)),
+        bg: erode(&reachable_from_the_border(&low), bg_margin_radius(pw, ph)),
     })
 }
 
@@ -883,10 +923,12 @@ fn box_pass(
 }
 
 impl Bites {
-    /// 窪みを確定前景として敷く。**モデルの確定背景の上にも敷く**——
-    /// `SEG_SILHOUETTE` は `SEG_BG` より低いので、窪みはモデルが 0.03〜0.1 と
-    /// 言った場所（確定背景になりうる）に重なる。そこを商品へ戻すのが
-    /// この処理である。利用者の指示は、呼ぶ側がこの後でもう 1 度重ねる。
+    /// 窪みを確定前景として敷く。**既にある印の上にも敷く。**
+    ///
+    /// モデルの確定背景とは重ならない——窪みは `SEG_SILHOUETTE` を超える格子、
+    /// 確定背景は `SEG_BG` 以下の格子で、`SEG_BG <= SEG_SILHOUETTE` である
+    /// （テストが固定している）。上書きしうるのは利用者の指示で、そちらは
+    /// 呼ぶ側がこの後でもう 1 度重ねる。
     ///
     /// **書き換えた画素の元の印を、書いた順で返す。** 採らなかったときに
     /// `unmark` へ渡せば元へ戻る。表を丸ごと複製すると 24.5MP で 24MB を
@@ -943,7 +985,7 @@ fn grid_index(v: u32, from: u32, to: u32) -> u32 {
     crate::cutout::constraints::nearest(v, from, to)
 }
 
-/// 確定領域を削る半径。**確率マップの格子で数える。**
+/// 確定前景と外形を削る半径。**確率マップの格子で数える。**
 ///
 /// `SEG_MARGIN` は長辺 1000px 換算なので、長辺が `long` の格子では
 /// `SEG_MARGIN * long / 1000` になる。原寸の大きさには依らない——
@@ -951,6 +993,12 @@ fn grid_index(v: u32, from: u32, to: u32) -> u32 {
 pub fn margin_radius(width: u32, height: u32) -> u32 {
     let scale = f64::from(width.max(height)) / 1000.0;
     (SEG_MARGIN * scale).ceil() as u32
+}
+
+/// 確定背景を削る半径。数え方は `margin_radius` と同じで、幅だけが違う。
+pub fn bg_margin_radius(width: u32, height: u32) -> u32 {
+    let scale = f64::from(width.max(height)) / 1000.0;
+    (SEG_BG_MARGIN * scale).ceil() as u32
 }
 
 /// モデルを読み、確率マップを返す。
@@ -1211,7 +1259,7 @@ mod tests {
         assert!(p.as_slice().iter().all(|&v| v == 0.0));
     }
 
-    /// 0.9 以上が確定前景、0.1 以下が確定背景、あいだは不明。
+    /// 0.9 以上が確定前景、0.03 以下が確定背景、あいだは不明。
     ///
     /// **収縮の幅ぶんだけ確定領域は内側へ下がる。** 200px の画像では
     /// `ceil(8 * 0.2) = 2` px。
@@ -1228,9 +1276,16 @@ mod tests {
 
         assert_eq!(c.at(10, 100), Constraint::ForcedFg);
         assert_eq!(c.at(190, 100), Constraint::ForcedBg);
-        // 境目の左右 2px は削られて不明になる
+        // 境目の左 2px と右 1px は削られて不明になる。**背景の側は狭くしか
+        // 削らない**（`SEG_BG_MARGIN`）
+        assert_eq!(bg_margin_radius(w, h), 1);
         assert_eq!(c.at(98, 100), Constraint::Free, "確定前景が削られていない");
-        assert_eq!(c.at(101, 100), Constraint::Free, "確定背景が削られていない");
+        assert_eq!(c.at(100, 100), Constraint::Free, "確定背景が削られていない");
+        assert_eq!(
+            c.at(101, 100),
+            Constraint::ForcedBg,
+            "確定背景を確定前景と同じ幅で削っている"
+        );
         assert!(stats.uncertain_ratio > 0.0);
         assert!((stats.fg_ratio + stats.bg_ratio + stats.uncertain_ratio - 1.0).abs() < 1e-9);
         assert_eq!(
@@ -1270,7 +1325,7 @@ mod tests {
 
         assert_eq!(c.at(10, 400), Constraint::ForcedFg);
         assert_eq!(c.at(790, 400), Constraint::ForcedBg);
-        // 格子 2px の収縮は原寸では 8px 幅の不明帯になる
+        // 格子で削った帯は、原寸では格子 1 つあたり 4px に広がる
         assert_eq!(c.at(399, 400), Constraint::Free, "境目が確定になっている");
         assert_eq!(c.at(400, 400), Constraint::Free);
         assert!((stats.fg_ratio - 0.49).abs() < 0.02, "{stats:?}");
@@ -1321,12 +1376,37 @@ mod tests {
         assert_eq!(c.at(35, 20), Constraint::ForcedFg);
     }
 
+    /// 窪みはモデルの確定背景と重ならない（`Bites::mark` の前提）。
+    ///
+    /// 2 つの線を離すなら、窪みが確定背景を商品へ戻す場合を考え直すこと。
+    #[test]
+    fn the_background_line_is_not_above_the_silhouette_line() {
+        const { assert!(SEG_BG <= SEG_SILHOUETTE) };
+    }
+
     /// 半径は**格子**で数える。原寸の大きさには依らない。
     #[test]
     fn the_margin_is_measured_on_the_grid_not_the_output() {
         assert_eq!(margin_radius(1024, 768), 9, "ISNet の格子");
         assert_eq!(margin_radius(200, 200), 2);
         assert_eq!(margin_radius(1000, 1000), 8, "SEG_MARGIN そのもの");
+        assert_eq!(bg_margin_radius(1024, 768), 3, "ISNet の格子");
+        assert_eq!(bg_margin_radius(1000, 1000), 2, "SEG_BG_MARGIN そのもの");
+    }
+
+    /// モデルが少し迷っただけの場所（0.03 を超える）は確定背景にしない。
+    ///
+    /// 実写のキーボードの枠がこれで、0.1 で切ると商品の縁が確定背景に落ちる。
+    #[test]
+    fn a_region_the_model_is_only_slightly_unsure_of_is_not_background() {
+        // 左半分が 0.0、右半分が 0.05。どちらも外周に接している
+        let (w, h) = (40u32, 40u32);
+        let data: Vec<f32> = (0..(w * h))
+            .map(|i| if (i % w) >= 20 { 0.05 } else { 0.0 })
+            .collect();
+        let (c, _) = to_constraints(&Probability::new(w, h, data).unwrap(), w, h);
+        assert_eq!(c.at(5, 20), Constraint::ForcedBg);
+        assert_eq!(c.at(35, 20), Constraint::Free);
     }
 
     /// 長さの食い違いは panic ではなく `Result` で返る。

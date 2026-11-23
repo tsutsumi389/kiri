@@ -1172,12 +1172,13 @@ fn fields() -> Vec<FieldEntry> {
             null_means: None,
             warns: vec![],
             gates: None,
-            summary: "--edge-repair auto / --auto が解き直した窓の数（0 なら何もしていない）",
+            summary: "--edge-repair auto / --auto が解き直した窓の数（0 なら成果物は 1 回目のまま）",
             notes: Some(
                 "1 回目の切り抜きで CONTOUR_ROUGH か RIM_CONTAMINATED が出たときだけ、その\
                  data.regions を広げた窓で 2 回目を切って差し替える。0 のときの成果物は\
                  --edge-repair off と 1 バイトも違わない——警告が出なかったか、gated_by の\
-                 警告が出ていて見送ったかのどちらかである",
+                 警告が出ていて見送ったか、解き直した結果を reverted_by の警告で\
+                 戻したかのどれかである",
             ),
         },
         FieldEntry {
@@ -1201,7 +1202,9 @@ fn fields() -> Vec<FieldEntry> {
             appears_in: vec!["cutout"],
             unit: "enum",
             nullable: true,
-            null_means: Some("見送っていない（解き直したか、直す区間が無かった）"),
+            null_means: Some(
+                "見送っていない（解き直したか、解き直して reverted_by で戻したか、直す区間が無かった）",
+            ),
             warns: vec![],
             gates: None,
             summary: "解き直しを見送らせた警告の code",
@@ -1210,6 +1213,23 @@ fn fields() -> Vec<FieldEntry> {
                  FOREGROUND_TOO_LARGE / SUBJECT_TOUCHES_EDGE のどれか。どれも縁の位置では\
                  なく切り抜きそのものが外れていることを言い、帯を解き直しても直らない\
                  （ベンチでは解き直すと悪化した）。先にその警告の remedy を当てること",
+            ),
+        },
+        FieldEntry {
+            path: "edge_repair.reverted_by",
+            appears_in: vec!["cutout"],
+            unit: "enum",
+            nullable: true,
+            null_means: Some("戻していない（解き直しを採ったか、解き直していない）"),
+            warns: vec![],
+            gates: None,
+            summary: "解き直した結果が新たに出したので 1 回目へ戻した、その警告の code",
+            notes: Some(
+                "gated_by と同じ 6 つの code のどれか。解き直した結果がそれを出すなら、\
+                 解き直しが切り抜きを外したことになるので採らない（色で分かれない商品では、\
+                 輪郭の内側の帯が背景へ倒れて商品が欠ける）。このとき repaired は 0、\
+                 windows は空、after は before と同じで、成果物は --edge-repair off と\
+                 1 バイトも違わない。次の手は面の指示（--trimap / --fg-polygon）",
             ),
         },
         FieldEntry {

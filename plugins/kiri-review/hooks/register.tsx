@@ -233,6 +233,7 @@ function repairOf(v: unknown): KiriRepair | undefined {
   return {
     repaired: typeof o.repaired === 'number' ? o.repaired : 0,
     gatedBy: typeof o.gated_by === 'string' ? o.gated_by : null,
+    revertedBy: typeof o.reverted_by === 'string' ? o.reverted_by : null,
     before: numbers(o.before),
     after: numbers(o.after),
   }
@@ -315,7 +316,7 @@ export function repairLine(r: KiriRepair): string {
   const keys = [...new Set([...Object.keys(r.before), ...Object.keys(r.after)])]
   const show = (v: number | null | undefined) => (typeof v === 'number' ? String(v) : '—')
   const metrics = keys.map(k => `${METRIC_LABEL[k] ?? k} ${show(r.before[k])}→${show(r.after[k])}`).join(' · ')
-  return `kiri の境界の解き直し ${r.repaired} か所${r.gatedBy === null ? '' : `（見送り: ${r.gatedBy}）`}${metrics === '' ? '' : `: ${metrics}`}`
+  return `kiri の境界の解き直し ${r.repaired} か所${r.gatedBy === null ? '' : `（見送り: ${r.gatedBy}）`}${(r.revertedBy ?? null) === null ? '' : `（解き直したが悪化したので戻した: ${r.revertedBy}）`}${metrics === '' ? '' : `: ${metrics}`}`
 }
 
 /** `a.png "b c.png" 'd.jpg'` を引用符を外して分ける */

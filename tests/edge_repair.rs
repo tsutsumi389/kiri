@@ -281,6 +281,60 @@ fn a_failed_cut_comes_back_untouched() {
     assert_eq!(result.image.as_raw(), image.as_raw());
 }
 
+/// 解き直した結果が門の警告を新たに出したら、1 回目へ戻す。結果は 1 回目そのもの。
+///
+/// 実写のキーボード（`--segment isnet`）で起きる。手持ちの 27 点には起きる点が
+/// 無いので、判定だけを差し替えて戻す経路を通す。
+#[test]
+fn a_repair_that_raises_a_gate_is_taken_back() {
+    let s = scene("R1");
+    let truth = real_scene(&s);
+    let opts = CutoutOptions {
+        bbox: Some(common::assisted_bbox(&truth)),
+        tolerance: s.assisted_tolerance,
+        ..Default::default()
+    };
+    let first = cutout(&truth.image, &opts);
+    let (mask, image) = (first.mask.clone(), first.image.clone());
+    let codes: Vec<WarningCode> = first.warnings.iter().map(|w| w.code).collect();
+    let before = first.diagnostics.clone();
+    let (result, outcome) = edge_repair::repair_with(
+        &truth.image,
+        &opts,
+        first,
+        None,
+        &Bands::default(),
+        |_, _| Some(WarningCode::HaloRemains),
+    );
+    assert_eq!(outcome.reverted_by, Some(WarningCode::HaloRemains));
+    assert_eq!(outcome.gated_by, None);
+    assert!(outcome.windows.is_empty());
+    assert_eq!(outcome.before, before);
+    assert_eq!(outcome.after, before);
+    assert_eq!(result.mask.as_slice(), mask.as_slice());
+    assert_eq!(result.image.as_raw(), image.as_raw());
+    assert_eq!(
+        result.warnings.iter().map(|w| w.code).collect::<Vec<_>>(),
+        codes
+    );
+}
+
+/// 効いている解き直しは戻さない（R1 assisted は門の警告を新たに出さない）。
+#[test]
+fn a_repair_that_helps_is_kept() {
+    let s = scene("R1");
+    let truth = real_scene(&s);
+    let opts = CutoutOptions {
+        bbox: Some(common::assisted_bbox(&truth)),
+        tolerance: s.assisted_tolerance,
+        ..Default::default()
+    };
+    let first = cutout(&truth.image, &opts);
+    let (_, outcome) = edge_repair::repair(&truth.image, &opts, first, None, &Bands::default());
+    assert_eq!(outcome.reverted_by, None);
+    assert!(!outcome.windows.is_empty());
+}
+
 /// 解き直しは決定的である。
 #[test]
 fn the_repair_is_deterministic() {
@@ -372,6 +426,7 @@ fn off_changes_nothing_and_auto_without_regions_only_adds_the_block() {
     assert_eq!(block["repaired"], 0, "{block}");
     assert_eq!(block["windows"].as_array().unwrap().len(), 0);
     assert!(block["gated_by"].is_null());
+    assert!(block["reverted_by"].is_null());
     assert_eq!(block["before"], block["after"]);
     let mut auto = without_elapsed(auto);
     auto.as_object_mut().unwrap().remove("edge_repair");

@@ -696,12 +696,15 @@ pub struct ReflectReport {
 /// `--edge-repair auto` が何をしたか。**指定したときだけ出る**（`optimize` と同じ規約）。
 #[derive(Debug, Serialize)]
 pub struct EdgeRepairReport {
-    /// 解き直した窓の数。0 なら何もしていない（成果物は off と同じ）
+    /// 解き直した窓の数。0 なら成果物は off と同じ（何もしていないか、解き直して戻した）
     pub repaired: usize,
     /// 解き直した窓（`[x1, y1, x2, y2]`、両端を含む入力の画素。`applied_bbox` と同じ座標系）
     pub windows: Vec<[u32; 4]>,
     /// 見送った理由の警告 code。見送っていなければ null
     pub gated_by: Option<WarningCode>,
+    /// 解き直した結果が新たに出したので 1 回目へ戻した、その警告 code。
+    /// 戻していなければ null
+    pub reverted_by: Option<WarningCode>,
     /// 1 回目の指標
     pub before: EdgeRepairMetrics,
     /// 差し替えた後の指標（`mask.*` と同じ値）

@@ -44,6 +44,8 @@ export type KiriMapping = {
 export type KiriRepair = {
   repaired: number
   gatedBy: string | null
+  /** 解き直した結果が新たに出したので 1 回目へ戻した、その警告 code */
+  revertedBy?: string | null
   before: Record<string, number | null>
   after: Record<string, number | null>
 }

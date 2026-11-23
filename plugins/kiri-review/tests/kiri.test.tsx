@@ -43,6 +43,8 @@ describe('kiri の結果を読む', () => {
       .toBe('kiri の境界の解き直し 9 か所: 縁残り 0.0239→0.0068 · ギザギザ 0.2541→0.0939 · 縁の混色 0.0613→0.0111')
     expect(repairLine({ repaired: 0, gatedBy: 'low_confidence', before: { halo_ratio: 0.1 }, after: { halo_ratio: null } }))
       .toBe('kiri の境界の解き直し 0 か所（見送り: low_confidence）: 縁残り 0.1→—')
+    expect(repairLine({ repaired: 0, gatedBy: null, revertedBy: 'HALO_REMAINS', before: { halo_ratio: 0.08 }, after: { halo_ratio: 0.08 } }))
+      .toBe('kiri の境界の解き直し 0 か所（解き直したが悪化したので戻した: HALO_REMAINS）: 縁残り 0.08→0.08')
   })
 })
 

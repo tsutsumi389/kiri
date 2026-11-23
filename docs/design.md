@@ -770,7 +770,7 @@ AI エージェントが `--allow-upscale` を付けるか元素材を見直す�
 
 **`returned` は成果物の出所を言う**（`"search"` / `"segment"` / `"default"`）。`adopted` が `false` の実行が既定の 1 回を返したのか、モデルの範囲で切り直した結果を返したのかは、`settings.segment` からは読めない（`--segment auto` の門が走らせなかった後に昇格した実行では、指定値は `auto` のままである）
 
-`--edge-repair auto` か `--auto` を渡すと `edge_repair` ブロックが増える（渡さなければキーごと現れない）。解き直した窓の数と窓そのもの（入力の画素）、見送った理由の警告 code、1 回目と差し替えた後の 3 つの指標を持つ。`mask.*` は差し替えた後の値で、`edge_repair.after` と一致する（4.18）。
+`--edge-repair auto` か `--auto` を渡すと `edge_repair` ブロックが増える（渡さなければキーごと現れない）。解き直した窓の数と窓そのもの（入力の画素）、見送った理由の警告 code、解き直した結果を戻した理由の警告 code、1 回目と差し替えた後の 3 つの指標を持つ。`mask.*` は差し替えた後の値で、`edge_repair.after` と一致する（4.18）。
 
 **`stage` が `"search"` の候補の数値は参考値である。** その候補は縮小版を
 `refine` 抜きで回したものなので、halo・輪郭の粗さ・縁の汚染・`touches_edge` は

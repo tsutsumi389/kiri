@@ -320,7 +320,43 @@ pub fn composite(
     bands: &Bands,
 ) {
     let (image, mask) = first;
-    let (w, h) = (mask.width(), mask.height());
+    let w = mask.width() as usize;
+    each_weight(windows, bands, mask.width(), mask.height(), |x, y, t| {
+        let i = (y as usize) * w + (x as usize);
+        let a = mix(mask.as_slice()[i], second.1.as_slice()[i], t);
+        mask.as_mut_slice()[i] = a;
+        let p1 = image.get_pixel(x, y).0;
+        let p2 = second.0.get_pixel(x, y).0;
+        let shown = a.min(source.get_pixel(x, y).0[3]);
+        image.put_pixel(
+            x,
+            y,
+            image::Rgba([
+                mix(p1[0], p2[0], t),
+                mix(p1[1], p2[1], t),
+                mix(p1[2], p2[2], t),
+                shown,
+            ]),
+        );
+    });
+}
+
+/// 重み `t` で 1 回目（`a`）から 2 回目（`b`）へ寄せる。
+fn mix(a: u8, b: u8, t: f64) -> u8 {
+    (f64::from(a) * (1.0 - t) + f64::from(b) * t).round() as u8
+}
+
+/// 窓の和の中の画素を、2 回目の重み（窓の縁から `blend` px かけて 0 → 1。
+/// 縁の画素（距離 1）は 0.5 / blend）と一緒に辿る。
+///
+/// `composite` と `blend_mask` が同じ重みを使うことを、ここ 1 箇所で保証する。
+fn each_weight(
+    windows: &[Window],
+    bands: &Bands,
+    w: u32,
+    h: u32,
+    mut visit: impl FnMut(u32, u32, f64),
+) {
     let blend = (bands.blend * scale_at_1000(w, h)).max(1.0);
     let Some((hx1, hy1, hx2, hy2)) = hull(windows) else {
         return;
@@ -328,31 +364,42 @@ pub fn composite(
     let (depth, dw) = union_depth(windows, (hx1, hy1, hx2, hy2));
     for y in hy1..=hy2 {
         for x in hx1..=hx2 {
-            // 窓の縁から `blend` px かけて 0 → 1。縁の画素（距離 1）は 0.5 / blend
             let d = depth[((y - hy1) as usize + 1) * dw + (x - hx1) as usize + 1];
             if d == 0 {
                 continue;
             }
-            let t = ((f64::from(d) - 0.5) / blend).min(1.0);
-            let i = (y as usize) * (w as usize) + (x as usize);
-            let mix = |a: u8, b: u8| (f64::from(a) * (1.0 - t) + f64::from(b) * t).round() as u8;
-            let a = mix(mask.as_slice()[i], second.1.as_slice()[i]);
-            mask.as_mut_slice()[i] = a;
-            let p1 = image.get_pixel(x, y).0;
-            let p2 = second.0.get_pixel(x, y).0;
-            let shown = a.min(source.get_pixel(x, y).0[3]);
-            image.put_pixel(
-                x,
-                y,
-                image::Rgba([
-                    mix(p1[0], p2[0]),
-                    mix(p1[1], p2[1]),
-                    mix(p1[2], p2[2]),
-                    shown,
-                ]),
-            );
+            visit(x, y, ((f64::from(d) - 0.5) / blend).min(1.0));
         }
     }
+}
+
+/// `composite` が作るマスクだけを先に作る（1 回目のマスクをその場で書き換える）。
+///
+/// 採否は混ぜた**マスク**で決まる（診断は元画像とマスクから測る）ので、画像を
+/// 混ぜる前に判定できる。戻すときに 1 回目の画像（24.5MP で 98MB）の控えが要らない。
+fn blend_mask(mask: &mut Mask, second: &Mask, windows: &[Window], bands: &Bands) {
+    let w = mask.width() as usize;
+    each_weight(windows, bands, mask.width(), mask.height(), |x, y, t| {
+        let i = (y as usize) * w + (x as usize);
+        mask.as_mut_slice()[i] = mix(mask.as_slice()[i], second.as_slice()[i], t);
+    });
+}
+
+/// 混ぜた結果が、1 回目には無かった `GATES` の警告を出していれば、その code。
+///
+/// **門は 1 回目だけでなく結果にも掛ける。** `GATES` は「この切り抜きは縁を
+/// 解き直しても直らない」を言う警告で、解き直した結果がそれを出すなら、
+/// 解き直しが切り抜きを外したことになる。実写のキーボード（黒い商品 / 暗い机、
+/// `--segment isnet`）では、1 回目の輪郭が既に真の縁の近くにあり、不明帯は
+/// 輪郭の内側にしか無いので、色で分かれない商品の縁が背景へ倒れた——
+/// `halo_ratio` 0.080 → 0.112 で `HALO_REMAINS` が新たに出て、正解に対する
+/// 商品の欠けは 0.55% → 0.97% に増えた。ベンチ 27 点で解き直しが走る 7 点は
+/// どれも新たな門の警告を出さない。
+pub fn newly_gated(first: &[Warning], mixed: &[Warning]) -> Option<WarningCode> {
+    mixed
+        .iter()
+        .map(|w| w.code)
+        .find(|c| GATES.contains(c) && !first.iter().any(|w| w.code == *c))
 }
 
 /// 解き直しの前後。結果 JSON の `edge_repair` ブロックの中身になる。
@@ -363,9 +410,12 @@ pub struct Outcome {
     /// 見送った理由。`GATES` の警告が出ていればその code、警告の区間が
     /// 無ければ None（直すものが無かった）
     pub gated_by: Option<WarningCode>,
+    /// 解き直したが、結果がこの警告を新たに出したので 1 回目へ戻した
+    /// （`newly_gated`）。戻していなければ None。Some のとき `windows` は空
+    pub reverted_by: Option<WarningCode>,
     /// 1 回目の指標
     pub before: Diagnostics,
-    /// 混ぜた後の指標。解き直していなければ `before` と同じ
+    /// 混ぜた後の指標。解き直していない・戻したなら `before` と同じ
     pub after: Diagnostics,
 }
 
@@ -376,7 +426,8 @@ pub struct Outcome {
 /// 主体の矩形は動かない。
 ///
 /// 解き直す区間が無ければ（警告が無い、`GATES` に当たった）、`first` を
-/// **そのまま**返す——画素も警告も 1 バイトも動かない。
+/// **そのまま**返す——画素も警告も 1 バイトも動かない。解き直した結果が
+/// 門の警告を新たに出したとき（`newly_gated`）も同じで、`first` をそのまま返す。
 ///
 /// 2 回目は `opts` に指示（`trimap`）だけを差し替えて同じ `cutout_seen` を
 /// 通す。混ぜた後の分離度・診断・警告は、**1 回目の背景の場で**測り直す
@@ -387,6 +438,22 @@ pub fn repair(
     first: CutoutResult,
     seen: Option<&BackgroundSeen>,
     bands: &Bands,
+) -> (CutoutResult, Outcome) {
+    repair_with(image, opts, first, seen, bands, newly_gated)
+}
+
+/// `repair` の本体。`verdict` は（1 回目の警告, 混ぜた結果の警告）を見て、
+/// 戻すならその理由の code を返す。**本体は `newly_gated` を渡す。** 引数に
+/// してあるのは、戻す経路をテストから確実に通すためである（手持ちの合成の
+/// 27 点には、解き直しが門の警告を新たに出す点が無い）。
+#[doc(hidden)]
+pub fn repair_with(
+    image: &RgbaImage,
+    opts: &CutoutOptions,
+    first: CutoutResult,
+    seen: Option<&BackgroundSeen>,
+    bands: &Bands,
+    verdict: impl Fn(&[Warning], &[Warning]) -> Option<WarningCode>,
 ) -> (CutoutResult, Outcome) {
     // **直すものがあったときだけ「見送った」と言う。** 縁の警告が出ていない
     // 切り抜きで門の code を返すと、直す必要があったのに止めたと読まれる
@@ -408,6 +475,7 @@ pub fn repair(
         let outcome = Outcome {
             windows,
             gated_by,
+            reverted_by: None,
             before: first.diagnostics.clone(),
             after: first.diagnostics.clone(),
         };
@@ -424,6 +492,32 @@ pub fn repair(
     ));
     let second = cutout_seen(image, &again, seen);
     drop(again);
+    // **画像を混ぜる前に、混ぜたマスクで採否を決める。** 分離度・診断・警告は
+    // 元画像とマスクから測るので、ここで出る値は混ぜた後に測るのと同じである
+    let mut mixed = first.mask.clone();
+    blend_mask(&mut mixed, &second.mask, &windows, bands);
+    let stats = mixed.stats();
+    let (separability, diagnostics) = judge(image, &mixed, &first.field, &first.residual, opts);
+    drop(mixed);
+    let judged = collect_warnings(
+        &first.background,
+        &first.residual,
+        &stats,
+        separability,
+        &diagnostics,
+        first.subject.as_ref(),
+        opts.bbox.is_some(),
+    );
+    if let Some(code) = verdict(&first.warnings, &judged) {
+        let outcome = Outcome {
+            windows: Vec::new(),
+            gated_by: None,
+            reverted_by: Some(code),
+            before: first.diagnostics.clone(),
+            after: first.diagnostics.clone(),
+        };
+        return (first, outcome);
+    }
     let CutoutResult {
         image: mut out,
         mut mask,
@@ -459,25 +553,16 @@ pub fn repair(
         .collect();
     // 2 回目はここで手放す。24.5MP では画像だけで 98MB ある
     drop(second);
-    let stats = mask.stats();
-    let (separability, diagnostics) = judge(image, &mask, &field, &residual, opts);
     // 設定の警告（堤防・場・matting）は 1 回目のまま正しい。結果の警告だけを
     // 混ぜたマスクで判定し直して入れ替える
     warnings.truncate(judged_from);
     warnings.extend(carried);
     let judged_from = warnings.len();
-    warnings.extend(collect_warnings(
-        &background,
-        &residual,
-        &stats,
-        separability,
-        &diagnostics,
-        subject.as_ref(),
-        opts.bbox.is_some(),
-    ));
+    warnings.extend(judged);
     let outcome = Outcome {
         windows,
         gated_by: None,
+        reverted_by: None,
         before,
         after: diagnostics.clone(),
     };
@@ -509,6 +594,58 @@ pub fn repair(
 mod tests {
     use super::*;
     use crate::cutout::regions::Grid;
+
+    fn warned(codes: &[WarningCode]) -> Vec<Warning> {
+        codes.iter().map(|&c| Warning::new(c, "")).collect()
+    }
+
+    /// 結果が門の警告を新たに出したときだけ、その code を返す。
+    #[test]
+    fn only_a_gate_the_first_cut_did_not_raise_takes_the_repair_back() {
+        let first = warned(&[WarningCode::ContourRough, WarningCode::LowUniformity]);
+        assert_eq!(newly_gated(&first, &first), None);
+        // 門でない警告が増えても戻さない
+        let rim = warned(&[WarningCode::ContourRough, WarningCode::RimContaminated]);
+        assert_eq!(newly_gated(&first, &rim), None);
+        let halo = warned(&[WarningCode::HaloRemains, WarningCode::ContourRough]);
+        assert_eq!(newly_gated(&first, &halo), Some(WarningCode::HaloRemains));
+        // 1 回目から出ていた門は「新たに」ではない
+        assert_eq!(newly_gated(&halo, &halo), None);
+        for &gate in GATES {
+            assert_eq!(newly_gated(&first, &warned(&[gate])), Some(gate));
+        }
+    }
+
+    /// 採否に使うマスクは、`composite` が書くマスクと同じである。
+    #[test]
+    fn the_judged_mask_is_the_composited_mask() {
+        let source = RgbaImage::from_pixel(200, 200, image::Rgba([10, 20, 30, 255]));
+        let first_mask = square();
+        let mut second_mask = Mask::new(200, 200, 0);
+        for y in 50..150 {
+            for x in 50..143 {
+                second_mask.set(x, y, 255);
+            }
+        }
+        let second_image = RgbaImage::from_pixel(200, 200, image::Rgba([200, 100, 50, 0]));
+        let windows = [(120, 40, 160, 100), (110, 90, 170, 130)];
+        let bands = Bands::default();
+        let mut judged = first_mask.clone();
+        blend_mask(&mut judged, &second_mask, &windows, &bands);
+        let mut image = RgbaImage::from_fn(200, 200, |x, y| {
+            image::Rgba([10, 20, 30, first_mask.get(x, y)])
+        });
+        let mut mask = first_mask.clone();
+        composite(
+            &source,
+            (&mut image, &mut mask),
+            (&second_image, &second_mask),
+            &windows,
+            &bands,
+        );
+        assert_ne!(mask.as_slice(), first_mask.as_slice(), "前提: 混ざっている");
+        assert_eq!(judged.as_slice(), mask.as_slice());
+    }
 
     /// 200x200 の中央に 50..150 の正方形（不透明）。外は透明。
     fn square() -> Mask {

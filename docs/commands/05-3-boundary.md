@@ -185,6 +185,7 @@ kiri cutout in.jpg -o out.png --optimize --edge-repair auto --json
   "repaired": 9,
   "windows": [[39, 2016, 1161, 2625], "..."],
   "gated_by": null,
+  "reverted_by": null,
   "before": { "halo_ratio": 0.0239, "contour_roughness": 0.2541, "rim_contamination": 0.0613 },
   "after":  { "halo_ratio": 0.0068, "contour_roughness": 0.0939, "rim_contamination": 0.0111 }
 }
@@ -199,6 +200,12 @@ kiri cutout in.jpg -o out.png --optimize --edge-repair auto --json
   `FOREGROUND_TOO_LARGE` / `SUBJECT_TOUCHES_EDGE` のどれかが出ていれば、
   `gated_by` にその code を入れて 1 回目をそのまま返す。帯を解き直しても直らず、
   ベンチでは悪化した。先にその警告の remedy を当てること
+- **解き直した結果が同じ 6 つの警告のどれかを新たに出したら、採らずに 1 回目へ戻す。**
+  `reverted_by` にその code が入り、`repaired` は 0、`after` は `before` と同じで、
+  成果物は `off` と 1 バイトも違わない。色で分かれない商品（黒いキーボード / 暗い机を
+  `--segment isnet` で切った実写）で起きる——不明帯は輪郭の内側にしか無いので、
+  帯の中の商品が背景へ倒れ、正解に対する商品の欠けが 0.55% → 0.97% に増えた。
+  次の手は面の指示（`--trimap` / `--fg-polygon`）である
 - **時間は 2 回目の切り抜きの分かかる**（24.5MP で探索なし 2.6 → 4.8 秒、
   `--optimize` 込み 7.8 → 9.8 秒）。直す区間が無ければ 2 回目は走らない
 - 指定しなければ（`off`）成果物も結果 JSON も、この機能を足す前と 1 バイトも変わらない。

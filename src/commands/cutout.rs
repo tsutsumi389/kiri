@@ -333,7 +333,11 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
         opts.constraints.is_some(),
         match &edge_repair {
             None => Repair::Off,
-            Some(report) => report.gated_by.map_or(Repair::Ran, Repair::Gated),
+            Some(report) => match (report.gated_by, report.reverted_by) {
+                (Some(gate), _) => Repair::Gated(gate),
+                (None, Some(raised)) => Repair::Reverted(raised),
+                (None, None) => Repair::Ran,
+            },
         },
     );
 
@@ -662,6 +666,9 @@ pub fn run(args: &CutoutArgs) -> Result<CutoutReport> {
 ///   「付けたのに何も変わらない」としか見えない。**名指す code は `gated_by`
 ///   そのものを受け取る**——ここで `warnings` から数え直すと、解き直した後の
 ///   測り直しで初めて門の警告が出た実行を「見送った」と言ってしまう
+/// - **解き直した結果が門の警告を新たに出して戻されたとき**（`reverted_by`）は、
+///   そう言って面の指示を勧める。帯の中を色では解けなかったので、もう一度
+///   `--edge-repair auto` を付けても同じ結果になる
 ///
 /// 同じ原因には同じ文面を返す。別の言い方をすると、手が 2 つあると読まれる。
 fn guide_hints(
@@ -696,6 +703,11 @@ fn guide_hints(
             "境界の解き直しは {gate} が出ているため見送りました。先に {gate} を消してください\
              （直し方はその警告の hint、無ければ schema の remedy）",
             gate = gate.as_str(),
+        )),
+        Repair::Reverted(raised) => Some(format!(
+            "境界の解き直しは {raised} を新たに出したため 1 回目へ戻しました\
+             （edge_repair.reverted_by）。data.regions の区間を --trimap か --fg-polygon で指してください",
+            raised = raised.as_str(),
         )),
         Repair::Off | Repair::Ran => None,
     };
@@ -996,6 +1008,9 @@ enum Repair {
     Off,
     /// 付けたが、この警告が出ていたので見送った（`edge_repair.gated_by`）
     Gated(WarningCode),
+    /// 付けて解き直したが、結果がこの警告を新たに出したので 1 回目へ戻した
+    /// （`edge_repair.reverted_by`）
+    Reverted(WarningCode),
     /// 付けて、解き直した（または直す区間が無かった）
     Ran,
 }
@@ -1015,6 +1030,7 @@ fn edge_repair_report(outcome: &edge_repair::Outcome) -> EdgeRepairReport {
             .map(|&(x1, y1, x2, y2)| [x1, y1, x2, y2])
             .collect(),
         gated_by: outcome.gated_by,
+        reverted_by: outcome.reverted_by,
         before: metrics(&outcome.before),
         after: metrics(&outcome.after),
     }
@@ -3179,6 +3195,22 @@ mod tests {
             Repair::Ran,
         );
         assert_eq!(hints[1], None);
+    }
+
+    /// 解き直しが戻されたら、戻した理由の警告を名指して面の指示を勧める
+    #[test]
+    fn a_reverted_repair_says_so_and_sends_to_the_constraints() {
+        let codes = [WarningCode::ContourRough, WarningCode::RimContaminated];
+        let hints = hints_of(
+            &codes,
+            true,
+            false,
+            Repair::Reverted(WarningCode::HaloRemains),
+        );
+        let rough = hints[0].as_deref().unwrap();
+        assert!(rough.contains("HALO_REMAINS") && rough.contains("戻しました"));
+        assert!(rough.contains("--trimap") && !rough.contains("見送りました"));
+        assert_eq!(hints[0], hints[1]);
     }
 
     /// 門が開いていれば `--edge-repair auto` を勧め、既に付けていれば黙る

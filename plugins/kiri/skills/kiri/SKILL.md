@@ -106,7 +106,9 @@ kiri cutout in.jpg -o out.png --auto --dry-run --preview /tmp/kiri-preview.png -
    探索が走ったかは結果の `optimize` ブロックの有無で、解き直した窓の数は `edge_repair.repaired` で分かる。
    解き直しが見送られたときは、`CONTOUR_ROUGH` / `RIM_CONTAMINATED` の hint が止めた警告の code を言う
    （`edge_repair.gated_by` と同じ）——その警告を先に消す。解き直した結果が悪化して戻されたとき
-   （`edge_repair.reverted_by`）は、もう一度付けても同じなので 3 へ進む
+   （`edge_repair.reverted_by`）は、もう一度付けても同じなので 3 へ進む。
+   `CONTOUR_ROUGH` の `data.parts.outline` が 0.16 以下なら、輪郭そのものは滑らかで、値を持ち上げて
+   いるのは縁に散った粒と小さな穴（`detail`）である。どちらも `--cleanup` では消えない
 3. **どこが商品かを面で教える。** 探索と解き直しで直らない輪郭も、これで直る。
    preview の元画像パネルのグリッドから座標を読み、正規化座標で渡す
    ```bash

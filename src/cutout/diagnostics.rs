@@ -211,6 +211,66 @@ pub struct Local {
     pub halo: Vec<Tally>,
     pub roughness: Vec<Tally>,
     pub rim: Vec<Tally>,
+    /// `contour_roughness` の内訳。**警告が出る値のときだけ測る**（`regions` と
+    /// 同じ扱い）。出ない実行に連結成分の走査を払わせない
+    pub roughness_parts: Option<RoughnessParts>,
+}
+
+/// `contour_roughness` を、主輪郭と細部（小さな島・穴の縁）に分けたもの。
+///
+/// **同じ値でも意味が違う。** 主輪郭が蛇行しているなら境界を解き直す話で、
+/// 縁に散った粒や小さな穴が値を持ち上げているなら、輪郭そのものは滑らかである
+/// （粒は `--cleanup` では消えない。`DETAIL_SIDE_AT_1000` を参照）。実写の
+/// キーボード（`--segment isnet`）では、輪郭画素の 14% しかない島・穴が値の 46% を
+/// 作っていた——平滑化した参照から消える大きさなので、どの画素も頭打ちの距離の
+/// 近くで数えられる。
+///
+/// 3 つの値は `contour_roughness = outline × (1 − detail_share) + detail ×
+/// detail_share` を満たす（どちらも同じ距離の和を、輪郭画素の数で割っている）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RoughnessParts {
+    /// 主輪郭だけで測った粗さ。主輪郭の画素が無ければ None
+    pub outline: Option<f64>,
+    /// 細部の縁だけで測った粗さ。細部が無ければ None
+    pub detail: Option<f64>,
+    /// 輪郭画素のうち細部の縁が占める割合
+    pub detail_share: f64,
+}
+
+/// 細部とみなす島・穴の一辺（px, 長辺 1000px 換算）。面積がこの 2 乗に満たない
+/// 連結成分を細部に数える。
+///
+/// `--cleanup 8` が孤立ノイズと呼ぶ大きさ（`speck_min_area` の (2n+1)² =
+/// 289px²）に揃えた。平滑化の参照が形を保てる大きさ（頭打ちの距離 3r = 6px の
+/// 2 倍、一辺 12px）より少し広い——参照に残っても、歪んで残るうちは粗さを
+/// 持ち上げる側にいる。
+///
+/// **しきい値は効いていない側にある。** 実写 2 枚（キーボード・リモコン）の
+/// 最終マスクでは、穴は 1,000 個以上がすべて 25px² 未満で、島も 9 割がそこに
+/// 入る。289px² を越える島は、切り損ねた実行に残る背景の塊（リモコン既定で 8 個）
+/// で、粒ではない。
+///
+/// **`--cleanup` を上げても細部は消えない。** 理由は 2 つある。
+///
+/// - `remove_specks` は**アルファが 0 でない画素**をたどって成分を作る。縁の粒は
+///   半透明の画素で商品とつながっているので、掃除から見れば商品の一部である。
+///   ここでは輪郭と同じく 128 以上でつなぐので、同じ粒が島になる。最終マスクへ
+///   `remove_specks(8)` を掛け直しても細部の輪郭画素はほとんど減らず（キーボード
+///   2,160 → 2,150、リモコンは 1 つも減らない）、二値化してから掛けると島のぶんが
+///   消える（キーボード → 508）
+/// - 穴は掃除の対象ではない（`remove_specks` は前景しか消さない）。リモコンの
+///   `--optimize` では細部の輪郭画素 2,532 のうち 2,211 が穴の縁である
+///
+/// キーボードの `--segment isnet` で `--cleanup` を 2 → 8 にすると、細部の粗さは
+/// 1.12 → 1.31 とむしろ上がった。だから内訳は警告の data に出すだけで、hint は
+/// 足していない
+pub const DETAIL_SIDE_AT_1000: f64 = 17.0;
+
+/// 細部とみなす連結成分の面積の上限(px²)。これに満たないものが細部。
+pub fn detail_area(width: u32, height: u32) -> usize {
+    (DETAIL_SIDE_AT_1000 * scale_at_1000(width, height))
+        .powi(2)
+        .round() as usize
 }
 
 impl Diagnostics {
@@ -280,31 +340,31 @@ pub fn diagnose(
     //
     // 局所の集計も同じで、各指標が自分の `Vec<Tally>` を持って帰る。共有の
     // 表へ並列に足すことはしないので、足す順が揺れる余地が無い
-    let (((halo_ratio_v, halo_cells), edge_width_v), ((roughness, rough_cells), (rim, rim_cells))) =
-        rayon::join(
-            || {
-                rayon::join(
-                    || halo_of(image, mask, field, reference_gate, &grid),
-                    || edge_width(mask),
-                )
-            },
-            || {
-                rayon::join(
-                    || roughness_of(mask, &contour, bbox, &grid),
-                    || contamination_of(image, mask, &contour, &grid),
-                )
-            },
-        );
+    let (((halo_ratio_v, halo_cells), edge_width_v), (rough, (rim, rim_cells))) = rayon::join(
+        || {
+            rayon::join(
+                || halo_of(image, mask, field, reference_gate, &grid),
+                || edge_width(mask),
+            )
+        },
+        || {
+            rayon::join(
+                || roughness_of(mask, &contour, bbox, &grid, Split::WhenWarned),
+                || contamination_of(image, mask, &contour, &grid),
+            )
+        },
+    );
     Diagnostics {
         halo_ratio: halo_ratio_v,
         edge_width: edge_width_v,
-        contour_roughness: roughness,
+        contour_roughness: rough.value,
         rim_contamination: rim,
         local: Local {
             grid,
             halo: halo_cells,
-            roughness: rough_cells,
+            roughness: rough.cells,
             rim: rim_cells,
+            roughness_parts: rough.parts,
         },
     }
 }
@@ -443,7 +503,29 @@ pub fn contour_roughness(mask: &Mask, bbox: Option<(u32, u32, u32, u32)>) -> Opt
         mask.height(),
         scale_at_1000(mask.width(), mask.height()),
     );
-    roughness_of(mask, &contour_pixels(mask, bbox), bbox, &grid).0
+    roughness_of(mask, &contour_pixels(mask, bbox), bbox, &grid, Split::Never).value
+}
+
+/// `contour_roughness` の内訳。粗さが測れないか、分けられなければ None。
+///
+/// `diagnose` と違い、値が警告に届いていなくても測る。ベンチと試験のための口。
+pub fn contour_roughness_parts(
+    mask: &Mask,
+    bbox: Option<(u32, u32, u32, u32)>,
+) -> Option<RoughnessParts> {
+    let grid = Grid::new(
+        mask.width(),
+        mask.height(),
+        scale_at_1000(mask.width(), mask.height()),
+    );
+    roughness_of(
+        mask,
+        &contour_pixels(mask, bbox),
+        bbox,
+        &grid,
+        Split::Always,
+    )
+    .parts
 }
 
 /// 帯の中で「局所前景より局所背景に近い」画素の割合。判定できなければ None。
@@ -468,16 +550,17 @@ pub fn rim_contamination(
 /// ぼかしても 0.5 の等高線が動かないので値は 0 に近く、1〜3px で蛇行していれば
 /// 蛇行ぶんがそのまま距離として出る。
 ///
-/// 2 つ目の戻り値は格子セルごとの集計（分子は頭打ちにした距離の和、分母は
+/// `cells` は格子セルごとの集計（分子は頭打ちにした距離の和、分母は
 /// 輪郭画素の数）。測れなければ空である。
 fn roughness_of(
     mask: &Mask,
     contour: &[(u32, u32)],
     bbox: Option<(u32, u32, u32, u32)>,
     grid: &Grid,
-) -> (Option<f64>, Vec<Tally>) {
+    split: Split,
+) -> Roughness {
     if contour.is_empty() {
-        return (None, Vec::new());
+        return Roughness::default();
     }
     let (w, h) = (mask.width(), mask.height());
     let scale = scale_at_1000(w, h);
@@ -494,7 +577,7 @@ fn roughness_of(
     // 平滑化で輪郭が消えるなら、比べる相手が無い。0 と報告すると
     // 「完全に滑らか」という最良の結果に見えてしまう
     if smooth_contour.is_empty() {
-        return (None, Vec::new());
+        return Roughness::default();
     }
 
     let cap = (3 * radius * u32::from(CHAMFER_STEP)).min(u32::from(u8::MAX));
@@ -525,8 +608,159 @@ fn roughness_of(
         cell.num += d;
         cell.den += 1;
     }
-    let mean = total as f64 / contour.len() as f64 / f64::from(CHAMFER_STEP);
-    (Some(mean / scale), cells)
+    // 和と数から値へ。全体も内訳もここを通すので、主輪郭しか無いマスクでは
+    // 内訳の `outline` が全体の値と 1 ビットも違わない
+    let mean = |sum: u64, count: usize| sum as f64 / count as f64 / f64::from(CHAMFER_STEP) / scale;
+    let value = mean(total, contour.len());
+    let wanted = match split {
+        Split::Never => false,
+        Split::WhenWarned => value > CONTOUR_ROUGH_WARN,
+        Split::Always => true,
+    };
+    let parts = wanted
+        .then(|| detail_pixels(mask, contour, bbox))
+        .flatten()
+        .map(|detail| {
+            let (mut sum, mut count) = (0u64, 0usize);
+            for (&(x, y), _) in contour.iter().zip(&detail).filter(|(_, d)| **d) {
+                sum += u64::from(u32::from(distance.at(x, y)).min(cap));
+                count += 1;
+            }
+            let outline = contour.len() - count;
+            RoughnessParts {
+                outline: (outline > 0).then(|| mean(total - sum, outline)),
+                detail: (count > 0).then(|| mean(sum, count)),
+                detail_share: count as f64 / contour.len() as f64,
+            }
+        });
+    Roughness {
+        value: Some(value),
+        cells,
+        parts,
+    }
+}
+
+/// `roughness_of` の結果。測れなければ全部が空。
+#[derive(Default)]
+struct Roughness {
+    value: Option<f64>,
+    cells: Vec<Tally>,
+    parts: Option<RoughnessParts>,
+}
+
+/// `roughness_of` が内訳まで測るか。
+#[derive(Clone, Copy)]
+enum Split {
+    Never,
+    /// 値が `CONTOUR_ROUGH_WARN` を越えたときだけ
+    WhenWarned,
+    Always,
+}
+
+/// 輪郭画素のそれぞれが細部（小さな島・穴の縁）かどうか。並びは `contour` と同じ。
+///
+/// - **島**: 前景の連結成分（8 近傍）で、面積が `detail_area` に満たないもの。
+///   いちばん大きい成分は、どれだけ小さくても島ではない（それが商品である）
+/// - **穴**: 背景の連結成分（4 近傍）で、画像の外周に届かず、面積が
+///   `detail_area` に満たないもの。取っ手の内側のような大きな穴は商品の形で
+///   あって細部ではない
+///
+/// 輪郭画素は、島に属するか、接している背景が穴だけなら細部である。
+///
+/// 連結成分は `remove_specks` と同じくランで結ぶ。**ランが細かく割れるマスクでは
+/// None を返す**——表が画素数に比例して膨らむうえ（`RUN_DENSITY_LIMIT`）、そこまで
+/// 砕けたマスクには主輪郭と呼べるものが無い。
+fn detail_pixels(
+    mask: &Mask,
+    contour: &[(u32, u32)],
+    bbox: Option<(u32, u32, u32, u32)>,
+) -> Option<Vec<bool>> {
+    use morphology::{RUN_DENSITY_LIMIT, Runs};
+
+    let (w, h) = (mask.width() as usize, mask.height() as usize);
+    let alpha = mask.as_slice();
+    let limit = u32::try_from(detail_area(mask.width(), mask.height())).unwrap_or(u32::MAX);
+    let fg = Runs::collect(w, h, RUN_DENSITY_LIMIT, |i| {
+        alpha[i] >= FOREGROUND_THRESHOLD
+    })?;
+    let bg = Runs::collect(w, h, RUN_DENSITY_LIMIT, |i| alpha[i] < FOREGROUND_THRESHOLD)?;
+
+    // 成分ごとに `f(行, ラン)` を畳む。成分の番号は代表のランの通し番号。
+    // 表は `remove_specks` と同じくランの数で持つ（面積は u32。上限と比べるだけ
+    // なので、溢れる大きさは頭打ちでよい）
+    fn fold<T: Copy>(
+        runs: &Runs,
+        component: &[u32],
+        zero: T,
+        mut f: impl FnMut(T, usize, morphology::Run) -> T,
+    ) -> Vec<T> {
+        let mut out = vec![zero; component.len()];
+        for y in 0..runs.rows() {
+            let row = runs.first[y]..runs.first[y + 1];
+            for (&run, &c) in runs.runs[row.clone()].iter().zip(&component[row]) {
+                out[c as usize] = f(out[c as usize], y, run);
+            }
+        }
+        out
+    }
+    let area = |runs: &Runs, component: &[u32]| {
+        fold(runs, component, 0u32, |a, _, run| {
+            a.saturating_add(run.x1 - run.x0 + 1)
+        })
+    };
+
+    // 前景の側は外周に届くかを問わない（見切れた商品も島も、面積だけで分ける）
+    let fg_component = fg.components(true);
+    let fg_area = area(&fg, &fg_component);
+    let largest = fg_area.iter().copied().max().unwrap_or(0);
+    let island: Vec<bool> = fg_area.iter().map(|&a| a < limit && a < largest).collect();
+    drop(fg_area);
+    let bg_component = bg.components(false);
+    let framed = fold(&bg, &bg_component, false, |framed, y, run| {
+        framed || y == 0 || y == h - 1 || run.x0 == 0 || run.x1 as usize == w - 1
+    });
+    let hole: Vec<bool> = area(&bg, &bg_component)
+        .iter()
+        .zip(&framed)
+        .map(|(&a, &framed)| a < limit && !framed)
+        .collect();
+    drop(framed);
+
+    // 画素を含むランの成分。`contour` の画素は必ず前景のランに、その背景の
+    // 隣は必ず背景のランに入っている
+    let component_at = |runs: &Runs, component: &[u32], x: u32, y: u32| -> usize {
+        let row = &runs.runs[runs.first[y as usize]..runs.first[y as usize + 1]];
+        let k = row.partition_point(|run| run.x1 < x);
+        component[runs.first[y as usize] + k] as usize
+    };
+    // `contour_pixels_in` と同じ規約: bbox の外の背景は輪郭を作らない
+    let inside = |x: i64, y: i64| -> bool {
+        if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
+            return false;
+        }
+        bbox.is_none_or(|(x1, y1, x2, y2)| {
+            (x as u32) >= x1 && (x as u32) <= x2 && (y as u32) >= y1 && (y as u32) <= y2
+        })
+    };
+    Some(
+        contour
+            .par_iter()
+            .map(|&(x, y)| {
+                if island[component_at(&fg, &fg_component, x, y)] {
+                    return true;
+                }
+                // 接している背景が 1 つでも「穴でない」なら主輪郭
+                ![(-1i64, 0i64), (1, 0), (0, -1), (0, 1)]
+                    .into_iter()
+                    .any(|(dx, dy)| {
+                        let (nx, ny) = (i64::from(x) + dx, i64::from(y) + dy);
+                        inside(nx, ny)
+                            && !mask.is_foreground(nx as u32, ny as u32)
+                            && !hole[component_at(&bg, &bg_component, nx as u32, ny as u32)]
+                    })
+            })
+            .collect(),
+    )
 }
 
 /// 帯の各画素を「局所前景 F」と「局所背景 B」の 2 択で分類し、B 寄りの割合を返す。
@@ -1970,5 +2204,280 @@ mod tests {
         );
         assert!(d.rim_regions().is_empty(), "{:?}", d.rim_regions());
         assert!(d.halo_regions().is_empty(), "{:?}", d.halo_regions());
+    }
+
+    /// 円盤（中心 `c`、半径 `r`）を塗る。`value` 0 で穴を開ける。
+    fn disc(mask: &mut Mask, c: (f32, f32), r: f32, value: u8) {
+        for y in 0..mask.height() {
+            for x in 0..mask.width() {
+                if (x as f32 + 0.5 - c.0).hypot(y as f32 + 0.5 - c.1) <= r {
+                    mask.set(x, y, value);
+                }
+            }
+        }
+    }
+
+    /// 円盤の外周のすぐ外に、3x3 の島を 24 個並べる（縁に残った繊維の粒）。
+    fn with_islands(mut mask: Mask) -> Mask {
+        let c = mask.width() as f32 / 2.0;
+        let ring = mask.width() as f32 * 0.3 + 12.0;
+        for k in 0..24 {
+            let theta = k as f32 * std::f32::consts::TAU / 24.0;
+            let (x, y) = (
+                (c + ring * theta.cos()) as u32,
+                (c + ring * theta.sin()) as u32,
+            );
+            for dy in 0..3 {
+                for dx in 0..3 {
+                    mask.set(x + dx, y + dy, 255);
+                }
+            }
+        }
+        mask
+    }
+
+    fn parts_of(mask: &Mask) -> RoughnessParts {
+        contour_roughness_parts(mask, None).expect("分けられる")
+    }
+
+    /// 全体の値は、2 つの部分を輪郭画素の比で重み付けした平均に戻る。
+    fn recombined(p: &RoughnessParts) -> f64 {
+        p.outline.unwrap_or(0.0) * (1.0 - p.detail_share) + p.detail.unwrap_or(0.0) * p.detail_share
+    }
+
+    #[test]
+    fn a_clean_shape_has_no_detail() {
+        let mask = jagged_disc(400, 3.0, 4.0);
+        let p = parts_of(&mask);
+        assert_eq!(p.detail, None, "{p:?}");
+        assert_eq!(p.detail_share, 0.0, "{p:?}");
+        assert_eq!(p.outline, contour_roughness(&mask, None), "{p:?}");
+    }
+
+    /// **島は主輪郭の値を動かさない。** 全体の値は島のぶんだけ上がるが、
+    /// 主輪郭の値は島を足す前と同じでなければ、分けた意味が無い。
+    #[test]
+    fn islands_by_the_rim_are_counted_as_detail() {
+        let clean = jagged_disc(400, 0.0, 4.0);
+        let dirty = with_islands(clean.clone());
+        let whole = contour_roughness(&dirty, None).unwrap();
+        assert!(
+            whole > CONTOUR_ROUGH_WARN,
+            "前提: 島だけで警告に届く ({whole})"
+        );
+
+        let p = parts_of(&dirty);
+        assert_eq!(p.outline, contour_roughness(&clean, None), "{p:?}");
+        assert!(p.outline.unwrap() < CONTOUR_ROUGH_WARN, "{p:?}");
+        assert!(p.detail.unwrap() > 1.0, "{p:?}");
+        // 3x3 の島の輪郭画素は 8 個（中心は背景に接しない）
+        let total = contour_pixels(&dirty, None).len() as f64;
+        assert!((p.detail_share - 24.0 * 8.0 / total).abs() < 1e-12, "{p:?}");
+        assert!((recombined(&p) - whole).abs() < 1e-9, "{p:?} / {whole}");
+    }
+
+    #[test]
+    fn small_holes_are_counted_as_detail() {
+        let clean = jagged_disc(400, 0.0, 4.0);
+        let mut holed = clean.clone();
+        for k in 0..10 {
+            disc(&mut holed, (150.0 + 10.0 * k as f32, 200.0), 1.5, 0);
+        }
+        let p = parts_of(&holed);
+        assert_eq!(p.outline, contour_roughness(&clean, None), "{p:?}");
+        assert!(p.detail.unwrap() > 1.0, "{p:?}");
+        assert!(p.detail_share > 0.0, "{p:?}");
+        let whole = contour_roughness(&holed, None).unwrap();
+        assert!((recombined(&p) - whole).abs() < 1e-9, "{p:?} / {whole}");
+    }
+
+    /// 取っ手の内側のような大きな穴は商品の形であって、細部ではない。
+    #[test]
+    fn a_large_hole_belongs_to_the_outline() {
+        let mut ring = jagged_disc(400, 0.0, 4.0);
+        disc(&mut ring, (200.0, 200.0), 60.0, 0);
+        let p = parts_of(&ring);
+        assert_eq!(p.detail_share, 0.0, "{p:?}");
+        assert_eq!(p.outline, contour_roughness(&ring, None), "{p:?}");
+    }
+
+    /// セット商品の 2 つ目は島ではない。
+    #[test]
+    fn a_second_product_belongs_to_the_outline() {
+        let mut pair = Mask::new(600, 400, 0);
+        disc(&mut pair, (160.0, 200.0), 100.0, 255);
+        disc(&mut pair, (460.0, 200.0), 40.0, 255);
+        let p = parts_of(&pair);
+        assert_eq!(p.detail_share, 0.0, "{p:?}");
+    }
+
+    /// 画像の外周につながる背景は、狭くても穴ではない（見切れた商品の脇の隙間）。
+    #[test]
+    fn background_reaching_the_frame_is_not_a_hole() {
+        let mut mask = Mask::new(400, 400, 255);
+        // 参照輪郭を残すための大きな穴（これが無いと粗さそのものが測れない）
+        disc(&mut mask, (200.0, 200.0), 60.0, 0);
+        for y in 0..6 {
+            for x in 190..196 {
+                mask.set(x, y, 0);
+            }
+        }
+        let p = parts_of(&mask);
+        assert_eq!(p.detail_share, 0.0, "{p:?}");
+    }
+
+    /// 細部の大きさは長辺 1000px 換算で決める。同じ形を 2 倍で撮っても分け方は同じ。
+    #[test]
+    fn the_size_of_detail_follows_the_resolution() {
+        let grown = |scale: u32| {
+            let mut mask = Mask::new(1000 * scale, 600 * scale, 0);
+            let s = scale as f32;
+            disc(&mut mask, (300.0 * s, 300.0 * s), 200.0 * s, 255);
+            // 一辺 12px（換算）の島。細部の上限（一辺 17px）より小さい
+            for y in 0..12 * scale {
+                for x in 0..12 * scale {
+                    mask.set(700 * scale + x, 300 * scale + y, 255);
+                }
+            }
+            parts_of(&mask)
+        };
+        let (small, large) = (grown(1), grown(2));
+        assert!(small.detail_share > 0.0, "{small:?}");
+        assert!(large.detail_share > 0.0, "{large:?}");
+    }
+
+    /// **内訳は警告が出たときだけ測る。** 出ない実行に連結成分の走査を払わせない。
+    #[test]
+    fn the_parts_are_only_measured_when_the_warning_fires() {
+        let bg = [250u8, 250, 249];
+        let field = BackgroundField::flat(bg);
+        let image = |mask: &Mask| {
+            let mut image = RgbaImage::from_pixel(
+                mask.width(),
+                mask.height(),
+                Rgba([bg[0], bg[1], bg[2], 255]),
+            );
+            for y in 0..mask.height() {
+                for x in 0..mask.width() {
+                    if mask.is_foreground(x, y) {
+                        image.put_pixel(x, y, Rgba([40, 40, 45, 255]));
+                    }
+                }
+            }
+            image
+        };
+        let clean = jagged_disc(400, 0.0, 4.0);
+        let d = diagnose(&image(&clean), &clean, &field, 3.0, None);
+        assert!(d.contour_roughness.unwrap() <= CONTOUR_ROUGH_WARN, "{d:?}");
+        assert_eq!(d.local.roughness_parts, None);
+
+        let dirty = with_islands(clean);
+        let d = diagnose(&image(&dirty), &dirty, &field, 3.0, None);
+        assert!(d.contour_roughness.unwrap() > CONTOUR_ROUGH_WARN, "{d:?}");
+        assert_eq!(
+            d.local.roughness_parts,
+            contour_roughness_parts(&dirty, None)
+        );
+    }
+
+    /// 細部の上限はちょうど `detail_area`（換算 289px²）で、届いた成分は細部ではない。
+    #[test]
+    fn the_limit_of_detail_is_exclusive() {
+        let with_island = |w: u32, h: u32| {
+            let mut mask = Mask::new(600, 400, 0);
+            disc(&mut mask, (200.0, 200.0), 120.0, 255);
+            for y in 0..h {
+                for x in 0..w {
+                    mask.set(450 + x, 200 + y, 255);
+                }
+            }
+            parts_of(&mask)
+        };
+        assert_eq!(detail_area(600, 400), 289);
+        assert!(with_island(17, 16).detail_share > 0.0);
+        assert_eq!(with_island(17, 17).detail_share, 0.0);
+    }
+
+    /// いちばん大きい成分は、上限より小さくても島ではない。同じ大きさが 2 つでも同じ。
+    #[test]
+    fn the_largest_components_are_never_islands() {
+        let mut mask = Mask::new(200, 200, 0);
+        disc(&mut mask, (60.0, 100.0), 8.0, 255);
+        disc(&mut mask, (140.0, 100.0), 8.0, 255);
+        let p = parts_of(&mask);
+        assert_eq!(p.detail_share, 0.0, "{p:?}");
+    }
+
+    /// 穴と外の背景の両方に接する 1px の壁は主輪郭である。
+    #[test]
+    fn a_wall_between_a_hole_and_the_outside_is_outline() {
+        let mut mask = Mask::new(400, 400, 0);
+        for y in 100..300 {
+            for x in 100..300 {
+                mask.set(x, y, 255);
+            }
+        }
+        // 左辺のすぐ内側に 3x3 の穴。x = 100 の 3 画素が壁になる
+        for y in 200..203 {
+            for x in 101..104 {
+                mask.set(x, y, 0);
+            }
+        }
+        let p = parts_of(&mask);
+        // 穴に接する輪郭画素は上・下・右・左に 3 つずつ。左の 3 つ（壁）は外にも接する
+        let total = contour_pixels(&mask, None).len() as f64;
+        assert!((p.detail_share - 9.0 / total).abs() < 1e-12, "{p:?}");
+    }
+
+    /// **bbox の外の背景は、接していても数えない**（`contour_pixels` と同じ規約）。
+    /// bbox の縁の 1px の壁は、外の背景ではなく、内側で接している穴で決まる。
+    /// bbox の縁から入り込んだ窪みは外の背景とつながっているので、穴ではない。
+    #[test]
+    fn the_background_outside_a_bbox_does_not_make_an_outline() {
+        let bbox = (150, 50, 350, 350);
+        let mut mask = Mask::new(400, 400, 0);
+        for y in 100..300 {
+            for x in 150..300 {
+                mask.set(x, y, 255);
+            }
+        }
+        // 窪み: bbox の左の縁（x = 150）から 3x3 入り込む
+        // 穴: 縁から 1px 内側の 3x3。x = 150 の 3 画素が壁になる
+        for d in 0..3 {
+            for e in 0..3 {
+                mask.set(150 + d, 180 + e, 0);
+                mask.set(151 + d, 250 + e, 0);
+            }
+        }
+        let p = contour_roughness_parts(&mask, Some(bbox)).expect("分けられる");
+        // 細部は穴の縁の 12 画素（壁の 3 つを含む）だけ。窪みの縁は主輪郭
+        let total = contour_pixels(&mask, Some(bbox)).len() as f64;
+        assert!((p.detail_share - 12.0 / total).abs() < 1e-12, "{p:?}");
+    }
+
+    /// bbox が輪郭を切っていなければ、分け方は bbox の有無で変わらない。
+    #[test]
+    fn a_bbox_around_the_shape_does_not_change_the_parts() {
+        let mut mask = with_islands(jagged_disc(400, 0.0, 4.0));
+        disc(&mut mask, (200.0, 200.0), 1.5, 0);
+        let within = contour_roughness_parts(&mask, Some((20, 20, 380, 380)));
+        assert!(within.is_some());
+        assert_eq!(within, contour_roughness_parts(&mask, None));
+    }
+
+    /// ランが細かく割れるマスク（1px の市松）では連結成分の表を作らない。
+    /// 分けられなかったことは None で言う——0 と言うと「細部は無い」に見える。
+    #[test]
+    fn a_shattered_mask_is_not_split() {
+        let mut mask = Mask::new(200, 200, 0);
+        for y in 40..160 {
+            for x in 40..160 {
+                if (x + y) % 2 == 0 {
+                    mask.set(x, y, 255);
+                }
+            }
+        }
+        assert!(contour_roughness(&mask, None).is_some());
+        assert_eq!(contour_roughness_parts(&mask, None), None);
     }
 }

@@ -1302,6 +1302,7 @@ pub(crate) fn collect_warnings(
                 // 直す手は `--edge-repair auto` で、門が開いているときに限って
                 // `commands::cutout::guide_hints` が勧める
                 .with_data("contour_roughness", round4(roughness))
+                .with_data("parts", parts_data(diagnostics.local.roughness_parts))
                 .with_data(
                     "regions",
                     regions_data(&diagnostics.roughness_regions(), &diagnostics.local.grid),
@@ -1407,10 +1408,52 @@ fn regions_data(found: &[regions::Region], grid: &regions::Grid) -> serde_json::
     )
 }
 
+/// `CONTOUR_ROUGH` の内訳（`diagnostics::RoughnessParts`）を警告の data へ落とす。
+///
+/// 分けられなかったときは null。キーは常に出す——無いと「細部は無かった」と
+/// 「測れなかった」が見分けられない。丸めは指標と同じ小数第 4 位。
+///
+/// **割合は、画素がある側を 0 へ丸めない。** 24.5MP では輪郭が 3 万画素あり、
+/// 細部が 1 画素だけだと割合は 0.00003 で、そのまま丸めると `detail` に値が
+/// あるのに `detail_share` が 0 になる。0.0001〜0.9999 の内側へ留める。
+fn parts_data(parts: Option<diagnostics::RoughnessParts>) -> serde_json::Value {
+    match parts {
+        Some(p) => {
+            let floor: f64 = if p.detail.is_some() { 0.0001 } else { 0.0 };
+            let ceiling: f64 = if p.outline.is_some() { 0.9999 } else { 1.0 };
+            let share = round4(p.detail_share).clamp(floor, ceiling);
+            serde_json::json!({
+                "outline": p.outline.map(round4),
+                "detail": p.detail.map(round4),
+                "detail_share": share,
+            })
+        }
+        None => serde_json::Value::Null,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use image::Rgba;
+
+    /// 画素がある側の割合は 0 にも 1 にも丸まらない。無い側はそのまま 0 / 1。
+    #[test]
+    fn a_share_with_pixels_behind_it_is_never_rounded_away() {
+        let parts = |outline, detail, detail_share| {
+            parts_data(Some(diagnostics::RoughnessParts {
+                outline,
+                detail,
+                detail_share,
+            }))
+        };
+        assert_eq!(parts(Some(0.2), Some(2.0), 0.00003)["detail_share"], 0.0001);
+        assert_eq!(parts(Some(0.2), Some(2.0), 0.99997)["detail_share"], 0.9999);
+        assert_eq!(parts(Some(0.2), Some(2.0), 0.1431)["detail_share"], 0.1431);
+        assert_eq!(parts(Some(0.2), None, 0.0)["detail_share"], 0.0);
+        assert_eq!(parts(None, Some(2.0), 1.0)["detail_share"], 1.0);
+        assert!(parts_data(None).is_null());
+    }
 
     /// 解き切れなかったときだけ警告が出る。
     ///

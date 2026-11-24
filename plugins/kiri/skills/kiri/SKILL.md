@@ -108,7 +108,8 @@ kiri cutout in.jpg -o out.png --auto --dry-run --preview /tmp/kiri-preview.png -
    （`edge_repair.gated_by` と同じ）——その警告を先に消す。解き直した結果が悪化して戻されたとき
    （`edge_repair.reverted_by`）は、もう一度付けても同じなので 3 へ進む。
    `CONTOUR_ROUGH` の `data.parts.outline` が 0.16 以下なら、輪郭そのものは滑らかで、値を持ち上げて
-   いるのは縁に散った粒と小さな穴（`detail`）である。どちらも `--cleanup` では消えない
+   いるのは縁に散った粒と小さな穴（`detail`）である。どちらも `--cleanup` では消えず、
+   輪郭を直す手も効かない。出力に残る欠陥ではあるので、合格とは読まず、preview で目で確かめる
 3. **どこが商品かを面で教える。** 探索と解き直しで直らない輪郭も、これで直る。
    preview の元画像パネルのグリッドから座標を読み、正規化座標で渡す
    ```bash

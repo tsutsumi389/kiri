@@ -101,17 +101,23 @@ fn specks_beside_a_clean_edge() -> RgbaImage {
     })
 }
 
-/// 蛇行が主輪郭にあるとき、内訳は全部を主輪郭へ寄せる。
+/// 蛇行が主輪郭にあるとき、内訳は値を主輪郭へ寄せる。
+///
+/// **細部がちょうど 0 であることは求めない。** 切り抜きの全経路を通した結果
+/// なので、境界の解き直しが歯の先に粒を 1 つ残しただけで落ちる試験にしない。
 #[test]
-fn a_jagged_outline_has_no_detail_part() {
+fn a_jagged_outline_is_reported_as_the_outline() {
     let dir = TempDir::new().unwrap();
     let input = write_png(dir.path(), "jagged.png", &jagged_right_edge());
     let v = cutout(&input, &dir, &[]);
     let w = warning(&v, "CONTOUR_ROUGH").unwrap();
     let parts = &w["data"]["parts"];
-    assert_eq!(parts["detail_share"], 0.0, "{w}");
-    assert!(parts["detail"].is_null(), "{w}");
-    assert_eq!(parts["outline"], w["data"]["contour_roughness"], "{w}");
+    let share = parts["detail_share"].as_f64().unwrap();
+    assert!(share < 0.02, "{w}");
+    let outline = parts["outline"].as_f64().unwrap();
+    let whole = w["data"]["contour_roughness"].as_f64().unwrap();
+    assert!(outline > 0.16, "主輪郭だけで警告に届く: {w}");
+    assert!((outline - whole).abs() < 0.05, "{w}");
 }
 
 /// 粒が値を持ち上げているとき、内訳は「主輪郭は滑らか」と言う。

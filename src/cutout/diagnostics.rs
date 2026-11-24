@@ -2329,21 +2329,27 @@ mod tests {
     /// 細部の大きさは長辺 1000px 換算で決める。同じ形を 2 倍で撮っても分け方は同じ。
     #[test]
     fn the_size_of_detail_follows_the_resolution() {
-        let grown = |scale: u32| {
+        let grown = |scale: u32, side: u32| {
             let mut mask = Mask::new(1000 * scale, 600 * scale, 0);
             let s = scale as f32;
             disc(&mut mask, (300.0 * s, 300.0 * s), 200.0 * s, 255);
-            // 一辺 12px（換算）の島。細部の上限（一辺 17px）より小さい
-            for y in 0..12 * scale {
-                for x in 0..12 * scale {
+            for y in 0..side * scale {
+                for x in 0..side * scale {
                     mask.set(700 * scale + x, 300 * scale + y, 255);
                 }
             }
             parts_of(&mask)
         };
-        let (small, large) = (grown(1), grown(2));
+        // 一辺 12px（換算）の島は、細部の上限（一辺 17px）より小さい
+        let (small, large) = (grown(1, 12), grown(2, 12));
         assert!(small.detail_share > 0.0, "{small:?}");
-        assert!(large.detail_share > 0.0, "{large:?}");
+        assert!(
+            (small.detail_share - large.detail_share).abs() < 0.01,
+            "{small:?} / {large:?}"
+        );
+        // 一辺 20px（換算）の島は、どちらの寸法でも細部ではない
+        assert_eq!(grown(1, 20).detail_share, 0.0);
+        assert_eq!(grown(2, 20).detail_share, 0.0);
     }
 
     /// **内訳は警告が出たときだけ測る。** 出ない実行に連結成分の走査を払わせない。

@@ -85,6 +85,64 @@ fn contour_rough_points_at_the_jagged_edge() {
     }
 }
 
+/// 暗い矩形（白地、辺はまっすぐ）の右に、6x6 の暗い粒を 20 個散らす。
+///
+/// 粒は既定の `--cleanup 2` が消す面積（25px²）より大きいので島として残る。
+/// 主輪郭は滑らかなまま、島だけが `CONTOUR_ROUGH` を出す。
+fn specks_beside_a_clean_edge() -> RgbaImage {
+    RgbaImage::from_fn(800, 600, |x, y| {
+        let product = (150..450).contains(&y) && (200..600).contains(&x);
+        let speck = (620..626).contains(&x) && (160..440).contains(&y) && (y - 160) % 14 < 6;
+        if product || speck {
+            Rgba([40, 40, 45, 255])
+        } else {
+            Rgba([250, 250, 249, 255])
+        }
+    })
+}
+
+/// 蛇行が主輪郭にあるとき、内訳は値を主輪郭へ寄せる。
+///
+/// **細部がちょうど 0 であることは求めない。** 切り抜きの全経路を通した結果
+/// なので、境界の解き直しが歯の先に粒を 1 つ残しただけで落ちる試験にしない。
+#[test]
+fn a_jagged_outline_is_reported_as_the_outline() {
+    let dir = TempDir::new().unwrap();
+    let input = write_png(dir.path(), "jagged.png", &jagged_right_edge());
+    let v = cutout(&input, &dir, &[]);
+    let w = warning(&v, "CONTOUR_ROUGH").unwrap();
+    let parts = &w["data"]["parts"];
+    let share = parts["detail_share"].as_f64().unwrap();
+    assert!(share < 0.02, "{w}");
+    let outline = parts["outline"].as_f64().unwrap();
+    let whole = w["data"]["contour_roughness"].as_f64().unwrap();
+    assert!(outline > 0.16, "主輪郭だけで警告に届く: {w}");
+    assert!((outline - whole).abs() < 0.05, "{w}");
+}
+
+/// 粒が値を持ち上げているとき、内訳は「主輪郭は滑らか」と言う。
+#[test]
+fn specks_are_reported_apart_from_the_outline() {
+    let dir = TempDir::new().unwrap();
+    let input = write_png(dir.path(), "specks.png", &specks_beside_a_clean_edge());
+    let v = cutout(&input, &dir, &[]);
+    let w = warning(&v, "CONTOUR_ROUGH").expect("粒で CONTOUR_ROUGH が出るはず");
+    let parts = &w["data"]["parts"];
+    let num = |v: &Value| v.as_f64().unwrap_or_else(|| panic!("{w}"));
+    let (outline, detail, share) = (
+        num(&parts["outline"]),
+        num(&parts["detail"]),
+        num(&parts["detail_share"]),
+    );
+    assert!(outline <= 0.16, "主輪郭だけなら警告に届かない: {w}");
+    assert!(detail > 1.0, "{w}");
+    assert!(share > 0.0 && share < 0.5, "{w}");
+    // 全体の値は、輪郭画素の比で重み付けした平均に戻る（丸めの 1e-4 × 係数ぶんの誤差）
+    let whole = num(&w["data"]["contour_roughness"]);
+    let back = outline * (1.0 - share) + detail * share;
+    assert!((back - whole).abs() < 1e-3, "{back} / {whole}: {w}");
+}
+
 /// `normalized_bbox` は `--bbox <値> --normalized` へそのまま渡せる。
 ///
 /// 戻ってきた `applied_bbox` は元の矩形を**必ず含み**、始点は 1px、終点は
@@ -134,6 +192,7 @@ fn a_clean_cut_has_no_regions_anywhere() {
     }
     let text = v.to_string();
     assert!(!text.contains("\"regions\""), "{text}");
+    assert!(!text.contains("\"parts\""), "{text}");
 }
 
 /// キャンバスが無ければ、入力の全面がそのまま出力の全面へ写る。

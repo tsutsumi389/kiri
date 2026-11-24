@@ -1932,7 +1932,18 @@ fn fields() -> Vec<FieldEntry> {
                  （長辺 1000px 換算で 64px）ごとに測り直し、しきい値を越えたセルを束ねた\
                  区間を悪い順に最大 5 個、bbox（applied_bbox と同じ入力の画素）・\
                  normalized_bbox（--bbox <値> --normalized へそのまま渡せる）・score\
-                 （その区間での同じ指標の値）で返す。警告が出なければ regions も出ない",
+                 （その区間での同じ指標の値）で返す。警告が出なければ regions も出ない。\
+                 **警告が出たときは data.parts が内訳も言う。** 輪郭画素を主輪郭と細部\
+                 （面積が長辺 1000px 換算で 289px² に満たない島と、外周に届かない同じ\
+                 大きさの穴の縁）に分け、outline（主輪郭だけの粗さ）・detail（細部だけの\
+                 粗さ）・detail_share（輪郭画素のうち細部の割合）で返す。\
+                 contour_roughness = outline × (1 − detail_share) + detail × detail_share。\
+                 outline がしきい値以下なら、値を持ち上げているのは縁に散った粒であって、\
+                 輪郭そのものは滑らかである。該当する画素が無い側は null、マスクが\
+                 細かく砕けているか画像がごく小さくて分けられなければ parts ごと null。\
+                 **細部は --cleanup では消えない**——島は半透明の画素で商品とつながって\
+                 いて掃除からは商品の一部に見え、穴は掃除の対象ではない。だから内訳に \
+                 hint は付かない",
             ),
         },
         FieldEntry {
